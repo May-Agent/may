@@ -1,23 +1,20 @@
 //! The guard over scripted pressure and footprints. The jobs are `sleep`
-//! commands running in real session shells; no test holds memory.
-//!
-//! The tests of jobs that run in a container or on a remote host are kept
-//! behind `cfg(any())`: aither's job registry is not nameable by an
-//! embedder, so a job at those places cannot be registered, and a real
-//! container or SSH host is not a test fixture.
+//! commands running in real session shells; no test holds memory. A job
+//! at a container or on a remote host is placed on the shell's jobs by
+//! aither's `test-util` feature, since a real container or SSH host is not a
+//! test fixture.
 
 #![allow(clippy::assert_is_empty, clippy::significant_drop_tightening)]
 
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
-#[cfg(any())]
+use aither_sandbox::test_ids::lease;
 use aither_sandbox::{
-    AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
-    JobMemory, JobPlace, ScriptLanguage, TerminalMode,
-};
-use aither_sandbox::{
-    FootprintError, FootprintReader, FootprintRegistry, JobStatus, KillCause, MemoryDomain,
+    AnyContainerMemory, CgroupMemory, ContainerMemory, FootprintError, FootprintReader,
+    FootprintRegistry, JobPlace, JobStatus, KillCause, MemoryDomain,
 };
 
 use super::*;
@@ -83,10 +80,8 @@ impl FootprintRegistry for Entry {
 }
 
 /// A harmless process standing for a job, in a group of its own.
-#[cfg(any())]
 struct Sleeper(Child);
 
-#[cfg(any())]
 impl Sleeper {
     fn start() -> Self {
         Self(
@@ -103,7 +98,6 @@ impl Sleeper {
     }
 }
 
-#[cfg(any())]
 impl Drop for Sleeper {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -122,31 +116,26 @@ struct Agent {
     guard: RunawayGuard,
     /// The jobs the agent started, by the name the test gave them.
     jobs: Vec<(&'static str, aither_sandbox::Job)>,
-    /// The kill switches of the container jobs, by task.
-    #[cfg(any())]
-    switches: Vec<(String, async_channel::Receiver<()>)>,
+    /// The kill switches of the container jobs, by name.
+    switches: Vec<(&'static str, async_channel::Receiver<()>)>,
+    /// The local processes standing for remote jobs.
+    sleepers: Vec<Sleeper>,
 }
 
 /// What the container's cgroup says, scripted.
-#[cfg(any())]
 #[derive(Clone)]
 struct Cgroup(Arc<Mutex<CgroupState>>);
 
-#[cfg(any())]
 struct CgroupState {
     limit: Option<u64>,
     pressure: &'static str,
     jobs: HashMap<String, u64>,
 }
 
-#[cfg(any())]
 const CALM: &str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
-#[cfg(any())]
 const STALLED: &str = "some avg10=12.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
-#[cfg(any())]
 const THRASHING: &str = "some avg10=40.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=15.00 avg60=0.00 avg300=0.00 total=0";
 
-#[cfg(any())]
 impl Cgroup {
     fn limited(limit: u64) -> Self {
         Self(Arc::new(Mutex::new(CgroupState {
@@ -169,7 +158,6 @@ impl Cgroup {
     }
 }
 
-#[cfg(any())]
 impl ContainerMemory for Cgroup {
     fn cgroup(&self) -> impl Future<Output = Result<CgroupMemory, FootprintError>> + Send {
         let state = self.0.lock().unwrap();
@@ -213,7 +201,21 @@ impl Agent {
             footprints,
             guard,
             jobs: Vec::new(),
+            switches: Vec::new(),
+            sleepers: Vec::new(),
         }
+    }
+
+    /// An agent that works in a container reading as `cgroup`.
+    async fn containerized(physical: u64, cgroup: &Cgroup) -> Self {
+        let mut agent = Self::new(physical, None).await;
+        agent.guard = RunawayGuard::new(
+            agent
+                .shell
+                .job_memory()
+                .with_container(AnyContainerMemory::new(cgroup.clone())),
+        );
+        agent
     }
 
     /// The terminal's shell, reading `footprints` and publishing to
@@ -289,72 +291,24 @@ impl Agent {
     }
 }
 
-#[cfg(any())]
 impl Agent {
-    fn new(physical: u64, machine: Option<(&Machine, &'static str)>) -> Self {
-        Self::build(physical, machine, None)
-    }
-
-    /// An agent that works in a container reading as `cgroup`.
-    fn containerized(physical: u64, cgroup: &Cgroup) -> Self {
-        Self::build(physical, None, Some(cgroup))
-    }
-
-    fn build(
-        physical: u64,
-        machine: Option<(&Machine, &'static str)>,
-        cgroup: Option<&Cgroup>,
-    ) -> Self {
-        let (registry, service) = job_registry_channel();
-        tokio::spawn(async move { service.serve().await });
-        let footprints = Footprints {
-            physical,
-            ..Footprints::default()
-        };
-        let window = ResponseWindow::new(WINDOW);
-        let memory = JobMemory::new(
-            registry.clone(),
-            AnyFootprintReader::new(footprints.clone()),
-            machine.map(|(machine, agent)| {
-                AnyFootprintRegistry::new(Entry {
-                    machine: machine.clone(),
-                    agent,
-                })
-            }),
-            window.clone(),
-        );
-        let memory = match cgroup {
-            Some(cgroup) => memory.with_container(AnyContainerMemory::new(cgroup.clone())),
-            None => memory,
-        };
-        Self {
-            registry,
-            footprints,
-            guard: RunawayGuard::new(memory),
-            sleepers: Vec::new(),
-            window,
-            switches: Vec::new(),
-        }
-    }
-
     /// Starts a job inside the container holding `bytes`. A container job
     /// is killed through its kill switch, which the test keeps.
-    async fn container_job(&mut self, cgroup: &Cgroup, task_id: &str, bytes: u64) {
+    async fn container_job(&mut self, cgroup: &Cgroup, task_id: &'static str, bytes: u64) {
         let pid = self.next_pid();
-        self.registry
-            .register_at(
-                JobPlace::Container,
-                pid,
-                &aither_sandbox::test_ids::lease(task_id),
-                "exec",
-                task_id,
-                ScriptLanguage::Shell,
-                TerminalMode::Sandboxed,
-            )
-            .await;
+        let jobs = self.shell.jobs();
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-        self.registry.attach_kill_switch(pid, kill_tx).await;
-        self.switches.push((task_id.to_string(), kill_rx));
+        jobs.place_for_test(
+            JobPlace::Container,
+            pid,
+            &lease(task_id),
+            task_id,
+            Some(kill_tx),
+        )
+        .await;
+        self.jobs
+            .push((task_id, jobs.get(task_id).await.expect("the job is held")));
+        self.switches.push((task_id, kill_rx));
         cgroup
             .0
             .lock()
@@ -372,20 +326,14 @@ impl Agent {
 
     /// Starts a job on a remote host holding `bytes` there. Its local `ssh`
     /// stand-in is a real process, which must never be killed.
-    async fn remote_job(&mut self, task_id: &str, bytes: u64) -> u32 {
+    async fn remote_job(&mut self, task_id: &'static str, bytes: u64) -> u32 {
         let sleeper = Sleeper::start();
         let pid = sleeper.pid();
-        self.registry
-            .register_at(
-                JobPlace::Remote,
-                pid,
-                &aither_sandbox::test_ids::lease(task_id),
-                "exec",
-                task_id,
-                ScriptLanguage::Shell,
-                TerminalMode::Sandboxed,
-            )
+        let jobs = self.shell.jobs();
+        jobs.place_for_test(JobPlace::Remote, pid, &lease(task_id), task_id, None)
             .await;
+        self.jobs
+            .push((task_id, jobs.get(task_id).await.expect("the job is held")));
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
         self.sleepers.push(sleeper);
         pid
@@ -399,35 +347,8 @@ impl Agent {
     fn container_job_killed(&self, task_id: &str) -> bool {
         self.switches
             .iter()
-            .find(|(id, _)| id == task_id)
+            .find(|(id, _)| *id == task_id)
             .is_some_and(|(_, rx)| rx.try_recv().is_ok())
-    }
-
-    /// Starts a job holding `bytes`.
-    async fn job(&mut self, task_id: &str, bytes: u64) -> u32 {
-        let sleeper = Sleeper::start();
-        let pid = sleeper.pid();
-        self.registry
-            .register(
-                pid,
-                &aither_sandbox::test_ids::lease(task_id),
-                "exec",
-                task_id,
-                TerminalMode::Sandboxed,
-                None,
-            )
-            .await;
-        self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
-        self.sleepers.push(sleeper);
-        pid
-    }
-
-    async fn status(&self, task_id: &str) -> JobStatus {
-        self.registry
-            .get_by_task_id_settled(task_id)
-            .await
-            .expect("the job is registered")
-            .status
     }
 }
 
@@ -820,7 +741,6 @@ fn the_alerts_read_as_plain_text() {
     );
 }
 
-#[cfg(any())]
 const fn is_container(event: &HostLoadEvent) -> bool {
     matches!(
         event,
@@ -843,12 +763,11 @@ const fn is_container(event: &HostLoadEvent) -> bool {
     )
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn a_containers_own_pressure_raises_its_own_alerts_once_per_change() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(8 * GIB);
-    let mut agent = Agent::containerized(64 * GIB, &cgroup);
+    let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
     agent.container_job(&cgroup, "small", GIB).await;
     agent.container_job(&cgroup, "large", 3 * GIB).await;
     // The machine is calm throughout: only the container's pressure moves.
@@ -866,7 +785,7 @@ async fn a_containers_own_pressure_raises_its_own_alerts_once_per_change() {
         panic!("one yellow alert: {yellow:?}");
     };
     assert_eq!(*domain, MemoryDomain::Container);
-    assert_eq!(task_ids(jobs), ["large", "small"]);
+    assert_eq!(names(&agent.jobs, jobs), ["large", "small"]);
     assert!(observe(STALLED).await.is_empty());
 
     let red = observe(THRASHING).await;
@@ -909,13 +828,12 @@ async fn a_containers_own_pressure_raises_its_own_alerts_once_per_change() {
     assert!(observe(CALM).await.is_empty());
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
     // The machine has 64 GiB, so 4 GiB of jobs would be nothing to it.
-    let mut agent = Agent::containerized(64 * GIB, &cgroup);
+    let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
     agent.container_job(&cgroup, "small", GIB).await;
     agent.container_job(&cgroup, "large", 3 * GIB).await;
     let normal = Some(MemoryPressure::Normal);
@@ -956,7 +874,7 @@ async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
     );
     assert!(agent.container_job_killed("large"));
     assert!(matches!(
-        agent.status("large").await,
+        agent.settled_status("large").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway {
                 footprint_bytes,
@@ -969,24 +887,23 @@ async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
     assert_eq!(agent.status("small").await, JobStatus::Running);
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn a_container_job_the_agent_stopped_in_time_is_not_killed() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
-    let mut agent = Agent::containerized(64 * GIB, &cgroup);
+    let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
     agent.container_job(&cgroup, "large", 4 * GIB).await;
     let normal = Some(MemoryPressure::Normal);
 
     assert_eq!(agent.guard.observe(clock.now(), normal).await.len(), 1);
     clock.advance(30);
-    assert!(agent.registry.kill_by_task_id("large").await);
+    assert!(agent.job_named("large").kill().await);
     cgroup.hold("large", 0);
 
     clock.advance(120);
     assert!(agent.guard.observe(clock.now(), normal).await.is_empty());
     assert!(matches!(
-        agent.status("large").await,
+        agent.settled_status("large").await,
         JobStatus::Killed {
             cause: KillCause::User,
             ..
@@ -994,12 +911,11 @@ async fn a_container_job_the_agent_stopped_in_time_is_not_killed() {
     ));
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn jobs_under_the_containers_limit_are_never_killed_whatever_the_pressure() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(8 * GIB);
-    let mut agent = Agent::containerized(64 * GIB, &cgroup);
+    let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
     agent.container_job(&cgroup, "a", 3 * GIB).await;
     agent.container_job(&cgroup, "b", 4 * GIB).await;
     for pressure in [THRASHING, THRASHING, STALLED] {
@@ -1020,14 +936,13 @@ async fn jobs_under_the_containers_limit_are_never_killed_whatever_the_pressure(
     assert!(!agent.container_job_killed("a") && !agent.container_job_killed("b"));
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn a_container_without_a_memory_limit_adds_nothing_to_watch() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
     cgroup.0.lock().unwrap().limit = None;
     cgroup.pressure(THRASHING);
-    let mut agent = Agent::containerized(64 * GIB, &cgroup);
+    let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
     agent.container_job(&cgroup, "large", 100 * GIB).await;
 
     let events = agent
@@ -1046,12 +961,11 @@ async fn a_container_without_a_memory_limit_adds_nothing_to_watch() {
     assert!(!agent.container_job_killed("large"));
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn the_machine_and_the_container_are_judged_apart() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(8 * GIB);
-    let mut agent = Agent::containerized(10 * GIB, &cgroup);
+    let mut agent = Agent::containerized(10 * GIB, &cgroup).await;
     agent.container_job(&cgroup, "boxed", 2 * GIB).await;
     // A local job over the machine's memory is the machine's trouble alone.
     agent.job("local", 11 * GIB).await;
@@ -1070,15 +984,14 @@ async fn the_machine_and_the_container_are_judged_apart() {
     else {
         panic!("only the machine warns: {events:?}");
     };
-    assert_eq!(job.task_id, "local");
+    assert!(agent.is(&job.task_id, "local"));
     assert!(!events.iter().any(is_container));
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn jobs_of_a_remote_environment_are_never_warned_about_or_killed() {
     let clock = Clock::new();
-    let mut agent = Agent::new(10 * GIB, None);
+    let mut agent = Agent::new(10 * GIB, None).await;
     // The remote job's reading would be far past the machine's memory, if
     // anything ever read it.
     let remote = agent.remote_job("remote", 500 * GIB).await;
@@ -1102,25 +1015,33 @@ async fn jobs_of_a_remote_environment_are_never_warned_about_or_killed() {
             if let HostLoadEvent::MemoryYellow { jobs, .. }
             | HostLoadEvent::MemoryRed { jobs, .. } = event
             {
-                assert_eq!(task_ids(jobs), ["local"], "the remote job is not listed");
+                assert_eq!(
+                    names(&agent.jobs, jobs),
+                    ["local"],
+                    "the remote job is not listed"
+                );
             }
         }
     }
     assert_eq!(agent.status("remote").await, JobStatus::Running);
     // Its stand-in process is still alive.
+    let sleeper = agent
+        .sleepers
+        .iter_mut()
+        .find(|sleeper| sleeper.pid() == remote)
+        .expect("the remote job's stand-in");
     assert!(
-        agent.sleepers.iter().any(|sleeper| sleeper.pid() == remote),
+        sleeper.0.try_wait().unwrap().is_none(),
         "the remote job's process was left alone"
     );
-    assert_eq!(agent.registry.kill_running().await, 2);
+    assert_eq!(agent.shell.jobs().kill_all().await, 2);
 }
 
-#[cfg(any())]
 #[tokio::test]
 async fn a_remote_job_in_a_container_terminal_is_still_never_judged() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
-    let mut agent = Agent::containerized(10 * GIB, &cgroup);
+    let mut agent = Agent::containerized(10 * GIB, &cgroup).await;
     agent.remote_job("remote", 500 * GIB).await;
     // The container's cgroup knows nothing of the remote job either.
     cgroup.hold("remote", 500 * GIB);

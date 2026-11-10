@@ -247,6 +247,8 @@ lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", 
 # Checks that every model-facing id word is one o200k_base token.
 tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio-test = "0.4"
+# Places jobs in a container or on a remote host for the memory guard's tests.
+aither-sandbox = { version = "0.30.0", features = ["test-util"] }
 
 [workspace.lints]
 rust.missing_docs = "warn"
