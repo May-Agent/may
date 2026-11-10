@@ -50,6 +50,7 @@ use async_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -202,6 +203,32 @@ impl ProviderType {
             | Self::Custom
             | Self::Copilot
             | Self::Chatgpt => None,
+        }
+    }
+
+    /// The prompt-cache block size the provider publishes, in tokens: it
+    /// caches and serves whole blocks only. `None` where no size is
+    /// published.
+    #[must_use]
+    pub const fn cache_block_tokens(self) -> Option<NonZeroU64> {
+        match self {
+            // OpenAI's prompt caching guide: cache hits grow in 128-token
+            // increments past the first 1024 tokens.
+            Self::OpenAI => NonZeroU64::new(128),
+            Self::Anthropic
+            | Self::Google
+            | Self::Copilot
+            | Self::Chatgpt
+            | Self::OpenRouter
+            | Self::DeepSeek
+            | Self::Ollama
+            | Self::LMStudio
+            | Self::Groq
+            | Self::Together
+            | Self::Mistral
+            | Self::XAI
+            | Self::Grok
+            | Self::Custom => None,
         }
     }
 
@@ -2225,6 +2252,19 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         assert!(saved.contains("communication = \"Chinese\""), "{saved}");
         assert!(!MayConfig::default().language.languages().enforced());
+    }
+
+    #[test]
+    fn only_openai_publishes_a_cache_block_size() {
+        assert_eq!(
+            ProviderType::OpenAI.cache_block_tokens(),
+            NonZeroU64::new(128)
+        );
+        assert_eq!(ProviderType::Custom.cache_block_tokens(), None);
+        assert_eq!(
+            ProviderType::from_id("openai").cache_block_tokens(),
+            NonZeroU64::new(128)
+        );
     }
 
     #[test]

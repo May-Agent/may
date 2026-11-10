@@ -4,15 +4,16 @@
 //! cache than the previous request on the same route (session, provider and
 //! model) left there. What the previous request left is what it read plus
 //! what it wrote; a provider that does not report writes is credited with
-//! its whole prompt, since it cached the prompt it read and extended. Both
-//! are amounts the provider itself reported on its own increments, so any
-//! shortfall is cache the provider no longer served.
+//! its prompt rounded down to the route's cache block, since it caches whole
+//! blocks only. Both are amounts the provider itself reported on its own
+//! increments, so any shortfall is cache the provider no longer served.
 //!
 //! The cause comes from the two requests' prompt-prefix hash chains (where
 //! the prefix first changed), the gap between them against the provider's
 //! cache lifetime, and what aither and May report happened in between.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -51,16 +52,41 @@ impl CacheObservation {
 
     /// Tokens this request left cached for the next request on its route.
     ///
-    /// A provider that reports no writes is credited with its whole prompt,
-    /// which it cached up to the provider's block granularity, so the next
-    /// request is held to at least what it read.
+    /// A provider that reports no writes cached its prompt in whole blocks
+    /// of `block` tokens, so it is credited with the prompt rounded down to
+    /// a block, and the next request is held to at least what this one read.
+    /// With no known block size nothing is credited beyond what was read.
     #[must_use]
-    pub fn cached_tokens(&self) -> u64 {
+    pub fn cached_tokens(&self, block: Option<NonZeroU64>) -> u64 {
         self.cache_write_tokens.map_or_else(
-            || self.prompt_tokens.max(self.cache_read_tokens),
+            || {
+                let whole_blocks =
+                    block.map_or(0, |block| self.prompt_tokens / block.get() * block.get());
+                whole_blocks.max(self.cache_read_tokens)
+            },
             |written| self.cache_read_tokens + written,
         )
     }
+}
+
+/// The cache block size a route's reads imply, `read` folded into `block`.
+///
+/// It is the greatest common divisor of the nonzero reads observed so far. A
+/// provider serves the cache in whole blocks, so every read is a multiple of its block
+/// size and the divisor converges on it.
+#[must_use]
+pub fn observed_block(block: Option<NonZeroU64>, read: u64) -> Option<NonZeroU64> {
+    let Some(read) = NonZeroU64::new(read) else {
+        return block;
+    };
+    let Some(block) = block else {
+        return Some(read);
+    };
+    let (mut larger, mut smaller) = (read.get().max(block.get()), read.get().min(block.get()));
+    while smaller != 0 {
+        (larger, smaller) = (smaller, larger % smaller);
+    }
+    NonZeroU64::new(larger)
 }
 
 /// What happened between the previous request on a route and this one.
@@ -162,15 +188,19 @@ pub struct CacheMiss {
 
 /// The miss `current` is against `previous`, the route's request before it,
 /// or `None` when it read at least everything `previous` left cached.
+///
+/// `block` is the route's cache block size, which sizes what a provider that
+/// reports no writes left cached.
 #[must_use]
 pub fn detect_cache_miss(
     previous: &CacheObservation,
     current: &CacheObservation,
     since: SincePrevious,
     lifetime: CacheLifetime,
+    block: Option<NonZeroU64>,
 ) -> Option<CacheMiss> {
     let missed_tokens = previous
-        .cached_tokens()
+        .cached_tokens(block)
         .checked_sub(current.cache_read_tokens)
         .filter(|&missed| missed > 0)?;
     let gap = Duration::from_millis(
@@ -270,12 +300,18 @@ mod tests {
         for turn in 2..8_u32 {
             let current = observation(
                 i64::from(turn) * 60_000,
-                u32::try_from(previous.cached_tokens()).expect("fits"),
+                u32::try_from(previous.cached_tokens(None)).expect("fits"),
                 4_000,
                 PrefixChain::of(&tools, &conversation(turn as usize)),
             );
             assert_eq!(
-                detect_cache_miss(&previous, &current, SincePrevious::default(), one_hour()),
+                detect_cache_miss(
+                    &previous,
+                    &current,
+                    SincePrevious::default(),
+                    one_hour(),
+                    None
+                ),
                 None,
                 "turn {turn}"
             );
@@ -293,8 +329,14 @@ mod tests {
             9_000,
             PrefixChain::of(&tools, &conversation(3)),
         );
-        let miss = detect_cache_miss(&previous, &current, SincePrevious::default(), one_hour())
-            .expect("a miss");
+        let miss = detect_cache_miss(
+            &previous,
+            &current,
+            SincePrevious::default(),
+            one_hour(),
+            None,
+        )
+        .expect("a miss");
         assert_eq!(miss.cause, CacheMissCause::Expired);
         assert_eq!(miss.missed_tokens, 8_500);
         assert_eq!(miss.diverged, None);
@@ -316,6 +358,7 @@ mod tests {
             &current,
             SincePrevious::default(),
             CacheLifetime::Permanent,
+            None,
         )
         .expect("a miss");
         assert_eq!(miss.cause, CacheMissCause::ProviderDropped);
@@ -338,7 +381,7 @@ mod tests {
             },
             ..SincePrevious::default()
         };
-        let miss = detect_cache_miss(&previous, &current, since, one_hour()).expect("a miss");
+        let miss = detect_cache_miss(&previous, &current, since, one_hour(), None).expect("a miss");
         assert_eq!(miss.cause, CacheMissCause::Compaction);
         assert_eq!(miss.missed_tokens, 91_000);
         assert_eq!(
@@ -364,8 +407,14 @@ mod tests {
             21_000,
             PrefixChain::of(&[tool("terminal"), tool("monitor")], &conversation(5)),
         );
-        let miss = detect_cache_miss(&previous, &current, SincePrevious::default(), one_hour())
-            .expect("a miss");
+        let miss = detect_cache_miss(
+            &previous,
+            &current,
+            SincePrevious::default(),
+            one_hour(),
+            None,
+        )
+        .expect("a miss");
         assert_eq!(miss.cause, CacheMissCause::ToolsChanged);
         assert_eq!(miss.diverged, Some(PrefixBlock::Tools));
     }
@@ -381,39 +430,123 @@ mod tests {
             agent_rebuilt: true,
             ..SincePrevious::default()
         };
-        let miss = detect_cache_miss(&previous, &current, since, one_hour()).expect("a miss");
+        let miss = detect_cache_miss(&previous, &current, since, one_hour(), None).expect("a miss");
         assert_eq!(miss.cause, CacheMissCause::AgentRebuilt);
         let since = SincePrevious::default();
-        let miss = detect_cache_miss(&previous, &current, since, one_hour()).expect("a miss");
+        let miss = detect_cache_miss(&previous, &current, since, one_hour(), None).expect("a miss");
         assert_eq!(miss.cause, CacheMissCause::PrefixChanged);
     }
 
-    /// A provider that reports no writes is held to its whole prompt, so each
-    /// of two consecutive requests that read nothing records the loss.
+    fn block(tokens: u64) -> Option<NonZeroU64> {
+        NonZeroU64::new(tokens)
+    }
+
+    /// A request on a provider that reports no cache writes.
+    fn unwritten(at_ms: i64, prompt: u32, read: u32, turns: usize) -> CacheObservation {
+        let mut usage = Usage::new(prompt, 10);
+        usage.cache_read_tokens = Some(read);
+        CacheObservation::new(
+            at_ms,
+            &usage,
+            PrefixChain::of(&[tool("terminal")], &conversation(turns)),
+        )
+    }
+
+    /// A provider that reports no writes is held to its prompt rounded down
+    /// to its block, so each of two consecutive requests that read nothing
+    /// records the loss.
     #[test]
     fn consecutive_zero_read_requests_without_write_counts_each_record_a_miss() {
-        let tools = [tool("terminal")];
-        let usage = |prompt: u32, read: u32| {
-            let mut usage = Usage::new(prompt, 10);
-            usage.cache_read_tokens = Some(read);
-            usage
-        };
-        let observe = |at_ms, prompt, read, turns| {
-            CacheObservation::new(
-                at_ms,
-                &usage(prompt, read),
-                PrefixChain::of(&tools, &conversation(turns)),
-            )
-        };
-        let first = observe(0, 30_000, 0, 2);
-        let second = observe(1_000, 31_000, 0, 3);
-        let third = observe(2_000, 32_000, 0, 4);
+        let first = unwritten(0, 30_000, 0, 2);
+        let second = unwritten(1_000, 31_000, 0, 3);
+        let third = unwritten(2_000, 32_000, 0, 4);
         let since = SincePrevious::default();
-        let miss = detect_cache_miss(&first, &second, since, one_hour()).expect("a miss");
-        assert_eq!(miss.missed_tokens, 30_000);
-        let miss = detect_cache_miss(&second, &third, since, one_hour()).expect("a miss");
-        assert_eq!(miss.missed_tokens, 31_000);
+        let blocks = block(64);
+        let miss = detect_cache_miss(&first, &second, since, one_hour(), blocks).expect("a miss");
+        assert_eq!(miss.missed_tokens, 29_952);
+        let miss = detect_cache_miss(&second, &third, since, one_hour(), blocks).expect("a miss");
+        assert_eq!(miss.missed_tokens, 30_976);
         assert_eq!(miss.cause, CacheMissCause::ProviderDropped);
+    }
+
+    /// Live session: each request read the previous prompt up to a 64-token
+    /// block, which is no miss.
+    #[test]
+    fn a_shortfall_within_one_block_records_no_miss() {
+        let live = [
+            (12_009, 11_968),
+            (12_244, 12_224),
+            (12_451, 12_544),
+            (13_842, 13_824),
+            (14_140, 14_080),
+        ];
+        for (previous_prompt, next_read) in live {
+            let previous = unwritten(0, previous_prompt, 0, 2);
+            let current = unwritten(1_000, previous_prompt + 1_200, next_read, 3);
+            assert_eq!(
+                detect_cache_miss(
+                    &previous,
+                    &current,
+                    SincePrevious::default(),
+                    one_hour(),
+                    block(64)
+                ),
+                None,
+                "prompt {previous_prompt}"
+            );
+        }
+    }
+
+    /// A read a whole block or more under the credit is a real drop.
+    #[test]
+    fn a_real_drop_still_records_provider_dropped() {
+        let previous = unwritten(0, 14_140, 0, 2);
+        let current = unwritten(1_000, 14_500, 12_800, 3);
+        let miss = detect_cache_miss(
+            &previous,
+            &current,
+            SincePrevious::default(),
+            one_hour(),
+            block(64),
+        )
+        .expect("a miss");
+        assert_eq!(miss.cause, CacheMissCause::ProviderDropped);
+        assert_eq!(miss.missed_tokens, 14_080 - 12_800);
+    }
+
+    /// `OpenAI` documents 128-token increments: a 100-token shortfall is a
+    /// miss at 64 but not at 128.
+    #[test]
+    fn the_block_size_sets_the_credit() {
+        let previous = unwritten(0, 12_000, 0, 2);
+        let current = unwritten(1_000, 12_100, 11_904, 3);
+        let since = SincePrevious::default();
+        assert_eq!(
+            detect_cache_miss(&previous, &current, since, one_hour(), block(128)),
+            None
+        );
+        let miss = detect_cache_miss(&previous, &current, since, one_hour(), block(64))
+            .expect("a miss at 64");
+        assert_eq!(miss.missed_tokens, 11_968 - 11_904);
+    }
+
+    /// With no known block nothing is credited beyond what was read.
+    #[test]
+    fn an_unknown_block_credits_only_the_read() {
+        assert_eq!(unwritten(0, 12_000, 0, 2).cached_tokens(None), 0);
+        assert_eq!(unwritten(0, 12_000, 11_968, 2).cached_tokens(None), 11_968);
+    }
+
+    #[test]
+    fn the_observed_block_is_the_gcd_of_the_nonzero_reads() {
+        assert_eq!(observed_block(None, 0), None);
+        assert_eq!(observed_block(None, 11_968), block(11_968));
+        assert_eq!(observed_block(block(11_968), 0), block(11_968));
+        let mut inferred = None;
+        for read in [11_968, 12_224, 12_544, 13_824, 14_080] {
+            inferred = observed_block(inferred, read);
+        }
+        assert_eq!(inferred, block(64));
     }
 
     /// A request that read all of the previous prompt is no miss, with or
@@ -437,7 +570,13 @@ mod tests {
             PrefixChain::of(&tools, &conversation(3)),
         );
         assert_eq!(
-            detect_cache_miss(&previous, &current, SincePrevious::default(), one_hour()),
+            detect_cache_miss(
+                &previous,
+                &current,
+                SincePrevious::default(),
+                one_hour(),
+                None
+            ),
             None
         );
     }
