@@ -120,11 +120,12 @@ impl ChatDb {
         query!(
             tx,
             "INSERT INTO prompt_cache_routes (session_id, provider_id, model, observed_at_ms, \
-             cache_read_tokens, cache_write_tokens, chain) VALUES (?, ?, ?, ?, ?, ?, ?) \
+             cache_read_tokens, cache_write_tokens, prompt_tokens, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (session_id, provider_id, model) DO UPDATE SET \
              observed_at_ms = excluded.observed_at_ms, \
              cache_read_tokens = excluded.cache_read_tokens, \
-             cache_write_tokens = excluded.cache_write_tokens, chain = excluded.chain",
+             cache_write_tokens = excluded.cache_write_tokens, \
+             prompt_tokens = excluded.prompt_tokens, chain = excluded.chain",
             request.session_id,
             request.provider_id,
             request.model,
@@ -134,6 +135,7 @@ impl ChatDb {
                 .cache_write_tokens
                 .map(|tokens| to_i64_from_u64(tokens, "cache_write_tokens"))
                 .transpose()?,
+            to_i64_from_u64(current.prompt_tokens, "prompt_tokens")?,
             chain.as_slice(),
         )
         .execute()
@@ -209,6 +211,7 @@ fn stored_observation(route: &prompt_cache_routes::Model) -> Result<CacheObserva
             .cache_write_tokens
             .map(|value| tokens(value, "cache_write_tokens"))
             .transpose()?,
+        prompt_tokens: tokens(route.prompt_tokens, "prompt_tokens")?,
         chain,
     })
 }

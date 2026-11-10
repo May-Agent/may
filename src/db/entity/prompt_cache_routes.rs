@@ -17,6 +17,8 @@ pub struct Model {
     pub cache_read_tokens: i64,
     /// Tokens the request wrote to the cache, when the provider reports it.
     pub cache_write_tokens: Option<i64>,
+    /// Tokens in the request's prompt.
+    pub prompt_tokens: i64,
     /// The request's prompt-prefix hash chain, `rmp_serde` encoded.
     pub chain: Vec<u8>,
 }
