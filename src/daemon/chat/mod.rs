@@ -1192,6 +1192,9 @@ async fn dispatch_follow_ups(
     // Whether the newest turn ran to completion, so the session is idle
     // once the queue drains.
     let mut last_turn_completed = false;
+    // The end of the newest turn, announced once the session runs on or is
+    // released.
+    let mut unannounced: Option<UnannouncedEnd> = None;
     loop {
         let next = match state
             .runtime_service
@@ -1201,6 +1204,10 @@ async fn dispatch_follow_ups(
             Ok(next) => next,
             Err(error) => {
                 finish_failed_run(guard).await;
+                record_release(&state, None).await;
+                if let Some(end) = unannounced {
+                    end.announce();
+                }
                 return Err(FollowUpError::Next(error));
             }
         };
@@ -1211,14 +1218,27 @@ async fn dispatch_follow_ups(
                     continue;
                 }
                 Ok(None) => {
+                    record_release(&state, None).await;
+                    if let Some(end) = unannounced {
+                        end.announce();
+                    }
                     if last_turn_completed {
                         session_became_idle(&state, &session_id);
                     }
                     return Ok(());
                 }
-                Err(error) => return Err(FollowUpError::Release(error)),
+                Err(error) => {
+                    if let Some(end) = unannounced {
+                        end.announce();
+                    }
+                    return Err(FollowUpError::Release(error));
+                }
             }
         };
+        // The session runs on into the next turn.
+        if let Some(end) = unannounced.take() {
+            end.announce();
+        }
 
         let request = ChatRequest {
             session_id: session_id.clone(),
@@ -1228,18 +1248,23 @@ async fn dispatch_follow_ups(
             delivery_mode: next.delivery_mode,
             pending_entry_id: next.id,
         };
-        match Box::pin(run_chat_collect_with_receiver(
+        let (end, result) = Box::pin(run_chat_collect_with_receiver(
             state.clone(),
             request,
             true,
             true,
             &guard,
         ))
-        .await
-        {
-            Ok(end) => last_turn_completed = end == TurnEnd::Completed,
+        .await;
+        match result {
+            Ok(turn_end) => {
+                last_turn_completed = turn_end == TurnEnd::Completed;
+                unannounced = Some(end);
+            }
             Err(error) => {
                 finish_failed_run(guard).await;
+                record_release(&state, None).await;
+                end.announce();
                 return Err(FollowUpError::Turn(error));
             }
         }
@@ -1685,6 +1710,7 @@ pub(super) async fn start_prompt_turn(
             req,
             run_guard,
             TurnKind::Prompt,
+            None,
         ))
         .await
         {
@@ -2563,17 +2589,17 @@ const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
     )
 }
 
-/// Runs one turn under `guard`, publishing it to the session's clients, and
-/// settles the guard: a continued guard (more queued work) runs next.
 /// Starts a turn for `session_id` whose idle agent collected background
-/// commands that need the model (`wake`). An idle agent waits on background
-/// commands only after the run that parked it released the session, so the
-/// only thing that can hold the session here is a new turn, which takes the
-/// parked agent and sees the results; nothing runs then.
+/// commands that need the model (`events`), the wake `resuming` serves. An
+/// idle agent waits on background commands only after the run that parked
+/// it released the session, so the only thing that can hold the session
+/// here is a new turn, which takes the parked agent and sees the results;
+/// nothing runs then.
 pub(super) async fn start_background_turn(
     state: &Arc<DaemonState>,
     session_id: &str,
-    wake: aither_agent::BackgroundWake,
+    events: Vec<aither_agent::TimedEvent>,
+    resuming: background::ResumePending,
 ) {
     if !state.parked_agents.contains(session_id) {
         return;
@@ -2593,12 +2619,13 @@ pub(super) async fn start_background_turn(
         delivery_mode: crate::session::PendingUserMessageMode::default(),
         pending_entry_id: None,
     };
-    tracing::info!(%session_id, events = wake.events.len(), "background commands resume the session");
+    tracing::info!(%session_id, events = events.len(), "background commands resume the session");
     if let Err(error) = Box::pin(run_published_turn(
         state.clone(),
         req,
         guard,
-        TurnKind::Resume(wake.events),
+        TurnKind::Resume(events),
+        Some(resuming),
     ))
     .await
     {
@@ -2646,15 +2673,22 @@ fn session_became_idle(state: &Arc<DaemonState>, session_id: &str) {
     recap::arm(state, session_id);
 }
 
+/// Runs one turn under `guard`, publishing it to the session's clients, and
+/// settles the guard: a continued guard (more queued work) runs next. A turn
+/// a background wake started settles that wake (`resuming`) when it
+/// releases the session.
 async fn run_published_turn(
     state: Arc<DaemonState>,
     req: ChatRequest,
     guard: SessionRunGuard,
     kind: TurnKind,
+    resuming: Option<background::ResumePending>,
 ) -> Result<(), crate::db::ChatDbError> {
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true, &kind).await;
     let response_session_id = req.session_id.clone();
+    // Every arm releases the session and records the release before
+    // announcing the end of the turn.
     match result {
         Ok(result) => {
             let done_event = done_event_from_run_result(
@@ -2668,6 +2702,7 @@ async fn run_published_turn(
             // as a concurrent run. Finishing continues the session under a
             // new guard only when there is pending work to dispatch.
             let continued = guard.finish(RunOutcome::Completed).await?;
+            record_release(&state, resuming).await;
             sink.finish_with("done", &done_event, crate::client::RunEnd::Completed);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
@@ -2683,6 +2718,7 @@ async fn run_published_turn(
                 *result,
             );
             let continued = guard.finish(RunOutcome::Completed).await?;
+            record_release(&state, resuming).await;
             sink.finish_with("paused", &paused_event, crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
@@ -2691,14 +2727,29 @@ async fn run_published_turn(
         // Errors are already published through on_error in run_agent_loop.
         Err(AgentLoopError::Cancelled(_)) => {
             guard.finish_idle(RunOutcome::Cancelled).await?;
+            record_release(&state, resuming).await;
             sink.finish(crate::client::RunEnd::Cancelled);
         }
         Err(_) => {
             guard.finish_idle(RunOutcome::Failed).await?;
+            record_release(&state, resuming).await;
             sink.finish(crate::client::RunEnd::Failed);
         }
     }
     Ok(())
+}
+
+/// A run just released its session: the background wake it served, if any,
+/// is settled, and the record of the sessions with background work is
+/// brought up to date. Called before the session's clients hear the turn
+/// end, so what a daemon killed after that end leaves persisted says the
+/// session finished — the released run claim and the background record
+/// both.
+async fn record_release(state: &DaemonState, resuming: Option<background::ResumePending>) {
+    if let Some(resuming) = resuming {
+        resuming.settle().await;
+    }
+    state.session_background.record_now().await;
 }
 
 /// How a turn driven by [`run_chat_collect_with_receiver`] ended without
@@ -2714,14 +2765,15 @@ enum TurnEnd {
 /// queue to dispatch server-side enqueued messages. All assistant text and
 /// tool events are still persisted by the main loop; the sink only
 /// suppresses network emission. The caller keeps the run's guard and settles
-/// it once the queue is drained.
+/// it once the queue is drained, and announces the turn's end once it knows
+/// whether the session runs on: see [`UnannouncedEnd`].
 async fn run_chat_collect_with_receiver(
     state: Arc<DaemonState>,
     req: ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     guard: &SessionRunGuard,
-) -> Result<TurnEnd, ChatCollectError> {
+) -> (UnannouncedEnd, Result<TurnEnd, ChatCollectError>) {
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(
         &state,
@@ -2733,29 +2785,41 @@ async fn run_chat_collect_with_receiver(
         &TurnKind::Prompt,
     )
     .await;
-    match result {
-        Ok(_) => {
-            sink.finish(crate::client::RunEnd::Completed);
-            Ok(TurnEnd::Completed)
-        }
+    let (outcome, result) = match result {
+        Ok(_) => (crate::client::RunEnd::Completed, Ok(TurnEnd::Completed)),
         Err(AgentLoopError::BrowserTakeoverPaused(_)) => {
-            sink.finish(crate::client::RunEnd::Paused);
-            Ok(TurnEnd::Paused)
+            (crate::client::RunEnd::Paused, Ok(TurnEnd::Paused))
         }
-        Err(AgentLoopError::Preparation(error)) => {
-            sink.finish(crate::client::RunEnd::Failed);
-            Err(ChatCollectError::Preparation(error))
-        }
-        Err(AgentLoopError::Cancelled(reason)) => {
-            sink.finish(crate::client::RunEnd::Cancelled);
+        Err(AgentLoopError::Preparation(error)) => (
+            crate::client::RunEnd::Failed,
+            Err(ChatCollectError::Preparation(error)),
+        ),
+        Err(AgentLoopError::Cancelled(reason)) => (
+            crate::client::RunEnd::Cancelled,
             Err(ChatCollectError::Sky(internal_error(
                 AgentLoopError::Cancelled(reason),
-            )))
-        }
-        Err(other) => {
-            sink.finish(crate::client::RunEnd::Failed);
-            Err(ChatCollectError::Sky(internal_error(other)))
-        }
+            ))),
+        ),
+        Err(other) => (
+            crate::client::RunEnd::Failed,
+            Err(ChatCollectError::Sky(internal_error(other))),
+        ),
+    };
+    (UnannouncedEnd { sink, outcome }, result)
+}
+
+/// The end of a follow-up turn its clients have yet to hear. It is announced
+/// once the session either runs its next turn or is released and the
+/// release recorded, so no client hears a turn end while the persisted state
+/// still says a run the turn ended holds the session.
+struct UnannouncedEnd {
+    sink: HubSink,
+    outcome: crate::client::RunEnd,
+}
+
+impl UnannouncedEnd {
+    fn announce(mut self) {
+        self.sink.finish(self.outcome);
     }
 }
 
