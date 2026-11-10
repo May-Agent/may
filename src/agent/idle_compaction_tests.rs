@@ -264,6 +264,8 @@ pub struct SessionParts {
     pub rules_import: Option<crate::rules_import::RulesImport>,
     /// Messaging between main agents, when a test hosts several.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// The SSH servers the session is built with.
+    pub ssh_servers: Vec<crate::config::SshServerConfig>,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -297,6 +299,7 @@ impl SessionParts {
             host: ScriptedHost::default(),
             rules_import: None,
             agent_messaging: None,
+            ssh_servers: Vec::new(),
             _queues: (workspace_queue, ask_user_queue),
         }
     }
@@ -458,6 +461,7 @@ impl Session {
             .await
             .expect("the session config resolves");
         agent_config.clock = Some(clock.clone());
+        agent_config.ssh_servers = parts.ssh_servers.clone();
         agent_config.host_reader = Some(parts.host.source());
         Box::pin(MayAgent::new(agent_config))
             .await

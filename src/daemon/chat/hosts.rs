@@ -113,11 +113,14 @@ impl ParkedAgents {
         let session_id = session_id.to_string();
         state.tokio_handle.spawn(async move {
             while let Ok(wake) = wake_rx.recv().await {
-                // The session reads as resuming through the whole turn, so a
-                // client never sees the gap between the command finishing
-                // and the turn it starts.
-                let _resuming = wake_state.session_background.resume_pending(&session_id);
-                super::start_background_turn(&wake_state, &session_id, wake).await;
+                // The session reads as resuming, and the wake's jobs as owed
+                // a turn, through the whole turn, so a client never sees the
+                // gap between the command finishing and the turn it starts;
+                // the turn settles both when it releases the session.
+                let resuming = wake_state
+                    .session_background
+                    .resume_pending(&session_id, wake.pending);
+                super::start_background_turn(&wake_state, &session_id, wake.events, resuming).await;
             }
         });
     }
