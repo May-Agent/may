@@ -1,22 +1,24 @@
-//! May's rules on what a terminal script may run, as aither command
-//! policies.
+//! May's rules on what a terminal script may run, as aither script policies.
 //!
-//! Every script of a registry built with [`register`] is put to them before
-//! it runs: one that kills processes by name or pattern, or is not valid
-//! shell and so cannot be checked for that; a foreground `sleep`; a re-read
-//! of files unchanged since their last read; and, in the managed bash, the
-//! host `grep`, `awk` and `find` and the `sed` forms `aither_sed::supports`
-//! does not accept. Each refusal names what to do instead.
+//! Every script of a shell built with [`policies`] is put to them before it
+//! runs: one that kills processes by name or pattern, or is not valid shell
+//! and so cannot be checked for that; a foreground `sleep`; a re-read of
+//! files unchanged since their last read; and, in the managed bash, the host
+//! `grep`, `awk` and `find` and the `sed` forms `aither_sed::supports` does
+//! not accept. Each refusal names what to do instead. None of them approves
+//! a script that leaves the sandbox: each [passes](ScriptDecision::Pass) one
+//! it has no objection to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use aither_core::llm::tool::CallIdentity;
 use aither_sandbox::{
-    CommandPolicy, PolicyDecision, PolicyRefusal, ScriptCheck, ScriptEnd, ScriptOrigin,
-    ScriptOutcome, ShellCommand, ShellScript, ToolRegistryBuilder,
+    AnyScriptPolicy, ScriptCheck, ScriptDecision, ScriptEnd, ScriptOrigin, ScriptOutcome,
+    ScriptPolicy, ScriptRefusal, ShellCommand, ShellScript,
 };
 use askama::Template;
 
@@ -28,23 +30,53 @@ pub const fn runs_managed_bash(in_container: bool) -> bool {
     in_container || cfg!(not(windows))
 }
 
-/// Puts every script `builder`'s terminals run to May's policies;
-/// `managed_bash` is [`runs_managed_bash`] of the session.
-pub fn register(builder: &mut ToolRegistryBuilder, managed_bash: bool) {
-    builder.command_policy(KillByName);
-    builder.command_policy(ForegroundSleep);
-    builder.command_policy(UnchangedFileReads);
-    builder.command_policy(PythonWithUv);
-    if managed_bash {
-        builder.command_policy(ManagedShellCommands);
+/// The calls the unchanged-read policy refused, for the agent's turn
+/// boundary to tell a turn made only of repeated reads from one that
+/// learned something. Every clone shares the record.
+#[derive(Debug, Clone, Default)]
+pub struct RefusedReads(Arc<Mutex<HashSet<CallIdentity>>>);
+
+impl RefusedReads {
+    fn record(&self, call: CallIdentity) {
+        self.0
+            .lock()
+            .expect("the refused read record is never held across a panic")
+            .insert(call);
+    }
+
+    /// Whether `call` was refused as an unchanged re-read; each call is
+    /// answered once.
+    #[must_use]
+    pub fn take(&self, call: &CallIdentity) -> bool {
+        self.0
+            .lock()
+            .expect("the refused read record is never held across a panic")
+            .remove(call)
     }
 }
 
-fn refuse(template: &impl Template) -> PolicyDecision {
-    PolicyDecision::Refuse(PolicyRefusal::new(
+/// May's policies for the shell of one agent; `managed_bash` is
+/// [`runs_managed_bash`] of the session, and `refused` the record the
+/// agent's turn boundary reads.
+#[must_use]
+pub fn policies(managed_bash: bool, refused: RefusedReads) -> Vec<AnyScriptPolicy> {
+    let mut policies = vec![
+        AnyScriptPolicy::new(KillByName),
+        AnyScriptPolicy::new(ForegroundSleep),
+        AnyScriptPolicy::new(UnchangedFileReads { refused }),
+        AnyScriptPolicy::new(PythonWithUv),
+    ];
+    if managed_bash {
+        policies.push(AnyScriptPolicy::new(ManagedShellCommands));
+    }
+    policies
+}
+
+fn refuse(template: &impl Template) -> ScriptDecision {
+    ScriptDecision::Refuse(ScriptRefusal::new(
         template
             .render()
-            .expect("a command policy template renders typed input"),
+            .expect("a script policy template renders typed input"),
     ))
 }
 
@@ -127,20 +159,20 @@ fn kill_by_name(script: &ShellScript) -> Option<String> {
     None
 }
 
-impl CommandPolicy for KillByName {
+impl ScriptPolicy for KillByName {
     type State = ();
 
     fn check(
         &self,
         script: &ScriptCheck<'_>,
         (): &(),
-    ) -> impl Future<Output = PolicyDecision> + Send {
+    ) -> impl Future<Output = ScriptDecision> + Send {
         let decision = match script.shell {
-            None => PolicyDecision::Allow,
+            None => ScriptDecision::Pass,
             Some(Err(error)) => refuse(&UnparsableRefused {
                 reason: error.reason(),
             }),
-            Some(Ok(shell)) => kill_by_name(shell).map_or(PolicyDecision::Allow, |program| {
+            Some(Ok(shell)) => kill_by_name(shell).map_or(ScriptDecision::Pass, |program| {
                 refuse(&KillByNameRefused { program: &program })
             }),
         };
@@ -159,14 +191,14 @@ struct SleepRefused;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ForegroundSleep;
 
-impl CommandPolicy for ForegroundSleep {
+impl ScriptPolicy for ForegroundSleep {
     type State = ();
 
     fn check(
         &self,
         script: &ScriptCheck<'_>,
         (): &(),
-    ) -> impl Future<Output = PolicyDecision> + Send {
+    ) -> impl Future<Output = ScriptDecision> + Send {
         let sleeps = script.origin == ScriptOrigin::Foreground
             && parsed(script).is_some_and(|shell| {
                 shell
@@ -177,7 +209,7 @@ impl CommandPolicy for ForegroundSleep {
         std::future::ready(if sleeps {
             refuse(&SleepRefused)
         } else {
-            PolicyDecision::Allow
+            ScriptDecision::Pass
         })
     }
 }
@@ -252,11 +284,13 @@ struct UnchangedFileReadRefused<'a> {
 /// Refuses a `terminal` script whose every file read is of a file unchanged
 /// since its last successful read: re-reading it spends a turn for nothing,
 /// and only a background event can say something new.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnchangedFileReads;
+#[derive(Debug, Clone)]
+pub struct UnchangedFileReads {
+    refused: RefusedReads,
+}
 
 /// The stamp of every existing file `reads` names, relative paths resolved
-/// against `working_dir`.
+/// against `working_dir`, the directory the script starts in.
 async fn fingerprints(working_dir: &Path, reads: &[&str]) -> Vec<(PathBuf, Fingerprint)> {
     let stamps = futures_util::future::join_all(reads.iter().map(|read| async move {
         let path = working_dir.join(read);
@@ -269,23 +303,27 @@ async fn fingerprints(working_dir: &Path, reads: &[&str]) -> Vec<(PathBuf, Finge
     stamps.into_iter().flatten().collect()
 }
 
-impl CommandPolicy for UnchangedFileReads {
+impl ScriptPolicy for UnchangedFileReads {
     type State = FileReads;
 
-    async fn check(&self, script: &ScriptCheck<'_>, state: &FileReads) -> PolicyDecision {
+    async fn check(&self, script: &ScriptCheck<'_>, state: &FileReads) -> ScriptDecision {
         if script.origin == ScriptOrigin::Run {
-            return PolicyDecision::Allow;
+            return ScriptDecision::Pass;
         }
         let Some(shell) = parsed(script) else {
-            return PolicyDecision::Allow;
+            return ScriptDecision::Pass;
+        };
+        // A script on a server reads files this host cannot stamp.
+        let Some(start) = script.start.host() else {
+            return ScriptDecision::Pass;
         };
         let reads = file_reads(shell);
         if reads.is_empty() {
-            return PolicyDecision::Allow;
+            return ScriptDecision::Pass;
         }
-        let stamps = fingerprints(script.working_dir, &reads).await;
+        let stamps = fingerprints(start, &reads).await;
         if stamps.is_empty() {
-            return PolicyDecision::Allow;
+            return ScriptDecision::Pass;
         }
         let unchanged = {
             let inner = state.inner();
@@ -295,17 +333,16 @@ impl CommandPolicy for UnchangedFileReads {
         };
         if unchanged {
             let paths: Vec<&Path> = stamps.iter().map(|(path, _)| path.as_path()).collect();
-            return PolicyDecision::Refuse(PolicyRefusal::unchanged_read(
-                UnchangedFileReadRefused { paths: &paths }
-                    .render()
-                    .expect("the unchanged file read template renders typed input"),
-            ));
+            if let Some(call) = script.call {
+                self.refused.record(call.clone());
+            }
+            return refuse(&UnchangedFileReadRefused { paths: &paths });
         }
         state
             .inner()
             .pending
             .insert(script.task_id.to_string(), stamps);
-        PolicyDecision::Allow
+        ScriptDecision::Pass
     }
 
     fn ended(&self, end: &ScriptEnd<'_>, state: &FileReads) -> impl Future<Output = ()> + Send {
@@ -389,17 +426,17 @@ fn python_setup(command: &ShellCommand) -> Option<(String, &'static str)> {
     }
 }
 
-impl CommandPolicy for PythonWithUv {
+impl ScriptPolicy for PythonWithUv {
     type State = ();
 
     fn check(
         &self,
         script: &ScriptCheck<'_>,
         (): &(),
-    ) -> impl Future<Output = PolicyDecision> + Send {
+    ) -> impl Future<Output = ScriptDecision> + Send {
         let decision = parsed(script)
             .and_then(|shell| shell.commands().iter().find_map(python_setup))
-            .map_or(PolicyDecision::Allow, |(command, replacement)| {
+            .map_or(ScriptDecision::Pass, |(command, replacement)| {
                 refuse(&PythonSetupRefused {
                     command: &command,
                     replacement,
@@ -459,7 +496,7 @@ fn run_by_own_shell(script: &ShellScript, command: &ShellCommand) -> bool {
 
 /// The refusal of the first command `script`'s own shell runs that the
 /// managed bash does not provide.
-fn host_command(script: &ShellScript) -> Option<PolicyDecision> {
+fn host_command(script: &ShellScript) -> Option<ScriptDecision> {
     script.commands().iter().find_map(|command| {
         let name = command.argv().first()?.as_str();
         if !run_by_own_shell(script, command) {
@@ -480,18 +517,18 @@ fn host_command(script: &ShellScript) -> Option<PolicyDecision> {
     })
 }
 
-impl CommandPolicy for ManagedShellCommands {
+impl ScriptPolicy for ManagedShellCommands {
     type State = ();
 
     fn check(
         &self,
         script: &ScriptCheck<'_>,
         (): &(),
-    ) -> impl Future<Output = PolicyDecision> + Send {
+    ) -> impl Future<Output = ScriptDecision> + Send {
         std::future::ready(
             parsed(script)
                 .and_then(host_command)
-                .unwrap_or(PolicyDecision::Allow),
+                .unwrap_or(ScriptDecision::Pass),
         )
     }
 }

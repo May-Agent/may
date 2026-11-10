@@ -1,4 +1,4 @@
-use aither_sandbox::{CommandRole, ScriptLanguage, ShellParseError};
+use aither_sandbox::{Carry, Interpreter, SandboxMode, ScriptDir, ShellParseError};
 
 use super::*;
 
@@ -7,41 +7,53 @@ fn check_with<'a>(
     script: &'a str,
     shell: Option<Result<&'a ShellScript, &'a ShellParseError>>,
     origin: ScriptOrigin,
-    working_dir: &'a Path,
+    start: &'a ScriptDir,
 ) -> ScriptCheck<'a> {
     ScriptCheck {
         task_id,
         script,
-        language: ScriptLanguage::Shell,
+        interpreter: Interpreter::Shell,
         shell,
         origin,
-        role: CommandRole::Main,
-        working_dir,
+        sandbox: SandboxMode::Sandboxed,
+        location: None,
+        start,
         call: None,
     }
 }
 
-async fn decide<P: CommandPolicy>(
+fn unchanged_reads() -> UnchangedFileReads {
+    UnchangedFileReads {
+        refused: RefusedReads::default(),
+    }
+}
+
+async fn decide<P: ScriptPolicy>(
     policy: &P,
     state: &P::State,
     script: &str,
     origin: ScriptOrigin,
-) -> PolicyDecision {
+) -> ScriptDecision {
     let shell = ShellScript::parse(script);
-    let check = check_with(
-        "task-a",
-        script,
-        Some(shell.as_ref()),
-        origin,
-        Path::new("/"),
-    );
+    let start = ScriptDir::Host(PathBuf::from("/"));
+    let check = check_with("task-a", script, Some(shell.as_ref()), origin, &start);
     policy.check(&check, state).await
 }
 
-fn refusal(decision: &PolicyDecision) -> Option<&str> {
+fn refusal(decision: &ScriptDecision) -> Option<&str> {
     match decision {
-        PolicyDecision::Allow => None,
-        PolicyDecision::Refuse(refusal) => Some(refusal.text()),
+        ScriptDecision::Pass => None,
+        ScriptDecision::Refuse(refusal) => Some(refusal.text()),
+        other => panic!("a May policy decides only Pass or Refuse, not {other:?}"),
+    }
+}
+
+fn ended<'a>(task_id: &'a str, code: i32, end: &'a ScriptDir) -> ScriptEnd<'a> {
+    ScriptEnd {
+        task_id,
+        outcome: ScriptOutcome::Exited { code },
+        end,
+        carry: Carry::Unchanged,
     }
 }
 
@@ -70,7 +82,7 @@ async fn kills_by_name_are_refused_and_kills_by_pid_run() {
         "pgrep foo | wc -l",
     ] {
         let decision = decide(&KillByName, &(), script, ScriptOrigin::Run).await;
-        assert_eq!(decision, PolicyDecision::Allow, "`{script}` runs");
+        assert_eq!(decision, ScriptDecision::Pass, "`{script}` runs");
     }
 }
 
@@ -87,15 +99,16 @@ async fn a_shell_script_that_does_not_parse_is_refused_and_python_is_not_checked
         refusal(&decision).is_some_and(|text| text.contains("is not valid shell")),
         "{decision:?}"
     );
+    let start = ScriptDir::Host(PathBuf::from("/"));
     let mut python = check_with(
         "task-a",
         "import os",
         None,
         ScriptOrigin::Foreground,
-        Path::new("/"),
+        &start,
     );
-    python.language = ScriptLanguage::Python;
-    assert_eq!(KillByName.check(&python, &()).await, PolicyDecision::Allow);
+    python.interpreter = Interpreter::Python;
+    assert_eq!(KillByName.check(&python, &()).await, ScriptDecision::Pass);
 }
 
 #[tokio::test]
@@ -122,7 +135,7 @@ async fn only_a_foreground_sleep_is_refused() {
     ] {
         assert_eq!(
             decide(&ForegroundSleep, &(), script, origin).await,
-            PolicyDecision::Allow,
+            ScriptDecision::Pass,
             "`{script}` runs"
         );
     }
@@ -134,50 +147,45 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
     let log = dir.path().join("log.txt");
     std::fs::write(&log, "v1").expect("write");
     let state = FileReads::default();
+    let policy = unchanged_reads();
     let shell = ShellScript::parse("tail -50 log.txt").expect("parses");
+    let start = ScriptDir::Host(dir.path().to_path_buf());
+    let call = CallIdentity::new(
+        aither_core::llm::tool::ToolCallId::new("call-c"),
+        aither_core::llm::tool::AgentIdentity::new("main", None),
+    );
     let check = |task_id| {
         check_with(
             task_id,
             "tail -50 log.txt",
             Some(Ok(&shell)),
             ScriptOrigin::Foreground,
-            dir.path(),
+            &start,
         )
     };
 
     assert_eq!(
-        UnchangedFileReads.check(&check("task-a"), &state).await,
-        PolicyDecision::Allow
+        policy.check(&check("task-a"), &state).await,
+        ScriptDecision::Pass
     );
-    UnchangedFileReads
-        .ended(
-            &ScriptEnd {
-                task_id: "task-a",
-                outcome: ScriptOutcome::Exited { code: 1 },
-            },
-            &state,
-        )
-        .await;
+    policy.ended(&ended("task-a", 1, &start), &state).await;
     assert_eq!(
-        UnchangedFileReads.check(&check("task-b"), &state).await,
-        PolicyDecision::Allow,
+        policy.check(&check("task-b"), &state).await,
+        ScriptDecision::Pass,
         "a failed read records nothing"
     );
-    UnchangedFileReads
-        .ended(
-            &ScriptEnd {
-                task_id: "task-b",
-                outcome: ScriptOutcome::Exited { code: 0 },
-            },
-            &state,
-        )
-        .await;
+    policy.ended(&ended("task-b", 0, &start), &state).await;
 
-    let PolicyDecision::Refuse(refused) = UnchangedFileReads.check(&check("task-c"), &state).await
-    else {
+    let mut repeated = check("task-c");
+    repeated.call = Some(&call);
+    let ScriptDecision::Refuse(refused) = policy.check(&repeated, &state).await else {
         panic!("the unchanged re-read is refused");
     };
-    assert!(refused.is_unchanged_read());
+    assert!(
+        policy.refused.take(&call),
+        "the refused call is recorded for the turn boundary"
+    );
+    assert!(!policy.refused.take(&call), "and answered once");
     assert!(
         refused.text().contains(&format!(
             "`{}`, unchanged since the last read",
@@ -189,8 +197,8 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
 
     std::fs::write(&log, "v1 and more").expect("rewrite");
     assert_eq!(
-        UnchangedFileReads.check(&check("task-d"), &state).await,
-        PolicyDecision::Allow,
+        policy.check(&check("task-d"), &state).await,
+        ScriptDecision::Pass,
         "a changed file reads again"
     );
 }
@@ -200,6 +208,7 @@ async fn a_follow_or_a_missing_file_is_no_reread() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("log.txt"), "v1").expect("write");
     let state = FileReads::default();
+    let start = ScriptDir::Host(dir.path().to_path_buf());
     for script in ["tail -f log.txt", "cat missing.txt"] {
         let shell = ShellScript::parse(script).expect("parses");
         let check = check_with(
@@ -207,11 +216,11 @@ async fn a_follow_or_a_missing_file_is_no_reread() {
             script,
             Some(Ok(&shell)),
             ScriptOrigin::Foreground,
-            dir.path(),
+            &start,
         );
         assert_eq!(
-            UnchangedFileReads.check(&check, &state).await,
-            PolicyDecision::Allow
+            unchanged_reads().check(&check, &state).await,
+            ScriptDecision::Pass
         );
         assert!(
             state.inner().pending.is_empty(),
@@ -248,7 +257,7 @@ async fn the_scripts_own_shell_runs_no_host_grep_awk_or_find() {
     ] {
         assert_eq!(
             decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await,
-            PolicyDecision::Allow,
+            ScriptDecision::Pass,
             "`{script}` runs the host's program"
         );
     }
@@ -263,7 +272,7 @@ async fn sed_runs_only_in_the_forms_the_managed_sed_prints() {
     ] {
         assert_eq!(
             decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await,
-            PolicyDecision::Allow,
+            ScriptDecision::Pass,
             "`{script}` prints a line range"
         );
     }
@@ -362,7 +371,7 @@ async fn uv_and_read_only_pip_forms_run() {
     ] {
         assert_eq!(
             decide(&PythonWithUv, &(), script, ScriptOrigin::Foreground).await,
-            PolicyDecision::Allow,
+            ScriptDecision::Pass,
             "`{script}` runs"
         );
     }
