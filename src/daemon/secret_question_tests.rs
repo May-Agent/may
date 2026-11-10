@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use aither_core::llm::{Tool, ToolContext};
-use aither_sandbox::TerminalEnvSource as _;
 use tempfile::TempDir;
 
 use super::state::{

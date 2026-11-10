@@ -701,6 +701,7 @@ mod tests {
     use futures_lite::Stream;
 
     use super::*;
+    use crate::test_support::{TestCommands, main_launch, subagent_launch};
 
     /// The subagent assembly of a session whose shell has default budgets.
     fn test_subagents() -> SubagentAssembly {
@@ -790,7 +791,7 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let artifacts_dir = session_dir.join("artifacts");
         let ask_user_runtime = test_runtime(temp.path()).await;
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
@@ -822,7 +823,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -830,6 +831,11 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
@@ -837,16 +843,17 @@ mod tests {
         let usages = descriptions.usages;
         let descriptions = descriptions.descriptions;
 
-        let registry = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        assert!(registry.is_tool_configured("ask_user"));
-        assert!(registry.is_tool_configured("imagine"));
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = built.registry();
+        let launch = main_launch();
+        assert!(registry.is_configured(&launch, "ask_user"));
+        assert!(registry.is_configured(&launch, "imagine"));
         let names: Vec<_> = usages.iter().map(|usage| usage.name.as_str()).collect();
         assert_eq!(names, ["ask_user", "subagent", "tasks"]);
         // `subagent` is bound to a terminal, which this registry lacks; its
         // usage comes from its tool's arguments the same way.
         assert_eq!(
-            registry.tool_help("ask_user").as_deref(),
+            registry.help(&launch, "ask_user").as_deref(),
             Some(usages[0].usage.as_str()),
             "the prompt's usage of `ask_user` is what its --help prints"
         );
@@ -870,7 +877,7 @@ mod tests {
     async fn chat_specific_tools_are_absent_without_live_chat_brokers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
@@ -899,7 +906,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -907,16 +914,21 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        assert!(!registry.is_tool_configured("ask_user"));
-        assert!(!registry.is_tool_configured("imagine"));
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = built.registry();
+        assert!(!registry.is_configured(&main_launch(), "ask_user"));
+        assert!(!registry.is_configured(&main_launch(), "imagine"));
         assert!(
             !descriptions
                 .iter()
@@ -933,7 +945,7 @@ mod tests {
     async fn websearch_is_never_registered_as_an_ipc_command() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
@@ -962,7 +974,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -970,24 +982,29 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        assert!(!registry.is_tool_configured("websearch"));
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = built.registry();
+        assert!(!registry.is_configured(&main_launch(), "websearch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
-        assert!(registry.is_tool_configured("webfetch"));
+        assert!(registry.is_configured(&main_launch(), "webfetch"));
     }
 
     #[tokio::test]
     async fn webfetch_is_suppressed_when_hosted_fetch_is_enabled() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
 
         let mut request_parameters = Parameters::default();
         request_parameters.native_tools.claude.web_fetch = true;
@@ -1019,7 +1036,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1027,15 +1044,19 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        assert!(!registry.is_tool_configured("webfetch"));
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        assert!(!built.registry().is_configured(&main_launch(), "webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "webfetch"));
     }
 
@@ -1044,7 +1065,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
         let ask_user_runtime = test_runtime(temp.path()).await;
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
         register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
@@ -1072,7 +1093,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1080,33 +1101,31 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register");
-        let main = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        let subagent = main.for_subagent(None, None);
+        let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = commands.registry();
+        let (main, subagent) = (main_launch(), subagent_launch());
 
         // A subagent's terminal has no `subagent` command.
-        assert!(main.is_tool_configured("subagent"));
-        assert!(!subagent.is_tool_configured("subagent"));
+        assert!(registry.is_configured(&main, "subagent"));
+        assert!(!registry.is_configured(&subagent, "subagent"));
 
         // The main agent creates an issue; the subagent can read it.
-        let created = main
-            .query_tool_handler(
-                "issue",
-                &["create".to_string(), "bug".to_string(), "seed".to_string()],
-            )
+        let created = commands
+            .call(&main, "issue", &["create", "bug", "seed"])
             .await;
         assert!(created.ok, "{created:?}");
-        let viewed = subagent
-            .query_tool_handler("issue", &["view".to_string(), "1".to_string()])
-            .await;
+        let viewed = commands.call(&subagent, "issue", &["view", "1"]).await;
         assert!(viewed.ok, "{viewed:?}");
-        let listed = subagent
-            .query_tool_handler("issue", &["list".to_string()])
-            .await;
+        let listed = commands.call(&subagent, "issue", &["list"]).await;
         assert!(listed.ok, "{listed:?}");
 
         // Every write subcommand is refused from the subagent registry.
@@ -1119,8 +1138,7 @@ mod tests {
             vec!["blocked-by", "1", "--add", "2"],
             vec!["sub-issue", "1", "--add", "2"],
         ] {
-            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
-            let refused = subagent.query_tool_handler("issue", &args).await;
+            let refused = commands.call(&subagent, "issue", &args).await;
             assert!(!refused.ok, "{args:?}: {refused:?}");
             assert!(
                 refused
@@ -1130,19 +1148,16 @@ mod tests {
                 "{args:?}: {refused:?}"
             );
         }
-        let issues = main
-            .query_tool_handler(
-                "issue",
-                &["list".to_string(), "--state".to_string(), "all".to_string()],
-            )
+        let issues = commands
+            .call(&main, "issue", &["list", "--state", "all"])
             .await;
         assert!(issues.ok, "{issues:?}");
 
         // `ask_user` is refused to the subagent and stays available to the main agent.
-        assert!(!main.is_reserved("ask_user"));
-        assert!(subagent.is_reserved("ask_user"));
-        let refused = subagent
-            .query_tool_handler("ask_user", &["--question".to_string(), "q".to_string()])
+        assert!(!registry.is_reserved(&main, "ask_user"));
+        assert!(registry.is_reserved(&subagent, "ask_user"));
+        let refused = commands
+            .call(&subagent, "ask_user", &["--question", "q"])
             .await;
         assert!(!refused.ok, "{refused:?}");
         assert!(
@@ -1164,18 +1179,19 @@ mod tests {
     }
 
     async fn agent_list(
-        registry: &aither_sandbox::ToolRegistry,
-    ) -> aither_sandbox::CommandEnvelope {
-        registry
-            .query_tool_handler("agent", &["list".to_string()])
-            .await
+        commands: &TestCommands,
+        launch: &aither_sandbox::LaunchInfo,
+    ) -> crate::ipc::CommandEnvelope {
+        commands.call(launch, "agent", &["list"]).await
     }
 
     async fn agent_send(
-        registry: &aither_sandbox::ToolRegistry,
-    ) -> aither_sandbox::CommandEnvelope {
-        let args = ["send", "peer-agent", "note.txt"].map(str::to_string);
-        registry.query_tool_handler("agent", &args).await
+        commands: &TestCommands,
+        launch: &aither_sandbox::LaunchInfo,
+    ) -> crate::ipc::CommandEnvelope {
+        commands
+            .call(launch, "agent", &["send", "peer-agent", "note.txt"])
+            .await
     }
 
     #[tokio::test]
@@ -1219,7 +1235,7 @@ mod tests {
             forks: crate::agent_link::ForkHosts::default(),
         };
 
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
         register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
@@ -1247,7 +1263,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
@@ -1255,19 +1271,27 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register");
-        let main = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        let subagent = main.for_subagent(None, None);
+        let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = commands.registry();
+        let (main, subagent) = (main_launch(), subagent_launch());
 
-        assert!(!main.is_reserved("agent"));
-        assert!(subagent.is_reserved("agent"));
-        assert!(!main.is_reserved("btw"));
-        assert!(subagent.is_reserved("btw"));
-        for refused in [agent_list(&subagent).await, agent_send(&subagent).await] {
+        assert!(!registry.is_reserved(&main, "agent"));
+        assert!(registry.is_reserved(&subagent, "agent"));
+        assert!(!registry.is_reserved(&main, "btw"));
+        assert!(registry.is_reserved(&subagent, "btw"));
+        for refused in [
+            agent_list(&commands, &subagent).await,
+            agent_send(&commands, &subagent).await,
+        ] {
             assert!(!refused.ok, "{refused:?}");
             assert!(
                 refused
@@ -1282,15 +1306,15 @@ mod tests {
             "a refused send must not reach the recipient"
         );
 
-        let listed = agent_list(&main).await;
+        let listed = agent_list(&commands, &main).await;
         assert!(listed.ok, "{listed:?}");
-        let Some(aither_sandbox::CommandPayload::Text { content: text }) = listed.payload else {
+        let Some(crate::ipc::CommandPayload::Text { content: text }) = listed.payload else {
             panic!("agent list returns text: {listed:?}");
         };
         assert!(text.contains("main-agent (you)"), "{text}");
         assert!(text.contains("peer-agent"), "{text}");
 
-        let sent = agent_send(&main).await;
+        let sent = agent_send(&commands, &main).await;
         assert!(sent.ok, "{sent:?}");
         tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv())
             .await
@@ -1303,7 +1327,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
         let (task_broker, _queue) = crate::agent::task_tool::channel();
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
 
         register_shared_terminal_commands(
             &mut builder,
@@ -1332,7 +1356,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1340,24 +1364,29 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register");
-        let main = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        let subagent = main.for_subagent(None, None);
+        let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = commands.registry();
+        let (main, subagent) = (main_launch(), subagent_launch());
 
-        assert!(main.is_tool_configured("task"));
-        assert!(!main.is_reserved("task"));
-        assert!(subagent.is_reserved("task"));
+        assert!(registry.is_configured(&main, "task"));
+        assert!(!registry.is_reserved(&main, "task"));
+        assert!(registry.is_reserved(&subagent, "task"));
     }
 
     #[tokio::test]
     async fn web_commands_are_registered_without_hosted_tools() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
@@ -1386,7 +1415,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1394,16 +1423,21 @@ mod tests {
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        assert!(!registry.is_tool_configured("websearch"));
-        assert!(registry.is_tool_configured("webfetch"));
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = built.registry();
+        assert!(!registry.is_configured(&main_launch(), "websearch"));
+        assert!(registry.is_configured(&main_launch(), "webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(descriptions.iter().any(|(name, _)| name == "webfetch"));
     }
@@ -1415,8 +1449,8 @@ mod tests {
         session_dir: &std::path::Path,
         runtime: TaskRuntimeKind,
         git: crate::host_git::HostGit,
-    ) -> Result<(ToolRegistryBuilder, SharedTerminalCommands), TerminalCommandsError> {
-        let mut builder = ToolRegistryBuilder::new();
+    ) -> Result<(CommandRegistryBuilder, SharedTerminalCommands), TerminalCommandsError> {
+        let mut builder = CommandRegistryBuilder::new();
         let commands = register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
@@ -1444,7 +1478,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp).await,
-                task_events: aither_agent::WorkEvents::new(),
+                task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1452,6 +1486,11 @@ mod tests {
                 acp: None,
                 git,
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
             },
         )
         .await?;
@@ -1475,9 +1514,12 @@ mod tests {
         .await
         .expect("commands should register");
 
-        let registry = builder
-            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
-        assert!(registry.is_tool_configured(crate::commit_signing::SIGN_COMMAND));
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        assert!(
+            built
+                .registry()
+                .is_configured(&main_launch(), crate::commit_signing::SIGN_COMMAND)
+        );
         assert!(
             !commands
                 .descriptions
@@ -1505,9 +1547,10 @@ mod tests {
         .expect("commands should register");
 
         assert!(
-            builder
-                .build(crate::test_support::test_output_store(session_dir.join("outputs")).await)
-                .is_tool_configured(crate::commit_signing::SIGN_COMMAND)
+            TestCommands::build(builder, session_dir.join("outputs"))
+                .await
+                .registry()
+                .is_configured(&main_launch(), crate::commit_signing::SIGN_COMMAND)
         );
         let program = std::process::Command::new("git")
             .args(["config", "--file"])

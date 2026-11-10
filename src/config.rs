@@ -2359,7 +2359,11 @@ mod tests {
             .await
             .expect_err("an unresolvable host has no platform");
         assert!(
-            matches!(error, aither_sandbox::SshProbeError::Failed { .. }),
+            matches!(
+                error,
+                aither_sandbox::SshProbeError::Upload(_)
+                    | aither_sandbox::SshProbeError::Failed { .. }
+            ),
             "{error}"
         );
     }

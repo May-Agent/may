@@ -1064,6 +1064,9 @@ pub(crate) mod test_sandbox {
             commands: CommandRegistryBuilder,
             env_source: Option<CommandEnv>,
         ) -> Self {
+            // A shell spawns its job registry on the global executor, which
+            // the `may` binary installs at startup.
+            let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
             let cache = crate::tools::test_tool_cache();
@@ -1089,7 +1092,9 @@ pub(crate) mod test_sandbox {
                 permissions: SandboxedOnly,
                 env_source,
                 budgets: crate::shell::ShellBudgets::of(&settings),
-                interpreters: vec![Interpreter::Shell],
+                // As a session's shell, whose tool definition a fork must
+                // present unchanged.
+                interpreters: vec![Interpreter::Shell, Interpreter::Python],
                 policies: crate::command_policy::PolicySet {
                     managed_bash: crate::command_policy::runs_managed_bash(false),
                     refused: crate::command_policy::RefusedReads::default(),
@@ -1116,9 +1121,32 @@ pub(crate) mod test_sandbox {
             &self.shell
         }
 
+        /// Starts a background job that sleeps for a minute, and returns it
+        /// with its pid.
+        pub async fn sleeping_job(&self) -> (aither_sandbox::Job, u32) {
+            let job = self
+                .shell
+                .run_background(aither_sandbox::ShellArgs {
+                    description: "sleeps".to_string(),
+                    script: "sleep 60".to_string(),
+                    interpreter: aither_sandbox::Interpreter::default(),
+                    sandbox: aither_sandbox::SandboxMode::Sandboxed,
+                    location: None,
+                    resolution: aither_sandbox::MediaResolution::default(),
+                    max_lines: None,
+                    raw: false,
+                    timeout: 120,
+                    background: true,
+                })
+                .await
+                .expect("the job starts");
+            let pid = job.info().await.pid;
+            (job, pid)
+        }
+
         /// The terminal's sandbox, as a shell-bound command gets it.
         pub fn sandbox(&self) -> CloneSandbox {
-            CloneSandbox::new(self.shell.clone(), self.timeout)
+            CloneSandbox::new(SessionShell::clone(&self.shell), self.timeout)
         }
     }
 

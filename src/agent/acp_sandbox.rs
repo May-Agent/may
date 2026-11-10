@@ -595,7 +595,9 @@ pub(crate) async fn test_sandbox(root: &Path) -> aither_sandbox::Sandbox {
     grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
     grants.add_writable(root);
     std::fs::create_dir_all(root).expect("session dir");
-    let tmp = root.join("tmp");
+    let tmp = std::fs::canonicalize(root)
+        .expect("session dir resolves")
+        .join("tmp");
     let path = std::env::var("PATH").expect("PATH is set and UTF-8");
     aither_sandbox::Sandbox::new(Backend::Host { heel }, DefaultExecutor, root)
         .with_grants(grants)

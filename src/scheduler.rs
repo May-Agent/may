@@ -2077,7 +2077,8 @@ mod tests {
             .expect("task runtime should load");
 
         let error = runtime
-            .local_terminal_tool(
+            .local_shell(
+                &crate::config::MayConfig::default(),
                 "profile",
                 NetworkAccessSource::TaskValidationLocal,
                 &TaskScript {
@@ -2148,7 +2149,11 @@ mod tests {
             &terminal,
             &workspace,
             format!("sleep {runtime_secs}; echo finished"),
-            TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
+            TaskTimeout::new(
+                runtime_secs + 60,
+                crate::config::ShellSettings::default().timeout_cap,
+            )
+            .expect("timeout is within the cap"),
         )
         .await
         .expect("a task longer than the foreground wait should complete");
@@ -2165,7 +2170,8 @@ mod tests {
             &terminal,
             &workspace,
             "sleep 60; echo finished".to_string(),
-            TaskTimeout::new(2).expect("timeout is within the cap"),
+            TaskTimeout::new(2, crate::config::ShellSettings::default().timeout_cap)
+                .expect("timeout is within the cap"),
         )
         .await
         .expect_err("a task past its timeout must fail");
@@ -2232,17 +2238,13 @@ mod tests {
 
     #[test]
     fn task_timeout_is_bounded_by_the_background_cap() {
-        assert!(TaskTimeout::new(0).is_err());
-        assert!(TaskTimeout::new(1).is_ok());
-        let cap = u32::try_from(
-            crate::config::ShellSettings::default()
-                .timeout_cap
-                .as_secs(),
-        )
-        .expect("the background cap fits in u32 seconds");
-        assert!(TaskTimeout::new(cap).is_ok());
-        assert!(TaskTimeout::new(cap + 1).is_err());
-        assert!(TaskTimeout::from_stored(-1).is_err());
+        let limit = crate::config::ShellSettings::default().timeout_cap;
+        assert!(TaskTimeout::new(0, limit).is_err());
+        assert!(TaskTimeout::new(1, limit).is_ok());
+        let cap = u32::try_from(limit.as_secs()).expect("the background cap fits in u32 seconds");
+        assert!(TaskTimeout::new(cap, limit).is_ok());
+        assert!(TaskTimeout::new(cap + 1, limit).is_err());
+        assert!(TaskTimeout::from_stored(-1, limit).is_err());
     }
 
     /// A daemon's `history.db` with a task runtime whose runs can `wake`.

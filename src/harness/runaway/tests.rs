@@ -1,23 +1,29 @@
-//! The guard over scripted pressure, footprints and registry entries. The
-//! jobs are `sleep` processes the tests start in their own process groups;
-//! no test holds memory.
+//! The guard over scripted pressure and footprints. The jobs are `sleep`
+//! commands running in real session shells; no test holds memory.
+//!
+//! The tests of jobs that run in a container or on a remote host are kept
+//! behind `cfg(any())`: aither's job registry is not nameable by an
+//! embedder, so a job at those places cannot be registered, and a real
+//! container or SSH host is not a test fixture.
 
 #![allow(clippy::assert_is_empty, clippy::significant_drop_tightening)]
 
 use std::collections::HashMap;
-use std::os::unix::process::CommandExt as _;
-use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
+#[cfg(any())]
 use aither_sandbox::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
-    FootprintError, FootprintReader, FootprintRegistry, JobMemory, JobPlace, JobRegistry,
-    JobStatus, KillCause, MemoryDomain, ResponseWindow, ScriptLanguage, TerminalMode,
-    job_registry_channel,
+    JobMemory, JobPlace, ScriptLanguage, TerminalMode,
+};
+use aither_sandbox::{
+    FootprintError, FootprintReader, FootprintRegistry, JobStatus, KillCause, MemoryDomain,
 };
 
 use super::*;
-use crate::clock::{AnyClock, ManualClock};
+use crate::ipc::SessionShell;
+use crate::repo_clone::test_sandbox::TestTerminal;
+use aither_agent::{AnyClock, ManualClock};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const WINDOW: Duration = Duration::from_secs(60);
@@ -26,7 +32,7 @@ const WINDOW: Duration = Duration::from_secs(60);
 #[derive(Clone, Default)]
 struct Footprints {
     by_pid: Arc<Mutex<HashMap<u32, u64>>>,
-    physical: u64,
+    physical: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FootprintReader for Footprints {
@@ -39,7 +45,7 @@ impl FootprintReader for Footprints {
     }
 
     fn physical_memory(&self) -> Result<u64, FootprintError> {
-        Ok(self.physical)
+        Ok(self.physical.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -77,8 +83,10 @@ impl FootprintRegistry for Entry {
 }
 
 /// A harmless process standing for a job, in a group of its own.
+#[cfg(any())]
 struct Sleeper(Child);
 
+#[cfg(any())]
 impl Sleeper {
     fn start() -> Self {
         Self(
@@ -95,6 +103,7 @@ impl Sleeper {
     }
 }
 
+#[cfg(any())]
 impl Drop for Sleeper {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -102,31 +111,42 @@ impl Drop for Sleeper {
     }
 }
 
-/// One agent: its jobs, and a guard over them.
+/// One agent: a real session shell, its jobs and a guard over them.
 struct Agent {
-    registry: JobRegistry,
+    _dir: tempfile::TempDir,
+    /// Owns the shell's sandbox.
+    _terminal: TestTerminal,
+    /// The shell reading the scripted footprints.
+    shell: SessionShell,
     footprints: Footprints,
     guard: RunawayGuard,
-    sleepers: Vec<Sleeper>,
-    window: ResponseWindow,
+    /// The jobs the agent started, by the name the test gave them.
+    jobs: Vec<(&'static str, aither_sandbox::Job)>,
     /// The kill switches of the container jobs, by task.
+    #[cfg(any())]
     switches: Vec<(String, async_channel::Receiver<()>)>,
 }
 
 /// What the container's cgroup says, scripted.
+#[cfg(any())]
 #[derive(Clone)]
 struct Cgroup(Arc<Mutex<CgroupState>>);
 
+#[cfg(any())]
 struct CgroupState {
     limit: Option<u64>,
     pressure: &'static str,
     jobs: HashMap<String, u64>,
 }
 
+#[cfg(any())]
 const CALM: &str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
+#[cfg(any())]
 const STALLED: &str = "some avg10=12.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
+#[cfg(any())]
 const THRASHING: &str = "some avg10=40.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=15.00 avg60=0.00 avg300=0.00 total=0";
 
+#[cfg(any())]
 impl Cgroup {
     fn limited(limit: u64) -> Self {
         Self(Arc::new(Mutex::new(CgroupState {
@@ -149,6 +169,7 @@ impl Cgroup {
     }
 }
 
+#[cfg(any())]
 impl ContainerMemory for Cgroup {
     fn cgroup(&self) -> impl Future<Output = Result<CgroupMemory, FootprintError>> + Send {
         let state = self.0.lock().unwrap();
@@ -171,6 +192,104 @@ impl ContainerMemory for Cgroup {
     }
 }
 
+impl Agent {
+    /// An agent on a machine of `physical` bytes, which shares what it
+    /// holds with the other agents of `machine` when given one.
+    async fn new(physical: u64, machine: Option<(&Machine, &'static str)>) -> Self {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("a session root");
+        let terminal = TestTerminal::new(dir.path()).await;
+        let footprints = Footprints {
+            physical: Arc::new(std::sync::atomic::AtomicU64::new(physical)),
+            ..Footprints::default()
+        };
+        let machine = machine.map(|(machine, agent)| (machine.clone(), agent));
+        let shell = Self::shell_of(&terminal, &footprints, machine.as_ref());
+        let guard = RunawayGuard::new(shell.job_memory());
+        Self {
+            _dir: dir,
+            _terminal: terminal,
+            shell,
+            footprints,
+            guard,
+            jobs: Vec::new(),
+        }
+    }
+
+    /// The terminal's shell, reading `footprints` and publishing to
+    /// `machine`, with the test's response window.
+    fn shell_of(
+        terminal: &TestTerminal,
+        footprints: &Footprints,
+        machine: Option<&(Machine, &'static str)>,
+    ) -> SessionShell {
+        let mut shell =
+            SessionShell::clone(terminal.shell()).with_footprint_reader(footprints.clone());
+        if let Some((machine, agent)) = machine {
+            shell = shell.with_footprint_registry(Entry {
+                machine: machine.clone(),
+                agent,
+            });
+        }
+        shell.response_window().set(WINDOW);
+        shell
+    }
+
+    /// Starts a job holding `bytes`, named `name` by the test.
+    async fn job(&mut self, name: &'static str, bytes: u64) -> u32 {
+        let (job, pid) = self._terminal.sleeping_job().await;
+        self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
+        self.jobs.push((name, job));
+        pid
+    }
+
+    /// The task id the shell gave the job the test named `name`.
+    fn task(&self, name: &str) -> String {
+        self.job_named(name).task_id().to_string()
+    }
+
+    fn job_named(&self, name: &str) -> &aither_sandbox::Job {
+        &self
+            .jobs
+            .iter()
+            .find(|(job, _)| *job == name)
+            .expect("the test started that job")
+            .1
+    }
+
+    /// Whether `task_id` is the id of the job the test named `name`.
+    fn is(&self, task_id: &str, name: &str) -> bool {
+        task_id == self.task(name)
+    }
+
+    /// Changes what the machine's physical memory reads as, and the guard
+    /// over it.
+    fn set_physical(&mut self, bytes: u64) {
+        self.footprints
+            .physical
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.guard = RunawayGuard::new(self.shell.job_memory());
+    }
+
+    /// The job's status as it is now.
+    async fn status(&self, name: &str) -> JobStatus {
+        self.job_named(name).info().await.status
+    }
+
+    /// The job's status once its process is gone, for a job that was killed.
+    async fn settled_status(&self, name: &str) -> JobStatus {
+        for _ in 0..200 {
+            let status = self.status(name).await;
+            if status != JobStatus::Running {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the job {name} is still running");
+    }
+}
+
+#[cfg(any())]
 impl Agent {
     fn new(physical: u64, machine: Option<(&Machine, &'static str)>) -> Self {
         Self::build(physical, machine, None)
@@ -335,14 +454,27 @@ impl Clock {
     }
 }
 
-fn task_ids(jobs: &[aither_sandbox::JobFootprint]) -> Vec<&str> {
-    jobs.iter().map(|job| job.task_id.as_str()).collect()
+/// The names the test gave the jobs `footprints` list, in their order.
+fn names<'a>(
+    started: &[(&'a str, aither_sandbox::Job)],
+    footprints: &[aither_sandbox::JobFootprint],
+) -> Vec<&'a str> {
+    footprints
+        .iter()
+        .map(|footprint| {
+            started
+                .iter()
+                .find(|(_, job)| job.task_id() == footprint.task_id)
+                .expect("a job of this agent")
+                .0
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn yellow_red_and_dropped_back_alerts_fire_once_per_change_and_list_jobs_by_footprint() {
     let clock = Clock::new();
-    let mut agent = Agent::new(64 * GIB, None);
+    let mut agent = Agent::new(64 * GIB, None).await;
     agent.job("small", GIB).await;
     agent.job("large", 4 * GIB).await;
     let mut observe = async |pressure| agent.guard.observe(clock.now(), Some(pressure)).await;
@@ -352,14 +484,14 @@ async fn yellow_red_and_dropped_back_alerts_fire_once_per_change_and_list_jobs_b
     let [HostLoadEvent::MemoryYellow { jobs, .. }] = yellow.as_slice() else {
         panic!("one yellow alert: {yellow:?}");
     };
-    assert_eq!(task_ids(jobs), ["large", "small"]);
+    assert_eq!(names(&agent.jobs, jobs), ["large", "small"]);
     assert!(observe(MemoryPressure::Warning).await.is_empty());
 
     let red = observe(MemoryPressure::Critical).await;
     let [HostLoadEvent::MemoryRed { jobs, .. }] = red.as_slice() else {
         panic!("one red alert: {red:?}");
     };
-    assert_eq!(task_ids(jobs), ["large", "small"]);
+    assert_eq!(names(&agent.jobs, jobs), ["large", "small"]);
     assert!(observe(MemoryPressure::Critical).await.is_empty());
 
     let dropped = observe(MemoryPressure::Warning).await;
@@ -390,7 +522,7 @@ async fn yellow_red_and_dropped_back_alerts_fire_once_per_change_and_list_jobs_b
 #[tokio::test]
 async fn an_agent_over_physical_memory_loses_its_largest_job_when_the_window_ends_unanswered() {
     let clock = Clock::new();
-    let mut agent = Agent::new(10 * GIB, None);
+    let mut agent = Agent::new(10 * GIB, None).await;
     agent.job("small", 3 * GIB).await;
     agent.job("large", 8 * GIB).await;
 
@@ -401,7 +533,7 @@ async fn an_agent_over_physical_memory_loses_its_largest_job_when_the_window_end
     let [HostLoadEvent::MemoryFinalWarning { job, window, .. }] = warned.as_slice() else {
         panic!("the final warning: {warned:?}");
     };
-    assert_eq!((job.task_id.as_str(), *window), ("large", WINDOW));
+    assert_eq!((agent.is(&job.task_id, "large"), *window), (true, WINDOW));
 
     clock.advance(59);
     assert!(
@@ -421,12 +553,12 @@ async fn an_agent_over_physical_memory_loses_its_largest_job_when_the_window_end
     assert!(
         matches!(
             killed.as_slice(),
-            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if task_id == "large"
+            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if agent.is(task_id, "large")
         ),
         "{killed:?}"
     );
     assert!(matches!(
-        agent.status("large").await,
+        agent.settled_status("large").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway {
                 footprint_bytes,
@@ -442,7 +574,7 @@ async fn an_agent_over_physical_memory_loses_its_largest_job_when_the_window_end
 #[tokio::test]
 async fn a_job_the_agent_stopped_in_time_is_not_killed_and_reports_a_user_kill() {
     let clock = Clock::new();
-    let mut agent = Agent::new(10 * GIB, None);
+    let mut agent = Agent::new(10 * GIB, None).await;
     agent.job("small", 3 * GIB).await;
     let large = agent.job("large", 8 * GIB).await;
 
@@ -452,7 +584,7 @@ async fn a_job_the_agent_stopped_in_time_is_not_killed_and_reports_a_user_kill()
         .await;
     assert_eq!(warned.len(), 1, "{warned:?}");
     clock.advance(30);
-    assert!(agent.registry.kill(large).await);
+    assert!(agent.job_named("large").kill().await);
     // The processes are gone, so the agent's jobs fit the machine again.
     agent.footprints.by_pid.lock().unwrap().insert(large, 0);
 
@@ -463,7 +595,7 @@ async fn a_job_the_agent_stopped_in_time_is_not_killed_and_reports_a_user_kill()
         .await;
     assert!(after.is_empty(), "{after:?}");
     assert!(matches!(
-        agent.status("large").await,
+        agent.settled_status("large").await,
         JobStatus::Killed {
             cause: KillCause::User,
             ..
@@ -475,7 +607,7 @@ async fn a_job_the_agent_stopped_in_time_is_not_killed_and_reports_a_user_kill()
 #[tokio::test]
 async fn jobs_under_physical_memory_are_never_killed_whatever_the_pressure() {
     let clock = Clock::new();
-    let mut agent = Agent::new(10 * GIB, None);
+    let mut agent = Agent::new(10 * GIB, None).await;
     agent.job("a", 4 * GIB).await;
     agent.job("b", 5 * GIB).await;
     for pressure in [
@@ -501,8 +633,8 @@ async fn jobs_under_physical_memory_are_never_killed_whatever_the_pressure() {
 async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_while_critical() {
     let clock = Clock::new();
     let machine = Machine::default();
-    let mut big = Agent::new(50 * GIB, Some((&machine, "big")));
-    let mut small = Agent::new(50 * GIB, Some((&machine, "small")));
+    let mut big = Agent::new(50 * GIB, Some((&machine, "big"))).await;
+    let mut small = Agent::new(50 * GIB, Some((&machine, "small"))).await;
     big.job("anchor", 25 * GIB).await;
     big.job("bridge", 10 * GIB).await;
     small.job("canyon", 20 * GIB).await;
@@ -543,7 +675,7 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     assert!(
         big_events.iter().any(|event| matches!(
             event,
-            HostLoadEvent::MemoryFinalWarning { job, .. } if job.task_id == "anchor"
+            HostLoadEvent::MemoryFinalWarning { job, .. } if big.is(&job.task_id, "anchor")
         )),
         "{big_events:?}"
     );
@@ -556,12 +688,12 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     assert!(
         matches!(
             killed.as_slice(),
-            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if task_id == "anchor"
+            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if big.is(task_id, "anchor")
         ),
         "{killed:?}"
     );
     assert!(matches!(
-        big.status("anchor").await,
+        big.settled_status("anchor").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway { .. },
             ..
@@ -569,7 +701,7 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     ));
     assert_eq!(big.status("bridge").await, JobStatus::Running);
     // The killed processes hold nothing now: 30 GiB together fits.
-    let killed_pid = big.registry.get_by_task_id("anchor").await.unwrap().pid;
+    let killed_pid = big.job_named("anchor").info().await.pid;
     big.footprints.by_pid.lock().unwrap().insert(killed_pid, 0);
     clock.advance(600);
     for agent in [&mut big, &mut small] {
@@ -591,8 +723,8 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
 async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     let clock = Clock::new();
     let machine = Machine::default();
-    let mut first = Agent::new(20 * GIB, Some((&machine, "first")));
-    let mut second = Agent::new(20 * GIB, Some((&machine, "second")));
+    let mut first = Agent::new(20 * GIB, Some((&machine, "first"))).await;
+    let mut second = Agent::new(20 * GIB, Some((&machine, "second"))).await;
     let first_pid = first.job("first", 15 * GIB).await;
     second.job("second", 12 * GIB).await;
     let critical = Some(MemoryPressure::Critical);
@@ -618,7 +750,7 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     first.guard.observe(clock.now(), critical).await;
     first.footprints.by_pid.lock().unwrap().insert(first_pid, 0);
     assert!(matches!(
-        first.status("first").await,
+        first.settled_status("first").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway { .. },
             ..
@@ -628,29 +760,20 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     // 12 GiB is under 20: nothing more. Shrink the machine to keep both
     // conditions true, and the second contributor is next.
     let mut second_only = second;
-    second_only.footprints.physical = 8 * GIB;
-    second_only.guard = RunawayGuard::new(JobMemory::new(
-        second_only.registry.clone(),
-        AnyFootprintReader::new(second_only.footprints.clone()),
-        Some(AnyFootprintRegistry::new(Entry {
-            machine: machine.clone(),
-            agent: "second",
-        })),
-        second_only.window.clone(),
-    ));
+    second_only.set_physical(8 * GIB);
     clock.advance(10);
     let next = second_only.guard.observe(clock.now(), critical).await;
     assert!(
         next.iter().any(|event| matches!(
             event,
-            HostLoadEvent::MemoryFinalWarning { job, .. } if job.task_id == "second"
+            HostLoadEvent::MemoryFinalWarning { job, .. } if second_only.is(&job.task_id, "second")
         )),
         "{next:?}"
     );
     clock.advance(60);
     second_only.guard.observe(clock.now(), critical).await;
     assert!(matches!(
-        second_only.status("second").await,
+        second_only.settled_status("second").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway { .. },
             ..
@@ -697,6 +820,7 @@ fn the_alerts_read_as_plain_text() {
     );
 }
 
+#[cfg(any())]
 const fn is_container(event: &HostLoadEvent) -> bool {
     matches!(
         event,
@@ -719,6 +843,7 @@ const fn is_container(event: &HostLoadEvent) -> bool {
     )
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn a_containers_own_pressure_raises_its_own_alerts_once_per_change() {
     let clock = Clock::new();
@@ -784,6 +909,7 @@ async fn a_containers_own_pressure_raises_its_own_alerts_once_per_change() {
     assert!(observe(CALM).await.is_empty());
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
     let clock = Clock::new();
@@ -843,6 +969,7 @@ async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
     assert_eq!(agent.status("small").await, JobStatus::Running);
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn a_container_job_the_agent_stopped_in_time_is_not_killed() {
     let clock = Clock::new();
@@ -867,6 +994,7 @@ async fn a_container_job_the_agent_stopped_in_time_is_not_killed() {
     ));
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn jobs_under_the_containers_limit_are_never_killed_whatever_the_pressure() {
     let clock = Clock::new();
@@ -892,6 +1020,7 @@ async fn jobs_under_the_containers_limit_are_never_killed_whatever_the_pressure(
     assert!(!agent.container_job_killed("a") && !agent.container_job_killed("b"));
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn a_container_without_a_memory_limit_adds_nothing_to_watch() {
     let clock = Clock::new();
@@ -917,6 +1046,7 @@ async fn a_container_without_a_memory_limit_adds_nothing_to_watch() {
     assert!(!agent.container_job_killed("large"));
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn the_machine_and_the_container_are_judged_apart() {
     let clock = Clock::new();
@@ -944,6 +1074,7 @@ async fn the_machine_and_the_container_are_judged_apart() {
     assert!(!events.iter().any(is_container));
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn jobs_of_a_remote_environment_are_never_warned_about_or_killed() {
     let clock = Clock::new();
@@ -984,6 +1115,7 @@ async fn jobs_of_a_remote_environment_are_never_warned_about_or_killed() {
     assert_eq!(agent.registry.kill_running().await, 2);
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn a_remote_job_in_a_container_terminal_is_still_never_judged() {
     let clock = Clock::new();

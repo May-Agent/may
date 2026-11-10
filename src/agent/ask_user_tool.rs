@@ -505,14 +505,13 @@ impl ContextSource for OpenQuestionsContext {
 mod tests {
     use std::sync::Arc;
 
-    use aither_sandbox::ToolRegistryBuilder;
+    use crate::ipc::CommandRegistryBuilder;
+    use crate::test_support::{TestCommands, main_launch};
 
     use super::{ASK_USER_DESCRIPTION, AskUserTool};
 
     /// The `ask_user` command on a fresh session's database, and that database.
-    async fn ask_user_registry(
-        dir: &tempfile::TempDir,
-    ) -> (aither_sandbox::ToolRegistry, crate::db::ChatDb) {
+    async fn ask_user_registry(dir: &tempfile::TempDir) -> (TestCommands, crate::db::ChatDb) {
         let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("chat db opens");
@@ -524,10 +523,10 @@ mod tests {
             crate::ui_event_bus::UiEventBus::new(),
             crate::session::MayHomePaths::new(dir.path().join("home")),
         ));
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
         builder.configure_tool(AskUserTool::new(runtime, "session"));
         (
-            builder.build(crate::test_support::test_output_store(dir.path().join("outputs")).await),
+            TestCommands::build(builder, dir.path().join("outputs")).await,
             db,
         )
     }
@@ -540,7 +539,8 @@ mod tests {
         let (registry, db) = ask_user_registry(&dir).await;
         let words = shell_words::split(r#""Which database?" --option PostgreSQL --option SQLite"#)
             .expect("shell syntax");
-        let reply = registry.query_tool_handler("ask_user", &words).await;
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let reply = registry.call(&main_launch(), "ask_user", &words).await;
         assert!(reply.ok, "{reply:?}");
 
         let open = db
@@ -556,7 +556,8 @@ mod tests {
 
         let twice = shell_words::split(r#""Which database?" --question "Which DB?""#)
             .expect("shell syntax");
-        let reply = registry.query_tool_handler("ask_user", &twice).await;
+        let twice: Vec<&str> = twice.iter().map(String::as_str).collect();
+        let reply = registry.call(&main_launch(), "ask_user", &twice).await;
         assert!(!reply.ok, "a question given twice is refused: {reply:?}");
     }
 
@@ -574,7 +575,8 @@ mod tests {
         assert_eq!(examples.len(), 3, "single, several and secret questions");
         for example in examples {
             let words = shell_words::split(example).expect("the example is shell syntax");
-            let reply = registry.query_tool_handler("ask_user", &words[1..]).await;
+            let words: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+            let reply = registry.call(&main_launch(), "ask_user", &words).await;
             assert!(reply.ok, "{example}: {reply:?}");
         }
     }

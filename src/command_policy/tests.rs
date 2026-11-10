@@ -152,7 +152,7 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
     let start = ScriptDir::Host(dir.path().to_path_buf());
     let call = CallIdentity::new(
         aither_core::llm::tool::ToolCallId::new("call-c"),
-        aither_core::llm::tool::AgentIdentity::new("main", None),
+        aither_core::llm::tool::AgentIdentity::Main,
     );
     let check = |task_id| {
         check_with(

@@ -563,87 +563,84 @@ pub async fn cancel_subagents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_sandbox::SandboxMode;
+    use crate::repo_clone::test_sandbox::TestTerminal;
 
-    async fn registry_with_job(pid: u32, _task_id: &str) -> (JobRegistry, String) {
-        let (registry, service) = aither_sandbox::job_registry_channel();
-        tokio::spawn(service.serve());
-        let task_id = aither_core::AnyIdAllocator::default()
-            .lease()
-            .expect("a free task id");
-        let word = task_id.to_string();
-        registry
-            .register(
-                pid,
-                &task_id,
-                "key",
-                "sleep 30",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        (registry, word)
+    /// A real session shell in its own directory, running a `sleep` job in
+    /// the background: the shell, the job and the job's pid.
+    async fn shell_with_job(dir: &std::path::Path) -> (TestTerminal, aither_sandbox::Job, u32) {
+        let terminal = TestTerminal::new(dir).await;
+        let (job, pid) = terminal.sleeping_job().await;
+        (terminal, job, pid)
+    }
+
+    /// The agent taking the completion of the shell's next ended job: the
+    /// event that carries it is read and dropped.
+    async fn take_completion(terminal: &TestTerminal) {
+        let events = terminal.shell().jobs().events();
+        loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .await
+                .expect("the job ended");
+            if matches!(event, aither_sandbox::ShellEvent::JobEnded(_)) {
+                return;
+            }
+        }
     }
 
     #[tokio::test]
     async fn earlier_agents_jobs_stay_listed_while_they_run() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
         let backgrounds = SessionBackgrounds::default();
-        let (old, old_id) = registry_with_job(10, "t-old").await;
-        backgrounds.add_job_registry("s", old.clone());
-        let (new, _) = registry_with_job(11, "t-new").await;
-        backgrounds.add_job_registry("s", new);
+        let (old_shell, old, old_pid) = shell_with_job(&dir.path().join("old")).await;
+        backgrounds.add_jobs("s", old_shell.shell().jobs());
+        let (new_shell, _new, new_pid) = shell_with_job(&dir.path().join("new")).await;
+        backgrounds.add_jobs("s", new_shell.shell().jobs());
 
-        let pids: Vec<u32> = backgrounds
-            .jobs("s")
-            .await
-            .iter()
-            .map(|job| job.pid)
-            .collect();
-        assert_eq!(pids, vec![10, 11]);
-        assert!(backgrounds.registry_with("s", 10).await.is_some());
+        let pids = async || -> Vec<u32> {
+            backgrounds
+                .jobs("s")
+                .await
+                .iter()
+                .map(|job| job.pid)
+                .collect()
+        };
+        assert_eq!(pids().await, vec![old_pid, new_pid]);
+        assert!(backgrounds.job_with("s", old_pid).await.is_some());
 
-        old.complete(10, 0, None).await;
-        let pids: Vec<u32> = backgrounds
-            .jobs("s")
-            .await
-            .iter()
-            .map(|job| job.pid)
-            .collect();
-        assert_eq!(pids, vec![10, 11], "its completion is still owed");
-        drop(old.owe_completion(&old_id, Ok(0)).await);
-        let pids: Vec<u32> = backgrounds
-            .jobs("s")
-            .await
-            .iter()
-            .map(|job| job.pid)
-            .collect();
-        assert_eq!(pids, vec![11], "a finished earlier job drops out");
+        assert!(old.kill().await, "the job was running");
+        old.info().await;
         assert_eq!(
-            backgrounds.registries("s").len(),
-            1,
-            "its registry is let go"
+            pids().await,
+            vec![old_pid, new_pid],
+            "its completion is still owed"
         );
+        take_completion(&old_shell).await;
+        drop(old);
+        assert_eq!(
+            pids().await,
+            vec![new_pid],
+            "a finished earlier job drops out"
+        );
+        assert_eq!(backgrounds.registries("s").len(), 1, "its shell is let go");
     }
 
     #[tokio::test]
     async fn a_finished_job_reads_as_resuming_until_its_completion_is_taken() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
         let backgrounds = SessionBackgrounds::default();
-        let (registry, owed_id) = registry_with_job(20, "t-owed").await;
-        backgrounds.add_job_registry("s", registry.clone());
+        let (shell, job, _) = shell_with_job(dir.path()).await;
+        backgrounds.add_jobs("s", shell.shell().jobs());
         assert!(backgrounds.snapshot("s").await.will_resume(), "it runs");
 
-        // The job finishes; the idle agent has not taken the completion yet.
-        registry.complete(20, 0, None).await;
+        // The job finishes; its agent has not taken the completion yet.
+        assert!(job.kill().await, "the job was running");
         let snapshot = backgrounds.snapshot("s").await;
         assert!(snapshot.resuming, "{snapshot:?}");
 
-        let owed = registry
-            .owe_completion(&owed_id, Ok(0))
-            .await
-            .expect("the job is registered");
-        assert!(backgrounds.snapshot("s").await.resuming);
-
-        drop(owed);
+        take_completion(&shell).await;
         assert!(!backgrounds.snapshot("s").await.will_resume());
     }
 }

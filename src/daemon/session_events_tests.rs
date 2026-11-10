@@ -324,25 +324,13 @@ async fn a_job_added_then_removed_upserts_then_removes() {
 
     let mut stream = Stream::open(&router, &format!("/api/sessions/{SESSION}/events")).await;
 
-    let (registry, service) = aither_sandbox::job_registry::job_registry_channel();
-    tokio::spawn(service.serve());
+    let dir = tempfile::tempdir().expect("temp dir");
+    let terminal =
+        crate::repo_clone::test_sandbox::TestTerminal::new(&dir.path().join("first")).await;
     state
         .session_background
-        .add_job_registry(SESSION, registry.clone());
-    let task_id = aither_core::AnyIdAllocator::default()
-        .lease()
-        .expect("a free task id");
-    let task_id_word = task_id.to_string();
-    registry
-        .register(
-            1234,
-            &task_id,
-            "exec-1",
-            "sleep 60",
-            aither_sandbox::SandboxMode::Sandboxed,
-            None,
-        )
-        .await;
+        .add_jobs(SESSION, terminal.shell().jobs());
+    let (job, pid) = terminal.sleeping_job().await;
     state.publish_session_change(SESSION, SessionChange::Background);
 
     let upserted = stream.next().await;
@@ -350,17 +338,17 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     let data: serde_json::Value = serde_json::from_str(&upserted.data).expect("payload json");
     assert_eq!(
         (data["sessionId"].as_str(), data["job"]["pid"].as_u64()),
-        (Some(SESSION), Some(1234))
+        (Some(SESSION), Some(u64::from(pid)))
     );
 
-    // The finished registry falls out of the snapshot once its completion
+    // The finished shell falls out of the snapshot once its completion
     // is taken and it is no longer the newest: the job leaves as a removal.
-    registry.complete(1234, 0, None).await;
-    let taken = registry.owe_completion(&task_id_word, Ok(0)).await;
-    drop(taken);
-    let (next, next_service) = aither_sandbox::job_registry::job_registry_channel();
-    tokio::spawn(next_service.serve());
-    state.session_background.add_job_registry(SESSION, next);
+    assert!(job.kill().await, "the job was running");
+    job.wait().await.expect("the completion is taken");
+    let next = crate::repo_clone::test_sandbox::TestTerminal::new(&dir.path().join("next")).await;
+    state
+        .session_background
+        .add_jobs(SESSION, next.shell().jobs());
     state.publish_session_change(SESSION, SessionChange::Background);
 
     let removed = stream.next().await;
@@ -368,7 +356,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     let data: serde_json::Value = serde_json::from_str(&removed.data).expect("payload json");
     assert_eq!(
         (data["sessionId"].as_str(), data["pid"].as_u64()),
-        (Some(SESSION), Some(1234))
+        (Some(SESSION), Some(u64::from(pid)))
     );
 }
 

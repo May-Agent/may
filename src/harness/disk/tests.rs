@@ -4,7 +4,7 @@ use std::time::Duration;
 use aither_sandbox::{ForegroundWait, MemorySize};
 
 use super::*;
-use crate::host_load::{
+use crate::harness::host_load::{
     HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, MachineLoad, MemoryPressure,
 };
 
@@ -332,6 +332,7 @@ mod home {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             std::future::ready(Err("a probe is never streamed".to_string()))
         }
@@ -441,6 +442,7 @@ mod home {
                 _kill_rx: Receiver<()>,
                 _stdin_rx: Receiver<Vec<u8>>,
                 _stdout: Sender<Vec<u8>>,
+                _lifetime: ExecLifetime,
             ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
                 std::future::ready(Err("the container is gone".to_string()))
             }

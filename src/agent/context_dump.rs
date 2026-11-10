@@ -237,7 +237,10 @@ mod tests {
         let dump = ContextDump::assemble("o4-mini-high", "custom", "mighty-pine-fjord", &snapshot);
         let text = dump.render();
 
-        assert!(text.contains("[0] role: system\nYou run in a terminal-first environment."));
+        // The instructions render in the layout's order, not insertion order.
+        assert!(text.contains(
+            "[0] role: system\nYou are May. Be warm, lead with the point, prefer prose over lists.\nYou run in a terminal-first environment."
+        ));
         assert!(text.contains(
             "[2] role: assistant\nreasoning: claude (25 bytes)\ntool_calls:\n  - name: terminal\n    arguments: {\"command\":\"cargo test reproduce -- --nocapture\",\"timeout\":120}"
         ));

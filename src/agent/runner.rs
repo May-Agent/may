@@ -94,6 +94,14 @@ pub enum TuiEvent {
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
     Retract,
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it, marked as translated.
+    ReplyTranslated {
+        /// The reply translated into the communication language.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
+    },
     /// The daemon withdrew the turn: it was stopped before any tool call or
     /// response text, so its message left the conversation.
     Withdrawn {
@@ -1243,11 +1251,19 @@ mod tests {
                         .next()
                         .is_some_and(|line| line.contains("/models"))
                     {
-                        let _ = socket
-                            .write_all(
-                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                            )
-                            .await;
+                        let body = serde_json::json!({
+                            "data": [{
+                                "id": crate::agent::idle_compaction_tests::SESSION_MODEL,
+                                "owned_by": "stub",
+                                "context_length": 128_000
+                            }]
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
                         return;
                     }
                     let _ = request_tx.send(()).await;
@@ -1257,24 +1273,20 @@ mod tests {
             }
         });
 
-        let llm = crate::agent::ModelSlot::new(
-            crate::agent::RedactedModel::new(
-                aither_cloud::CloudProvider::OpenAI(
-                    aither_cloud::openai::OpenAI::builder("test-key")
-                        .base_url(format!("http://{addr}"))
-                        .model("gpt-5")
-                        .no_retry()
-                        .build(),
-                ),
-                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
-            ),
-            aither_core::llm::model::Parameters::default(),
-        );
-        let (mut agent, temp) = crate::agent::may::test_agent(llm, "openai", "gpt-5").await;
+        let server = crate::agent::idle_compaction_tests::StubModel {
+            base_url: format!("http://{addr}"),
+            requests: std::sync::Arc::default(),
+        };
+        let session = crate::agent::idle_compaction_tests::Session::start(
+            &crate::agent::idle_compaction_tests::saved_config(&server, None),
+        )
+        .await;
+        let temp = session.temp.path().to_path_buf();
+        let mut agent = session.agent;
         agent.push_message(aither_core::llm::Message::user("first turn"));
         agent.push_message(aither_core::llm::Message::assistant("first answer"));
 
-        let db = crate::db::ChatDb::open(&temp.path().join("worker.db"))
+        let db = crate::db::ChatDb::open(&temp.join("worker.db"))
             .await
             .expect("open worker db");
         let runs =

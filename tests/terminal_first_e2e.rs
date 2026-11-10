@@ -8,7 +8,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_sandbox::ToolTarget;
 use askama::Template;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -26,6 +25,7 @@ use may_agent::model_selector::ModelSelector;
 use may_agent::session::{
     SandboxResourceLayout, SessionId, SessionStore, initialize_session_persistence,
 };
+use may_agent::tools::ToolTarget;
 use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
 use serial_test::serial;

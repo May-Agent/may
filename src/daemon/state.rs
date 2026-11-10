@@ -1328,6 +1328,12 @@ impl DaemonState {
         config: MayConfig,
         connectivity: aither_connectivity::Connectivity,
     ) -> anyhow::Result<Self> {
+        // Shells spawn their job registries on the global executor, which
+        // the `may` binary installs at startup.
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        // The daemon writes the bundled skills there at startup, and a
+        // session's shell grants the directory.
+        std::fs::create_dir_all(may_dir.join("skills"))?;
         let db = crate::db::ChatDb::open(&may_dir.join("history.db")).await?;
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
         let (session_change_tx, session_change_rx) = async_channel::unbounded();

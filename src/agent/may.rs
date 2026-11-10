@@ -958,6 +958,8 @@ impl MayAgent {
         .await?;
         let registry = commands.build();
         let shell = assembly.build_on(sandbox, registry.clone()).await?;
+        // A side request forks the agent before it has run any bound command.
+        shared_terminal_commands.fork_launcher.set(&shell);
 
         // The command table, the capabilities and the efficiency rules are
         // rendered from the commands registered above.

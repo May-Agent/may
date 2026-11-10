@@ -4,7 +4,7 @@ use std::time::Duration;
 use aither_sandbox::ForegroundWait;
 
 use super::*;
-use crate::clock::ManualClock;
+use aither_agent::ManualClock;
 
 const NORMAL_WAIT: Duration = Duration::from_secs(10);
 const HIGH_LOAD_WAIT: Duration = Duration::from_secs(90);

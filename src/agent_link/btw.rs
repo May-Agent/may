@@ -50,13 +50,14 @@ struct ForkHost {
     languages: crate::harness::language::Languages,
 }
 
-/// The shell of a session's main agent, filled when the agent's command
-/// registry is first bound to it.
+/// The shell of a session's main agent, filled when the agent's shell is
+/// built.
 #[derive(Debug, Clone, Default)]
 pub struct ForkLauncher(Arc<OnceLock<SessionShell>>);
 
 impl ForkLauncher {
-    fn set(&self, shell: &SessionShell) {
+    /// Records `shell` as the one the session's forks launch from.
+    pub fn set(&self, shell: &SessionShell) {
         // A shell bound later belongs to the same agent; the first stays.
         let _ = self.0.set(shell.clone());
     }

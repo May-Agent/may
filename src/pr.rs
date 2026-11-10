@@ -2494,7 +2494,7 @@ mod tests {
     /// the row naming it is told of each change once.
     #[tokio::test]
     async fn an_opened_and_closed_pr_reaches_the_tasks_inbox() {
-        use aither_agent::ContextSource;
+        use aither_agent::{ContextSource, Moment};
 
         let fx = Fixture::new().await;
         let (mut store, clone) = fx.store("s1", None).await;
@@ -2507,15 +2507,20 @@ mod tests {
         )
         .unwrap();
         let mut tasks = crate::tasks_md::schema::working_document(sandbox.path(), events);
-        tasks.on_request(false).await;
+        tasks.blocks(Moment::Request { reassembled: false }).await;
 
         commit_file(&clone, "work.txt");
         store.open(None, Some("work"), None, true).await.unwrap();
         store.close(1, None).await.unwrap();
 
-        tasks.on_request(false).await;
-        let alert = tasks.on_tool_turn_end().await.expect("the row is told");
-        let text = alert.content();
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+        let alert = tasks
+            .blocks(Moment::ToolTurnEnd)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row is told");
+        let text = alert.block().content();
         // The row naming PR #1 already records its opening.
         assert_eq!(text.matches("PR #1 was opened").count(), 0, "{text}");
         assert_eq!(text.matches("PR #1 was closed").count(), 1, "{text}");

@@ -18,7 +18,7 @@ use super::{ChatDb, ChatDbError, query};
 /// checkpoint's serialized shape makes every older blob undecodable. Bump this
 /// constant whenever that shape changes; a row written under a different
 /// version fails to load.
-pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 5;
+pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 6;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
 #[derive(Debug)]
@@ -438,8 +438,6 @@ mod tests {
                 },
                 messages: vec![aither_core::llm::Message::user("hello")],
             },
-            has_background_tasks: false,
-            document: None,
         }
     }
 
@@ -459,16 +457,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         keys.sort();
-        assert_eq!(
-            keys,
-            [
-                "context",
-                "context_window",
-                "document",
-                "has_background_tasks",
-                "tool_surface_hash"
-            ]
-        );
+        assert_eq!(keys, ["context", "context_window", "tool_surface_hash"]);
     }
 
     #[tokio::test]
@@ -498,7 +487,6 @@ mod tests {
         assert_eq!(stored.applied_seq, 42);
         assert_eq!(stored.checkpoint.tool_surface_hash, "tool-surface-hash");
         assert_eq!(stored.checkpoint.context_window.messages.len(), 1);
-        assert!(!stored.checkpoint.has_background_tasks);
     }
 
     #[tokio::test]

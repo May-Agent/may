@@ -48,7 +48,7 @@ async fn turn_end(source: &mut WorkingDocument) -> (DocumentReview, Option<Strin
     let review = source.review().await;
     let alert = source
         .alert(&review, true)
-        .map(|block| block.content().to_string());
+        .map(|block| block.block().content().to_string());
     (review, alert)
 }
 
@@ -112,7 +112,7 @@ async fn the_session_start_carries_the_whole_document_under_its_name() {
     let block = source.on_request(false).await.expect("shows the document");
     assert_eq!(
         block.content(),
-        "<working_document>\nContents of plan.md:\n* first\n\n</working_document>"
+        "<tasks_document>\nContents of plan.md:\n* first\n\n</tasks_document>"
     );
     assert!(
         source.on_request(false).await.is_none(),
@@ -154,7 +154,11 @@ async fn an_absent_document_is_never_shown() {
     let (mut source, _events) = document(root.path());
     assert!(source.on_request(false).await.is_none());
     assert!(source.on_request(true).await.is_none());
-    assert!(source.render().await.is_none());
+    assert!(
+        ContextSource::peek(&source, Moment::Request { reassembled: true })
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -170,7 +174,7 @@ async fn a_merged_pr_still_listed_alerts_once_naming_it_and_its_row() {
     let alert = tool_turn(&mut source).await.expect("one alert");
     assert_eq!(
         alert.content(),
-        "<document_alert>\nPR #12 was merged, and plan.md still says: \"#129 ship it, PR #12 open\"\n</document_alert>"
+        "<tasks_alert>\nPR #12 was merged, and plan.md still says: \"#129 ship it, PR #12 open\"\n</tasks_alert>"
     );
     assert!(
         tool_turn(&mut source).await.is_none(),
@@ -580,6 +584,7 @@ async fn an_unrecorded_event_at_the_end_of_the_turn_is_found_once() {
         !source
             .alert(&review, false)
             .expect("the same findings")
+            .block()
             .content()
             .contains("before ending the turn"),
         "a run that ends is not told to keep going"
@@ -599,7 +604,7 @@ async fn the_schemas_problems_alert_once_per_edit_and_at_every_turn_end() {
     let alert = tool_turn(&mut source).await.expect("the edit alerts");
     assert_eq!(
         alert.content(),
-        "<document_alert>\nLine 2 of plan.md is a checkbox.\n</document_alert>"
+        "<tasks_alert>\nLine 2 of plan.md is a checkbox.\n</tasks_alert>"
     );
     assert!(
         tool_turn(&mut source).await.is_none(),
@@ -679,7 +684,7 @@ async fn a_blocker_that_no_longer_waits_is_a_stale_row() {
     let alert = alert.expect("stale");
     assert!(
         alert.contains(
-            "The row \"pick a db waits req-answered\" waits on req-answered, which no longer waits."
+            "The row \"pick a db waits req-answered\" is marked BLOCKING req-answered, which no longer waits."
         ),
         "{alert}"
     );

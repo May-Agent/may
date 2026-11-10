@@ -179,9 +179,14 @@ mod test_support {
     pub async fn test_output_store(
         dir: impl Into<std::path::PathBuf>,
     ) -> aither_sandbox::OutputStore {
-        aither_sandbox::OutputStore::new(dir, aither_core::AnyIdAllocator::default())
-            .await
-            .expect("outputs store")
+        aither_sandbox::OutputStore::new(
+            dir,
+            aither_core::AnyIdAllocator::default(),
+            crate::shell::ShellBudgets::of(&crate::config::ShellSettings::default()).output(),
+            crate::shell::MayShellWording::any(),
+        )
+        .await
+        .expect("outputs store")
     }
 
     /// The launch of a sandboxed script the main agent's call started.

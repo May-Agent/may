@@ -121,12 +121,7 @@ trait ChatSink {
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
     /// Every agent event of the run, as the agent emitted it, with the
     /// model's context window.
-    fn on_agent_event(
-        &mut self,
-        _event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
-        _context_window: Option<u32>,
-    ) {
-    }
+    fn on_agent_event(&mut self, _event: &aither_agent::TimedEvent, _context_window: Option<u32>) {}
     fn on_start(
         &mut self,
         session_id: &str,
@@ -396,18 +391,20 @@ impl ChatSink for HubSink {
         });
     }
 
-    fn on_agent_event(
-        &mut self,
-        event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
-        context_window: Option<u32>,
-    ) {
-        if let Ok(event) = event
-            && let Some(phase) = crate::client::CompactionPhase::from_event(event)
-        {
+    fn on_agent_event(&mut self, timed: &aither_agent::TimedEvent, context_window: Option<u32>) {
+        if let Some(phase) = crate::client::CompactionPhase::from_event(&timed.event) {
             hosts::publish_compaction(&self.hub, &self.session_id, phase);
         }
-        if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
-            self.publish_agent(crate::client::SessionAgentBody::Agent { event });
+        self.publish_agent(crate::client::SessionAgentBody::Agent {
+            event: timed.clone(),
+        });
+        if let Some(tokens) = context_window
+            && matches!(
+                timed.event,
+                aither_agent::AgentEvent::RequestEnded { usage: Some(_), .. }
+            )
+        {
+            self.publish_agent(crate::client::SessionAgentBody::ContextWindow { tokens });
         }
     }
 
@@ -437,6 +434,10 @@ impl ChatSink for HubSink {
                 language_name: &language_name,
             },
         );
+        self.publish_agent(crate::client::SessionAgentBody::ReplyTranslated {
+            text: text.to_owned(),
+            language: language.to_owned(),
+        });
         true
     }
 
@@ -2072,7 +2073,6 @@ async fn drive_turn<S: ChatSink>(
             if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
                 return Err(stop);
             }
-            turn.sink.on_agent_event(Err(&error), turn.context_window);
             Err(turn_events::TurnStop::Failed(error))
         }
     }
@@ -2326,6 +2326,8 @@ fn run_agent_loop_attempts<'a>(
                 terminal_snapshot: TerminalStateSnapshot::default(),
                 saw_tool_activity: false,
                 tool_arguments_by_id: std::collections::HashMap::new(),
+                tool_names: std::collections::HashMap::new(),
+                hosted_calls: std::collections::HashSet::new(),
                 tool_started_at: std::collections::HashMap::new(),
                 pending_tool_streams: std::collections::HashMap::new(),
                 last_todo_hash: None,
@@ -4484,21 +4486,36 @@ mod tests {
 
     #[test]
     fn tool_turn_complete_does_not_close_the_next_reasoning_phase() {
-        assert!(!super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::turn_complete(1, true)
-        ));
+        let event = |json: serde_json::Value| -> aither_agent::AgentEvent {
+            serde_json::from_value(json).expect("an agent event")
+        };
+        let turn_ended = |tool_calls: usize| {
+            event(serde_json::json!({
+                "TurnEnded": {"run": "r1", "turn": 1, "tool_calls": tool_calls}
+            }))
+        };
+        let block_delta = |kind: &str, text: &str| {
+            event(serde_json::json!({
+                "BlockDelta": {"request": 1, "block": 1, "kind": kind, "text": text}
+            }))
+        };
+        assert!(!super::closes_reasoning_phase(&turn_ended(1)));
+        assert!(super::closes_reasoning_phase(&turn_ended(0)));
+        assert!(super::closes_reasoning_phase(&block_delta(
+            "Text", "visible"
+        )));
         assert!(super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::turn_complete(1, false)
+            &aither_agent::AgentEvent::tool_call_started(
+                aither_core::llm::ToolCallId::new("id"),
+                "terminal".to_string(),
+                serde_json::json!({}),
+                aither_agent::ToolOrigin::Local,
+            )
         ));
-        assert!(super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::text("visible")
-        ));
-        assert!(super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::tool_start("id", "terminal", "{}")
-        ));
-        assert!(!super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::reasoning("think")
-        ));
+        assert!(!super::closes_reasoning_phase(&block_delta(
+            "Reasoning",
+            "think"
+        )));
     }
 
     #[test]
@@ -4569,8 +4586,6 @@ mod tests {
                         },
                         messages: Vec::new(),
                     },
-                    has_background_tasks: false,
-                    document: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
@@ -4846,8 +4861,6 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         notes: Option<async_channel::Sender<Note>>,
-        /// How many times the run showed the text `WAKE_TEXT` as an agent event.
-        wake_texts: usize,
         /// The message texts the run withdrew.
         withdrawn: Vec<String>,
         /// Panics when the run starts streaming.
@@ -4855,9 +4868,6 @@ mod tests {
         /// The messages of the errors the run reported.
         errors: Vec<String>,
     }
-
-    /// The text of the background event a test resume turn opens with.
-    const WAKE_TEXT: &str = "background command finished";
 
     impl TestSink {
         fn noting() -> (Self, async_channel::Receiver<Note>) {
@@ -4881,12 +4891,9 @@ mod tests {
     impl super::ChatSink for TestSink {
         fn on_agent_event(
             &mut self,
-            event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+            _event: &aither_agent::TimedEvent,
             _context_window: Option<u32>,
         ) {
-            if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
-                self.wake_texts += 1;
-            }
         }
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
             assert!(!self.panic_on_start, "test panic in the turn runner");
@@ -5557,29 +5564,37 @@ mod tests {
     }
 
     /// A resumed turn whose provider call fails and is retried on the same
-    /// provider continues with the agent it took, and clients see its
-    /// background events once.
+    /// provider continues with the agent it took: the idle agent's wait on
+    /// its jobs put the finished command's report into its context once, and
+    /// the retried request still carries it once.
     #[tokio::test]
     async fn a_resume_turn_retries_with_the_agent_it_took() {
+        const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const MARK: &str = "WAKE-MARK-42";
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-        let mut script = vec![sse_text("first")];
+        let arguments = serde_json::json!({
+            "script": "echo WAKE-MARK-$((40 + 2))",
+            "description": "finishes in the background",
+            "background": true,
+            "timeout": TURN_WAIT.as_secs()
+        })
+        .to_string();
+        let mut script = vec![
+            sse_tool_call("call_1", "terminal", &arguments),
+            sse_text("started"),
+        ];
         script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
         script.push(sse_text("resumed"));
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
+        std::fs::create_dir_all(may_dir.path().join("sessions/session/files"))
+            .expect("session files");
         let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
-
-        // A first turn leaves the session's idle agent behind.
-        let mut sink = TestSink::default();
-        run_prompt_turn(&state, &mut sink)
-            .await
-            .expect("the first turn completes");
-        assert!(state.parked_agents.contains("session"));
 
         let req = ChatRequest {
             session_id: "session".to_string(),
-            content: String::new(),
+            content: "start it".to_string(),
             attachments: Vec::new(),
             hidden_context_xml: None,
             delivery_mode: crate::session::PendingUserMessageMode::default(),
@@ -5591,24 +5606,36 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        let wake = vec![aither_agent::TimedEvent {
-            at: jiff::Timestamp::now(),
-            event: aither_agent::AgentEvent::Text(WAKE_TEXT.to_string()),
-        }];
         let mut sink = TestSink::default();
-        let result = run_agent_loop(
-            &state,
-            &req,
-            &mut sink,
-            &guard,
-            false,
-            true,
-            &TurnKind::Resume(wake),
+        tokio::time::timeout(
+            TURN_WAIT,
+            run_agent_loop(
+                &state,
+                &req,
+                &mut sink,
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            ),
         )
-        .await;
-        let result = result.expect("the retried resume completes");
-        assert_eq!(result.full_text, "resumed");
-        assert_eq!(sink.wake_texts, 1, "the background events are shown once");
+        .await
+        .expect("the turn finishes within its wait")
+        .expect("the turn completes");
+        assert!(state.parked_agents.contains("session"));
+
+        // The release lets the idle agent's wait read the finished command,
+        // which resumes the session: the failed attempts, then the retry.
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+        let body = last_body(&provider_a, 2 + OPENAI_CLIENT_ATTEMPTS + 1).await;
+        assert_eq!(
+            body.matches(MARK).count(),
+            1,
+            "the background report reaches the retried request once: {body}"
+        );
     }
 
     /// A background command that finishes after the turn parked its agent but
@@ -5743,7 +5770,7 @@ mod tests {
         };
         let writable_checkout = |agent: &crate::agent::MayAgent| {
             agent
-                .terminal_grants()
+                .grants()
                 .snapshot()
                 .writable
                 .iter()
