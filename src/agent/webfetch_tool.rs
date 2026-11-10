@@ -10,10 +10,10 @@ const WEBFETCH_DESCRIPTION: &str = include_str!("../texts/webfetch_description.t
 
 /// [`WebFetchTool`] with May's description.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MayWebFetch(WebFetchTool);
+pub struct MayWebFetch(WebFetchTool);
 
 impl MayWebFetch {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(WebFetchTool::new())
     }
 }
