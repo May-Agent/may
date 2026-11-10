@@ -1227,6 +1227,9 @@ where
                     TuiEvent::ToolReading { call_id, reading } => {
                         app.chat.set_tool_reading(&call_id, reading);
                     }
+                    TuiEvent::ToolCard { call_id, card } => {
+                        app.chat.set_tool_card(&call_id, card);
+                    }
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {
                             let at = until

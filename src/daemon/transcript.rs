@@ -64,6 +64,10 @@ pub(super) enum TranscriptEntry {
         status: &'static str,
         #[schema(value_type = Object)]
         result: Option<aither_core::llm::ToolResult>,
+        /// The card of a call that ran one of May's commands; its
+        /// `ask_user` answer is joined when the transcript is served.
+        #[schema(value_type = Option<Object>)]
+        card: Option<crate::command_reading::Card>,
     },
     InteractionRequest {
         id: String,
@@ -161,6 +165,7 @@ pub(super) fn build_entries(rows: &[ChatMessage]) -> Vec<TranscriptEntry> {
                             arguments,
                             status: "running",
                             result: None,
+                            card: None,
                         });
                     }
                     ToolEventRecord::End {
@@ -236,7 +241,15 @@ pub(super) async fn get_transcript(
     let history = crate::session::load_history_from_db(&state.db(), &id)
         .await
         .map_err(internal_error)?;
-    let entries = build_entries(history.messages());
+    let mut entries = build_entries(history.messages());
+    let mut cards = state.db().tool_cards(&id).await.map_err(internal_error)?;
+    for entry in &mut entries {
+        if let TranscriptEntry::ToolCall { call_id, card, .. } = entry
+            && let Some(stored) = cards.remove(call_id.as_str())
+        {
+            *card = Some(super::chat::cards::with_answers(&state.db(), stored).await);
+        }
+    }
     let end = match &query.before {
         Some(before) => entries
             .iter()

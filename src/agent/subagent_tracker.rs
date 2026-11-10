@@ -30,6 +30,8 @@ use aither_core::llm::tool::ToolContext;
 use aither_core::llm::{Event, LLMRequest, LLMRequestWithTools, Tool, ToolResult};
 use aither_sandbox::CommandUsage;
 use dashmap::DashMap;
+
+use crate::command_reading::{Card, SubagentState};
 use futures_lite::{Stream, StreamExt};
 
 tokio::task_local! {
@@ -154,9 +156,18 @@ pub struct SubagentTracker {
     runs: Arc<DashMap<u64, Arc<SubagentRun>>>,
     /// Run id sequence.
     next_id: Arc<AtomicU64>,
+    /// Where the commands of the session that render as cards report them.
+    cards: super::command_cards::CommandCards,
 }
 
 impl SubagentTracker {
+    /// The session's command cards: `subagent` reports its runs there, and
+    /// so do the other commands that render as cards.
+    #[must_use]
+    pub const fn cards(&self) -> &super::command_cards::CommandCards {
+        &self.cards
+    }
+
     /// Snapshots of all in-flight runs, oldest start first.
     #[must_use]
     pub fn running(&self) -> Vec<SubagentRunSnapshot> {
@@ -270,6 +281,8 @@ where
 pub struct TrackedSubagentTool<T> {
     inner: T,
     tracker: SubagentTracker,
+    /// Whether each run is reported as the card of its terminal call.
+    cards: bool,
 }
 
 impl<T> fmt::Debug for TrackedSubagentTool<T> {
@@ -282,7 +295,18 @@ impl<T> fmt::Debug for TrackedSubagentTool<T> {
 impl<T> TrackedSubagentTool<T> {
     /// Wraps `inner`, reporting every call to `tracker`.
     pub const fn new(inner: T, tracker: SubagentTracker) -> Self {
-        Self { inner, tracker }
+        Self {
+            inner,
+            tracker,
+            cards: false,
+        }
+    }
+
+    /// Reports every run as the card of the terminal call that started it.
+    #[must_use]
+    pub const fn with_cards(mut self) -> Self {
+        self.cards = true;
+        self
     }
 }
 
@@ -313,7 +337,42 @@ where
             .await
             .unwrap_or(prompt_file);
         let (run, _guard) = self.tracker.begin(&subagent, &prompt);
-        ACTIVE_RUN.scope(run, self.inner.call(args, cx)).await
+        let card = self
+            .cards
+            .then(|| cx.identity().map(|identity| identity.call().to_string()))
+            .flatten();
+        let started_at = jiff::Timestamp::now();
+        let card_of = |state, finished_at, result| Card::Subagent {
+            agent: subagent.clone(),
+            title: Card::brief_title(&prompt),
+            state,
+            started_at,
+            finished_at,
+            result,
+        };
+        if let Some(call_id) = &card {
+            self.tracker
+                .cards()
+                .report(call_id, Some(card_of(SubagentState::Running, None, None)));
+        }
+        let outcome = ACTIVE_RUN.scope(run, self.inner.call(args, cx)).await;
+        if let Some(call_id) = &card {
+            // A run that failed has no card: the ordinary row shows why.
+            let finished = outcome.as_ref().ok().and_then(|result| match result {
+                ToolResult::Text { text } | ToolResult::Tsv { text } => Some(text.clone()),
+                ToolResult::Done => Some(String::new()),
+                _ => None,
+            });
+            let card = finished.map(|text| {
+                card_of(
+                    SubagentState::Done,
+                    Some(jiff::Timestamp::now()),
+                    Some(text),
+                )
+            });
+            self.tracker.cards().report(call_id, card);
+        }
+        outcome
     }
 }
 
@@ -323,5 +382,127 @@ where
 {
     fn usage(&self) -> impl Future<Output = String> + Send {
         self.inner.usage()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_core::llm::{AgentIdentity, CallIdentity, ToolCallId};
+
+    use super::*;
+
+    /// An inner `subagent` that returns `outcome`.
+    struct Stub(Result<&'static str, &'static str>);
+
+    impl Tool for Stub {
+        fn name(&self) -> Cow<'static, str> {
+            Cow::Borrowed("subagent")
+        }
+
+        type Arguments = SubagentArgs;
+        type Res = ToolResult;
+
+        #[allow(clippy::unused_async_trait_impl)]
+        async fn call(
+            &self,
+            _: Self::Arguments,
+            _: ToolContext,
+        ) -> aither_core::Result<ToolResult> {
+            match self.0 {
+                Ok(text) => Ok(ToolResult::text(text)),
+                Err(message) => Err(anyhow::anyhow!(message)),
+            }
+        }
+    }
+
+    fn args(brief: &std::path::Path) -> SubagentArgs {
+        serde_json::from_value(serde_json::json!({
+            "name": "explorer",
+            "prompt_file": brief.to_str().expect("utf-8 path"),
+        }))
+        .expect("subagent arguments")
+    }
+
+    fn call_context() -> ToolContext {
+        ToolContext::new().with_identity(CallIdentity::new(
+            ToolCallId::new("c1"),
+            AgentIdentity::Main,
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_run_is_reported_as_the_card_of_its_call_until_it_returns() {
+        let dir = tempfile::tempdir().expect("dir");
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "\n## Map the parser\n\nbody").expect("brief");
+        let tracker = SubagentTracker::default();
+        let updates = tracker.cards().claim_updates().expect("reader");
+        let tool = TrackedSubagentTool::new(Stub(Ok("Found two parsers.")), tracker).with_cards();
+        tool.call(args(&brief), call_context()).await.expect("runs");
+
+        let running = updates.try_recv().expect("start");
+        assert_eq!(running.call_id, "c1");
+        let Some(Card::Subagent {
+            agent,
+            title,
+            state,
+            result,
+            ..
+        }) = running.card
+        else {
+            panic!("a subagent card");
+        };
+        assert_eq!(
+            (agent.as_str(), title.as_str()),
+            ("explorer", "Map the parser")
+        );
+        assert_eq!((state, result), (SubagentState::Running, None));
+
+        let done = updates.try_recv().expect("completion");
+        let Some(Card::Subagent {
+            state,
+            finished_at,
+            result,
+            ..
+        }) = done.card
+        else {
+            panic!("a subagent card");
+        };
+        assert_eq!(state, SubagentState::Done);
+        assert!(finished_at.is_some());
+        assert_eq!(result.as_deref(), Some("Found two parsers."));
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_withdraws_its_card() {
+        let dir = tempfile::tempdir().expect("dir");
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "brief").expect("brief");
+        let tracker = SubagentTracker::default();
+        let updates = tracker.cards().claim_updates().expect("reader");
+        let tool = TrackedSubagentTool::new(Stub(Err("no such subagent")), tracker).with_cards();
+        assert!(tool.call(args(&brief), call_context()).await.is_err());
+        assert!(updates.try_recv().expect("start").card.is_some());
+        assert_eq!(updates.try_recv().expect("withdrawn").card, None);
+    }
+
+    #[tokio::test]
+    async fn explore_and_calls_outside_a_terminal_report_no_card() {
+        let dir = tempfile::tempdir().expect("dir");
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "brief").expect("brief");
+        let tracker = SubagentTracker::default();
+        let updates = tracker.cards().claim_updates().expect("reader");
+        let plain = TrackedSubagentTool::new(Stub(Ok("x")), tracker.clone());
+        plain
+            .call(args(&brief), call_context())
+            .await
+            .expect("runs");
+        let carded = TrackedSubagentTool::new(Stub(Ok("x")), tracker).with_cards();
+        carded
+            .call(args(&brief), ToolContext::new())
+            .await
+            .expect("runs");
+        assert!(updates.try_recv().is_err());
     }
 }

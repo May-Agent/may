@@ -129,6 +129,7 @@ async fn resolve_ask_user(
         .await
         .map_err(ask_user_respond_error)?
         .ok_or_else(ask_user_not_open_error)?;
+    super::chat::cards::announce_answer(state, &resolved.session_id, id).await;
     let runtime = match resolved.outcome {
         AskUserOutcome::Woke | AskUserOutcome::AlreadyAnswered => state
             .runtime_service

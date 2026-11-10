@@ -1867,6 +1867,9 @@ impl App {
                             if let Some(reading) = msg.reading.clone() {
                                 self.chat.set_tool_reading(&id, reading);
                             }
+                            if msg.card.is_some() {
+                                self.chat.set_tool_card(&id, msg.card.clone());
+                            }
                         }
                         Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
                             self.show_tool_end(&id, &result);
@@ -3869,6 +3872,7 @@ impl App {
                 mode: aither_sandbox::TerminalExecutionMode::Unsafe,
                 location: None,
                 reading: None,
+                card: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4329,6 +4333,7 @@ impl App {
                 location,
                 // The daemon's reading arrives right after the start.
                 reading: None,
+                card: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),

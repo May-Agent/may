@@ -26,6 +26,7 @@ import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, terminalLocation, type OutputStream } from '@/lib/terminalResult';
 import { recognisesAny } from '@/lib/commandReading';
+import { CommandCardView } from './CommandCardView';
 import { CommandReadingView } from './CommandReadingView';
 import { CompactionRow } from './CompactionRow';
 import { searchFetchLabel } from '@/lib/hostedLabel';
@@ -348,7 +349,10 @@ function ExpandableToolCard({ tool }: ToolCardProps) {
     }
   }, [streamTerminalDetails]);
 
+  const card = tool.summary?.card ?? null;
+
   return (
+    <>
     <details ref={detailsRef} className="group">
       <summary
         className={cn(
@@ -378,5 +382,11 @@ function ExpandableToolCard({ tool }: ToolCardProps) {
       </summary>
       {details && <div className="mt-1.5 ml-5 space-y-2">{details}</div>}
     </details>
+    {card && (
+      <div className="mt-1 ml-5">
+        <CommandCardView card={card} />
+      </div>
+    )}
+    </>
   );
 }
