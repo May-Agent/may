@@ -21,4 +21,7 @@ pub struct Model {
     pub prompt_tokens: i64,
     /// The request's prompt-prefix hash chain, `rmp_serde` encoded.
     pub chain: Vec<u8>,
+    /// The route's cache block size its reads imply: the greatest common
+    /// divisor of the nonzero reads up to this request. `None` before one.
+    pub cache_block_tokens: Option<i64>,
 }

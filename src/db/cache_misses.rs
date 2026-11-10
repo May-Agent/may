@@ -14,7 +14,7 @@ use aither_core::llm::Usage;
 
 use super::{
     ChatDb, ChatDbError,
-    entity::{cache_misses, prompt_cache_blocks, prompt_cache_routes},
+    entity::{cache_misses, prompt_cache_routes},
     query, storage_error, to_i64_from_u64,
 };
 use crate::agent::cache_miss::{
@@ -73,19 +73,12 @@ impl ChatDb {
             request.usage,
             request.prefix.chain,
         );
-        let observed = query!(
-            self.db,
-            "SELECT * FROM prompt_cache_blocks WHERE session_id = ? AND provider_id = ? AND model = ?",
-            request.session_id,
-            request.provider_id,
-            request.model
-        )
-        .fetch_all::<prompt_cache_blocks::Model>()
-        .await?
-        .first()
-        .and_then(|row| u64::try_from(row.block_tokens).ok())
-        .and_then(NonZeroU64::new);
-        let miss = match routes.iter().find(|route| is_this_route(route)) {
+        let this_route = routes.iter().find(|route| is_this_route(route));
+        let observed = this_route
+            .and_then(|route| route.cache_block_tokens)
+            .and_then(|tokens| u64::try_from(tokens).ok())
+            .and_then(NonZeroU64::new);
+        let miss = match this_route {
             Some(route) => {
                 let previous = stored_observation(route)?;
                 let since = SincePrevious {
@@ -136,30 +129,17 @@ impl ChatDb {
             .execute()
             .await?;
         }
-        if let Some(block) = inferred.filter(|_| inferred != observed) {
-            query!(
-                tx,
-                "INSERT INTO prompt_cache_blocks (session_id, provider_id, model, block_tokens) \
-                 VALUES (?, ?, ?, ?) \
-                 ON CONFLICT (session_id, provider_id, model) DO UPDATE SET \
-                 block_tokens = excluded.block_tokens",
-                request.session_id,
-                request.provider_id,
-                request.model,
-                to_i64_from_u64(block.get(), "block_tokens")?,
-            )
-            .execute()
-            .await?;
-        }
         query!(
             tx,
             "INSERT INTO prompt_cache_routes (session_id, provider_id, model, observed_at_ms, \
-             cache_read_tokens, cache_write_tokens, prompt_tokens, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             cache_read_tokens, cache_write_tokens, prompt_tokens, chain, cache_block_tokens) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (session_id, provider_id, model) DO UPDATE SET \
              observed_at_ms = excluded.observed_at_ms, \
              cache_read_tokens = excluded.cache_read_tokens, \
              cache_write_tokens = excluded.cache_write_tokens, \
-             prompt_tokens = excluded.prompt_tokens, chain = excluded.chain",
+             prompt_tokens = excluded.prompt_tokens, chain = excluded.chain, \
+             cache_block_tokens = excluded.cache_block_tokens",
             request.session_id,
             request.provider_id,
             request.model,
@@ -171,6 +151,9 @@ impl ChatDb {
                 .transpose()?,
             to_i64_from_u64(current.prompt_tokens, "prompt_tokens")?,
             chain.as_slice(),
+            inferred
+                .map(|block| to_i64_from_u64(block.get(), "cache_block_tokens"))
+                .transpose()?,
         )
         .execute()
         .await?;
