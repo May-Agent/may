@@ -3,7 +3,7 @@
 use aither_cloud::{
     ClaudeProvider, CloudModelProvider, CodexProvider, CopilotProvider, GeminiProvider,
 };
-use aither_core::llm::{LanguageModelProvider, model::Ability};
+use aither_core::llm::LanguageModelProvider;
 use aither_models::lookup as lookup_model_info;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -233,8 +233,11 @@ async fn fetch_models_for_provider(
                 provider_description.to_string()
             };
 
-            let mut abilities: Vec<String> =
-                p.abilities.into_iter().map(ability_to_label).collect();
+            let mut abilities: Vec<String> = p
+                .abilities
+                .into_iter()
+                .map(|a| a.label().to_string())
+                .collect();
 
             // Enrich with abilities from the static model database when the
             // provider API returns none (Claude/Gemini list_models omit them).
@@ -244,7 +247,7 @@ async fn fetch_models_for_provider(
                 abilities = info
                     .abilities()
                     .iter()
-                    .map(|a| ability_to_label(*a))
+                    .map(|a| a.label().to_string())
                     .collect();
             }
 
@@ -305,7 +308,7 @@ async fn fetch_openai_compatible_models(
                 .map(|info| {
                     info.abilities()
                         .iter()
-                        .map(|ability| ability_to_label(*ability))
+                        .map(|ability| ability.label().to_string())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -337,34 +340,6 @@ struct OpenAiModelDescriptor {
     max_tokens: Option<u32>,
     #[serde(default, alias = "inputTokenLimit", alias = "input_token_limit")]
     input_token_limit: Option<u32>,
-}
-
-/// Stable lowercase label for a model [`Ability`], used in listings.
-///
-/// # Panics
-///
-/// Panics on an [`Ability`] variant added without a corresponding label —
-/// keep the arm list in sync.
-#[must_use]
-pub fn ability_to_label(ability: Ability) -> String {
-    match ability {
-        Ability::ToolUse => "tool_use".to_string(),
-        Ability::Vision => "vision".to_string(),
-        Ability::Audio => "audio".to_string(),
-        Ability::AudioOutput => "audio_output".to_string(),
-        Ability::Video => "video".to_string(),
-        Ability::WebSearch => "web_search".to_string(),
-        Ability::Pdf => "pdf".to_string(),
-        Ability::CodeExecution => "code_execution".to_string(),
-        Ability::Reasoning => "reasoning".to_string(),
-        Ability::ImageGeneration => "image_generation".to_string(),
-        Ability::ComputerUse => "computer_use".to_string(),
-        Ability::PromptCaching => "prompt_caching".to_string(),
-        Ability::AssistantPrefill => "assistant_prefill".to_string(),
-        Ability::PerMessageEffort => "per_message_effort".to_string(),
-        Ability::MidConversationSystem => "mid_conversation_system".to_string(),
-        _ => panic!("unsupported ability variant: {ability:?}"),
-    }
 }
 
 /// Trailing tokens a provider catalog uses to encode a reasoning-effort rung
@@ -541,23 +516,9 @@ pub fn effort_ladder(
 #[cfg(test)]
 mod tests {
     use super::{
-        Ability, FamilyEffortRungs, FetchedModel, ProviderType, ability_to_label, effort_ladder,
-        effort_rung_rank, record_family_effort_rungs, same_selectable_model,
+        FamilyEffortRungs, FetchedModel, ProviderType, effort_ladder, effort_rung_rank,
+        record_family_effort_rungs, same_selectable_model,
     };
-
-    /// The abilities aither-core 0.27 added, which the catalog sets on the
-    /// Claude models, list instead of panicking.
-    #[test]
-    fn the_cache_preserving_abilities_have_labels() {
-        assert_eq!(
-            ability_to_label(Ability::PerMessageEffort),
-            "per_message_effort"
-        );
-        assert_eq!(
-            ability_to_label(Ability::MidConversationSystem),
-            "mid_conversation_system"
-        );
-    }
 
     fn fetched(provider_id: &str, id: &str) -> FetchedModel {
         FetchedModel {

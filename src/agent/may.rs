@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aither_agent::{
-    Agent, AgentError, AgentKind, AgentOptions, CompactResult, HCons, Prepared, PromptCache, Run,
-    TerminalAgentBuilder, Unprepared,
+    Agent, AgentError, AgentKind, AgentOptions, CacheKeepAlive, CompactResult, HCons, Prepared,
+    PromptCache, Run, TerminalAgentBuilder, Unprepared,
 };
 use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
@@ -434,8 +434,6 @@ impl MayAgent {
     /// Returns [`MayAgentError`] when the sandbox environment cannot be
     /// prepared — opening the network audit log, creating the terminal tool,
     /// or registering the skills/subagents directories fails.
-    // aither does not export `CacheKeepAlive`, so only its default can be named.
-    #[allow(clippy::default_trait_access)]
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
         let is_container = matches!(config.environment, AgentEnvironment::Container { .. });
 
@@ -821,11 +819,7 @@ impl MayAgent {
             )
             .context_policy(config.context_policy)
             .background_jobs(config.background_jobs)
-            // A run parked on a detached command refreshes the cache entry
-            // the command would outlive, at aither's default lead of
-            // `keep_warm::REFRESH_MARGIN` (the type is not exported, so only
-            // its default can be named).
-            .cache_keep_alive(Default::default())
+            .cache_keep_alive(CacheKeepAlive::default())
             .connectivity(config.connectivity.clone());
         if let Some(runtime) = hook_runtime.clone() {
             builder = builder

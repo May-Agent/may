@@ -27,7 +27,7 @@ const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
-    "282a342df9f5e2865d207b86153e155294b4f5b70c64b0eb2fbee81367fbef3a";
+    "f8e2e8115411da5e848cd11c5ff1cd0ed67a2d7b051df957ab6bfb0b1ed4e6c3";
 
 /// Loads the distribution: aither's embedded, hash-pinned baseline tools with
 /// May's own host programs in place of the baseline's.
