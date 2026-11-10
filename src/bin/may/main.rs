@@ -1967,7 +1967,6 @@ where
                                             session_id.as_str(),
                                             &[],
                                             &[],
-                                            &[],
                                             &may_agent::db::SessionIntervals::default(),
                                             Some(created_at.as_millisecond()),
                                             jiff::Timestamp::now().as_millisecond(),

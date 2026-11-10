@@ -173,6 +173,7 @@ mod tests {
             elapsed_ms: 4_000,
             ok: true,
             error: None,
+            keep_warm: false,
         })
         .await
         .expect("request log persists");
@@ -210,7 +211,6 @@ mod tests {
         let report = assemble_usage_report(
             session,
             &rows,
-            &[],
             &[],
             &intervals,
             Some(created),

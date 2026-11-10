@@ -311,12 +311,6 @@ pub async fn usage_report(
         .request_logs_for_session(&session_id)
         .await
         .map_err(internal_error)?;
-    let keep_warm = state
-        .runtime_service
-        .db()
-        .keep_warm_request_ids_for_session(&session_id)
-        .await
-        .map_err(internal_error)?;
     let intervals = state
         .runtime_service
         .db()
@@ -346,7 +340,6 @@ pub async fn usage_report(
     json_ok_response(&crate::agent::assemble_usage_report(
         &session_id,
         &rows,
-        &keep_warm,
         &misses,
         &intervals,
         created_at_ms,

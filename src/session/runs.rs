@@ -116,15 +116,9 @@ impl SessionRuns {
         &self,
         entry: crate::daemon::types::RequestLogEntry,
     ) {
-        let logged = match self.db.append_request_log(entry.as_params()).await {
-            Ok(logged) => logged,
-            Err(error) => {
-                tracing::warn!(%error, "failed to persist a keep-warm request");
-                return;
-            }
-        };
-        if let Err(error) = self.db.mark_request_keep_warm(&logged).await {
-            tracing::warn!(%error, "failed to mark a keep-warm request");
+        if let Err(error) = self.db.append_request_log(entry.as_params()).await {
+            tracing::warn!(%error, "failed to persist a keep-warm request");
+            return;
         }
         self.ui_event_bus.publish(UiEventTopics::REQUEST_LOGS);
     }

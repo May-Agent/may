@@ -122,13 +122,11 @@ fn stored_cause(row: &cache_misses::Model) -> CacheMissCause {
         .unwrap_or_else(|error| panic!("cache_misses row {}: {error}", row.id))
 }
 
-/// Fold the session's request log into a usage report. `keep_warm` holds the
-/// ids of the logged requests that only refreshed the prompt cache.
+/// Fold the session's request log into a usage report.
 #[must_use]
 pub fn assemble_usage_report(
     session_id: &str,
     rows: &[request_logs::Model],
-    keep_warm: &[i32],
     misses: &[cache_misses::Model],
     intervals: &SessionIntervals,
     created_at_ms: Option<i64>,
@@ -159,7 +157,7 @@ pub fn assemble_usage_report(
             });
         let entry = &mut models[index];
         entry.requests += 1;
-        entry.keep_warm_requests += u64::from(keep_warm.contains(&row.id));
+        entry.keep_warm_requests += u64::from(row.keep_warm);
         entry.prompt_tokens += u64::try_from(row.prompt_tokens.unwrap_or(0)).unwrap_or_default();
         entry.completion_tokens +=
             u64::try_from(row.completion_tokens.unwrap_or(0)).unwrap_or_default();
@@ -303,6 +301,7 @@ mod tests {
             elapsed_ms: 1,
             ok: true,
             error: None,
+            keep_warm: false,
         }
     }
 
@@ -310,7 +309,6 @@ mod tests {
         let mut report = assemble_usage_report(
             "s",
             rows,
-            &[],
             &[],
             &SessionIntervals::default(),
             None,

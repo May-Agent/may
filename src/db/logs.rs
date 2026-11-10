@@ -51,8 +51,8 @@ impl ChatDb {
             .query(
                 "INSERT INTO request_logs (session_id, timestamp, model, provider_id, \
                  prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, \
-                 cache_write_tokens, context_window, elapsed_ms, ok, error) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 cache_write_tokens, context_window, elapsed_ms, ok, error, keep_warm) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(params.session_id)
             .bind(params.timestamp)
@@ -67,6 +67,7 @@ impl ChatDb {
             .bind(elapsed_ms)
             .bind(params.ok)
             .bind(params.error)
+            .bind(params.keep_warm)
             .execute()
             .await?;
 
@@ -109,50 +110,6 @@ impl ChatDb {
             .bind(session_id.to_string())
             .fetch_all::<request_logs::Model>()
             .await?)
-    }
-
-    /// Marks a logged request as a prompt-cache keep-warm request, so
-    /// `/usage` counts it apart from the conversation's own requests.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChatDbError`](ChatDbError) when the insert fails.
-    pub async fn mark_request_keep_warm(
-        &self,
-        request: &request_logs::Model,
-    ) -> Result<(), ChatDbError> {
-        self.db
-            .query("INSERT OR IGNORE INTO request_log_keep_warm (request_log_id, session_id) VALUES (?, ?)")
-            .bind(request.id)
-            .bind(request.session_id.clone())
-            .execute()
-            .await?;
-        Ok(())
-    }
-
-    /// The ids of the session's logged requests that were keep-warm
-    /// requests.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChatDbError`](ChatDbError) when the query fails.
-    pub async fn keep_warm_request_ids_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<i32>, ChatDbError> {
-        #[derive(serde::Deserialize, skyzen::FromRow)]
-        struct IdRow {
-            request_log_id: i32,
-        }
-        Ok(self
-            .db
-            .query("SELECT request_log_id FROM request_log_keep_warm WHERE session_id = ?")
-            .bind(session_id.to_string())
-            .fetch_all::<IdRow>()
-            .await?
-            .into_iter()
-            .map(|row| row.request_log_id)
-            .collect())
     }
 
     /// Append one network-access log entry.

@@ -899,7 +899,8 @@ async fn keep_warm_idle(
         &usage,
         agent.model_context_window(),
     )
-    .success(elapsed_ms);
+    .success(elapsed_ms)
+    .keep_warm();
     runs.record_keep_warm_request(entry).await;
     KeepWarmOutcome::Refreshed
 }

@@ -204,16 +204,14 @@ async fn the_idle_worker_refreshes_and_a_turn_cancels_it() {
         .request_logs_for_session(&session_id)
         .await
         .expect("request logs");
-    let keep_warm = db
-        .keep_warm_request_ids_for_session(&session_id)
-        .await
-        .expect("keep-warm ids");
     assert!(rows.len() >= 2, "{rows:?}");
-    assert_eq!(keep_warm.len(), rows.len(), "every logged request is one");
+    assert!(
+        rows.iter().all(|row| row.keep_warm),
+        "every logged request is one"
+    );
     let report = super::assemble_usage_report(
         &session_id,
         &rows,
-        &keep_warm,
         &[],
         &crate::db::SessionIntervals::default(),
         None,
