@@ -2052,18 +2052,24 @@ where
                         }
                     }
                     Some(SendAction::SshAdd { name, target }) => {
-                        app.config
-                            .upsert_ssh_server(may_agent::config::SshServerConfig {
-                                name: name.clone(),
-                                target,
-                            });
-                        if let Err(e) = app.config.clone().save().await {
-                            let err_msg = format!("Failed to save SSH server: {e}");
-                            app.chat.push_error(&err_msg);
-                        } else {
-                            app.set_status(format!("Added SSH server: {name}"));
-                            if app.ssh_selected + 1 < app.config.ssh_servers.len() {
-                                app.ssh_selected = app.config.ssh_servers.len() - 1;
+                        app.set_status(format!("Probing SSH server: {name}"));
+                        match may_agent::config::SshServerConfig::probe(name.clone(), target).await
+                        {
+                            Err(e) => {
+                                app.chat
+                                    .push_error(&format!("Failed to add SSH server {name}: {e}"));
+                            }
+                            Ok(server) => {
+                                app.config.upsert_ssh_server(server);
+                                if let Err(e) = app.config.clone().save().await {
+                                    let err_msg = format!("Failed to save SSH server: {e}");
+                                    app.chat.push_error(&err_msg);
+                                } else {
+                                    app.set_status(format!("Added SSH server: {name}"));
+                                    if app.ssh_selected + 1 < app.config.ssh_servers.len() {
+                                        app.ssh_selected = app.config.ssh_servers.len() - 1;
+                                    }
+                                }
                             }
                         }
                     }
