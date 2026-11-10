@@ -10,7 +10,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use aither_sandbox::{
-    ScriptLanguage, TerminalMode,
+    CommandLocation, ScriptLanguage, TerminalMode,
     permission::{PermissionError, PermissionHandler},
 };
 
@@ -567,6 +567,7 @@ impl PermissionHandler for PermissionApprover {
         mode: TerminalMode,
         script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> Result<bool, PermissionError> {
         match mode {
             TerminalMode::Sandboxed => Ok(true),
@@ -593,6 +594,7 @@ impl PermissionHandler for PermissionApprover {
         mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> bool {
         !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
             && matches!(mode, TerminalMode::Unsafe)

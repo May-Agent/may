@@ -615,6 +615,7 @@ pub struct RequestLogEntry {
     pub(crate) elapsed_ms: u64,
     pub(crate) ok: bool,
     pub(crate) error: Option<String>,
+    pub(crate) keep_warm: bool,
 }
 
 impl From<crate::db::entity::request_logs::Model> for RequestLogEntry {
@@ -645,6 +646,7 @@ impl From<crate::db::entity::request_logs::Model> for RequestLogEntry {
             elapsed_ms: u64::try_from(value.elapsed_ms).unwrap_or(0),
             ok: value.ok,
             error: value.error,
+            keep_warm: value.keep_warm,
         }
     }
 }
@@ -706,6 +708,33 @@ impl RequestLogEntry {
             elapsed_ms: 0,
             ok: false,
             error: None,
+            keep_warm: false,
+        }
+    }
+
+    /// Marks the entry as a request that only refreshed the prompt cache.
+    pub(crate) const fn keep_warm(mut self) -> Self {
+        self.keep_warm = true;
+        self
+    }
+
+    /// The row this entry is stored as.
+    pub(crate) fn as_params(&self) -> crate::db::RequestLogParams<'_> {
+        crate::db::RequestLogParams {
+            session_id: self.session_id.as_str(),
+            timestamp: self.timestamp.as_str(),
+            model: self.model.as_str(),
+            provider_id: self.provider_id.as_str(),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            context_window: self.context_window,
+            elapsed_ms: self.elapsed_ms,
+            ok: self.ok,
+            error: self.error.as_deref(),
+            keep_warm: self.keep_warm,
         }
     }
 

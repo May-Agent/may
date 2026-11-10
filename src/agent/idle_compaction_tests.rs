@@ -392,6 +392,22 @@ impl Session {
         Self::start_with(config, false).await
     }
 
+    /// Starts a session whose cache entry ages on the system clock, for a
+    /// test that waits on the idle worker's real timers.
+    pub(super) async fn start_on_system_clock(config: &MayConfig) -> Self {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parts = SessionParts::new(temp.path().to_path_buf()).await;
+        let clock = ManualClock::new();
+        let agent = Box::pin(Self::build_on(config, &parts, None, 0)).await;
+        Self {
+            agent,
+            clock,
+            parts,
+            temp,
+        }
+    }
+
     /// Starts a session that persists its interactions through a runtime
     /// service over its database, as the web server's sessions do.
     pub(super) async fn start_with_runtime(config: &MayConfig) -> Self {
@@ -455,12 +471,22 @@ impl Session {
         clock: &ManualClock,
         prompt_cache_epoch: u32,
     ) -> MayAgent {
+        Self::build_on(config, parts, Some(clock), prompt_cache_epoch).await
+    }
+
+    /// Like [`Self::build`], on the system clock when `clock` is `None`.
+    async fn build_on(
+        config: &MayConfig,
+        parts: &SessionParts,
+        clock: Option<&ManualClock>,
+        prompt_cache_epoch: u32,
+    ) -> MayAgent {
         let mut input = parts.input().await;
         input.prompt_cache_epoch = prompt_cache_epoch;
         let mut agent_config: MayAgentConfig = MayAgent::session_config(config, input)
             .await
             .expect("the session config resolves");
-        agent_config.clock = Some(clock.clone());
+        agent_config.clock = clock.cloned();
         agent_config.ssh_servers = parts.ssh_servers.clone();
         agent_config.host_reader = Some(parts.host.source());
         Box::pin(MayAgent::new(agent_config))
