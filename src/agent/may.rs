@@ -523,20 +523,16 @@ impl MayAgent {
         // Local and container commands draw from the pool: a container
         // command's fifo is made in the container's kernel and brokered by
         // aither's relay over its exec, so it works on VM-backed runtimes
-        // too. An SSH server is another machine, and aither fails SSH
-        // executions while a pool is configured, so a session with SSH
-        // servers runs without one.
-        let terminal_tool = if config.ssh_servers.is_empty() {
-            let connection = config
-                .job_server
-                .connect()
-                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
-            terminal_tool
-                .with_jobserver_pool(connection.pool, connection.fifo_dir)
-                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
-        } else {
-            terminal_tool
-        };
+        // too. A command located on an SSH server runs on another machine,
+        // outside the pool, and takes no local token; aither enforces that,
+        // so a session with SSH servers is built with the pool like any other.
+        let connection = config
+            .job_server
+            .connect()
+            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+        let terminal_tool = terminal_tool
+            .with_jobserver_pool(connection.pool, connection.fifo_dir)
+            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
