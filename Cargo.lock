@@ -5,11 +5,11 @@ version = 4
 [[package]]
 name = "acpsub"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/acpsub?branch=dev#fc7fcdecd6d92e25195b1d2f4560c10d5d18881f"
+source = "git+https://github.com/lexoliu/acpsub?branch=dev#0f6446c249e7fa5a1336b2218fb8d7635dfcf7fc"
 dependencies = [
- "aither-acp 0.28.0",
- "aither-core 0.28.0",
- "aither-mcp 0.28.0",
+ "aither-acp",
+ "aither-core",
+ "aither-mcp",
  "async-net",
  "async-process",
  "dirs",
@@ -144,34 +144,13 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a805f0d52436cb4fe2f5ebce01f04819d0c30891405e5f400cd012b5a3640f0e"
-dependencies = [
- "aither-agent 0.28.0",
- "aither-core 0.28.0",
- "aither-mcp 0.28.0",
- "async-channel",
- "async-process",
- "executor-core",
- "futures-lite",
- "futures-util",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "aither-acp"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f185cb5e4650bc000fe6a90cbf653cee8282bc73ea977396932c99427e9bd568"
 dependencies = [
- "aither-agent 0.29.0",
- "aither-core 0.29.0",
- "aither-mcp 0.29.0",
+ "aither-agent",
+ "aither-core",
+ "aither-mcp",
  "async-channel",
  "async-process",
  "executor-core",
@@ -182,52 +161,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "aither-agent"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62398eab2f399bdb6040a8692a4eed80e9c654dbc8277b30510b0d1ae048a5d7"
-dependencies = [
- "aho-corasick",
- "aither-attachments 0.28.0",
- "aither-core 0.28.0",
- "aither-mcp 0.28.0",
- "aither-sandbox 0.28.0",
- "anyhow",
- "arc-swap",
- "askama 0.16.1",
- "async-channel",
- "async-fs",
- "async-io",
- "async-process",
- "async-stream",
- "basic-toml",
- "blocking",
- "dunce",
- "event-listener",
- "executor-core",
- "futures",
- "futures-core",
- "futures-lite",
- "indexmap",
- "jiff",
- "libc",
- "notify",
- "num-traits",
- "regex",
- "rustix 1.1.6",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "similar",
- "sync_wrapper",
- "thiserror 2.0.21",
- "tracing",
- "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -237,11 +170,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2a8c1d50690fc66f9aba59490d00b67dbf27fa0d44804632636935166b42df0"
 dependencies = [
  "aho-corasick",
- "aither-attachments 0.29.0",
+ "aither-attachments",
  "aither-connectivity",
- "aither-core 0.29.0",
- "aither-mcp 0.29.0",
- "aither-sandbox 0.29.0",
+ "aither-core",
+ "aither-mcp",
+ "aither-sandbox",
  "aither-skills",
  "aither-webfetch",
  "anyhow",
@@ -282,20 +215,6 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "082db4baa299a2556eb79ea4291a816c77839c9460b735fe871759858dd0eed1"
-dependencies = [
- "async-fs",
- "const-hex",
- "futures-lite",
- "serde",
- "serde_json",
- "sha2 0.11.0",
-]
-
-[[package]]
-name = "aither-attachments"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7cb50ad5f7012f2cfb2491de8f3864f82994bec36d5951e7eb27802dd927c79"
@@ -314,8 +233,8 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "083c91a71ca140950eb276bb29dcc9011eb88337bfb22b6564d13958d19dee4c"
 dependencies = [
- "aither-agent 0.29.0",
- "aither-core 0.29.0",
+ "aither-agent",
+ "aither-core",
  "askama 0.16.1",
  "schemars",
  "serde",
@@ -328,7 +247,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4db5da7f6f567288878555f0229846db04b13d97f929d9c6e64f2ce213667cfc"
 dependencies = [
- "aither-core 0.29.0",
+ "aither-core",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -350,7 +269,7 @@ dependencies = [
  "aither-claude",
  "aither-codex",
  "aither-copilot",
- "aither-core 0.29.0",
+ "aither-core",
  "aither-gemini",
  "aither-openai",
  "async-stream",
@@ -365,7 +284,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80cf0daa0ccb376a9f91427a10be20b1fa21034fa5b49f1f9fa110b424cd49d2"
 dependencies = [
- "aither-core 0.29.0",
+ "aither-core",
  "aither-models",
  "aither-openai",
  "async-io",
@@ -416,7 +335,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ad45e58b7db5ce38633a1695eb7413d6d80cc20de33eb8fe06ad3ff9de98f2e"
 dependencies = [
- "aither-core 0.29.0",
+ "aither-core",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -433,30 +352,11 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51bc490484b339d04295504091d8ebe278449726f3f777d17abe69432249b3aa"
-dependencies = [
- "aither-derive 0.28.0",
- "anyhow",
- "askama 0.16.1",
- "futures-core",
- "futures-lite",
- "mime",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "url",
-]
-
-[[package]]
-name = "aither-core"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cf8a511b5f792bffa7df6896f2907b5cee6af60c20b95b1ba2358a6f52394d1"
 dependencies = [
- "aither-derive 0.29.0",
+ "aither-derive",
  "anyhow",
  "askama 0.16.1",
  "async-channel",
@@ -481,18 +381,6 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0af6e70b88825783a06d6977a3bf2a84fdfc93d2f3184134edb21a4e63da8ed"
-dependencies = [
- "convert_case 0.12.0",
- "proc-macro2",
- "quote",
- "syn 3.0.7",
-]
-
-[[package]]
-name = "aither-derive"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d0be17e2c3645829c3afabebff9144a2549d5d8b5e921d62980b63232a23054"
@@ -509,8 +397,8 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b089f9f9c3be60501773b0e3b91770d3ff32ebb35c91762f58dc0ee722644c1"
 dependencies = [
- "aither-attachments 0.29.0",
- "aither-core 0.29.0",
+ "aither-attachments",
+ "aither-core",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -529,37 +417,12 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ed2b980b5ea9da09de959817c1a8f645b65e284b9a6b7a045f7d8ea49674bc6"
-dependencies = [
- "aither-core 0.28.0",
- "aither-sandbox 0.28.0",
- "arc-swap",
- "askama 0.16.1",
- "async-channel",
- "async-process",
- "base64 0.23.1",
- "blocking",
- "executor-core",
- "futures-lite",
- "futures-util",
- "mime",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tracing",
- "zenwave",
-]
-
-[[package]]
-name = "aither-mcp"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3b3acec12806d144909fa828693b9be44609b221af7b5265ea27807b19aa644"
 dependencies = [
- "aither-core 0.29.0",
- "aither-sandbox 0.29.0",
+ "aither-core",
+ "aither-sandbox",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -583,7 +446,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "347a555b5bfd9643c31495ea9ac6aac69e430a598f416bfbb2404409a42ce04a"
 dependencies = [
- "aither-core 0.29.0",
+ "aither-core",
  "serde",
  "serde_json",
 ]
@@ -594,8 +457,8 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a247fd2ca6f742c4d22328a22d96609c9b95cfdb663ff5d78fa5c001df9f53f7"
 dependencies = [
- "aither-attachments 0.29.0",
- "aither-core 0.29.0",
+ "aither-attachments",
+ "aither-core",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -623,67 +486,12 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "156e44f98915c4a97389072e94b79648bc6658350c2183a463c9db2a26f08dfa"
-dependencies = [
- "aither-core 0.28.0",
- "anyhow",
- "arc-swap",
- "askama 0.16.1",
- "async-channel",
- "async-fs",
- "async-io",
- "async-lock",
- "async-process",
- "blocking",
- "bollard",
- "brush-parser",
- "dunce",
- "executor-core",
- "fd-lock",
- "flate2",
- "futures",
- "futures-lite",
- "globset",
- "heel",
- "hex",
- "image",
- "jiff",
- "libc",
- "lzma-rust2 0.24.0",
- "percent-encoding",
- "regex",
- "rmp-serde",
- "schemars",
- "semver",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "shell-words",
- "strsim",
- "tar",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "typed-path",
- "url",
- "uuid",
- "vte",
- "windows-sys 0.61.2",
- "zenwave",
- "zip 9.0.5",
-]
-
-[[package]]
-name = "aither-sandbox"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccea91d04ba75a5d346b303d1e2afc9aeb0bfde1109b10ab51542324f7ad91d5"
 dependencies = [
  "aither-connectivity",
- "aither-core 0.29.0",
+ "aither-core",
  "anyhow",
  "arc-swap",
  "askama 0.16.1",
@@ -766,7 +574,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0f19fc70588d68ece984374a828ff3d9d8d7015b5e1326ee7ac66bac5d82534"
 dependencies = [
- "aither-core 0.29.0",
+ "aither-core",
  "anyhow",
  "async-net",
  "dom_smoothie",
@@ -4651,7 +4459,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.5.3",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -5749,19 +5557,19 @@ version = "0.1.0"
 dependencies = [
  "acpsub",
  "ahash",
- "aither-acp 0.29.0",
- "aither-agent 0.29.0",
+ "aither-acp",
+ "aither-agent",
  "aither-browser",
  "aither-cloud",
  "aither-codex",
  "aither-connectivity",
  "aither-copilot",
- "aither-core 0.29.0",
- "aither-mcp 0.29.0",
+ "aither-core",
+ "aither-mcp",
  "aither-models",
  "aither-openai",
  "aither-patch",
- "aither-sandbox 0.29.0",
+ "aither-sandbox",
  "aither-sed",
  "anyhow",
  "arboard",
@@ -7862,7 +7670,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7901,7 +7709,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]

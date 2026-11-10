@@ -306,14 +306,8 @@ mod tests {
     }
 
     fn report(rows: &[request_logs::Model]) -> ModelUsageRow {
-        let mut report = assemble_usage_report(
-            "s",
-            rows,
-            &[],
-            &SessionIntervals::default(),
-            None,
-            1_000,
-        );
+        let mut report =
+            assemble_usage_report("s", rows, &[], &SessionIntervals::default(), None, 1_000);
         report.models.remove(0)
     }
 

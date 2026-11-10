@@ -1126,6 +1126,7 @@ where
             // that ends them so no spark stays on screen.
             needs_draw = app.processing
                 || app.new_year.animating()
+                || app.compaction.is_holding()
                 || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
