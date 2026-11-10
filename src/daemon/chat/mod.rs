@@ -762,13 +762,19 @@ fn project_tool_summary_for_sink(
     id: &str,
     name: &str,
     fallback: Option<&str>,
+    ended: bool,
 ) -> crate::daemon::tool_summary::ToolSummary {
     let raw = pending_streams
         .get(id)
         .map(|p| p.buffered_arguments.as_str())
         .or(fallback)
         .unwrap_or("");
-    crate::daemon::tool_summary::project_tool_summary(raw, ToolVariant::infer(name))
+    let variant = ToolVariant::infer(name);
+    if ended {
+        crate::daemon::tool_summary::project_final_tool_summary(raw, variant)
+    } else {
+        crate::daemon::tool_summary::project_tool_summary(raw, variant)
+    }
 }
 
 fn normalize_tool_delta_for_sink(

@@ -465,6 +465,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             &id,
                             &name,
                             Some(arguments.as_str()),
+                            false,
                         );
                         let summary = locate_reading(self.workdir, summary).await;
                         self.sink
@@ -481,6 +482,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             &id,
                             &name,
                             None,
+                            false,
                         );
                         self.sink
                             .on_tool_delta(&id, &name, &arguments_fragment, summary)
@@ -536,6 +538,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             &id,
                             &name,
                             Some(arguments.as_str()),
+                            false,
                         );
                         let summary = locate_reading(self.workdir, summary).await;
                         Some((id, name, arguments, summary))
@@ -595,6 +598,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     &id,
                     &name,
                     arguments.as_deref(),
+                    true,
                 );
                 self.pending_tool_streams.remove(&id);
                 if !self

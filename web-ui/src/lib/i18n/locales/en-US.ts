@@ -194,6 +194,7 @@ export const enUS = {
     escalated: 'Elevated permissions',
     sshLocation: 'SSH',
     viewFullOutput: 'View full output',
+    invalidArguments: 'invalid arguments',
     card: {
       tasksAdded: 'Task added',
       tasksStarted: 'Task started',

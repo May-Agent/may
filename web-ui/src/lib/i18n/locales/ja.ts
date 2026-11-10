@@ -196,6 +196,7 @@ export const ja: Messages = {
     escalated: '権限を昇格',
     sshLocation: 'SSH',
     viewFullOutput: '完全な出力を表示',
+    invalidArguments: '引数が無効',
     card: {
       tasksAdded: 'タスクを追加',
       tasksStarted: 'タスクを開始',
