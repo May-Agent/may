@@ -1655,7 +1655,9 @@ impl TaskScheduler {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                if let Err(e) = self.runtime.tick_due_tasks().await {
+                if let Some(Err(e)) =
+                    crate::panic_boundary::round("scheduler", self.runtime.tick_due_tasks()).await
+                {
                     tracing::error!(error = %e, "Scheduler tick failed");
                 }
             }

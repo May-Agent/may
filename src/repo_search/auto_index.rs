@@ -118,25 +118,32 @@ impl AutoIndexer {
         Ok(())
     }
 
+    /// Touches every due worktree; true when one was deferred.
+    async fn touch_due(&mut self) -> bool {
+        for worktree in self.due().await {
+            match self.touch(worktree.clone()).await {
+                Ok(()) => {
+                    tracing::debug!(worktree = %worktree.display(), "auto-index touched");
+                    self.touched.insert(worktree, Instant::now());
+                }
+                Err(error) => {
+                    tracing::debug!(worktree = %worktree.display(), %error, "auto-index deferred");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Runs forever.
     pub async fn run(mut self) {
         loop {
             let wait = self.backoff.unwrap_or(TICK);
             async_io::Timer::after(wait).await;
-            let mut failed = false;
-            for worktree in self.due().await {
-                match self.touch(worktree.clone()).await {
-                    Ok(()) => {
-                        tracing::debug!(worktree = %worktree.display(), "auto-index touched");
-                        self.touched.insert(worktree, Instant::now());
-                    }
-                    Err(error) => {
-                        tracing::debug!(worktree = %worktree.display(), %error, "auto-index deferred");
-                        failed = true;
-                        break;
-                    }
-                }
-            }
+            // A round that panics counts as failed, so the next one backs off.
+            let failed = crate::panic_boundary::round("auto-index", self.touch_due())
+                .await
+                .unwrap_or(true);
             self.backoff = failed.then(|| {
                 self.backoff
                     .map_or(RETOUCH, |current| current * 2)

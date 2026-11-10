@@ -156,7 +156,9 @@ pub(super) async fn stream_session_events(
     let epoch = state.session_events_epoch;
     let owns_turn = query.owns_turn;
     let task_state = state.clone();
-    state.tokio_handle.spawn(async move {
+    state.tokio_handle.spawn(crate::panic_boundary::round(
+        "session event stream",
+        async move {
         let client_gone = async {
             if reset {
                 #[derive(Serialize)]
@@ -223,7 +225,8 @@ pub(super) async fn stream_session_events(
                 tracing::error!(%session_id, %error, "failed to stop the session of a disconnected client");
             }
         }
-    });
+        },
+    ));
     Ok(sse)
 }
 
@@ -280,17 +283,23 @@ async fn run(state: Arc<DaemonState>, rx: SessionChangeReceiver) {
                 .or_default()
                 .insert(notice.kind);
         }
-        for (session_id, mut kinds) in pending.drain() {
-            for kind in kinds.take() {
-                publish_piece(
-                    &state,
-                    &session_id,
-                    kind,
-                    published.entry(session_id.clone()).or_default(),
-                )
-                .await;
-            }
-        }
+        Box::pin(crate::panic_boundary::round(
+            "session event dispatcher",
+            async {
+                for (session_id, mut kinds) in pending.drain() {
+                    for kind in kinds.take() {
+                        publish_piece(
+                            &state,
+                            &session_id,
+                            kind,
+                            published.entry(session_id.clone()).or_default(),
+                        )
+                        .await;
+                    }
+                }
+            },
+        ))
+        .await;
     }
 }
 

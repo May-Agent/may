@@ -112,7 +112,7 @@ fn advance(
 pub(super) fn spawn(state: Arc<DaemonState>) {
     state.tokio_handle.clone().spawn(async move {
         loop {
-            poll(&state).await;
+            crate::panic_boundary::round("pr checks", poll(&state)).await;
             let seconds = state.config.load().ci.pr_poll_seconds;
             async_io::Timer::after(Duration::from_secs(seconds)).await;
         }
