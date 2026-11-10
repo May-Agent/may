@@ -239,13 +239,13 @@ fn recap_window<'a>(
 #[derive(Template)]
 #[template(path = "aux/recap.md", escape = "none")]
 struct RecapPrompt {
-    language: Option<aither_agent::Language>,
+    language: Option<crate::harness::language::Language>,
 }
 
 /// The aux request: the windowed conversation, then the recap instruction.
 fn recap_messages(
     conversation: &[(&MessageRole, &str)],
-    language: Option<aither_agent::Language>,
+    language: Option<crate::harness::language::Language>,
 ) -> Vec<aither_core::llm::Message> {
     let prompt = RecapPrompt { language }
         .render()
@@ -456,7 +456,7 @@ async fn freshness(state: &Arc<DaemonState>, session_id: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn last_message(language: Option<aither_agent::Language>) -> String {
+    fn last_message(language: Option<crate::harness::language::Language>) -> String {
         let conversation = [
             (&MessageRole::User, "ship it"),
             (&MessageRole::Assistant, "shipped"),
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn the_recap_request_names_the_session_communication_language() {
-        let chinese: aither_agent::Language = "Chinese".parse().unwrap();
+        let chinese: crate::harness::language::Language = "Chinese".parse().unwrap();
         let prompt = last_message(Some(chinese));
         assert!(prompt.contains("Write in Chinese."), "{prompt}");
         assert!(!prompt.contains("language of the user's messages"));

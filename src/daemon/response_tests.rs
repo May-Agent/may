@@ -7,9 +7,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AnswerValue, AskUserArgs, AskUserRequest, AskUserRequestPayload};
-use aither_agent::workspace_request::RequestWorkspaceArgs;
-use aither_sandbox::TerminalMode;
+use crate::harness::ask_user::{AnswerValue, AskUserArgs, AskUserRequest, AskUserRequestPayload};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
+use aither_sandbox::SandboxMode;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -138,7 +138,7 @@ impl Prompt for Permission {
         let runtime = runtime.clone();
         tokio::spawn(async move {
             let accepted = approver
-                .request_and_wait(TerminalMode::Unsafe, "make install".to_string())
+                .request_and_wait(SandboxMode::Unsandboxed, "make install".to_string())
                 .await
                 .expect("the waiter is woken with a decision");
             observe(&runtime, Self::RESPONSE_ROLE, accepted).await
@@ -270,7 +270,7 @@ impl Prompt for Question {
         self.0
             .resolve(
                 id,
-                vec![aither_agent::ask_user::QuestionAnswer {
+                vec![crate::harness::ask_user::QuestionAnswer {
                     section: String::new(),
                     answer: AnswerValue::Selected(vec![answer.to_string()]),
                 }],
@@ -448,8 +448,8 @@ prompt_tests! {
     ask_user => Question,
 }
 
-fn answer(value: &str) -> Vec<aither_agent::ask_user::QuestionAnswer> {
-    vec![aither_agent::ask_user::QuestionAnswer {
+fn answer(value: &str) -> Vec<crate::harness::ask_user::QuestionAnswer> {
+    vec![crate::harness::ask_user::QuestionAnswer {
         section: String::new(),
         answer: AnswerValue::Selected(vec![value.to_string()]),
     }]
@@ -529,7 +529,7 @@ async fn only_selecting_the_allow_option_approves_a_late_answer() {
             .0
             .resolve(
                 &id,
-                vec![aither_agent::ask_user::QuestionAnswer {
+                vec![crate::harness::ask_user::QuestionAnswer {
                     section: String::new(),
                     answer: AnswerValue::Custom(typed.to_string()),
                 }],

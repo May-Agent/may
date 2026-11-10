@@ -2,6 +2,7 @@
 //! policies it checks scripts with and the commands its scripts call back.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aither_connectivity::Connectivity;
 use aither_core::AnyIdAllocator;
@@ -96,7 +97,7 @@ impl ShellAssembly {
     /// # Errors
     /// Fails when the environment cannot be prepared, the host `heel` cannot
     /// be verified, a server is invalid or the shell cannot be built.
-    pub async fn build(self) -> Result<SessionShell, ShellAssemblyError> {
+    pub async fn build(self) -> Result<Arc<SessionShell>, ShellAssemblyError> {
         let sandbox = self.sandbox().await?;
         let sessions = ShellSessionRegistry::default();
         for server in &self.ssh_servers {
@@ -125,6 +126,7 @@ impl ShellAssembly {
             Some(connectivity) => shell.with_connectivity(connectivity),
             None => shell,
         };
+        let shell = Arc::new(shell);
         self.slot.bind(&shell);
         Ok(shell)
     }

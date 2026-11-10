@@ -51,7 +51,7 @@ pub fn refresh_in(
 mod tests {
     use std::time::Instant;
 
-    use aither_sandbox::{JobPlace, ScriptLanguage, TerminalMode};
+    use aither_sandbox::{JobPlace, SandboxMode, ScriptLanguage};
 
     use super::*;
 
@@ -62,7 +62,7 @@ mod tests {
             execution_key: String::new(),
             script: "sleep 9999".to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            mode: SandboxMode::Sandboxed,
             started_at: Instant::now(),
             status,
             output_path: None,

@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use aither_sandbox::TerminalMode;
+use aither_sandbox::SandboxMode;
 
 use super::idle_compaction_tests::{
     SESSION_MODEL, Session, StubModel, run_short_turn, saved_config,
@@ -41,7 +41,7 @@ async fn start_job(
             &lease,
             "key",
             "sleep 9999",
-            TerminalMode::Sandboxed,
+            SandboxMode::Sandboxed,
             None,
         )
         .await;

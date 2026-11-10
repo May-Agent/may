@@ -572,7 +572,7 @@ pub async fn cancel_subagents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_sandbox::TerminalMode;
+    use aither_sandbox::SandboxMode;
 
     async fn registry_with_job(pid: u32, _task_id: &str) -> (JobRegistry, String) {
         let (registry, service) = aither_sandbox::job_registry_channel();
@@ -587,7 +587,7 @@ mod tests {
                 &task_id,
                 "key",
                 "sleep 30",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;

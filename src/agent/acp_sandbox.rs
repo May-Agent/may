@@ -27,7 +27,7 @@ use acpsub::{
 };
 use aither_acp::{PermissionOption, PermissionOptionKind, RequestPermissionOutcome};
 use aither_sandbox::permission::PermissionHandler as TerminalPermissions;
-use aither_sandbox::{CommandFifo, JobBroker, ProcessPriority, TerminalGrants, TerminalMode};
+use aither_sandbox::{CommandFifo, JobBroker, ProcessPriority, SandboxMode, TerminalGrants};
 use arc_swap::ArcSwap;
 use askama::Template;
 use event_listener::Event;
@@ -708,7 +708,7 @@ impl<N: Send + Sync + 'static> PermissionHandler for ApprovalPermissions<N> {
                 match approver
                     .clone()
                     .for_subagent()
-                    .request_and_wait(TerminalMode::Sandboxed, script)
+                    .request_and_wait(SandboxMode::Sandboxed, script)
                     .await
                 {
                     Ok(answer) => answer,

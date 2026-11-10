@@ -4415,7 +4415,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.5.3",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -4445,7 +4445,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -5513,6 +5513,7 @@ version = "0.1.0"
 dependencies = [
  "acpsub",
  "ahash",
+ "aho-corasick",
  "aither-acp",
  "aither-agent",
  "aither-browser",
@@ -5621,6 +5622,7 @@ dependencies = [
  "shell-escape",
  "shell-words",
  "shlex",
+ "similar",
  "skyzen",
  "skyzen-core",
  "skyzen-services",
@@ -5648,6 +5650,7 @@ dependencies = [
  "waterkit-screen",
  "web-push",
  "webrtc",
+ "whatlang",
  "which 8.0.6",
  "yuv",
  "zenwave",
@@ -7641,7 +7644,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7680,7 +7683,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -11483,6 +11486,15 @@ dependencies = [
  "lazy_static",
  "serde",
  "wezterm-dynamic",
+]
+
+[[package]]
+name = "whatlang"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e8f38b596e2a359b755342473520a99421e43658548c79489ee221b728c107"
+dependencies = [
+ "hashbrown 0.15.5",
 ]
 
 [[package]]

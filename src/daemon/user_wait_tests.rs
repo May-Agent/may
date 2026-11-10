@@ -5,11 +5,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayload};
-use aither_agent::workspace_request::RequestWorkspaceArgs;
+use crate::harness::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayload};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::permission::PermissionHandler;
-use aither_sandbox::{CommandLocation, ScriptLanguage, TerminalMode};
+use aither_sandbox::{CommandLocation, SandboxMode, ScriptLanguage};
 use base64::Engine;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -81,7 +81,7 @@ async fn an_unsafe_command_approval_announces_the_command() {
     let approver = fixture.approver();
     let _ = approver
         .check(
-            TerminalMode::Unsafe,
+            SandboxMode::Unsandboxed,
             "make install",
             ScriptLanguage::Shell,
             CommandLocation::Local,

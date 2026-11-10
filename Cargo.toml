@@ -109,7 +109,10 @@ cron = "0.15"
 chrono = "0.4"
 shell-escape = "0.1"
 shell-words = "1.1"
-arc-swap = "1"
+arc-swap = { version = "1", features = ["weak"] }
+aho-corasick = { version = "1.1.5", features = ["std", "perf-literal"] }
+whatlang = { version = "0.18", default-features = false }
+similar = "3"
 fastrand = "2"
 
 # Web Push notifications

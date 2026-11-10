@@ -1,4 +1,4 @@
-use aither_agent::tool_request::{
+use crate::harness::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};

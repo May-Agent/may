@@ -2,10 +2,10 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aither_sandbox::{IpcProvider, LaunchInfo, OutputStore};
-use arc_swap::ArcSwapOption;
+use arc_swap::ArcSwapWeak;
 use heel::ipc::{IpcContext, IpcError};
 use heel::{IpcCommand, IpcRouter};
 use serde_json::Value;
@@ -16,10 +16,18 @@ use super::payload::CommandEnvelope;
 use super::registry::CommandRegistry;
 
 /// The shell a bridge serves, set once the shell is built (the shell is
-/// built with the bridge, so the bridge cannot hold it earlier) and cleared
-/// when the session's agent is dropped, which ends the reference cycle.
-#[derive(Debug, Clone, Default)]
-pub struct ShellSlot(Arc<ArcSwapOption<SessionShell>>);
+/// built with the bridge, so the bridge cannot hold it earlier). The slot
+/// holds the shell weakly: the shell owns the bridge, so a strong reference
+/// would keep both alive forever, and the shell lives as long as its owner
+/// holds it.
+#[derive(Debug, Clone)]
+pub struct ShellSlot(Arc<ArcSwapWeak<SessionShell>>);
+
+impl Default for ShellSlot {
+    fn default() -> Self {
+        Self(Arc::new(ArcSwapWeak::new(Weak::new())))
+    }
+}
 
 impl ShellSlot {
     /// An empty slot.
@@ -28,18 +36,13 @@ impl ShellSlot {
         Self::default()
     }
 
-    /// Binds the slot to `shell`.
-    pub fn bind(&self, shell: &SessionShell) {
-        self.0.store(Some(Arc::new(shell.clone())));
-    }
-
-    /// Releases the shell.
-    pub fn release(&self) {
-        self.0.store(None);
+    /// Binds the slot to `shell`, which stays owned by the caller.
+    pub fn bind(&self, shell: &Arc<SessionShell>) {
+        self.0.store(Arc::downgrade(shell));
     }
 
     fn get(&self) -> Option<Arc<SessionShell>> {
-        self.0.load_full()
+        self.0.load().upgrade()
     }
 }
 

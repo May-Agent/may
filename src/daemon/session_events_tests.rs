@@ -339,7 +339,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
             &task_id,
             "exec-1",
             "sleep 60",
-            aither_sandbox::TerminalMode::Sandboxed,
+            aither_sandbox::SandboxMode::Sandboxed,
             None,
         )
         .await;

@@ -61,14 +61,14 @@ impl super::aux::AuxOutput for ProgressReport {
 #[derive(Template)]
 #[template(path = "aux/progress.md", escape = "none")]
 struct ProgressPrompt {
-    language: Option<aither_agent::Language>,
+    language: Option<crate::harness::language::Language>,
 }
 
 /// The side request: the messages the session's agent would send next, then
 /// the instruction.
 fn progress_messages(
     mut context: Vec<aither_core::llm::Message>,
-    language: Option<aither_agent::Language>,
+    language: Option<crate::harness::language::Language>,
 ) -> Vec<aither_core::llm::Message> {
     let prompt = ProgressPrompt { language }
         .render()
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn the_instruction_names_the_session_language() {
-        let chinese: aither_agent::Language = "Chinese".parse().unwrap();
+        let chinese: crate::harness::language::Language = "Chinese".parse().unwrap();
         let context = vec![aither_core::llm::Message::user("继续")];
         let messages = progress_messages(context, Some(chinese));
         assert_eq!(messages.len(), 2, "the context, then the instruction");

@@ -7,11 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use aither_agent::{
-    DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument, StopDecision, StopHook,
-    TurnBoundaryContext,
-};
 use askama::Template;
+
+use crate::harness::working_document::{
+    DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument,
+};
 
 use super::{FILE, TasksFile, violation_sentence};
 
@@ -68,10 +68,14 @@ pub fn document_spec(limit: &LineLimit) -> DocumentSpec {
 #[cfg(test)]
 pub(crate) fn working_document(
     sandbox_dir: &Path,
-    events: aither_agent::WorkEvents,
-) -> aither_agent::WorkingDocument {
-    aither_agent::WorkingDocument::new(&document_spec(&LineLimit::default()), sandbox_dir, events)
-        .with_notices(crate::agent::notices::may_notices())
+    events: crate::harness::working_document::WorkEvents,
+) -> crate::harness::working_document::WorkingDocument {
+    crate::harness::working_document::WorkingDocument::new(
+        &document_spec(&LineLimit::default()),
+        sandbox_dir,
+        events,
+    )
+    .with_continue_reminder(continue_reminder())
 }
 
 /// Reads `tasks.md`: rows of `Doing` and `Queued` are open work, `Roots`
@@ -125,33 +129,18 @@ impl DocumentSchema for TasksSchema {
 #[template(path = "tasks_continue.txt", escape = "none")]
 struct ContinueTemplate;
 
-/// The stop rule of `tasks.md`.
+/// The reminder of the stop rule of `tasks.md`.
 ///
 /// A document that fell behind — an event it left unrecorded, a row naming
 /// a finished item or a dead mark, a format violation — keeps the run going
 /// with the alert naming each; otherwise a row under `Doing` or `Queued`
-/// that nothing blocks keeps it going with a reminder to continue.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TasksStopHook;
-
-impl StopHook for TasksStopHook {
-    fn on_turn_end(
-        &self,
-        ctx: &TurnBoundaryContext<'_>,
-    ) -> impl Future<Output = StopDecision> + Send {
-        let decision = match ctx.document {
-            Some(review) if !review.findings().is_empty() => StopDecision::Hold { reminder: None },
-            Some(review) if review.actionable_rows().next().is_some() => StopDecision::Hold {
-                reminder: Some(
-                    ContinueTemplate
-                        .render()
-                        .expect("the tasks.md continue template is static"),
-                ),
-            },
-            _ => StopDecision::End,
-        };
-        std::future::ready(decision)
-    }
+/// that nothing blocks keeps it going with this reminder to continue. The
+/// working document applies the rule as the model ends its turn.
+#[must_use]
+pub fn continue_reminder() -> String {
+    ContinueTemplate
+        .render()
+        .expect("the tasks.md continue template is static")
 }
 
 #[derive(Template)]

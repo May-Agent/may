@@ -1,10 +1,10 @@
-//! The [`WorkTracker`](aither_agent::WorkTracker) over the session's issue
+//! The [`WorkTracker`](crate::harness::working_document::WorkTracker) over the session's issue
 //! and PR backends, which `tasks.md` reads its rows' state and its roots'
 //! trees through.
 
 use std::path::{Path, PathBuf};
 
-use aither_agent::working_document::{RelatedWork, WorkComment, WorkKind, WorkStatus};
+use crate::harness::working_document::{RelatedWork, WorkComment, WorkKind, WorkStatus};
 use aither_agent::{WorkItem, WorkRef, WorkState, WorkTrackerError};
 
 use crate::db::{ChatDb, PrRow};
@@ -179,7 +179,7 @@ impl MayWorkTracker {
     }
 }
 
-impl aither_agent::WorkTracker for MayWorkTracker {
+impl crate::harness::working_document::WorkTracker for MayWorkTracker {
     async fn item(&self, reference: &WorkRef) -> Result<WorkItem, WorkTrackerError> {
         match reference.kind() {
             WorkKind::Issue => self.issue(reference).await,

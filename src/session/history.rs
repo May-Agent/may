@@ -311,7 +311,7 @@ pub struct MessageTranslation {
 /// when the detector does not know it.
 #[must_use]
 pub fn language_display_name(code: &str) -> String {
-    code.parse::<aither_agent::Language>()
+    code.parse::<crate::harness::language::Language>()
         .map_or_else(|_| code.to_string(), |language| language.name().to_string())
 }
 

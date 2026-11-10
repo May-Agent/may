@@ -873,8 +873,8 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
             reason: reason.to_string(),
         })
     };
-    match aither_agent::validate_subagent_name(name) {
-        Err(aither_agent::DefinitionError::Reserved(_)) => {
+    match crate::harness::subagent_file::validate_subagent_name(name) {
+        Err(crate::harness::subagent_file::DefinitionError::Reserved(_)) => {
             return reject("the name belongs to a built-in subagent type");
         }
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
@@ -1562,13 +1562,13 @@ impl Default for SessionsConfig {
 /// name or an ISO 639-3 code, rejected at load when unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct ConfiguredLanguage(pub aither_agent::Language);
+pub struct ConfiguredLanguage(pub crate::harness::language::Language);
 
 impl TryFrom<String> for ConfiguredLanguage {
     type Error = String;
 
     fn try_from(name: String) -> Result<Self, String> {
-        name.parse::<aither_agent::Language>()
+        name.parse::<crate::harness::language::Language>()
             .map(Self)
             .map_err(|error| error.to_string())
     }
@@ -1597,11 +1597,11 @@ pub struct LanguageConfig {
 impl LanguageConfig {
     /// The languages the session's agent is held to.
     #[must_use]
-    pub fn languages(&self) -> aither_agent::Languages {
+    pub fn languages(&self) -> crate::harness::language::Languages {
         let languages = self
             .communication
-            .map_or_else(aither_agent::Languages::unset, |language| {
-                aither_agent::Languages::new(language.0)
+            .map_or_else(crate::harness::language::Languages::unset, |language| {
+                crate::harness::language::Languages::new(language.0)
             });
         self.working
             .map_or(languages, |working| languages.with_working(working.0))
@@ -1789,7 +1789,7 @@ pub struct HostLoadSettings {
 
 impl Default for HostLoadSettings {
     fn default() -> Self {
-        let defaults = aither_agent::HostLoadConfig::new();
+        let defaults = crate::harness::host_load::HostLoadConfig::new();
         Self {
             load_threshold: defaults.load_threshold.0,
             start_after: defaults.start_after,
@@ -1803,9 +1803,9 @@ impl Default for HostLoadSettings {
 impl HostLoadSettings {
     /// The aither monitor configuration these settings describe.
     #[must_use]
-    pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
-        aither_agent::HostLoadConfig::new()
-            .load_threshold(aither_agent::MachineLoad(self.load_threshold))
+    pub const fn monitor_config(&self) -> crate::harness::host_load::HostLoadConfig {
+        crate::harness::host_load::HostLoadConfig::new()
+            .load_threshold(crate::harness::host_load::MachineLoad(self.load_threshold))
             .start_after(self.start_after)
             .end_after(self.end_after)
             .poll_interval(self.poll_interval)

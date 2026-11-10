@@ -74,8 +74,8 @@ struct OpenQuestionsText<'a> {
 pub struct AskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
-    languages: Option<aither_agent::LanguageGuard>,
-    task_events: Option<aither_agent::WorkEvents>,
+    languages: Option<crate::harness::language::LanguageGuard>,
+    task_events: Option<crate::harness::working_document::WorkEvents>,
     cards: Option<super::command_cards::CommandCards>,
 }
 
@@ -102,14 +102,14 @@ impl AskUserTool {
     /// Record every question asked on `events`, the main agent's `tasks.md`
     /// inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
+    pub fn with_task_events(mut self, events: crate::harness::working_document::WorkEvents) -> Self {
         self.task_events = Some(events);
         self
     }
 
     /// Refuse a question outside the communication language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -292,7 +292,7 @@ impl Tool for AskUserTool {
             ask: crate::session::UserAsk::question(&request),
         });
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::WorkEvent::QuestionAsked(word.clone()));
+            events.record(crate::harness::working_document::WorkEvent::QuestionAsked(word.clone()));
         }
         Ok(ToolResult::text(
             AskedText { request_id: &word }
@@ -314,7 +314,7 @@ pub struct WithdrawAskUserArgs {
 pub struct WithdrawAskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
-    task_events: Option<aither_agent::WorkEvents>,
+    task_events: Option<crate::harness::working_document::WorkEvents>,
 }
 
 impl WithdrawAskUserTool {
@@ -331,7 +331,7 @@ impl WithdrawAskUserTool {
     /// Record every question withdrawn on `events`, the main agent's
     /// `tasks.md` inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
+    pub fn with_task_events(mut self, events: crate::harness::working_document::WorkEvents) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -372,7 +372,7 @@ impl Tool for WithdrawAskUserTool {
             return Err(AskUserToolError::NotOpen(args.request_id).into());
         }
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::WorkEvent::QuestionWithdrawn(
+            events.record(crate::harness::working_document::WorkEvent::QuestionWithdrawn(
                 args.request_id.clone(),
             ));
         }

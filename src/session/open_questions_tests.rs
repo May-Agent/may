@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
+use crate::harness::ask_user::{AnswerValue, QuestionAnswer};
 use aither_core::llm::{Tool, ToolContext};
 use tempfile::TempDir;
 
@@ -20,7 +20,7 @@ use crate::agent::ask_user_tool::{
 };
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
-use aither_agent::BlockerResolver;
+use crate::harness::working_document::BlockerResolver;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);

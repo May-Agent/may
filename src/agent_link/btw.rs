@@ -43,7 +43,7 @@ struct ForkHost {
     /// The terminal the session's agent launches forks' terminals from.
     launcher: ForkLauncher,
     /// The session's communication and working languages.
-    languages: aither_agent::Languages,
+    languages: crate::harness::language::Languages,
 }
 
 /// The terminal launcher of a session's main agent, filled when the agent's
@@ -128,7 +128,7 @@ pub struct SideContext {
     /// The agent's model under the prompt-cache key its requests carry.
     pub model: ModelSlot<ProviderLlm>,
     /// The agent's communication and working languages.
-    pub languages: aither_agent::Languages,
+    pub languages: crate::harness::language::Languages,
 }
 
 /// The fork source and model of every session agent the daemon hosts.
@@ -161,7 +161,7 @@ impl ForkHosts {
         source: aither_agent::ForkSource,
         model: ModelSlot<ProviderLlm>,
         launcher: ForkLauncher,
-        languages: aither_agent::Languages,
+        languages: crate::harness::language::Languages,
     ) -> ForkRegistration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.hosts().insert(
@@ -394,7 +394,7 @@ pub struct BtwArgs {
 pub struct BtwCommand {
     messaging: AgentMessaging,
     session_id: String,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     fork_launcher: Option<ForkLauncher>,
 }
 
@@ -420,7 +420,7 @@ impl BtwCommand {
 
     /// Refuse a question outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -465,7 +465,7 @@ impl Tool for BtwTool {
         }
         if let Some(guard) = &self.command.languages {
             guard
-                .check_working(question, aither_agent::WorkingText::Internal)
+                .check_working(question, crate::harness::language::WorkingText::Internal)
                 .map_err(crate::agent::notices::language_refused)?;
         }
         let answer = self

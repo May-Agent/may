@@ -121,7 +121,7 @@ pub enum AgentEnvironment {
         /// Container ID from Docker.
         container_id: String,
         /// Route the container uses to reach the host's IPC bridge.
-        container_ipc_route: aither_sandbox::ContainerIpcRoute,
+        container_ipc_route: aither_sandbox::HostRoute,
         /// Executor for running commands inside the container.
         container_exec: AnyContainerExec,
         /// Resolved browser CDP endpoint reachable from inside the container.

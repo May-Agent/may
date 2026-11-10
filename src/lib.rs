@@ -105,6 +105,7 @@ pub mod trust;
 
 /// The user's global sleep state.
 /// May's IPC command bridge.
+pub mod harness;
 pub mod ipc;
 pub mod secrets;
 /// Session model, history, and on-disk layout.
@@ -142,8 +143,8 @@ pub(crate) mod video;
 pub mod workspace;
 /// XML block serialization for prompt/context payloads.
 pub mod xml;
-pub use aither_agent::ask_user;
-pub use aither_agent::workspace_request;
+pub use harness::ask_user;
+pub use harness::workspace_request;
 
 pub use agent::{
     AgentEnvironment, ContextCategory, ContextCategoryRow, ContextReport, MayAgent,

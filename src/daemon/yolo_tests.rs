@@ -6,10 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::workspace_request::RequestWorkspaceArgs;
+use crate::harness::workspace_request::RequestWorkspaceArgs;
 use aither_sandbox::permission::{PermissionError, PermissionHandler};
 use aither_sandbox::{
-    CommandLocation, CommandRole, LocationApproval, ScriptLanguage, SshServer, TerminalMode,
+    CommandLocation, CommandRole, LocationApproval, SandboxMode, ScriptLanguage, SshServer,
 };
 use tempfile::TempDir;
 
@@ -76,7 +76,7 @@ async fn an_unsafe_command_runs_without_a_prompt_in_a_yolo_session() {
 
     let granted = approver
         .check(
-            TerminalMode::Unsafe,
+            SandboxMode::Unsandboxed,
             "make install",
             ScriptLanguage::Shell,
             CommandLocation::Local,
@@ -91,7 +91,7 @@ async fn an_unsafe_command_runs_without_a_prompt_in_a_yolo_session() {
     assert!(
         !approver
             .will_wait_for_approval(
-                TerminalMode::Unsafe,
+                SandboxMode::Unsafe,
                 "x",
                 ScriptLanguage::Shell,
                 CommandLocation::Local
@@ -110,7 +110,7 @@ async fn a_subagent_of_a_yolo_session_is_granted_too() {
     assert!(
         subagent
             .check(
-                TerminalMode::Unsafe,
+                SandboxMode::Unsafe,
                 "make install",
                 ScriptLanguage::Shell,
                 CommandLocation::Local
@@ -128,7 +128,7 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     assert!(
         approver
             .check(
-                TerminalMode::Unsafe,
+                SandboxMode::Unsafe,
                 "first",
                 ScriptLanguage::Shell,
                 CommandLocation::Local
@@ -140,7 +140,7 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     fixture.yolo(false).await;
     let error = approver
         .check(
-            TerminalMode::Unsafe,
+            SandboxMode::Unsandboxed,
             "second",
             ScriptLanguage::Shell,
             CommandLocation::Local,
@@ -155,7 +155,7 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     assert!(
         approver
             .will_wait_for_approval(
-                TerminalMode::Unsafe,
+                SandboxMode::Unsafe,
                 "x",
                 ScriptLanguage::Shell,
                 CommandLocation::Local
@@ -171,7 +171,7 @@ async fn a_session_without_yolo_still_asks() {
     let error = fixture
         .approver()
         .check(
-            TerminalMode::Unsafe,
+            SandboxMode::Unsandboxed,
             "make install",
             ScriptLanguage::Shell,
             CommandLocation::Local,

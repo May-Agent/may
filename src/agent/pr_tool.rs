@@ -105,7 +105,7 @@ pub enum PrArgs {
 #[derive(Debug, Clone)]
 pub struct PrCommand {
     context: PrContext,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
 }
 
 impl PrCommand {
@@ -120,7 +120,7 @@ impl PrCommand {
 
     /// Refuse a PR title outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -145,7 +145,7 @@ impl PrCommand {
 /// for the main agent, `list` and `show` for a subagent.
 pub struct PrTool {
     store: PrStore,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     role: CommandRole,
 }
 
@@ -218,7 +218,7 @@ impl Tool for PrTool {
         ) = (&self.languages, &args)
         {
             guard
-                .check_working(title, aither_agent::WorkingText::Public)
+                .check_working(title, crate::harness::language::WorkingText::Public)
                 .map_err(super::notices::language_refused)?;
         }
         let result = match args {
