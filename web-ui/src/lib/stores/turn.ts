@@ -1,5 +1,11 @@
 import { create } from 'zustand';
-import type { ApiAttachment, ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
+import type {
+  ApiAttachment,
+  ApiMessage,
+  ChatRequestPayload,
+  ChatStreamEvent,
+  CommandCard,
+} from '../types';
 import { sendMessage, stopSession } from '../api/chat';
 import {
   applyBackgroundDelta,
@@ -241,6 +247,12 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
           if (turnId != null && suppressedTurns.has(turnId)) {
             if (frame.event === 'end') suppressedTurns.delete(turnId);
             return;
+          }
+          if (frame.event === 'tool_card') {
+            // The card can change after its turn ended (an answer arrives),
+            // so the settled messages take it as well as the turn in progress.
+            const { id, card } = frame.data as unknown as { id: string; card: CommandCard | null };
+            useSessionsStore.getState().applyToolCard(sessionId, id, card);
           }
           handle(sessionId, { ...frame.data, kind: frame.event } as unknown as ChatStreamEvent);
           return;

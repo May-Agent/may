@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type {
   ApiMessage,
   ApiSession,
+  CommandCard,
   SessionPlanState,
   SessionRuntimeSummary,
 } from '../types';
@@ -18,7 +19,7 @@ import {
   type UpdateSessionPatch,
 } from '../api/sessions';
 import { putSessionTasks } from '../api/tasks';
-import { foldTranscript } from '../transcript';
+import { foldTranscript, withToolCard } from '../transcript';
 import { useConfigStore } from './config';
 
 const DRAFT_PREFIX = 'draft_';
@@ -106,6 +107,8 @@ interface SessionsState {
   replaceMessage: (sessionId: string, msg: ApiMessage) => void;
   /** Drop the latest user message whose text is `content`: a withdrawn turn's. */
   withdrawUserMessage: (sessionId: string, content: string) => void;
+  /** The card of a finished turn's terminal call changed (a question was answered). */
+  applyToolCard: (sessionId: string, callId: string, card: CommandCard | null) => void;
   /**
    * A turn ended: the oldest not-yet-stored user message takes the id the
    * daemon stored it under, and the reply, when the turn stored one, joins
@@ -398,6 +401,15 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         messages: { ...prev.messages, [sessionId]: messages.filter((_, i) => i !== at) },
       };
     });
+  },
+
+  applyToolCard(sessionId, callId, card) {
+    set((prev) => ({
+      messages: {
+        ...prev.messages,
+        [sessionId]: withToolCard(prev.messages[sessionId] ?? [], callId, card),
+      },
+    }));
   },
 
   replaceMessage(sessionId, msg) {
