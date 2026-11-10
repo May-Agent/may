@@ -16,6 +16,7 @@ mod compact_tool_tests;
 mod compaction_report;
 #[cfg(test)]
 mod compaction_tests;
+mod compaction_watch;
 #[cfg(target_os = "macos")]
 pub mod computer_tool;
 mod context_dump;
@@ -80,6 +81,7 @@ pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
 pub use compaction_report::CompactionReporter;
+pub use compaction_watch::MayRun;
 pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};

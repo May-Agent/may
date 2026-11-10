@@ -2085,6 +2085,36 @@ async fn drive_turn<S: ChatSink>(
     }
 }
 
+/// Carries out the compaction the `compact` tool asked for when the turn
+/// ended, telling the session's clients how it stands; the next turn starts
+/// on the compacted context. A failure leaves the context as it was.
+async fn compact_after_turn(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    guard: &SessionRunGuard,
+    agent: &mut MayAgent,
+) {
+    let (phases, phase_rx) = async_channel::unbounded();
+    let reporter = crate::agent::CompactionReporter::new(phases);
+    let forward = async {
+        while let Ok(phase) = phase_rx.recv().await {
+            hosts::publish_compaction(&state.turn_hub, session_id, phase);
+        }
+    };
+    let compaction = async {
+        let compacted = agent
+            .compact_requested(&state.db(), guard.fence(), &reporter)
+            .await;
+        // Closes the phase channel, which ends the forwarding.
+        drop(reporter);
+        compacted
+    };
+    let (compacted, ()) = futures_lite::future::zip(compaction, forward).await;
+    if let Err(error) = compacted {
+        tracing::error!(%session_id, %error, "the requested compaction failed");
+    }
+}
+
 /// The turn runner: [`run_agent_loop_attempts`] behind the turn's panic
 /// boundary.
 ///
@@ -2359,6 +2389,9 @@ fn run_agent_loop_attempts<'a>(
                 },
             )
             .await;
+            if stopped.is_ok() {
+                compact_after_turn(state, session_id.as_str(), guard, &mut agent).await;
+            }
             let took_action = turn.took_action();
             let turn_events::TurnEvents {
                 sink: _,

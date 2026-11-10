@@ -682,6 +682,7 @@ async fn run_worker(
                     &command_rx,
                     &command_tx,
                     &event_tx,
+                    &reporter(),
                 ))
                 .await;
                 if matches!(outcome, WorkOutcome::Shutdown) {
@@ -1127,6 +1128,7 @@ async fn run_agent_prompt(
     command_rx: &Receiver<WorkerCommand>,
     command_tx: &Sender<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
+    reporter: &CompactionReporter,
 ) -> WorkOutcome<()> {
     let PromptRun {
         prompt,
@@ -1167,7 +1169,13 @@ async fn run_agent_prompt(
         },
     );
     match race_against_commands(driven, command_rx, command_tx).await {
-        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {}
+        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {
+            // The `compact` tool ended the turn for a compaction: it runs
+            // before the lease is released, so its snapshot is accepted.
+            if let Err(error) = agent.compact_requested(snapshot_db, fence, reporter).await {
+                tracing::error!(session_id = %fence.session_id, %error, "the requested compaction failed");
+            }
+        }
         WorkOutcome::Finished(Err(error)) => {
             let _ = event_tx.send(TuiEvent::Agent(Err(error))).await;
         }

@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aither_agent::{Agent, AgentBuilder, AgentError, AnyClock, CompactResult, PromptCache, Run};
+use aither_agent::{
+    Agent, AgentBuilder, AgentError, AgentPath, AnyClock, CompactResult, PromptCache,
+};
 use aither_core::llm::{
-    Attachment as LlmAttachment, Message as LlmMessage,
+    Attachment as LlmAttachment, Message as LlmMessage, ToolCallId,
     model::{Parameters, ReasoningEffort},
 };
 use aither_sandbox::{
@@ -16,6 +18,7 @@ use executor_core::DefaultExecutor;
 
 use super::agents_md;
 use super::compaction_report::CompactionReporter;
+use super::compaction_watch::{MayRun, PreCompactionAlert, RunWatch, WindowGauge};
 use super::context_dump::ContextDump;
 use super::hooks::MayHooks;
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
@@ -38,6 +41,7 @@ use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
 use crate::command_policy::{PolicySet, RefusedReads};
 use crate::config::MayConfig;
+use crate::db::{ChatDb, RunFence};
 use crate::harness::compact_tool::CompactSignal;
 use crate::harness::disk::{AnyDiskReader, SystemDisk, home_volumes};
 use crate::harness::host_load::{
@@ -49,7 +53,9 @@ use crate::harness::working_document::file::DocumentFile;
 use crate::harness::working_document::{
     AnyBlockerResolver, AnyWorkTracker, WorkEvents, WorkingDocument,
 };
-use crate::ipc::{CommandRegistry, CommandRegistryBuilder, SessionShell, ShellSlot};
+use crate::ipc::{
+    CommandRegistry, CommandRegistryBuilder, KeptExchangeReceiver, SessionShell, ShellSlot,
+};
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
@@ -417,6 +423,13 @@ pub struct MayAgent {
     language_guard: LanguageGuard,
     /// Set when the `compact` tool ended a turn for a compaction.
     compaction_requested: Arc<AtomicBool>,
+    /// Hands the window's measure to the `compact` valve and the warning.
+    watch: RunWatch,
+    /// Where the calls whose exchanges a compaction keeps are reported.
+    kept_exchanges: KeptExchangeReceiver,
+    /// The calls reported since the last compaction, whose exchanges the
+    /// next one carries into the compacted context.
+    kept_calls: Vec<ToolCallId>,
     /// This agent's entry among the daemon's btw fork hosts, while it is the
     /// session's agent.
     _fork_registration: Option<crate::agent_link::ForkRegistration>,
@@ -1066,6 +1079,11 @@ impl MayAgent {
         .into_sources();
 
         let (job_facts_tx, job_facts) = async_channel::unbounded();
+        let gauge = Arc::new(WindowGauge::new(
+            config.context_policy,
+            config.model_context_window,
+        ));
+        let watch_valve = valve.clone();
         let mut builder = AgentBuilder::new(llm)
             .hooks(hooks)
             .system_layout(tag::layout())
@@ -1081,6 +1099,7 @@ impl MayAgent {
             .approver(permissions)
             .fork_source(shared_terminal_commands.fork_source.clone())
             .subagents(subagent_tracker.runs().clone())
+            .context_source(PreCompactionAlert::new(gauge.clone()))
             .context_source(conditions)
             .context_source(events)
             .context_source(JobReports::new(shell.jobs().events(), job_facts_tx.clone()));
@@ -1133,11 +1152,18 @@ impl MayAgent {
         let native_tools = builder.tool_definitions();
         let mut agent = builder.build();
         runtime_system_context.reconcile(agent.context_mut());
+        let watch = RunWatch::new(
+            AgentPath::of(agent.identity()),
+            gauge,
+            watch_valve,
+            config.context_policy.compaction_floor,
+        );
 
         let named_commands = command_descriptions
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
+        let kept_exchanges = registry.kept_receiver();
         Ok(Self {
             inner: agent,
             sandbox_dir: shell.working_dir().clone(),
@@ -1161,6 +1187,9 @@ impl MayAgent {
             btw_llm,
             language_guard,
             compaction_requested,
+            watch,
+            kept_exchanges,
+            kept_calls: Vec::new(),
             _fork_registration: fork_registration,
         })
     }
@@ -1335,14 +1364,14 @@ impl MayAgent {
         })
     }
 
-    /// Runs a query; [`Run::drive`] hands its events to the caller.
+    /// Runs a query; [`MayRun::drive`] hands its events to the caller.
     pub fn run(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+    ) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
-        self.inner.run(prompt, attachments)
+        MayRun::new(self.inner.run(prompt, attachments), self.watch.clone())
     }
 
     /// Runs a query after persisting per-turn hidden context as a regular
@@ -1352,7 +1381,7 @@ impl MayAgent {
         prompt: &str,
         hidden_context: Option<&str>,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+    ) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -1365,9 +1394,9 @@ impl MayAgent {
     /// Continues the conversation without a new user message, for the model
     /// to act on what a background command reported. Driven like
     /// [`Self::run`].
-    pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+    pub fn resume(&mut self) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
-        self.inner.resume()
+        MayRun::new(self.inner.resume(), self.watch.clone())
     }
 
     /// Waits, between runs, for a fact about the session's jobs that the
@@ -1408,11 +1437,74 @@ impl MayAgent {
         self.job_facts.clone()
     }
 
-    /// Whether the last run ended for the `compact` tool's request, which
-    /// the caller then carries out; the flag is cleared.
-    #[must_use]
-    pub fn take_compaction_request(&self) -> bool {
-        self.compaction_requested.swap(false, Ordering::AcqRel)
+    /// Carries out the compaction the `compact` tool asked for, if the last
+    /// run ended for one: the handoff replaces the conversation and the
+    /// context is persisted as the run holding `fence`. The turn ended at the
+    /// request, so the next turn starts on the compacted context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when generating the handoff fails.
+    pub async fn compact_requested(
+        &mut self,
+        db: &ChatDb,
+        fence: &RunFence,
+        reporter: &CompactionReporter,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        if !self.compaction_requested.swap(false, Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let compacted = self.compact_reporting(None, reporter).await;
+        if let Ok(Some(_)) = &compacted
+            && let Err(error) =
+                crate::session::persist_agent_context_snapshot(db, fence, self).await
+        {
+            tracing::warn!(session_id = %fence.session_id, %error, "failed to persist the compacted context");
+        }
+        compacted
+    }
+
+    /// Takes the exchanges of the calls the registry reported as kept out of
+    /// the conversation, in order.
+    fn kept_exchanges(&mut self) -> Vec<LlmMessage> {
+        self.kept_calls.extend(self.kept_exchanges.take_pending());
+        if self.kept_calls.is_empty() {
+            return Vec::new();
+        }
+        let kept = |id: &str| self.kept_calls.iter().any(|call| call.as_str() == id);
+        let mut exchanges = Vec::new();
+        for message in self.inner.context().conversation_messages() {
+            match message {
+                LlmMessage::Assistant { tool_calls, .. } => {
+                    let calls: Vec<_> = tool_calls
+                        .into_iter()
+                        .filter(|call| kept(&call.id))
+                        .collect();
+                    if !calls.is_empty() {
+                        exchanges.push(LlmMessage::assistant_with_tool_calls("", calls));
+                    }
+                }
+                LlmMessage::Tool {
+                    ref tool_call_id, ..
+                } if kept(tool_call_id) => exchanges.push(message),
+                _ => {}
+            }
+        }
+        exchanges
+    }
+
+    /// Puts the kept `exchanges` back into the compacted context, their
+    /// results marked to survive the next compaction too.
+    fn restore_kept_exchanges(&mut self, exchanges: Vec<LlmMessage>) {
+        self.kept_calls.clear();
+        let context = self.inner.context_mut();
+        for message in exchanges {
+            if matches!(message, LlmMessage::Tool { .. }) {
+                context.push_kept(message);
+            } else {
+                context.push(message);
+            }
+        }
     }
 
     /// One-shot query.
@@ -1711,7 +1803,10 @@ impl MayAgent {
         &mut self,
         reporter: &CompactionReporter,
     ) -> Result<Option<CompactResult>, AgentError> {
-        reporter.drive(self.inner.compact_when_idle()).await
+        let exchanges = self.kept_exchanges();
+        let compacted = reporter.drive(self.inner.compact_when_idle()).await;
+        self.compaction_landed(&compacted, exchanges);
+        compacted
     }
 
     /// Compacts the conversation, reporting its progress to `reporter`.
@@ -1720,7 +1815,25 @@ impl MayAgent {
         focus: Option<&str>,
         reporter: &CompactionReporter,
     ) -> Result<Option<CompactResult>, AgentError> {
-        reporter.drive(self.inner.compact(focus)).await
+        let exchanges = self.kept_exchanges();
+        let compacted = reporter.drive(self.inner.compact(focus)).await;
+        self.compaction_landed(&compacted, exchanges);
+        compacted
+    }
+
+    /// What follows a compaction, whether it applied or not: the kept
+    /// exchanges go back into the context it left, and the valve and the
+    /// warning learn its size.
+    fn compaction_landed(
+        &mut self,
+        compacted: &Result<Option<CompactResult>, AgentError>,
+        exchanges: Vec<LlmMessage>,
+    ) {
+        let applied = matches!(compacted, Ok(Some(_)));
+        if applied {
+            self.restore_kept_exchanges(exchanges);
+        }
+        self.watch.ended(applied);
     }
 
     #[cfg(test)]
@@ -1767,6 +1880,18 @@ impl MayAgent {
         ));
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
+        // The conversation may have grown past what the provider last
+        // reported, such as a restored or seeded one: the agent's own
+        // measure, calibrated against the provider's counts, stands in.
+        match self.inner.snapshot_context_window().await {
+            Ok(snapshot) => self.watch.estimated(
+                snapshot.metrics.estimated_tokens,
+                snapshot.metrics.context_window,
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "could not measure the context window");
+            }
+        }
     }
 }
 
