@@ -759,6 +759,7 @@ impl MayAgent {
         // Connected ACP agents start in the boundary this session's own
         // terminal commands run in; a container session has no host sandbox
         // to give them, so it offers none.
+        let managed_tools = super::acp_sandbox::ManagedTools::default();
         let acp = match config.acp.as_ref() {
             Some(hosts) if !is_container => Some({
                 let heel = crate::tools::prepare_heel(
@@ -786,6 +787,7 @@ impl MayAgent {
                                 .broker()
                                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
                             heel,
+                            managed_tools.clone(),
                         ),
                     )
                     .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
@@ -969,6 +971,20 @@ impl MayAgent {
             "preparing session tool environments"
         );
         let builder = Box::pin(prepare_tools(builder, &config, tool_environment_key)).await?;
+        if !is_container {
+            let bin = builder
+                .shell_sessions()
+                .local_tools()
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+                .bin_dir()
+                .clone();
+            managed_tools.set(bin).map_err(|bin| {
+                MayAgentError::Sandbox(format!(
+                    "the managed tools directory was already set: {}",
+                    bin.display()
+                ))
+            })?;
+        }
         let named_commands = builder
             .tool_descriptions()
             .iter()

@@ -821,6 +821,7 @@ mod tests {
             approver,
             job_broker(root),
             heel,
+            crate::repo_clone::test_sandbox::managed_tools().await,
         )
     }
 
