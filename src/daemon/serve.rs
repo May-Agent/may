@@ -18,6 +18,7 @@ use skyzen::extract::PeerAddr;
 use skyzen::routing::Router;
 
 use super::auth::TailnetLogin;
+use super::session_ids::ConnectionIds;
 use super::state::DaemonState;
 
 type ResponseBody =
@@ -31,6 +32,7 @@ async fn handle(
     router: Arc<Router>,
     peer: Option<SocketAddr>,
     tailnet: Option<TailnetLogin>,
+    ids: ConnectionIds,
     request: hyper::Request<Incoming>,
 ) -> Result<hyper::Response<ResponseBody>, Infallible> {
     let method = request.method().clone();
@@ -46,6 +48,7 @@ async fn handle(
     if let Some(login) = tailnet {
         request.extensions_mut().insert(login);
     }
+    request.extensions_mut().insert(ids);
     // WebSocket upgrade extraction needs the runtime executor skyzen's own
     // launcher inserts per request.
     request
@@ -89,8 +92,11 @@ fn serve_connection<IO>(
             }
             _ => None,
         };
+        // The id leases this connection's requests take; they go when the
+        // connection closes and the service holding them drops.
+        let ids = ConnectionIds::default();
         let service = hyper::service::service_fn(move |request| {
-            handle(router.clone(), peer, tailnet.clone(), request)
+            handle(router.clone(), peer, tailnet.clone(), ids.clone(), request)
         });
         if let Err(error) = hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(io), service)

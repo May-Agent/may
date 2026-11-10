@@ -23,6 +23,7 @@ mod repo_clone;
 mod repo_usage;
 mod search_outbox;
 mod session;
+mod session_ids;
 mod session_intervals;
 mod session_run;
 mod sleep_log;
@@ -51,7 +52,7 @@ pub use daemon_exit::PreviousDaemon;
 pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
-pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
+pub use open_questions::{CommittedAskUserAnswer, NamedAskUserQuestion, PendingAskUserQuestion};
 pub use pr::{PrEventRow, PrRow};
 pub use pr_checks::PrCheckState;
 pub use repo_clone::RepoCloneRow;
@@ -78,6 +79,8 @@ pub(super) use query;
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     pub(super) db: SkyDb,
+    /// Each session's pool of model-facing ids.
+    session_pools: session_ids::SessionPools,
     /// Test seam: suspends a run claim or finish at its await.
     #[cfg(test)]
     pub(crate) run_gates: session_run::RunGates,
@@ -111,6 +114,7 @@ impl ChatDb {
         Self::ensure_session_interval_triggers(&db).await?;
         Ok(Self {
             db,
+            session_pools: session_ids::SessionPools::default(),
             #[cfg(test)]
             run_gates: session_run::RunGates::default(),
         })

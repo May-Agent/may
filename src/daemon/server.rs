@@ -475,6 +475,7 @@ fn api_routes() -> Route {
             "/github/repos".at(super::github_repos::list_github_repos),
             "/events".at(stream_events),
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
+            "/session-names".post(super::sessions::issue_session_name),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
                 "".post(create_session),
@@ -535,6 +536,12 @@ fn api_routes() -> Route {
                     Route::new((
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
                         "/artifacts/diagnostics".post(report_artifact_diagnostics),
+                    )),
+                    Route::new((
+                        "/ids".post(super::session_ids::lease_session_id),
+                        "/ids/{word}".delete(super::session_ids::release_session_id),
+                        "/ids/{word}/keep".post(super::session_ids::keep_session_id),
+                        "/stored-ids/{word}".delete(super::session_ids::release_stored_session_id),
                     )),
                 ))),
             ))),
@@ -605,7 +612,7 @@ fn api_routes() -> Route {
             ))),
             "/tunnels".route(Route::new((
                 "".post(super::tunnel::register_tunnel),
-                "/{id}".at(super::tunnel::get_tunnel),
+                "/{session}/{id}".at(super::tunnel::get_tunnel),
             ))),
             "/browser".route(Route::new((
                 "/status".at(browser_status),
@@ -642,9 +649,9 @@ fn api_routes() -> Route {
 
 fn tunnel_routes() -> Route {
     Route::new((
-        "/tunnel/{id}".any(super::tunnel::tunnel_proxy),
-        "/tunnel/{id}/".any(super::tunnel::tunnel_proxy),
-        "/tunnel/{id}/{*path}".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{session}/{id}".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{session}/{id}/".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{session}/{id}/{*path}".any(super::tunnel::tunnel_proxy),
     ))
 }
 

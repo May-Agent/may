@@ -16,15 +16,3 @@ pub fn new() -> String {
         .generate_one(3, "-")
         .expect("failed to generate an id")
 }
-
-/// A four-word id for ids that double as capabilities (webhook tokens and
-/// other secrets).
-///
-/// # Panics
-/// Panics if the embedded petname dictionary cannot produce an id.
-#[must_use]
-pub fn new_long() -> String {
-    Petnames::default()
-        .generate_one(4, "-")
-        .expect("failed to generate an id")
-}

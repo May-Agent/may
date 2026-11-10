@@ -7,14 +7,15 @@
 
 pub mod acp;
 pub mod background;
+pub mod ids;
 mod sse;
 mod wire;
 
 pub use sse::{ServerEvent, SseParser};
 pub use wire::{
     CreateSessionRequest, HoldReason, IndexCoverage, IssueRemovedFrame, IssueUpsertedFrame,
-    JobRemovedFrame, JobUpsertedFrame, PermissionPollItem, PrsChangedFrame, RecapFrame,
-    RewindRequest, RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot,
+    IssuedSessionName, JobRemovedFrame, JobUpsertedFrame, PermissionPollItem, PrsChangedFrame,
+    RecapFrame, RewindRequest, RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot,
     SessionIssuesFrame, SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame,
     SubagentUpsertedFrame, SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError,
     WireAgentEvent, WirePr, WirePrCheck, WirePrChecks, WireSession, WireTranscriptEntry,

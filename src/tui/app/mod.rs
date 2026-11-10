@@ -475,12 +475,14 @@ pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
 /// How often live terminal output is read from the daemon while calls run.
 const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Base URL `<tunnel id>` tags resolve against in the TUI: the daemon's
-/// loopback listener.
-fn tunnel_base(config: &MayConfig) -> String {
-    format!(
-        "http://localhost:{}/tunnel",
-        config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT)
+/// Base URL `<tunnel id>` tags of `session` resolve against in the TUI: the
+/// session's tunnels on the daemon's loopback listener. A tunnel is named by
+/// a word of its session's ids, so the session is part of its address.
+fn tunnel_base(config: &MayConfig, session: Option<&SessionId>) -> String {
+    let port = config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT);
+    session.map_or_else(
+        || format!("http://localhost:{port}/tunnel"),
+        |session| format!("http://localhost:{port}/tunnel/{session}"),
     )
 }
 
@@ -599,7 +601,10 @@ impl App {
         status: Option<StatusNotice>,
     ) -> Self {
         let needs_setup = !config.is_configured();
-        let tunnel_base = tunnel_base(&config);
+        let tunnel_base = tunnel_base(
+            &config,
+            session_manager.current().map(|session| &session.id),
+        );
         // Always start in Chat mode - show inline message if not configured
         let mode = AppMode::Chat;
 
@@ -1749,7 +1754,10 @@ impl App {
     /// finished turn folds into its "Worked for" row. The last turn folds
     /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
-        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
+        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(
+            &self.config,
+            self.session_manager.current().map(|session| &session.id),
+        ));
         self.chat.push_welcome(self.cwd_label());
         let mut turn = HistoryTurn::default();
         for (history_index, msg) in messages.iter().enumerate() {
@@ -4882,7 +4890,7 @@ mod tests {
             .await
             .expect("session manager");
         let id = sessions
-            .create_session_in_profile(None, None)
+            .create_session_in_profile(crate::SessionId::from_string("amber-river"), None, None)
             .expect("session")
             .id
             .as_str()
