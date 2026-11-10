@@ -690,6 +690,7 @@ const fn cancellation_reason_of<E>(cancel: &Result<CancelReason, E>) -> &'static
     match cancel {
         Ok(CancelReason::User) => USER_CANCELLED,
         Ok(CancelReason::DaemonRestarting) => "run interrupted: the daemon is restarting",
+        Ok(CancelReason::ClientDisconnected) => "run cancelled: its client disconnected",
         Err(_) => "run cancellation channel closed unexpectedly",
     }
 }
@@ -1605,16 +1606,26 @@ async fn stop_session_run_impl(
         );
     }
 
-    let cancelled = state
-        .runtime_service
-        .runs()
-        .cancel(&session_id, CancelReason::User);
+    stop_session(&state, &session_id, CancelReason::User)
+        .await
+        .map(Json)
+}
+
+/// Stops the session's agent for `reason`: its running turn, if any, and its
+/// background commands and subagent runs; the session settles as stopped.
+pub(super) async fn stop_session(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    reason: CancelReason,
+) -> SkyResult<SessionRuntimeResponse> {
+    let session_id = session_id.to_string();
+    let cancelled = state.runtime_service.runs().cancel(&session_id, reason);
     // Stopping the agent ends its background work too: the idle agent's
     // jobs first, so their completions wait for the user's next input
     // instead of starting a turn, then every job and subagent run left.
     state
         .parked_agents
-        .stop_background(&state, &session_id)
+        .stop_background(state, &session_id)
         .await;
     let stopped = state.session_background.stop_all(&session_id).await;
     tracing::info!(session_id = %session_id, cancelled, stopped, "received session stop request");
@@ -1630,7 +1641,7 @@ async fn stop_session_run_impl(
         .settle_stopped(&session_id)
         .await
         .map_err(internal_error)?;
-    Ok(Json(runtime.into()))
+    Ok(runtime.into())
 }
 
 /// `POST /api/sessions/{id}/turns`: one user message, delivered the way
@@ -1639,7 +1650,8 @@ async fn stop_session_run_impl(
 ///
 /// The turn runs in the daemon and streams to every client of the session
 /// over `/api/sessions/{id}/events`; a client that disconnects does not
-/// stop it.
+/// stop it, except the one-shot run whose event stream owns the turn (see
+/// `session_events`).
 pub(super) async fn post_turn(
     params: skyzen::routing::Params,
     Json(req): Json<super::types::TurnRequest>,
