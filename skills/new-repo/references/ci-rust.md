@@ -101,7 +101,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - uses: taiki-e/install-action@nextest
+      # Doctests stay on cargo test: nextest does not run them.
+      - run: cargo nextest run --workspace --all-features
+      - run: cargo test --doc --workspace --all-features
 ```
 
 A job skipped by its `if` reports success under its own name, so a pull request that touches no Rust file still passes the required checks.
