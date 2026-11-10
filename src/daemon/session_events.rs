@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_lite::StreamExt;
 use serde::Serialize;
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
