@@ -64,6 +64,10 @@ pub(super) enum TranscriptEntry {
         status: &'static str,
         #[schema(value_type = Object)]
         result: Option<aither_core::llm::ToolResult>,
+        /// How the call's script was read when it started; absent for a row
+        /// stored without one.
+        #[schema(value_type = Option<Object>)]
+        reading: Option<crate::command_reading::CommandReading>,
     },
     InteractionRequest {
         id: String,
@@ -151,6 +155,7 @@ pub(super) fn build_entries(rows: &[ChatMessage]) -> Vec<TranscriptEntry> {
                         id: call_id,
                         name,
                         arguments,
+                        reading,
                     } => {
                         open_tools.insert(call_id.clone(), entries.len());
                         entries.push(TranscriptEntry::ToolCall {
@@ -161,6 +166,7 @@ pub(super) fn build_entries(rows: &[ChatMessage]) -> Vec<TranscriptEntry> {
                             arguments,
                             status: "running",
                             result: None,
+                            reading,
                         });
                     }
                     ToolEventRecord::End {

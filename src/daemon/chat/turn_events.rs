@@ -470,10 +470,37 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 // Buffer accumulated text segment before the tool call.
                 self.flush_segment();
 
+                // The reading is stored with the call: a located edit's line
+                // numbers come from files the call changes.
+                let visible = match normalize_tool_start_for_sink(
+                    &mut self.pending_tool_streams,
+                    &id,
+                    &name,
+                    &arguments,
+                ) {
+                    Some(SinkToolEvent::Start {
+                        id,
+                        name,
+                        arguments,
+                    }) => {
+                        let summary = project_tool_summary_for_sink(
+                            &self.pending_tool_streams,
+                            &id,
+                            &name,
+                            Some(arguments.as_str()),
+                        );
+                        let summary = locate_reading(self.workdir, summary).await;
+                        Some((id, name, arguments, summary))
+                    }
+                    _ => None,
+                };
                 let record = ToolEventRecord::Start {
                     id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
+                    reading: visible
+                        .as_ref()
+                        .and_then(|(_, _, _, summary)| summary.reading.clone()),
                 };
                 let serialized = serde_json::to_string(&record)
                     .map_err(|e| ChatDbError::Storage(e.to_string()))?;
@@ -483,24 +510,8 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.tool_arguments_by_id
                     .insert(id.clone(), arguments.clone());
                 self.tool_started_at.insert(id.clone(), at);
-                if let Some(SinkToolEvent::Start {
-                    id,
-                    name,
-                    arguments,
-                }) = normalize_tool_start_for_sink(
-                    &mut self.pending_tool_streams,
-                    &id,
-                    &name,
-                    &arguments,
-                ) {
+                if let Some((id, name, arguments, summary)) = visible {
                     self.log_first_visible_tool_event(&id, &name, "canonical_start");
-                    let summary = project_tool_summary_for_sink(
-                        &self.pending_tool_streams,
-                        &id,
-                        &name,
-                        Some(arguments.as_str()),
-                    );
-                    let summary = locate_reading(self.workdir, summary).await;
                     if !self
                         .sink
                         .on_tool_start(&id, &name, &arguments, summary)

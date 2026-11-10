@@ -1850,6 +1850,7 @@ impl App {
                             id,
                             name,
                             arguments,
+                            ..
                         }) => {
                             // A stored call carries the arguments schema of
                             // the build that ran it, so it is read field by
@@ -5619,6 +5620,7 @@ mod tests {
             id: "c1".to_string(),
             name: "terminal".to_string(),
             arguments: arguments.clone(),
+            reading: None,
         };
         let mut served = crate::ChatMessage::user(serde_json::to_string(&start).expect("start"));
         served.role = MessageRole::Tool;
@@ -5642,6 +5644,50 @@ mod tests {
                 .as_ref()
                 .is_some_and(crate::command_reading::CommandReading::recognises_any)
         );
+    }
+
+    /// A session reloaded from the daemon's transcript shows the step lines
+    /// of a past call, from the reading the transcript entry carries.
+    #[tokio::test]
+    async fn a_reloaded_transcript_call_shows_its_step_lines() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let script = "cat src/lib.rs | head -n 5";
+        let reading = crate::command_reading::CommandReading::of(script);
+        let entries = vec![
+            crate::client::WireTranscriptEntry::User {
+                id: "1".into(),
+                timestamp: None,
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "2".into(),
+                timestamp: None,
+                call_id: "c1".into(),
+                name: "terminal".into(),
+                arguments: serde_json::json!({ "description": "look", "script": script })
+                    .to_string(),
+                status: "running".into(),
+                result: None,
+                reading: Some(reading.clone()),
+            },
+        ];
+        let messages = crate::session::chat_messages_from_transcript(&entries);
+        app.render_history(&messages).await;
+        let Some(ChatElement::ToolCall {
+            display: crate::tui::ui::chat::ToolDisplay::Terminal { reading: shown, .. },
+            ..
+        }) = app
+            .chat
+            .elements()
+            .iter()
+            .find(|element| matches!(element, ChatElement::ToolCall { .. }))
+        else {
+            panic!("the stored call is shown");
+        };
+        assert_eq!(shown.as_ref(), Some(&reading));
+        assert!(reading.recognises_any());
     }
 
     #[tokio::test]
@@ -5743,6 +5789,7 @@ mod tests {
                 name: "terminal".to_string(),
                 arguments: serde_json::json!({ "description": script, "script": script })
                     .to_string(),
+                reading: None,
             };
             let end = ToolEventRecord::End {
                 id: id.to_string(),
@@ -5808,6 +5855,7 @@ mod tests {
                 name: "terminal".to_string(),
                 arguments: serde_json::json!({ "description": script, "script": script })
                     .to_string(),
+                reading: None,
             };
             let end = ToolEventRecord::End {
                 id: id.to_string(),

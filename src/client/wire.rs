@@ -911,6 +911,9 @@ pub enum WireTranscriptEntry {
         status: String,
         /// Stored result, when finished.
         result: Option<aither_core::llm::ToolResult>,
+        /// How the daemon read a terminal call's script.
+        #[serde(default)]
+        reading: Option<crate::command_reading::CommandReading>,
     },
     /// An agent question or permission/workspace request.
     InteractionRequest {
