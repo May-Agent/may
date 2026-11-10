@@ -411,3 +411,33 @@ async fn an_ask_user_exchange_survives_a_compaction() {
         "an ordinary exchange is not kept"
     );
 }
+
+fn read_make_flags(index: usize) -> Step {
+    match index {
+        0 => terminal("printenv MAKEFLAGS || echo jobs=none"),
+        _ => Step::Text("done"),
+    }
+}
+
+/// A session with SSH servers is built with the machine-wide pool like every
+/// other: a local command sees the jobserver. Commands located on a server
+/// run outside the pool in aither, so the servers never keep it away.
+#[tokio::test]
+async fn a_session_with_ssh_servers_runs_local_commands_in_the_job_pool() {
+    let model = ScriptedModel::spawn(read_make_flags).await;
+    let config = config_for(&model, ContextConfig::default());
+    let mut session = Box::pin(Session::start(&config)).await;
+    session.parts.ssh_servers = vec![crate::config::SshServerConfig {
+        name: "remote".to_string(),
+        target: "ssh://nobody@127.0.0.1:1".to_string(),
+    }];
+    session.rebuild(&config).await;
+
+    run(&mut session, 0, "Read the job flags.").await;
+
+    let followup = model.last_request().await;
+    assert!(
+        followup.contains("--jobserver-auth=fifo:"),
+        "the local command ran without the pool: {followup}"
+    );
+}
