@@ -8,6 +8,7 @@
 //! unknown, never a guessed path. Clients, the approval prompt and the
 //! audit log render the reading instead of decoding shell themselves.
 
+mod card;
 mod describe;
 mod patch;
 mod recognise;
@@ -17,6 +18,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub use card::{AnswerCard, AskedCard, Card, RowChange, RowChangeKind, RowView, SubagentState};
 pub use patch::{DiffLine, DiffOp, FileChange, FileEdit, Hunk};
 
 /// A terminal call's script, read into the commands it runs.
@@ -104,6 +106,12 @@ pub enum Intent {
         /// The script or target a `run` or `make` names.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
+    },
+    /// `tasks`: an edit of the session's `tasks.md` the command's arguments
+    /// name; a listing is not one.
+    Tasks {
+        /// The command's arguments.
+        args: Vec<String>,
     },
     /// Anything May does not understand.
     Unknown {
@@ -199,6 +207,14 @@ impl CommandReading {
         self.steps.iter().any(|step| {
             matches!(&step.intent, Intent::Edit { files }
                 if files.iter().any(|file| matches!(&file.change, FileChange::Update { hunks, .. } if !hunks.is_empty())))
+        })
+    }
+
+    /// The `tasks.md` edits the script makes, in order.
+    pub fn tasks_edits(&self) -> impl Iterator<Item = crate::tasks_md::edit::Op> + '_ {
+        self.steps.iter().filter_map(|step| match &step.intent {
+            Intent::Tasks { args } => crate::tasks_md::edit::parse(args).ok(),
+            _ => None,
         })
     }
 

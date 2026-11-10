@@ -354,6 +354,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ToolCard { call_id, card } => {
+            app.chat.set_tool_card(&call_id, card);
+            Ok(None)
+        }
         AppEvent::Warning {
             session_id,
             message,

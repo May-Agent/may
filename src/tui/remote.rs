@@ -630,6 +630,18 @@ async fn forward_agent_frame(
                     .await;
             }
         }
+        SessionAgentBody::ToolCard { call_id, card } => {
+            // Between turns the card still changes (an answer arrives), so
+            // it reaches the chat directly.
+            match current.as_mut() {
+                Some(turn) => {
+                    let _ = turn.events.send(TuiEvent::ToolCard { call_id, card }).await;
+                }
+                None => {
+                    let _ = app_events.send(AppEvent::ToolCard { call_id, card }).await;
+                }
+            }
+        }
         SessionAgentBody::Hold { reason, message } => {
             if let Some(turn) = current.as_mut() {
                 let _ = turn.events.send(TuiEvent::Hold { reason, message }).await;

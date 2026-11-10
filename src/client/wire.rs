@@ -529,6 +529,17 @@ pub enum SessionAgentBody {
         /// How the daemon read the script.
         reading: crate::command_reading::CommandReading,
     },
+    /// The card of the terminal call `call_id` changed: the call ran one of
+    /// May's commands, and the card shows what it did. Sent whenever the
+    /// card changes, and again after the run ended when the card did.
+    ToolCard {
+        /// The call the card belongs to.
+        call_id: String,
+        /// The card as it stands now; absent when the call has none, so the
+        /// ordinary command row shows.
+        #[serde(default)]
+        card: Option<crate::command_reading::Card>,
+    },
     /// The run is parked.
     Hold {
         /// What the run waits for.
@@ -903,6 +914,10 @@ pub enum WireTranscriptEntry {
         status: String,
         /// Stored result, when finished.
         result: Option<aither_core::llm::ToolResult>,
+        /// The call's card, when it ran one of May's commands that renders
+        /// as one.
+        #[serde(default)]
+        card: Option<crate::command_reading::Card>,
     },
     /// An agent question or permission/workspace request.
     InteractionRequest {
@@ -1125,6 +1140,29 @@ mod tests {
             SessionAgentBody::ToolReading { ref call_id, ref reading }
                 if call_id == "t1" && reading.recognises_any()
         ));
+    }
+
+    #[test]
+    fn a_tool_card_frame_survives_the_round_trip_and_withdraws_with_no_card() {
+        use super::SessionAgentBody;
+        use crate::command_reading::Card;
+        let card = Card::AskUser {
+            request_id: "r1".to_string(),
+            questions: Vec::new(),
+            answers: None,
+        };
+        for card in [Some(card), None] {
+            let body = SessionAgentBody::ToolCard {
+                call_id: "t1".to_string(),
+                card: card.clone(),
+            };
+            let json = serde_json::to_string(&body).expect("serialize");
+            let back: SessionAgentBody = serde_json::from_str(&json).expect("deserialize");
+            assert!(matches!(
+                back,
+                SessionAgentBody::ToolCard { call_id, card: back } if call_id == "t1" && back == card
+            ));
+        }
     }
 
     #[test]

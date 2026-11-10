@@ -64,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_network_access_logs_timestamp ON network_access_l
 CREATE INDEX IF NOT EXISTS idx_network_access_logs_session ON network_access_logs(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_session_pending_permissions_session ON session_pending_permissions(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id);
+CREATE TABLE IF NOT EXISTS message_tool_cards (session_id TEXT NOT NULL, call_id TEXT NOT NULL, card TEXT NOT NULL, PRIMARY KEY (session_id, call_id));
 CREATE TABLE IF NOT EXISTS issue_projects (id INTEGER PRIMARY KEY, repo_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS issues (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, number INTEGER NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (project_id, number));
 CREATE TABLE IF NOT EXISTS issue_labels (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE (project_id, name));

@@ -27,6 +27,7 @@ pub(super) fn recognise(
         return None;
     }
     match name {
+        "tasks" => tasks(args),
         "cat" => cat(args),
         "head" => head_or_tail(args, true),
         "tail" => head_or_tail(args, false),
@@ -45,6 +46,18 @@ pub(super) fn recognise(
         "uv" => build(args, BuildTool::Uv),
         "make" => build(args, BuildTool::Make),
         _ => None,
+    }
+}
+
+/// `tasks <edit>`: literal words that name an operation which edits the file.
+fn tasks(args: &[Arg]) -> Option<Vec<Intent>> {
+    let args = args
+        .iter()
+        .map(|arg| arg.literal().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    match crate::tasks_md::edit::parse(&args).ok()? {
+        crate::tasks_md::edit::Op::List => None,
+        _ => Some(vec![Intent::Tasks { args }]),
     }
 }
 

@@ -76,9 +76,17 @@ pub struct AskUserTool {
     session_id: String,
     languages: Option<aither_agent::LanguageGuard>,
     task_events: Option<aither_agent::WorkEvents>,
+    cards: Option<super::command_cards::CommandCards>,
 }
 
 impl AskUserTool {
+    /// Report every question asked as the card of its terminal call.
+    #[must_use]
+    pub fn with_cards(mut self, cards: super::command_cards::CommandCards) -> Self {
+        self.cards = Some(cards);
+        self
+    }
+
     /// The command for `session_id`, persisting through `runtime`.
     #[must_use]
     pub fn new(runtime: Arc<SessionRuntimeService>, session_id: impl Into<String>) -> Self {
@@ -87,6 +95,7 @@ impl AskUserTool {
             session_id: session_id.into(),
             languages: None,
             task_events: None,
+            cards: None,
         }
     }
 
@@ -250,11 +259,7 @@ impl Tool for AskUserTool {
     type Arguments = AskUserArgs;
     type Res = ToolResult;
 
-    async fn call(
-        &self,
-        args: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         let questions = args.into_questions()?;
         if questions.is_empty() {
             return Err(AskUserToolError::NoQuestion.into());
@@ -275,6 +280,12 @@ impl Tool for AskUserTool {
             .open_question(&self.session_id, &request)
             .await
             .map_err(AskUserToolError::Persist)?;
+        if let (Some(cards), Some(identity)) = (&self.cards, cx.identity()) {
+            cards.report(
+                identity.call().to_string(),
+                Some(crate::command_reading::Card::asked(&request)),
+            );
+        }
         self.runtime.announce_user_wait(crate::session::UserWait {
             session_id: self.session_id.clone(),
             ask: crate::session::UserAsk::question(&request),

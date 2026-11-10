@@ -28,6 +28,7 @@ mod session_run;
 mod sleep_log;
 mod sql;
 mod task;
+mod tool_cards;
 
 use std::path::Path;
 

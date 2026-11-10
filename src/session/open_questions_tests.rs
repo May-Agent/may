@@ -726,3 +726,72 @@ async fn open_questions_are_read_whole_while_they_are_answered() {
         .await
         .expect("the reader saw whole requests");
 }
+
+/// The command reports the question as the card of the terminal call that
+/// asked it, and the committed answer joins the card by the request id.
+#[tokio::test]
+async fn an_asked_question_is_the_card_of_its_call_and_takes_its_answer() {
+    use crate::command_reading::Card;
+    use aither_core::llm::{AgentIdentity, CallIdentity, ToolCallId};
+
+    let fixture = Fixture::new().await;
+    let service = fixture.service().await;
+    let cards = crate::agent::command_cards::CommandCards::default();
+    let updates = cards.claim_updates().expect("the first reader claims");
+    let tool = AskUserTool::new(service.clone(), "session").with_cards(cards);
+    let cx = ToolContext::new().with_identity(CallIdentity::new(
+        ToolCallId::new("c1"),
+        AgentIdentity::Main,
+    ));
+    bounded("ask_user to return", tool.call(which_database(), cx))
+        .await
+        .expect("ask_user succeeds");
+
+    let update = updates.try_recv().expect("the question is reported");
+    assert_eq!(update.call_id, "c1");
+    let card = update.card.expect("a card");
+    let Card::AskUser {
+        request_id,
+        questions,
+        answers,
+    } = &card
+    else {
+        panic!("an ask_user card, got {card:?}");
+    };
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].question, "Which database?");
+    assert_eq!(questions[0].options, ["PostgreSQL", "SQLite"]);
+    assert_eq!(answers, &None);
+
+    service
+        .answer_ask_user(request_id, &[selected("", "SQLite")])
+        .await
+        .expect("the answer commits");
+    let committed = service
+        .committed_ask_user_answers(request_id)
+        .await
+        .expect("read")
+        .expect("committed");
+    let Card::AskUser {
+        answers: Some(answers),
+        ..
+    } = card.clone().answered(&committed)
+    else {
+        panic!("the answered card carries its answers");
+    };
+    assert_eq!(answers[0].text, "SQLite");
+}
+
+/// A call outside a terminal call has no card.
+#[tokio::test]
+async fn a_question_outside_a_terminal_call_reports_no_card() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service().await;
+    let cards = crate::agent::command_cards::CommandCards::default();
+    let updates = cards.claim_updates().expect("the first reader claims");
+    let tool = AskUserTool::new(service.clone(), "session").with_cards(cards);
+    tool.call(which_database(), ToolContext::new())
+        .await
+        .expect("ask_user succeeds");
+    assert!(updates.try_recv().is_err());
+}

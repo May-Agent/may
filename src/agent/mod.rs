@@ -9,6 +9,7 @@ pub(crate) mod browser_tool;
 pub mod cache_miss;
 pub(crate) mod ci_alert;
 pub(crate) mod ci_tool;
+pub mod command_cards;
 pub mod command_env;
 #[cfg(test)]
 mod compact_tool_tests;

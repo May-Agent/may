@@ -381,6 +381,7 @@ pub async fn load_history_from_db(
             tool_calls,
             translation,
             reading: None,
+            card: None,
             thinking: msg.thinking,
         });
     }

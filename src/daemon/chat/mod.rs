@@ -1,5 +1,6 @@
 mod aux;
 mod background;
+pub mod cards;
 mod hosts;
 mod hub;
 mod progress;
@@ -170,6 +171,15 @@ trait ChatSink {
         result: &ToolResult,
         summary: crate::daemon::tool_summary::ToolSummary,
     ) -> impl Future<Output = bool> + Send;
+    /// The terminal call `id` ran one of May's commands, and `card` shows
+    /// what it did.
+    fn on_tool_card(
+        &mut self,
+        _id: &str,
+        _card: &crate::command_reading::Card,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     fn on_todo_update(
         &mut self,
         rows: Vec<crate::task_rows::TaskRow>,
@@ -501,6 +511,11 @@ impl ChatSink for HubSink {
                 summary,
             },
         );
+        true
+    }
+
+    async fn on_tool_card(&mut self, id: &str, card: &crate::command_reading::Card) -> bool {
+        cards::publish(&self.hub, &self.session_id, &self.turn_id, id, Some(card));
         true
     }
 
@@ -2164,6 +2179,7 @@ fn run_agent_loop<'a>(
                 pending_tool_streams: std::collections::HashMap::new(),
                 last_todo_hash: None,
                 tasks_accepted,
+                tasks_edits: std::collections::HashMap::new(),
                 turn_persister: turn_persister::TurnPersister::new(guard.fence().clone()),
                 first_agent_event_seen: false,
                 first_visible_tool_seen: false,
@@ -4045,6 +4061,8 @@ fn build_session_agent<'a>(
             Err(_) => None,
         };
 
+        let subagents = state.session_background.subagents(ctx.session_id.as_str());
+        cards::forward_updates(state, ctx.session_id.as_str(), subagents.tracker.cards());
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
             crate::agent::MayAgentSessionInput {
@@ -4099,7 +4117,7 @@ fn build_session_agent<'a>(
                         .metrics
                         .prompt_cache_epoch
                 }),
-                subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
+                subagents: Some(subagents),
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
