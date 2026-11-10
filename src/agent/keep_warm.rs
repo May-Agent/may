@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use aither_agent::CacheKeepAlive;
 use aither_sandbox::{JobInfo, JobStatus};
 
 /// How long before its entry goes cold a refresh is sent, at most.
@@ -16,7 +17,10 @@ use aither_sandbox::{JobInfo, JobStatus};
 /// both paths land in the same window: late enough that a command ending
 /// meanwhile saves the request, early enough that a slow request still
 /// reaches the provider before the entry expires.
-pub const REFRESH_MARGIN: Duration = Duration::from_secs(30);
+#[must_use]
+pub fn refresh_margin() -> Duration {
+    CacheKeepAlive::default().send_before_expiry
+}
 
 /// How long from now the next refresh is due, `None` when none should be
 /// sent.
@@ -27,7 +31,7 @@ pub const REFRESH_MARGIN: Duration = Duration::from_secs(30);
 /// is beyond the cold point. When every running job ends first, the turn its
 /// completion starts arrives while the cache is still warm.
 ///
-/// The refresh is due [`REFRESH_MARGIN`] before the entry goes cold, or half
+/// The refresh is due [`refresh_margin`] before the entry goes cold, or half
 /// a `lifetime` before it for a lifetime shorter than twice the margin, so a
 /// short lifetime never makes the refreshes follow each other at once.
 #[must_use]
@@ -40,7 +44,7 @@ pub fn refresh_in(
     jobs.iter()
         .filter(|job| job.status == JobStatus::Running)
         .any(|job| job.remaining().is_none_or(|remaining| remaining > cold_in))
-        .then(|| cold_in.saturating_sub(REFRESH_MARGIN.min(lifetime / 2)))
+        .then(|| cold_in.saturating_sub(refresh_margin().min(lifetime / 2)))
 }
 
 #[cfg(test)]
@@ -77,7 +81,7 @@ mod tests {
         let jobs = [job(JobStatus::Running, Some(Duration::from_hours(2)))];
         assert_eq!(refresh_in(Some(COLD_IN), LIFETIME, &jobs), Some(DUE));
         assert_eq!(
-            refresh_in(Some(REFRESH_MARGIN), LIFETIME, &jobs),
+            refresh_in(Some(refresh_margin()), LIFETIME, &jobs),
             Some(Duration::ZERO),
             "the refresh that fires at the margin sends at once"
         );

@@ -51,78 +51,78 @@
     },
     {
       "tool": "heel",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.3/heel-aarch64-apple-darwin",
-      "sha256": "94db51d5dcf4098b5d0696faba60c05173c4dc750aee4127ee3c41b91bfd81d4",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.4/heel-aarch64-apple-darwin",
+      "sha256": "dce6f879053fe7addfcb3f2c308c056f723d348c178dff648b2ae01e5d1d25de",
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "94db51d5dcf4098b5d0696faba60c05173c4dc750aee4127ee3c41b91bfd81d4",
+      "executable_sha256": "dce6f879053fe7addfcb3f2c308c056f723d348c178dff648b2ae01e5d1d25de",
       "size": 3338544
     },
     {
       "tool": "heel",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.3/heel-aarch64-unknown-linux-gnu",
-      "sha256": "5255c1903c66c7215305b3d98ff7b224d66e7e2ff3d67576062b5f422e1c9754",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.4/heel-aarch64-unknown-linux-gnu",
+      "sha256": "5cbee9175f434b750472152b1c370334711a4f50c98ccd7acdceaea49a24017b",
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "5255c1903c66c7215305b3d98ff7b224d66e7e2ff3d67576062b5f422e1c9754",
-      "size": 3745168
+      "executable_sha256": "5cbee9175f434b750472152b1c370334711a4f50c98ccd7acdceaea49a24017b",
+      "size": 3745192
     },
     {
       "tool": "heel",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.3/heel-x86_64-unknown-linux-gnu",
-      "sha256": "82413b0418d34c0dd838ebb872cfc7ac2860acc8168f03ea1c59e42f562384eb",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.4/heel-x86_64-unknown-linux-gnu",
+      "sha256": "910ac50704331856cc94fd4b65a391cc7f4809ed465ff87fc78e9b8cfcae7891",
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "82413b0418d34c0dd838ebb872cfc7ac2860acc8168f03ea1c59e42f562384eb",
-      "size": 4241488
+      "executable_sha256": "910ac50704331856cc94fd4b65a391cc7f4809ed465ff87fc78e9b8cfcae7891",
+      "size": 4254440
     },
     {
       "tool": "heel",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "target": {
         "os": "windows",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.3/heel-aarch64-pc-windows-msvc.exe",
-      "sha256": "7951eb3786808ed139febaa812bf267466f11dd321a6d7d1d55d48a47ab7d476",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.4/heel-aarch64-pc-windows-msvc.exe",
+      "sha256": "3ee98705151f0670d50ee38a9097052c62afaca26208938115ff677a1e3bbf69",
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "7951eb3786808ed139febaa812bf267466f11dd321a6d7d1d55d48a47ab7d476",
-      "size": 4041728
+      "executable_sha256": "3ee98705151f0670d50ee38a9097052c62afaca26208938115ff677a1e3bbf69",
+      "size": 4045824
     },
     {
       "tool": "heel",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "target": {
         "os": "windows",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.3/heel-x86_64-pc-windows-msvc.exe",
-      "sha256": "63c5e377b479070d209353a1e32df1a63344565c413b4d84670c94a7c1122322",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.9.4/heel-x86_64-pc-windows-msvc.exe",
+      "sha256": "ff129209f5216883676c31c1d6bdf4112336d7b32bed2f94c575da24ca4b678d",
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "63c5e377b479070d209353a1e32df1a63344565c413b4d84670c94a7c1122322",
-      "size": 4843520
+      "executable_sha256": "ff129209f5216883676c31c1d6bdf4112336d7b32bed2f94c575da24ca4b678d",
+      "size": 4853248
     }
   ]
 }

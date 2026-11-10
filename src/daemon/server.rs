@@ -871,7 +871,7 @@ fn build_models_response(
                             info.max_input_tokens(),
                             info.abilities()
                                 .iter()
-                                .map(|a| crate::models::ability_to_label(*a))
+                                .map(|a| a.label().to_string())
                                 .collect::<Vec<_>>(),
                         )
                     },
