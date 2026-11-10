@@ -6,6 +6,7 @@ mod approval;
 mod assembly;
 mod budgets;
 mod environment;
+mod output_treatment;
 mod settings;
 mod tools;
 mod wording;
@@ -14,6 +15,7 @@ pub use approval::ServerApproval;
 pub use assembly::{ShellAssembly, ShellAssemblyError};
 pub use budgets::ShellBudgets;
 pub use environment::{HostSession, SessionEnvironmentError};
+pub use output_treatment::FileReadsAreVerbatim;
 pub use settings::{
     INPUT_TOOL, KILL_TOOL, MONITOR_TOOL, READ_TOOL, SHELL_TOOL, monitor_settings,
     shell_tool_settings,

@@ -6,6 +6,8 @@ Terminal commands run in a managed GNU bash 5.3.20 (pinned for macOS arm64, Linu
 
 Before a script runs, May refuses it when the script's own shell would run `grep`, `awk` or `find` (the refusal names the replacement: `rg`; `python3` or `jq`; `fd`), or `sed` in any form but the line ranges (`sed -n '2,3p' file`), the forms `aither-sed` accepts; they run the host `sed`. The rule binds only the script's own shell, `time` and `eval` included: a program named by path, run through a wrapper such as `env`, `xargs` or `command`, or by another shell (`sh -c`, a Makefile, a `python3 -c "import subprocess..."`) still reaches the system programs. A script that kills processes by name or pattern, a shell script that does not parse, a foreground `sleep`, and a script that only re-reads files unchanged since their last successful read are refused the same way.
 
+Command output has each run of blank lines collapsed before the agent reads it. A script whose every step is a file read (`cat`, `head`, `tail`, `sed -n`, `nl`, as `command_reading` recognises them) is the exception: its output keeps every blank line, so the agent reads the file as it is. A script that mixes a read with any other command, a pipeline into another program, or a script that does not parse is command output and collapses.
+
 ## What May provides
 
 May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.24.0.json`, the byte-exact release asset of aither's `patch-v0.24.0`). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them.
