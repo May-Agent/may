@@ -191,12 +191,18 @@ async fn the_idle_worker_refreshes_and_a_turn_cancels_it() {
     } = idle_worker(&stub, Duration::from_secs(2)).await;
     let registry = worker.job_registry().expect("a registry").clone();
     let _job = start_job(&registry, 1, None).await;
-    let sent = stub.requests.lock().await.len();
-
+    // A refresh is logged after its response ends, so wait on the log, not
+    // on the stub, which counts a request when it arrives.
     eventually(
         Duration::from_secs(15),
         "the idle worker refreshed the cache twice",
-        async || stub.requests.lock().await.len() >= sent + 2,
+        async || {
+            db.request_logs_for_session(&session_id)
+                .await
+                .expect("request logs")
+                .len()
+                >= 2
+        },
     )
     .await;
 
@@ -204,7 +210,6 @@ async fn the_idle_worker_refreshes_and_a_turn_cancels_it() {
         .request_logs_for_session(&session_id)
         .await
         .expect("request logs");
-    assert!(rows.len() >= 2, "{rows:?}");
     assert!(
         rows.iter().all(|row| row.keep_warm),
         "every logged request is one"
