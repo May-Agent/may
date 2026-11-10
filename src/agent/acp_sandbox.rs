@@ -35,8 +35,8 @@ use arc_swap::ArcSwap;
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use executor_core::{DefaultExecutor, Executor as _};
-use futures_lite::io::{AsyncRead, AsyncWrite};
 use futures_lite::Stream;
+use futures_lite::io::{AsyncRead, AsyncWrite};
 use heel::{Access, Grant, HeelBinary, ResolvedPath};
 
 use crate::agent::PermissionApprover;
@@ -246,9 +246,9 @@ impl SessionSandbox {
 /// `value` as text; the variable or path `what` names is not UTF-8
 /// otherwise.
 fn os_text(what: &str, value: OsString) -> io::Result<String> {
-    value
-        .into_string()
-        .map_err(|value| io::Error::other(format!("{what} is not UTF-8: {}", value.to_string_lossy())))
+    value.into_string().map_err(|value| {
+        io::Error::other(format!("{what} is not UTF-8: {}", value.to_string_lossy()))
+    })
 }
 
 /// The resolved directory of every link on the way from `program` to the
@@ -422,7 +422,11 @@ pub struct ChunkWriter {
 }
 
 impl AsyncWrite for ChunkWriter {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         // The channel is unbounded, so a send never waits.
         match self.chunks.try_send(buf.to_vec()) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
@@ -449,10 +453,7 @@ impl SandboxExecutor {
     /// they start, giving an agent the grants `config` lists for its command
     /// when it starts.
     #[must_use]
-    pub const fn new(
-        cell: Arc<ArcSwap<SessionSandbox>>,
-        config: Arc<ArcSwap<MayConfig>>,
-    ) -> Self {
+    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>, config: Arc<ArcSwap<MayConfig>>) -> Self {
         Self { cell, config }
     }
 

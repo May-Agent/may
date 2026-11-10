@@ -471,8 +471,8 @@ fn parse_terminal_execution_mode(value: &str) -> SandboxMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, SandboxMode,
-        TuiArgs, parse_cli_mode, parse_reasoning_effort,
+        BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, SandboxMode, TuiArgs,
+        parse_cli_mode, parse_reasoning_effort,
     };
     use aither_core::llm::model::ReasoningEffort;
     use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
