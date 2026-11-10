@@ -524,25 +524,19 @@ async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
     }
     std::fs::create_dir_all(paths.root())?;
     let label = on_demand_label(&std::fs::canonicalize(paths.root())?);
-    // Jobs of deleted homes go first, so a start never leaves them behind;
-    // failing to sweep them must not stop this home's daemon.
+    // Jobs of deleted homes go first, so a start never leaves them behind.
     #[cfg(target_os = "macos")]
     {
         let sweep_domain = domain.clone();
-        let swept = blocking::unblock(move || {
+        let removed = blocking::unblock(move || {
             sweep_stale_jobs(
                 &mut repo_search_client::launcher::install::SystemLaunchctl,
                 &sweep_domain,
             )
         })
-        .await;
-        match swept {
-            Ok(removed) => {
-                for service in removed {
-                    tracing::info!(%service, "booted out the on-demand daemon of a deleted May home");
-                }
-            }
-            Err(error) => tracing::warn!(%error, "could not sweep stale on-demand daemon jobs"),
+        .await?;
+        for service in removed {
+            tracing::info!(%service, "booted out the on-demand daemon of a deleted May home");
         }
     }
     let plist = on_demand_plist_path(paths);
