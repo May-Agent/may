@@ -10,11 +10,7 @@ use super::{
 
 #[test]
 fn the_system_layout_holds_the_languages_slot() {
-    assert!(
-        tag::layout()
-            .instructions()
-            .contains(&aither_agent::InstructionSlot::LANGUAGES)
-    );
+    assert!(tag::layout().instructions().contains(&tag::LANGUAGES));
 }
 
 fn test_context() -> aither_agent::Context {
@@ -335,10 +331,7 @@ fn the_system_layout_places_the_command_table_after_capabilities() {
         .iter()
         .position(|slot| *slot == tag::CAPABILITIES)
         .expect("capabilities are laid out");
-    assert_eq!(
-        slots.get(capabilities + 1),
-        Some(&aither_agent::InstructionSlot::COMMANDS)
-    );
+    assert_eq!(slots.get(capabilities + 1), Some(&tag::COMMANDS));
 }
 
 #[test]

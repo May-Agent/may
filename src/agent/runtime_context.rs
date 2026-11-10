@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aither_agent::context::LiveContent;
-use aither_agent::{AgentOptions, ExternalContent, InstructionSlot};
+use aither_agent::{ExternalContent, InstructionSlot};
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
@@ -47,12 +47,16 @@ pub mod tag {
     pub const WORK: InstructionSlot = InstructionSlot::new("work");
     pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
     pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
-    /// aither's built-in permissions slot, holding May's text.
-    pub const PERMISSIONS: InstructionSlot = InstructionSlot::PERMISSIONS;
+    pub const PERMISSIONS: InstructionSlot = InstructionSlot::new("permissions");
     pub const HARNESS: InstructionSlot = InstructionSlot::new("harness");
     pub const EVIDENCE: InstructionSlot = InstructionSlot::new("evidence");
-    /// aither's built-in knowledge-and-time slot, holding May's text.
-    pub const TIME: InstructionSlot = InstructionSlot::KNOWLEDGE_AND_TIME;
+    pub const TIME: InstructionSlot = InstructionSlot::new("knowledge_and_time");
+    /// The prepared tools of the home environment.
+    pub const PREPARED_TOOLS: InstructionSlot = InstructionSlot::new("prepared_tools");
+    /// The table of the commands a script can call.
+    pub const COMMANDS: InstructionSlot = InstructionSlot::new("commands");
+    /// The languages the session talks and works in.
+    pub const LANGUAGES: InstructionSlot = InstructionSlot::new("languages");
 
     pub const MEMORY: ExternalSlot = ExternalSlot::new("memory");
     pub const PROFILE_MEMORIES: ExternalSlot = ExternalSlot::new("profile_memories");
@@ -101,15 +105,15 @@ pub mod tag {
                 PROFILE_PERSONA,
                 ENVIRONMENT,
                 TERMINAL,
-                InstructionSlot::PREPARED_TOOLS,
+                PREPARED_TOOLS,
                 EFFICIENCY,
                 CAPABILITIES,
-                InstructionSlot::COMMANDS,
+                COMMANDS,
                 BROWSER,
                 WORK,
                 PERMISSIONS,
                 TIME,
-                InstructionSlot::LANGUAGES,
+                LANGUAGES,
                 SESSION,
                 REPO_CLONES,
                 PLAN_MODE,
@@ -230,30 +234,9 @@ impl RuntimeSystemContext {
         ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str())
     }
 
-    /// Hands every block to the agent builder, so the first request carries
-    /// them before any reconcile.
-    pub(crate) fn install<B: AgentOptions>(&self, mut builder: B) -> B {
-        for (slot, text) in &self.instructions {
-            builder = builder.system_text(slot, text.clone());
-        }
-        if let Some(rules) = &self.agents.rules {
-            builder = builder.system_text(&tag::PROJECT_RULES, rules.clone());
-        }
-        builder = builder.external_content(&tag::MEMORY, self.memory_block());
-        for (slot, block) in [
-            (&tag::PROFILE_MEMORIES, &self.profile_memories),
-            (&tag::GLOBAL_AGENTS_MD, &self.agents.global),
-            (&tag::AGENTS_MD, &self.agents.root),
-            (&tag::HANDOFF_AGENTS_MD, &self.agents.handoff),
-            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
-        ] {
-            if let Some(block) = block {
-                builder = builder.external_content(slot, block.clone());
-            }
-        }
-        builder
-    }
-
+    /// Brings the blocks of `context` to this state. A context no request
+    /// has carried yet takes them as they are; a later one stages the
+    /// difference and announces it once.
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         let instructions = context.instructions_mut();
         for slot in &tag::MAY_INSTRUCTIONS {

@@ -484,7 +484,10 @@ impl<S: IssueStore, T> IssueTool<S, T> {
     /// Record every issue created or closed on `events`, the main agent's
     /// `tasks.md` inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: crate::harness::working_document::WorkEvents) -> Self {
+    pub fn with_task_events(
+        mut self,
+        events: crate::harness::working_document::WorkEvents,
+    ) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -676,8 +679,12 @@ async fn execute<S: IssueStore>(
         {
             let issue = crate::harness::working_document::WorkRef::issue(number);
             match action {
-                IssueAction::Create => events.record(crate::harness::working_document::WorkEvent::IssueCreated(issue)),
-                IssueAction::Close => events.record(crate::harness::working_document::WorkEvent::IssueClosed(issue)),
+                IssueAction::Create => events.record(
+                    crate::harness::working_document::WorkEvent::IssueCreated(issue),
+                ),
+                IssueAction::Close => events.record(
+                    crate::harness::working_document::WorkEvent::IssueClosed(issue),
+                ),
                 _ => {}
             }
         }

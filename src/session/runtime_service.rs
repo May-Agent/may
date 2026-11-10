@@ -92,16 +92,17 @@ pub struct SessionRuntimeService {
     agents: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Session id → the running terminal's runtime grant handle, installed
     /// when its agent is built.
-    terminal_grants: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, aither_sandbox::TerminalGrants>>,
-    >,
+    terminal_grants:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, aither_sandbox::Grants>>>,
     /// Popups announcing they wait on the user; see [`Self::announce_user_wait`].
     user_waits: tokio::sync::broadcast::Sender<UserWait>,
     /// Session id → the inbox its main agent's `tasks.md` takes state
     /// changes from. It outlives any one agent build, so an answer committed
     /// while no agent runs reaches the next one.
     task_events: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, crate::harness::working_document::WorkEvents>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::harness::working_document::WorkEvents>,
+        >,
     >,
 }
 
@@ -219,7 +220,7 @@ impl SessionRuntimeService {
     /// # Panics
     /// When the `terminal_grants` lock is poisoned.
     #[must_use]
-    pub fn terminal_grants(&self, session_id: &str) -> Option<aither_sandbox::TerminalGrants> {
+    pub fn terminal_grants(&self, session_id: &str) -> Option<aither_sandbox::Grants> {
         self.terminal_grants
             .lock()
             .expect("terminal_grants poisoned")
@@ -232,7 +233,7 @@ impl SessionRuntimeService {
     ///
     /// # Panics
     /// When the `terminal_grants` lock is poisoned.
-    pub fn set_terminal_grants(&self, session_id: &str, grants: aither_sandbox::TerminalGrants) {
+    pub fn set_terminal_grants(&self, session_id: &str, grants: aither_sandbox::Grants) {
         self.terminal_grants
             .lock()
             .expect("terminal_grants poisoned")

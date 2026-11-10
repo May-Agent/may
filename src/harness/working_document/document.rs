@@ -396,9 +396,12 @@ impl WorkingDocument {
         .render()
         .expect("issue trees template must render");
         Some(
-            Block::external("issue_trees", &ExternalContent::data("issue tracker", rendered))
-                .content()
-                .to_string(),
+            Block::external(
+                "issue_trees",
+                &ExternalContent::data("issue tracker", rendered),
+            )
+            .content()
+            .to_string(),
         )
     }
 
@@ -567,7 +570,11 @@ impl WorkingDocument {
         if whole_content.is_none() && changes.is_none() && trees.is_none() {
             return None;
         }
-        Some(self.shown_block(whole_content.as_deref(), changes.as_deref(), trees.as_deref()))
+        Some(self.shown_block(
+            whole_content.as_deref(),
+            changes.as_deref(),
+            trees.as_deref(),
+        ))
     }
 
     fn shown_block(

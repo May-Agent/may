@@ -643,7 +643,11 @@ impl HostConditions {
                     reading,
                 )
                 .alert_text();
-                (condition, now, ContextBlock::stable("system-reminder", text))
+                (
+                    condition,
+                    now,
+                    ContextBlock::stable("system-reminder", text),
+                )
             })
             .collect()
     }

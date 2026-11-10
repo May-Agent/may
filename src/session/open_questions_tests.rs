@@ -19,8 +19,8 @@ use crate::agent::ask_user_tool::{
     WithdrawAskUserTool,
 };
 use crate::db::ChatDb;
-use crate::ui_event_bus::UiEventBus;
 use crate::harness::working_document::BlockerResolver;
+use crate::ui_event_bus::UiEventBus;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);

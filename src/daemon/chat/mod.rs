@@ -1917,7 +1917,7 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
 /// caller sees the closed reply channel, and the next request is served.
 async fn dispatch_requests<Args: Clone, Response, Fut: Future<Output = Response>>(
     worker: &'static str,
-    queue: aither_agent::tool_request::ToolRequestQueue<Args, Response>,
+    queue: crate::harness::tool_request::ToolRequestQueue<Args, Response>,
     handler: impl Fn(Args) -> Fut,
 ) {
     while let Some(request) = queue.next().await {
@@ -4192,7 +4192,6 @@ fn build_session_agent<'a>(
                         .prompt_cache_epoch
                 }),
                 subagents: Some(subagents),
-                background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
                 limits: state.live_limits.clone(),
@@ -5143,7 +5142,7 @@ mod tests {
     /// dispatcher serves the next command on the same queue.
     #[tokio::test]
     async fn a_dispatcher_survives_a_panicking_command() {
-        let (broker, queue) = aither_agent::tool_request::channel::<u32, u32>();
+        let (broker, queue) = crate::harness::tool_request::channel::<u32, u32>();
         let worker = tokio::spawn(super::dispatch_requests(
             "test dispatcher",
             queue,

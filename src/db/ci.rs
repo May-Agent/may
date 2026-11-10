@@ -480,6 +480,22 @@ impl ChatDb {
         Ok(rows.into_iter().map(|row| row.alert).collect())
     }
 
+    /// The alerts [`take_ci_alerts`](Self::take_ci_alerts) would take, left
+    /// for it.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn waiting_ci_alerts(&self, session_id: &str) -> Result<Vec<String>, ChatDbError> {
+        let rows = query!(
+            self.db,
+            "SELECT * FROM ci_findings WHERE session_id = ? AND alerted = 0 ORDER BY id",
+            session_id
+        )
+        .fetch_all::<CiFindingRow>()
+        .await?;
+        Ok(rows.into_iter().map(|row| row.alert).collect())
+    }
+
     /// The session's findings after `after`, oldest first.
     ///
     /// # Errors

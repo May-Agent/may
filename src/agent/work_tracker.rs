@@ -4,8 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::harness::working_document::{RelatedWork, WorkComment, WorkKind, WorkStatus};
-use aither_agent::{WorkItem, WorkRef, WorkState, WorkTrackerError};
+use crate::harness::working_document::{
+    RelatedWork, WorkComment, WorkItem, WorkKind, WorkRef, WorkState, WorkStatus, WorkTrackerError,
+};
 
 use crate::db::{ChatDb, PrRow};
 use crate::issue::{

@@ -103,6 +103,25 @@ impl ChatDb {
         Ok(rows.into_iter().map(|row| row.text).collect())
     }
 
+    /// The alerts [`take_pr_check_alerts`](Self::take_pr_check_alerts) would
+    /// take, left for it.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn waiting_pr_check_alerts(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<String>, ChatDbError> {
+        let rows = query!(
+            self.db,
+            "SELECT text FROM pr_check_alerts WHERE session_id = ? AND alerted = 0 ORDER BY id",
+            session_id
+        )
+        .fetch_all::<AlertText>()
+        .await?;
+        Ok(rows.into_iter().map(|row| row.text).collect())
+    }
+
     /// Every GitHub PR still in flight, across sessions.
     ///
     /// # Errors

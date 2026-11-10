@@ -9,9 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use askama::Template;
 
-use crate::harness::working_document::{
-    DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument,
-};
+use crate::harness::working_document::{DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument};
 
 use super::{FILE, TasksFile, violation_sentence};
 

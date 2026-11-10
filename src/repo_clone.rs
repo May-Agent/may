@@ -104,9 +104,9 @@ impl CloneSandbox {
     async fn stderr_text(result: &ScriptResult) -> String {
         match &result.stderr {
             Some(CommandStream::Inline { text }) => text.clone(),
-            Some(CommandStream::Stored { file, .. }) => {
-                async_fs::read_to_string(&file.path).await.unwrap_or_default()
-            }
+            Some(CommandStream::Stored { file, .. }) => async_fs::read_to_string(&file.path)
+                .await
+                .unwrap_or_default(),
             Some(CommandStream::Image { .. }) | None => String::new(),
         }
     }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_agent::ContextWindowPhase;
-use aither_sandbox::TerminalExecutionMode;
+use aither_sandbox::SandboxMode;
 use askama::Template as _;
 
 use crate::agent::cache_miss::CacheMissCause;
@@ -152,7 +152,7 @@ pub enum ToolDisplay {
         /// Command text.
         command: String,
         /// Requested execution backend.
-        mode: TerminalExecutionMode,
+        mode: SandboxMode,
         /// Name of the SSH server the command runs on; `None` for the home
         /// environment.
         location: Option<String>,
@@ -3658,9 +3658,9 @@ fn format_status_usage(
 /// Marker prefix shown before a terminal command for its execution
 /// backend. A host-run (`unsafe`) command is marked by the red status
 /// icon instead — see [`status_icon`].
-const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
+const fn terminal_mode_marker(mode: SandboxMode) -> &'static str {
     match mode {
-        TerminalExecutionMode::Default | TerminalExecutionMode::Unsafe => "",
+        SandboxMode::Sandboxed | SandboxMode::Unsandboxed => "",
     }
 }
 
@@ -3711,7 +3711,7 @@ fn tool_header_line(
     let unsafe_exec = matches!(
         display,
         ToolDisplay::Terminal {
-            mode: TerminalExecutionMode::Unsafe,
+            mode: SandboxMode::Unsandboxed,
             ..
         }
     );
@@ -4679,7 +4679,7 @@ mod tests {
         assert_eq!(format_cost_usd(0.000_004_2), "$0.0000042");
     }
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
-    use aither_sandbox::TerminalExecutionMode;
+    use aither_sandbox::SandboxMode;
     use ratatui::style::Color;
     use ratatui::text::Line;
     use std::path::PathBuf;
@@ -4835,7 +4835,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: "echo hi".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -4884,7 +4884,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: command.to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -4933,7 +4933,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: command.to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -4987,7 +4987,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: "ech".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -5018,7 +5018,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: "greet".to_string(),
                 command: "echo hi".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -5049,9 +5049,9 @@ mod tests {
 
     #[test]
     fn terminal_mode_marker_covers_every_backend() {
-        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Default), "");
+        assert_eq!(terminal_mode_marker(SandboxMode::Sandboxed), "");
         // Unsafe carries no text marker — the red status icon marks it.
-        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Unsafe), "");
+        assert_eq!(terminal_mode_marker(SandboxMode::Unsandboxed), "");
     }
 
     #[test]
@@ -5065,7 +5065,7 @@ mod tests {
             let display = ToolDisplay::Terminal {
                 description: description.to_string(),
                 command: "uname".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: location.map(str::to_string),
                 reading: None,
                 card: None,
@@ -5089,9 +5089,9 @@ mod tests {
     #[test]
     fn inline_terminal_renders_mode_marker() {
         for (mode, marker, icon_fg) in [
-            (TerminalExecutionMode::Default, "", Color::Green),
+            (SandboxMode::Sandboxed, "", Color::Green),
             // Unsafe: no text marker — the status icon turns red instead.
-            (TerminalExecutionMode::Unsafe, "", Color::Red),
+            (SandboxMode::Unsandboxed, "", Color::Red),
         ] {
             let display = ToolDisplay::Terminal {
                 description: String::new(),
@@ -5123,7 +5123,7 @@ mod tests {
         ToolDisplay::Terminal {
             description: String::new(),
             command: command.to_string(),
-            mode: TerminalExecutionMode::Default,
+            mode: SandboxMode::Sandboxed,
             location: None,
             reading: None,
             card: None,
@@ -5151,7 +5151,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: "terminal {…}".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -5691,7 +5691,7 @@ mod tests {
         ToolDisplay::Terminal {
             description: "work".to_string(),
             command: script.to_string(),
-            mode: TerminalExecutionMode::Default,
+            mode: SandboxMode::Sandboxed,
             location: None,
             reading: Some(crate::command_reading::CommandReading::of(script)),
             card: None,
@@ -6804,7 +6804,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: format!("echo {label}"),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 status: ToolStatus::Done,
                 output: None,
@@ -6911,7 +6911,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: "echo hi".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,
@@ -6959,7 +6959,7 @@ mod tests {
             ToolDisplay::Terminal {
                 description: "run inner".to_string(),
                 command: "echo inner".to_string(),
-                mode: TerminalExecutionMode::Default,
+                mode: SandboxMode::Sandboxed,
                 location: None,
                 reading: None,
                 card: None,

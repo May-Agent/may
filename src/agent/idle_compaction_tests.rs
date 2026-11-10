@@ -345,7 +345,6 @@ impl SessionParts {
             job_server: self.job_server.clone(),
             provider_attempt: 0,
             subagents: None,
-            background_jobs: aither_agent::BackgroundJobPolicy::Await,
             connectivity: aither_connectivity::Connectivity::manual(true).0,
             rules_import: self.rules_import.clone(),
             limits: crate::agent::LiveLimits::of(&MayConfig::default()),

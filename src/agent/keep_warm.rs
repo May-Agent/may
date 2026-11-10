@@ -8,18 +8,14 @@
 
 use std::time::Duration;
 
-use aither_agent::CacheKeepAlive;
 use aither_sandbox::{JobInfo, JobStatus};
 
-/// How long before its entry goes cold a refresh is sent, at most.
-///
-/// It is aither's default lead for the refreshes it sends while a run waits, so
-/// both paths land in the same window: late enough that a command ending
-/// meanwhile saves the request, early enough that a slow request still
-/// reaches the provider before the entry expires.
+/// How long before its entry goes cold a refresh is sent, at most: late
+/// enough that a command ending meanwhile saves the request, early enough
+/// that a slow request still reaches the provider before the entry expires.
 #[must_use]
-pub fn refresh_margin() -> Duration {
-    CacheKeepAlive::default().send_before_expiry
+pub const fn refresh_margin() -> Duration {
+    Duration::from_secs(30)
 }
 
 /// How long from now the next refresh is due, `None` when none should be
@@ -51,7 +47,7 @@ pub fn refresh_in(
 mod tests {
     use std::time::Instant;
 
-    use aither_sandbox::{JobPlace, SandboxMode, ScriptLanguage};
+    use aither_sandbox::{Interpreter, JobPlace, SandboxMode};
 
     use super::*;
 
@@ -61,7 +57,7 @@ mod tests {
             task_id: "amber".to_string(),
             execution_key: String::new(),
             script: "sleep 9999".to_string(),
-            language: ScriptLanguage::Shell,
+            interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
             started_at: Instant::now(),
             status,

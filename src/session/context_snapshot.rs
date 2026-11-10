@@ -1,4 +1,4 @@
-use aither_agent::{AgentCheckpoint, CheckpointContext};
+use aither_agent::AgentCheckpoint;
 
 use crate::{
     MayAgent,
@@ -27,18 +27,6 @@ pub fn parse_persisted_context_snapshot(
         checkpoint: snapshot.checkpoint,
         applied_seq: snapshot.applied_seq,
         updated_at: snapshot.updated_at,
-    }
-}
-
-/// Build an [`AgentCheckpoint`] from a checkpoint-hook context.
-#[must_use]
-pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
-    AgentCheckpoint {
-        context: ctx.context.clone(),
-        tool_surface_hash: ctx.tool_surface_hash.to_string(),
-        context_window: ctx.window.clone(),
-        has_background_tasks: ctx.has_background_tasks,
-        document: ctx.document.cloned(),
     }
 }
 
@@ -130,21 +118,6 @@ async fn persist_checkpoint(
     Ok(())
 }
 
-/// Persist a checkpoint produced by a checkpoint hook as the session's
-/// context snapshot, as the run holding `fence`.
-///
-/// # Errors
-///
-/// Returns [`ChatDbError`](crate::db::ChatDbError) when reading the latest
-/// message ID or upserting the snapshot fails.
-pub async fn persist_checkpoint_from_hook(
-    db: &ChatDb,
-    fence: &RunFence,
-    ctx: &CheckpointContext<'_>,
-) -> Result<(), crate::db::ChatDbError> {
-    persist_checkpoint(db, fence, checkpoint_from_hook(ctx)).await
-}
-
 /// Export the agent's checkpoint and persist it as the session's context
 /// snapshot, as the run holding `fence`.
 ///
@@ -194,8 +167,6 @@ mod tests {
                 },
                 messages: Vec::new(),
             },
-            has_background_tasks: false,
-            document: None,
         }
     }
 

@@ -1,8 +1,7 @@
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, ToolResult, tool::ToolResultPart,
 };
-use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalDeltaArgs};
-use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
+use aither_sandbox::{JobInputArgs, JobKillArgs, JobReadArgs, SandboxMode, ShellArgs};
 use partial_json_fixer::fix_json;
 
 /// Frontend-agnostic start event for a tool call.
@@ -15,7 +14,7 @@ pub enum ToolStartKind {
         /// Command or script being executed.
         script: String,
         /// Requested execution backend for the command.
-        mode: TerminalExecutionMode,
+        mode: SandboxMode,
         /// Name of the SSH server the command runs on; `None` for the home
         /// environment.
         location: Option<String>,
@@ -138,27 +137,23 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
         )
     }
     match name {
-        "terminal" => parse(name, arguments, |args: TerminalArgs| {
-            ToolStartKind::Terminal {
-                description: args.description,
-                script: args.script,
-                mode: args.mode,
-                location: location_name(args.location.as_deref()),
-            }
+        "terminal" => parse(name, arguments, |args: ShellArgs| ToolStartKind::Terminal {
+            description: args.description,
+            script: args.script,
+            mode: args.sandbox,
+            location: location_name(args.location.as_deref()),
         }),
-        "terminal_input" => parse(name, arguments, |args: InputTerminalArgs| {
-            ToolStartKind::Stdin {
-                task_id: args.task_id,
-                input: args.input,
-            }
+        "terminal_input" => parse(name, arguments, |args: JobInputArgs| ToolStartKind::Stdin {
+            task_id: args.task_id,
+            input: args.input,
         }),
-        "terminal_kill" => parse(name, arguments, |args: KillTerminalArgs| {
+        "terminal_kill" => parse(name, arguments, |args: JobKillArgs| {
             ToolStartKind::JobControl {
                 action: JobControlAction::Kill,
                 task_id: args.task_id,
             }
         }),
-        "terminal_read" => parse(name, arguments, |args: ReadTerminalDeltaArgs| {
+        "terminal_read" => parse(name, arguments, |args: JobReadArgs| {
             ToolStartKind::JobControl {
                 action: JobControlAction::Read,
                 task_id: args.task_id,
@@ -189,7 +184,7 @@ pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
             description: pick(&value, "description"),
             script: pick(&value, "script"),
             mode: value
-                .get("mode")
+                .get("sandbox")
                 .and_then(|mode| serde_json::from_value(mode.clone()).ok())
                 .unwrap_or_default(),
             location: location_name(value.get("location").and_then(serde_json::Value::as_str)),
@@ -365,16 +360,16 @@ mod tests {
     use aither_core::llm::{
         CommandOutcome, CommandResult, CommandStream, StoredFile, ToolResult, tool::ToolResultPart,
     };
-    use aither_sandbox::TerminalExecutionMode;
+    use aither_sandbox::SandboxMode;
 
     #[test]
     fn parse_tool_start_uses_actual_execution_mode() {
         for (mode_json, expected) in [
-            ("default", TerminalExecutionMode::Default),
-            ("unsafe", TerminalExecutionMode::Unsafe),
+            ("sandboxed", SandboxMode::Sandboxed),
+            ("unsandboxed", SandboxMode::Unsandboxed),
         ] {
             let args = format!(
-                r#"{{"description":"say hi","script":"echo hi","mode":"{mode_json}","timeout":5}}"#
+                r#"{{"description":"say hi","script":"echo hi","sandbox":"{mode_json}","timeout":5}}"#
             );
             let start = parse_tool_start("terminal", &args);
             match start {
@@ -461,7 +456,7 @@ mod tests {
             } => {
                 assert_eq!(description, "serve");
                 assert_eq!(script, "bun dev");
-                assert_eq!(mode, TerminalExecutionMode::Default);
+                assert_eq!(mode, SandboxMode::Sandboxed);
             }
             _ => panic!("expected terminal start event"),
         }
@@ -545,7 +540,7 @@ mod tests {
             else {
                 panic!("expected terminal start kind");
             };
-            assert_eq!(mode, TerminalExecutionMode::Default);
+            assert_eq!(mode, SandboxMode::Sandboxed);
             assert!(description.starts_with(previous.as_str()));
             previous = description;
             let _ = script;
@@ -557,20 +552,20 @@ mod tests {
     fn parse_tool_start_partial_reads_partial_mode() {
         let ToolStartKind::Terminal { mode, .. } = parse_tool_start_partial(
             "terminal",
-            r#"{"description":"x","script":"rm -rf /","mode":"unsa"}"#,
+            r#"{"description":"x","script":"rm -rf /","sandbox":"unsa"}"#,
         ) else {
             panic!("expected terminal start kind");
         };
         // Truncated enum text is unreadable — falls back to the default.
-        assert_eq!(mode, TerminalExecutionMode::Default);
+        assert_eq!(mode, SandboxMode::Sandboxed);
 
         let ToolStartKind::Terminal { mode, .. } = parse_tool_start_partial(
             "terminal",
-            r#"{"description":"x","script":"rm -rf /","mode":"unsafe"}"#,
+            r#"{"description":"x","script":"rm -rf /","sandbox":"unsandboxed"}"#,
         ) else {
             panic!("expected terminal start kind");
         };
-        assert_eq!(mode, TerminalExecutionMode::Unsafe);
+        assert_eq!(mode, SandboxMode::Unsandboxed);
     }
 
     #[test]

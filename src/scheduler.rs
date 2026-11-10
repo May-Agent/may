@@ -13,9 +13,9 @@ use std::sync::Arc;
 use aither_core::llm::CommandOutcome;
 use aither_sandbox::{
     AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
-    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalTool,
-    ToolRegistryBuilder, permission::PermissionError,
+    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, SandboxMode,
+    ShellRuntimeAvailability, ShellSessionRegistry, TerminalArgs, TerminalExecutionMode,
+    TerminalTool, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -2077,9 +2077,8 @@ mod tests {
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("db should initialize");
-        let empty_distribution =
-            crate::tools::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
-                .expect("an empty distribution is well-formed");
+        let empty_distribution = crate::tools::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
+            .expect("an empty distribution is well-formed");
         let runtime = TaskRuntime::load(db, may_dir.clone(), Arc::new(empty_distribution))
             .await
             .expect("task runtime should load");

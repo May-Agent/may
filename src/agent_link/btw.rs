@@ -88,7 +88,7 @@ impl ForkHost {
         task: ForkTask<'_>,
     ) -> Result<ForkOutcome, AgentLinkError> {
         let shell = launcher
-            .subagent(SubagentGrant::new(), None)
+            .subagent(SubagentGrant::new(), None, "btw")
             .await
             .map_err(|error| AgentLinkError::Fork(error.to_string()))?;
         let space = shell.working_dir().clone();

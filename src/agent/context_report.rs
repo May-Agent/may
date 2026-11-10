@@ -163,7 +163,7 @@ impl ContextReport {
         }
         for (slot, content) in context.instructions().iter() {
             match slot {
-                slot if *slot == tag::CAPABILITIES || *slot == InstructionSlot::COMMANDS => {
+                slot if *slot == tag::CAPABILITIES || *slot == tag::COMMANDS => {
                     let carved = carve_capabilities(content, named_commands);
                     system_prompt_chars += carved.architecture_chars;
                     command_chars += carved.command_chars;
@@ -376,7 +376,7 @@ mod tests {
         let mut context = aither_agent::Context::with_layout(tag::layout());
         let instructions = context.instructions_mut();
         instructions.insert(&tag::CAPABILITIES, base_system_block());
-        instructions.insert(&InstructionSlot::COMMANDS, COMMAND_TABLE);
+        instructions.insert(&tag::COMMANDS, COMMAND_TABLE);
         instructions.insert(&tag::ENVIRONMENT, "sandbox=/tmp cwd=/tmp");
         context.external_mut().insert(
             &tag::MEMORY,

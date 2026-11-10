@@ -479,7 +479,10 @@ impl PrStore {
             .await?;
         self.event(&pr, "opened", Some(&format!("base {base_sha}")))
             .await;
-        self.task_event(&pr, crate::harness::working_document::WorkEvent::PullRequestOpened);
+        self.task_event(
+            &pr,
+            crate::harness::working_document::WorkEvent::PullRequestOpened,
+        );
         if let Some(n) = external_number {
             self.event(&pr, "opened", Some(&format!("github PR #{n}")))
                 .await;
@@ -577,7 +580,10 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
-                self.task_event(&pr, crate::harness::working_document::WorkEvent::PullRequestMerged);
+                self.task_event(
+                    &pr,
+                    crate::harness::working_document::WorkEvent::PullRequestMerged,
+                );
                 let clone = self.retire_clone(&resolved, &head_sha).await?;
                 Ok(PrMerged {
                     number,
@@ -595,7 +601,10 @@ impl PrStore {
                     .update_pr(pr.id, "rejected", Some(&head_sha), None, None)
                     .await?;
                 self.event(&pr, "rejected", Some(&reason)).await;
-                self.task_event(&pr, crate::harness::working_document::WorkEvent::PullRequestRejected);
+                self.task_event(
+                    &pr,
+                    crate::harness::working_document::WorkEvent::PullRequestRejected,
+                );
                 Err(PrError::Rejected(reason))
             }
         }
@@ -637,7 +646,10 @@ impl PrStore {
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
-        self.task_event(&pr, crate::harness::working_document::WorkEvent::PullRequestClosed);
+        self.task_event(
+            &pr,
+            crate::harness::working_document::WorkEvent::PullRequestClosed,
+        );
         if resolved.record.local {
             drop_ref(
                 self.context.signing.host(),
@@ -1059,7 +1071,10 @@ impl PrStore {
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
                 self.record_queue_wait(pr).await;
-                self.task_event(pr, crate::harness::working_document::WorkEvent::PullRequestMerged);
+                self.task_event(
+                    pr,
+                    crate::harness::working_document::WorkEvent::PullRequestMerged,
+                );
                 let pull_sync = self.pull_sync(&resolved.record, &owner_repo).await;
                 let clone = self.retire_clone(resolved, head_sha).await?;
                 let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
@@ -1085,7 +1100,10 @@ impl PrStore {
                             .update_pr(pr.id, "closed", Some(head_sha), None, None)
                             .await?;
                         self.event(pr, "closed", Some(&report)).await;
-                        self.task_event(pr, crate::harness::working_document::WorkEvent::PullRequestClosed);
+                        self.task_event(
+                            pr,
+                            crate::harness::working_document::WorkEvent::PullRequestClosed,
+                        );
                         Err(PrError::State(report))
                     }
                     merge_watch::Stopped::CheckFailed(_) => {
@@ -1363,12 +1381,16 @@ impl PrStore {
     fn task_event(
         &self,
         pr: &crate::db::PrRow,
-        change: fn(crate::harness::working_document::WorkRef) -> crate::harness::working_document::WorkEvent,
+        change: fn(
+            crate::harness::working_document::WorkRef,
+        ) -> crate::harness::working_document::WorkEvent,
     ) {
         if let Some(events) = &self.context.task_events
             && let Ok(number) = u64::try_from(pr.number)
         {
-            events.record(change(crate::harness::working_document::WorkRef::pull_request(number)));
+            events.record(change(
+                crate::harness::working_document::WorkRef::pull_request(number),
+            ));
         }
     }
 

@@ -183,4 +183,62 @@ mod test_support {
             .await
             .expect("outputs store")
     }
+
+    /// The launch of a sandboxed script the main agent's call started.
+    pub fn main_launch() -> aither_sandbox::LaunchInfo {
+        aither_sandbox::LaunchInfo::new("task", None, aither_sandbox::SandboxMode::Sandboxed)
+    }
+
+    /// The launch of a sandboxed script a subagent's call started.
+    pub fn subagent_launch() -> aither_sandbox::LaunchInfo {
+        let identity = aither_core::llm::CallIdentity::new(
+            aither_core::llm::ToolCallId::new("call"),
+            aither_core::llm::AgentIdentity::Subagent(aither_core::llm::SubagentIdentity::new(
+                "worker", None,
+            )),
+        );
+        aither_sandbox::LaunchInfo::new(
+            "task",
+            Some(identity),
+            aither_sandbox::SandboxMode::Sandboxed,
+        )
+    }
+
+    /// A built command registry and the store its outputs go to: the view a
+    /// script's `launch` has of the commands, called without a shell.
+    pub struct TestCommands {
+        registry: crate::ipc::CommandRegistry,
+        outputs: aither_sandbox::OutputStore,
+    }
+
+    impl TestCommands {
+        /// `builder`'s registry with outputs stored in `dir`.
+        pub async fn build(
+            builder: crate::ipc::CommandRegistryBuilder,
+            dir: impl Into<std::path::PathBuf>,
+        ) -> Self {
+            Self {
+                registry: builder.build(),
+                outputs: test_output_store(dir).await,
+            }
+        }
+
+        /// The registry, for the questions only it answers.
+        pub const fn registry(&self) -> &crate::ipc::CommandRegistry {
+            &self.registry
+        }
+
+        /// Calls `name` with `args` as the script `launch` describes.
+        pub async fn call(
+            &self,
+            launch: &aither_sandbox::LaunchInfo,
+            name: &str,
+            args: &[&str],
+        ) -> crate::ipc::CommandEnvelope {
+            let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+            self.registry
+                .call(launch, None, &self.outputs, name, &args, None)
+                .await
+        }
+    }
 }

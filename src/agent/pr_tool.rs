@@ -2,8 +2,8 @@
 
 use std::borrow::Cow;
 
-use aither_core::llm::{Tool, ToolResult};
 use crate::ipc::{Binding, Role as CommandRole};
+use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
 

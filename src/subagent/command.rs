@@ -37,7 +37,7 @@ use super::tier::{Tier, TierModels};
 use crate::agent::acp_subagent::AcpSession;
 use crate::agent::subagent_tracker::{RunCard, RunUsage, SubagentTracker};
 use crate::harness::compact_tool::CompactSignal;
-use crate::harness::language::{LanguageGuard, WorkingText, default_refusal};
+use crate::harness::language::{LanguageGuard, WorkingText};
 use crate::harness::subagent_file::{SubagentAccess, SubagentDefinition, SubagentLookup};
 use crate::harness::working_document::{DocumentSpec, WorkEvent, WorkEvents, WorkingDocument};
 use crate::ipc::{CommandUsage, SessionShell};
@@ -283,7 +283,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         if let Some(guard) = &self.settings().languages {
             guard
                 .check_working(prompt, WorkingText::Internal)
-                .map_err(|refusal| anyhow::anyhow!(default_refusal(&refusal)))?;
+                .map_err(|refusal| crate::agent::notices::subagent_language_refused(&refusal))?;
         }
         Ok(prompt.to_string())
     }
@@ -317,12 +317,13 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         &self,
         grant: SubagentGrant,
         caller: Option<&Path>,
+        name: &str,
     ) -> anyhow::Result<SessionShell> {
         let Some(shell) = &self.shell else {
             anyhow::bail!("a subagent needs the shell of the agent that launches it");
         };
         shell
-            .subagent(grant, caller)
+            .subagent(grant, caller, name)
             .await
             .map_err(|error| anyhow::anyhow!("failed to create the subagent's shell: {error}"))
     }
@@ -337,7 +338,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let working_dir = self.caller_dir(caller);
         let (worktrees, commit_worktrees) = requested.paths(Some(working_dir));
         let shell = self
-            .launch(requested.grant(Some(working_dir)), Some(working_dir))
+            .launch(requested.grant(Some(working_dir)), Some(working_dir), agent)
             .await?;
         let ledger = shell.commit_ledger();
         let working_copies = shell
@@ -416,7 +417,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             Source::Definition(_) => tiers.select(prompt, declared).await?,
         };
         let shell = self
-            .launch(grant.grant(Some(self.caller_dir(caller))), caller)
+            .launch(grant.grant(Some(self.caller_dir(caller))), caller, &name)
             .await?;
         Ok(Pending {
             name,
