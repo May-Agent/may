@@ -1505,12 +1505,12 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let user = crate::commit_signing::test_user::TestUser::new(&temp.path().join("user"));
 
-        let (builder, commands) = register_for(
+        let (builder, commands) = Box::pin(register_for(
             temp.path(),
             &session_dir,
             TaskRuntimeKind::Local,
             user.host(),
-        )
+        ))
         .await
         .expect("commands should register");
 
@@ -1537,12 +1537,12 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let user = crate::commit_signing::test_user::TestUser::new(&temp.path().join("user"));
 
-        let (builder, _) = register_for(
+        let (builder, _) = Box::pin(register_for(
             temp.path(),
             &session_dir,
             TaskRuntimeKind::Container,
             user.host(),
-        )
+        ))
         .await
         .expect("commands should register");
 
@@ -1577,12 +1577,12 @@ mod tests {
         std::fs::write(session_dir.join(".config"), "").expect("blocker");
         let user = crate::commit_signing::test_user::TestUser::new(&temp.path().join("user"));
 
-        let Err(error) = register_for(
+        let Err(error) = Box::pin(register_for(
             temp.path(),
             &session_dir,
             TaskRuntimeKind::Local,
             user.host(),
-        )
+        ))
         .await
         else {
             panic!("registration succeeded");

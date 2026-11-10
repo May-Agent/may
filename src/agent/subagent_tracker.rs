@@ -158,6 +158,7 @@ impl Drop for TrackedRun {
 
 /// The card of one `subagent` call: running from its start, done with its
 /// result, withdrawn when the call failed.
+#[derive(Debug)]
 pub struct RunCard<'a> {
     tracker: &'a SubagentTracker,
     call_id: String,
@@ -168,6 +169,7 @@ pub struct RunCard<'a> {
 
 impl<'a> RunCard<'a> {
     /// Reports a running card for call `call_id`.
+    #[must_use]
     pub fn start(
         tracker: &'a SubagentTracker,
         call_id: String,
@@ -287,12 +289,12 @@ mod tests {
             aither_core::llm::AgentIdentity::Main,
         );
         let run = runs.start(&call, "explorer", "brief");
-        let (usage, tracked) = tracker.track(run.id());
-        usage.record(&aither_core::llm::Usage::new(10, 4));
+        let (counters, held) = tracker.track(run.id());
+        counters.record(&aither_core::llm::Usage::new(10, 4));
         let [snapshot] = tracker.running().try_into().expect("one run");
         assert_eq!(snapshot.total_tokens(), 14);
         assert_eq!(snapshot.requests, 1);
-        drop(tracked);
+        drop(held);
         drop(run);
         assert!(tracker.running().is_empty());
     }

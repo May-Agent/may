@@ -46,6 +46,9 @@ impl RefusedReads {
 
     /// Whether `call` was refused as an unchanged re-read; each call is
     /// answered once.
+    ///
+    /// # Panics
+    /// Panics when the record's lock is poisoned.
     #[must_use]
     pub fn take(&self, call: &CallIdentity) -> bool {
         self.0

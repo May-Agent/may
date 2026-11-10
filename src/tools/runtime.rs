@@ -1143,67 +1143,6 @@ impl<D> PreparedTools<D> {
 }
 
 impl PreparedTools<PathBuf> {
-    pub(crate) async fn verify_local_versions<E: executor_core::Executor + Clone + 'static>(
-        &self,
-        executor: E,
-        heel_binary: heel::HeelBinary,
-    ) -> Result<(), ToolRuntimeError> {
-        use futures::{StreamExt, TryStreamExt};
-        let scratch = blocking::unblock(tempfile::tempdir).await?;
-        let config = heel::SandboxConfig::builder()
-            .heel_binary(heel_binary)
-            .working_dir(
-                std::fs::canonicalize(scratch.path())
-                    .unwrap_or_else(|_| scratch.path().to_path_buf()),
-            )
-            .grant(
-                heel::ResolvedPath::new(std::fs::canonicalize(&self.bin_dir)?)
-                    .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?,
-                heel::Access::READ | heel::Access::EXEC,
-            )
-            .build();
-        let sandbox = std::sync::Arc::new(
-            heel::Sandbox::with_config_and_executor(config, executor)
-                .await
-                .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?,
-        );
-        let directory = self.bin_dir.clone();
-        futures::stream::iter(self.catalog.tools.clone())
-            .map(|info| {
-                let sandbox = sandbox.clone();
-                let program = directory
-                    .join(info.command)
-                    .with_extension(std::env::consts::EXE_EXTENSION);
-                async move {
-                    let program = program
-                        .to_str()
-                        .ok_or_else(|| ToolRuntimeError::InvalidCache(program.clone()))?;
-                    let command = sandbox.command(program).arg("--version");
-                    let output = futures_lite::future::or(
-                        async {
-                            command
-                                .output()
-                                .await
-                                .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))
-                        },
-                        async {
-                            async_io::Timer::after(std::time::Duration::from_secs(30)).await;
-                            Err(ToolRuntimeError::InitializationTimeout)
-                        },
-                    )
-                    .await?;
-                    if !output.status.success() {
-                        return Err(ToolRuntimeError::VersionMismatch(info.command.into()));
-                    }
-                    info.verify_version(&String::from_utf8(output.stdout)?)
-                }
-            })
-            .buffer_unordered(ManagedTool::ALL.len())
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(())
-    }
-
     #[doc = "Rejects writable host grants that expose the managed executable directory."]
     #[doc = "# Errors"]
     #[doc = "Returns path resolution errors or a writable-directory conflict."]
@@ -1252,10 +1191,12 @@ impl PreparedTools<PathBuf> {
     }
 }
 
-/// `UV_PYTHON_PREFERENCE`: a project without its own Python request gets the
-/// managed `python3` from `PATH` rather than whichever interpreter `uv` last
-/// installed for another project. A `.python-version` or `.venv` that no
-/// `PATH` interpreter satisfies is still installed or found by `uv`.
+/// `UV_PYTHON_PREFERENCE` for the managed `uv`.
+///
+/// A project without its own Python request gets the managed `python3` from
+/// `PATH` rather than whichever interpreter `uv` last installed for another
+/// project. A `.python-version` or `.venv` that no `PATH` interpreter
+/// satisfies is still installed or found by `uv`.
 pub const UV_PYTHON_PREFERENCE: &str = "system";
 
 /// `uv`'s cache and project Python installs, both under the shared
@@ -1781,21 +1722,6 @@ pub mod tests {
             target: target.clone(),
             interpreter_sha256: hex::encode(digest(&fixture_interpreter(FIXTURE_PYTHON_VERSION))),
         }
-    }
-
-    /// The native target's interpreter pin for an interpreter with `digest`,
-    /// as manifest JSON; empty where the platform has no managed `python3`.
-    pub fn python_pins_for(digest: [u8; 32], version: &str) -> Vec<PythonPin> {
-        let target = ToolTarget::native().unwrap();
-        target
-            .provides_python()
-            .then(|| PythonPin {
-                version: version.into(),
-                target,
-                interpreter_sha256: hex::encode(digest),
-            })
-            .into_iter()
-            .collect()
     }
 
     /// The interpreter pin matching what the fixture `uv` installs.

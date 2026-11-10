@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use aither_sandbox::{JobInfo, JobStatus};
 
-/// How long before its entry goes cold a refresh is sent, at most: late
-/// enough that a command ending meanwhile saves the request, early enough
-/// that a slow request still reaches the provider before the entry expires.
+/// How long before its entry goes cold a refresh is sent, at most.
+///
+/// Late enough that a command ending meanwhile saves the request, early
+/// enough that a slow request still reaches the provider before the entry
+/// expires.
 #[must_use]
 pub const fn refresh_margin() -> Duration {
     Duration::from_secs(30)

@@ -131,6 +131,10 @@ trait ChatSink {
     fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
     /// The reply just streamed was not in the communication language:
     /// `text` is its translation, shown instead and marked as translated.
+    #[expect(
+        dead_code,
+        reason = "the redesigned loop has no reply-translation step to call it yet"
+    )]
     fn on_reply_translated(
         &mut self,
         _text: &str,
@@ -302,6 +306,10 @@ impl HubSink {
 /// turn just streamed; the streamed text stays its original.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    dead_code,
+    reason = "the redesigned loop has no reply-translation step to emit it yet"
+)]
 struct SseTranslatedEvent<'a> {
     seq: u64,
     turn_id: &'a str,
@@ -1989,7 +1997,6 @@ struct TurnRun<'r> {
     /// Set once a retry follows tool activity: the attempt continues the
     /// committed transcript instead of resubmitting the prompt.
     continue_from_transcript: bool,
-    attempt: usize,
 }
 
 /// What the handler of a turn's run works on: the turn, the facts of the
@@ -2025,7 +2032,7 @@ async fn step_turn<'a, 't, 's, S: ChatSink>(
     }
     match step.turn.handle(timed).await {
         ControlFlow::Continue(()) => ControlFlow::Continue(step),
-        ControlFlow::Break(stop) => ControlFlow::Break(stop),
+        ControlFlow::Break(halt) => ControlFlow::Break(halt),
     }
 }
 
@@ -2047,21 +2054,21 @@ async fn drive_turn<S: ChatSink>(
         TurnKind::Prompt if !run.continue_from_transcript => {
             let run =
                 agent.run_with_hidden_context(run.prompt, run.hidden_context, run.attachments);
-            let step = TurnStep {
+            let handler = TurnStep {
                 turn: &mut *turn,
                 facts,
                 checkpoints: run.checkpoints(),
             };
-            run.drive(step, stop, step_turn).await
+            run.drive(handler, stop, step_turn).await
         }
         TurnKind::Prompt | TurnKind::Resume => {
             let run = agent.resume();
-            let step = TurnStep {
+            let handler = TurnStep {
                 turn: &mut *turn,
                 facts,
                 checkpoints: run.checkpoints(),
             };
-            run.drive(step, stop, step_turn).await
+            run.drive(handler, stop, step_turn).await
         }
     };
     match driven {
@@ -2349,7 +2356,6 @@ fn run_agent_loop_attempts<'a>(
                     hidden_context: turn_hidden_context_xml.as_deref(),
                     attachments,
                     continue_from_transcript,
-                    attempt,
                 },
             )
             .await;

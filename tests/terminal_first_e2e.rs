@@ -45,12 +45,6 @@ const TITLE_REQUEST_PREFIX: &str =
     "Generate a short, descriptive title (3-6 words) for this conversation.";
 
 #[derive(Template)]
-#[template(path = "test_terminal_input.sh", escape = "none")]
-struct TerminalInputScript<'a> {
-    task_id: &'a str,
-}
-
-#[derive(Template)]
 #[template(path = "test_terminal_read.sh", escape = "none")]
 struct TerminalReadScript<'a> {
     output_file: &'a str,
@@ -619,21 +613,15 @@ impl MockScenarioState {
                             "terminal tool result did not include an output file".to_string()
                         })?,
                     );
-                    let script = TerminalInputScript { task_id: &task_id }
-                        .render()
-                        .map_err(|error| error.to_string())?;
                     MockHttpResponse::sse(vec![
                         delayed_sse_frame(
                             tool_call_chunk(
                                 "call-terminal-input",
-                                "terminal",
+                                "terminal_input",
                                 &serde_json::json!({
-                                    "description": "Send a name through terminal IPC",
-                                    "script": script,
-                                    "mode": "default",
-                                    "raw": true,
-                                    "timeout": 10,
-                                    "max_lines": 50
+                                    "task_id": task_id,
+                                    "input": "lexo",
+                                    "append_newline": true
                                 }),
                             ),
                             Duration::from_millis(350),
@@ -5829,7 +5817,7 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
     let mut agent_events = Vec::new();
     loop {
         let frame = next_turn_frame(&mut frames).await;
-        let complete = frame.data.contains("\"type\":\"complete\"");
+        let complete = frame.data.contains("\"kind\":\"end\"");
         agent_events.push(frame.data);
         if complete {
             break;
@@ -5837,7 +5825,7 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
     }
     let Some(recovery) = agent_events
         .iter()
-        .find(|data| data.contains("\"type\":\"compaction_recovery\""))
+        .find(|data| data.contains("\"CompactionRecovery\""))
     else {
         panic!(
             "the failed compaction's cleanup should reach the transcript: {agent_events:?}; server logs:\n{}",
@@ -5845,7 +5833,7 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
         );
     };
     let frame: Value = serde_json::from_str(recovery).expect("agent frame JSON");
-    let event = &frame["body"]["event"];
+    let event = &frame["body"]["event"]["event"]["CompactionRecovery"];
     assert!(
         event["alerts_removed"].is_u64() && event["outputs_spilled"].is_u64(),
         "the recovery frame counts what the cleanup did: {frame}"

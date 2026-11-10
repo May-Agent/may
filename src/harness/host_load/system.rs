@@ -76,6 +76,7 @@ const PSI_CRITICAL_PERCENT: f64 = 10.0;
 
 /// The memory pressure the text of a PSI memory file (`/proc/pressure/memory`
 /// or a cgroup's `memory.pressure`) states; `None` when the text is not PSI.
+#[must_use]
 pub fn psi_memory_pressure(content: &str) -> Option<MemoryPressure> {
     Some(if psi_avg10(content, "full")? >= PSI_CRITICAL_PERCENT {
         MemoryPressure::Critical

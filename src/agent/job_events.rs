@@ -270,6 +270,7 @@ impl ContextSource for JobReports {
         SourceId::new("jobs")
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
         if !matches!(moment, Moment::Request { .. } | Moment::ToolTurnEnd) {
             return Vec::new();
@@ -287,6 +288,7 @@ impl ContextSource for JobReports {
             .collect()
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn peek(&self, _moment: Moment) -> Vec<ContextBlock> {
         Vec::new()
     }

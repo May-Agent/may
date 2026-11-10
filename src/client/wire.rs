@@ -882,7 +882,7 @@ mod tests {
 
     /// An agent event of the kind only aither emits, built from its serde
     /// form.
-    fn emitted(event: serde_json::Value) -> TimedEvent {
+    fn emitted(event: &serde_json::Value) -> TimedEvent {
         let timed = serde_json::json!({
             "at": "2026-01-01T00:00:00Z",
             "agent": [],
@@ -898,7 +898,7 @@ mod tests {
             failure: aither_core::llm::Failure::transient(),
         };
         let body = SessionAgentBody::Agent {
-            event: emitted(serde_json::json!({
+            event: emitted(&serde_json::json!({
                 "CompactionRecovery": {
                     "error": serde_json::to_value(&error).expect("error"),
                     "alerts_removed": 2,
@@ -929,7 +929,7 @@ mod tests {
             failure,
         };
         let body = SessionAgentBody::Agent {
-            event: emitted(serde_json::json!({
+            event: emitted(&serde_json::json!({
                 "RunEnded": {
                     "run": "r1",
                     "outcome": { "Failed": { "error": serde_json::to_value(&error).expect("error") } },

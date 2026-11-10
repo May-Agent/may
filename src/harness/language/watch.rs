@@ -91,6 +91,7 @@ impl ContextSource for LanguageAlerts {
         .collect()
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn peek(&self, _moment: Moment) -> Vec<ContextBlock> {
         Vec::new()
     }

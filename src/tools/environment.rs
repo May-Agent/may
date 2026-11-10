@@ -233,24 +233,6 @@ impl ToolEnvironments {
     ) -> Self {
         Self::new(PreparedHome::Local(tools), distribution, cache_root)
     }
-
-    /// The environment of container tools a test prepared by hand.
-    #[cfg(test)]
-    pub(crate) fn with_test_container_tools(
-        tools: PreparedTools<ContainerPath>,
-        container_id: String,
-        distribution: &ToolDistribution,
-        cache_root: &Path,
-    ) -> Self {
-        Self::new(
-            PreparedHome::Container {
-                container_id,
-                tools,
-            },
-            distribution,
-            cache_root,
-        )
-    }
 }
 
 /// A server is prepared when the first command names it, once, and again

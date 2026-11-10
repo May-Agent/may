@@ -193,6 +193,7 @@ pub struct SubagentLookup<'a> {
 
 /// A subagent a name resolves to, as the listing of resolvable names shows
 /// it: its description, or why its definition is invalid.
+#[derive(Debug)]
 pub struct Listed {
     /// The subagent's name.
     pub name: String,
@@ -207,6 +208,9 @@ impl SubagentLookup<'_> {
 
     /// The definition `name` resolves to: the embedder's, else the working
     /// directory's.
+    ///
+    /// # Errors
+    /// Fails when the name is invalid or no definition resolves.
     pub async fn resolve(&self, name: &str) -> Result<SubagentDefinition, ResolveError> {
         validate_subagent_name(name)?;
         if let Some(definition) = self.definitions.get(name) {

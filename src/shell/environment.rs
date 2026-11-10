@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use aither_sandbox::HostLaunch;
 use heel::{Access, Grant, ResolvedPath};
 
 use crate::tools::{PreparedTools, ToolRuntimeError, UV_PYTHON_PREFERENCE};
@@ -69,10 +68,9 @@ impl HostSession {
 /// The object `path` names, in the spelling a resolved grant checks: a
 /// symlinked component or an 8.3 alias would not name the same object.
 fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
-    ResolvedPath::new(
-        dunce::simplified(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-            .to_path_buf(),
-    )
+    ResolvedPath::new(dunce::simplified(
+        &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    ))
 }
 
 fn path_value(name: &'static str, path: &Path) -> Result<String, SessionEnvironmentError> {
@@ -293,12 +291,4 @@ async fn write_git_shim(tools: &PreparedTools<PathBuf>) -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> std::io::Result<()> {
     Ok(())
-}
-
-/// The launch of the host's managed shell, for the backend.
-///
-/// # Errors
-/// Fails when the shell's path is not text.
-pub fn host_launch(tools: &PreparedTools<PathBuf>) -> Result<HostLaunch, ToolRuntimeError> {
-    Ok(HostLaunch::new(tools.shell()?))
 }

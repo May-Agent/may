@@ -1911,8 +1911,8 @@ impl Default for ShellSettings {
     fn default() -> Self {
         Self {
             foreground_wait: Duration::from_secs(10),
-            timeout_cap: Duration::from_secs(120 * 60),
-            long_job_alert: Duration::from_secs(40 * 60),
+            timeout_cap: Duration::from_mins(120),
+            long_job_alert: Duration::from_mins(40),
             monitor_max_timeout: Duration::from_secs(7200),
             monitor_default_interval: Duration::from_secs(10),
             response_window: Duration::from_secs(120),

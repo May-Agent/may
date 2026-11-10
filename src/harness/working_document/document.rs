@@ -194,10 +194,6 @@ impl WorkingDocument {
         self
     }
 
-    pub(crate) const fn file(&self) -> &DocumentFile {
-        &self.file
-    }
-
     /// What the conversation holds of the document; `None` before the
     /// session start showed it.
     #[must_use]

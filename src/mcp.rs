@@ -696,6 +696,10 @@ pub async fn load_active_mcp_connections(
 /// An MCP server's tools as a command set of May's registry: the registry
 /// reads the server's tool list at every lookup, so a tool the server adds
 /// mid-session runs at once.
+#[allow(
+    missing_debug_implementations,
+    reason = "wraps a live server connection"
+)]
 pub struct McpCommands(std::sync::Arc<McpConnection>);
 
 impl McpCommands {

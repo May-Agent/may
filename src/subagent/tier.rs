@@ -94,6 +94,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> TierModels<LLM> {
     /// # Errors
     /// Returns why a profile cannot be read or the routing failed; nothing
     /// falls back to another tier.
+    ///
+    /// # Panics
+    /// Panics when the router prompt fails to render, which typed input
+    /// never does.
     pub async fn select(
         &self,
         brief: &str,

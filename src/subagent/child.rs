@@ -64,12 +64,14 @@ impl ChildHooks {
 }
 
 impl Hooks for ChildHooks {
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn before_tool(&self, _call: &ToolInvocation<'_>) -> ToolDecision {
         self.deny
             .clone()
             .map_or(ToolDecision::Allow, ToolDecision::Deny)
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
         if let Some(valve) = &self.valve
             && outcome.name != COMPACT_TOOL_NAME
@@ -79,6 +81,7 @@ impl Hooks for ChildHooks {
         AfterTool::Keep
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn on_turn_boundary(&self, _cx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
         match &self.valve {
             Some(valve) if valve.take_request() => {
@@ -155,7 +158,7 @@ impl<LLM: LanguageModel + 'static> std::fmt::Debug for ChildSession<LLM> {
 impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
     /// A session over `agent`, built with hooks sharing `requested`, running
     /// in `shell`.
-    pub fn new(
+    pub const fn new(
         agent: Agent<LLM, ChildHooks, LLM, HandoffDocument>,
         requested: Arc<AtomicBool>,
         shell: SessionShell,

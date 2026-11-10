@@ -569,6 +569,7 @@ impl HostLoadChannels {
 }
 
 /// A monitor's channels: what it sends through, and what the agent reads.
+#[must_use]
 pub fn channels() -> (HostLoadSenders, HostLoadChannels) {
     let (conditions, condition_receiver) = async_channel::unbounded();
     let (events, event_receiver) = async_channel::unbounded();
@@ -584,6 +585,7 @@ pub fn channels() -> (HostLoadSenders, HostLoadChannels) {
 /// Host load, memory and disk pressure as state: the model hears of a
 /// condition only when its level differs from the one it last saw, in the
 /// words for that change.
+#[derive(Debug)]
 pub struct HostConditions {
     receiver: Receiver<HostLoadEvent>,
     /// The latest event of each condition: the readings (load, jobs, free
@@ -615,9 +617,9 @@ impl HostConditions {
         let mut changes: Vec<_> = self
             .levels
             .iter()
-            .filter(|(condition, now)| match seen.get(*condition) {
-                Some(last) => last != *now,
-                None => !now.is_normal(),
+            .filter(|(condition, now)| {
+                seen.get(*condition)
+                    .map_or_else(|| !now.is_normal(), |last| last != *now)
             })
             .map(|(condition, now)| (condition.clone(), *now))
             .collect();
@@ -658,6 +660,7 @@ impl ContextSource for HostConditions {
         SourceId::new("host_conditions")
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
         let Moment::Request { reassembled } = moment else {
             return Vec::new();
@@ -679,6 +682,7 @@ impl ContextSource for HostConditions {
         blocks
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
         let Moment::Request { reassembled } = moment else {
             return Vec::new();
@@ -694,6 +698,7 @@ impl ContextSource for HostConditions {
 
 /// The host events that are history: a final memory warning, a job
 /// killed for memory. Each reaches the model once.
+#[derive(Debug)]
 pub struct HostEvents {
     receiver: Receiver<HostLoadEvent>,
 }
@@ -703,6 +708,7 @@ impl ContextSource for HostEvents {
         SourceId::new("host_events")
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
         if !matches!(moment, Moment::Request { .. }) {
             return Vec::new();
@@ -712,6 +718,7 @@ impl ContextSource for HostEvents {
             .collect()
     }
 
+    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn peek(&self, _moment: Moment) -> Vec<ContextBlock> {
         Vec::new()
     }

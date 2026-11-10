@@ -15,11 +15,12 @@ use super::cli::{flatten_args_to_cli, has_help_flag};
 use super::payload::CommandEnvelope;
 use super::registry::CommandRegistry;
 
-/// The shell a bridge serves, set once the shell is built (the shell is
-/// built with the bridge, so the bridge cannot hold it earlier). The slot
-/// holds the shell weakly: the shell owns the bridge, so a strong reference
-/// would keep both alive forever, and the shell lives as long as its owner
-/// holds it.
+/// The shell a bridge serves, set once the shell is built.
+///
+/// The shell is built with the bridge, so the bridge cannot hold it earlier.
+/// The slot holds the shell weakly: the shell owns the bridge, so a strong
+/// reference would keep both alive forever, and the shell lives as long as
+/// its owner holds it.
 #[derive(Debug, Clone)]
 pub struct ShellSlot(Arc<ArcSwapWeak<SessionShell>>);
 

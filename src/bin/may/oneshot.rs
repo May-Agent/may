@@ -185,6 +185,10 @@ async fn next_resumed_turn(
 }
 
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
+    #[allow(
+        clippy::large_enum_variant,
+        reason = "one event is held at a time, and boxing it only moves it"
+    )]
     enum Event {
         Agent(TuiEvent),
         /// Time to look for prompts the daemon's run waits on.
@@ -516,7 +520,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::ContextDumpSaved { .. }
                 // A one-shot run prints no tool cards.
                 | TuiEvent::ToolReading { .. }
-                | TuiEvent::ToolCard { .. },
+                | TuiEvent::ToolCard { .. }
+                // It prints the reply as it streamed, not its translation.
+                | TuiEvent::ReplyTranslated { .. },
             ) => {}
             Event::Agent(TuiEvent::Hold {
                 reason: HoldReason::Retry { until, retry },
@@ -557,8 +563,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     "[retrying] the response was cut off; the text above is discarded"
                 )?;
             }
-            // The one-shot run prints the reply as it streamed.
-            Event::Agent(TuiEvent::ReplyTranslated { .. }) => {}
             Event::Agent(TuiEvent::Withdrawn { .. }) => {
                 writeln!(output.stderr()?, "[stopped] the message was withdrawn")?;
             }
@@ -820,7 +824,7 @@ mod tests {
     }
 
     /// An event of the kind only aither emits, built from its serde form.
-    fn emitted(at: &str, event: serde_json::Value) -> TimedEvent {
+    fn emitted(at: &str, event: &serde_json::Value) -> TimedEvent {
         serde_json::from_value(serde_json::json!({ "at": at, "agent": [], "event": event }))
             .expect("a timed event")
     }
@@ -892,7 +896,7 @@ mod tests {
         output
             .event(&Ok(emitted(
                 "2024-03-01T10:00:01Z",
-                serde_json::json!({
+                &serde_json::json!({
                     "CompactionRecovery": {
                         "error": serde_json::to_value(aither_agent::AgentError::llm_local("no handoff"))
                             .expect("error"),
@@ -917,7 +921,7 @@ mod tests {
         output
             .event(&Ok(emitted(
                 "1970-01-01T00:00:00Z",
-                serde_json::json!({
+                &serde_json::json!({
                     "RequestEnded": {
                         "request": 1,
                         "usage": serde_json::to_value(usage).expect("usage"),

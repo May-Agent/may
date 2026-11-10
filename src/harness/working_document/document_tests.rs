@@ -1,3 +1,5 @@
+#![allow(clippy::assert_is_empty)]
+
 use super::*;
 use crate::harness::working_document::blocker::BlockerResolver;
 use crate::harness::working_document::test_schema::ListSchema;

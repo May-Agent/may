@@ -72,8 +72,6 @@ pub enum ExecError {
     InitializeBaselineTools(#[from] may_agent::tools::ToolRuntimeError),
     #[error("failed to initialize tool dispatch runtime: {0}")]
     InitializeToolDispatch(may_agent::tool_dispatch::ToolDispatchError),
-    #[error("failed to configure ssh servers: {0}")]
-    ConfigureSshServers(String),
     #[error("ssh server '{0}' is not attached to the session's profile")]
     SshServerNotAttached(String),
     #[error("terminal execution failed: {0}")]

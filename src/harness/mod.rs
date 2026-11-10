@@ -9,6 +9,7 @@ use askama::Template;
 pub mod ask_user;
 pub mod compact_tool;
 pub mod disk;
+/// Filesystem questions the harness asks.
 pub mod fs_util;
 pub mod host_load;
 pub mod language;

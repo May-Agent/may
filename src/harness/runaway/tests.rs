@@ -115,7 +115,7 @@ impl Drop for Sleeper {
 struct Agent {
     _dir: tempfile::TempDir,
     /// Owns the shell's sandbox.
-    _terminal: TestTerminal,
+    terminal: TestTerminal,
     /// The shell reading the scripted footprints.
     shell: SessionShell,
     footprints: Footprints,
@@ -208,7 +208,7 @@ impl Agent {
         let guard = RunawayGuard::new(shell.job_memory());
         Self {
             _dir: dir,
-            _terminal: terminal,
+            terminal,
             shell,
             footprints,
             guard,
@@ -237,7 +237,7 @@ impl Agent {
 
     /// Starts a job holding `bytes`, named `name` by the test.
     async fn job(&mut self, name: &'static str, bytes: u64) -> u32 {
-        let (job, pid) = self._terminal.sleeping_job().await;
+        let (job, pid) = self.terminal.sleeping_job().await;
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
         self.jobs.push((name, job));
         pid

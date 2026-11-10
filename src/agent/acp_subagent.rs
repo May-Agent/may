@@ -546,6 +546,10 @@ impl AcpSession {
     }
 
     /// Ends the agent's session.
+    ///
+    /// # Panics
+    /// Panics when the session was already closed, which consuming `self`
+    /// prevents.
     pub async fn close(mut self) {
         let session = self
             .session

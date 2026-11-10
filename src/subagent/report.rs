@@ -217,7 +217,7 @@ mod tests {
         });
         assert!(other.contains("'a'") && other.contains("'b'"), "{other}");
         for reason in [ForkRefusal::NoShell, ForkRefusal::NothingSent] {
-            assert!(!render(&ForkRefused { reason: &reason }).is_empty());
+            assert_ne!(render(&ForkRefused { reason: &reason }), "");
         }
     }
 

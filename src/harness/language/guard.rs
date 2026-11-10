@@ -50,6 +50,7 @@ struct RefusalTemplate<'a> {
 }
 
 /// aither's wording of a language refusal.
+#[must_use]
 pub fn default_refusal(refusal: &LanguageRefusal) -> String {
     crate::harness::rendered(&RefusalTemplate { refusal })
 }
@@ -84,6 +85,7 @@ struct LanguageAlertsTemplate<'a> {
 }
 
 /// aither's wording of the language alerts raised since the last request.
+#[must_use]
 pub fn default_alerts(alerts: &[LanguageAlert]) -> String {
     crate::harness::rendered(&LanguageAlertsTemplate { alerts })
 }
@@ -234,6 +236,10 @@ impl LanguageGuard {
 /// # Errors
 ///
 /// The model's failure.
+///
+/// # Panics
+/// Panics when the translate template fails to render, which typed input
+/// never does.
 pub async fn translate<M: LanguageModel>(
     model: &M,
     parameters: &Parameters,

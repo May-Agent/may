@@ -134,6 +134,9 @@ struct ContinueTemplate;
 /// with the alert naming each; otherwise a row under `Doing` or `Queued`
 /// that nothing blocks keeps it going with this reminder to continue. The
 /// working document applies the rule as the model ends its turn.
+///
+/// # Panics
+/// Panics when the static template fails to render.
 #[must_use]
 pub fn continue_reminder() -> String {
     ContinueTemplate

@@ -363,6 +363,10 @@ fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, E
 
 /// Builds a [`CommandRegistry`].
 #[derive(Default)]
+#[allow(
+    missing_debug_implementations,
+    reason = "holds boxed command factories"
+)]
 pub struct CommandRegistryBuilder {
     entries: HashMap<String, Entry>,
     sets: Vec<AnyCommandSet>,
@@ -539,6 +543,9 @@ impl CommandRegistryBuilder {
 
     /// Marks every command `configure` registers as one whose exchanges are
     /// kept verbatim through compaction.
+    ///
+    /// # Panics
+    /// Panics when `configure` registers a command set.
     pub fn kept_through_compaction(&mut self, configure: impl FnOnce(&mut Self)) {
         let mut registered = Self::new();
         configure(&mut registered);
@@ -701,28 +708,36 @@ impl CommandRegistry {
     /// The help text of `name` as `launch` sees it.
     #[must_use]
     pub fn help(&self, launch: &LaunchInfo, name: &str) -> Option<String> {
-        match self.entries.get(name) {
-            Some(entry) => entry
-                .exists(Role::of(launch), launch.mode)
-                .then(|| entry.help.clone()),
-            None => self.set_entry(name).map(|entry| entry.help),
-        }
+        self.entries.get(name).map_or_else(
+            || self.set_entry(name).map(|entry| entry.help),
+            |entry| {
+                entry
+                    .exists(Role::of(launch), launch.mode)
+                    .then(|| entry.help.clone())
+            },
+        )
     }
 
     /// The stdin argument of `name` as `launch` sees it.
     #[must_use]
     pub fn stdin_arg(&self, launch: &LaunchInfo, name: &str) -> Option<String> {
-        match self.entries.get(name) {
-            Some(entry) => entry
-                .exists(Role::of(launch), launch.mode)
-                .then(|| entry.stdin_arg.clone())
-                .flatten(),
-            None => self.set_entry(name).and_then(|entry| entry.stdin_arg),
-        }
+        self.entries.get(name).map_or_else(
+            || self.set_entry(name).and_then(|entry| entry.stdin_arg),
+            |entry| {
+                entry
+                    .exists(Role::of(launch), launch.mode)
+                    .then(|| entry.stdin_arg.clone())
+                    .flatten()
+            },
+        )
     }
 
     /// Runs the command `name` for the process `launch` describes, which was
     /// in `working_dir` when it made the request.
+    ///
+    /// # Panics
+    /// Panics when a refusal template fails to render, which typed input
+    /// never does.
     pub async fn call(
         &self,
         launch: &LaunchInfo,

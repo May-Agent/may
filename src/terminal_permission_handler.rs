@@ -24,9 +24,10 @@ enum SshLocations {
     Ask(Arc<MaySshAuthorizer>),
 }
 
-/// What decides a session's approvals and its network connections: the
-/// [`Approver`] answering scripts that leave the sandbox, and the
-/// [`DomainApprover`] enforcing the network policy and auditing every
+/// What decides a session's approvals and its network connections.
+///
+/// The [`Approver`] answers scripts that leave the sandbox, and the
+/// [`DomainApprover`] enforces the network policy and audits every
 /// connection.
 #[derive(Debug, Clone)]
 pub struct TerminalPermissionHandler {

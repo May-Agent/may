@@ -38,7 +38,7 @@ impl ShellBudgets {
         }
     }
 
-    fn output_limits(settings: &ShellSettings) -> OutputLimits {
+    const fn output_limits(settings: &ShellSettings) -> OutputLimits {
         OutputLimits {
             inline_bytes: settings.inline_output_bytes,
             preview_bytes: settings.preview_bytes,

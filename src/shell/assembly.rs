@@ -173,27 +173,26 @@ where
     /// cannot be verified.
     pub async fn sandbox(&self) -> Result<Sandbox, ShellAssemblyError> {
         let executor = executor_core::DefaultExecutor;
-        let sandbox = match &self.container {
-            Some(runtime) => Sandbox::new(
+        let sandbox = if let Some(runtime) = &self.container {
+            Sandbox::new(
                 Backend::Container {
                     runtime: runtime.clone(),
                     launch: self.tools.container_launch()?,
                 },
                 executor,
                 &self.working_dir,
-            ),
-            None => {
-                let tools = self.tools.local_tools()?;
-                let heel = tools.heel().ok_or(ShellAssemblyError::NoHeel)?;
-                let path = heel.path().to_path_buf();
-                let heel = blocking::unblock(move || HeelBinary::verify(path)).await?;
-                let session = HostSession::prepare(&self.working_dir, tools).await?;
-                Sandbox::new(Backend::Host { heel }, executor, &self.working_dir)
-                    .with_fixed_grants(session.grants)
-                    .with_environment(session.environment)
-                    .with_write_denylist(session.write_denylist)
-                    .with_audit_log(self.audit_log.clone())
-            }
+            )
+        } else {
+            let tools = self.tools.local_tools()?;
+            let heel = tools.heel().ok_or(ShellAssemblyError::NoHeel)?;
+            let path = heel.path().to_path_buf();
+            let heel = blocking::unblock(move || HeelBinary::verify(path)).await?;
+            let session = HostSession::prepare(&self.working_dir, tools).await?;
+            Sandbox::new(Backend::Host { heel }, executor, &self.working_dir)
+                .with_fixed_grants(session.grants)
+                .with_environment(session.environment)
+                .with_write_denylist(session.write_denylist)
+                .with_audit_log(self.audit_log.clone())
         };
         let sandbox = match &self.env_source {
             Some(source) => sandbox.with_env_source(source.clone()),

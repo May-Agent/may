@@ -117,6 +117,10 @@ impl CloneSandbox {
     /// # Errors
     /// Fails when the terminal refuses or cannot run the script, or the
     /// script exits nonzero or is killed at its timeout.
+    ///
+    /// # Panics
+    /// Panics when the failure template fails to render, which typed input
+    /// never does.
     pub async fn run(&self, dir: &Path, script: &str) -> Result<String, RepoCloneError> {
         let failed = |reason: String| RepoCloneError::Sandbox {
             script: script.to_string(),
@@ -127,28 +131,27 @@ impl CloneSandbox {
             .run(Script::new(script, dir, self.timeout))
             .await
             .map_err(|error| failed(error.to_string()))?;
-        match result.outcome {
-            RunOutcome::Exited { code: 0 } => match result.stdout {
+        if result.outcome == (RunOutcome::Exited { code: 0 }) {
+            match result.stdout {
                 CommandStream::Inline { text } => Ok(text),
                 CommandStream::Stored { file, .. } => {
                     Ok(async_fs::read_to_string(&file.path).await?)
                 }
                 CommandStream::Image { .. } => Err(failed("printed an image".to_string())),
-            },
-            _ => {
-                let exit = match result.outcome {
-                    RunOutcome::Exited { code } => Some(code),
-                    RunOutcome::Killed(_) => None,
-                };
-                let stderr = Self::stderr_text(&result).await;
-                let reason = ScriptFailure {
-                    exit,
-                    stderr: stderr.trim(),
-                }
-                .render()
-                .expect("the script failure template renders typed input");
-                Err(failed(reason))
             }
+        } else {
+            let exit = match result.outcome {
+                RunOutcome::Exited { code } => Some(code),
+                RunOutcome::Killed(_) => None,
+            };
+            let stderr = Self::stderr_text(&result).await;
+            let reason = ScriptFailure {
+                exit,
+                stderr: stderr.trim(),
+            }
+            .render()
+            .expect("the script failure template renders typed input");
+            Err(failed(reason))
         }
     }
 }
