@@ -98,7 +98,7 @@ pub(super) fn spawn_reminders(state: &Arc<DaemonState>) {
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            remind_once(&state).await;
+            crate::panic_boundary::round("sleep reminder", remind_once(&state)).await;
         }
     });
 }

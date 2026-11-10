@@ -14,7 +14,13 @@ pub(super) fn spawn_notifier(state: &Arc<DaemonState>) {
     state.tokio_handle.spawn(async move {
         loop {
             match waits.recv().await {
-                Ok(wait) => notifications.notify_user_wait(&wait).await,
+                Ok(wait) => {
+                    crate::panic_boundary::round(
+                        "user wait notifier",
+                        notifications.notify_user_wait(&wait),
+                    )
+                    .await;
+                }
                 Err(RecvError::Lagged(skipped)) => {
                     tracing::warn!(
                         skipped,

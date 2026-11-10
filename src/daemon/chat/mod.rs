@@ -1959,6 +1959,44 @@ async fn drive_turn<S: ChatSink>(
     }
 }
 
+/// The turn runner: [`run_agent_loop_attempts`] behind the turn's panic
+/// boundary.
+///
+/// A panic ends the turn with an error event carrying its message, so the
+/// caller releases the session as it does for any failed turn.
+fn run_agent_loop<'a>(
+    state: &'a Arc<DaemonState>,
+    req: &'a ChatRequest,
+    sink: &'a mut impl ChatSink,
+    guard: &'a SessionRunGuard,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
+    kind: &'a TurnKind,
+) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
+    Box::pin(async move {
+        let turn = run_agent_loop_attempts(
+            state,
+            req,
+            &mut *sink,
+            guard,
+            persist_user_message,
+            use_persisted_context_snapshot,
+            kind,
+        );
+        match crate::panic_boundary::catch(turn).await {
+            Ok(result) => result,
+            Err(panicked) => {
+                let message = panicked.message().to_owned();
+                tracing::error!(session_id = %req.session_id, panic = %message, "a turn panicked");
+                let _ = sink
+                    .on_error(ApiErrorCode::InternalError, &message, false)
+                    .await;
+                Err(AgentLoopError::Panicked(message))
+            }
+        }
+    })
+}
+
 /// Shared agent event loop used by both streaming and non-streaming chat.
 ///
 /// Handles: retry logic, agent event processing, history persistence,
@@ -1968,7 +2006,7 @@ async fn drive_turn<S: ChatSink>(
 /// in a frame that has returned before it is first polled: a caller that
 /// boxed it itself would reserve room for it in its own poll frame, which a
 /// debug build keeps on the stack under every provider request.
-fn run_agent_loop<'a>(
+fn run_agent_loop_attempts<'a>(
     state: &'a Arc<DaemonState>,
     req: &'a ChatRequest,
     sink: &'a mut impl ChatSink,
@@ -3283,6 +3321,8 @@ enum AgentLoopError {
     BrowserTakeoverPaused(Box<AgentRunResult>),
     #[error("Model returned an empty assistant response")]
     EmptyAssistantResponse,
+    #[error("the turn panicked: {0}")]
+    Panicked(String),
 }
 
 #[derive(Debug)]
@@ -4686,6 +4726,10 @@ mod tests {
         wake_texts: usize,
         /// The message texts the run withdrew.
         withdrawn: Vec<String>,
+        /// Panics when the run starts streaming.
+        panic_on_start: bool,
+        /// The messages of the errors the run reported.
+        errors: Vec<String>,
     }
 
     /// The text of the background event a test resume turn opens with.
@@ -4721,6 +4765,7 @@ mod tests {
             }
         }
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
+            assert!(!self.panic_on_start, "test panic in the turn runner");
             std::future::ready(true)
         }
         fn on_text(&mut self, _c: &str) -> impl Future<Output = bool> + Send {
@@ -4789,9 +4834,10 @@ mod tests {
         fn on_error(
             &mut self,
             _c: ApiErrorCode,
-            _m: &str,
+            message: &str,
             _r: bool,
         ) -> impl Future<Output = bool> + Send {
+            self.errors.push(message.to_string());
             std::future::ready(true)
         }
     }
@@ -5051,6 +5097,74 @@ mod tests {
             .await
             .expect("session");
         state
+    }
+
+    /// A panic in the turn runner fails the turn with an error event
+    /// carrying its message, and the session runs its next turn.
+    #[tokio::test]
+    async fn a_panicking_turn_ends_with_an_error_and_the_next_turn_runs() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("done")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink {
+            panic_on_start: true,
+            ..TestSink::default()
+        };
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(super::AgentLoopError::Panicked(m)) if m == "test panic in the turn runner"),
+            "the panic fails the turn: {result:?}"
+        );
+        assert_eq!(sink.errors, ["test panic in the turn runner"]);
+        guard
+            .finish_idle(crate::session::RunOutcome::Failed)
+            .await
+            .expect("the failed turn releases the session");
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("the session is idle again");
+        let mut sink = TestSink::default();
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        assert!(result.is_ok(), "the next turn runs: {result:?}");
     }
 
     /// A first attempt whose provider fails retryably retries with the same

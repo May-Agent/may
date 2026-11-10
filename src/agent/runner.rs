@@ -834,7 +834,13 @@ async fn next_command(
         .await;
         match step {
             IdleStep::Command(command) => return command,
-            IdleStep::KeepWarm => match keep_warm_idle(agent, command_rx, runs).await {
+            IdleStep::KeepWarm => match crate::panic_boundary::round(
+                "keep warm",
+                keep_warm_idle(agent, command_rx, runs),
+            )
+            .await
+            .unwrap_or(KeepWarmOutcome::Failed)
+            {
                 KeepWarmOutcome::Refreshed | KeepWarmOutcome::NotDue => {}
                 KeepWarmOutcome::Failed => keep_warm_failed = true,
                 KeepWarmOutcome::Command(command) => return command,
