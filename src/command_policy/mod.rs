@@ -34,6 +34,7 @@ pub fn register(builder: &mut ToolRegistryBuilder, managed_bash: bool) {
     builder.command_policy(KillByName);
     builder.command_policy(ForegroundSleep);
     builder.command_policy(UnchangedFileReads);
+    builder.command_policy(PythonWithUv);
     if managed_bash {
         builder.command_policy(ManagedShellCommands);
     }
@@ -317,6 +318,94 @@ impl CommandPolicy for UnchangedFileReads {
             state.inner().recorded.extend(stamps);
         }
         std::future::ready(())
+    }
+}
+
+#[derive(Template)]
+#[template(path = "refused_python_setup.txt")]
+struct PythonSetupRefused<'a> {
+    command: &'a str,
+    replacement: &'a str,
+}
+
+/// Refuses a script that installs Python packages with pip or creates a
+/// virtual environment with `venv` or `virtualenv`: uv does both, and the
+/// managed interpreter refuses a bare `pip install` anyway.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PythonWithUv;
+
+const PIP_INSTALL_WITH_UV: &str =
+    "`uv add <package>` in a project or `uv pip install <package>` in an environment";
+const VENV_WITH_UV: &str = "`uv venv`";
+
+/// Whether `version` is empty or a version suffix such as `3` or `3.13`.
+fn is_version_suffix(version: &str) -> bool {
+    version
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+}
+
+/// Whether `program` is `pip`, `pip3` or a versioned `pip3.13`.
+fn is_pip(program: &str) -> bool {
+    program.strip_prefix("pip").is_some_and(is_version_suffix)
+}
+
+/// Whether `program` is `python`, `python3` or a versioned `python3.13`.
+fn is_python(program: &str) -> bool {
+    program
+        .strip_prefix("python")
+        .is_some_and(is_version_suffix)
+}
+
+/// The first word of `arguments` that is not an option.
+fn subcommand(arguments: &[String]) -> Option<&str> {
+    arguments
+        .iter()
+        .map(String::as_str)
+        .find(|argument| !argument.starts_with('-'))
+}
+
+/// The refused form `command` is, with the uv command that replaces it.
+fn python_setup(command: &ShellCommand) -> Option<(String, &'static str)> {
+    let program = command.program();
+    let arguments = command.arguments();
+    if is_pip(program) {
+        return (subcommand(arguments) == Some("install"))
+            .then(|| (format!("{program} install"), PIP_INSTALL_WITH_UV));
+    }
+    if program == "virtualenv" {
+        return Some((program.to_string(), VENV_WITH_UV));
+    }
+    if !is_python(program) {
+        return None;
+    }
+    let module = arguments.iter().position(|argument| argument == "-m")? + 1;
+    let module_name = arguments.get(module)?.as_str();
+    match module_name {
+        "pip" => (subcommand(&arguments[module + 1..]) == Some("install"))
+            .then(|| (format!("{program} -m pip install"), PIP_INSTALL_WITH_UV)),
+        "venv" | "virtualenv" => Some((format!("{program} -m {module_name}"), VENV_WITH_UV)),
+        _ => None,
+    }
+}
+
+impl CommandPolicy for PythonWithUv {
+    type State = ();
+
+    fn check(
+        &self,
+        script: &ScriptCheck<'_>,
+        (): &(),
+    ) -> impl Future<Output = PolicyDecision> + Send {
+        let decision = parsed(script)
+            .and_then(|shell| shell.commands().iter().find_map(python_setup))
+            .map_or(PolicyDecision::Allow, |(command, replacement)| {
+                refuse(&PythonSetupRefused {
+                    command: &command,
+                    replacement,
+                })
+            });
+        std::future::ready(decision)
     }
 }
 

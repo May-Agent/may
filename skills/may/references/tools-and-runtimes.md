@@ -52,6 +52,7 @@ The environment exports `UV_CACHE_DIR=~/.may/tools/runtimes/uv/cache`, `UV_PYTHO
 
 - `python3` is always the managed 3.13.18. A project that asks for no particular Python gets that interpreter from `PATH` through `uv` (`system` preference) instead of whichever interpreter `uv` last installed for another project.
 - A project's `.python-version` or `requires-python`, or an existing `.venv`, that the `PATH` interpreter does not satisfy is not refused: `uv` installs the requested Python into `UV_PYTHON_INSTALL_DIR` (shared by all sessions) or uses the one the `.venv` was built with. Use `uv venv`, `uv sync`, `uv run` and `uv pip` for project environments.
+- The agent must use `uv` for Python dependencies (`uv add`, `uv pip install`), virtual environments (`uv venv`), interpreter versions (`uv python install`) and Python tools (`uv run`, `uvx`); the system prompt says so. The command policy refuses, before they run, `pip install` and `pip3 install` (also as `python -m pip install` or `python3 -m pip install`, and through any path to the program), `python -m venv` and `virtualenv`, and the refusal names the `uv` command that does the same job. `uv` itself and read-only pip subcommands (`pip list`, `pip show`, `pip freeze`) are not affected.
 - The first run of the first session downloads and verifies artifacts and installs Python, so it is slow; later sessions reuse the directory.
 
 ## Ids the agent sees

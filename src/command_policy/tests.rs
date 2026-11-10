@@ -276,3 +276,94 @@ async fn sed_runs_only_in_the_forms_the_managed_sed_prints() {
         );
     }
 }
+
+#[tokio::test]
+async fn pip_installs_and_virtual_environments_are_refused_with_the_uv_command() {
+    for (script, command, replacement) in [
+        ("pip install requests", "pip install", "`uv add <package>`"),
+        (
+            "pip3 install -r requirements.txt",
+            "pip3 install",
+            "`uv pip install <package>`",
+        ),
+        ("pip --quiet install x", "pip install", "`uv add <package>`"),
+        (
+            "/usr/bin/pip3.13 install x",
+            "pip3.13 install",
+            "`uv add <package>`",
+        ),
+        (
+            "python -m pip install x",
+            "python -m pip install",
+            "`uv add <package>`",
+        ),
+        (
+            "python3 -m pip install --user x",
+            "python3 -m pip install",
+            "`uv pip install <package>`",
+        ),
+        (
+            "~/.venv/bin/python3.12 -m pip install x",
+            "python3.12 -m pip install",
+            "`uv add <package>`",
+        ),
+        (
+            "cd app && sudo pip install x",
+            "pip install",
+            "`uv add <package>`",
+        ),
+        ("python -m venv .venv", "python -m venv", "`uv venv`"),
+        ("python3 -m venv .venv", "python3 -m venv", "`uv venv`"),
+        ("/opt/bin/virtualenv .venv", "virtualenv", "`uv venv`"),
+    ] {
+        let decision = decide(&PythonWithUv, &(), script, ScriptOrigin::Foreground).await;
+        let text = refusal(&decision).unwrap_or_else(|| panic!("`{script}` is refused"));
+        assert!(
+            text.contains(&format!("`{command}` is not used")),
+            "{script}: {text}"
+        );
+        assert!(text.contains(replacement), "{script}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn the_refusal_text_is_exact() {
+    let decision = decide(
+        &PythonWithUv,
+        &(),
+        "pip install x",
+        ScriptOrigin::Foreground,
+    )
+    .await;
+    assert_eq!(
+        refusal(&decision),
+        Some(
+            "Refused before running: `pip install` is not used in scripts; Python dependencies, virtual environments and interpreters are managed with uv. Use `uv add <package>` in a project or `uv pip install <package>` in an environment."
+        )
+    );
+}
+
+#[tokio::test]
+async fn uv_and_read_only_pip_forms_run() {
+    for script in [
+        "uv add requests",
+        "uv pip install requests",
+        "uv venv && uv run pytest",
+        "uvx ruff check .",
+        "uv python install 3.12",
+        "pip list",
+        "pip3 show requests",
+        "pip freeze > req.txt",
+        "python -m pip list",
+        "python3 -m pip --version",
+        "python3 script.py install",
+        "python -m pytest",
+        "echo pip install",
+    ] {
+        assert_eq!(
+            decide(&PythonWithUv, &(), script, ScriptOrigin::Foreground).await,
+            PolicyDecision::Allow,
+            "`{script}` runs"
+        );
+    }
+}
