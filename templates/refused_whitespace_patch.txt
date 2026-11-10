@@ -1,0 +1,1 @@
+The patch was refused: a hunk of `{{ path }}` only changes whitespace, which is formatting done by hand. Do not format by hand; run the project's formatter instead.
