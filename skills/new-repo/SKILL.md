@@ -9,7 +9,12 @@ Follow the steps in order. Each detail file is read at the step that names it; t
 
 1. **Ask the user for the license** with `ask_user`, in one question: the SPDX identifier (for example `MIT`, `Apache-2.0`, `MIT OR Apache-2.0`) and the copyright holder name. Do not pick one yourself. Do not continue without the answer.
 2. **Create the repository** under the owner the user named, private unless the user said public: `gh repo create OWNER/NAME --private --description "<one line>"`. Create no branch protection and no files through the web editor.
-3. **Make the first commit locally**, on a branch named `dev`, containing `LICENSE` (the text of the chosen license with the holder's name and the current year), `README.md` (outline in `references/readme.md`), `.gitignore` for the language, the language's manifest and entry point, and the CI workflow (step 4). Sign the commit. Push `dev` as the first commit of the repository: `git push -u origin dev`.
+3. **Make the first commit locally**, on a branch named `dev`, containing:
+   - The license file or files: a single SPDX identifier is one `LICENSE`; an expression is one `LICENSE-<ID>` file per operand (`MIT OR Apache-2.0` becomes `LICENSE-MIT` and `LICENSE-APACHE-2.0`). Each file is the canonical text fetched from `https://raw.githubusercontent.com/spdx/license-list-data/main/text/<ID>.txt` with its placeholders filled by the holder's name and the current year.
+   - `README.md` (outline in `references/readme.md`), `.gitignore` for the language, the language's manifest and entry point. The manifest records the same answer in its `license` field — `license = "MIT OR Apache-2.0"` in `Cargo.toml`, `"license": "MIT OR Apache-2.0"` in `package.json`.
+   - For a Rust project, `deny.toml` as `references/ci-rust.md` gives it.
+   - The CI workflow (step 4).
+   Sign the commit. Push `dev` as the first commit of the repository: `git push -u origin dev`.
 4. **CI**: copy the template for the project's language and edit only what its `# PROJECT` comments mark.
    - Rust: `references/ci-rust.md`
    - TypeScript with bun: `references/ci-typescript.md`

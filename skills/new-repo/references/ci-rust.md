@@ -1,6 +1,6 @@
 # CI for a Rust project
 
-Save as `.github/workflows/ci.yml`. These jobs are the minimum and all exist in every Rust repository: `build`, `test`, `lint`, `format`. Do not remove, merge or rename them, and do not add `continue-on-error`.
+Save as `.github/workflows/ci.yml`. These jobs are the minimum and all exist in every Rust repository: `build`, `test`, `lint`, `format`, `deny`. Do not remove, merge or rename them, and do not add `continue-on-error`. The `deny` job reads `deny.toml` at the repository root; its starter is below the workflow, and its `allow` and `allow-git` lists grow as the project's dependencies need them, never shrink to pass a check.
 
 Edit only the places marked `# PROJECT`:
 
@@ -48,6 +48,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'deny.toml'
               - 'rust-toolchain*'
               - 'rustfmt.toml'
               - '.rustfmt.toml'
@@ -80,6 +81,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  deny:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   # PROJECT: copy the build and test jobs per platform (see above).
   build:
     needs: changes
@@ -105,3 +115,31 @@ jobs:
 ```
 
 A job skipped by its `if` reports success under its own name, so a pull request that touches no Rust file still passes the required checks.
+
+Save as `deny.toml`, next to `Cargo.toml`. The `allow` list is the fixed starting set; a dependency under another license earns an `allow` entry and a git dependency an `allow-git` prefix — the project amends the file, never the job.
+
+```toml
+[licenses]
+version = 2
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
+```
+
+The action runs `cargo deny --all-features check`, which covers advisories, bans, licenses and sources; `advisories` and `bans` keep their defaults (deny a matching advisory or yanked release, warn on multiple versions and wildcards).
