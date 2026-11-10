@@ -310,7 +310,7 @@ mod tests {
     }
 
     async fn server(size: usize) -> (tempfile::TempDir, JobServer) {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().unwrap();
         let server = JobServer::start(dir.path(), nz(size)).await.unwrap();
         (dir, server)

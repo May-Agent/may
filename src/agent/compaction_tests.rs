@@ -180,7 +180,7 @@ fn roles_mentioning(request: &Value, needle: &str) -> Vec<String> {
 /// first handoff, so the second handoff can name the constraint again.
 #[tokio::test]
 async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let stub = StubModel::spawn().await;
     let llm = ModelSlot::new(
         crate::agent::RedactedModel::new(
@@ -256,7 +256,7 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
 
 /// Builds the agent of the context-reading tests against `stub`.
 async fn agent_on(stub: &StubModel) -> (super::may::MayAgent, tempfile::TempDir) {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let llm = ModelSlot::new(
         crate::agent::RedactedModel::new(
             aither_cloud::CloudProvider::OpenAI(

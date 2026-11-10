@@ -262,7 +262,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connecting_an_agent_that_goes_silent_after_initialize_times_out() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let dir = tempfile::tempdir().expect("temp dir");
         let mut config = MayConfig::default();
         config.acp.trial_limit = Duration::from_millis(1500);
@@ -289,7 +288,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_trial_with_a_silent_agent_returns_within_its_limit_and_margin() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let limit = Duration::from_millis(1500);
         let silent = fake_agent(Some("a"), Some("default"));
         let agent = AcpAgentConfig {
@@ -329,8 +328,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connecting_asks_for_the_model_and_mode_then_configures_the_agent() {
-        // The probe's sandbox spawns on the daemon's global executor.
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let dir = tempfile::tempdir().expect("temp dir");
         let state = DaemonState::for_test(dir.path(), MayConfig::default())
             .await

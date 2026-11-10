@@ -1207,7 +1207,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

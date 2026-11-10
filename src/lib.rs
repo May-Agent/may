@@ -169,6 +169,13 @@ pub use xml::{XmlBlock, XmlBlockError};
 /// Test support shared by the crate's `#[cfg(test)]` code.
 #[cfg(test)]
 mod test_support {
+    /// Installs the process-wide executor the production binary installs at
+    /// startup. Idempotent: every nextest test runs in its own process, so a
+    /// test that reaches the global executor must install it itself.
+    pub fn install_global_executor() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    }
+
     /// An output store in `dir` with the default model-facing id allocator.
     pub async fn test_output_store(
         dir: impl Into<std::path::PathBuf>,

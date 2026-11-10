@@ -240,7 +240,6 @@ async fn a_direct_bind_accepts_the_node_owner_and_rejects_others() {
 
 #[tokio::test]
 async fn a_listed_shared_device_user_is_accepted_through_the_live_allow_list() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
     let state = state().await;
     let source = tailscale_source(&["owner@example.com"]);
     let router = direct_router(&state, &source);

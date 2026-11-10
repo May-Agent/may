@@ -18,7 +18,6 @@ use crate::config::MayConfig;
 const LARGE_JSON: &str = "/api/config";
 
 async fn state() -> Arc<DaemonState> {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
     // The home must outlive the state: `for_test` opens the database inside
     // it but does not keep the directory handle.
     let dir = tempfile::tempdir().expect("temp dir");

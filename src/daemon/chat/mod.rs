@@ -5161,7 +5161,6 @@ mod tests {
     /// carrying its message, and the session runs its next turn.
     #[tokio::test]
     async fn a_panicking_turn_ends_with_an_error_and_the_next_turn_runs() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider_a = stub_provider(vec![sse_text("done")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5230,7 +5229,6 @@ mod tests {
     /// holds it once.
     #[tokio::test]
     async fn a_failed_first_attempt_retries_without_repeating_the_user_message() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         // One failure more than the OpenAI client retries on its own, so the
         // turn retries; the cache is warm, so it stays on provider A.
         let mut script = vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS];
@@ -5299,7 +5297,6 @@ mod tests {
     /// continues from the committed transcript.
     #[tokio::test]
     async fn a_failure_after_a_tool_call_continues_without_replaying_it() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let may_dir = tempfile::tempdir().expect("may dir");
         // Session-scoped `files/` is the writable side of the workspace.
         let session_files = may_dir.path().join("sessions/session/files");
@@ -5397,7 +5394,6 @@ mod tests {
     /// started it.
     #[tokio::test]
     async fn a_turn_unarms_the_recap_timer_when_it_starts() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5419,7 +5415,6 @@ mod tests {
     /// timer armed, as a published turn does.
     #[tokio::test]
     async fn a_drained_queue_arms_the_recap_timer() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5447,7 +5442,6 @@ mod tests {
     /// session idle and its recap timer armed.
     #[tokio::test]
     async fn an_enqueue_on_an_idle_session_arms_the_recap_timer() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider_a = stub_provider(vec![sse_text("answer")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5477,7 +5471,6 @@ mod tests {
     /// background events once.
     #[tokio::test]
     async fn a_resume_turn_retries_with_the_agent_it_took() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let mut script = vec![sse_text("first")];
         script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
         script.push(sse_text("resumed"));
@@ -5539,7 +5532,6 @@ mod tests {
         // already failed.
         const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
         const DONE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let may_dir = tempfile::tempdir().expect("may dir");
         // The session's `files/` is what the sandboxed command can write and
         // read.
@@ -5641,7 +5633,6 @@ mod tests {
     /// continuing with the grants captured at build.
     #[tokio::test]
     async fn a_trust_change_retires_the_idle_agent() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("first")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let cwd = tempfile::tempdir().expect("cwd");
@@ -5744,7 +5735,6 @@ mod tests {
         use crate::daemon::sleep::{SleepRequest, start_sleep};
         use skyzen::utils::{Json, State};
 
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("Good night")]).await;
         let unused = stub_provider(vec![sse_text("unused")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5802,7 +5792,6 @@ mod tests {
         use crate::daemon::sleep::{SleepRequest, start_sleep};
         use skyzen::utils::{Json, State};
 
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("Good night")]).await;
         let unused = stub_provider(vec![sse_text("unused")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5846,7 +5835,6 @@ mod tests {
         use crate::ui_event_bus::UiEventTopics;
         use skyzen::utils::{Json, State};
 
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("Good night")]).await;
         let unused = stub_provider(vec![sse_text("unused")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
@@ -5965,7 +5953,6 @@ mod tests {
     /// start does not deliver it again and the queue reports it gone.
     #[tokio::test]
     async fn a_delivered_hidden_context_entry_is_not_redelivered_after_restart() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("unused")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
@@ -6099,7 +6086,6 @@ mod tests {
     /// completes on the same provider with nothing of the outage in history.
     #[tokio::test]
     async fn a_network_failure_offline_waits_for_the_network_on_the_same_provider() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let mut script = vec!["drop".to_string(); OPENAI_CLIENT_ATTEMPTS];
         script.push(sse_text("back online"));
         let provider_a = stub_provider(script).await;
@@ -6147,7 +6133,6 @@ mod tests {
     /// and the prompt resubmits to the same provider.
     #[tokio::test]
     async fn a_wake_mid_stream_aborts_and_resubmits() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let partial = sse_chunk(
             &serde_json::json!({
                 "choices": [{"index": 0, "delta": {"content": "half an ans"}}]
@@ -6197,7 +6182,6 @@ mod tests {
     /// checkpoint already covers from being pushed again.
     #[tokio::test]
     async fn a_restored_turn_contains_the_answer_exactly_once() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("the answer")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
@@ -6254,7 +6238,6 @@ mod tests {
     /// messages the turn stored.
     #[tokio::test]
     async fn a_turns_done_event_names_its_messages_as_rest_does() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("答えは四十二。回答は42です。")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
@@ -6307,7 +6290,6 @@ mod tests {
     /// assigned — the stored entries and the agent's own checkpoint agree.
     #[tokio::test]
     async fn seeded_transcript_seqs_are_the_agents_own() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
@@ -6381,7 +6363,6 @@ mod tests {
         Result<super::AgentRunResult, super::AgentLoopError>,
         tempfile::TempDir,
     ) {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![format!("stall:{partial}")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
@@ -6488,7 +6469,6 @@ mod tests {
     /// its row left with the turn, and the next turn's request carries it.
     #[tokio::test]
     async fn a_withdrawn_turn_gives_back_the_takeover_alert() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let thinking = sse_chunk(
             &serde_json::json!({
                 "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]

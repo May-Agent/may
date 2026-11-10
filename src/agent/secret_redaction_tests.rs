@@ -184,7 +184,7 @@ fn assert_name_not_value(traffic: &[String]) {
 /// name.
 #[tokio::test]
 async fn main_agent_tool_result_carries_the_name_not_the_value() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let (base_url, requests) = spawn_stub().await;
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
     let mut agent = Agent::builder(model(&base_url, redactor.clone()))
@@ -223,7 +223,7 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
 /// built: its model still never sends the value.
 #[tokio::test]
 async fn subagent_request_carries_the_name_not_the_value() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let (base_url, requests) = spawn_stub().await;
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
     let mut agent = Agent::builder(model(&base_url, redactor))
