@@ -65,22 +65,23 @@ pub mod tag {
     pub const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
-    /// The instruction slots May writes, in prompt order. aither's
-    /// `prepared_tools`, `commands` and `languages` blocks sit between them
-    /// in [`layout`].
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 16] = [
+    /// The instruction slots May writes, in prompt order.
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
         IDENTITY,
         HARNESS,
         EVIDENCE,
         PROFILE_PERSONA,
         ENVIRONMENT,
         TERMINAL,
+        PREPARED_TOOLS,
         EFFICIENCY,
         CAPABILITIES,
+        COMMANDS,
         BROWSER,
         WORK,
         PERMISSIONS,
         TIME,
+        LANGUAGES,
         SESSION,
         REPO_CLONES,
         PLAN_MODE,
@@ -192,6 +193,12 @@ impl RuntimeSystemContext {
         );
         self.instructions.insert(slot, text);
         self
+    }
+
+    /// Replaces the command table; the next [`reconcile`](Self::reconcile)
+    /// announces the change.
+    pub(crate) fn set_commands(&mut self, table: String) {
+        self.instructions.insert(tag::COMMANDS, table);
     }
 
     pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
@@ -732,6 +739,72 @@ pub fn build_terminal(environment: &AgentEnvironment) -> String {
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render terminal: {error}"))
+}
+
+struct CommandRow {
+    name: String,
+    description: String,
+}
+
+#[derive(Template)]
+#[template(path = "commands.txt", escape = "none")]
+struct CommandTableTemplate {
+    commands: Vec<CommandRow>,
+}
+
+/// The table of the commands a script can call: the ones registered by name
+/// with their descriptions, then the tools of every command set as they are
+/// now, so a tool an MCP server added mid-session is announced.
+pub fn build_commands(
+    descriptions: &[(String, String)],
+    sets: &[crate::ipc::AnyCommandSet],
+) -> String {
+    let mut commands: Vec<CommandRow> = descriptions
+        .iter()
+        .map(|(name, description)| CommandRow {
+            name: name.clone(),
+            description: description.clone(),
+        })
+        .collect();
+    for definition in sets.iter().flat_map(crate::ipc::AnyCommandSet::definitions) {
+        if commands.iter().all(|row| row.name != definition.name()) {
+            commands.push(CommandRow {
+                name: definition.name().to_string(),
+                description: definition.description().to_string(),
+            });
+        }
+    }
+    CommandTableTemplate { commands }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render commands: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "languages.txt", escape = "none")]
+struct LanguagesTemplate<'a> {
+    communication: &'a str,
+    working: &'a str,
+}
+
+/// The languages section: set when the session has a communication language.
+pub fn build_languages(languages: &crate::harness::language::Languages) -> Option<String> {
+    let communication = languages.communication()?;
+    Some(
+        LanguagesTemplate {
+            communication: communication.name(),
+            working: languages.working().name(),
+        }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render languages: {error}")),
+    )
+}
+
+/// The prepared-tools section of the home environment's catalog.
+///
+/// # Errors
+/// Fails when the catalog does not render.
+pub fn build_prepared_tools(catalog: &crate::tools::ToolCatalog) -> Result<String, MayAgentError> {
+    Ok(catalog.render()?)
 }
 
 #[derive(Template)]

@@ -8,8 +8,7 @@ use aither_connectivity::Connectivity;
 use aither_core::AnyIdAllocator;
 use aither_core::llm::Approver;
 use aither_sandbox::{
-    Backend, ContainerShellRuntime, DomainApprover, Grants, Interpreter, Sandbox,
-    Shell,
+    Backend, ContainerShellRuntime, DomainApprover, Grants, Interpreter, Sandbox, Shell,
     ShellSessionRegistry, SshServer, SshServerError, TerminalError,
 };
 use heel::HeelBinary;
@@ -19,8 +18,8 @@ use super::{
     shell_tool_settings,
 };
 use crate::agent::command_env::CommandEnv;
-use crate::command_policy::PolicySet;
 use crate::agent::subagent_spaces::SessionSubagentSpaces;
+use crate::command_policy::PolicySet;
 use crate::ipc::{CommandBridge, CommandRegistry, SessionShell, ShellSlot};
 use crate::jobserver::JobConnection;
 use crate::tools::{ToolEnvironments, ToolRuntimeError};
@@ -78,8 +77,6 @@ pub struct ShellAssembly<P> {
     pub interpreters: Vec<Interpreter>,
     /// May's rules on scripts.
     pub policies: PolicySet,
-    /// The commands scripts call back.
-    pub commands: CommandRegistry,
     /// The slot the finished shell is bound into for the commands to reach.
     pub slot: ShellSlot,
     /// The SSH servers of the session.
@@ -101,26 +98,33 @@ impl<P> ShellAssembly<P>
 where
     P: Approver + DomainApprover + Clone + 'static,
 {
-    /// The shell of the session, bound into its slot.
+    /// The shell of the session serving `commands`, bound into its slot, on
+    /// a sandbox of its own.
     ///
     /// # Errors
     /// Fails when the environment cannot be prepared, the host `heel` cannot
     /// be verified, a server is invalid or the shell cannot be built.
-    pub async fn build(self) -> Result<Arc<SessionShell>, ShellAssemblyError> {
-        self.build_with_sandbox().await.map(|(shell, _)| shell)
+    pub async fn build(
+        self,
+        commands: CommandRegistry,
+    ) -> Result<Arc<SessionShell>, ShellAssemblyError> {
+        let sandbox = self.sandbox().await?;
+        self.build_on(sandbox, commands).await
     }
 
-    /// The shell of the session, bound into its slot, and the sandbox it
-    /// spawns in, for processes of the session that are not scripts (a
-    /// connected ACP agent and its commands).
+    /// The shell of the session serving `commands`, bound into its slot,
+    /// spawning in `sandbox`: the one [`sandbox`](Self::sandbox) returned,
+    /// which processes of the session that are not scripts (a connected ACP
+    /// agent and its commands) share, so the commands can name them before
+    /// the shell exists.
     ///
     /// # Errors
-    /// As [`build`](Self::build).
-    pub async fn build_with_sandbox(
+    /// As [`build`](Self::build), but for the sandbox.
+    pub async fn build_on(
         self,
-    ) -> Result<(Arc<SessionShell>, Sandbox), ShellAssemblyError> {
-        let sandbox = self.sandbox().await?;
-        let spawner = sandbox.clone();
+        sandbox: Sandbox,
+        commands: CommandRegistry,
+    ) -> Result<Arc<SessionShell>, ShellAssemblyError> {
         let sessions = ShellSessionRegistry::default();
         for server in &self.ssh_servers {
             sessions.add_ssh_server(server.clone(), self.tools.clone())?;
@@ -132,7 +136,7 @@ where
             .wording(MayShellWording)
             .tools(shell_tool_settings(&self.budgets))
             .policy(ServerApproval::new(sessions.clone()))
-            .ipc(CommandBridge::new(self.commands, self.slot.clone()));
+            .ipc(CommandBridge::new(commands, self.slot.clone()));
         let mut shell = self
             .policies
             .apply(builder)
@@ -155,10 +159,15 @@ where
         };
         let shell = Arc::new(shell);
         self.slot.bind(&shell);
-        Ok((shell, spawner))
+        Ok(shell)
     }
 
-    async fn sandbox(&self) -> Result<Sandbox, ShellAssemblyError> {
+    /// The sandbox the session's processes spawn in.
+    ///
+    /// # Errors
+    /// Fails when the environment cannot be prepared or the host `heel`
+    /// cannot be verified.
+    pub async fn sandbox(&self) -> Result<Sandbox, ShellAssemblyError> {
         let executor = executor_core::DefaultExecutor;
         let sandbox = match &self.container {
             Some(runtime) => Sandbox::new(

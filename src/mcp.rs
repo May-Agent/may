@@ -692,3 +692,36 @@ pub async fn load_active_mcp_connections(
 
     Ok(manager.take_connections())
 }
+
+/// An MCP server's tools as a command set of May's registry: the registry
+/// reads the server's tool list at every lookup, so a tool the server adds
+/// mid-session runs at once.
+pub struct McpCommands(std::sync::Arc<McpConnection>);
+
+impl McpCommands {
+    /// Serves the tools of `connection`.
+    #[must_use]
+    pub fn new(connection: McpConnection) -> Self {
+        Self(std::sync::Arc::new(connection))
+    }
+}
+
+impl crate::ipc::CommandSet for McpCommands {
+    fn definitions(&self) -> Vec<aither_core::llm::tool::ToolDefinition> {
+        self.0.definitions()
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        _call: Option<aither_core::llm::CallIdentity>,
+        arguments: serde_json::Value,
+    ) -> Result<aither_core::llm::ToolResult, String> {
+        let result = self
+            .0
+            .call(name, arguments)
+            .await
+            .map_err(|error| error.to_string())?;
+        aither_mcp::call_result_to_tool_result(result).map_err(|error| error.to_string())
+    }
+}

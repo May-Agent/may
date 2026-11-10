@@ -543,7 +543,10 @@ where
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
         tiers,
-        definitions: crate::bundle::Bundle::subagent_definitions(),
+        definitions: crate::bundle::Bundle::subagent_definitions()
+            .into_iter()
+            .map(|definition| (definition.name.clone(), definition))
+            .collect(),
         files: PromptFiles::new(
             config.sandbox_dir.clone(),
             [
@@ -592,7 +595,7 @@ where
     // list at every lookup, so a tool the server adds mid-session runs at
     // once, and the agent's command table announces it.
     for connection in load_active_mcp_connections(&DefaultExecutor, &config.may_dir).await? {
-        builder.command_set(connection);
+        builder.command_set(crate::mcp::McpCommands::new(connection));
     }
 
     usages.push(CoreCommandUsage {

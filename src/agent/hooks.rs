@@ -16,11 +16,13 @@
 //!   output again, and only a background event can say something new.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aither_agent::{AfterTool, Hooks, ToolOutcome, TurnBoundaryAction, TurnBoundaryContext};
 use aither_sandbox::{JobStatus, Jobs, Refused, UnchangedRead};
 
 use crate::command_policy::RefusedReads;
+use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionRuntimeService};
 
@@ -32,6 +34,10 @@ pub(super) struct MayHooks {
     redactor: SecretRedactor,
     refused: RefusedReads,
     jobs: Jobs,
+    /// The `compact` tool's valve: a request it holds ends the turn.
+    valve: Arc<CompactSignal>,
+    /// Set when the valve ended a turn for a compaction; the runner takes it.
+    compaction: Arc<AtomicBool>,
 }
 
 impl MayHooks {
@@ -41,6 +47,8 @@ impl MayHooks {
         redactor: SecretRedactor,
         refused: RefusedReads,
         jobs: Jobs,
+        valve: Arc<CompactSignal>,
+        compaction: Arc<AtomicBool>,
     ) -> Self {
         Self {
             runtime,
@@ -48,6 +56,8 @@ impl MayHooks {
             redactor,
             refused,
             jobs,
+            valve,
+            compaction,
         }
     }
 
@@ -87,6 +97,9 @@ impl MayHooks {
 
 impl Hooks for MayHooks {
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
+        if outcome.name != COMPACT_TOOL_NAME {
+            self.valve.acted();
+        }
         let redactions = self.redactor.current().await;
         let shown = outcome.for_model();
         let mut result = shown.clone();
@@ -100,6 +113,10 @@ impl Hooks for MayHooks {
 
     async fn on_turn_boundary(&self, cx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
         if self.steer_pending().await {
+            return TurnBoundaryAction::EndTurn;
+        }
+        if self.valve.take_request() {
+            self.compaction.store(true, Ordering::Release);
             return TurnBoundaryAction::EndTurn;
         }
         if self.only_unchanged_reads(cx.outcomes)

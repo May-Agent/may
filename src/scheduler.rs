@@ -1472,7 +1472,6 @@ impl TaskRuntime {
                 managed_bash: crate::command_policy::runs_managed_bash(in_container),
                 refused: crate::command_policy::RefusedReads::default(),
             },
-            commands: commands.build(),
             slot: crate::ipc::ShellSlot::new(),
             ssh_servers: Vec::new(),
             ids: None,
@@ -1480,7 +1479,7 @@ impl TaskRuntime {
             pool,
             connectivity: self.connectivity.clone(),
         }
-        .build()
+        .build(commands.build())
         .await
         .map_err(|error| init_terminal_tool_error("failed to build the task shell: ", &error))
     }
@@ -1570,12 +1569,9 @@ impl TaskRuntime {
         let exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
             container_manager.runtime().client.clone(),
         ))));
-        let runtime = ContainerShellRuntime::new(
-            container_id.clone(),
-            container_ipc_route,
-            exec.clone(),
-        )
-        .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
+        let runtime =
+            ContainerShellRuntime::new(container_id.clone(), container_ipc_route, exec.clone())
+                .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
         let shell = self
             .task_shell(
                 config,
