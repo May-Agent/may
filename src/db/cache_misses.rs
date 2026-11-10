@@ -6,6 +6,7 @@
 //! request that reads less than its route had cached is appended to
 //! `cache_misses` with its cause.
 
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use aither_agent::context::{PrefixChain, PromptPrefix};
@@ -13,11 +14,12 @@ use aither_core::llm::Usage;
 
 use super::{
     ChatDb, ChatDbError,
-    entity::{cache_misses, prompt_cache_routes},
+    entity::{cache_misses, prompt_cache_blocks, prompt_cache_routes},
     query, storage_error, to_i64_from_u64,
 };
 use crate::agent::cache_miss::{
     CacheMiss, CacheObservation, SincePrevious, block_index, block_kind, detect_cache_miss,
+    observed_block,
 };
 use crate::cache_lifetime::CacheLifetime;
 
@@ -38,6 +40,9 @@ pub struct PromptCacheRequest<'a> {
     pub prefix: PromptPrefix,
     /// How long the provider keeps the conversation's cache warm.
     pub lifetime: CacheLifetime,
+    /// The provider's published cache block size; `None` where it publishes
+    /// none and the route's reads imply it.
+    pub published_block: Option<NonZeroU64>,
 }
 
 impl ChatDb {
@@ -68,6 +73,18 @@ impl ChatDb {
             request.usage,
             request.prefix.chain,
         );
+        let observed = query!(
+            self.db,
+            "SELECT * FROM prompt_cache_blocks WHERE session_id = ? AND provider_id = ? AND model = ?",
+            request.session_id,
+            request.provider_id,
+            request.model
+        )
+        .fetch_all::<prompt_cache_blocks::Model>()
+        .await?
+        .first()
+        .and_then(|row| u64::try_from(row.block_tokens).ok())
+        .and_then(NonZeroU64::new);
         let miss = match routes.iter().find(|route| is_this_route(route)) {
             Some(route) => {
                 let previous = stored_observation(route)?;
@@ -76,10 +93,12 @@ impl ChatDb {
                     agent_rebuilt: request.prefix.first_request,
                     model_switched: latest.is_some_and(|latest| !is_this_route(latest)),
                 };
-                detect_cache_miss(&previous, &current, since, request.lifetime)
+                let block = request.published_block.or(observed);
+                detect_cache_miss(&previous, &current, since, request.lifetime, block)
             }
             None => None,
         };
+        let inferred = observed_block(observed, current.cache_read_tokens);
 
         let chain = rmp_serde::to_vec(&current.chain)
             .map_err(|error| storage_error(format!("failed to encode prefix chain: {error}")))?;
@@ -113,6 +132,21 @@ impl ChatDb {
                 miss.since.rewrites.reassembled,
                 miss.since.agent_rebuilt,
                 miss.since.model_switched,
+            )
+            .execute()
+            .await?;
+        }
+        if let Some(block) = inferred.filter(|_| inferred != observed) {
+            query!(
+                tx,
+                "INSERT INTO prompt_cache_blocks (session_id, provider_id, model, block_tokens) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (session_id, provider_id, model) DO UPDATE SET \
+                 block_tokens = excluded.block_tokens",
+                request.session_id,
+                request.provider_id,
+                request.model,
+                to_i64_from_u64(block.get(), "block_tokens")?,
             )
             .execute()
             .await?;
@@ -295,6 +329,7 @@ mod tests {
                         first_request: std::mem::replace(&mut self.first_request, false),
                     },
                     lifetime: CacheLifetime::Limited(Duration::from_mins(5)),
+                    published_block: None,
                 })
                 .await
                 .expect("the request is observed");
@@ -354,6 +389,53 @@ mod tests {
         let report = session.report().await;
         assert!(report.cache_miss_causes.is_empty());
         assert!(report.recent_cache_misses.is_empty());
+    }
+
+    /// A provider that reports no writes and publishes no block size: the
+    /// block is inferred from the route's reads, so sub-block shortfalls stay
+    /// unrecorded once it is known and a real drop is still recorded.
+    #[tokio::test]
+    async fn an_inferred_block_absorbs_sub_block_shortfalls() {
+        let dir = tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db opens");
+        db.create_session(SESSION, Some("Cache"), Some("opus"))
+            .await
+            .expect("session is created");
+        let mut at_ms = START_MS;
+        let mut observe = async |prompt: u32, read: u32| {
+            at_ms += 1_000;
+            let mut usage = Usage::new(prompt, 10);
+            usage.cache_read_tokens = Some(read);
+            db.observe_prompt_cache(PromptCacheRequest {
+                session_id: SESSION,
+                provider_id: "custom",
+                model: "m",
+                at: jiff::Timestamp::from_millisecond(at_ms).expect("in range"),
+                usage: &usage,
+                prefix: PromptPrefix {
+                    chain: PrefixChain::of(&[], &[Message::system("you are may")]),
+                    rewrites: PrefixRewrites::default(),
+                    first_request: false,
+                },
+                lifetime: CacheLifetime::default(),
+                published_block: None,
+            })
+            .await
+            .expect("the request is observed")
+        };
+        // No nonzero read yet: nothing is credited beyond what was read.
+        assert_eq!(observe(12_009, 0).await, None);
+        assert_eq!(observe(12_244, 11_968).await, None);
+        assert_eq!(observe(12_451, 12_224).await, None);
+        assert_eq!(observe(13_842, 12_544).await, None);
+        assert_eq!(observe(14_140, 13_824).await, None);
+        // The reads so far share the block 64: 14_140 rounds to 14_080.
+        assert_eq!(observe(14_300, 14_080).await, None);
+        let miss = observe(14_900, 12_800).await.expect("a real drop");
+        assert_eq!(miss.cause, CacheMissCause::ProviderDropped);
+        assert_eq!(miss.missed_tokens, 14_272 - 12_800);
     }
 
     #[tokio::test]

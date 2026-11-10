@@ -10,6 +10,7 @@ pub mod notification_mailbox;
 pub mod profile_memories;
 pub mod profile_memory_jobs;
 pub mod profiles;
+pub mod prompt_cache_blocks;
 pub mod prompt_cache_routes;
 pub mod push_subscriptions;
 pub mod request_logs;

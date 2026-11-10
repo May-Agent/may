@@ -29,6 +29,7 @@ DELETE FROM session_intervals WHERE ? IS NULL OR session_id = ?;
 DELETE FROM ci_findings WHERE ? IS NULL OR session_id = ?;
 DELETE FROM pr_check_alerts WHERE ? IS NULL OR session_id = ?;
 DELETE FROM prompt_cache_routes WHERE ? IS NULL OR session_id = ?;
+DELETE FROM prompt_cache_blocks WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_headers WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_prompt_attachments WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_messages WHERE ? IS NULL OR session_id = ?;

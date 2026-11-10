@@ -211,6 +211,24 @@ pub(super) fn provider_cache_lifetime(
         .unwrap_or_default()
 }
 
+/// The prompt-cache block size `provider_id` publishes, `None` where it
+/// publishes none.
+fn provider_cache_block(
+    state: &Arc<DaemonState>,
+    provider_id: &str,
+) -> Option<std::num::NonZeroU64> {
+    state
+        .config
+        .load()
+        .provider
+        .get(provider_id)
+        .map_or_else(
+            || crate::config::ProviderType::from_id(provider_id),
+            |instance| instance.resolve_type(provider_id),
+        )
+        .cache_block_tokens()
+}
+
 /// Measure a request against its route's prompt cache; a miss is logged and
 /// persisted with its cause.
 async fn record_prompt_cache(state: &Arc<DaemonState>, request: crate::db::PromptCacheRequest<'_>) {
@@ -424,6 +442,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             usage: &usage,
                             prefix,
                             lifetime: provider_cache_lifetime(self.state, self.provider_id),
+                            published_block: provider_cache_block(self.state, self.provider_id),
                         },
                     )
                     .await;

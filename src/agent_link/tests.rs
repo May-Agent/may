@@ -275,6 +275,7 @@ async fn request_made(host: &Host, session_id: &str, ago: std::time::Duration) {
                 first_request: true,
             },
             lifetime: CacheLifetime::default(),
+            published_block: None,
         })
         .await
         .expect("request is recorded");

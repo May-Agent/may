@@ -240,6 +240,7 @@ async fn a_cold_recipient_is_refused_without_a_model_call() {
                 first_request: true,
             },
             lifetime: CacheLifetime::default(),
+            published_block: None,
         })
         .await
         .expect("request is recorded");
