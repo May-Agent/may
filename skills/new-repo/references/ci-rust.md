@@ -12,10 +12,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev, main]
   merge_group:
   push:
-    branches: [dev]
+    branches: [main] # PROJECT: the repository's default branch
 
 concurrency:
   group: ci-${{ github.ref }}
