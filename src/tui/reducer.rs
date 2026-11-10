@@ -234,6 +234,12 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::SshProbed { name, result } => {
+            if app.ssh_probed(&name, result) {
+                app.persist_config_background();
+            }
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat
