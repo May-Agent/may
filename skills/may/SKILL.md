@@ -55,7 +55,7 @@ Each session has `~/.may/profiles/<profile>/sessions/<id>/`, which is the sandbo
 
 ## Commands
 
-Everything except the native tools (`terminal`, `terminal_read`, `terminal_input`, `terminal_kill`, `monitor`) is a command run inside `terminal`; each has `--help`. Positional arguments map only to required non-list fields; anything else is a `--flag`.
+Everything except the native tools (`terminal`, `terminal_read`, `terminal_input`, `terminal_kill`, `monitor`) is a command run inside `terminal`; each has `--help`. Positional arguments map only to required non-list fields; anything else is a `--flag`. The system prompt's command table is fixed for the warm prompt cache: a command added or removed mid-session (an MCP server connected, a skill registered) is announced once as a command-table change, and the table itself is rewritten only when the prompt is next reassembled.
 
 - `ask_user --questions '<json array of {"section","question","option":[...],"multi_select"}>'` works. The positional form shown in older descriptions, `ask_user "Which database?" --option A`, does not parse today (`question` is optional, so it is not positional and the call fails with "unexpected positional argument"); use `--questions`, or `--question "..." --option A --option B`. The call returns a request id at once; the answer arrives later as a message. `withdraw_ask_user <request_id>` closes a question. An unanswered question is not authorization.
 - `search <query>` searches code in the session's git worktree by description; flags `--repo`, `--budget`, `--files`, `--path`, `--lang`, `--kind`, `--symbol`, `--wait`. The query `status` reports the index, `index` reconciles it. It is always hybrid (text and vector). Frequently searched repositories are indexed automatically by the daemon.
@@ -108,7 +108,7 @@ Work on a git repository happens in a clone inside the session, and `pr` lands i
 
 ## Context and compaction
 
-The conversation is compacted into a handoff document in the background when you call the native `compact` tool, when usage nears the window less the context policy's `handoff_reserve`, when the session has been idle until the provider's prompt cache (default one hour, the provider's `cache_lifetime` setting) is about to expire, or when the user runs `/compact`. The idle session's agent is kept between turns and reused unless something it was built from changed, so detached commands keep running. `/context` and `/btw` are answered without disturbing the conversation.
+The conversation is compacted into a handoff document in the background when you call the native `compact` tool, when usage nears the window less the context policy's `handoff_reserve`, when the session has been idle until the provider's prompt cache (default one hour, the provider's `cache_lifetime` setting) is about to expire, or when the user runs `/compact`. The `compact` tool ends the turn: the compaction runs after it, no turn is served meanwhile, and the next turn starts on the handoff. The idle session's agent is kept between turns and reused unless something it was built from changed, so detached commands keep running. `/context` and `/btw` are answered without disturbing the conversation.
 
 ## Defects to know
 
