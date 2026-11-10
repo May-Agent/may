@@ -20,6 +20,8 @@ mod context_dump;
 mod context_report;
 mod environment;
 pub(crate) mod explore_tool;
+/// The `find` command: regex search over session history.
+pub mod find_tool;
 mod hooks;
 #[cfg(test)]
 mod host_load_tests;

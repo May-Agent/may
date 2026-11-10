@@ -1,0 +1,20 @@
+{%- if matches.is_empty() -%}
+No message matches.
+{%- else -%}
+Showing {{ matches.len() }} matching message(s) starting at offset {{ offset }}{% if has_more %}; more follow, raise --offset to read them{% endif %}.
+{% for item in matches %}
+Message {{ item.message_id }} ({{ item.role }}, {{ item.time }}) in session {{ item.session_id }} "{{ item.title }}":
+{%- for line in item.before %}
+  context, message {{ line.message_id }} ({{ line.role }}): {{ line.text }}
+{%- endfor %}
+{%- for line in item.lines %}
+> {{ line }}
+{%- endfor %}
+{%- if item.more_lines > 0 %}
+> ... and {{ item.more_lines }} more matching line(s)
+{%- endif %}
+{%- for line in item.after %}
+  context, message {{ line.message_id }} ({{ line.role }}): {{ line.text }}
+{%- endfor %}
+{% endfor %}
+{%- endif %}

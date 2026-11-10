@@ -13,6 +13,7 @@ use executor_core::DefaultExecutor;
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::explore_tool::{ExploreArgs, ExploreTool};
+use crate::agent::find_tool::FindTool;
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::pr_tool::{PrArgs, PrCommand};
@@ -229,6 +230,11 @@ where
                 RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
             )),
         ),
+    );
+    register_tool_with_description(
+        builder,
+        &mut descriptions,
+        FindTool::new(config.may_dir.clone()),
     );
     register_tool_with_description(
         builder,

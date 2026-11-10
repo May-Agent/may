@@ -8,6 +8,7 @@ mod common;
 mod context_snapshot;
 mod daemon_exit;
 pub mod entity;
+mod find;
 mod issue;
 mod issue_provenance;
 mod issue_search;
@@ -49,6 +50,7 @@ pub use common::{
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use daemon_exit::PreviousDaemon;
+pub use find::{MessageScan, ScannedMessage};
 pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
