@@ -295,7 +295,8 @@ impl DaemonClient {
     }
 
     /// Opens `/api/sessions/{id}/events`; `after` is the cursor the stream
-    /// continues from.
+    /// continues from. With `owns_turn` the daemon stops the session's turn
+    /// when this connection ends: the one-shot run's turn belongs to it.
     ///
     /// # Errors
     /// Fails when the daemon is unreachable or refuses the subscription.
@@ -303,8 +304,9 @@ impl DaemonClient {
         &self,
         session_id: &str,
         after: Option<&str>,
+        owns_turn: bool,
     ) -> Result<EventStream, DaemonClientError> {
-        let path = session_events_url(session_id, after);
+        let path = session_events_url(session_id, after, owns_turn);
         self.stream(&path).await
     }
 
@@ -319,10 +321,13 @@ impl DaemonClient {
 
 /// The `/api/sessions/{id}/events` path `session_events` opens: `after` is
 /// URL-encoded like every other query the client builds.
-fn session_events_url(session_id: &str, after: Option<&str>) -> String {
+fn session_events_url(session_id: &str, after: Option<&str>, owns_turn: bool) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     if let Some(after) = after {
         query.append_pair("after", after);
+    }
+    if owns_turn {
+        query.append_pair("ownsTurn", "true");
     }
     let mut path = session_path(session_id, "/events");
     path.push('?');
@@ -366,16 +371,16 @@ mod tests {
     #[test]
     fn a_resumed_session_stream_names_its_cursor() {
         assert_eq!(
-            session_events_url("s 1", Some("42.7")),
+            session_events_url("s 1", Some("42.7"), false),
             "/api/sessions/s 1/events?after=42.7"
         );
         assert_eq!(
-            session_events_url("s", Some("a/b?c=d")),
+            session_events_url("s", Some("a/b?c=d"), false),
             "/api/sessions/s/events?after=a%2Fb%3Fc%3Dd",
             "the cursor is URL-encoded"
         );
         assert_eq!(
-            session_events_url("s", None),
+            session_events_url("s", None, false),
             "/api/sessions/s/events?",
             "a new session passes no after"
         );

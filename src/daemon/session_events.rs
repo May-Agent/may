@@ -30,6 +30,7 @@ use super::helpers::send_event;
 use super::state::DaemonState;
 use super::types::{ArtifactEntry, SessionRuntimeResponse};
 use crate::client::background::SessionBackgroundSnapshot;
+use crate::session::CancelReason;
 use crate::tui::sidebar::IssueBrief;
 
 /// How long a burst of change notices is held so one recompute serves it.
@@ -110,7 +111,14 @@ pub(super) fn parse_cursor(raw: &str, epoch: u64) -> Option<u64> {
 pub(super) struct SessionEventsQuery {
     #[serde(default)]
     after: Option<String>,
+    /// The subscriber is the one-shot client the session's turns belong to:
+    /// its connection ending stops the running turn.
+    #[serde(default)]
+    owns_turn: bool,
 }
+
+/// How often an owning stream beats while the session is quiet.
+const OWNER_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// `GET /api/sessions/{id}/events`.
 pub(super) async fn stream_session_events(
@@ -145,38 +153,73 @@ pub(super) async fn stream_session_events(
 
     let (sender, sse) = Sse::channel();
     let epoch = state.session_events_epoch;
+    let owns_turn = query.owns_turn;
+    let task_state = state.clone();
     state.tokio_handle.spawn(async move {
-        if reset {
-            #[derive(Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Reset<'a> {
-                session_id: &'a str,
+        let client_gone = async {
+            if reset {
+                #[derive(Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Reset<'a> {
+                    session_id: &'a str,
+                }
+                if !send_event(
+                    &sender,
+                    "reset",
+                    &Reset {
+                        session_id: &session_id,
+                    },
+                )
+                .await
+                {
+                    return true;
+                }
             }
-            if !send_event(
-                &sender,
-                "reset",
-                &Reset {
-                    session_id: &session_id,
-                },
-            )
-            .await
-            {
-                return;
+            // A send fails once the client's connection is closed; an owner's
+            // stream beats while quiet so the close shows without a frame.
+            let mut heartbeat = async_io::Timer::interval(OWNER_HEARTBEAT);
+            loop {
+                let frames = tokio::select! {
+                    frames = subscription.next() => match frames {
+                        Some(frames) => frames,
+                        None => return false,
+                    },
+                    _ = heartbeat.next(), if owns_turn => {
+                        if sender
+                            .send(skyzen::responder::sse::Event::comment(""))
+                            .await
+                            .is_err()
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
+                };
+                for frame in frames {
+                    let sent = sender
+                        .send(
+                            skyzen::responder::sse::Event::data(&*frame.data)
+                                .event(frame.kind)
+                                .id(format_cursor(epoch, frame.index)),
+                        )
+                        .await
+                        .is_ok();
+                    if !sent {
+                        return true;
+                    }
+                }
             }
         }
-        while let Some(frames) = subscription.next().await {
-            for frame in frames {
-                let sent = sender
-                    .send(
-                        skyzen::responder::sse::Event::data(&*frame.data)
-                            .event(frame.kind)
-                            .id(format_cursor(epoch, frame.index)),
-                    )
+        .await;
+        // Only a turn still running belongs to the client; a one-shot run
+        // that exits after its turn ended leaves the session as it is.
+        if owns_turn && client_gone && task_state.runtime_service.runs().is_held(&session_id) {
+            tracing::info!(%session_id, "the client owning the turn disconnected; stopping the session");
+            if let Err(error) =
+                super::chat::stop_session(&task_state, &session_id, CancelReason::ClientDisconnected)
                     .await
-                    .is_ok();
-                if !sent {
-                    return;
-                }
+            {
+                tracing::error!(%session_id, %error, "failed to stop the session of a disconnected client");
             }
         }
     });

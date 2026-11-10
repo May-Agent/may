@@ -373,6 +373,9 @@ pub struct RuntimeDeps {
     oneshot_reasoning_effort: Option<ReasoningEffort>,
     /// The May daemon that runs this TUI's agents, when it is a client.
     daemon: Option<crate::client::DaemonClient>,
+    /// The session's turns belong to this process, a one-shot run: the daemon
+    /// stops a turn whose client disconnects.
+    owns_turns: bool,
 }
 
 /// An agent worker under construction off the event loop.
@@ -419,6 +422,7 @@ impl RuntimeDeps {
             oneshot_model: None,
             oneshot_reasoning_effort: None,
             daemon: None,
+            owns_turns: false,
         }
     }
 
@@ -450,6 +454,7 @@ impl RuntimeDeps {
     ) -> Self {
         self.oneshot_model = model;
         self.oneshot_reasoning_effort = reasoning_effort;
+        self.owns_turns = true;
         self
     }
 
@@ -965,6 +970,7 @@ impl RuntimeDeps {
         model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
         events_cursor: Option<String>,
+        owns_turns: bool,
     ) -> PendingWorkerBuild {
         let cwd = app.cwd.display().to_string();
         let model_id = model.as_str().to_string();
@@ -996,6 +1002,7 @@ impl RuntimeDeps {
                 session_id.as_str().to_string(),
                 app_events,
                 events_cursor,
+                owns_turns,
             ))
         });
         PendingWorkerBuild {
@@ -1022,6 +1029,7 @@ impl RuntimeDeps {
                 model,
                 reasoning_effort,
                 events_cursor,
+                self.owns_turns,
             ));
         }
         Ok(Self::begin_remote_worker(
@@ -1033,6 +1041,7 @@ impl RuntimeDeps {
             model,
             reasoning_effort,
             events_cursor,
+            self.owns_turns,
         ))
     }
 

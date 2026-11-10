@@ -63,6 +63,7 @@ pub fn spawn_remote_worker(
     session_id: String,
     app_events: EventSender,
     events_cursor: Option<String>,
+    owns_turns: bool,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let (foreign_tx, foreign_rx) = unbounded::<ForeignTurn>();
@@ -84,6 +85,7 @@ pub fn spawn_remote_worker(
             app_events,
         },
         events_cursor,
+        owns_turns,
     ));
     tokio::spawn(run_commands(client, session_id, shared, command_rx));
     AgentWorker::remote(command_tx, foreign_rx, background)
@@ -460,6 +462,7 @@ async fn follow_session(
     shared: Arc<Shared>,
     forwarding: Forwarding,
     events_cursor: Option<String>,
+    owns_turns: bool,
 ) {
     let mut current: Option<ForwardedTurn> = None;
     let mut state = StreamState::default();
@@ -469,7 +472,7 @@ async fn follow_session(
     while !shared.stopped.load(Ordering::Acquire) {
         load_initial_state(&client, &session_id, &mut state, &forwarding.app_events).await;
         let mut stream = match client
-            .session_events(&session_id, last_frame.as_deref())
+            .session_events(&session_id, last_frame.as_deref(), owns_turns)
             .await
         {
             Ok(stream) => stream,

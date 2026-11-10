@@ -53,6 +53,8 @@ pub enum CancelReason {
     User,
     /// The daemon is shutting down and draining its turns.
     DaemonRestarting,
+    /// The client that owns the run, a one-shot run's, disconnected.
+    ClientDisconnected,
 }
 
 /// Starts a detached background task: the settling of a dropped guard.

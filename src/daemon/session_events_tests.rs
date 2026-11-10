@@ -436,3 +436,86 @@ async fn a_removed_session_topic_is_rejected_on_the_shared_stream() {
         .expect_err("a removed topic name is unknown");
     assert_eq!(error.status(), StatusCode::BAD_REQUEST);
 }
+
+/// A run standing in for a turn: it waits for its cancellation and settles
+/// as cancelled, reporting why it was stopped.
+async fn run_until_cancelled(
+    state: &DaemonState,
+) -> tokio::task::JoinHandle<crate::session::CancelReason> {
+    let guard = state
+        .runtime_service
+        .runs()
+        .acquire(SESSION)
+        .await
+        .expect("the session is free");
+    tokio::spawn(async move {
+        let reason = guard
+            .cancellation()
+            .recv()
+            .await
+            .expect("the run is cancelled, not abandoned");
+        guard
+            .finish(crate::session::RunOutcome::Cancelled)
+            .await
+            .expect("the run settles");
+        reason
+    })
+}
+
+#[tokio::test]
+async fn a_one_shot_client_that_disconnects_mid_turn_stops_the_turn() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+
+    let run = run_until_cancelled(&state).await;
+    let stream = Stream::open(
+        &router,
+        &format!("/api/sessions/{SESSION}/events?ownsTurn=true"),
+    )
+    .await;
+    assert!(state.runtime_service.runs().is_held(SESSION));
+
+    drop(stream);
+    let reason = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the turn is cancelled within 10s")
+        .expect("the run task finishes");
+    assert_eq!(reason, crate::session::CancelReason::ClientDisconnected);
+
+    let runtime = state
+        .runtime_service
+        .settle_stopped(SESSION)
+        .await
+        .expect("runtime reads");
+    assert_eq!(
+        runtime.state,
+        SessionRuntimeState::Idle,
+        "recorded as stopped"
+    );
+    assert!(!state.runtime_service.runs().is_held(SESSION));
+}
+
+#[tokio::test]
+async fn an_ordinary_client_that_disconnects_leaves_the_turn_running() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+
+    let run = run_until_cancelled(&state).await;
+    let stream = Stream::open(&router, &format!("/api/sessions/{SESSION}/events")).await;
+    drop(stream);
+    // Publish a frame so the daemon notices the closed connection.
+    publish_turn_frame(&state, SESSION, r#"{"seq":1}"#);
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!run.is_finished(), "the turn is not cancelled");
+    assert!(state.runtime_service.runs().is_held(SESSION));
+    assert!(
+        state
+            .runtime_service
+            .runs()
+            .cancel(SESSION, crate::session::CancelReason::User)
+    );
+    run.await.expect("the run task finishes");
+}
