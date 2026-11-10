@@ -30,6 +30,19 @@ describe('foldTranscript', () => {
     expect(events[4]).toMatchObject({ stage: 'start', id: 'c3', variant: 'generic', seq: 2 });
   });
 
+  test('a terminal call keeps the reading the daemon served', () => {
+    const reading = { steps: [{ link: 'start', intent: { kind: 'unknown' }, line: 'ls' }] };
+    const msgs = foldTranscript([
+      entry({ kind: 'toolCall', id: '1', callId: 'c', name: 'terminal', arguments: '{}', status: 'running', reading: reading as never }),
+      entry({ kind: 'assistant', id: '2', text: 'a' }),
+      entry({ kind: 'toolCall', id: '3', callId: 'd', name: 'terminal', arguments: '{}', status: 'running' }),
+    ]);
+    const events = msgs[0].toolEvent as Record<string, unknown>[];
+    expect(events[0]).toMatchObject({ id: 'c', summary: { reading } });
+    expect(events[1]).toMatchObject({ id: 'd' });
+    expect(events[1]!.summary).toBeUndefined();
+  });
+
   test('tools before the first assistant of a turn attach to it', () => {
     const msgs = foldTranscript([
       entry({ kind: 'user', id: '1', text: 'q' }),

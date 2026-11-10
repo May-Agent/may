@@ -178,6 +178,7 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
             id,
             name,
             arguments,
+            ..
         } => {
             let variant = ToolVariant::infer(name);
             let summary = super::tool_summary::project_tool_summary(arguments, variant);

@@ -1,4 +1,4 @@
-import type { ApiAttachment, ApiMessage, CommandCard } from './types';
+import type { ApiAttachment, ApiMessage, CommandCard, CommandReading } from './types';
 
 export interface TranscriptEntry {
   kind: string;
@@ -15,6 +15,8 @@ export interface TranscriptEntry {
   arguments?: string;
   status?: string;
   result?: unknown;
+  /** How the daemon read a terminal call's script. */
+  reading?: CommandReading | null;
   /** The card of a call that ran one of May's commands. */
   card?: CommandCard | null;
   interaction?: string;
@@ -95,6 +97,7 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
           name: entry.name,
           variant: inferVariant(entry.name),
           arguments: entry.arguments,
+          summary: entry.reading ? { reading: entry.reading } : undefined,
           seq: seq++,
           ...(entry.card ? { summary: { card: entry.card } } : {}),
         });

@@ -968,6 +968,9 @@ pub enum WireTranscriptEntry {
         status: String,
         /// Stored result, when finished.
         result: Option<aither_core::llm::ToolResult>,
+        /// How the daemon read a terminal call's script.
+        #[serde(default)]
+        reading: Option<crate::command_reading::CommandReading>,
         /// The call's card, when it ran one of May's commands that renders
         /// as one.
         #[serde(default)]
