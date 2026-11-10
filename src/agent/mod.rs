@@ -109,9 +109,7 @@ pub use subagent_tracker::{
 pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,
 };
-pub use tool_environment_cache::{
-    HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
-};
+pub use tool_environment_cache::{HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError};
 pub use usage::{
     CacheMissCauseRow, CacheMissRow, ModelUsageRow, SessionUsageReport, assemble_usage_report,
 };

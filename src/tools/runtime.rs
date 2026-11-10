@@ -1342,6 +1342,14 @@ pub struct ToolCatalog {
     tools: Vec<ToolInfo>,
 }
 
+#[cfg(test)]
+impl ToolCatalog {
+    /// A catalog of no commands, for tests that never describe tools.
+    pub(crate) const fn empty() -> Self {
+        Self { tools: Vec::new() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolInfo {
     source: CatalogCommand,

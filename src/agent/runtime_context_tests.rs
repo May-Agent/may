@@ -416,9 +416,7 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
 fn container_environment() -> AgentEnvironment {
     use std::sync::Arc;
 
-    use aither_sandbox::{
-        AnyContainerExec, BollardContainerExec, BridgeAddress, ContainerIpcRoute,
-    };
+    use aither_sandbox::{AnyContainerExec, BollardContainerExec, HostRoute};
 
     // An HTTP client handle neither probes a socket nor dials until used;
     // rendering never uses it.
@@ -427,11 +425,11 @@ fn container_environment() -> AgentEnvironment {
             .expect("an HTTP Docker client handle is built without connecting");
     AgentEnvironment::Container {
         container_id: "test-container".to_string(),
-        container_ipc_route: ContainerIpcRoute::new(
+        container_ipc_route: HostRoute::new(
             "host.docker.internal",
-            BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                .expect("loopback binds the bridge"),
-        ),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+        )
+        .expect("loopback is a usable host route"),
         container_exec: AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
             client,
         )))),

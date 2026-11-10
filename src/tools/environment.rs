@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aither_sandbox::{
-    AnyContainerExec, ContainerLaunch, ContainerPath, HostLaunch, PreparedSsh, SshServer,
+    AnyContainerExec, ContainerLaunch, ContainerPath, HostLaunch, PrepareSsh, PreparedSsh,
+    SshServer,
 };
 
 use super::distribution::ToolDistribution;
@@ -199,13 +200,12 @@ impl ToolEnvironments {
         &self.catalog
     }
 
-    /// The server's tools and `heel`: prepared when it joins, so a command
-    /// on it never waits for an installation.
+    /// Prepares `server`: its `heel` and the home environment's tools.
     ///
     /// # Errors
     /// Fails when the server cannot be reached, its platform has no pinned
     /// artifacts, or its tools differ from the home environment's.
-    pub async fn prepare_ssh(&self, server: &SshServer) -> Result<PreparedSsh, ToolRuntimeError> {
+    async fn prepare_server(&self, server: &SshServer) -> Result<PreparedSsh, ToolRuntimeError> {
         let transport = SshToolTransport::new(server.clone());
         let info = probe_tool_environment(&transport).await?;
         ensure_command_line_tools(&transport, &info.target).await?;
@@ -250,6 +250,19 @@ impl ToolEnvironments {
             distribution,
             cache_root,
         )
+    }
+}
+
+/// A server is prepared when the first command names it, once, and again
+/// after a failure: adding a server never waits on an installation.
+impl PrepareSsh for ToolEnvironments {
+    type Error = ToolRuntimeError;
+
+    fn prepare(
+        &self,
+        server: &SshServer,
+    ) -> impl Future<Output = Result<PreparedSsh, Self::Error>> + Send {
+        self.prepare_server(server)
     }
 }
 

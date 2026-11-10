@@ -85,12 +85,12 @@ const fn host_gateway_name(kind: ContainerRuntimeKind) -> &'static str {
 /// container dials the gateway name. `OrbStack` and Podman machine forward
 /// their gateway names the same way.
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
-fn docker_desktop_ipc_route(kind: ContainerRuntimeKind) -> aither_sandbox::ContainerIpcRoute {
-    let loopback = aither_sandbox::BridgeAddress::try_from(std::net::IpAddr::V4(
-        std::net::Ipv4Addr::LOCALHOST,
-    ))
-    .expect("loopback is a usable bridge bind");
-    aither_sandbox::ContainerIpcRoute::new(host_gateway_name(kind), loopback)
+fn docker_desktop_ipc_route(kind: ContainerRuntimeKind) -> aither_sandbox::HostRoute {
+    aither_sandbox::HostRoute::new(
+        host_gateway_name(kind),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    )
+    .expect("loopback is a usable host route")
 }
 
 /// The gateway address a container uses to reach its host, selected from the
@@ -100,7 +100,8 @@ fn docker_desktop_ipc_route(kind: ContainerRuntimeKind) -> aither_sandbox::Conta
 pub(crate) fn select_ipc_gateway(
     inspect: &bollard::models::ContainerInspectResponse,
     container_id: &str,
-) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+    host_name: &str,
+) -> Result<aither_sandbox::HostRoute, ContainerError> {
     let mut gateways: Vec<String> = inspect
         .network_settings
         .as_ref()
@@ -126,7 +127,7 @@ pub(crate) fn select_ipc_gateway(
                     error.to_string(),
                 )
             })?;
-            aither_sandbox::BridgeAddress::try_from(address).map_err(|error| {
+            aither_sandbox::HostRoute::new(host_name, address).map_err(|error| {
                 ContainerError::IpcRouteUnusableGateway(
                     container_id.to_string(),
                     gateway.clone(),
@@ -189,7 +190,7 @@ impl ContainerRuntime {
     pub async fn ipc_route(
         &self,
         container_id: &str,
-    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
+    ) -> Result<aither_sandbox::HostRoute, ContainerError> {
         self.resolve_ipc_route(container_id).await
     }
 
@@ -199,7 +200,7 @@ impl ContainerRuntime {
     fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> std::future::Ready<Result<aither_sandbox::ContainerIpcRoute, ContainerError>> {
+    ) -> std::future::Ready<Result<aither_sandbox::HostRoute, ContainerError>> {
         std::future::ready(Ok(docker_desktop_ipc_route(self.kind)))
     }
 
@@ -208,7 +209,7 @@ impl ContainerRuntime {
     async fn resolve_ipc_route(
         &self,
         container_id: &str,
-    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
+    ) -> Result<aither_sandbox::HostRoute, ContainerError> {
         // Native Docker and Podman resolve the host gateway name to the
         // container network's gateway, so the bridge binds that exact
         // address — read from the container's own inspection, never a
@@ -221,11 +222,7 @@ impl ContainerRuntime {
             )
             .await
             .map_err(ContainerError::Docker)?;
-        let bind = select_ipc_gateway(&inspect, container_id)?;
-        Ok(aither_sandbox::ContainerIpcRoute::new(
-            self.host_gateway(),
-            bind,
-        ))
+        select_ipc_gateway(&inspect, container_id, self.host_gateway())
     }
 
     /// Hosts that are neither Docker Desktop hosts nor native Linux.
@@ -233,7 +230,7 @@ impl ContainerRuntime {
     fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> std::future::Ready<Result<aither_sandbox::ContainerIpcRoute, ContainerError>> {
+    ) -> std::future::Ready<Result<aither_sandbox::HostRoute, ContainerError>> {
         std::future::ready(Err(ContainerError::IpcRouteUnsupportedPlatform))
     }
 
@@ -764,10 +761,14 @@ mod tests {
 
     #[test]
     fn select_ipc_gateway_uses_the_inspected_gateway() {
-        let bind = select_ipc_gateway(&inspect_with_gateways(&["172.30.5.1"]), "container")
-            .expect("a reported gateway binds the bridge");
+        let bind = select_ipc_gateway(
+            &inspect_with_gateways(&["172.30.5.1"]),
+            "container",
+            "host.docker.internal",
+        )
+        .expect("a reported gateway binds the bridge");
         assert_eq!(
-            bind.ip(),
+            bind.address(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 30, 5, 1))
         );
     }
@@ -780,7 +781,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    select_ipc_gateway(&inspect, "container"),
+                    select_ipc_gateway(&inspect, "container", "host.docker.internal"),
                     Err(ContainerError::IpcRouteNoGateway(_))
                 ),
                 "inspection without a non-empty gateway must fail"
@@ -793,6 +794,7 @@ mod tests {
         let error = select_ipc_gateway(
             &inspect_with_gateways(&["172.30.5.1", "172.17.0.1"]),
             "container",
+            "host.docker.internal",
         )
         .expect_err("distinct gateways must conflict");
         assert!(matches!(
@@ -806,10 +808,11 @@ mod tests {
         let bind = select_ipc_gateway(
             &inspect_with_gateways(&["172.30.5.1", "172.30.5.1"]),
             "container",
+            "host.docker.internal",
         )
         .expect("a gateway repeated across networks is unambiguous");
         assert_eq!(
-            bind.ip(),
+            bind.address(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 30, 5, 1))
         );
     }
@@ -819,7 +822,11 @@ mod tests {
         for gateway in ["not-an-ip", "0.0.0.0", "224.0.0.1"] {
             assert!(
                 matches!(
-                    select_ipc_gateway(&inspect_with_gateways(&[gateway]), "container"),
+                    select_ipc_gateway(
+                        &inspect_with_gateways(&[gateway]),
+                        "container",
+                        "host.docker.internal"
+                    ),
                     Err(ContainerError::IpcRouteUnusableGateway(_, _, _))
                 ),
                 "gateway {gateway} must be rejected"
@@ -830,9 +837,9 @@ mod tests {
     #[test]
     fn docker_desktop_route_dials_host_docker_internal_over_loopback() {
         let route = docker_desktop_ipc_route(ContainerRuntimeKind::Docker);
-        assert_eq!(route.host(), "host.docker.internal");
+        assert_eq!(route.name(), "host.docker.internal");
         assert_eq!(
-            route.bind().ip(),
+            route.address(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
     }

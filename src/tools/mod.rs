@@ -18,7 +18,7 @@ pub use environment::ToolEnvironments;
 pub use python::{PythonPin, PythonRuntime};
 pub use runtime::{
     HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool, PreparedTools, ToolBinary,
-    ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
+    ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget, UV_PYTHON_PREFERENCE,
 };
 pub use transport::{
     ContainerToolTransport, LocalToolTransport, SshToolTransport, ToolEnvironmentInfo,
