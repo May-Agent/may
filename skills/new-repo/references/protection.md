@@ -83,10 +83,13 @@ After the first green CI run on `dev`, add a `required_status_checks` rule to th
       { "context": "build" },
       { "context": "test" },
       { "context": "lint" },
-      { "context": "format" }
+      { "context": "format" },
+      { "context": "deny" }
     ]
   }
 }
 ```
+
+The contexts are the literal name of every job in the generated workflow — a Rust repository's set is `build`, `test`, `lint`, `format`, `deny`, with the per-platform pairs replacing `build`/`test` where the project copied them; a TypeScript repository's set is the same minus `deny`.
 
 Required job names must be literal: a job with a `matrix:` that is skipped by its `if` reports an unexpanded name and stays pending forever. The CI templates therefore name each job literally and use no matrix. Run the read-back again afterwards; `rules` now also lists `required_status_checks`.
