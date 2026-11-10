@@ -66,6 +66,9 @@ pub enum ChatDbError {
     /// Every session name the generator can issue was issued.
     #[error("every session name was issued")]
     SessionNamesExhausted,
+    /// The database's tables differ from the schema this build creates.
+    #[error("{0}")]
+    SchemaMismatch(super::schema_check::SchemaProblems),
 }
 
 impl From<SkyDbError> for ChatDbError {
