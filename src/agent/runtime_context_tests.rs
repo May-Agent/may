@@ -411,6 +411,10 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         terminal.contains(&format!("means {}/outputs/", dir.path().display())),
         "{terminal}"
     );
+    assert!(
+        terminal.contains("- Use `uv` for Python dependencies (`uv add`, `uv pip install`)"),
+        "{terminal}"
+    );
     assert_eq!(
         terminal.contains("`grep`, `awk` and `find` fail in scripts"),
         cfg!(not(windows)),
