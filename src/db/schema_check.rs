@@ -112,8 +112,7 @@ impl fmt::Display for SchemaProblems {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "The database {} does not match the schema this build of May uses. \
-             May keeps no migrations: move the file away so a fresh one is created.",
+            "The database {} does not match the schema this build of May uses:",
             self.path
         )?;
         for problem in &self.problems {
