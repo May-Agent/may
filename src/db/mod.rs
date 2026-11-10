@@ -842,6 +842,7 @@ mod tests {
             elapsed_ms: 42,
             ok: false,
             error: Some("boom"),
+            keep_warm: false,
         })
         .await
         .expect("request log should persist");

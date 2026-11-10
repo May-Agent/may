@@ -947,6 +947,7 @@ mod tests {
             status: crate::client::background::WireJobStatus::Running,
             output_path: None,
             place: crate::client::background::WirePlace::Host,
+            timeout_ms: None,
         };
         let upserted = stream_app_event(
             "job.upserted",

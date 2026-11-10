@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aither_sandbox::permission::{NoopPermissionHandler, PermissionError, PermissionHandler};
-use aither_sandbox::{CommandRole, ScriptLanguage, SshServer, TerminalMode};
+use aither_sandbox::{
+    CommandLocation, CommandRole, LocationApproval, ScriptLanguage, SshServer, TerminalMode,
+};
 
 use crate::agent::PermissionApprover;
 use crate::agent::ssh_authorizer::MaySshAuthorizer;
@@ -149,10 +151,15 @@ impl PermissionHandler for TerminalPermissionHandler {
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> Result<bool, PermissionError> {
         match &self.approver {
-            Some(approver) => approver.check(mode, script, language).await,
-            None => NoopPermissionHandler.check(mode, script, language).await,
+            Some(approver) => approver.check(mode, script, language, location).await,
+            None => {
+                NoopPermissionHandler
+                    .check(mode, script, language, location)
+                    .await
+            }
         }
     }
 
@@ -203,12 +210,17 @@ impl PermissionHandler for TerminalPermissionHandler {
         &self,
         server: &SshServer,
         _role: CommandRole,
-    ) -> Result<bool, PermissionError> {
-        match &self.ssh {
-            SshLocations::Deny => Ok(false),
-            SshLocations::Allow => Ok(true),
-            SshLocations::Ask(authorizer) => authorizer.authorize_connect(&server.target).await,
-        }
+    ) -> Result<LocationApproval, PermissionError> {
+        let approved = match &self.ssh {
+            SshLocations::Deny => false,
+            SshLocations::Allow => true,
+            SshLocations::Ask(authorizer) => authorizer.authorize_connect(&server.target).await?,
+        };
+        Ok(if approved {
+            LocationApproval::Session
+        } else {
+            LocationApproval::Refused
+        })
     }
 
     async fn will_wait_for_location(&self, _server: &SshServer, _role: CommandRole) -> bool {
@@ -226,16 +238,17 @@ impl PermissionHandler for TerminalPermissionHandler {
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> bool {
         match &self.approver {
             Some(approver) => {
                 approver
-                    .will_wait_for_approval(mode, script, language)
+                    .will_wait_for_approval(mode, script, language, location)
                     .await
             }
             None => {
                 NoopPermissionHandler
-                    .will_wait_for_approval(mode, script, language)
+                    .will_wait_for_approval(mode, script, language, location)
                     .await
             }
         }
