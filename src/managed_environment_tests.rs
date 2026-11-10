@@ -1,6 +1,7 @@
 //! What a sandboxed terminal command finds on `PATH`: the managed copies of
 //! the base tools first, the host's own toolchain after them.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use aither_sandbox::SubagentGrant;
@@ -145,12 +146,11 @@ async fn cargo_credentials_inside_the_granted_home_stay_unreadable() {
         .expect("a cargo home");
     std::fs::create_dir_all(&cargo_home).expect("the cargo home exists");
     let credentials = cargo_home.join("credentials.toml");
-    let _created = CreatedFile(match credentials.exists() {
-        true => None,
-        false => {
-            std::fs::write(&credentials, "").expect("a credentials file");
-            Some(credentials)
-        }
+    let _created = CreatedFile(if credentials.exists() {
+        None
+    } else {
+        std::fs::write(&credentials, "").expect("a credentials file");
+        Some(credentials)
     });
 
     let session = tempfile::tempdir().expect("session dir");
@@ -263,12 +263,14 @@ async fn the_main_agents_git_in_a_committing_worktree_runs_nothing_the_subagent_
     // Its repository's configuration names the program everywhere a program
     // can be named; the worktree's attributes bind the filter.
     let mut config = std::fs::read_to_string(subagent.join("config")).expect("its config");
-    config.push_str(&format!(
+    write!(
+        config,
         "\n[core]\n\tfsmonitor = {program}\n\thooksPath = {hooks}\n\
          [filter \"pwn\"]\n\tclean = {program}\n\trequired = true\n",
         program = program.display(),
         hooks = hooks.display(),
-    ));
+    )
+    .expect("a string takes the text");
     std::fs::write(subagent.join("config"), config).expect("its config is rewritten");
     std::fs::write(worktree.join(".gitattributes"), "* filter=pwn\n").expect("the attributes");
 
