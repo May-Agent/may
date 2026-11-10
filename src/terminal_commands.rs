@@ -16,7 +16,7 @@ use crate::agent::pr_tool::{PrArgs, PrCommand};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
 use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
-use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
+use crate::agent::subagent_tracker::SubagentTracker;
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::agent::webfetch_tool::MayWebFetch;
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
@@ -27,6 +27,10 @@ use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
 use crate::repo_search::{CodeSearchTool, RepoSearch, RepoSearchCollections};
+use crate::subagent::{
+    ExternalAgents, PromptFiles, SubagentArgs, SubagentCommand, SubagentFileMount, SubagentService,
+    SubagentSettings, TierModels,
+};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
 /// Configuration for the `imagine` (image generation) IPC command.
@@ -36,6 +40,24 @@ pub struct ImagineCommandConfig {
     pub generator: Option<ImageGeneratorConfig>,
     /// Directory generated artifacts are written to.
     pub artifacts_dir: PathBuf,
+}
+
+/// What the `subagent` command needs of the host to build its agents like
+/// the main agent's.
+#[derive(Debug, Clone)]
+pub struct SubagentAssembly {
+    /// The tools every agent of the session registers: a fork presents the
+    /// definitions of the main agent's request, so both register them
+    /// through it.
+    pub toolkit: crate::shell::ShellToolkit,
+    /// The cache lifetime a subagent's context runs with.
+    pub cache_lifetime: aither_agent::context::CacheLifetime,
+    /// Cache keep-alives, for a provider whose cache is short enough to go
+    /// cold while a subagent waits.
+    pub keep_alive: Option<crate::subagent::KeepAlive>,
+    /// The instruction blocks, besides its definition's prompt, every
+    /// subagent's context starts with.
+    pub instructions: Vec<String>,
 }
 
 /// Dependencies every shared terminal IPC command needs from the host runtime.
@@ -77,9 +99,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub register_skills_broker: Option<RegisterBroker>,
     /// Broker for workspace-access requests.
     pub workspace_request_broker: Option<WorkspaceRequestBroker>,
-    /// Registry the `subagent` command reports in-flight runs to;
-    /// cloneable handle the host uses to list or cancel them.
-    pub subagent_runs: aither_agent::specialized::SubagentRuns,
+    /// What the `subagent` command builds its agents from.
+    pub subagents: SubagentAssembly,
     /// Request parameters the agent will run with. Provider-hosted URL fetch
     /// (`Parameters::hosted_web_fetch`) suppresses the redundant `webfetch`
     /// command. Search is always provider-hosted; there is no `websearch`
@@ -150,8 +171,8 @@ pub struct SharedTerminalCommands {
     /// Where the main agent publishes its requests for the `subagent` command's
     /// `fork` kind; the main agent's builder must be given it.
     pub fork_source: aither_agent::ForkSource,
-    /// Receives the main agent's terminal launcher, which the read-only
-    /// forks answering side requests run their terminal on.
+    /// Receives the main agent's shell, which the read-only forks answering
+    /// side requests launch theirs from.
     pub fork_launcher: crate::agent_link::ForkLauncher,
 }
 
@@ -187,7 +208,7 @@ pub async fn register_shared_terminal_commands<LLM>(
     config: SharedTerminalCommandConfig<LLM>,
 ) -> Result<SharedTerminalCommands, TerminalCommandsError>
 where
-    LLM: LanguageModel + Clone + 'static,
+    LLM: LanguageModel + Clone + Sync + 'static,
 {
     let mut descriptions = Vec::new();
     let mut usages = Vec::new();
@@ -202,11 +223,6 @@ where
     let balanced = config.ask_balanced.unwrap_or_else(|| session_model.clone());
     let fast = config.ask_fast.unwrap_or(session_model);
     let fast_llm = fast.llm.clone();
-    // The main agent is declared on the advanced tier (the terminal agent
-    // builder has no setter for it) and a fork must resolve to the model the
-    // main agent runs on, so the advanced slot of `subagent` is the session's
-    // own model.
-    let subagent_flagship = config.llm.clone();
     let screen_llm = fast_llm.clone();
     let ask_command = AskCommand::new(fast_llm.clone())
         .with_parameters(fast.parameters.clone())
@@ -420,10 +436,10 @@ where
             btw = btw.with_languages(guard.clone());
         }
         describe_arguments::<crate::agent_link::BtwArgs>(&mut descriptions, "btw");
-        // Built per terminal: the fork answering a question runs on a
-        // terminal launched from the asking agent's.
+        // Bound per call: the fork answering a question launches its shell
+        // from the asking agent's.
         builder.main_only(|reserved| {
-            reserved.configure_terminal_bound_tool("btw", move |binding| btw.for_terminal(binding));
+            reserved.configure_bound_tool("btw", move |binding| btw.bind(binding));
         });
         let mut agent = crate::agent_link::AgentTool::new(
             messaging,
@@ -505,60 +521,69 @@ where
 
     // A subagent runs on the model of its definition's tier: the models `ask`
     // offers.
-    let mut subagent_tool = SubagentTool::new(UsageObservedModel::new(subagent_flagship))
-        .with_definitions(crate::bundle::Bundle::subagent_definitions())
-        .with_request_parameters(config.request_parameters.clone())
-        .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
-        .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
-        .with_runs(config.subagent_runs)
-        .with_work_events(config.task_events.clone())
-        // Each subagent keeps its own `tasks.md` under the main agent's schema
-        // and stop rule, and reads May's wording.
-        .with_working_document(
-            Some(crate::tasks_md::schema::document_spec(
-                &config.tasks_line_limit,
-            )),
-            Some(aither_agent::AnyStopHook::new(
-                crate::tasks_md::schema::TasksStopHook,
-            )),
-        )
-        .with_notices(crate::agent::notices::may_notices())
-        .with_base_dir(&config.sandbox_dir)
-        .with_file_mounts([
-            SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
-            SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
-        ]);
-    if let Some(guard) = &config.languages {
-        subagent_tool = subagent_tool.with_languages(guard.clone());
-    }
-    if let Some(acp) = &config.acp {
-        subagent_tool = acp.register(subagent_tool)?;
-    }
-    let subagent_tracker = config.subagent_tracker;
-    let fork_source = subagent_tool.fork_source();
-    describe_tool(&mut descriptions, &subagent_tool);
+    // The main agent is declared on the advanced tier and a fork must resolve
+    // to the model the main agent runs on, so the advanced slot is the
+    // session's own model.
+    let tiers = TierModels {
+        advanced: ModelSlot::new(config.llm.clone(), config.request_parameters.clone()),
+        balanced: balanced.clone(),
+        fast: fast.clone(),
+    };
+    let fork_source = aither_agent::ForkSource::default();
+    let externals = match &config.acp {
+        Some(acp) => acp.externals()?,
+        None => ExternalAgents::default(),
+    };
+    let SubagentAssembly {
+        toolkit,
+        cache_lifetime,
+        keep_alive,
+        instructions,
+    } = config.subagents;
+    let subagent_service = SubagentService::new(SubagentSettings {
+        tracker: config.subagent_tracker,
+        tiers,
+        definitions: crate::bundle::Bundle::subagent_definitions(),
+        files: PromptFiles::new(
+            config.sandbox_dir.clone(),
+            [
+                SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
+                SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
+            ],
+        ),
+        base_dir: config.sandbox_dir.clone(),
+        fork_source: fork_source.clone(),
+        toolkit,
+        languages: config.languages.clone(),
+        externals,
+        work: config.task_events.clone(),
+        // Each subagent keeps its own `tasks.md` under the main agent's
+        // schema and stop rule.
+        document: Some(crate::tasks_md::schema::document_spec(
+            &config.tasks_line_limit,
+        )),
+        continue_reminder: Some(crate::tasks_md::schema::continue_reminder()),
+        instructions,
+        cache_lifetime,
+        keep_alive,
+    });
+    describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
     usages.push(CoreCommandUsage {
         name: "subagent".to_string(),
-        usage: tool_usage(&subagent_tool),
+        usage: arguments_usage::<SubagentArgs>(),
     });
     describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
-    let subagent_tool = Arc::new(subagent_tool);
-    // Built for the main agent's terminal alone: a subagent has no `subagent`
+    // Built for the main agent's shell alone: a subagent has no `subagent`
     // or `explore` command.
     builder.main_exclusive(|main| {
-        let explore_tool = subagent_tool.clone();
-        let explore_tracker = subagent_tracker.clone();
-        main.configure_terminal_bound_usage_tool("subagent", move |binding| {
-            TrackedSubagentTool::new(
-                subagent_tool.for_terminal(binding),
-                subagent_tracker.clone(),
-            )
-            .with_cards()
+        let explore_service = subagent_service.clone();
+        main.configure_bound_usage_tool("subagent", move |binding| {
+            SubagentCommand::new(subagent_service.clone(), binding.shell.cloned()).with_cards()
         });
-        main.configure_terminal_bound_usage_tool("explore", move |binding| {
-            ExploreTool::new(TrackedSubagentTool::new(
-                explore_tool.for_terminal(binding),
-                explore_tracker.clone(),
+        main.configure_bound_usage_tool("explore", move |binding| {
+            ExploreTool::new(SubagentCommand::new(
+                explore_service.clone(),
+                binding.shell.cloned(),
             ))
         });
     });
@@ -586,9 +611,12 @@ where
 /// The usage `--help` prints for `tool`'s command: the text aither's registry
 /// builds from the schema of the tool's own arguments.
 fn tool_usage<T: Tool>(_tool: &T) -> String {
-    schema_to_help(
-        &serde_json::to_value(schemars::schema_for!(T::Arguments)).expect("a schema serializes"),
-    )
+    arguments_usage::<T::Arguments>()
+}
+
+/// The usage `--help` prints for a command taking `A`.
+fn arguments_usage<A: schemars::JsonSchema>() -> String {
+    schema_to_help(&serde_json::to_value(schemars::schema_for!(A)).expect("a schema serializes"))
 }
 
 /// What the sandboxed `gh` command answers with.
@@ -670,6 +698,18 @@ mod tests {
     use futures_lite::Stream;
 
     use super::*;
+
+    /// The subagent assembly of a session whose shell has default budgets.
+    fn test_subagents() -> SubagentAssembly {
+        SubagentAssembly {
+            toolkit: crate::shell::ShellToolkit::of(&crate::shell::ShellBudgets::of(
+                &crate::config::ShellSettings::default(),
+            )),
+            cache_lifetime: aither_agent::context::CacheLifetime::Permanent,
+            keep_alive: None,
+            instructions: Vec::new(),
+        }
+    }
 
     #[derive(Clone)]
     struct MockLlm;
@@ -775,7 +815,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -852,7 +892,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -915,7 +955,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -972,7 +1012,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
@@ -1025,7 +1065,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -1200,7 +1240,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
@@ -1285,7 +1325,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -1339,7 +1379,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -1397,7 +1437,7 @@ mod tests {
                 browser_broker: None,
                 register_skills_broker: None,
                 workspace_request_broker: None,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagents: test_subagents(),
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp).await,
