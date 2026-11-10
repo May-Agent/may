@@ -206,12 +206,31 @@ fn boot_out_relocated(
             removed.push(service);
         }
     }
-    // `bootout` returns once launchd has signalled the job, not once the
-    // process exited: a server stopping mid-load stays registered, in state
-    // `SIGTERMed`, until it exits or launchd's exit timeout kills it.
+    await_bootouts(launchctl, &removed)?;
+    Ok(removed)
+}
+
+/// Blocks until every service in `booted_out` has left launchd.
+///
+/// `bootout` returns once launchd has signalled the job, not once the process
+/// exited: a server stopping mid-load stays registered, in state `SIGTERMed`,
+/// until it exits or launchd's exit timeout kills it.
+///
+/// # Errors
+/// Fails when the launchd state cannot be read, or a service is still
+/// registered [`BOOTOUT_SETTLE`] after its bootout.
+#[cfg(target_os = "macos")]
+fn await_bootouts(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    booted_out: &[String],
+) -> Result<(), RepoSearchError> {
     let deadline = std::time::Instant::now() + BOOTOUT_SETTLE;
-    for service in &removed {
-        while launchctl.service(service).map_err(launch)?.is_some() {
+    for service in booted_out {
+        while launchctl
+            .service(service)
+            .map_err(|error| RepoSearchError::Launch(error.to_string()))?
+            .is_some()
+        {
             if std::time::Instant::now() >= deadline {
                 return Err(RepoSearchError::Launch(format!(
                     "{service} is still registered {BOOTOUT_SETTLE:?} after its bootout"
@@ -220,7 +239,7 @@ fn boot_out_relocated(
             std::thread::sleep(BOOTOUT_POLL);
         }
     }
-    Ok(removed)
+    Ok(())
 }
 
 /// How long a booted-out agent may stay registered while its process stops:
@@ -327,6 +346,7 @@ fn sweep_stale(
             removed.push(service);
         }
     }
+    await_bootouts(launchctl, &removed)?;
     Ok(removed)
 }
 
@@ -341,14 +361,29 @@ mod tests {
 
     /// A launchd holding `loaded` services, recording every `bootout`.
     /// `plists` gives the plist launchd reports for a service, by label.
+    /// A booted-out service stays registered for `linger` more lookups, as a
+    /// process still stopping does.
     struct Fake {
         loaded: Vec<String>,
         booted_out: Vec<String>,
         plists: Vec<(String, std::path::PathBuf)>,
+        linger: usize,
+        stopping: Vec<(String, usize)>,
     }
 
     impl Launchctl for Fake {
         fn service(&mut self, service: &str) -> Result<Option<Service>, LaunchctlError> {
+            if let Some(index) = self.stopping.iter().position(|(name, _)| name == service) {
+                let left = &mut self.stopping[index].1;
+                if *left > 0 {
+                    *left -= 1;
+                    return Ok(Some(Service {
+                        pid: None,
+                        path: None,
+                    }));
+                }
+                self.stopping.remove(index);
+            }
             Ok(self
                 .loaded
                 .iter()
@@ -375,6 +410,9 @@ mod tests {
         fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
             self.booted_out.push(service.to_owned());
             self.loaded.retain(|loaded| loaded != service);
+            if self.linger > 0 {
+                self.stopping.push((service.to_owned(), self.linger));
+            }
             Ok(())
         }
 
@@ -391,6 +429,29 @@ mod tests {
                 .collect(),
             booted_out: Vec::new(),
             plists: Vec::new(),
+            linger: 0,
+            stopping: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_sweep_returns_once_its_swept_agents_have_left_launchd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let login = Path::new("/Users/login");
+        let (stale, stale_server) = labels_for(Path::new("/tmp/gone-home"), login);
+        let mut launchctl = fake_with(&[&stale, &stale_server]);
+        let gone = dir.path().join("gone.plist");
+        launchctl.plists = vec![(stale, gone.clone()), (stale_server, gone)];
+        launchctl.linger = 3;
+
+        let removed = sweep_stale(&mut launchctl, "user/501").expect("sweep should succeed");
+
+        assert_eq!(removed.len(), 2);
+        for service in &removed {
+            assert!(
+                launchctl.service(service).expect("lookup").is_none(),
+                "{service} should have left launchd when the sweep returned"
+            );
         }
     }
 
