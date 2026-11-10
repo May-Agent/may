@@ -12,6 +12,7 @@ pub(crate) mod ci_tool;
 pub mod command_env;
 #[cfg(test)]
 mod compact_tool_tests;
+mod compaction_report;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(target_os = "macos")]
@@ -20,6 +21,8 @@ mod context_dump;
 mod context_report;
 mod environment;
 pub(crate) mod explore_tool;
+/// The `find` command: regex search over session history.
+pub mod find_tool;
 mod hooks;
 #[cfg(test)]
 mod host_load_tests;
@@ -70,6 +73,7 @@ pub mod work_tracker;
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
+pub use compaction_report::CompactionReporter;
 pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};

@@ -67,6 +67,14 @@ pub enum AppEvent {
     /// Background config save completed.
     ConfigSaved(Result<(), TuiError>),
 
+    /// An `/ssh add` probe finished; the error is the probe's message.
+    SshProbed {
+        /// The name the server was added under.
+        name: String,
+        /// The probed server, or why it could not be reached.
+        result: Result<crate::config::SshServerConfig, String>,
+    },
+
     /// The session's stored reasoning effort arrived from the daemon.
     EffortLoaded(Option<String>),
     /// A `/effort` update finished; Ok carries the applied token.
@@ -182,6 +190,14 @@ pub enum AppEvent {
         /// The window in tokens.
         window: u32,
     },
+    /// A `session_compaction` frame arrived: the session's compaction
+    /// started or ended.
+    Compaction {
+        /// Session being compacted.
+        session_id: String,
+        /// Where the compaction stands.
+        phase: crate::client::CompactionPhase,
+    },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -247,6 +263,7 @@ impl AppEvent {
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ProfileSessionsPushed(_) => "profile_sessions_pushed",
             Self::ConfigSaved(_) => "config_saved",
+            Self::SshProbed { .. } => "ssh_probed",
             Self::EffortLoaded(_) => "effort_loaded",
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",
@@ -266,6 +283,7 @@ impl AppEvent {
             Self::Recap { .. } => "recap",
             Self::Warning { .. } => "warning",
             Self::ContextWindow { .. } => "context_window",
+            Self::Compaction { .. } => "compaction",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

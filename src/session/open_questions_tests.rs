@@ -104,26 +104,30 @@ async fn an_answer_clears_the_marks_naming_it_and_names_the_rows() {
     std::fs::write(
         &tasks,
         format!(
-            "## Doing\n- 迁移数据库\n  BLOCKING {blocking}\n- データベース設計 BLOCKING {blocking}\n- 문서\n  BLOCKING {other}\n\n## Queued\n- tests\n"
+            "## Doing\n- 迁移数据库\n  BLOCKING {blocking}\n- データベース設計 BLOCKING {blocking}\n- 문서\n  BLOCKING {other}\n\n## Queued\n- tests\n",
+            blocking = blocking.word,
+            other = other.word,
         ),
     )
     .expect("tasks.md");
 
     service
-        .answer_ask_user(&blocking, &[selected("", "SQLite")])
+        .answer_ask_user(&blocking.id, &[selected("", "SQLite")])
         .await
         .expect("the answer commits");
 
     assert_eq!(
         std::fs::read_to_string(&tasks).expect("tasks.md"),
         format!(
-            "## Doing\n- 迁移数据库\n- データベース設計\n- 문서\n  BLOCKING {other}\n\n## Queued\n- tests\n"
+            "## Doing\n- 迁移数据库\n- データベース設計\n- 문서\n  BLOCKING {other}\n\n## Queued\n- tests\n",
+            other = other.word,
         )
     );
     let reminder = queued_reminder(&service).await;
     assert!(
         reminder.contains(&format!(
-            "no longer marks these rows BLOCKING {blocking}; they are pending again:\n1. 迁移数据库\n2. データベース設計\nContinue"
+            "no longer marks these rows BLOCKING {blocking}; they are pending again:\n1. 迁移数据库\n2. データベース設計\nContinue",
+            blocking = blocking.word,
         )),
         "{reminder}"
     );
@@ -153,14 +157,17 @@ async fn an_answer_to_a_question_that_blocks_nothing_edits_nothing() {
     std::fs::write(&tasks, document).expect("tasks.md");
 
     service
-        .answer_ask_user(&id, &[selected("", "SQLite")])
+        .answer_ask_user(&id.id, &[selected("", "SQLite")])
         .await
         .expect("the answer commits");
 
     assert_eq!(std::fs::read_to_string(&tasks).expect("tasks.md"), document);
     let reminder = queued_reminder(&service).await;
     assert!(
-        reminder.contains(&format!("No row of tasks.md was marked BLOCKING {id}.")),
+        reminder.contains(&format!(
+            "No row of tasks.md was marked BLOCKING {}.",
+            id.word
+        )),
         "{reminder}"
     );
 }
@@ -204,8 +211,16 @@ fn two_questions() -> AskUserArgs {
     }
 }
 
-/// Ask through the command and return the request id it reports.
-async fn ask(service: &Arc<SessionRuntimeService>, args: AskUserArgs) -> String {
+/// A question asked through the command.
+struct Asked {
+    /// Its request id, which the user's answer names.
+    id: String,
+    /// The one word the model knows it by.
+    word: String,
+}
+
+/// Ask through the command and return the question it reports.
+async fn ask(service: &Arc<SessionRuntimeService>, args: AskUserArgs) -> Asked {
     let tool = AskUserTool::new(service.clone(), "session");
     let result = bounded(
         "ask_user to return its request id",
@@ -222,12 +237,25 @@ async fn ask(service: &Arc<SessionRuntimeService>, args: AskUserArgs) -> String 
         .await
         .expect("runtime loads")
         .open_questions;
-    open.iter()
-        .map(|request| request.id.clone())
-        .find(|id| text.contains(id.as_str()))
-        .unwrap_or_else(|| {
-            panic!("the result must name an open question's id: {text:?} / {open:?}")
-        })
+    for request in &open {
+        let word = service
+            .db()
+            .open_ask_user_question_word(&request.id)
+            .await
+            .expect("the question loads")
+            .expect("an open question has a word");
+        if text.contains(&format!("Question {word} is open")) {
+            assert!(
+                !text.contains(&request.id),
+                "the model is shown the word, not the request id: {text:?}"
+            );
+            return Asked {
+                id: request.id.clone(),
+                word,
+            };
+        }
+    }
+    panic!("the result must name an open question's word: {text:?} / {open:?}")
 }
 
 fn selected(section: &str, value: &str) -> QuestionAnswer {
@@ -248,25 +276,35 @@ async fn blocker_marks_hold_only_while_their_question_is_open() {
     let open = ask(&service, which_database()).await;
     let answered = ask(&service, which_database()).await;
     service
-        .answer_ask_user(&answered, &[selected("", "SQLite")])
+        .answer_ask_user(&answered.id, &[selected("", "SQLite")])
         .await
         .expect("the answer commits");
     let withdrawn = ask(&service, which_database()).await;
     WithdrawAskUserTool::new(service.clone(), "session")
         .call(
             WithdrawAskUserArgs {
-                request_id: withdrawn.clone(),
+                request_id: withdrawn.word.clone(),
             },
             ToolContext::new(),
         )
         .await
         .expect("the open question is withdrawn");
 
-    assert_eq!(resolver.is_open(&open).await, Ok(true));
-    assert_eq!(resolver.is_open(&answered).await, Ok(false));
-    assert_eq!(resolver.is_open(&withdrawn).await, Ok(false));
+    assert_eq!(resolver.is_open(&open.word).await, Ok(true));
+    assert_eq!(resolver.is_open(&answered.word).await, Ok(false));
+    assert_eq!(resolver.is_open(&withdrawn.word).await, Ok(false));
     assert_eq!(resolver.is_open("waiting on the user").await, Ok(true));
     assert_eq!(resolver.is_open("never-issued-words").await, Ok(true));
+
+    let distinct = [&open.word, &answered.word, &withdrawn.word];
+    assert_eq!(
+        distinct
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "questions open together never share a word: {distinct:?}"
+    );
 }
 
 /// An answer to a question the agent asked reaches the session's `tasks.md`
@@ -275,9 +313,9 @@ async fn blocker_marks_hold_only_while_their_question_is_open() {
 async fn an_answer_is_recorded_on_the_session_tasks_inbox() {
     let fixture = Fixture::new().await;
     let service = fixture.service().await;
-    let asked = ask(&service, which_database()).await;
+    let Asked { id, word: asked } = ask(&service, which_database()).await;
     service
-        .answer_ask_user(&asked, &[selected("", "SQLite")])
+        .answer_ask_user(&id, &[selected("", "SQLite")])
         .await
         .expect("the answer commits");
 
@@ -321,8 +359,14 @@ async fn ask_user_returns_its_request_id_without_waiting() {
     let runtime = service.get("session").await.expect("runtime loads");
     assert_eq!(runtime.open_questions.len(), 1, "the question is persisted");
     let open = &runtime.open_questions[0];
+    let word = service
+        .db()
+        .open_ask_user_question_word(&open.id)
+        .await
+        .expect("the question loads")
+        .expect("the question has a word");
     assert!(
-        text.contains(&format!("BLOCKING {}", open.id)),
+        text.contains(&format!("BLOCKING {word}")),
         "the result tells the agent how to mark the blocked tasks: {text:?}"
     );
     assert_eq!(open.questions[0].question, "Which database?");
@@ -345,7 +389,7 @@ async fn a_withdrawn_question_is_gone_and_its_answer_is_not_delivered() {
         "withdraw_ask_user to return",
         withdraw.call(
             WithdrawAskUserArgs {
-                request_id: withdrawn.clone(),
+                request_id: withdrawn.word.clone(),
             },
             ToolContext::new(),
         ),
@@ -360,12 +404,12 @@ async fn a_withdrawn_question_is_gone_and_its_answer_is_not_delivered() {
             .iter()
             .map(|request| request.id.as_str())
             .collect::<Vec<_>>(),
-        [kept.as_str()],
+        [kept.id.as_str()],
         "only the question that was not withdrawn stays in the user's view"
     );
 
     let late = service
-        .answer_ask_user(&withdrawn, &[selected("", "SQLite")])
+        .answer_ask_user(&withdrawn.id, &[selected("", "SQLite")])
         .await
         .expect("answering a withdrawn question is not a storage failure");
     assert!(late.is_none(), "the withdrawn question takes no answer");
@@ -379,7 +423,7 @@ async fn a_withdrawn_question_is_gone_and_its_answer_is_not_delivered() {
     let again = withdraw
         .call(
             WithdrawAskUserArgs {
-                request_id: withdrawn,
+                request_id: withdrawn.word,
             },
             ToolContext::new(),
         )
@@ -396,7 +440,7 @@ async fn a_withdrawn_question_is_gone_and_its_answer_is_not_delivered() {
 async fn an_answer_is_queued_as_a_steer_message_with_its_text() {
     let fixture = Fixture::new().await;
     let service = fixture.service().await;
-    let id = ask(&service, two_questions()).await;
+    let Asked { id, word } = ask(&service, two_questions()).await;
 
     let committed = service
         .answer_ask_user(
@@ -430,7 +474,7 @@ async fn an_answer_is_queued_as_a_steer_message_with_its_text() {
         .hidden_context_xml
         .expect("the answer rides hidden context");
     for expected in [
-        id.as_str(),
+        word.as_str(),
         "Question: Which database?",
         "Answer: SQLite",
         "Question: Anything else?",
@@ -470,7 +514,7 @@ async fn an_answer_is_queued_as_a_steer_message_with_its_text() {
 async fn answers_that_do_not_fit_the_question_commit_nothing() {
     let fixture = Fixture::new().await;
     let service = fixture.service().await;
-    let id = ask(&service, two_questions()).await;
+    let Asked { id, .. } = ask(&service, two_questions()).await;
 
     let refused = service
         .answer_ask_user(&id, &[selected("database", "SQLite")])
@@ -489,11 +533,11 @@ async fn answers_that_do_not_fit_the_question_commit_nothing() {
 #[tokio::test]
 async fn an_answer_after_a_restart_is_delivered_with_its_text() {
     let fixture = Fixture::new().await;
-    let id = {
+    let Asked { id, word } = {
         let before_restart = fixture.service().await;
-        let id = ask(&before_restart, which_database()).await;
+        let asked = ask(&before_restart, which_database()).await;
         drop(before_restart);
-        id
+        asked
     };
 
     let after_restart = fixture.service().await;
@@ -517,7 +561,10 @@ async fn an_answer_after_a_restart_is_delivered_with_its_text() {
         .pending_immediate
         .expect("the answer is queued");
     let text = delivered.hidden_context_xml.expect("hidden context");
-    assert!(text.contains(&id), "{text}");
+    assert!(
+        text.contains(&format!("question {word}")),
+        "the word survives the restart: {text}"
+    );
     assert!(text.contains("Question: Which database?"), "{text}");
     assert!(text.contains("Answer: PostgreSQL"), "{text}");
 }
@@ -532,7 +579,7 @@ async fn a_session_cannot_withdraw_another_sessions_question() {
         .create_session("other", Some("Other"), Some("test-model"))
         .await
         .expect("create the other session");
-    let id = ask(&service, which_database()).await;
+    let Asked { id, .. } = ask(&service, which_database()).await;
 
     let withdrawn = service
         .withdraw_question("other", &id)
@@ -556,7 +603,7 @@ async fn a_session_cannot_withdraw_another_sessions_question() {
 async fn an_answer_that_chooses_nothing_commits_nothing_and_leaves_the_question_open() {
     let fixture = Fixture::new().await;
     let service = fixture.service().await;
-    let id = ask(&service, which_database()).await;
+    let Asked { id, .. } = ask(&service, which_database()).await;
 
     for empty in [
         AnswerValue::Selected(Vec::new()),
@@ -596,7 +643,7 @@ async fn an_answer_that_chooses_nothing_commits_nothing_and_leaves_the_question_
 async fn the_delivered_answer_has_no_blank_lines() {
     let fixture = Fixture::new().await;
     let service = fixture.service().await;
-    let id = ask(&service, two_questions()).await;
+    let Asked { id, .. } = ask(&service, two_questions()).await;
     service
         .answer_ask_user(
             &id,
@@ -667,7 +714,7 @@ async fn an_answer_to_a_blocking_prompt_is_not_delivered_as_an_agent_question() 
 async fn deleting_a_session_deletes_its_open_questions() {
     let fixture = Fixture::new().await;
     let service = fixture.service().await;
-    let id = ask(&service, which_database()).await;
+    let Asked { id, .. } = ask(&service, which_database()).await;
 
     service
         .db()
@@ -694,7 +741,7 @@ async fn open_questions_are_read_whole_while_they_are_answered() {
     let service = fixture.service().await;
     let mut ids = Vec::new();
     for _ in 0..12 {
-        ids.push(ask(&service, which_database()).await);
+        ids.push(ask(&service, which_database()).await.id);
     }
 
     let reader = {

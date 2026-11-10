@@ -243,6 +243,8 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             AgentEvent::ToolCallDelta { .. }
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::Checkpoint { .. }
+            | AgentEvent::CompactionStarted
+            | AgentEvent::CompactionFinished { .. }
             | AgentEvent::Reasoning(_)
             | AgentEvent::Complete { .. }
             | AgentEvent::BuiltInToolResult { .. }

@@ -607,6 +607,9 @@ impl TaskRuntime {
     ///
     /// # Errors
     /// Returns an error message when the payload is malformed, script validation fails, or the insert errors.
+    ///
+    /// # Panics
+    /// Never: a task bound to a session is named by a word of its pool.
     pub async fn create_task_from_tool_request(
         &self,
         request: TaskCreateRequest,
@@ -700,8 +703,11 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
             .response(model.run_at.clone(), model.cron_expression.clone());
 
+        let task_id = model
+            .word
+            .expect("a task bound to a session is named by a word of its pool");
         Ok(TaskCreateResult {
-            task_id: model.id,
+            task_id,
             profile_id: model.profile_id,
             trigger,
             approved: model.approved,
@@ -2469,7 +2475,11 @@ mod tests {
         let prompt = host.stored_prompt("main").await;
         assert!(prompt.content.is_empty(), "it is not the user's text");
         let xml = prompt.hidden_context_xml.expect("task delivery");
-        assert!(xml.contains("task-1"), "the task id is named: {xml}");
+        let word = task.word.clone().expect("the task has a word");
+        assert!(
+            xml.contains(&format!("task=\"{word}\"")) && !xml.contains(&task.id),
+            "the task is named by its word: {xml}"
+        );
         assert!(xml.contains("Nightly check"), "the task is named: {xml}");
         assert!(xml.contains("check the backups"), "the prompt: {xml}");
     }

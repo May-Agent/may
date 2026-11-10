@@ -7,15 +7,34 @@ use super::common::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
 use super::entity::scheduled_tasks;
 use super::{ChatDb, ChatDbError, query};
 
+/// The session and word of a deleted task.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+struct NamedTaskRow {
+    session_id: Option<String>,
+    word: Option<String>,
+}
+
 impl ChatDb {
-    /// Create a scheduled task.
+    /// Create a scheduled task. A task bound to a session is named for the
+    /// model by a word of that session's pool, kept leased while the task
+    /// exists.
     ///
     /// # Errors
-    /// Returns [`ChatDbError`] when the insert fails or the id collides.
+    /// Returns [`ChatDbError`] when the insert fails or the id collides, or
+    /// every word of the session's pool is leased.
     pub async fn create_scheduled_task(
         &self,
         params: CreateScheduledTaskParams<'_>,
     ) -> Result<scheduled_tasks::Model, ChatDbError> {
+        let named = match params.session_id {
+            Some(session_id) => {
+                let ids = self.session_ids(session_id).await?;
+                let lease = ids.lease()?;
+                Some((ids, lease))
+            }
+            None => None,
+        };
+        let word = named.as_ref().map(|(_, lease)| lease.to_string());
         let trigger_kind = params.trigger.kind().as_str();
         let trigger_type = params.trigger.storage_trigger_type();
         let now = jiff::Timestamp::now().to_string();
@@ -30,7 +49,7 @@ impl ChatDb {
             .map(|signature| signature.header.clone());
         query!(
             self.db,
-            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, timeout_secs, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at, webhook_signature_secret, webhook_signature_header) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, timeout_secs, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at, webhook_signature_secret, webhook_signature_header, word) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params.id,
             params.profile_id,
             params.session_id,
@@ -51,10 +70,14 @@ impl ChatDb {
             now.clone(),
             now.clone(),
             signature_secret.clone(),
-            signature_header.clone()
+            signature_header.clone(),
+            word.as_deref()
         )
         .execute()
         .await?;
+        if let Some((ids, lease)) = named {
+            ids.keep(lease);
+        }
         Ok(scheduled_tasks::Model {
             id: params.id.to_string(),
             profile_id: params.profile_id.to_string(),
@@ -77,6 +100,7 @@ impl ChatDb {
             updated_at: now,
             webhook_signature_secret: signature_secret,
             webhook_signature_header: signature_header,
+            word,
         })
     }
 
@@ -174,9 +198,20 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn delete_scheduled_task(&self, id: &str) -> Result<(), ChatDbError> {
-        query!(self.db, "DELETE FROM scheduled_tasks WHERE id = ?", id)
-            .execute()
-            .await?;
+        let deleted = query!(
+            self.db,
+            "DELETE FROM scheduled_tasks WHERE id = ? RETURNING session_id, word",
+            id
+        )
+        .fetch_optional::<NamedTaskRow>()
+        .await?;
+        if let Some(NamedTaskRow {
+            session_id: Some(session_id),
+            word: Some(word),
+        }) = deleted
+        {
+            self.release_session_word(&session_id, &word);
+        }
         Ok(())
     }
 

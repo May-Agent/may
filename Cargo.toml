@@ -28,27 +28,27 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 may-tasks = { path = "tasks" }
 libc = "0.2.191"
 # Aither framework
-aither-core = { version = "0.27.0" }
-aither-agent = { version = "0.27.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
-aither-connectivity = { version = "0.27.0" }
+aither-core = { version = "0.28.0" }
+aither-agent = { version = "0.28.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
+aither-connectivity = { version = "0.28.0" }
 # The parser the harness applies `apply_patch` with; a call's reading uses it
 # to place each hunk in the file it edits.
-aither-patch = { version = "0.27.0" }
-aither-sandbox = { version = "0.27.0", features = ["code-folding", "connectivity", "jobserver"] }
-aither-cloud = { version = "0.27.0" }
-aither-copilot = { version = "0.27.0" }
-aither-codex = { version = "0.27.0" }
-aither-models = { version = "0.27.0" }
-aither-mcp = { version = "0.27.0" }
-aither-browser = { version = "0.27.0" }
+aither-patch = { version = "0.28.0" }
+aither-sandbox = { version = "0.28.0", features = ["code-folding", "connectivity", "jobserver"] }
+aither-cloud = { version = "0.28.0" }
+aither-copilot = { version = "0.28.0" }
+aither-codex = { version = "0.28.0" }
+aither-models = { version = "0.28.0" }
+aither-mcp = { version = "0.28.0" }
+aither-browser = { version = "0.28.0" }
 # Exact token counts (`LanguageModel::count_text`) for the decode meter.
-aither-openai = { version = "0.27.0", default-features = false, features = ["tokenizer"] }
+aither-openai = { version = "0.28.0", default-features = false, features = ["tokenizer"] }
 # Decides which `sed` forms a script may run (`aither_sed::supports`); the host
 # `sed` runs them, and a script's other `sed` calls are refused.
-aither-sed = { version = "0.27.0", default-features = false }
+aither-sed = { version = "0.28.0", default-features = false }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.
-aither-acp = { version = "0.27.0" }
+aither-acp = { version = "0.28.0" }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
 heel = { version = "0.9.3", default-features = false }
@@ -145,6 +145,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 zenwave = "0.7"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# hyper over futures-io streams, for daemon connections outside tokio
+smol-hyper = { version = "0.1.1", default-features = false }
 http-body-util = "0.1"
 
 # Browser automation (CDP) and WebRTC live streaming
@@ -231,6 +233,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serial_test = "3"
+# Checks that every model-facing id word is one o200k_base token.
+tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio-test = "0.4"
 
 [workspace.lints]

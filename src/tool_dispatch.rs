@@ -321,10 +321,19 @@ async fn handle_browser_request(
                         resolve_browser_session_paths(browser_service, session_id.as_str())
                             .await
                             .map_err(BrowserToolError::request_failed)?;
-                    let page =
-                        persist_browser_page_capture(session_id.as_str(), &session_paths, *payload)
-                            .await
-                            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let session_ids = browser_service
+                        .db
+                        .session_ids(session_id.as_str())
+                        .await
+                        .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let page = persist_browser_page_capture(
+                        session_id.as_str(),
+                        &session_paths,
+                        session_ids.allocator(),
+                        *payload,
+                    )
+                    .await
+                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                     Ok(BrowserResult {
                         running: true,
                         cdp_endpoint: status.cdp_endpoint,

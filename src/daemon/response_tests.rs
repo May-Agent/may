@@ -552,7 +552,7 @@ async fn only_selecting_the_allow_option_approves_a_late_answer() {
 async fn an_answer_to_an_open_question_is_queued_once_and_a_retry_finds_it_committed() {
     let fixture = Fixture::new().await;
     let approver = AskUserApprover::new().with_runtime_service(fixture.runtime.clone());
-    fixture
+    let word = fixture
         .runtime
         .open_question(
             "session",
@@ -590,7 +590,10 @@ async fn an_answer_to_an_open_question_is_queued_once_and_a_retry_finds_it_commi
         .hidden_context_xml
         .expect("hidden context")
         .to_string();
-    assert!(queued.contains("open-1"), "{queued}");
+    assert!(
+        queued.contains(&format!("question {word}")) && !queued.contains("open-1"),
+        "the answer names the question by its word: {queued}"
+    );
     assert!(runtime.queued_messages.is_empty(), "queued once");
 }
 

@@ -24,6 +24,23 @@ use crate::daemon::error::{
 };
 use crate::daemon::state::DaemonState;
 
+/// Tells every client of `session_id` how its compaction stands, on the
+/// `session_compaction` frame kind.
+pub(super) fn publish_compaction(
+    hub: &super::hub::TurnHub,
+    session_id: &str,
+    phase: crate::client::CompactionPhase,
+) {
+    let frame = crate::client::SessionCompactionFrame {
+        session_id: session_id.to_string(),
+        phase,
+    };
+    match serde_json::to_string(&frame) {
+        Ok(json) => hub.publish(session_id, "session_compaction", json.into()),
+        Err(error) => tracing::error!(%error, "failed to encode a compaction frame"),
+    }
+}
+
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
 pub struct ParkedAgents {
@@ -63,13 +80,24 @@ impl ParkedAgents {
         // One pending wake is enough: the agent's context holds every event
         // a later wake would add, and the run it starts sees them all.
         let (wakes, wake_rx) = async_channel::bounded(1);
+        let (compactions, compaction_rx) = async_channel::unbounded();
         let worker = spawn_idle_worker(
             executor_core::DefaultExecutor,
             agent,
             state.db(),
             state.runtime_service.runs().clone(),
             Some(crate::agent::BackgroundWakes { wakes, released }),
+            Some(compactions),
         );
+        // The compactions the worker runs on its own and on request reach
+        // the session's clients; ends with the worker like the wake task.
+        let hub = state.turn_hub.clone();
+        let compaction_session = session_id.to_string();
+        state.tokio_handle.spawn(async move {
+            while let Ok(phase) = compaction_rx.recv().await {
+                publish_compaction(&hub, &compaction_session, phase);
+            }
+        });
         let previous = self.workers().insert(
             session_id.to_string(),
             Parked {

@@ -15,6 +15,7 @@ use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, Termina
 use executor_core::DefaultExecutor;
 
 use super::agents_md;
+use super::compaction_report::CompactionReporter;
 use super::context_dump::ContextDump;
 use super::hooks::{ContextSnapshotHook, PendingSteerHook, SecretRedactionHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
@@ -96,6 +97,9 @@ pub enum MayAgentError {
     /// The session's row could not be read.
     #[error("cannot read the session's repository binding: {0}")]
     SessionRow(#[from] crate::db::ChatDbError),
+    /// The session's pool of model-facing ids could not be built.
+    #[error("cannot restore the session's model-facing ids: {0}")]
+    SessionIds(crate::db::ChatDbError),
     /// The session's stored repository binding is malformed.
     #[error(transparent)]
     Binding(#[from] crate::session::BindingError),
@@ -472,6 +476,13 @@ impl MayAgent {
             .cloned()
             .chain(std::iter::once(memories_dir));
 
+        // Job ids, stored outputs and subagent ids lease from the session's
+        // pool, as its questions, tunnels and tasks do.
+        let session_ids = config
+            .db
+            .session_ids(config.session_id.as_str())
+            .await
+            .map_err(MayAgentError::SessionIds)?;
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
             TerminalTool::new_exact(
@@ -490,6 +501,7 @@ impl MayAgent {
             )
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+            .with_id_allocator(session_ids.allocator().clone())
             .with_network_audit_log(network_audit.clone())
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)
@@ -748,6 +760,7 @@ impl MayAgent {
         // Connected ACP agents start in the boundary this session's own
         // terminal commands run in; a container session has no host sandbox
         // to give them, so it offers none.
+        let managed_tools = super::acp_sandbox::ManagedTools::default();
         let acp = match config.acp.as_ref() {
             Some(hosts) if !is_container => Some({
                 let heel = crate::tools::prepare_heel(
@@ -775,6 +788,7 @@ impl MayAgent {
                                 .broker()
                                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
                             heel,
+                            managed_tools.clone(),
                         ),
                     )
                     .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
@@ -958,6 +972,20 @@ impl MayAgent {
             "preparing session tool environments"
         );
         let builder = Box::pin(prepare_tools(builder, &config, tool_environment_key)).await?;
+        if !is_container {
+            let bin = builder
+                .shell_sessions()
+                .local_tools()
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+                .bin_dir()
+                .clone();
+            managed_tools.set(bin).map_err(|bin| {
+                MayAgentError::Sandbox(format!(
+                    "the managed tools directory was already set: {}",
+                    bin.display()
+                ))
+            })?;
+        }
         let named_commands = builder
             .tool_descriptions()
             .iter()
@@ -1460,15 +1488,36 @@ impl MayAgent {
 
     /// Compacts the idle session once it is due; see
     /// [`Agent::compact_when_idle`].
+    #[cfg(test)]
     pub(crate) async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
-        Box::pin(self.inner.compact_when_idle()).await
+        self.compact_when_idle_reporting(&CompactionReporter::silent())
+            .await
     }
 
+    /// [`Self::compact_when_idle`], reporting its progress to `reporter`.
+    pub(crate) async fn compact_when_idle_reporting(
+        &mut self,
+        reporter: &CompactionReporter,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        reporter.drive(self.inner.compact_when_idle()).await
+    }
+
+    /// Compacts the conversation, reporting its progress to `reporter`.
+    pub(crate) async fn compact_reporting(
+        &mut self,
+        focus: Option<&str>,
+        reporter: &CompactionReporter,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        reporter.drive(self.inner.compact(focus)).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn compact(
         &mut self,
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
-        Box::pin(self.inner.compact(focus)).await
+        self.compact_reporting(focus, &CompactionReporter::silent())
+            .await
     }
 
     pub(crate) fn restore_checkpoint(
@@ -1587,7 +1636,7 @@ pub async fn test_agent(
     let _db = crate::db::ChatDb::open(&temp.path().join("history.db"))
         .await
         .expect("open test db");
-    let session_id = SessionId::new();
+    let session_id = SessionId::from_string("amber-river");
     let inner = Agent::builder(llm.llm.clone())
         .request_parameters(llm.parameters.clone())
         .system_layout(tag::layout())

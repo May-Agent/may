@@ -55,6 +55,17 @@ pub enum ChatDbError {
         /// The terminal state the PR is in.
         state: String,
     },
+    /// Every model-facing id of a session is leased.
+    #[error(transparent)]
+    IdsExhausted(#[from] aither_core::IdsExhausted),
+    /// An id the database keeps for a session could not be leased again
+    /// when its pool was built: two stored ids share its word, or it is not
+    /// a pool word.
+    #[error("a stored model-facing id could not be leased again: {0}")]
+    StoredIdUnavailable(#[from] aither_core::WordUnavailable),
+    /// Every session name the generator can issue was issued.
+    #[error("every session name was issued")]
+    SessionNamesExhausted,
 }
 
 impl From<SkyDbError> for ChatDbError {
@@ -304,6 +315,8 @@ pub struct PendingAskUserLookup {
     pub(crate) session_id: String,
     /// Whether a run is waiting on the prompt, as opposed to an open question.
     pub(crate) blocking: bool,
+    /// The word the model knows an open question by.
+    pub(crate) word: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]

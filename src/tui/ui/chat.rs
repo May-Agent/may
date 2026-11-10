@@ -28,6 +28,7 @@ use crate::command_reading::{
     CommandReading, DiffLine, DiffOp, FileChange, FileEdit, Intent, Link,
 };
 use crate::task_rows::{TaskRow, TaskSection};
+use crate::tui::state::CompactionMeter;
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -1586,6 +1587,8 @@ pub struct StatusContext<'a> {
     /// Token usage info (`prompt_tokens`, model `context_window`). The status
     /// bar denominator is the auto-compact window derived from the latter.
     pub usage: Option<(u64, Option<u64>)>,
+    /// A compaction's state, shown in place of the usage.
+    pub compaction: CompactionMeter,
     /// Compaction thresholds the usage denominator follows.
     pub context_policy: aither_agent::ContextPolicy,
     /// Queued message count.
@@ -3407,9 +3410,19 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
     }
 
     // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
-    let usage = ctx.usage.map(|(prompt_tokens, context_window)| {
-        format_status_usage(prompt_tokens, context_window, &ctx.context_policy)
-    });
+    let usage = match ctx.compaction {
+        CompactionMeter::Compacting => Some(StatusUsage {
+            usage: "Compacting".to_string(),
+            warn: None,
+        }),
+        CompactionMeter::Compacted { .. } => Some(StatusUsage {
+            usage: "Compacted".to_string(),
+            warn: None,
+        }),
+        CompactionMeter::Idle => ctx.usage.map(|(prompt_tokens, context_window)| {
+            format_status_usage(prompt_tokens, context_window, &ctx.context_policy)
+        }),
+    };
 
     // The worktree index: fill bar while incomplete, `index ✓` once full,
     // red `index ✗` when repo-search is down.
@@ -4330,6 +4343,7 @@ mod tests {
         terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
+    use crate::tui::state::CompactionMeter;
 
     #[test]
     fn usage_shows_the_wall_clock_split() {
@@ -4996,6 +5010,7 @@ mod tests {
                         status_ctx: Some(StatusContext {
                             model: "model",
                             usage: None,
+                            compaction: CompactionMeter::Idle,
                             context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
@@ -6868,6 +6883,7 @@ mod tests {
                         status_ctx: Some(StatusContext {
                             model: "model",
                             usage: Some((4_800, Some(120_000))),
+                            compaction: CompactionMeter::Idle,
                             context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
@@ -7134,6 +7150,7 @@ mod tests {
         let status = StatusContext {
             model: "model",
             usage: None,
+            compaction: CompactionMeter::Idle,
             context_policy: aither_agent::ContextPolicy::default(),
             queue_count: 0,
             open_questions: 0,
@@ -7170,6 +7187,56 @@ mod tests {
         assert_eq!(rows[n - 3], "");
         assert!(rows[n - 2].starts_with("~ · model"));
         assert_eq!(rows[n - 1], "");
+    }
+
+    /// The status bar's right edge for `usage` and `compaction`.
+    fn status_row(compaction: CompactionMeter) -> String {
+        use super::StatusContext;
+        let status = StatusContext {
+            model: "model",
+            usage: Some((80_800, Some(262_144))),
+            compaction,
+            context_policy: aither_agent::ContextPolicy::default(),
+            queue_count: 0,
+            open_questions: 0,
+            yolo: false,
+            shells: 0,
+            subagents: 0,
+            decode_rate: None,
+            status_message: None,
+            cwd: "~",
+            activity: None,
+            spinner_frame: 0,
+            index_coverage: None,
+            index_failed: false,
+            index_loading: false,
+        };
+        let rows = build_plain_wrapped_lines_unified(
+            &sample_chat(),
+            80,
+            None,
+            None,
+            Some(&status),
+            None,
+            false,
+        );
+        rows.iter()
+            .find(|row| row.starts_with("~ · model"))
+            .expect("status row")
+            .clone()
+    }
+
+    #[test]
+    fn the_context_meter_shows_the_compaction_in_place_of_the_usage() {
+        let now = std::time::Instant::now();
+        assert!(status_row(CompactionMeter::Idle).trim_end().ends_with("%)"));
+        assert!(
+            status_row(CompactionMeter::Compacting)
+                .trim_end()
+                .ends_with("Compacting")
+        );
+        let held = CompactionMeter::Compacted { until: now };
+        assert!(status_row(held).trim_end().ends_with("Compacted"));
     }
 
     /// Render a sample screen and write every cell as JSON lines to

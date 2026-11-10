@@ -34,6 +34,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 ## Commands, skills, subagents
 
 - `src/terminal_commands.rs`: `register_shared_terminal_commands`, the list of IPC commands.
+- `src/model_ids.rs` and `src/model_ids/words.txt`: model-facing ids — session names, and `SessionIds`, a session's pool of one-token words; `src/db/session_ids.rs`: the session-name generator (`issue_session_name`, the `session_names` table) and the pools the daemon's `ChatDb` keeps per session (`session_ids()`); `may exec` leases from those pools over one daemon connection (`src/client/ids.rs`, `ChatDb::lease_ids_from`; routes in `src/daemon/session_ids.rs`), whose leases go when it closes.
 - Command implementations: `src/agent/ask_user_tool.rs`, `issue_tool.rs`, `pr_tool.rs` (store in `src/pr.rs`), `repo_tool.rs`, `session_tool.rs`, `task_tool.rs`, `tunnel_tool.rs`, `browser_tool.rs`, `register_tool.rs`, `imagine.rs`, `explore_tool.rs` (`explore`: the bundled read-only `explore` subagent on the fast model); `src/repo_search/code_search.rs` (`search`); `src/agent_link.rs` (`agent`); `src/issue/` (May and GitHub backends).
 - `src/skill.rs`: `SkillManager` (list, install from GitHub, register local). `src/bundle/mod.rs`: bundled skills embedded with `include_dir!` from `skills/` and written to `~/.may/skills`.
 - `aither-agent/src/specialized/task.rs`: `subagent` arguments; `aither-agent/subagents/*.toml`: the bundled definitions, written to `~/.may/subagents/`.

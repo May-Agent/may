@@ -66,7 +66,7 @@ struct WithdrawnText<'a> {
 #[derive(Template)]
 #[template(path = "context_open_questions.txt", escape = "none")]
 struct OpenQuestionsText<'a> {
-    requests: &'a [PersistedAskUserRequest],
+    requests: &'a [crate::db::NamedAskUserQuestion],
 }
 
 /// Asks the user a question without waiting for the answer.
@@ -271,7 +271,8 @@ impl Tool for AskUserTool {
             id: crate::id::new(),
             questions: persisted_questions(questions),
         };
-        self.runtime
+        let word = self
+            .runtime
             .open_question(&self.session_id, &request)
             .await
             .map_err(AskUserToolError::Persist)?;
@@ -280,14 +281,12 @@ impl Tool for AskUserTool {
             ask: crate::session::UserAsk::question(&request),
         });
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::WorkEvent::QuestionAsked(request.id.clone()));
+            events.record(aither_agent::WorkEvent::QuestionAsked(word.clone()));
         }
         Ok(ToolResult::text(
-            AskedText {
-                request_id: &request.id,
-            }
-            .render()
-            .expect("ask_user result template must render"),
+            AskedText { request_id: &word }
+                .render()
+                .expect("ask_user result template must render"),
         ))
     }
 }
@@ -344,11 +343,20 @@ impl Tool for WithdrawAskUserTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let withdrawn = self
+        let request_id = self
             .runtime
-            .withdraw_question(&self.session_id, &args.request_id)
+            .db()
+            .open_ask_user_question_named(&self.session_id, &args.request_id)
             .await
             .map_err(AskUserToolError::Withdraw)?;
+        let withdrawn = match request_id {
+            Some(request_id) => self
+                .runtime
+                .withdraw_question(&self.session_id, &request_id)
+                .await
+                .map_err(AskUserToolError::Withdraw)?,
+            None => false,
+        };
         if !withdrawn {
             return Err(AskUserToolError::NotOpen(args.request_id).into());
         }
@@ -396,20 +404,22 @@ impl aither_agent::BlockerResolver for AskUserBlockerResolver {
             reason: error.to_string(),
         };
         let db = self.runtime.db();
-        // A payload no question of this session carries is free text the
-        // harness cannot check, and holds.
-        if !db
-            .session_ask_user_request_exists(&self.session_id, mark)
+        // A mark names a question by the word the model knows it by.
+        if db
+            .open_ask_user_question_named(&self.session_id, mark)
             .await
             .map_err(unavailable)?
+            .is_some()
         {
             return Ok(true);
         }
-        Ok(db
-            .pending_ask_user_request(mark)
+        // A word that named a question of this session answered or withdrawn
+        // since stops blocking; a payload no question of this session
+        // carried is free text the harness cannot check, and holds.
+        Ok(!db
+            .session_ask_user_word_asked(&self.session_id, mark)
             .await
-            .map_err(unavailable)?
-            .is_some_and(|pending| pending.session_id == self.session_id))
+            .map_err(unavailable)?)
     }
 }
 
@@ -437,7 +447,7 @@ impl ContextSource for OpenQuestionsContext {
         let open = match self
             .runtime
             .db()
-            .open_ask_user_questions(&self.session_id)
+            .named_open_ask_user_questions(&self.session_id)
             .await
         {
             Ok(open) => open,

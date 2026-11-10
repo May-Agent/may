@@ -370,6 +370,10 @@ fn remote_hosts_render_only_while_one_is_connected() {
         vec![crate::config::SshServerConfig {
             name: "build-box".to_string(),
             target: "me@build-box".to_string(),
+            platform: crate::config::SshPlatformConfig {
+                os: "Linux".to_string(),
+                arch: "x86_64".to_string(),
+            },
         }],
         None,
     );
@@ -378,7 +382,7 @@ fn remote_hosts_render_only_while_one_is_connected() {
         "{connected}"
     );
     assert!(
-        connected.contains("- build-box (me@build-box)"),
+        connected.contains("- build-box (me@build-box), Linux x86_64"),
         "{connected}"
     );
 }
