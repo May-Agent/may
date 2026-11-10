@@ -40,7 +40,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 - `/config` opens the configuration screen (see `configuration.md`).
 - `/login` opens a provider sign-in picker with OpenAI (ChatGPT Plus/Pro subscription), xAI Grok (SuperGrok / X Premium+) and OpenRouter; Enter starts that flow. GitHub Copilot sign-in is started from `/config`.
 - `/mcp` manages MCP servers: a (add), d (remove), r (reconnect); stored in `~/.may/mcp.json`. Connected servers appear to the agent as terminal commands.
-- `/ssh` manages preconfigured SSH servers (`user@host[:port]` targets, a to add, d to remove), saved in `[[ssh_servers]]`; profiles attach them (see `profiles.md`).
+- `/ssh` manages preconfigured SSH servers (`user@host[:port]` targets, a to add, d to remove) and probes a server's OS when it is added, saved in `[[ssh_servers]]`; profiles attach them (see `profiles.md`).
 - `/skill` lists installed skills; a adds (install from a GitHub repository), d removes; typing filters.
 - `/connect` opens a picker of installed ACP agents to use as a subagent type; `/connect <command> [args]` connects that command directly. The connection is stored under `[acp_agents.<name>]` and needs the agent's handshake to finish within `[acp] trial_limit`.
 - `/secret KEY VALUE` stores VALUE in the OS keychain, injected into the shell environment as KEY. The line is removed from input history and never enters the transcript or reaches the agent.

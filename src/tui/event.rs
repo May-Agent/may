@@ -67,6 +67,14 @@ pub enum AppEvent {
     /// Background config save completed.
     ConfigSaved(Result<(), TuiError>),
 
+    /// An `/ssh add` probe finished; the error is the probe's message.
+    SshProbed {
+        /// The name the server was added under.
+        name: String,
+        /// The probed server, or why it could not be reached.
+        result: Result<crate::config::SshServerConfig, String>,
+    },
+
     /// The session's stored reasoning effort arrived from the daemon.
     EffortLoaded(Option<String>),
     /// A `/effort` update finished; Ok carries the applied token.
@@ -247,6 +255,7 @@ impl AppEvent {
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ProfileSessionsPushed(_) => "profile_sessions_pushed",
             Self::ConfigSaved(_) => "config_saved",
+            Self::SshProbed { .. } => "ssh_probed",
             Self::EffortLoaded(_) => "effort_loaded",
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",

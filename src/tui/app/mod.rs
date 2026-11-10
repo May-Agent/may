@@ -769,7 +769,46 @@ impl App {
         }
     }
 
-    fn persist_config_background(&self) {
+    /// Probe an SSH server off the event loop; `ssh_probed` receives the
+    /// result.
+    pub fn start_ssh_probe(&mut self, name: String, target: String) {
+        self.set_persistent_status(format!("Probing SSH server: {name}"));
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let result = crate::config::SshServerConfig::probe(name.clone(), target)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SshProbed { name, result }).await;
+        })
+        .detach();
+    }
+
+    /// Add a probed SSH server to the config, or show why the probe failed.
+    /// Returns whether the config changed and must be saved.
+    pub fn ssh_probed(
+        &mut self,
+        name: &str,
+        result: Result<crate::config::SshServerConfig, String>,
+    ) -> bool {
+        match result {
+            Err(error) => {
+                self.status = None;
+                self.chat
+                    .push_error(&format!("Failed to add SSH server {name}: {error}"));
+                false
+            }
+            Ok(server) => {
+                self.config.upsert_ssh_server(server);
+                self.set_status(format!("Added SSH server: {name}"));
+                if self.ssh_selected + 1 < self.config.ssh_servers.len() {
+                    self.ssh_selected = self.config.ssh_servers.len() - 1;
+                }
+                true
+            }
+        }
+    }
+
+    pub(in crate::tui) fn persist_config_background(&self) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
         spawn(async move {
@@ -5395,6 +5434,54 @@ mod tests {
                 ChatElement::Error { message } => Some(message.as_str()),
                 _ => None,
             })
+    }
+
+    fn probed_server(name: &str) -> crate::config::SshServerConfig {
+        crate::config::SshServerConfig {
+            name: name.to_string(),
+            target: "me@example.test".to_string(),
+            platform: crate::config::SshPlatformConfig {
+                os: "Linux".to_string(),
+                arch: "x86_64".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_ssh_probe_saves_the_server_and_selects_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.config.upsert_ssh_server(probed_server("first"));
+        app.set_persistent_status("Probing SSH server: second");
+
+        let save = app.ssh_probed("second", Ok(probed_server("second")));
+
+        assert!(save, "a probed server must be saved");
+        assert_eq!(app.config.ssh_servers.len(), 2);
+        assert_eq!(app.config.ssh_servers[1].name, "second");
+        assert_eq!(app.ssh_selected, 1);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Added SSH server: second")
+        );
+        assert_eq!(last_error(&app), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_ssh_probe_shows_the_error_and_saves_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.set_persistent_status("Probing SSH server: down");
+
+        let save = app.ssh_probed("down", Err("connection timed out".to_string()));
+
+        assert!(!save);
+        assert_eq!(app.config.ssh_servers.len(), 0);
+        assert!(app.status.is_none());
+        assert_eq!(
+            last_error(&app),
+            Some("Failed to add SSH server down: connection timed out")
+        );
     }
 
     #[tokio::test]

@@ -743,6 +743,50 @@ pub struct SshServerConfig {
     pub name: String,
     /// SSH target (`user@host[:port]`).
     pub target: String,
+    /// The platform the server reported when it was added.
+    pub platform: SshPlatformConfig,
+}
+
+/// The operating system and architecture an SSH server reported, as
+/// `uname -s` and `uname -m` print them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
+pub struct SshPlatformConfig {
+    /// The kernel name (`Linux`, `Darwin`).
+    pub os: String,
+    /// The machine hardware name (`x86_64`, `arm64`).
+    pub arch: String,
+}
+
+impl fmt::Display for SshPlatformConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.os, self.arch)
+    }
+}
+
+impl SshServerConfig {
+    /// A server named `name` at `target`, with the platform it reports.
+    ///
+    /// # Errors
+    /// Fails when the server cannot be reached or does not answer
+    /// `uname -s -m`, so a server that cannot run commands is never saved.
+    pub async fn probe(
+        name: String,
+        target: String,
+    ) -> Result<Self, aither_sandbox::SshProbeError> {
+        let platform = aither_sandbox::probe_ssh_os(&aither_sandbox::SshServer {
+            name: name.clone(),
+            target: target.clone(),
+        })
+        .await?;
+        Ok(Self {
+            name,
+            target,
+            platform: SshPlatformConfig {
+                os: platform.os,
+                arch: platform.arch,
+            },
+        })
+    }
 }
 
 /// An installed ACP agent connected as a subagent type (`/connect`).
@@ -2181,6 +2225,29 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         assert!(saved.contains("communication = \"Chinese\""), "{saved}");
         assert!(!MayConfig::default().language.languages().enforced());
+    }
+
+    #[test]
+    fn an_ssh_server_keeps_the_platform_it_reported() {
+        let config: MayConfig = toml::from_str(
+            "[[ssh_servers]]\nname = \"box\"\ntarget = \"me@box\"\n[ssh_servers.platform]\nos = \"Linux\"\narch = \"x86_64\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.ssh_servers()[0].platform.to_string(), "Linux x86_64");
+        let saved = toml::to_string(&config).unwrap();
+        let reloaded: MayConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.ssh_servers(), config.ssh_servers());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_be_probed_is_not_added() {
+        let error = SshServerConfig::probe("gone".into(), "nobody@host.invalid".into())
+            .await
+            .expect_err("an unresolvable host has no platform");
+        assert!(
+            matches!(error, aither_sandbox::SshProbeError::Failed { .. }),
+            "{error}"
+        );
     }
 
     #[test]

@@ -519,12 +519,10 @@ pub(super) async fn add_ssh_server(
     Json(req): Json<SshServerRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let updated = state.update_config(|config| {
-        config.upsert_ssh_server(SshServerConfig {
-            name: req.name,
-            target: req.target,
-        });
-    });
+    let server = SshServerConfig::probe(req.name, req.target)
+        .await
+        .map_err(bad_request_error)?;
+    let updated = state.update_config(|config| config.upsert_ssh_server(server));
     updated.save().await.map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))

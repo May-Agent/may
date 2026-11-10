@@ -165,6 +165,8 @@ export interface UiSessionsConfig {
 export interface UiSshServerConfig {
   name: string;
   target: string;
+  /** Kernel and architecture the server reported when it was added. */
+  platform: { os: string; arch: string };
 }
 
 export interface UiConfigResponse {
@@ -232,7 +234,7 @@ export function setFullConfig(full: UiFullConfig): Promise<void> {
   return apiPost<void>('/config/full', body);
 }
 
-export function upsertSshServer(server: UiSshServerConfig): Promise<void> {
+export function upsertSshServer(server: Pick<UiSshServerConfig, 'name' | 'target'>): Promise<void> {
   return apiPost<void>('/ssh', server);
 }
 
