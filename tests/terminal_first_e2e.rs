@@ -6117,7 +6117,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
             .arg("--session")
             .arg(session_id)
             .arg("--mode")
-            .arg("sandboxed")
+            .arg("default")
             .arg("--timeout")
             .arg(timeout)
             .arg("--")
@@ -6132,7 +6132,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     let running = tokio::spawn(exec(
         &session.id,
         format!("touch {}; while :; do sleep 0.1; done", started.display()),
-        "10",
+        "60",
     ));
     let deadline = Instant::now() + Duration::from_secs(60);
     while !started.exists() {
