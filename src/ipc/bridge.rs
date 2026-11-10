@@ -169,3 +169,45 @@ impl IpcCommand for ToolCallCommand {
         envelope_to_cli(envelope)
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use aither_core::llm::ToolResult;
+
+    use crate::ipc::CommandRegistryBuilder;
+    use crate::repo_clone::test_sandbox::TestTerminal;
+
+    /// A command that panics fails its own call with a message, and the
+    /// session's shell goes on serving the commands that do not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_command_fails_its_own_call_and_the_session_continues() {
+        let mut commands = CommandRegistryBuilder::new();
+        commands.configure_raw_handler("boom", "Panics", |_call, _args| {
+            Box::pin(async { panic!("the command's own bug") })
+        });
+        commands.configure_raw_handler("fine", "Succeeds", |_call, _args| {
+            Box::pin(async { Ok(ToolResult::text("still serving")) })
+        });
+        let session = tempfile::tempdir().expect("session dir");
+        let terminal = TestTerminal::with_commands(session.path(), commands).await;
+        let sandbox = terminal.sandbox();
+
+        let output = sandbox
+            .run(
+                session.path(),
+                "boom 2>&1 && echo boom=succeeded || echo boom=failed\nboom 2>&1 || true\nfine",
+            )
+            .await
+            .expect("the script runs to its end");
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                "error: IPC error: the `boom` command failed unexpectedly",
+                "boom=failed",
+                "error: IPC error: the `boom` command failed unexpectedly",
+                "still serving"
+            ],
+            "{output}"
+        );
+    }
+}

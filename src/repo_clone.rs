@@ -1057,6 +1057,11 @@ pub(crate) mod test_sandbox {
             Self::configured(session_root, commands, None).await
         }
 
+        /// A terminal whose scripts can call the commands `commands` holds.
+        pub async fn with_commands(session_root: &Path, commands: CommandRegistryBuilder) -> Self {
+            Self::configured(session_root, commands, None).await
+        }
+
         /// A terminal whose commands see the environment `env` supplies.
         pub async fn with_env(session_root: &Path, env: CommandEnv) -> Self {
             Self::configured(session_root, CommandRegistryBuilder::new(), Some(env)).await
