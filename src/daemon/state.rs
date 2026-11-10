@@ -447,7 +447,7 @@ pub struct DaemonState {
     pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     /// Embedded baseline tool distribution shared by agents, tasks and containers.
-    pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    pub(crate) tool_distribution: Arc<crate::tools::ToolDistribution>,
     /// Prepared tool environments reused by every agent rebuilt for a session.
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
     /// The machine-wide jobserver pool every terminal draws its jobs from.
@@ -547,7 +547,7 @@ impl DaemonState {
 
     /// The tool distribution's `heel`, prepared in the home's tools
     /// directory, which runs the sandboxes of ACP probes and trials.
-    pub(crate) async fn heel(&self) -> Result<heel::HeelBinary, aither_sandbox::ToolRuntimeError> {
+    pub(crate) async fn heel(&self) -> Result<heel::HeelBinary, crate::tools::ToolRuntimeError> {
         crate::tools::prepare_heel(
             &self.tool_distribution,
             &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),

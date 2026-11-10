@@ -40,7 +40,7 @@ pub enum ContainerError {
     Io(#[from] std::io::Error),
     #[doc = "Managed tools failed integrity or read-only preparation."]
     #[error("baseline tools preparation failed: {0}")]
-    Tools(#[from] aither_sandbox::ToolRuntimeError),
+    Tools(#[from] crate::tools::ToolRuntimeError),
     /// Container not found.
     #[error("Container not found: {0}")]
     NotFound(String),

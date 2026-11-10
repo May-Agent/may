@@ -62,7 +62,7 @@ pub struct ToolDispatchConfig {
     /// Broker for `ask_user` prompts.
     pub ask_user_broker: AskUserBroker,
     /// Baseline tool distribution prepared for task terminals.
-    pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    pub tool_distribution: Arc<crate::tools::ToolDistribution>,
 }
 
 #[derive(Debug, Clone)]

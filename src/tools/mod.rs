@@ -2,8 +2,28 @@
 
 use std::path::Path;
 
-use aither_sandbox::{HostProgram, ToolDistribution, ToolRuntimeError, ToolTarget};
 use heel::HeelBinary;
+
+mod distribution;
+mod environment;
+mod python;
+mod runtime;
+mod transport;
+
+pub use distribution::{
+    HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
+    ToolDistribution,
+};
+pub use environment::ToolEnvironments;
+pub use python::{PythonPin, PythonRuntime};
+pub use runtime::{
+    HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool, PreparedTools, ToolBinary,
+    ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
+};
+pub use transport::{
+    ContainerToolTransport, LocalToolTransport, SshToolTransport, ToolEnvironmentInfo,
+    ToolTransport,
+};
 
 #[cfg(test)]
 mod fixture;

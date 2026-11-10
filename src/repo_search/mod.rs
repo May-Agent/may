@@ -16,7 +16,7 @@ pub use code_search::CodeSearchTool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aither_sandbox::{HostProgram, ToolRuntimeError, ToolTarget};
+use crate::tools::{HostProgram, ToolRuntimeError, ToolTarget};
 use async_lock::OnceCell;
 use repo_search_client::client::{Client, ClientError};
 use repo_search_client::launcher::{self, ConnectError, Launcher as _};

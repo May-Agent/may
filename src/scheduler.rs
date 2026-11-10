@@ -57,7 +57,7 @@ pub struct TaskRuntime {
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
     /// Baseline tool distribution prepared for every task terminal.
-    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    tool_distribution: Arc<crate::tools::ToolDistribution>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
     /// The daemon's connectivity source; task terminals record the outages
@@ -441,7 +441,7 @@ impl TaskRuntime {
     pub async fn load(
         db: ChatDb,
         may_dir: PathBuf,
-        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+        tool_distribution: Arc<crate::tools::ToolDistribution>,
     ) -> Result<Self, crate::db::ChatDbError> {
         let runtime = Self {
             db,
@@ -2078,7 +2078,7 @@ mod tests {
             .await
             .expect("db should initialize");
         let empty_distribution =
-            aither_sandbox::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
+            crate::tools::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
                 .expect("an empty distribution is well-formed");
         let runtime = TaskRuntime::load(db, may_dir.clone(), Arc::new(empty_distribution))
             .await
