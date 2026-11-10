@@ -119,6 +119,18 @@ function appendToolSegment(segments: TurnSegment[], toolId: string, seq: number)
   return [...segments, { kind: 'tool', toolId, seq }];
 }
 
+/**
+ * A tool event's summary replaces the stored one, except for the card: the
+ * daemon reports it on its own `tool_card` event, which later start, delta
+ * and end summaries do not repeat.
+ */
+function mergeSummary(existing: ToolSummary, incoming: ToolSummary | undefined): ToolSummary {
+  if (!incoming) return existing;
+  return incoming.card === undefined && existing.card !== undefined
+    ? { ...incoming, card: existing.card }
+    : incoming;
+}
+
 function upsertTool(tools: TurnToolState[], id: string, apply: (tool: TurnToolState) => TurnToolState, fallback: () => TurnToolState): TurnToolState[] {
   const idx = tools.findIndex((t) => t.id === id);
   if (idx < 0) {
@@ -136,6 +148,18 @@ function upsertTool(tools: TurnToolState[], id: string, apply: (tool: TurnToolSt
  * stream reducer deterministic under out-of-order or replayed events.
  */
 export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState {
+  // A card change carries no `seq`: it is not part of the turn's ordered
+  // events and applies whenever it arrives.
+  if (event.kind === 'tool_card') {
+    return {
+      ...state,
+      tools: state.tools.map((tool) =>
+        tool.id === event.id
+          ? { ...tool, summary: { ...tool.summary, card: event.card } }
+          : tool,
+      ),
+    };
+  }
   if (event.kind !== 'start' && event.seq <= state.lastSeq) {
     return state;
   }
@@ -189,7 +213,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name,
           variant: event.variant,
           argumentsRaw: event.arguments,
-          summary: event.summary ?? existing.summary,
+          summary: mergeSummary(existing.summary, event.summary),
           status: 'streaming',
           seq: event.seq,
         }),
@@ -221,7 +245,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name || existing.name,
           variant: event.name ? event.variant : existing.variant,
           argumentsRaw: existing.argumentsRaw + event.argumentsFragment,
-          summary: event.summary ?? existing.summary,
+          summary: mergeSummary(existing.summary, event.summary),
           seq: event.seq,
         }),
         () => ({
@@ -250,7 +274,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         (existing) => ({
           ...existing,
           argumentsRaw: event.arguments ?? existing.argumentsRaw,
-          summary: event.summary ?? existing.summary,
+          summary: mergeSummary(existing.summary, event.summary),
           status: 'done',
           result: event.result,
           seq: event.seq,

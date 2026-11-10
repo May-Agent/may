@@ -104,6 +104,9 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) last_todo_hash: Option<u64>,
     /// The tasks.md content the issue ownership rule accepted last.
     pub(super) tasks_accepted: Option<String>,
+    /// The `tasks` edit of each running terminal call and the `tasks.md` it
+    /// started from, until the call ends and its card is built.
+    pub(super) tasks_edits: HashMap<String, (crate::tasks_md::edit::Op, String)>,
     pub(super) turn_persister: TurnPersister,
     pub(super) first_agent_event_seen: bool,
     pub(super) first_visible_tool_seen: bool,
@@ -128,6 +131,51 @@ async fn locate_reading(workdir: &std::path::Path, mut summary: ToolSummary) -> 
 }
 
 impl<S: ChatSink> TurnEvents<'_, '_, S> {
+    /// Remembers the `tasks.md` a terminal call that edits it starts from. A
+    /// script with several edits has no card: its changes cannot be told
+    /// apart.
+    async fn note_tasks_edit(&mut self, id: &str, arguments: &str) {
+        let Some(script) = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("script")?.as_str().map(str::to_owned))
+        else {
+            return;
+        };
+        let reading = CommandReading::of(&script);
+        let mut edits = reading.tasks_edits();
+        let (Some(op), None) = (edits.next(), edits.next()) else {
+            return;
+        };
+        let before = self
+            .session_paths
+            .tasks_content()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.tasks_edits.insert(id.to_owned(), (op, before));
+    }
+
+    /// Builds, stores and publishes the card of a finished `tasks` call from
+    /// the rows it changed.
+    async fn finish_tasks_card(&mut self, id: &str) -> bool {
+        let Some((op, before)) = self.tasks_edits.remove(id) else {
+            return true;
+        };
+        let after = self
+            .session_paths
+            .tasks_content()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let Some(card) = crate::command_reading::Card::tasks(&op, &before, &after) else {
+            return true;
+        };
+        super::cards::store(&self.state.db(), self.session_id.as_str(), id, Some(&card)).await;
+        self.sink.on_tool_card(id, &card).await
+    }
+
     /// Feeds streamed model output to the decode meter: counted with the
     /// model's vocabulary where it has one, estimated from its bytes
     /// otherwise.
@@ -510,6 +558,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.tool_arguments_by_id
                     .insert(id.clone(), arguments.clone());
                 self.tool_started_at.insert(id.clone(), at);
+                if name == "terminal" {
+                    self.note_tasks_edit(&id, &arguments).await;
+                }
                 if let Some((id, name, arguments, summary)) = visible {
                     self.log_first_visible_tool_event(&id, &name, "canonical_start");
                     if !self
@@ -558,6 +609,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 // reverted before anyone reads it.
                 enforce_issue_ownership(self.state, self.session_id, &mut self.tasks_accepted)
                     .await;
+                if !self.finish_tasks_card(&id).await {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                }
                 // Check if tasks.md changed after tool execution.
                 if let Some(rows) =
                     check_tasks_update(self.session_paths, &mut self.last_todo_hash).await

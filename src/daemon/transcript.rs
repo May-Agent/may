@@ -68,6 +68,10 @@ pub(super) enum TranscriptEntry {
         /// stored without one.
         #[schema(value_type = Option<Object>)]
         reading: Option<crate::command_reading::CommandReading>,
+        /// The card of a call that ran one of May's commands; its
+        /// `ask_user` answer is joined when the transcript is served.
+        #[schema(value_type = Option<Object>)]
+        card: Option<crate::command_reading::Card>,
     },
     InteractionRequest {
         id: String,
@@ -167,6 +171,7 @@ pub(super) fn build_entries(rows: &[ChatMessage]) -> Vec<TranscriptEntry> {
                             status: "running",
                             result: None,
                             reading,
+                            card: None,
                         });
                     }
                     ToolEventRecord::End {
@@ -242,7 +247,15 @@ pub(super) async fn get_transcript(
     let history = crate::session::load_history_from_db(&state.db(), &id)
         .await
         .map_err(internal_error)?;
-    let entries = build_entries(history.messages());
+    let mut entries = build_entries(history.messages());
+    let mut cards = state.db().tool_cards(&id).await.map_err(internal_error)?;
+    for entry in &mut entries {
+        if let TranscriptEntry::ToolCall { call_id, card, .. } = entry
+            && let Some(stored) = cards.remove(call_id.as_str())
+        {
+            *card = Some(super::chat::cards::with_answers(&state.db(), stored).await);
+        }
+    }
     let end = match &query.before {
         Some(before) => entries
             .iter()

@@ -175,6 +175,7 @@ export type CommandIntent =
   | { kind: 'list'; tool: string; paths: string[] }
   | { kind: 'git'; subcommand?: string | null }
   | { kind: 'build'; tool: string; subcommand?: string | null; target?: string | null }
+  | { kind: 'tasks'; args: string[] }
   | { kind: 'unknown'; source: string };
 
 export type StepLink = 'start' | 'pipe' | 'and' | 'or' | 'then';
@@ -189,6 +190,52 @@ export interface CommandStep {
 export interface CommandReading {
   steps: CommandStep[];
 }
+
+export type RowChangeKind = 'added' | 'started' | 'finished' | 'blocked' | 'unblocked' | 'edited';
+
+/** A `tasks.md` row as a card shows it. */
+export interface RowView {
+  section: string;
+  title: string;
+  detail: string;
+}
+
+export interface RowChange {
+  change: RowChangeKind;
+  before?: RowView | null;
+  after?: RowView | null;
+}
+
+export interface AskedCard {
+  section: string;
+  question: string;
+  options: string[];
+  multiSelect: boolean;
+  secret: boolean;
+}
+
+export interface AnswerCard {
+  section: string;
+  text: string;
+}
+
+/**
+ * What a `terminal` call of one of May's commands renders as, built by the
+ * daemon from what the command did. A call without one shows as the
+ * ordinary command row.
+ */
+export type CommandCard =
+  | { kind: 'tasks'; changes: RowChange[] }
+  | {
+      kind: 'subagent';
+      agent: string;
+      title: string;
+      state: 'running' | 'done' | 'interrupted';
+      startedAt: string;
+      finishedAt?: string | null;
+      result?: string | null;
+    }
+  | { kind: 'askUser'; requestId: string; questions: AskedCard[]; answers?: AnswerCard[] | null };
 
 export interface PersistedWorkspaceRequest {
   id: string;
@@ -310,6 +357,8 @@ export interface ToolSummary {
   prompt?: string | null;
   /** How the daemon read a terminal call's script, once the call is complete. */
   reading?: CommandReading | null;
+  /** The card of a call that ran one of May's commands, once the daemon built it. */
+  card?: CommandCard | null;
 }
 
 export interface SseToolStart {
@@ -344,6 +393,18 @@ export interface SseToolEnd {
   arguments?: string;
   result: unknown;
   summary?: ToolSummary;
+}
+
+/**
+ * The card of the terminal call `id` changed. Carries no `seq`: it can also
+ * arrive after the turn that ran the command, when an answer comes in.
+ */
+export interface SseToolCard {
+  kind: 'tool_card';
+  turnId: string;
+  id: string;
+  /** Absent when the call has none, so the ordinary command row shows. */
+  card: CommandCard | null;
 }
 
 /** A section of `tasks.md` that holds rows. */
@@ -481,6 +542,7 @@ export type ChatStreamEvent =
   | SseToolStart
   | SseToolDelta
   | SseToolEnd
+  | SseToolCard
   | SseTodoUpdate
   | SseError
   | SseDone

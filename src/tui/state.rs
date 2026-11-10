@@ -827,6 +827,66 @@ impl StatusNotice {
     }
 }
 
+/// How long the context meter reads `Compacted` before the new usage.
+///
+/// Long enough to notice at a glance while working
+/// elsewhere in the terminal, short enough that the figure it hides is
+/// back before the user wonders about it.
+pub const COMPACTED_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What the status bar's context meter shows: the usage figure, or the
+/// state of a compaction in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionMeter {
+    /// No compaction to report: the meter shows the context usage.
+    #[default]
+    Idle,
+    /// A compaction is running.
+    Compacting,
+    /// A compaction finished; the meter reads `Compacted` until `until`.
+    Compacted {
+        /// When the meter returns to the usage figure.
+        until: std::time::Instant,
+    },
+}
+
+impl CompactionMeter {
+    /// Follow the compaction to `phase`, reported at `now`. Only a compaction
+    /// that replaced the context reads `Compacted`; any other end returns the
+    /// meter to the usage figure.
+    pub fn apply(&mut self, phase: crate::client::CompactionPhase, now: std::time::Instant) {
+        use crate::client::CompactionPhase;
+        *self = match phase {
+            CompactionPhase::Started => Self::Compacting,
+            CompactionPhase::Applied => Self::Compacted {
+                until: now + COMPACTED_HOLD,
+            },
+            CompactionPhase::NothingToCompact
+            | CompactionPhase::Failed
+            | CompactionPhase::Discarded => Self::Idle,
+        };
+    }
+
+    /// Return to the usage figure, as when the session changes.
+    pub const fn cancel(&mut self) {
+        *self = Self::Idle;
+    }
+
+    /// Whether `Compacted` is on screen, so ticks redraw until it clears.
+    #[must_use]
+    pub const fn is_holding(self) -> bool {
+        matches!(self, Self::Compacted { .. })
+    }
+
+    /// Return to the usage figure once the hold has passed at `now`; ticks
+    /// call this.
+    pub fn clear_expired(&mut self, now: std::time::Instant) {
+        if matches!(*self, Self::Compacted { until } if now >= until) {
+            *self = Self::Idle;
+        }
+    }
+}
+
 /// MCP add server mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpAddMode {

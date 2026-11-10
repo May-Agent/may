@@ -289,6 +289,7 @@ async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
         tool_calls: Vec::new(),
         translation: None,
         reading: None,
+        card: None,
         thinking: None,
     };
     let rows = vec![

@@ -1126,6 +1126,7 @@ where
             // that ends them so no spark stays on screen.
             needs_draw = app.processing
                 || app.new_year.animating()
+                || app.compaction.is_holding()
                 || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
@@ -1225,6 +1226,9 @@ where
                     }
                     TuiEvent::ToolReading { call_id, reading } => {
                         app.chat.set_tool_reading(&call_id, reading);
+                    }
+                    TuiEvent::ToolCard { call_id, card } => {
+                        app.chat.set_tool_card(&call_id, card);
                     }
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {

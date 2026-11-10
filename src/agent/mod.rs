@@ -9,9 +9,11 @@ pub(crate) mod browser_tool;
 pub mod cache_miss;
 pub(crate) mod ci_alert;
 pub(crate) mod ci_tool;
+pub mod command_cards;
 pub mod command_env;
 #[cfg(test)]
 mod compact_tool_tests;
+mod compaction_report;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(target_os = "macos")]
@@ -72,6 +74,7 @@ pub mod work_tracker;
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
+pub use compaction_report::CompactionReporter;
 pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};

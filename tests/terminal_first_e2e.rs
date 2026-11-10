@@ -120,6 +120,9 @@ enum CompactionProbe {
     /// Every compaction is answered with a valid handoff once the run has
     /// asked the model again, or after [`COMPACTION_PROBE_GATE_LIMIT`].
     Lands,
+    /// Every compaction is answered with a valid handoff at once, for a
+    /// compaction nothing else in flight would release.
+    LandsAtOnce,
     /// The compaction and the retry aither makes on a bad answer get
     /// something that is no handoff; the rerun on the cleaned context gets a
     /// valid one.
@@ -434,7 +437,7 @@ impl MockScenarioState {
                     self.compaction_gate = Some(Arc::clone(&gate));
                     handoff.gated(gate)
                 }
-                CompactionProbe::FailsThenLands => handoff,
+                CompactionProbe::FailsThenLands | CompactionProbe::LandsAtOnce => handoff,
             };
             return MockHttpResponse::sse(vec![
                 handoff,
@@ -5859,6 +5862,76 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
         compactions, 3,
         "the compaction and its retry fail, the rerun lands"
     );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// An explicit compaction on an idle session reaches every client of the
+/// session as a `session_compaction` start and an applied finish.
+#[tokio::test]
+#[serial]
+async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(
+        CompactionProbe::LandsAtOnce,
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
+            "sessionId": session_id,
+            "content": COMPACTION_PROBE_FOLLOW_UP,
+        }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn to compact", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    let mut frames = agent_frames(&client, &server, &session_id, None).await;
+    let compacted = client
+        .post(format!(
+            "{}/api/sessions/{session_id}/actions/compact",
+            server.base_url
+        ))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("the compact request should be answered");
+    let compacted = expect_status(&server.log, compacted, StatusCode::OK).await;
+    let compacted: Value = compacted.json().await.expect("compact answer JSON");
+    assert_eq!(compacted["compacted"], true, "{compacted}");
+
+    let mut phases = Vec::new();
+    while phases.len() < 2 {
+        let Ok(next) = tokio::time::timeout(Duration::from_secs(20), frames.next_event()).await
+        else {
+            panic!(
+                "compaction frames so far {phases:?}; server logs:\n{}",
+                server.log.contents().await
+            );
+        };
+        let event = next.expect("the stream should stay open");
+        if event.event == "session_compaction" {
+            let frame: Value = serde_json::from_str(&event.data).expect("compaction frame JSON");
+            assert_eq!(frame["sessionId"], session_id);
+            phases.push(frame["phase"].as_str().expect("a phase").to_string());
+        }
+    }
+    assert_eq!(phases, ["started", "applied"]);
     server.stop().await;
     environment.release(&harness, &session_id).await;
 }

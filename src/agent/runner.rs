@@ -27,7 +27,8 @@ use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
 
 use crate::MayAgent;
-use crate::agent::{ContextDump, ContextReport, ModelSlot};
+use crate::agent::{CompactionReporter, ContextDump, ContextReport, ModelSlot};
+use crate::client::CompactionPhase;
 use crate::db::{ChatDb, RunFence};
 use crate::session::{CancelReason, RunOutcome, SessionRunGuard, SessionRuns};
 
@@ -75,6 +76,13 @@ pub enum TuiEvent {
         call_id: String,
         /// How the daemon read the call's script.
         reading: crate::command_reading::CommandReading,
+    },
+    /// The card of a terminal call that ran one of May's commands changed.
+    ToolCard {
+        /// The call the card belongs to.
+        call_id: String,
+        /// The card; absent when the call has none and shows as a command row.
+        card: Option<crate::command_reading::Card>,
     },
     /// The daemon parked the run.
     Hold {
@@ -559,7 +567,7 @@ pub fn spawn_worker<E: Executor + 'static>(
     snapshot_db: ChatDb,
     runs: SessionRuns,
 ) -> AgentWorker {
-    spawn_idle_worker(executor, agent, snapshot_db, runs, None)
+    spawn_idle_worker(executor, agent, snapshot_db, runs, None, None)
 }
 
 /// Where an idle worker reports the background commands its earlier runs
@@ -581,6 +589,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     snapshot_db: ChatDb,
     runs: SessionRuns,
     background_wakes: Option<BackgroundWakes>,
+    compactions: Option<Sender<CompactionPhase>>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
@@ -597,6 +606,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
             snapshot_db,
             runs,
             background_wakes,
+            compactions,
         ))
         .detach();
 
@@ -620,7 +630,13 @@ async fn run_worker(
     snapshot_db: ChatDb,
     runs: SessionRuns,
     background_wakes: Option<BackgroundWakes>,
+    compactions: Option<Sender<CompactionPhase>>,
 ) {
+    let reporter = || {
+        compactions
+            .clone()
+            .map_or_else(CompactionReporter::silent, CompactionReporter::new)
+    };
     loop {
         // Wait for a command; an idle session is compacted on the way, and
         // its detached background commands are collected.
@@ -630,6 +646,7 @@ async fn run_worker(
             &snapshot_db,
             &runs,
             background_wakes.as_ref(),
+            &reporter,
         )
         .await
         else {
@@ -674,7 +691,10 @@ async fn run_worker(
                     }
                 };
                 let outcome = race_against_commands(
-                    until_stopped(agent.compact(focus.as_deref()), guard.cancellation()),
+                    until_stopped(
+                        agent.compact_reporting(focus.as_deref(), &reporter()),
+                        guard.cancellation(),
+                    ),
                     &command_rx,
                     &command_tx,
                 )
@@ -762,6 +782,7 @@ async fn next_command(
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
     background_wakes: Option<&BackgroundWakes>,
+    reporter: &(dyn Fn() -> CompactionReporter + Sync),
 ) -> Option<WorkerCommand> {
     loop {
         let compaction_due_in = agent.idle_compaction_due_in();
@@ -804,7 +825,9 @@ async fn next_command(
                 }
             }
             IdleStep::Compact => {
-                if let Some(command) = compact_idle(agent, command_rx, snapshot_db, runs).await {
+                if let Some(command) =
+                    compact_idle(agent, command_rx, snapshot_db, runs, &reporter()).await
+                {
                     return command;
                 }
             }
@@ -830,6 +853,7 @@ async fn compact_idle(
     command_rx: &Receiver<WorkerCommand>,
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
+    reporter: &CompactionReporter,
 ) -> Option<Option<WorkerCommand>> {
     // The compaction rewrites the session's context, so it runs as a run
     // of its own; a session another process is running is left alone.
@@ -842,7 +866,13 @@ async fn compact_idle(
         }
     };
     let compaction = futures_lite::future::or(
-        async { Ok(until_stopped(agent.compact_when_idle(), guard.cancellation()).await) },
+        async {
+            Ok(until_stopped(
+                agent.compact_when_idle_reporting(reporter),
+                guard.cancellation(),
+            )
+            .await)
+        },
         async { Err(command_rx.recv().await.ok()) },
     )
     .await;

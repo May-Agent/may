@@ -273,3 +273,31 @@ fn the_reading_serializes_for_the_wire() {
     let back: CommandReading = serde_json::from_value(json).expect("deserializes");
     assert_eq!(back, reading);
 }
+
+#[test]
+fn a_tasks_edit_reads_from_its_literal_arguments() {
+    let reading = CommandReading::of("tasks start 2");
+    assert_eq!(
+        reading.steps[0].intent,
+        Intent::Tasks {
+            args: vec!["start".to_owned(), "2".to_owned()]
+        }
+    );
+    assert_eq!(reading.steps[0].line, "Update tasks (start)");
+    assert_eq!(reading.tasks_edits().count(), 1);
+}
+
+#[test]
+fn a_tasks_listing_an_unknown_subcommand_or_a_computed_word_is_unknown() {
+    for script in [
+        "tasks list",
+        "tasks frobnicate",
+        "tasks start $ROW",
+        "tasks",
+    ] {
+        assert!(
+            matches!(intents(script)[..], [Intent::Unknown { .. }]),
+            "{script} stays an ordinary command"
+        );
+    }
+}

@@ -25,9 +25,11 @@ use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
 use crate::agent::ContextReport;
 use crate::command_reading::{
-    CommandReading, DiffLine, DiffOp, FileChange, FileEdit, Intent, Link,
+    Card, CommandReading, DiffLine, DiffOp, FileChange, FileEdit, Intent, Link, RowChangeKind,
+    RowView, SubagentState,
 };
 use crate::task_rows::{TaskRow, TaskSection};
+use crate::tui::state::CompactionMeter;
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -157,6 +159,9 @@ pub enum ToolDisplay {
         /// How May reads the script; `None` while the script streams in
         /// and for `!` bash calls.
         reading: Option<CommandReading>,
+        /// The card the call renders as, when it ran one of May's commands
+        /// and the card represents what it did.
+        card: Option<Box<Card>>,
         /// Call status.
         status: ToolStatus,
         /// The output from this command.
@@ -1141,6 +1146,22 @@ impl ChatStream {
         }
     }
 
+    /// Attach the card of a terminal call that ran one of May's commands, or
+    /// take it away so the call shows as the ordinary command row.
+    pub fn set_tool_card(&mut self, id: &str, card: Option<Card>) {
+        let Some(index) = self.tool_index(id) else {
+            return;
+        };
+        if let ChatElement::ToolCall {
+            display: ToolDisplay::Terminal { card: slot, .. },
+            ..
+        } = &mut self.elements[index]
+        {
+            *slot = card.map(Box::new);
+            self.touch(index);
+        }
+    }
+
     /// Record a provider-hosted tool call the model just invoked.
     pub fn push_builtin(&mut self, id: String, tool: String, detail: String) {
         self.end_text();
@@ -1586,6 +1607,8 @@ pub struct StatusContext<'a> {
     /// Token usage info (`prompt_tokens`, model `context_window`). The status
     /// bar denominator is the auto-compact window derived from the latter.
     pub usage: Option<(u64, Option<u64>)>,
+    /// A compaction's state, shown in place of the usage.
+    pub compaction: CompactionMeter,
     /// Compaction thresholds the usage denominator follows.
     pub context_policy: aither_agent::ContextPolicy,
     /// Queued message count.
@@ -3407,9 +3430,19 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
     }
 
     // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
-    let usage = ctx.usage.map(|(prompt_tokens, context_window)| {
-        format_status_usage(prompt_tokens, context_window, &ctx.context_policy)
-    });
+    let usage = match ctx.compaction {
+        CompactionMeter::Compacting => Some(StatusUsage {
+            usage: "Compacting".to_string(),
+            warn: None,
+        }),
+        CompactionMeter::Compacted { .. } => Some(StatusUsage {
+            usage: "Compacted".to_string(),
+            warn: None,
+        }),
+        CompactionMeter::Idle => ctx.usage.map(|(prompt_tokens, context_window)| {
+            format_status_usage(prompt_tokens, context_window, &ctx.context_policy)
+        }),
+    };
 
     // The worktree index: fill bar while incomplete, `index ✓` once full,
     // red `index ✗` when repo-search is down.
@@ -3859,6 +3892,15 @@ fn render_tool_inline_at<'a>(
         open,
         spinner_frame,
     ));
+    // A call that ran one of May's commands shows what the command did, open
+    // or folded; only a subagent's full result waits for the expansion.
+    if let ToolDisplay::Terminal {
+        card: Some(card), ..
+    } = display
+    {
+        lines.extend(card_lines(card, selection_style, open));
+        return;
+    }
     if !open {
         // A folded edit keeps a compact diff; every other call folds to its
         // headline.
@@ -4004,6 +4046,156 @@ const fn link_marker(link: Link) -> &'static str {
         Link::Or => "|| ",
         Link::Then => "; ",
     }
+}
+
+/// Rows of the summary a subagent card shows folded.
+const CARD_SUMMARY_CHARS: usize = 160;
+
+/// Elapsed time as `1m 03s`.
+fn elapsed_text(from: jiff::Timestamp, to: jiff::Timestamp) -> String {
+    let seconds = to.duration_since(from).as_secs().max(0);
+    if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// The first line of `text`, cut to [`CARD_SUMMARY_CHARS`] characters.
+fn card_summary(text: &str) -> String {
+    let first = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let mut summary: String = first.chars().take(CARD_SUMMARY_CHARS).collect();
+    if first.chars().nth(CARD_SUMMARY_CHARS).is_some() || text.lines().nth(1).is_some() {
+        summary.push('…');
+    }
+    summary
+}
+
+fn row_text(row: &RowView) -> String {
+    if row.detail.is_empty() {
+        format!("{} ({})", row.title, row.section)
+    } else {
+        format!(
+            "{} ({}) — {}",
+            row.title,
+            row.section,
+            row.detail.replace('\n', "; ")
+        )
+    }
+}
+
+/// The rows a card renders as under its call's headline. `open` shows a
+/// subagent's whole result instead of its summary.
+#[must_use]
+pub fn card_lines(card: &Card, selection_style: Style, open: bool) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray).patch(selection_style);
+    let mut lines = Vec::new();
+    match card {
+        Card::Tasks { changes } => {
+            for change in changes {
+                let label = match change.change {
+                    RowChangeKind::Added => "added",
+                    RowChangeKind::Started => "started",
+                    RowChangeKind::Finished => "finished",
+                    RowChangeKind::Blocked => "blocked",
+                    RowChangeKind::Unblocked => "unblocked",
+                    RowChangeKind::Edited => "edited",
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  tasks {label}"),
+                    Style::default().fg(Color::Cyan).patch(selection_style),
+                )));
+                if let Some(before) = &change.before {
+                    lines.push(Line::from(Span::styled(
+                        format!("  - {}", row_text(before)),
+                        Style::default().fg(Color::Red).patch(selection_style),
+                    )));
+                }
+                if let Some(after) = &change.after {
+                    lines.push(Line::from(Span::styled(
+                        format!("  + {}", row_text(after)),
+                        Style::default().fg(Color::Green).patch(selection_style),
+                    )));
+                }
+            }
+        }
+        Card::Subagent {
+            agent,
+            title,
+            state,
+            started_at,
+            finished_at,
+            result,
+        } => {
+            let status = match (state, finished_at) {
+                (SubagentState::Running, _) => {
+                    format!(
+                        "running {}",
+                        elapsed_text(*started_at, jiff::Timestamp::now())
+                    )
+                }
+                (SubagentState::Done, Some(end)) => {
+                    format!("done in {}", elapsed_text(*started_at, *end))
+                }
+                (SubagentState::Done, None) => "done".to_owned(),
+                (SubagentState::Interrupted, _) => "interrupted".to_owned(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {agent}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bold()
+                        .patch(selection_style),
+                ),
+                Span::styled(format!(" · {title} · {status}"), dim),
+            ]));
+            if let Some(result) = result.as_deref().filter(|text| !text.trim().is_empty()) {
+                if open {
+                    lines.extend(
+                        result
+                            .lines()
+                            .map(|row| Line::from(Span::styled(format!("  {row}"), dim))),
+                    );
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", card_summary(result)),
+                        dim,
+                    )));
+                }
+            }
+        }
+        Card::AskUser {
+            questions, answers, ..
+        } => {
+            for question in questions {
+                lines.push(Line::from(Span::styled(
+                    format!("  ? {}", question.question),
+                    Style::default().fg(Color::Yellow).patch(selection_style),
+                )));
+                for option in &question.options {
+                    lines.push(Line::from(Span::styled(format!("    · {option}"), dim)));
+                }
+                if let Some(answer) = answers
+                    .iter()
+                    .flatten()
+                    .find(|answer| answer.section == question.section)
+                {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ✓ {}", answer.text),
+                        Style::default().fg(Color::Green).patch(selection_style),
+                    )));
+                }
+            }
+            if answers.is_none() {
+                lines.push(Line::from(Span::styled("  waiting for an answer", dim)));
+            }
+        }
+    }
+    lines
 }
 
 /// The rows a recognised script renders as: one line per step in plain
@@ -4323,6 +4515,7 @@ pub fn render_tool_fullscreen(
 }
 #[cfg(test)]
 mod tests {
+    use super::{Card, RowChangeKind, RowView, SubagentState, card_lines};
     use super::{
         ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
         background_summary, build_plain_wrapped_lines_unified, format_cost_usd, format_number,
@@ -4330,6 +4523,8 @@ mod tests {
         terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
+    use crate::tui::state::CompactionMeter;
+    use ratatui::style::Style;
 
     #[test]
     fn usage_shows_the_wall_clock_split() {
@@ -4619,6 +4814,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4667,6 +4863,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4715,6 +4912,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4768,6 +4966,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4798,6 +4997,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4844,6 +5044,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: location.map(str::to_string),
                 reading: None,
+                card: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -4874,6 +5075,7 @@ mod tests {
                 mode,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -4900,6 +5102,7 @@ mod tests {
             mode: TerminalExecutionMode::Default,
             location: None,
             reading: None,
+            card: None,
             status: ToolStatus::Done,
             output: None,
             diffs: Vec::new(),
@@ -4927,6 +5130,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Done,
                 output: Some(
                     super::TerminalCallInfo::new("terminal".to_string()).with_output(
@@ -4996,6 +5200,7 @@ mod tests {
                         status_ctx: Some(StatusContext {
                             model: "model",
                             usage: None,
+                            compaction: CompactionMeter::Idle,
                             context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
@@ -5465,6 +5670,7 @@ mod tests {
             mode: TerminalExecutionMode::Default,
             location: None,
             reading: Some(crate::command_reading::CommandReading::of(script)),
+            card: None,
             status: ToolStatus::Running,
             output: None,
             diffs: Vec::new(),
@@ -5530,6 +5736,134 @@ mod tests {
         assert_eq!(rows[1], "Search for \"foo\" in src");
         assert_eq!(rows[2], "| $ wc -l");
         assert_eq!(rows[3], "&& Run cargo test");
+    }
+
+    fn with_card(script: &str, card: Option<Card>) -> ToolDisplay {
+        let mut display = read_call(script);
+        if let ToolDisplay::Terminal { card: slot, .. } = &mut display {
+            *slot = card.map(Box::new);
+        }
+        display
+    }
+
+    fn row(section: &str, title: &str) -> RowView {
+        RowView {
+            section: section.to_owned(),
+            title: title.to_owned(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_tasks_call_renders_the_row_it_changed() {
+        let card = Card::Tasks {
+            changes: vec![crate::command_reading::RowChange {
+                change: RowChangeKind::Started,
+                before: Some(row("Queued", "write docs")),
+                after: Some(row("Doing", "write docs")),
+            }],
+        };
+        let rows = call_rows(&with_card("tasks start 2", Some(card)));
+        assert_eq!(rows[1], "  tasks started");
+        assert_eq!(rows[2], "  - write docs (Queued)");
+        assert_eq!(rows[3], "  + write docs (Doing)");
+    }
+
+    fn subagent(state: SubagentState, result: Option<&str>) -> Card {
+        let started_at = jiff::Timestamp::from_second(1_000).expect("time");
+        Card::Subagent {
+            agent: "explorer".to_owned(),
+            title: "Map the parser".to_owned(),
+            state,
+            started_at,
+            finished_at: matches!(state, SubagentState::Done)
+                .then(|| jiff::Timestamp::from_second(1_063).expect("time")),
+            result: result.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_finished_subagent_shows_its_summary_and_expands_to_the_result() {
+        let card = subagent(
+            SubagentState::Done,
+            Some("Found two parsers.\nThe old one is dead."),
+        );
+        let folded = call_rows(&finished(with_card(
+            "subagent explorer brief.md",
+            Some(card.clone()),
+        )));
+        assert_eq!(folded[1], "  explorer · Map the parser · done in 1m 03s");
+        assert_eq!(folded[2], "  Found two parsers.…");
+        let open: Vec<String> = rendered_text(&card_lines(&card, Style::default(), true));
+        assert_eq!(open[1], "  Found two parsers.");
+        assert_eq!(open[2], "  The old one is dead.");
+    }
+
+    #[test]
+    fn an_interrupted_subagent_shows_that_it_never_returned() {
+        let rows = rendered_text(&card_lines(
+            &subagent(SubagentState::Interrupted, None),
+            Style::default(),
+            false,
+        ));
+        assert_eq!(rows, ["  explorer · Map the parser · interrupted"]);
+    }
+
+    #[test]
+    fn a_running_subagent_shows_that_it_runs() {
+        let card = subagent(SubagentState::Running, None);
+        let rows = rendered_text(&card_lines(&card, Style::default(), false));
+        assert!(
+            rows[0].starts_with("  explorer · Map the parser · running "),
+            "{rows:?}"
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
+    fn question(answers: Option<Vec<crate::command_reading::AnswerCard>>) -> Card {
+        Card::AskUser {
+            request_id: "r1".to_owned(),
+            questions: vec![crate::command_reading::AskedCard {
+                section: "db".to_owned(),
+                question: "Which database?".to_owned(),
+                options: vec!["PostgreSQL".to_owned(), "SQLite".to_owned()],
+                multi_select: false,
+                secret: false,
+            }],
+            answers,
+        }
+    }
+
+    #[test]
+    fn an_ask_user_call_shows_the_question_and_then_the_answer() {
+        let waiting = call_rows(&with_card(
+            "ask_user \"Which database?\"",
+            Some(question(None)),
+        ));
+        assert_eq!(waiting[1], "  ? Which database?");
+        assert_eq!(waiting[2], "    · PostgreSQL");
+        assert_eq!(waiting[3], "    · SQLite");
+        assert_eq!(waiting[4], "  waiting for an answer");
+        let answered = call_rows(&with_card(
+            "ask_user \"Which database?\"",
+            Some(question(Some(vec![crate::command_reading::AnswerCard {
+                section: "db".to_owned(),
+                text: "SQLite".to_owned(),
+            }]))),
+        ));
+        assert_eq!(answered[4], "  ✓ SQLite");
+    }
+
+    #[test]
+    fn a_call_without_a_card_renders_as_the_ordinary_command_row() {
+        let rows = call_rows(&with_card("tasks start 9", None));
+        assert_eq!(rows[1], "Update tasks (start)", "{rows:?}");
+        let unknown = call_rows(&with_card("tasks frobnicate", None));
+        assert!(
+            unknown.iter().any(|row| row.contains("$ tasks frobnicate")),
+            "{unknown:?}"
+        );
+        assert!(rows.iter().all(|row| !row.contains("tasks started")));
     }
 
     fn finished(mut display: ToolDisplay) -> ToolDisplay {
@@ -6453,6 +6787,7 @@ mod tests {
                 diffs: Vec::new(),
                 pinned: None,
                 reading: None,
+                card: None,
             },
         );
     }
@@ -6555,6 +6890,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -6602,6 +6938,7 @@ mod tests {
                 mode: TerminalExecutionMode::Default,
                 location: None,
                 reading: None,
+                card: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -6868,6 +7205,7 @@ mod tests {
                         status_ctx: Some(StatusContext {
                             model: "model",
                             usage: Some((4_800, Some(120_000))),
+                            compaction: CompactionMeter::Idle,
                             context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
@@ -7134,6 +7472,7 @@ mod tests {
         let status = StatusContext {
             model: "model",
             usage: None,
+            compaction: CompactionMeter::Idle,
             context_policy: aither_agent::ContextPolicy::default(),
             queue_count: 0,
             open_questions: 0,
@@ -7170,6 +7509,56 @@ mod tests {
         assert_eq!(rows[n - 3], "");
         assert!(rows[n - 2].starts_with("~ · model"));
         assert_eq!(rows[n - 1], "");
+    }
+
+    /// The status bar's right edge for `usage` and `compaction`.
+    fn status_row(compaction: CompactionMeter) -> String {
+        use super::StatusContext;
+        let status = StatusContext {
+            model: "model",
+            usage: Some((80_800, Some(262_144))),
+            compaction,
+            context_policy: aither_agent::ContextPolicy::default(),
+            queue_count: 0,
+            open_questions: 0,
+            yolo: false,
+            shells: 0,
+            subagents: 0,
+            decode_rate: None,
+            status_message: None,
+            cwd: "~",
+            activity: None,
+            spinner_frame: 0,
+            index_coverage: None,
+            index_failed: false,
+            index_loading: false,
+        };
+        let rows = build_plain_wrapped_lines_unified(
+            &sample_chat(),
+            80,
+            None,
+            None,
+            Some(&status),
+            None,
+            false,
+        );
+        rows.iter()
+            .find(|row| row.starts_with("~ · model"))
+            .expect("status row")
+            .clone()
+    }
+
+    #[test]
+    fn the_context_meter_shows_the_compaction_in_place_of_the_usage() {
+        let now = std::time::Instant::now();
+        assert!(status_row(CompactionMeter::Idle).trim_end().ends_with("%)"));
+        assert!(
+            status_row(CompactionMeter::Compacting)
+                .trim_end()
+                .ends_with("Compacting")
+        );
+        let held = CompactionMeter::Compacted { until: now };
+        assert!(status_row(held).trim_end().ends_with("Compacted"));
     }
 
     /// Render a sample screen and write every cell as JSON lines to

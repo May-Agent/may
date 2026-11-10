@@ -1,4 +1,4 @@
-import type { ApiAttachment, ApiMessage, CommandReading } from './types';
+import type { ApiAttachment, ApiMessage, CommandCard, CommandReading } from './types';
 
 export interface TranscriptEntry {
   kind: string;
@@ -17,6 +17,8 @@ export interface TranscriptEntry {
   result?: unknown;
   /** How the daemon read a terminal call's script. */
   reading?: CommandReading | null;
+  /** The card of a call that ran one of May's commands. */
+  card?: CommandCard | null;
   interaction?: string;
 }
 
@@ -97,6 +99,7 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
           arguments: entry.arguments,
           summary: entry.reading ? { reading: entry.reading } : undefined,
           seq: seq++,
+          ...(entry.card ? { summary: { card: entry.card } } : {}),
         });
         if (entry.status !== 'running') {
           pendingTools.push({
@@ -119,4 +122,29 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
   }
   flush();
   return out;
+}
+
+/**
+ * `messages` with the card of the terminal call `callId` replaced: the
+ * summary of the call's start event carries it. Messages without the call
+ * are returned as they were.
+ */
+export function withToolCard(
+  messages: ApiMessage[],
+  callId: string,
+  card: CommandCard | null,
+): ApiMessage[] {
+  return messages.map((message) => {
+    if (!Array.isArray(message.toolEvent)) return message;
+    const events = message.toolEvent as Record<string, unknown>[];
+    if (!events.some((event) => event.stage === 'start' && event.id === callId)) return message;
+    return {
+      ...message,
+      toolEvent: events.map((event) =>
+        event.stage === 'start' && event.id === callId
+          ? { ...event, summary: { ...(event.summary as object | undefined), card } }
+          : event,
+      ),
+    };
+  });
 }

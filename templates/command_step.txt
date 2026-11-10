@@ -22,6 +22,8 @@ Run git{%- if let Some(subcommand) = subcommand %} {{ subcommand }}{%- endif -%}
 Run {{ tool.name() -}}
 {%- if let Some(subcommand) = subcommand %} {{ subcommand }}{%- endif -%}
 {%- if let Some(target) = target %} {{ target }}{%- endif -%}
+{%- when Intent::Tasks { args } -%}
+Update tasks ({{ args[0] }})
 {%- when Intent::Unknown { source } -%}
 {{ source }}
 {%- endmatch -%}

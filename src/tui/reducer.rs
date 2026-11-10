@@ -27,6 +27,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
+            app.compaction.clear_expired(std::time::Instant::now());
             app.sync_profile_follow();
             if app.new_year.check_due(std::time::Instant::now()) {
                 let zone = crate::tui::new_year::user_zone(&app.config.time);
@@ -360,6 +361,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ToolCard { call_id, card } => {
+            app.chat.set_tool_card(&call_id, card);
+            Ok(None)
+        }
         AppEvent::Warning {
             session_id,
             message,
@@ -381,6 +386,16 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 .is_some_and(|session| session.id.as_str() == session_id)
             {
                 app.context_window = Some(window);
+            }
+            Ok(None)
+        }
+        AppEvent::Compaction { session_id, phase } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.compaction.apply(phase, std::time::Instant::now());
             }
             Ok(None)
         }

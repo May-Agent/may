@@ -286,6 +286,11 @@ pub struct ChatMessage {
     /// attached when the daemon serves the history; never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reading: Option<crate::command_reading::CommandReading>,
+    /// The card of a stored `terminal` call start whose command renders as
+    /// one, attached when the daemon serves the history; never stored on the
+    /// row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<crate::command_reading::Card>,
     /// The reasoning text streamed before an assistant message, kept for
     /// display. Never part of the model's context: provider reasoning state
     /// lives in `reasoning`.
@@ -333,6 +338,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -351,6 +357,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -373,6 +380,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -391,6 +399,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -413,6 +422,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -434,6 +444,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -939,6 +950,7 @@ pub fn chat_messages_from_transcript(
             tool_calls: Vec::new(),
             translation: None,
             reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -979,6 +991,7 @@ pub fn chat_messages_from_transcript(
                 status,
                 result,
                 reading,
+                card,
             } => {
                 let start = ToolEventRecord::Start {
                     id: call_id.clone(),
@@ -990,6 +1003,7 @@ pub fn chat_messages_from_transcript(
                     tool_call_id: Some(call_id.clone()),
                     // The reading rides on the row, as the daemon served it.
                     reading: reading.clone(),
+                    card: card.clone(),
                     ..base(
                         id,
                         MessageRole::Tool,
@@ -1111,6 +1125,7 @@ mod transcript_tests {
                 status: "done".into(),
                 result: Some(result),
                 reading: Some(crate::command_reading::CommandReading::of("cat a.rs")),
+                card: None,
             },
             crate::client::WireTranscriptEntry::ToolCall {
                 id: "4".into(),
@@ -1121,6 +1136,7 @@ mod transcript_tests {
                 status: "stopped".into(),
                 result: None,
                 reading: None,
+                card: None,
             },
             crate::client::WireTranscriptEntry::ToolCall {
                 id: "5".into(),
@@ -1131,6 +1147,7 @@ mod transcript_tests {
                 status: "running".into(),
                 result: None,
                 reading: None,
+                card: None,
             },
             crate::client::WireTranscriptEntry::HiddenContext {
                 id: "6".into(),

@@ -376,7 +376,8 @@ where
 
     if let Some(runtime) = config.ask_user {
         let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone())
-            .with_task_events(config.task_events.clone());
+            .with_task_events(config.task_events.clone())
+            .with_cards(config.subagent_tracker.cards().clone());
         if let Some(guard) = &config.languages {
             ask_user = ask_user.with_languages(guard.clone());
         }
@@ -558,6 +559,7 @@ where
                 subagent_tool.for_terminal(binding),
                 subagent_tracker.clone(),
             )
+            .with_cards()
         });
         main.configure_terminal_bound_usage_tool("explore", move |binding| {
             ExploreTool::new(TrackedSubagentTool::new(

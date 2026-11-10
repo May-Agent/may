@@ -223,6 +223,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             status_ctx: Some(StatusContext {
                 model: &model_display,
                 usage: usage_info,
+                compaction: app.compaction,
                 context_policy: app.config.context.policy(),
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
@@ -3681,6 +3682,7 @@ mod tests {
             mode: aither_sandbox::TerminalExecutionMode::Default,
             location: None,
             reading: None,
+            card: None,
             status: ToolStatus::Done,
             output: Some(output),
             diffs: Vec::new(),

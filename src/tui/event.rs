@@ -175,6 +175,14 @@ pub enum AppEvent {
         /// The suggested next step, when the recap named one.
         next_action: Option<String>,
     },
+    /// A card changed after the turn that ran its command ended (a question
+    /// answered, a detached run finished).
+    ToolCard {
+        /// The call the card belongs to.
+        call_id: String,
+        /// The card; absent when the call shows as a command row.
+        card: Option<crate::command_reading::Card>,
+    },
     /// A `session_warning` frame arrived: shown to the user in the stream.
     Warning {
         /// Session the warning belongs to.
@@ -189,6 +197,14 @@ pub enum AppEvent {
         session_id: String,
         /// The window in tokens.
         window: u32,
+    },
+    /// A `session_compaction` frame arrived: the session's compaction
+    /// started or ended.
+    Compaction {
+        /// Session being compacted.
+        session_id: String,
+        /// Where the compaction stands.
+        phase: crate::client::CompactionPhase,
     },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
@@ -273,8 +289,10 @@ impl AppEvent {
             Self::UserNotification(_) => "user_notification",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
+            Self::ToolCard { .. } => "tool_card",
             Self::Warning { .. } => "warning",
             Self::ContextWindow { .. } => "context_window",
+            Self::Compaction { .. } => "compaction",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",
