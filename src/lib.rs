@@ -116,6 +116,8 @@ pub mod skill;
 pub mod sleep;
 /// Startup validation of configuration files.
 pub mod startup;
+/// The `subagent` command and the agents it runs.
+pub mod subagent;
 /// The rows of `tasks.md` as clients see them.
 pub mod task_rows;
 /// Scheduled-task trigger definitions.
