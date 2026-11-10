@@ -361,6 +361,8 @@ pub fn ability_to_label(ability: Ability) -> String {
         Ability::ComputerUse => "computer_use".to_string(),
         Ability::PromptCaching => "prompt_caching".to_string(),
         Ability::AssistantPrefill => "assistant_prefill".to_string(),
+        Ability::PerMessageEffort => "per_message_effort".to_string(),
+        Ability::MidConversationSystem => "mid_conversation_system".to_string(),
         _ => panic!("unsupported ability variant: {ability:?}"),
     }
 }
@@ -539,9 +541,23 @@ pub fn effort_ladder(
 #[cfg(test)]
 mod tests {
     use super::{
-        FamilyEffortRungs, FetchedModel, ProviderType, effort_ladder, effort_rung_rank,
-        record_family_effort_rungs, same_selectable_model,
+        Ability, FamilyEffortRungs, FetchedModel, ProviderType, ability_to_label, effort_ladder,
+        effort_rung_rank, record_family_effort_rungs, same_selectable_model,
     };
+
+    /// The abilities aither-core 0.27 added, which the catalog sets on the
+    /// Claude models, list instead of panicking.
+    #[test]
+    fn the_cache_preserving_abilities_have_labels() {
+        assert_eq!(
+            ability_to_label(Ability::PerMessageEffort),
+            "per_message_effort"
+        );
+        assert_eq!(
+            ability_to_label(Ability::MidConversationSystem),
+            "mid_conversation_system"
+        );
+    }
 
     fn fetched(provider_id: &str, id: &str) -> FetchedModel {
         FetchedModel {
