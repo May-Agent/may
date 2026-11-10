@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::mem;
 use std::panic;
 
-use aither_agent::{AgentEvent, TimedEvent};
+use aither_agent::{AgentEvent, OutputKind, TimedEvent};
 use anyhow::Context;
 use askama::Template as _;
 
@@ -1194,8 +1194,16 @@ where
                         // Capture text for title generation
                         if let Ok(TimedEvent {
                             at,
-                            event: AgentEvent::Text(ref text),
+                            event:
+                                AgentEvent::BlockDelta {
+                                    kind: OutputKind::Text,
+                                    ref text,
+                                    ..
+                                },
+                            ref agent,
+                            ..
                         }) = result
+                            && agent.is_main()
                         {
                             assistant_response.push(text, at);
                         }
@@ -1262,6 +1270,9 @@ where
                     TuiEvent::Retract => {
                         app.retract_response();
                         assistant_response.clear();
+                    }
+                    TuiEvent::ReplyTranslated { text, language } => {
+                        app.chat.set_translation(text, &language);
                     }
                     TuiEvent::Withdrawn { content, own } => {
                         assistant_response.clear();

@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aither_agent::{AgentEvent, TimedEvent};
+use aither_agent::{AgentEvent, OutputKind, RequestOutcome, TimedEvent, ToolOrigin};
 use aither_core::LanguageModel as _;
 use aither_core::llm::Usage;
 
@@ -99,6 +99,12 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) terminal_snapshot: TerminalStateSnapshot,
     pub(super) saw_tool_activity: bool,
     pub(super) tool_arguments_by_id: HashMap<String, String>,
+    /// The tool of each local call in flight, which its end event does not
+    /// name.
+    pub(super) tool_names: HashMap<String, String>,
+    /// The calls the provider runs itself: nothing is stored or shown for
+    /// them, and their end arms the next reasoning phase.
+    pub(super) hosted_calls: std::collections::HashSet<String>,
     pub(super) tool_started_at: HashMap<String, jiff::Timestamp>,
     pub(super) pending_tool_streams: HashMap<String, PendingToolStream>,
     pub(super) last_todo_hash: Option<u64>,
@@ -268,7 +274,14 @@ pub(super) async fn step<'a, 't, 's, S: ChatSink>(
 impl<S: ChatSink> TurnEvents<'_, '_, S> {
     /// Handles one event of the run.
     pub(super) async fn handle(&mut self, timed: TimedEvent) -> ControlFlow<TurnStop> {
-        let TimedEvent { at, event } = timed;
+        // A subagent's events ride its parent's stream; the subagent tracker
+        // shows them, so the turn neither stores nor streams them.
+        if !timed.agent.is_main() {
+            return ControlFlow::Continue(());
+        }
+        self.sink.on_agent_event(&timed, self.context_window);
+        let at = timed.at;
+        let event = timed.event;
         self.last_event_at = Some(at);
         // The first visible output of a call closes the pending reasoning
         // phase; its marker goes out before the event.
@@ -283,7 +296,6 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 "client disconnected during reasoning end",
             ));
         }
-        self.sink.on_agent_event(Ok(&event), self.context_window);
         match self.event(at, event).await {
             Ok(ControlFlow::Continue(())) => {}
             Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),
@@ -415,7 +427,11 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
     ) -> Result<ControlFlow<TurnStop>, ChatDbError> {
         const TOOL_STREAM: &str = "client disconnected during tool stream";
         match event {
-            AgentEvent::Reasoning(text) => {
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Reasoning,
+                text,
+                ..
+            } => {
                 self.log_first_agent_event("reasoning");
                 self.reasoning_text.push_str(&text);
                 self.turn_persister.push_reasoning(&text);
@@ -429,7 +445,11 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     .emit_speed("client disconnected during reasoning stream")
                     .await)
             }
-            AgentEvent::Text(text) => {
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Text,
+                text,
+                ..
+            } => {
                 self.log_first_agent_event("text");
                 log_first_text_event(
                     &mut self.first_text_seen,
@@ -450,49 +470,53 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     .emit_speed("client disconnected during text stream")
                     .await)
             }
-            // The reply just streamed drifted from the communication
-            // language: clients show this copy, the stored message keeps it
-            // beside the original.
-            AgentEvent::ReplyTranslated { text, language } => {
-                if !self.sink.on_reply_translated(&text, &language).await {
-                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
-                        "client disconnected during reply translation",
-                    )));
-                }
-                self.segment_translation = Some(MessageTranslation { text, language });
-                Ok(ControlFlow::Continue(()))
-            }
-            AgentEvent::PromptPrefix(prefix) => {
+            AgentEvent::RequestStarted { prefix, .. } => {
                 self.request_prefix = Some(prefix);
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::Usage(usage) => {
-                self.decode_meter.note_usage(usage.completion_tokens);
-                record_request_log(self.state, self.ledger.completed(&usage, Instant::now())).await;
-                if let Some(prefix) = self.request_prefix.take() {
-                    record_prompt_cache(
-                        self.state,
-                        crate::db::PromptCacheRequest {
-                            session_id: self.session_id.as_str(),
-                            provider_id: self.provider_id,
-                            model: self.model,
-                            at: jiff::Timestamp::now(),
-                            usage: &usage,
-                            prefix,
-                            lifetime: provider_cache_lifetime(self.state, self.provider_id),
-                            published_block: provider_cache_block(self.state, self.provider_id),
-                        },
-                    )
-                    .await;
+            AgentEvent::RequestEnded { usage, outcome, .. } => {
+                if let Some(usage) = usage {
+                    self.request_usage(usage).await;
                 }
-                self.usage = usage;
+                // The response stream broke after it opened and the same
+                // request is sent again: what streamed since it was sent is
+                // the broken attempt's, which neither the conversation nor
+                // the stored turn keeps. Clients drop what they rendered of
+                // it and show the wait.
+                if let RequestOutcome::Retrying {
+                    error,
+                    retry,
+                    delay,
+                    ..
+                } = outcome
+                {
+                    self.discard_attempt();
+                    let until = jiff::Timestamp::now()
+                        .checked_add(delay)
+                        .expect("a retry delay is far below the timestamp range");
+                    if !self.sink.on_retract().await
+                        || !self
+                            .sink
+                            .on_hold(
+                                crate::client::HoldReason::Retry { until, retry },
+                                &error.to_string(),
+                            )
+                            .await
+                    {
+                        return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                            "client disconnected during a response retry",
+                        )));
+                    }
+                }
                 Ok(ControlFlow::Continue(()))
             }
             AgentEvent::ToolCallDelta {
-                id,
+                call,
                 name,
                 arguments_fragment,
+                ..
             } => {
+                let id = call.as_str().to_owned();
                 self.log_first_agent_event("tool_delta");
                 tracing::trace!(
                     target: "may::chat::tool_delta",
@@ -552,11 +576,23 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM))
                 })
             }
-            AgentEvent::ToolCallStart {
-                id,
+            AgentEvent::ToolCallStarted {
+                origin: ToolOrigin::Hosted,
+                call,
+                ..
+            } => {
+                self.hosted_calls.insert(call.as_str().to_owned());
+                self.decode_meter.note_boundary();
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::ToolCallStarted {
+                call,
                 name,
                 arguments,
+                ..
             } => {
+                let id = call.as_str().to_owned();
+                let arguments = arguments.to_string();
                 self.log_first_agent_event("tool_start");
                 self.saw_tool_activity = true;
                 // Args that never streamed as deltas still count as decoded
@@ -617,6 +653,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 update_terminal_snapshot_from_tool_event(&mut self.terminal_snapshot, &record);
                 self.tool_arguments_by_id
                     .insert(id.clone(), arguments.clone());
+                self.tool_names.insert(id.clone(), name.clone());
                 self.tool_started_at.insert(id.clone(), at);
                 if name == "terminal" {
                     self.note_tasks_edit(&id, &arguments).await;
@@ -633,7 +670,15 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 }
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::ToolCallEnd { id, name, result } => {
+            // The provider reported the hosted call done; the next model
+            // call may reason again.
+            AgentEvent::ToolCallEnded { call, .. } if self.hosted_calls.remove(call.as_str()) => {
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::ToolCallEnded { call, result, .. } => {
+                let id = call.as_str().to_owned();
+                let name = self.tool_names.remove(&id).unwrap_or_default();
                 self.log_first_agent_event("tool_end");
                 self.saw_tool_activity = true;
                 let record = ToolEventRecord::End {
@@ -687,78 +732,45 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.reasoning_phase = self.reasoning_display.then(Instant::now);
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::BackgroundTaskStarted {
-                task_id,
-                output_preview,
-                output_file,
-            } => {
-                self.saw_tool_activity = true;
-                set_terminal_runtime_state(
-                    self.state,
-                    self.session_id.as_str(),
-                    TerminalRuntimeState {
-                        task_id: Some(task_id),
-                        output_file: Some(output_file),
-                        output_preview: Some(output_preview),
-                        input_notice: None,
-                    },
-                )
-                .await?;
-                Ok(ControlFlow::Continue(()))
-            }
-            // Delivered tool output / a resumed run arms the next call's
-            // reasoning phase.
-            AgentEvent::BuiltInToolResult { .. } | AgentEvent::RunResumed { .. } => {
+            // A resumed run arms the next call's reasoning phase.
+            AgentEvent::RunStarted { .. } => {
                 self.reasoning_phase = self.reasoning_display.then(Instant::now);
                 Ok(ControlFlow::Continue(()))
             }
             // A reply without tool calls that the run follows with another
             // reply is stored as a message of its own.
-            AgentEvent::TurnComplete { has_tool_calls, .. } => {
-                if !has_tool_calls {
+            AgentEvent::TurnEnded { tool_calls, .. } => {
+                if tool_calls == 0 {
                     self.flush_segment();
                 }
                 self.reasoning_floor = self.reasoning_text.len();
                 Ok(ControlFlow::Continue(()))
             }
-            // The response stream broke after it opened and the same request
-            // is sent again: what streamed since it was sent is the broken
-            // attempt's, which neither the conversation nor the stored turn
-            // keeps. Clients drop what they rendered of it and show the wait.
-            AgentEvent::ResponseRetry {
-                error,
-                retry,
-                delay,
-                ..
-            } => {
-                self.discard_attempt();
-                let until = jiff::Timestamp::now()
-                    .checked_add(delay)
-                    .expect("a retry delay is far below the timestamp range");
-                if !self.sink.on_retract().await
-                    || !self
-                        .sink
-                        .on_hold(
-                            crate::client::HoldReason::Retry { until, retry },
-                            &error.to_string(),
-                        )
-                        .await
-                {
-                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
-                        "client disconnected during a response retry",
-                    )));
-                }
-                Ok(ControlFlow::Continue(()))
-            }
-            AgentEvent::BackgroundTaskCompleted { .. } => {
-                self.saw_tool_activity = true;
-                self.reasoning_phase = self.reasoning_display.then(Instant::now);
-                clear_terminal_runtime_state(self.state, self.session_id.as_str()).await?;
-                mark_run_running(self.state, self.guard.fence()).await?;
-                Ok(ControlFlow::Continue(()))
-            }
-            AgentEvent::Error(error) => Ok(ControlFlow::Break(TurnStop::Failed(error))),
             _ => Ok(ControlFlow::Continue(())),
         }
+    }
+
+    /// Measures a finished request: its usage meters the decode, is logged
+    /// and is the context the window holds now.
+    async fn request_usage(&mut self, usage: Usage) {
+        self.decode_meter.note_usage(usage.completion_tokens);
+        record_request_log(self.state, self.ledger.completed(&usage, Instant::now())).await;
+        if let Some(prefix) = self.request_prefix.take() {
+            record_prompt_cache(
+                self.state,
+                crate::db::PromptCacheRequest {
+                    session_id: self.session_id.as_str(),
+                    provider_id: self.provider_id,
+                    model: self.model,
+                    at: jiff::Timestamp::now(),
+                    usage: &usage,
+                    prefix,
+                    lifetime: provider_cache_lifetime(self.state, self.provider_id),
+                    published_block: provider_cache_block(self.state, self.provider_id),
+                },
+            )
+            .await;
+        }
+        self.usage = usage;
     }
 }

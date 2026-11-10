@@ -61,6 +61,7 @@ pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 
 /// Agent event from aither-agent.
 pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
+use aither_agent::{OutputKind, RunOutcome, ToolOrigin};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, AuthReturn, ChatgptAuthStatus, ConfigEditMode,
@@ -383,6 +384,9 @@ pub struct App {
     /// cumulative JSON `ToolCallDelta` fragments assembled so far, so the
     /// call's element can render before the canonical `ToolCallStart`.
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
+    /// The tool of each call the provider runs itself and has not finished,
+    /// keyed by call id: its end event does not name it.
+    pub hosted_tool_calls: std::collections::HashMap<String, String>,
     /// Last time file-diff previews were requested for running calls.
     pub diff_preview_at: Option<std::time::Instant>,
     /// Loaded secret values for bash-mode masking and env injection.
@@ -758,6 +762,7 @@ impl App {
             run_guard: None,
             live_reads: std::collections::HashMap::new(),
             pending_tool_calls: std::collections::HashMap::new(),
+            hosted_tool_calls: std::collections::HashMap::new(),
             diff_preview_at: None,
             secrets,
             open_question_count: 0,
@@ -1964,6 +1969,7 @@ impl App {
         self.live_output_read_at = None;
         self.live_reads.clear();
         self.pending_tool_calls.clear();
+        self.hosted_tool_calls.clear();
         self.diff_preview_at = None;
 
         // Load chat history into display
@@ -4420,9 +4426,16 @@ impl App {
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
+            // A subagent's events ride its parent's stream; its own views
+            // show them.
+            Ok(TimedEvent { agent, .. }) if !agent.is_main() => false,
             Ok(TimedEvent { event, .. }) => {
                 match event {
-                    AgentEvent::Text(chunk) => {
+                    AgentEvent::BlockDelta {
+                        kind: OutputKind::Text,
+                        text: chunk,
+                        ..
+                    } => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.chat.collapse_thinking();
                         self.thinking_start = None;
@@ -4430,10 +4443,11 @@ impl App {
                         self.chat.push_text(&chunk);
                         self.input_visible = true;
                     }
-                    AgentEvent::ReplyTranslated { text, language } => {
-                        self.chat.set_translation(text, &language);
-                    }
-                    AgentEvent::Reasoning(chunk) => {
+                    AgentEvent::BlockDelta {
+                        kind: OutputKind::Reasoning,
+                        text: chunk,
+                        ..
+                    } => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
                         self.decode_meter.note_output(chunk.len());
                         if self.thinking_start.is_none() {
@@ -4446,10 +4460,12 @@ impl App {
                         }
                     }
                     AgentEvent::ToolCallDelta {
-                        id,
+                        call,
                         name,
                         arguments_fragment,
+                        ..
                     } => {
+                        let id = call.as_str().to_owned();
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.decode_meter.note_output(arguments_fragment.len());
                         let kind = {
@@ -4476,11 +4492,35 @@ impl App {
                             self.chat.upsert_tool_display(id, display);
                         }
                     }
-                    AgentEvent::ToolCallStart {
-                        id,
+                    AgentEvent::ToolCallStarted {
+                        call,
                         name,
                         arguments,
+                        origin: ToolOrigin::Hosted,
+                        ..
                     } => {
+                        // Provider-hosted call (server-side web search etc.):
+                        // visible like a tool call, executed by the provider.
+                        let detail = arguments
+                            .as_str()
+                            .map_or_else(|| arguments.to_string(), str::to_owned);
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
+                        self.chat.collapse_thinking();
+                        self.chat.end_text();
+                        self.thinking_start = None;
+                        self.decode_meter.note_boundary();
+                        let id = call.as_str().to_owned();
+                        self.hosted_tool_calls.insert(id.clone(), name.clone());
+                        self.chat.push_builtin(id, name, detail);
+                    }
+                    AgentEvent::ToolCallStarted {
+                        call,
+                        name,
+                        arguments,
+                        ..
+                    } => {
+                        let id = call.as_str().to_owned();
+                        let arguments = arguments.to_string();
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.chat.collapse_thinking();
                         self.chat.end_text();
@@ -4499,46 +4539,44 @@ impl App {
                         }
                         self.show_tool_start(id, parse_tool_start(&name, &arguments));
                     }
-                    AgentEvent::ToolCallEnd { id, result, .. } => {
-                        // Back to waiting on the model for the next burst.
-                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
-                        self.show_tool_end(&id, &result);
-                        self.live_reads.remove(&id);
-                        self.pending_tool_calls.remove(&id);
-                        self.request_file_diff(&id);
-                        self.refresh_todos().await;
-                    }
-                    AgentEvent::BuiltInToolCall { id, tool, detail } => {
-                        // Provider-hosted call (server-side web search etc.):
-                        // visible like a tool call, executed by the provider.
-                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
-                        self.chat.collapse_thinking();
-                        self.chat.end_text();
-                        self.thinking_start = None;
-                        self.decode_meter.note_boundary();
-                        self.chat.push_builtin(id, tool, detail);
-                    }
-                    AgentEvent::BuiltInToolResult { id, tool, result } => {
-                        // The provider reports the call done; the model call
-                        // that follows is thinking again.
-                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
-                        self.decode_meter.note_boundary();
-                        self.chat.finish_builtin(&id, &tool, result);
+                    AgentEvent::ToolCallEnded { call, result, .. } => {
+                        let id = call.as_str().to_owned();
+                        if let Some(tool) = self.hosted_tool_calls.remove(&id) {
+                            // The provider reports the call done; the model
+                            // call that follows is thinking again.
+                            self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
+                            self.decode_meter.note_boundary();
+                            self.chat
+                                .finish_builtin(&id, &tool, result.render_for_model());
+                        } else {
+                            // Back to waiting on the model for the next burst.
+                            self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
+                            self.show_tool_end(&id, &result);
+                            self.live_reads.remove(&id);
+                            self.pending_tool_calls.remove(&id);
+                            self.request_file_diff(&id);
+                            self.refresh_todos().await;
+                        }
                     }
                     // A reply that ends without tool calls may be followed
                     // by another in the same run (the harness re-prompting,
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
-                    AgentEvent::TurnComplete { has_tool_calls, .. } => {
-                        if !has_tool_calls {
+                    AgentEvent::TurnEnded { tool_calls, .. } => {
+                        if tool_calls == 0 {
                             self.chat.end_text();
                             self.decode_meter.note_boundary();
                         }
                         self.chat.seal_response();
                     }
-                    AgentEvent::Complete { .. } => {
-                        // Text was already streamed via AgentEvent::Text events
-                        // Just finalize the message
+                    // A failed run reports as the error it carries.
+                    AgentEvent::RunEnded {
+                        outcome: RunOutcome::Failed { .. },
+                        ..
+                    } => {}
+                    AgentEvent::RunEnded { .. } => {
+                        // Text was already streamed as block deltas; just
+                        // finalize the message.
                         self.chat.collapse_thinking();
                         self.chat.finish_running_calls();
                         self.chat.end_text();
@@ -4551,14 +4589,17 @@ impl App {
                         // Signal that processing is complete
                         return true;
                     }
-                    AgentEvent::Usage(u) => {
-                        self.decode_meter.note_usage(u.completion_tokens);
-                        self.usage = Some(u);
+                    AgentEvent::RequestEnded {
+                        usage: Some(usage), ..
+                    } => {
+                        self.decode_meter.note_usage(usage.completion_tokens);
+                        self.usage = Some(usage);
                     }
                     AgentEvent::CompactionRecovery {
                         error,
                         alerts_removed,
                         outputs_spilled,
+                        ..
                     } => {
                         self.chat
                             .push_compaction_recovery(&error, alerts_removed, outputs_spilled);
@@ -4946,8 +4987,7 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 mod tests {
     use super::utf8_complete_len;
     use super::{
-        AgentEvent, App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction,
-        TimedEvent,
+        App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction, TimedEvent,
     };
     use crate::session::SessionManager;
     use crate::tui::ui::chat::ChatElement;
@@ -5851,13 +5891,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let (mut app, _id) = app_with_session(dir.path()).await;
         let usage = |prompt_tokens| {
-            Ok(TimedEvent {
-                at: "2026-11-07T00:00:00Z".parse().expect("time"),
-                event: AgentEvent::Usage(aither_core::llm::Usage {
-                    prompt_tokens: Some(prompt_tokens),
-                    ..aither_core::llm::Usage::default()
-                }),
-            })
+            let usage = aither_core::llm::Usage {
+                prompt_tokens: Some(prompt_tokens),
+                ..aither_core::llm::Usage::default()
+            };
+            Ok(serde_json::from_value::<TimedEvent>(serde_json::json!({
+                "at": "2026-11-07T00:00:00Z",
+                "agent": [],
+                "event": {"RequestEnded": {
+                    "request": 1,
+                    "usage": serde_json::to_value(usage).expect("usage"),
+                    "outcome": "Completed",
+                }},
+            }))
+            .expect("a timed event"))
         };
         app.handle_agent_event(usage(40_000)).await;
         app.handle_agent_event(usage(45_000)).await;

@@ -69,7 +69,7 @@ pub enum ExecError {
     #[error("failed to connect to the daemon's jobserver pool: {0}")]
     ConnectJobserver(aither_sandbox::JobserverError),
     #[error("failed to initialize baseline tools: {0}")]
-    InitializeBaselineTools(#[from] aither_sandbox::ToolRuntimeError),
+    InitializeBaselineTools(#[from] may_agent::tools::ToolRuntimeError),
     #[error("failed to initialize tool dispatch runtime: {0}")]
     InitializeToolDispatch(may_agent::tool_dispatch::ToolDispatchError),
     #[error("failed to configure ssh servers: {0}")]
@@ -298,7 +298,7 @@ async fn build_exec_shell(
     may_config: &MayConfig,
     model: &may_agent::ModelSelector,
     ssh_server_id: Option<&str>,
-    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    tool_distribution: Arc<may_agent::tools::ToolDistribution>,
 ) -> Result<Arc<SessionShell>, ExecError> {
     // Only the targeted server is registered, so a local exec never depends
     // on the state of the profile's other attached servers.

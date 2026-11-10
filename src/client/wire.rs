@@ -1,401 +1,12 @@
 //! Agent events as the daemon streams them to the TUI.
 //!
-//! The TUI renders the agent's own event stream; [`WireAgentEvent`] carries
-//! the events it renders across the socket and turns back into
-//! [`aither_agent::AgentEvent`] on the client, so the TUI's rendering code
-//! is the same whether the agent runs in-process or in the daemon.
+//! The wire carries aither's own serde-enabled [`TimedEvent`], so the TUI's
+//! rendering code is the same whether the agent runs in-process or in the
+//! daemon. What May adds beside aither's events are the other
+//! [`SessionAgentBody`] variants.
 
-use aither_agent::{AgentError, AgentEvent, TimedEvent};
-use aither_core::llm::{Failure, FailureKind, ToolResult, Usage};
+use aither_agent::{AgentEvent, TimedEvent};
 use serde::{Deserialize, Serialize};
-
-/// An agent failure, as it crosses the socket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WireAgentError {
-    /// The model provider failed.
-    Llm {
-        /// Provider error.
-        message: String,
-        /// How the failure classifies.
-        failure: WireFailure,
-    },
-    /// A tool failed.
-    ToolExecution {
-        /// Tool name.
-        name: String,
-        /// Failure.
-        error: String,
-    },
-    /// The iteration limit was reached.
-    MaxIterations {
-        /// The limit.
-        limit: usize,
-    },
-    /// A tool the model called does not exist.
-    ToolNotFound {
-        /// Tool name.
-        name: String,
-    },
-    /// Anything else, as its message.
-    Other {
-        /// Display text of the error.
-        message: String,
-    },
-}
-
-/// A provider [`Failure`], as it crosses the socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WireFailure {
-    /// What kind of failure it is.
-    pub kind: WireFailureKind,
-    /// The delay the upstream asked for, in milliseconds.
-    #[serde(default)]
-    pub retry_after_ms: Option<u64>,
-}
-
-/// [`FailureKind`], as it crosses the socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WireFailureKind {
-    /// No response came back from the network.
-    Network,
-    /// The upstream answered with a temporary fault.
-    Transient,
-    /// A quota or usage limit is exhausted.
-    Quota,
-    /// Anything a retry cannot fix.
-    Permanent,
-}
-
-impl From<Failure> for WireFailure {
-    fn from(failure: Failure) -> Self {
-        Self {
-            kind: match failure.kind {
-                FailureKind::Network => WireFailureKind::Network,
-                FailureKind::Transient => WireFailureKind::Transient,
-                FailureKind::Quota => WireFailureKind::Quota,
-                FailureKind::Permanent => WireFailureKind::Permanent,
-            },
-            retry_after_ms: failure
-                .retry_after
-                .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
-        }
-    }
-}
-
-impl From<WireFailure> for Failure {
-    fn from(failure: WireFailure) -> Self {
-        Self::new(match failure.kind {
-            WireFailureKind::Network => FailureKind::Network,
-            WireFailureKind::Transient => FailureKind::Transient,
-            WireFailureKind::Quota => FailureKind::Quota,
-            WireFailureKind::Permanent => FailureKind::Permanent,
-        })
-        .with_retry_after(failure.retry_after_ms.map(std::time::Duration::from_millis))
-    }
-}
-
-impl From<&AgentError> for WireAgentError {
-    fn from(error: &AgentError) -> Self {
-        match error {
-            AgentError::Llm { message, failure } => Self::Llm {
-                message: message.clone(),
-                failure: (*failure).into(),
-            },
-            AgentError::ToolExecution { name, error } => Self::ToolExecution {
-                name: name.clone(),
-                error: error.clone(),
-            },
-            AgentError::MaxIterations { limit } => Self::MaxIterations { limit: *limit },
-            AgentError::ToolNotFound { name } => Self::ToolNotFound { name: name.clone() },
-            other => Self::Other {
-                message: other.to_string(),
-            },
-        }
-    }
-}
-
-impl From<WireAgentError> for AgentError {
-    fn from(error: WireAgentError) -> Self {
-        match error {
-            WireAgentError::Llm { message, failure } => Self::Llm {
-                message,
-                failure: failure.into(),
-            },
-            WireAgentError::ToolExecution { name, error } => Self::ToolExecution { name, error },
-            WireAgentError::MaxIterations { limit } => Self::MaxIterations { limit },
-            WireAgentError::ToolNotFound { name } => Self::ToolNotFound { name },
-            WireAgentError::Other { message } => Self::Config(message),
-        }
-    }
-}
-
-/// The agent events a UI renders.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WireAgentEvent {
-    /// Assistant text chunk.
-    Text {
-        /// The chunk.
-        text: String,
-    },
-    /// The reply just streamed was not in the communication language: show
-    /// this translation of it, marked as translated, and keep the original
-    /// reachable.
-    ReplyTranslated {
-        /// The reply translated into the communication language.
-        text: String,
-        /// The communication language's ISO 639-3 code.
-        language: String,
-    },
-    /// Reasoning chunk.
-    Reasoning {
-        /// The chunk.
-        text: String,
-    },
-    /// Tool-call arguments streaming in.
-    ToolCallDelta {
-        /// Call id.
-        id: String,
-        /// Tool name.
-        name: String,
-        /// Arguments fragment.
-        arguments_fragment: String,
-    },
-    /// A tool call starts.
-    ToolCallStart {
-        /// Call id.
-        id: String,
-        /// Tool name.
-        name: String,
-        /// JSON arguments.
-        arguments: String,
-    },
-    /// A tool call finished.
-    ToolCallEnd {
-        /// Call id.
-        id: String,
-        /// Tool name.
-        name: String,
-        /// Its result.
-        result: ToolResult,
-    },
-    /// A provider-hosted tool call started.
-    BuiltInToolCall {
-        /// Call id.
-        id: String,
-        /// Hosted tool name.
-        tool: String,
-        /// Query, URL or code.
-        detail: String,
-    },
-    /// A provider-hosted tool call finished.
-    BuiltInToolResult {
-        /// Call id.
-        id: String,
-        /// Hosted tool name.
-        tool: String,
-        /// Result summary.
-        result: String,
-    },
-    /// Token usage of a request.
-    Usage {
-        /// The usage.
-        usage: Usage,
-        /// The model's context window as the daemon resolved it; clients
-        /// show usage against it and look nothing up themselves.
-        #[serde(default)]
-        context_window: Option<u32>,
-    },
-    /// A model response ended; `has_tool_calls` is false when the next
-    /// text, if any, is a separate reply rather than a continuation.
-    TurnComplete {
-        /// The turn number.
-        turn: usize,
-        /// Whether the response called tools.
-        has_tool_calls: bool,
-    },
-    /// The agent finished the run.
-    Complete {
-        /// Full assistant text.
-        final_text: String,
-        /// Turns taken.
-        turns: usize,
-    },
-    /// A compaction failed at the pause point, so the context was cleaned and
-    /// the compaction reruns on it.
-    CompactionRecovery {
-        /// Why the compaction failed.
-        error: WireAgentError,
-        /// System alerts and reminders the cleanup removed.
-        alerts_removed: usize,
-        /// Long tool outputs the cleanup moved to files.
-        outputs_spilled: usize,
-    },
-    /// The agent failed.
-    Error {
-        /// The failure.
-        error: WireAgentError,
-    },
-}
-
-impl WireAgentEvent {
-    /// The context window a usage event carries.
-    #[must_use]
-    pub const fn context_window(&self) -> Option<u32> {
-        match self {
-            Self::Usage { context_window, .. } => *context_window,
-            _ => None,
-        }
-    }
-
-    /// The wire form of `event`, or `None` for events no UI renders; a usage
-    /// event carries the model's `context_window`.
-    #[must_use]
-    pub fn from_agent(
-        event: Result<&AgentEvent, &AgentError>,
-        context_window: Option<u32>,
-    ) -> Option<Self> {
-        let event = match event {
-            Ok(event) => event,
-            Err(error) => {
-                return Some(Self::Error {
-                    error: error.into(),
-                });
-            }
-        };
-        Some(match event {
-            AgentEvent::Text(text) => Self::Text { text: text.clone() },
-            AgentEvent::ReplyTranslated { text, language } => Self::ReplyTranslated {
-                text: text.clone(),
-                language: language.clone(),
-            },
-            AgentEvent::Reasoning(text) => Self::Reasoning { text: text.clone() },
-            AgentEvent::ToolCallDelta {
-                id,
-                name,
-                arguments_fragment,
-            } => Self::ToolCallDelta {
-                id: id.clone(),
-                name: name.clone(),
-                arguments_fragment: arguments_fragment.clone(),
-            },
-            AgentEvent::ToolCallStart {
-                id,
-                name,
-                arguments,
-            } => Self::ToolCallStart {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-            AgentEvent::ToolCallEnd { id, name, result } => Self::ToolCallEnd {
-                id: id.clone(),
-                name: name.clone(),
-                result: result.clone(),
-            },
-            AgentEvent::BuiltInToolCall { id, tool, detail } => Self::BuiltInToolCall {
-                id: id.clone(),
-                tool: tool.clone(),
-                detail: detail.clone(),
-            },
-            AgentEvent::BuiltInToolResult { id, tool, result } => Self::BuiltInToolResult {
-                id: id.clone(),
-                tool: tool.clone(),
-                result: result.clone(),
-            },
-            AgentEvent::Usage(usage) => Self::Usage {
-                usage: usage.clone(),
-                context_window,
-            },
-            AgentEvent::TurnComplete {
-                turn,
-                has_tool_calls,
-            } => Self::TurnComplete {
-                turn: *turn,
-                has_tool_calls: *has_tool_calls,
-            },
-            AgentEvent::Complete { final_text, turns } => Self::Complete {
-                final_text: final_text.clone(),
-                turns: *turns,
-            },
-            AgentEvent::CompactionRecovery {
-                error,
-                alerts_removed,
-                outputs_spilled,
-            } => Self::CompactionRecovery {
-                error: error.into(),
-                alerts_removed: *alerts_removed,
-                outputs_spilled: *outputs_spilled,
-            },
-            AgentEvent::Error(error) => Self::Error {
-                error: error.into(),
-            },
-            _ => return None,
-        })
-    }
-
-    /// The agent event this wire event stands for, stamped `at`.
-    ///
-    /// # Errors
-    /// An `error` event becomes the agent error it reports.
-    pub fn into_timed(self, at: jiff::Timestamp) -> Result<TimedEvent, AgentError> {
-        let event = match self {
-            Self::Text { text } => AgentEvent::Text(text),
-            Self::ReplyTranslated { text, language } => {
-                AgentEvent::ReplyTranslated { text, language }
-            }
-            Self::Reasoning { text } => AgentEvent::Reasoning(text),
-            Self::ToolCallDelta {
-                id,
-                name,
-                arguments_fragment,
-            } => AgentEvent::ToolCallDelta {
-                id,
-                name,
-                arguments_fragment,
-            },
-            Self::ToolCallStart {
-                id,
-                name,
-                arguments,
-            } => AgentEvent::ToolCallStart {
-                id,
-                name,
-                arguments,
-            },
-            Self::ToolCallEnd { id, name, result } => AgentEvent::ToolCallEnd { id, name, result },
-            Self::BuiltInToolCall { id, tool, detail } => {
-                AgentEvent::BuiltInToolCall { id, tool, detail }
-            }
-            Self::BuiltInToolResult { id, tool, result } => {
-                AgentEvent::BuiltInToolResult { id, tool, result }
-            }
-            Self::Usage { usage, .. } => AgentEvent::Usage(usage),
-            Self::TurnComplete {
-                turn,
-                has_tool_calls,
-            } => AgentEvent::TurnComplete {
-                turn,
-                has_tool_calls,
-            },
-            Self::Complete { final_text, turns } => AgentEvent::Complete { final_text, turns },
-            Self::CompactionRecovery {
-                error,
-                alerts_removed,
-                outputs_spilled,
-            } => AgentEvent::CompactionRecovery {
-                error: error.into(),
-                alerts_removed,
-                outputs_spilled,
-            },
-            Self::Error { error } => return Err(error.into()),
-        };
-        Ok(TimedEvent { at, event })
-    }
-}
 
 /// How far a compaction of a session has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,7 +70,7 @@ pub enum RunEnd {
 }
 
 /// One frame of the `session_agent` event kind.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAgentFrame {
     /// Session the run belongs to.
@@ -544,7 +155,7 @@ pub enum HoldReason {
 }
 
 /// What a `session_agent` frame reports.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionAgentBody {
     /// A run started.
@@ -558,8 +169,24 @@ pub enum SessionAgentBody {
     },
     /// An agent event of the run.
     Agent {
-        /// The event.
-        event: WireAgentEvent,
+        /// The event, as aither emitted it.
+        event: TimedEvent,
+    },
+    /// The model's context window as the daemon resolved it, sent with the
+    /// usage of each request; clients show usage against it and look
+    /// nothing up themselves.
+    ContextWindow {
+        /// The window, in tokens.
+        tokens: u32,
+    },
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it, marked as translated, and keep the original
+    /// reachable.
+    ReplyTranslated {
+        /// The reply translated into the communication language.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
     },
     /// A reasoning phase of the run closed; `seconds` is how long the model
     /// spent on it, whether or not the provider returned readable text.
@@ -1158,25 +785,40 @@ impl WirePrCheck {
 
 #[cfg(test)]
 mod tests {
-    use aither_agent::{AgentError, AgentEvent};
-    use aither_core::llm::ToolResult;
+    use aither_agent::{AgentError, AgentEvent, AgentPath, RunOutcome, TimedEvent};
+    use aither_core::llm::{ToolCallId, ToolResult};
 
-    use super::WireAgentEvent;
+    use super::SessionAgentBody;
+
+    fn round_trip(body: &SessionAgentBody) -> SessionAgentBody {
+        let json = serde_json::to_string(body).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
 
     #[test]
     fn tool_results_survive_the_round_trip() {
-        let event = AgentEvent::ToolCallEnd {
-            id: "t1".to_string(),
-            name: "terminal".to_string(),
-            result: ToolResult::text("done"),
+        let body = SessionAgentBody::Agent {
+            event: TimedEvent::now(
+                AgentPath::main(),
+                AgentEvent::tool_call_ended(ToolCallId::new("t1"), ToolResult::text("done")),
+            ),
         };
-        let wire = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
-        let json = serde_json::to_string(&wire).expect("serialize");
-        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
-        let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
+        let SessionAgentBody::Agent { event } = round_trip(&body) else {
+            panic!("an agent frame comes back as one");
+        };
+        assert!(event.agent.is_main());
         assert!(matches!(
-            timed.event,
-            AgentEvent::ToolCallEnd { ref id, ref result, .. } if id == "t1" && *result == ToolResult::text("done")
+            event.event,
+            AgentEvent::ToolCallEnded { ref call, ref result, .. }
+                if call.as_str() == "t1" && *result == ToolResult::text("done")
+        ));
+    }
+
+    #[test]
+    fn a_context_window_frame_survives_the_round_trip() {
+        assert!(matches!(
+            round_trip(&SessionAgentBody::ContextWindow { tokens: 262_144 }),
+            SessionAgentBody::ContextWindow { tokens: 262_144 }
         ));
     }
 
@@ -1225,74 +867,86 @@ mod tests {
 
     #[test]
     fn a_reply_translation_survives_the_round_trip() {
-        let event = AgentEvent::ReplyTranslated {
+        let body = SessionAgentBody::ReplyTranslated {
             text: "全部完成。".to_string(),
             language: "cmn".to_string(),
         };
-        let wire = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
-        let json = serde_json::to_string(&wire).expect("serialize");
-        assert!(json.contains("\"type\":\"reply_translated\""), "{json}");
-        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
-        let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(json.contains("\"reply_translated\""), "{json}");
         assert!(matches!(
-            timed.event,
-            AgentEvent::ReplyTranslated { ref text, ref language }
+            round_trip(&body),
+            SessionAgentBody::ReplyTranslated { ref text, ref language }
                 if text == "全部完成。" && language == "cmn"
         ));
     }
 
+    /// An agent event of the kind only aither emits, built from its serde
+    /// form.
+    fn emitted(event: serde_json::Value) -> TimedEvent {
+        let timed = serde_json::json!({
+            "at": "2026-01-01T00:00:00Z",
+            "agent": [],
+            "event": event,
+        });
+        serde_json::from_value(timed).expect("a timed event")
+    }
+
     #[test]
     fn compaction_recovery_survives_the_round_trip() {
-        let event = AgentEvent::CompactionRecovery {
-            error: AgentError::Llm {
-                message: "too long".to_string(),
-                failure: aither_core::llm::Failure::transient(),
-            },
-            alerts_removed: 2,
-            outputs_spilled: 3,
+        let error = AgentError::Llm {
+            message: "too long".to_string(),
+            failure: aither_core::llm::Failure::transient(),
         };
-        let wire = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
-        let json = serde_json::to_string(&wire).expect("serialize");
-        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
-        let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
+        let body = SessionAgentBody::Agent {
+            event: emitted(serde_json::json!({
+                "CompactionRecovery": {
+                    "error": serde_json::to_value(&error).expect("error"),
+                    "alerts_removed": 2,
+                    "outputs_spilled": 3,
+                },
+            })),
+        };
+        let SessionAgentBody::Agent { event } = round_trip(&body) else {
+            panic!("an agent frame comes back as one");
+        };
         assert!(matches!(
-            timed.event,
+            event.event,
             AgentEvent::CompactionRecovery {
                 error: AgentError::Llm { ref message, .. },
                 alerts_removed: 2,
                 outputs_spilled: 3,
+                ..
             } if message == "too long"
         ));
     }
 
     #[test]
-    fn a_usage_event_carries_the_daemons_context_window() {
-        let event = AgentEvent::Usage(aither_core::llm::Usage::default());
-        let wire = WireAgentEvent::from_agent(Ok(&event), Some(262_144)).expect("rendered event");
-        let json = serde_json::to_string(&wire).expect("serialize");
-        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.context_window(), Some(262_144));
-        let bare = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
-        assert_eq!(bare.context_window(), None);
-    }
-
-    #[test]
-    fn errors_come_back_as_errors() {
+    fn a_failed_run_comes_back_with_its_error() {
         let failure = aither_core::llm::Failure::transient()
             .with_retry_after(Some(std::time::Duration::from_secs(5)));
-        let wire = WireAgentEvent::from_agent(
-            Err(&AgentError::Llm {
-                message: "overloaded".to_string(),
-                failure,
-            }),
-            None,
-        )
-        .expect("rendered error");
-        let back = wire.into_timed(jiff::Timestamp::UNIX_EPOCH);
+        let error = AgentError::Llm {
+            message: "overloaded".to_string(),
+            failure,
+        };
+        let body = SessionAgentBody::Agent {
+            event: emitted(serde_json::json!({
+                "RunEnded": {
+                    "run": "r1",
+                    "outcome": { "Failed": { "error": serde_json::to_value(&error).expect("error") } },
+                },
+            })),
+        };
+        let SessionAgentBody::Agent { event } = round_trip(&body) else {
+            panic!("an agent frame comes back as one");
+        };
         assert!(matches!(
-            back,
-            Err(AgentError::Llm { message, failure: back_failure })
-                if message == "overloaded" && back_failure == failure
+            event.event,
+            AgentEvent::RunEnded {
+                outcome: RunOutcome::Failed {
+                    error: AgentError::Llm { ref message, failure: back },
+                },
+                ..
+            } if message == "overloaded" && back == failure
         ));
     }
 }
