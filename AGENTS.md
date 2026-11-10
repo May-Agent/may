@@ -200,7 +200,7 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 
 
 # Bad smell
-- .chars is expensive
+- Counting or indexing through `.chars()` (`.count()`, `.nth()`) walks the whole string; use byte offsets or `char_indices`. Byte comparison is only for ASCII-only grammars.
 - [..len] is forbidden since it can panic for non-ascii
 
 ## Rules
