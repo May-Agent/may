@@ -1150,7 +1150,10 @@ pub(super) fn spawn_task_wake_dispatcher(
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
         while let Ok(session_id) = wakes.recv().await {
-            spawn_follow_up_runs(state.clone(), session_id);
+            crate::panic_boundary::round("task wake dispatcher", async {
+                spawn_follow_up_runs(state.clone(), session_id);
+            })
+            .await;
         }
     });
 }
@@ -1855,44 +1858,63 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         register_skills,
         tunnel,
     } = queues;
+    let handle = state.tokio_handle.clone();
 
     let task_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = task.next().await {
-            let result = Box::pin(handle_task_request(&task_state, request.args.clone())).await;
-            let _ = request.respond(result);
-        }
-    });
+    handle.spawn(dispatch_requests(
+        "task command dispatcher",
+        task,
+        move |args| {
+            let state = task_state.clone();
+            async move { Box::pin(handle_task_request(&state, args)).await }
+        },
+    ));
 
     let browser_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = browser.next().await {
-            let result = handle_browser_request(&browser_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
+    handle.spawn(dispatch_requests(
+        "browser command dispatcher",
+        browser,
+        move |args| {
+            let state = browser_state.clone();
+            async move { handle_browser_request(&state, args).await }
+        },
+    ));
 
     let register_skills_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = register_skills.next().await {
-            let result =
-                handle_register_skills_request(&register_skills_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
+    handle.spawn(dispatch_requests(
+        "register-skills command dispatcher",
+        register_skills,
+        move |args| {
+            let state = register_skills_state.clone();
+            async move { handle_register_skills_request(&state, args).await }
+        },
+    ));
 
-    let tunnel_state = state;
-    let tokio_handle = tunnel_state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = tunnel.next().await {
-            let result =
-                super::tunnel::handle_tunnel_request(&tunnel_state, request.args.clone()).await;
+    handle.spawn(dispatch_requests(
+        "tunnel command dispatcher",
+        tunnel,
+        move |args| {
+            let state = state.clone();
+            async move { super::tunnel::handle_tunnel_request(&state, args).await }
+        },
+    ));
+}
+
+/// Answers each request on `queue` with `handler`'s result until the queue
+/// closes. A request whose handler panics is dropped unanswered, so its
+/// caller sees the closed reply channel, and the next request is served.
+async fn dispatch_requests<Args: Clone, Response, Fut: Future<Output = Response>>(
+    worker: &'static str,
+    queue: aither_agent::tool_request::ToolRequestQueue<Args, Response>,
+    handler: impl Fn(Args) -> Fut,
+) {
+    while let Some(request) = queue.next().await {
+        if let Some(result) =
+            crate::panic_boundary::round(worker, handler(request.args.clone())).await
+        {
             let _ = request.respond(result);
         }
-    });
+    }
 }
 
 /// What one attempt's run starts from.
@@ -2699,11 +2721,17 @@ pub(super) fn watch_aux_settings(state: &Arc<DaemonState>) {
         loop {
             match events.recv().await {
                 Ok(topics) if topics.intersects(UiEventTopics::CONFIG | UiEventTopics::SLEEP) => {
-                    apply_aux_settings(&state);
+                    crate::panic_boundary::round("aux settings", async {
+                        apply_aux_settings(&state);
+                    })
+                    .await;
                 }
                 // A lagged receiver may have missed the change.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    apply_aux_settings(&state);
+                    crate::panic_boundary::round("aux settings", async {
+                        apply_aux_settings(&state);
+                    })
+                    .await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -5097,6 +5125,24 @@ mod tests {
             .await
             .expect("session");
         state
+    }
+
+    /// A command whose handler panics fails for its caller alone: the
+    /// dispatcher serves the next command on the same queue.
+    #[tokio::test]
+    async fn a_dispatcher_survives_a_panicking_command() {
+        let (broker, queue) = aither_agent::tool_request::channel::<u32, u32>();
+        let worker = tokio::spawn(super::dispatch_requests(
+            "test dispatcher",
+            queue,
+            |args| async move {
+                assert_ne!(args, 0, "zero is refused");
+                args + 1
+            },
+        ));
+        assert!(broker.request(0).await.is_err());
+        assert_eq!(broker.request(4).await.expect("answered"), 5);
+        worker.abort();
     }
 
     /// A panic in the turn runner fails the turn with an error event

@@ -1443,16 +1443,19 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
                 maybe_event = watch_rx.recv() => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            let owners = event
-                                .paths
-                                .iter()
-                                .filter_map(|path| session_artifacts_owner(path));
-                            if owners.clone().next().is_some() {
-                                dirty.extend(owners);
-                                quiet.as_mut().reset(
-                                    tokio::time::Instant::now() + ARTIFACT_WATCH_DEBOUNCE,
-                                );
-                            }
+                            crate::panic_boundary::round("artifact watcher", async {
+                                let owners = event
+                                    .paths
+                                    .iter()
+                                    .filter_map(|path| session_artifacts_owner(path));
+                                if owners.clone().next().is_some() {
+                                    dirty.extend(owners);
+                                    quiet.as_mut().reset(
+                                        tokio::time::Instant::now() + ARTIFACT_WATCH_DEBOUNCE,
+                                    );
+                                }
+                            })
+                            .await;
                         }
                         Some(Err(error)) => {
                             tracing::warn!(error = %error, "artifact watcher error");
@@ -1461,12 +1464,15 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
                     }
                 }
                 () = &mut quiet, if !dirty.is_empty() => {
-                    for session_id in std::mem::take(&mut dirty) {
-                        bus.publish_session_change(
-                            &session_id,
-                            crate::daemon::session_events::SessionChange::Artifacts,
-                        );
-                    }
+                    crate::panic_boundary::round("artifact watcher", async {
+                        for session_id in std::mem::take(&mut dirty) {
+                            bus.publish_session_change(
+                                &session_id,
+                                crate::daemon::session_events::SessionChange::Artifacts,
+                            );
+                        }
+                    })
+                    .await;
                 }
             }
         }

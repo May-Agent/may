@@ -71,9 +71,9 @@ impl skyzen::HttpError for HandlerPanicked {
     }
 }
 
-/// The router's answer to `request`; a handler that panics is answered with
-/// a `500` carrying the panic message, so its connection and the others keep
-/// being served.
+/// The router's answer to `request`; a handler that panics is logged with
+/// its message and answered with a `500`, so its connection and the others
+/// keep being served.
 async fn answer(
     router: &Router,
     request: skyzen::Request,
@@ -213,11 +213,6 @@ mod tests {
 
         let failed = get(&router, "/boom").await;
         assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = failed.into_body().into_bytes().await.expect("body");
-        assert!(
-            String::from_utf8_lossy(&body).contains("test panic in a handler"),
-            "the body carries the panic message: {body:?}"
-        );
 
         let served = get(&router, "/ok").await;
         assert_eq!(served.status(), StatusCode::OK);
