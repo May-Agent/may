@@ -5644,8 +5644,8 @@ dependencies = [
 name = "may-tasks"
 version = "0.1.0"
 dependencies = [
- "aither-agent",
  "askama 0.16.1",
+ "serde",
  "tempfile",
 ]
 
