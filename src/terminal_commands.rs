@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use aither_agent::sandbox::builtin::AskCommand;
 use aither_agent::specialized::{SubagentFileMount, SubagentTool};
-use aither_agent::webfetch::WebFetchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
@@ -22,6 +21,7 @@ use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
+use crate::agent::webfetch_tool::MayWebFetch;
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
 use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
@@ -199,7 +199,7 @@ where
     );
 
     if !config.request_parameters.hosted_web_fetch() {
-        register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
+        register_tool_with_description(builder, &mut descriptions, MayWebFetch::new());
     }
     // The model of each tier; a tier nothing is configured for runs on the
     // session's model.
