@@ -209,6 +209,12 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
     let (store, db, _default_profile_id) = initialize_session_persistence(&may_dir)
         .await
         .map_err(ExecError::InitializeSession)?;
+    // A missing session fails before anything starts a daemon for it.
+    let session_row = db
+        .get_session(session_id)
+        .await
+        .map_err(|error| ExecError::InitializeSession(error.into()))?
+        .ok_or_else(|| ExecError::SessionNotFound(session_id.to_string()))?;
     may_agent::daemon::lifecycle::ensure_running(&daemon, |line| {
         let _ = writeln!(io::stderr(), "[may] {line}");
     })
@@ -219,11 +225,6 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
             .await
             .map_err(ExecError::ConnectDaemonIds)?,
     );
-    let session_row = db
-        .get_session(session_id)
-        .await
-        .map_err(|error| ExecError::InitializeSession(error.into()))?
-        .ok_or_else(|| ExecError::SessionNotFound(session_id.to_string()))?;
     let profile_id = session_row.profile_id.clone();
     let profile_model = match profile_id {
         Some(ref profile_id) => Some(
