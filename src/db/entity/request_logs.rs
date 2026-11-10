@@ -31,4 +31,6 @@ pub struct Model {
     pub ok: bool,
     /// Error summary when `ok` is false.
     pub error: Option<String>,
+    /// Whether the request only refreshed the prompt cache.
+    pub keep_warm: bool,
 }

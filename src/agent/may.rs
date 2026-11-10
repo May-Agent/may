@@ -434,6 +434,8 @@ impl MayAgent {
     /// Returns [`MayAgentError`] when the sandbox environment cannot be
     /// prepared — opening the network audit log, creating the terminal tool,
     /// or registering the skills/subagents directories fails.
+    // aither does not export `CacheKeepAlive`, so only its default can be named.
+    #[allow(clippy::default_trait_access)]
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
         let is_container = matches!(config.environment, AgentEnvironment::Container { .. });
 
@@ -819,6 +821,11 @@ impl MayAgent {
             )
             .context_policy(config.context_policy)
             .background_jobs(config.background_jobs)
+            // A run parked on a detached command refreshes the cache entry
+            // the command would outlive, at aither's default lead of
+            // `keep_warm::REFRESH_MARGIN` (the type is not exported, so only
+            // its default can be named).
+            .cache_keep_alive(Default::default())
             .connectivity(config.connectivity.clone());
         if let Some(runtime) = hook_runtime.clone() {
             builder = builder
@@ -1439,6 +1446,12 @@ impl MayAgent {
         &self.provider_id
     }
 
+    /// The agent's model as the request log names it: `provider::model`.
+    #[must_use]
+    pub fn model_selector(&self) -> crate::ModelSelector {
+        crate::ModelSelector::new(&self.provider_id, &self.model_id)
+    }
+
     /// Model context window resolved for this agent.
     #[must_use]
     pub const fn model_context_window(&self) -> Option<u32> {
@@ -1484,6 +1497,29 @@ impl MayAgent {
     /// [`Agent::idle_compaction_due_in`].
     pub(crate) fn idle_compaction_due_in(&self) -> Option<std::time::Duration> {
         self.inner.idle_compaction_due_in()
+    }
+
+    /// How long from now the idle agent's cache entry is to be refreshed, or
+    /// `None` when no refresh is due: the entry is cold or permanent, or
+    /// every running background job ends before it cools. See
+    /// [`super::keep_warm::refresh_in`].
+    pub(crate) async fn keep_warm_due_in(&self) -> Option<std::time::Duration> {
+        let aither_agent::context::CacheLifetime::Limited(lifetime) = self.inner.cache_lifetime()
+        else {
+            return None;
+        };
+        let cold_in = self.inner.cache_warmth().cold_in()?;
+        let jobs = self.job_registry.list().await;
+        super::keep_warm::refresh_in(Some(cold_in), lifetime, &jobs)
+    }
+
+    /// Refreshes the idle agent's cache entry with a one-token request whose
+    /// output is dropped; see [`Agent::keep_cache_warm`]. `None` when there
+    /// was nothing to refresh.
+    pub(crate) async fn keep_cache_warm(
+        &mut self,
+    ) -> Result<Option<aither_core::llm::Usage>, AgentError> {
+        self.inner.keep_cache_warm().await
     }
 
     /// Compacts the idle session once it is due; see

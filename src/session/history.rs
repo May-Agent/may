@@ -56,6 +56,11 @@ pub enum ToolEventRecord {
         name: String,
         /// Raw JSON arguments.
         arguments: String,
+        /// How May read the script of a terminal call as it started, with
+        /// line numbers a later edit of the files would change; absent for
+        /// other calls and for rows stored before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reading: Option<crate::command_reading::CommandReading>,
     },
     /// Tool call completed.
     #[serde(rename = "end")]
@@ -565,6 +570,7 @@ impl ChatHistory {
                                 id,
                                 name,
                                 arguments,
+                                ..
                             } => {
                                 if id != tool_call_id {
                                     return Some(Err(HistoryReplayError::ToolEventIdMismatch {
@@ -793,6 +799,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "lookup".to_string(),
             arguments: "{\"query\":\"rust\"}".to_string(),
+            reading: None,
         })
         .expect("serialize tool start");
         let end = serde_json::to_string(&ToolEventRecord::End {
@@ -857,6 +864,7 @@ mod tests {
             id: "call_9".to_string(),
             name: "terminal".to_string(),
             arguments: "{}".to_string(),
+            reading: None,
         })
         .expect("serialize tool start");
         let stopped = serde_json::to_string(&ToolEventRecord::Stopped {
@@ -982,15 +990,19 @@ pub fn chat_messages_from_transcript(
                 arguments,
                 status,
                 result,
+                reading,
                 card,
             } => {
                 let start = ToolEventRecord::Start {
                     id: call_id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
+                    reading: None,
                 };
                 messages.push(ChatMessage {
                     tool_call_id: Some(call_id.clone()),
+                    // The reading rides on the row, as the daemon served it.
+                    reading: reading.clone(),
                     card: card.clone(),
                     ..base(
                         id,
@@ -1112,6 +1124,7 @@ mod transcript_tests {
                 arguments: "{}".into(),
                 status: "done".into(),
                 result: Some(result),
+                reading: Some(crate::command_reading::CommandReading::of("cat a.rs")),
                 card: None,
             },
             crate::client::WireTranscriptEntry::ToolCall {
@@ -1122,6 +1135,7 @@ mod transcript_tests {
                 arguments: "{}".into(),
                 status: "stopped".into(),
                 result: None,
+                reading: None,
                 card: None,
             },
             crate::client::WireTranscriptEntry::ToolCall {
@@ -1132,6 +1146,7 @@ mod transcript_tests {
                 arguments: "{}".into(),
                 status: "running".into(),
                 result: None,
+                reading: None,
                 card: None,
             },
             crate::client::WireTranscriptEntry::HiddenContext {
@@ -1154,6 +1169,12 @@ mod transcript_tests {
         assert!(matches!(start, ToolEventRecord::Start { ref id, .. } if id == "c1"));
         let end: ToolEventRecord = serde_json::from_str(&messages[3].content).expect("end record");
         assert!(matches!(end, ToolEventRecord::End { ref id, .. } if id == "c1"));
+        // The served reading rides on the call's start row for the clients.
+        assert_eq!(
+            messages[2].reading,
+            Some(crate::command_reading::CommandReading::of("cat a.rs"))
+        );
+        assert!(messages[3].reading.is_none());
 
         // Stopped: Start + Stopped; running: Start only.
         let stopped: ToolEventRecord =

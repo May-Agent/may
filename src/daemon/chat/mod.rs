@@ -1540,24 +1540,7 @@ async fn record_tool_interval(
 
 async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
     let db = state.db();
-    if let Err(error) = db
-        .append_request_log(crate::db::RequestLogParams {
-            session_id: entry.session_id.as_str(),
-            timestamp: entry.timestamp.as_str(),
-            model: entry.model.as_str(),
-            provider_id: entry.provider_id.as_str(),
-            prompt_tokens: entry.prompt_tokens,
-            completion_tokens: entry.completion_tokens,
-            total_tokens: entry.total_tokens,
-            cache_read_tokens: entry.cache_read_tokens,
-            cache_write_tokens: entry.cache_write_tokens,
-            context_window: entry.context_window,
-            elapsed_ms: entry.elapsed_ms,
-            ok: entry.ok,
-            error: entry.error.as_deref(),
-        })
-        .await
-    {
+    if let Err(error) = db.append_request_log(entry.as_params()).await {
         tracing::warn!(error = %error, "failed to persist request log");
     }
     state.notify_ui_events(UiEventTopics::REQUEST_LOGS);

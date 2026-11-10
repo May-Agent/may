@@ -249,6 +249,10 @@ pub struct WireJob {
     pub output_path: Option<std::path::PathBuf>,
     /// Where it runs.
     pub place: WirePlace,
+    /// The bound it was started under, in milliseconds; absent when nothing
+    /// bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -275,6 +279,9 @@ impl From<&JobInfo> for WireJob {
             status: (&job.status).into(),
             output_path: job.output_path.clone(),
             place: job.place.into(),
+            timeout_ms: job
+                .timeout
+                .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         }
     }
 }
@@ -292,6 +299,7 @@ impl From<WireJob> for JobInfo {
             status: job.status.into(),
             output_path: job.output_path,
             place: job.place.into(),
+            timeout: job.timeout_ms.map(Duration::from_millis),
         }
     }
 }
@@ -604,6 +612,7 @@ mod tests {
             status,
             output_path: None,
             place: WirePlace::Host,
+            timeout_ms: None,
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
@@ -637,6 +646,7 @@ mod tests {
             },
             output_path: None,
             place: JobPlace::Host,
+            timeout: Some(Duration::from_secs(60)),
         };
         let wire: WireJob =
             serde_json::from_str(&serde_json::to_string(&WireJob::from(&job)).expect("serializes"))
@@ -644,6 +654,7 @@ mod tests {
         let back = JobInfo::from(wire);
         assert_eq!(back.pid, 7);
         assert_eq!(back.status, job.status);
+        assert_eq!(back.timeout, job.timeout);
         let age = back.started_at.elapsed().as_secs();
         assert!((5..7).contains(&age), "age {age}");
     }

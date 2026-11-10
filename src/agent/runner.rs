@@ -784,8 +784,16 @@ async fn next_command(
     background_wakes: Option<&BackgroundWakes>,
     reporter: &(dyn Fn() -> CompactionReporter + Sync),
 ) -> Option<WorkerCommand> {
+    // A refresh that failed is not retried until the next command, so a
+    // provider that refuses them is not asked again at once.
+    let mut keep_warm_failed = false;
     loop {
         let compaction_due_in = agent.idle_compaction_due_in();
+        let keep_warm_due_in = if keep_warm_failed {
+            None
+        } else {
+            agent.keep_warm_due_in().await
+        };
         let step = futures_lite::future::or(
             async { IdleStep::Command(command_rx.recv().await.ok()) },
             futures_lite::future::or(
@@ -798,23 +806,39 @@ async fn next_command(
                         None => std::future::pending().await,
                     }
                 },
-                async {
-                    match background_wakes {
-                        Some(background) => {
-                            // A job finishing before the run that parked the
-                            // agent released the session would wake a host
-                            // that finds the session held.
-                            background.released.wait().await;
-                            IdleStep::Background(agent.wait_background().await)
+                futures_lite::future::or(
+                    async {
+                        match keep_warm_due_in {
+                            Some(due_in) => {
+                                async_io::Timer::after(due_in).await;
+                                IdleStep::KeepWarm
+                            }
+                            None => std::future::pending().await,
                         }
-                        None => std::future::pending().await,
-                    }
-                },
+                    },
+                    async {
+                        match background_wakes {
+                            Some(background) => {
+                                // A job finishing before the run that parked the
+                                // agent released the session would wake a host
+                                // that finds the session held.
+                                background.released.wait().await;
+                                IdleStep::Background(agent.wait_background().await)
+                            }
+                            None => std::future::pending().await,
+                        }
+                    },
+                ),
             ),
         )
         .await;
         match step {
             IdleStep::Command(command) => return command,
+            IdleStep::KeepWarm => match keep_warm_idle(agent, command_rx, runs).await {
+                KeepWarmOutcome::Refreshed | KeepWarmOutcome::NotDue => {}
+                KeepWarmOutcome::Failed => keep_warm_failed = true,
+                KeepWarmOutcome::Command(command) => return command,
+            },
             IdleStep::Background(wake) => {
                 // The wake is recorded in the agent's context; a wake that
                 // starts a run asks the host for one.
@@ -841,8 +865,67 @@ enum IdleStep {
     Command(Option<WorkerCommand>),
     /// The idle compaction is due.
     Compact,
+    /// The prompt-cache refresh is due.
+    KeepWarm,
     /// A detached background command finished or raised an alert.
     Background(aither_agent::BackgroundWake),
+}
+
+/// How one idle refresh of the prompt cache ended.
+enum KeepWarmOutcome {
+    /// A refresh was sent and its usage recorded.
+    Refreshed,
+    /// The refresh was no longer due when its time came: the background
+    /// command that called for it had ended, or a request restarted the
+    /// cache entry.
+    NotDue,
+    /// The provider refused the refresh; none is retried until the next
+    /// command.
+    Failed,
+    /// A command arrived meanwhile, or `None` when the channel closed; the
+    /// refresh was dropped where it stood.
+    Command(Option<WorkerCommand>),
+}
+
+/// Sends the idle agent's prompt-cache refresh and records its usage with
+/// the session's. The refresh leaves the conversation untouched, so it needs
+/// no run of its own; a command arriving meanwhile drops it.
+async fn keep_warm_idle(
+    agent: &mut MayAgent,
+    command_rx: &Receiver<WorkerCommand>,
+    runs: &SessionRuns,
+) -> KeepWarmOutcome {
+    // The decision is taken again now: the command that called for the
+    // refresh may have ended since it was scheduled.
+    if agent.keep_warm_due_in().await != Some(std::time::Duration::ZERO) {
+        return KeepWarmOutcome::NotDue;
+    }
+    let started = std::time::Instant::now();
+    let refresh = futures_lite::future::or(async { Ok(agent.keep_cache_warm().await) }, async {
+        Err(command_rx.recv().await.ok())
+    })
+    .await;
+    let usage = match refresh {
+        Err(command) => return KeepWarmOutcome::Command(command),
+        Ok(Ok(Some(usage))) => usage,
+        Ok(Ok(None)) => return KeepWarmOutcome::NotDue,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to refresh the idle prompt cache");
+            return KeepWarmOutcome::Failed;
+        }
+    };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let entry = crate::daemon::types::RequestLogEntry::new(
+        agent.session_id().as_str(),
+        &agent.model_selector().to_string(),
+        agent.provider_id(),
+        &usage,
+        agent.model_context_window(),
+    )
+    .success(elapsed_ms)
+    .keep_warm();
+    runs.record_keep_warm_request(entry).await;
+    KeepWarmOutcome::Refreshed
 }
 
 /// Compacts the idle session as a run of its own. `Some` is a command that

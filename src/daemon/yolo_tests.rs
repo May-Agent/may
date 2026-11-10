@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use aither_agent::workspace_request::RequestWorkspaceArgs;
 use aither_sandbox::permission::{PermissionError, PermissionHandler};
-use aither_sandbox::{CommandRole, ScriptLanguage, SshServer, TerminalMode};
+use aither_sandbox::{
+    CommandLocation, CommandRole, LocationApproval, ScriptLanguage, SshServer, TerminalMode,
+};
 use tempfile::TempDir;
 
 use super::state::WorkspaceApprover;
@@ -73,7 +75,12 @@ async fn an_unsafe_command_runs_without_a_prompt_in_a_yolo_session() {
     let approver = fixture.approver();
 
     let granted = approver
-        .check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell)
+        .check(
+            TerminalMode::Unsafe,
+            "make install",
+            ScriptLanguage::Shell,
+            CommandLocation::Local,
+        )
         .await
         .expect("granted");
 
@@ -83,7 +90,12 @@ async fn an_unsafe_command_runs_without_a_prompt_in_a_yolo_session() {
     assert!(runtime.waiting_permission.is_none());
     assert!(
         !approver
-            .will_wait_for_approval(TerminalMode::Unsafe, "x", ScriptLanguage::Shell)
+            .will_wait_for_approval(
+                TerminalMode::Unsafe,
+                "x",
+                ScriptLanguage::Shell,
+                CommandLocation::Local
+            )
             .await
     );
     assert_eq!(fixture.history("permission_request").await, 1);
@@ -97,7 +109,12 @@ async fn a_subagent_of_a_yolo_session_is_granted_too() {
     let subagent = fixture.approver().for_subagent();
     assert!(
         subagent
-            .check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell)
+            .check(
+                TerminalMode::Unsafe,
+                "make install",
+                ScriptLanguage::Shell,
+                CommandLocation::Local
+            )
             .await
             .expect("granted")
     );
@@ -110,14 +127,24 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     fixture.yolo(true).await;
     assert!(
         approver
-            .check(TerminalMode::Unsafe, "first", ScriptLanguage::Shell)
+            .check(
+                TerminalMode::Unsafe,
+                "first",
+                ScriptLanguage::Shell,
+                CommandLocation::Local
+            )
             .await
             .expect("granted")
     );
 
     fixture.yolo(false).await;
     let error = approver
-        .check(TerminalMode::Unsafe, "second", ScriptLanguage::Shell)
+        .check(
+            TerminalMode::Unsafe,
+            "second",
+            ScriptLanguage::Shell,
+            CommandLocation::Local,
+        )
         .await
         .expect_err("nobody answers, so the request is denied");
     let PermissionError::Denied(message) = error else {
@@ -127,7 +154,12 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     assert_eq!(fixture.history("permission_request").await, 2);
     assert!(
         approver
-            .will_wait_for_approval(TerminalMode::Unsafe, "x", ScriptLanguage::Shell)
+            .will_wait_for_approval(
+                TerminalMode::Unsafe,
+                "x",
+                ScriptLanguage::Shell,
+                CommandLocation::Local
+            )
             .await
     );
 }
@@ -138,7 +170,12 @@ async fn a_session_without_yolo_still_asks() {
     assert!(!fixture.runtime.get("session").await.expect("runtime").yolo);
     let error = fixture
         .approver()
-        .check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell)
+        .check(
+            TerminalMode::Unsafe,
+            "make install",
+            ScriptLanguage::Shell,
+            CommandLocation::Local,
+        )
         .await
         .expect_err("unanswered");
     let PermissionError::Denied(message) = error else {
@@ -174,7 +211,7 @@ async fn ssh_connect_is_granted_without_asking_in_a_yolo_session() {
     .expect("did not ask")
     .expect("authorized");
 
-    assert!(granted);
+    assert_eq!(granted, LocationApproval::Session);
     assert_eq!(fixture.history("permission_response").await, 1);
 }
 

@@ -2948,6 +2948,7 @@ mod tests {
                 .expect("instant in range"),
             status,
             output_path: None,
+            timeout: None,
         }
     }
 

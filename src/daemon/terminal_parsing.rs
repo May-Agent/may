@@ -63,6 +63,7 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
             id,
             name,
             arguments,
+            ..
         } => {
             if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
                 return;
@@ -158,6 +159,7 @@ mod tests {
                 id: "call".to_string(),
                 name: "terminal".to_string(),
                 arguments: "{\"description\":\"d\",\"script\":\"make\"}".to_string(),
+                reading: None,
             },
         );
         update_terminal_snapshot_from_tool_event(

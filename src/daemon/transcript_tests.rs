@@ -194,6 +194,7 @@ async fn a_tool_call_folds_start_end_and_stopped_rows_into_one_entry() {
         id: "c1".into(),
         name: "terminal".into(),
         arguments: "{\"cmd\":\"ls\"}".into(),
+        reading: None,
     };
     let end = ToolEventRecord::End {
         id: "c1".into(),
@@ -208,6 +209,7 @@ async fn a_tool_call_folds_start_end_and_stopped_rows_into_one_entry() {
         id: "c2".into(),
         name: "monitor".into(),
         arguments: "{}".into(),
+        reading: None,
     };
     let rows = vec![
         ChatMessage::user("go"),
@@ -230,6 +232,35 @@ async fn a_tool_call_folds_start_end_and_stopped_rows_into_one_entry() {
     assert_eq!(entries[2]["kind"], "toolCall");
     assert_eq!(entries[2]["callId"], "c2");
     assert_eq!(entries[2]["status"], "stopped");
+}
+
+/// A stored terminal call carries the reading the live frame carried, the
+/// one stored with it (a located edit keeps its line numbers).
+#[tokio::test]
+async fn a_stored_terminal_call_carries_its_reading() {
+    let state = state().await;
+    let at = Timestamp::now();
+    let script = "cat src/lib.rs | head -n 5";
+    let arguments = json!({ "description": "look", "script": script }).to_string();
+    let live = crate::command_reading::CommandReading::of(script);
+    let stored = ToolEventRecord::Start {
+        id: "c1".into(),
+        name: "terminal".into(),
+        arguments,
+        reading: Some(live.clone()),
+    };
+    let rows = vec![ChatMessage::tool(
+        "c1",
+        serde_json::to_string(&stored).unwrap(),
+        at,
+    )];
+    seed(&state, &rows).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let page = page(&router, "").await;
+    let entries = page["entries"].as_array().expect("entries");
+    let wanted = serde_json::to_value(&live).unwrap();
+    assert!(live.recognises_any());
+    assert_eq!(entries[0]["reading"], wanted);
 }
 
 async fn remaining_ids(state: &DaemonState) -> Vec<i32> {
