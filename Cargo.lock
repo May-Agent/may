@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-attachments",
  "aither-connectivity",
@@ -201,7 +201,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -214,7 +214,7 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "askama 0.16.1",
@@ -227,7 +227,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -245,7 +245,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -286,7 +286,7 @@ dependencies = [
 [[package]]
 name = "aither-connectivity"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -311,7 +311,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -331,7 +331,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -360,7 +360,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -394,7 +394,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "arc-swap",
@@ -418,7 +418,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "serde",
@@ -428,7 +428,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -451,7 +451,7 @@ dependencies = [
 [[package]]
 name = "aither-patch"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -507,7 +507,7 @@ dependencies = [
 [[package]]
 name = "aither-sed"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -515,7 +515,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#d10e0f77bf023adeb6f0d193e2eb7c4e26f805e3"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -4415,7 +4415,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -4445,7 +4445,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5626,6 +5626,7 @@ dependencies = [
  "skyzen-services",
  "smol-hyper",
  "streamdown-parser",
+ "strsim",
  "subtle",
  "syntect",
  "tar",
@@ -7640,7 +7641,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7679,7 +7680,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

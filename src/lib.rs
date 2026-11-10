@@ -103,13 +103,15 @@ pub mod scheduler;
 /// Repository trust: the first-contact decision, resolved per repo.
 pub mod trust;
 
+/// The user's global sleep state.
+/// May's IPC command bridge.
+pub mod ipc;
 pub mod secrets;
 /// Session model, history, and on-disk layout.
 pub mod session;
+pub mod shell;
 /// Agent skill discovery and management.
 pub mod skill;
-/// The user's global sleep state.
-pub mod shell;
 pub mod sleep;
 /// Startup validation of configuration files.
 pub mod startup;

@@ -87,6 +87,7 @@ async-process = "2.5"
 humantime = { version = "2.4", default-features = false }
 async-net = "2"
 async-channel = "2"
+strsim = { version = "0.11", default-features = false }
 blocking = "1"
 terminal-colorsaurus = { version = "1.0.3", default-features = false }
 
