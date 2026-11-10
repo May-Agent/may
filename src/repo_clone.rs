@@ -1052,10 +1052,30 @@ pub(crate) mod test_sandbox {
             self.terminal.binding()
         }
 
+        /// The prepared managed tools of this terminal, as a connected ACP
+        /// agent's sandbox is given them.
+        pub fn managed_tools(&self) -> crate::agent::acp_sandbox::ManagedTools {
+            let bin = self
+                .terminal
+                .shell_sessions()
+                .local_tools()
+                .expect("the tools are prepared locally")
+                .bin_dir()
+                .clone();
+            std::sync::Arc::new(std::sync::OnceLock::from(bin))
+        }
+
         /// The terminal's sandbox, as a terminal-bound command gets it.
         pub fn sandbox(&self) -> CloneSandbox {
             CloneSandbox::new(self.terminal.binding().runner().clone())
         }
+    }
+
+    /// The managed tools a session sandbox is given, prepared as a session
+    /// terminal prepares them.
+    pub async fn managed_tools() -> crate::agent::acp_sandbox::ManagedTools {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        TestTerminal::new(scratch.path()).await.managed_tools()
     }
 
     /// Every executable setting a repository can carry for itself, set in

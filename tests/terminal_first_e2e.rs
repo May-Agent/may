@@ -120,6 +120,9 @@ enum CompactionProbe {
     /// Every compaction is answered with a valid handoff once the run has
     /// asked the model again, or after [`COMPACTION_PROBE_GATE_LIMIT`].
     Lands,
+    /// Every compaction is answered with a valid handoff at once, for a
+    /// compaction nothing else in flight would release.
+    LandsAtOnce,
     /// The compaction and the retry aither makes on a bad answer get
     /// something that is no handoff; the rerun on the cleaned context gets a
     /// valid one.
@@ -434,7 +437,7 @@ impl MockScenarioState {
                     self.compaction_gate = Some(Arc::clone(&gate));
                     handoff.gated(gate)
                 }
-                CompactionProbe::FailsThenLands => handoff,
+                CompactionProbe::FailsThenLands | CompactionProbe::LandsAtOnce => handoff,
             };
             return MockHttpResponse::sse(vec![
                 handoff,
@@ -1480,7 +1483,11 @@ impl TestHarness {
             .expect("profile lookup should succeed")
             .unwrap_or_else(|| panic!("default profile `{profile_slug}` should exist"))
             .id;
-        let session_id = SessionId::new().to_string();
+        let session_id = db
+            .issue_session_name()
+            .await
+            .expect("a session name")
+            .to_string();
         store
             .create_session_dirs(
                 &session_id,
@@ -4832,8 +4839,10 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         sleep(Duration::from_millis(100)).await;
     };
     assert!(
-        delivered.contains(&request_id) && delivered.contains("Answer: PostgreSQL"),
-        "the follow-up request must carry the request id and the answer: {delivered}"
+        delivered.contains("answered your ask_user question")
+            && !delivered.contains(&request_id)
+            && delivered.contains("Answer: PostgreSQL"),
+        "the follow-up request must name the question by its word and carry the answer: {delivered}"
     );
     wait_for_runtime_condition(
         &client,
@@ -4919,8 +4928,10 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
         "the request already in flight predates the answer"
     );
     assert!(
-        next.contains(&request_id) && next.contains("Answer: PostgreSQL"),
-        "the next request must carry the request id and the answer: {next}"
+        next.contains("answered your ask_user question")
+            && !next.contains(&request_id)
+            && next.contains("Answer: PostgreSQL"),
+        "the next request must name the question by its word and carry the answer: {next}"
     );
 
     server.stop().await;
@@ -5855,6 +5866,76 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
     environment.release(&harness, &session_id).await;
 }
 
+/// An explicit compaction on an idle session reaches every client of the
+/// session as a `session_compaction` start and an applied finish.
+#[tokio::test]
+#[serial]
+async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(
+        CompactionProbe::LandsAtOnce,
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
+            "sessionId": session_id,
+            "content": COMPACTION_PROBE_FOLLOW_UP,
+        }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn to compact", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    let mut frames = agent_frames(&client, &server, &session_id, None).await;
+    let compacted = client
+        .post(format!(
+            "{}/api/sessions/{session_id}/actions/compact",
+            server.base_url
+        ))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("the compact request should be answered");
+    let compacted = expect_status(&server.log, compacted, StatusCode::OK).await;
+    let compacted: Value = compacted.json().await.expect("compact answer JSON");
+    assert_eq!(compacted["compacted"], true, "{compacted}");
+
+    let mut phases = Vec::new();
+    while phases.len() < 2 {
+        let Ok(next) = tokio::time::timeout(Duration::from_secs(20), frames.next_event()).await
+        else {
+            panic!(
+                "compaction frames so far {phases:?}; server logs:\n{}",
+                server.log.contents().await
+            );
+        };
+        let event = next.expect("the stream should stay open");
+        if event.event == "session_compaction" {
+            let frame: Value = serde_json::from_str(&event.data).expect("compaction frame JSON");
+            assert_eq!(frame["sessionId"], session_id);
+            phases.push(frame["phase"].as_str().expect("a phase").to_string());
+        }
+    }
+    assert_eq!(phases, ["started", "applied"]);
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
 /// A command run through `may exec` draws its jobs from the daemon's
 /// machine-wide pool: it can take every token of the pool, and no more.
 #[tokio::test]
@@ -6033,6 +6114,149 @@ async fn tokens_held_by_exec_probe(
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Leases words of `session_id`'s pool in the daemon, on one connection,
+/// until every free one is taken; returns the pool and the leases.
+async fn lease_every_free_word(
+    socket: &Path,
+    session_id: &str,
+) -> (may_agent::model_ids::SessionIds, Vec<aither_core::IdLease>) {
+    let ids = may_agent::client::ids::DaemonIds::connect(socket)
+        .await
+        .expect("the daemon id connection")
+        .session(session_id);
+    tokio::task::spawn_blocking(move || {
+        let mut leases = Vec::new();
+        while let Ok(lease) = ids.lease() {
+            leases.push(lease);
+        }
+        (ids, leases)
+    })
+    .await
+    .expect("leasing finishes")
+}
+
+/// Returns `ids` once the daemon served every request sent on its connection
+/// before: a claim of a word no pool has is refused only after them, since
+/// one connection's requests are served in order.
+async fn served(ids: may_agent::model_ids::SessionIds) -> may_agent::model_ids::SessionIds {
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            ids.allocator().claim("qqqqqq").is_err(),
+            "no pool has the word"
+        );
+        ids
+    })
+    .await
+    .expect("the claim finishes")
+}
+
+/// The word `may exec` named its job by, from the notice of a job killed at
+/// its timeout.
+fn killed_job_word(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("background task: ")
+                .and_then(|rest| rest.strip_suffix(" (killed)"))
+        })
+        .unwrap_or_else(|| panic!("exec reports its killed job: {stderr}"))
+        .to_string()
+}
+
+/// `may exec` leases its ids from the daemon's pool of the session: a word
+/// the daemon holds is never handed to exec, and a word exec holds is never
+/// handed out by the daemon.
+#[tokio::test]
+#[serial]
+async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
+    // A session per direction, so neither sees the other's leases.
+    let session = harness.create_session().await;
+    let other = harness.create_session().await;
+    let socket = harness.may_dir.join("daemon.sock");
+    let binary = may_binary_path();
+    let exec = |session_id: &str, script: String, timeout: &str| {
+        Command::new(&binary)
+            .arg("exec")
+            .arg("--session")
+            .arg(session_id)
+            .arg("--mode")
+            .arg("default")
+            .arg("--timeout")
+            .arg(timeout)
+            .arg("--")
+            .arg(script)
+            .env("HOME", harness.home_path())
+            .envs(hermetic_git_env(harness.home_path()))
+            .output()
+    };
+
+    // While exec's job holds its word, the daemon hands out every other word.
+    let started = session.sandbox_dir.join("tmp/started");
+    let running = tokio::spawn(exec(
+        &session.id,
+        format!("touch {}; while :; do sleep 0.1; done", started.display()),
+        "60",
+    ));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "exec's job never started");
+        sleep(Duration::from_millis(50)).await;
+    }
+    let (ids, leases) = lease_every_free_word(&socket, &session.id).await;
+    let daemon_words: std::collections::BTreeSet<String> =
+        leases.iter().map(ToString::to_string).collect();
+    // The words go back before exec's job ends, which stores its output
+    // under words of its own.
+    drop(leases);
+    drop(served(ids).await);
+    let output = running
+        .await
+        .expect("exec task")
+        .expect("may exec should run");
+    let exec_word = killed_job_word(&output);
+    assert!(
+        !daemon_words.contains(&exec_word),
+        "the daemon handed out exec's word {exec_word}"
+    );
+    assert!(
+        !daemon_words.is_empty(),
+        "the daemon leased the other words"
+    );
+
+    // While the daemon holds every word of the other session but a few,
+    // exec's job there gets one of those. A few, since the killed job's
+    // output is stored under words too.
+    let (ids, mut held) = lease_every_free_word(&socket, &other.id).await;
+    let free: std::collections::BTreeSet<String> =
+        held.drain(..4).map(|lease| lease.to_string()).collect();
+    let ids = served(ids).await;
+    let output = exec(&other.id, "while :; do sleep 0.1; done".to_string(), "1")
+        .await
+        .expect("may exec should run");
+    let exec_word = killed_job_word(&output);
+    assert!(
+        free.contains(&exec_word),
+        "exec took {exec_word}, not one of the words the daemon did not hold: {free:?}"
+    );
+    drop((ids, held));
+
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+    assert!(stop.status.success(), "daemon stop failed");
 }
 
 /// `explore` runs the bundled explore subagent on the fast model and returns

@@ -58,10 +58,14 @@ mod live_response;
 /// Location lookup for location-aware profiles.
 pub mod location;
 pub mod log_ring;
+#[cfg(test)]
+mod managed_environment_tests;
 /// MCP server configuration, connections, and management.
 pub mod mcp;
 /// Profile memory extraction and injection.
 pub mod memory;
+/// Model-facing ids: session names and each session's pool of words.
+pub mod model_ids;
 /// Model selection and filtering helpers.
 pub mod model_selector;
 /// Model listing and metadata.

@@ -20,8 +20,9 @@ fn question(text: &str) -> AskUserArgs {
     }
 }
 
-/// Asks `text` and returns the request id of the question it opened.
-async fn ask(session: &Session, text: &str) -> String {
+/// Asks `text` and returns the request id of the question it opened, with
+/// the word the model knows it by.
+async fn ask(session: &Session, text: &str) -> (String, String) {
     let runtime = session.parts.runtime.clone().expect("a runtime");
     let session_id = session.agent.session_id().as_str().to_string();
     let before = runtime
@@ -33,7 +34,7 @@ async fn ask(session: &Session, text: &str) -> String {
         .call(question(text), ToolContext::new())
         .await
         .expect("ask_user succeeds");
-    runtime
+    let id = runtime
         .get(&session_id)
         .await
         .expect("runtime loads")
@@ -41,7 +42,14 @@ async fn ask(session: &Session, text: &str) -> String {
         .into_iter()
         .map(|request| request.id)
         .find(|id| !before.iter().any(|known| &known.id == id))
-        .expect("the new question is open")
+        .expect("the new question is open");
+    let word = runtime
+        .db()
+        .open_ask_user_question_word(&id)
+        .await
+        .expect("the question loads")
+        .expect("the question has a word");
+    (id, word)
 }
 
 /// After a compaction the next request names every open question by id and
@@ -60,13 +68,13 @@ async fn open_questions_survive_compaction_in_the_next_request() {
         .await
         .expect("the run lease is free");
 
-    let kept = ask(&session, "Which cache layer?").await;
-    let answered = ask(&session, "Which license?").await;
-    let withdrawn = ask(&session, "Which logo?").await;
+    let (kept_id, kept) = ask(&session, "Which cache layer?").await;
+    let (answered_id, answered) = ask(&session, "Which license?").await;
+    let (_, withdrawn) = ask(&session, "Which logo?").await;
 
     runtime
         .answer_ask_user(
-            &answered,
+            &answered_id,
             &[QuestionAnswer {
                 section: String::new(),
                 answer: AnswerValue::Custom("MIT".to_string()),
@@ -99,17 +107,16 @@ async fn open_questions_survive_compaction_in_the_next_request() {
         !after.contains("Your context window is being compacted"),
         "the last request is a turn, not the compaction"
     );
-    assert!(after.contains(&kept), "open question id missing: {after}");
     assert!(
         after.contains(&format!("{kept}:\\n- Which cache layer?\\n\"")),
-        "the entry has no blank line around it: {after}"
+        "the open question is listed by its word with no blank line around it: {after}"
     );
     assert!(
-        !after.contains("Which logo?") && !after.contains(&withdrawn),
+        !after.contains("Which logo?") && !after.contains(&format!("{withdrawn}:\\n")),
         "a withdrawn question is listed"
     );
     assert!(
-        !after.contains("Which license?") && !after.contains(&answered),
+        !after.contains("Which license?") && !after.contains(&format!("{answered}:\\n")),
         "an answered question is listed as open"
     );
     drop(requests);
@@ -122,5 +129,5 @@ async fn open_questions_survive_compaction_in_the_next_request() {
         .into_iter()
         .map(|request| request.id)
         .collect();
-    assert_eq!(shown, [kept], "the user's view lists the same open set");
+    assert_eq!(shown, [kept_id], "the user's view lists the same open set");
 }

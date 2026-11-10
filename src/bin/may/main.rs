@@ -1126,6 +1126,7 @@ where
             // that ends them so no spark stays on screen.
             needs_draw = app.processing
                 || app.new_year.animating()
+                || app.compaction.is_holding()
                 || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
@@ -2055,20 +2056,7 @@ where
                         }
                     }
                     Some(SendAction::SshAdd { name, target }) => {
-                        app.config
-                            .upsert_ssh_server(may_agent::config::SshServerConfig {
-                                name: name.clone(),
-                                target,
-                            });
-                        if let Err(e) = app.config.clone().save().await {
-                            let err_msg = format!("Failed to save SSH server: {e}");
-                            app.chat.push_error(&err_msg);
-                        } else {
-                            app.set_status(format!("Added SSH server: {name}"));
-                            if app.ssh_selected + 1 < app.config.ssh_servers.len() {
-                                app.ssh_selected = app.config.ssh_servers.len() - 1;
-                            }
-                        }
+                        app.start_ssh_probe(name, target);
                     }
                     Some(SendAction::SshRemove { name }) => {
                         if app.config.remove_ssh_server(&name) {

@@ -272,6 +272,9 @@ pub struct App {
     pub activity_phase: crate::tui::ui::chat::ActivityPhase,
     /// Context window size for current model
     pub context_window: Option<u32>,
+    /// What the status bar's context meter shows in place of the usage while
+    /// a compaction runs and just after it.
+    pub compaction: crate::tui::state::CompactionMeter,
     /// Current model being used by the agent
     pub current_model: Option<String>,
     /// MCP server info for display (cached)
@@ -475,12 +478,14 @@ pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
 /// How often live terminal output is read from the daemon while calls run.
 const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Base URL `<tunnel id>` tags resolve against in the TUI: the daemon's
-/// loopback listener.
-fn tunnel_base(config: &MayConfig) -> String {
-    format!(
-        "http://localhost:{}/tunnel",
-        config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT)
+/// Base URL `<tunnel id>` tags of `session` resolve against in the TUI: the
+/// session's tunnels on the daemon's loopback listener. A tunnel is named by
+/// a word of its session's ids, so the session is part of its address.
+fn tunnel_base(config: &MayConfig, session: Option<&SessionId>) -> String {
+    let port = config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT);
+    session.map_or_else(
+        || format!("http://localhost:{port}/tunnel"),
+        |session| format!("http://localhost:{port}/tunnel/{session}"),
     )
 }
 
@@ -599,7 +604,10 @@ impl App {
         status: Option<StatusNotice>,
     ) -> Self {
         let needs_setup = !config.is_configured();
-        let tunnel_base = tunnel_base(&config);
+        let tunnel_base = tunnel_base(
+            &config,
+            session_manager.current().map(|session| &session.id),
+        );
         // Always start in Chat mode - show inline message if not configured
         let mode = AppMode::Chat;
 
@@ -700,6 +708,7 @@ impl App {
             spinner_frame: 0,
             activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
+            compaction: crate::tui::state::CompactionMeter::default(),
             current_model: None,
             mcp_servers: Vec::new(),
             mcp_selected: 0,
@@ -764,7 +773,46 @@ impl App {
         }
     }
 
-    fn persist_config_background(&self) {
+    /// Probe an SSH server off the event loop; `ssh_probed` receives the
+    /// result.
+    pub fn start_ssh_probe(&mut self, name: String, target: String) {
+        self.set_persistent_status(format!("Probing SSH server: {name}"));
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let result = crate::config::SshServerConfig::probe(name.clone(), target)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SshProbed { name, result }).await;
+        })
+        .detach();
+    }
+
+    /// Add a probed SSH server to the config, or show why the probe failed.
+    /// Returns whether the config changed and must be saved.
+    pub fn ssh_probed(
+        &mut self,
+        name: &str,
+        result: Result<crate::config::SshServerConfig, String>,
+    ) -> bool {
+        match result {
+            Err(error) => {
+                self.status = None;
+                self.chat
+                    .push_error(&format!("Failed to add SSH server {name}: {error}"));
+                false
+            }
+            Ok(server) => {
+                self.config.upsert_ssh_server(server);
+                self.set_status(format!("Added SSH server: {name}"));
+                if self.ssh_selected + 1 < self.config.ssh_servers.len() {
+                    self.ssh_selected = self.config.ssh_servers.len() - 1;
+                }
+                true
+            }
+        }
+    }
+
+    pub(in crate::tui) fn persist_config_background(&self) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
         spawn(async move {
@@ -1749,7 +1797,10 @@ impl App {
     /// finished turn folds into its "Worked for" row. The last turn folds
     /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
-        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
+        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(
+            &self.config,
+            self.session_manager.current().map(|session| &session.id),
+        ));
         self.chat.push_welcome(self.cwd_label());
         let mut turn = HistoryTurn::default();
         for (history_index, msg) in messages.iter().enumerate() {
@@ -1935,6 +1986,7 @@ impl App {
 
         // The daemon sends the window with the session's next usage.
         self.context_window = None;
+        self.compaction.cancel();
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
@@ -4887,7 +4939,7 @@ mod tests {
             .await
             .expect("session manager");
         let id = sessions
-            .create_session_in_profile(None, None)
+            .create_session_in_profile(crate::SessionId::from_string("amber-river"), None, None)
             .expect("session")
             .id
             .as_str()
@@ -5394,6 +5446,54 @@ mod tests {
             })
     }
 
+    fn probed_server(name: &str) -> crate::config::SshServerConfig {
+        crate::config::SshServerConfig {
+            name: name.to_string(),
+            target: "me@example.test".to_string(),
+            platform: crate::config::SshPlatformConfig {
+                os: "Linux".to_string(),
+                arch: "x86_64".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_ssh_probe_saves_the_server_and_selects_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.config.upsert_ssh_server(probed_server("first"));
+        app.set_persistent_status("Probing SSH server: second");
+
+        let save = app.ssh_probed("second", Ok(probed_server("second")));
+
+        assert!(save, "a probed server must be saved");
+        assert_eq!(app.config.ssh_servers.len(), 2);
+        assert_eq!(app.config.ssh_servers[1].name, "second");
+        assert_eq!(app.ssh_selected, 1);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Added SSH server: second")
+        );
+        assert_eq!(last_error(&app), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_ssh_probe_shows_the_error_and_saves_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.set_persistent_status("Probing SSH server: down");
+
+        let save = app.ssh_probed("down", Err("connection timed out".to_string()));
+
+        assert!(!save);
+        assert_eq!(app.config.ssh_servers.len(), 0);
+        assert!(app.status.is_none());
+        assert_eq!(
+            last_error(&app),
+            Some("Failed to add SSH server down: connection timed out")
+        );
+    }
+
     #[tokio::test]
     async fn a_refused_daemon_request_is_a_chat_error_not_a_failure() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5594,6 +5694,56 @@ mod tests {
             None,
             "a new model drops the old window"
         );
+    }
+
+    #[tokio::test]
+    async fn the_context_meter_follows_a_compaction_and_returns_to_the_usage() {
+        use crate::client::CompactionPhase;
+        use crate::tui::state::{COMPACTED_HOLD, CompactionMeter};
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        let frame = |session_id: &str, phase| AppEvent::Compaction {
+            session_id: session_id.to_string(),
+            phase,
+        };
+        assert_eq!(app.compaction, CompactionMeter::Idle);
+
+        app.handle_event(frame("another-session", CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Idle, "another session");
+
+        app.handle_event(frame(&id, CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Compacting);
+
+        app.handle_event(frame(&id, CompactionPhase::Applied))
+            .expect("frame");
+        let CompactionMeter::Compacted { until } = app.compaction else {
+            panic!(
+                "a finished compaction reads Compacted: {:?}",
+                app.compaction
+            );
+        };
+
+        let start = until.checked_sub(COMPACTED_HOLD).expect("hold start");
+        app.compaction
+            .clear_expired(start + COMPACTED_HOLD.mul_f32(0.5));
+        assert!(app.compaction.is_holding(), "held for the whole hold");
+        app.compaction.clear_expired(until);
+        assert_eq!(app.compaction, CompactionMeter::Idle);
+
+        // A compaction that changed nothing restores the usage figure.
+        for ended in [
+            CompactionPhase::NothingToCompact,
+            CompactionPhase::Failed,
+            CompactionPhase::Discarded,
+        ] {
+            app.handle_event(frame(&id, CompactionPhase::Started))
+                .expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Compacting);
+            app.handle_event(frame(&id, ended)).expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Idle, "{ended:?}");
+        }
     }
 
     #[tokio::test]

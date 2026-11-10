@@ -89,6 +89,15 @@ pub struct SessionArgs {
     #[serde(default)]
     pub include_content: bool,
 
+    /// With `session messages <id>`: return only the messages around this
+    /// message id instead of the whole session.
+    #[serde(default)]
+    pub around: Option<i64>,
+
+    /// With `--around`: how many messages to return on each side. Default 3.
+    #[serde(default)]
+    pub context: Option<usize>,
+
     /// Include current session. Default false.
     #[serde(default)]
     pub include_current: bool,
@@ -144,6 +153,8 @@ enum SessionToolError {
     MissingActionSessionId { action: &'static str },
     #[error("session '{session_id}' was not found")]
     SessionNotFound { session_id: String },
+    #[error("session '{session_id}' has no message {message_id}")]
+    MessageNotFound { session_id: String, message_id: i64 },
     #[error(
         "every matching message is already present in the current context window; refine the query to recall older or other-session content"
     )]
@@ -171,6 +182,28 @@ struct SessionInspectRequest {
 #[derive(Debug, Clone)]
 struct SessionMessagesRequest {
     session_id: String,
+    around: Option<MessageWindow>,
+}
+
+/// The messages around one message of a session.
+#[derive(Debug, Clone, Copy)]
+struct MessageWindow {
+    message_id: i64,
+    context: usize,
+}
+
+const DEFAULT_AROUND_CONTEXT: usize = 3;
+
+impl SessionMessagesRequest {
+    fn new(session_id: String, args: &SessionArgs) -> Self {
+        Self {
+            session_id,
+            around: args.around.map(|message_id| MessageWindow {
+                message_id,
+                context: args.context.unwrap_or(DEFAULT_AROUND_CONTEXT),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -504,12 +537,21 @@ async fn execute_messages(
             session_id: request.session_id.clone(),
         }
     })?;
-    let messages = db
-        .get_messages(&request.session_id)
-        .await?
-        .into_iter()
-        .map(SessionMessageView::from)
-        .collect::<Vec<_>>();
+    let messages = match request.around {
+        None => db.get_messages(&request.session_id).await?,
+        Some(window) => {
+            let context = i64::try_from(window.context).unwrap_or(i64::MAX);
+            db.messages_around(&request.session_id, window.message_id, context)
+                .await?
+                .ok_or_else(|| SessionToolError::MessageNotFound {
+                    session_id: request.session_id.clone(),
+                    message_id: window.message_id,
+                })?
+        }
+    }
+    .into_iter()
+    .map(SessionMessageView::from)
+    .collect::<Vec<_>>();
 
     let text = SessionMessagesText {
         session: SessionSummaryView::from(session),
@@ -723,9 +765,7 @@ fn plan_from_tokens(
                 .get(1)
                 .ok_or(SessionToolError::MissingActionSessionId { action: "messages" })?;
             Ok(Some(SessionExecutionPlan::Messages(
-                SessionMessagesRequest {
-                    session_id: session_id.clone(),
-                },
+                SessionMessagesRequest::new(session_id.clone(), args),
             )))
         }
         "list" if tokens.len() == 1 => Ok(Some(SessionExecutionPlan::List(SessionListRequest {
@@ -762,11 +802,9 @@ fn plan_from_raw_query(
                 session_id: tokens[1].to_string(),
             }))
         }
-        "messages" if tokens.len() == 2 => {
-            Some(SessionExecutionPlan::Messages(SessionMessagesRequest {
-                session_id: tokens[1].to_string(),
-            }))
-        }
+        "messages" if tokens.len() == 2 => Some(SessionExecutionPlan::Messages(
+            SessionMessagesRequest::new(tokens[1].to_string(), args),
+        )),
         "list" if tokens.len() == 1 => Some(SessionExecutionPlan::List(SessionListRequest {
             limit: args.limit.clamp(1, 200),
             offset: args.offset,
@@ -914,7 +952,7 @@ fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> boo
     args.include_archived || !row.archived
 }
 
-fn truncate_text(input: &str, max_chars: usize) -> String {
+pub(super) fn truncate_text(input: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in input.chars().enumerate() {
         if idx >= max_chars {
@@ -1013,6 +1051,8 @@ mod tests {
             since: None,
             until: None,
             title_contains: None,
+            around: None,
+            context: None,
             include_content: false,
             include_current: false,
             include_archived: false,
@@ -1194,6 +1234,69 @@ mod tests {
             panic!("expected search plan");
         };
         assert_eq!(args.query, "abc123");
+    }
+
+    #[tokio::test]
+    async fn messages_around_returns_exactly_the_window() {
+        use crate::db::MessageMeta;
+        use crate::session::MessageRole;
+
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("s1", Some("t"), Some("m"))
+            .await
+            .expect("session");
+        db.create_session("s2", Some("t"), Some("m"))
+            .await
+            .expect("session");
+        let mut ids = Vec::new();
+        for n in 0..9 {
+            // An interleaved row of another session must not enter the window.
+            let session = if n == 4 { "s2" } else { "s1" };
+            let message = db
+                .append_message(
+                    session,
+                    MessageRole::User,
+                    &format!("body {n}"),
+                    Some("2026-01-01T00:00:00Z"),
+                    MessageMeta::default(),
+                )
+                .await
+                .expect("append");
+            ids.push(i64::from(message.id));
+        }
+
+        let mut args = base_args();
+        args.around = Some(ids[6]);
+        args.context = Some(2);
+        let request = SessionMessagesRequest::new("s1".to_string(), &args);
+        let text = execute_messages(db_path.clone(), request)
+            .await
+            .expect("messages")
+            .as_text()
+            .expect("text")
+            .to_string();
+        assert!(text.contains("5 message(s):"), "{text}");
+        for n in [3, 5, 6, 7, 8] {
+            assert!(
+                text.contains(&format!("body {n}\n")) || text.ends_with(&format!("body {n}\n")),
+                "{text}"
+            );
+        }
+        for n in [0, 1, 2, 4] {
+            assert!(!text.contains(&format!("body {n}")), "{text}");
+        }
+
+        let mut args = base_args();
+        args.around = Some(ids[4]);
+        let missing = execute_messages(
+            db_path,
+            SessionMessagesRequest::new("s1".to_string(), &args),
+        )
+        .await
+        .expect_err("message of another session");
+        assert!(missing.to_string().contains("has no message"), "{missing}");
     }
 
     fn match_row(session_id: &str, message_id: i64, content: &str) -> SessionMatchRow {

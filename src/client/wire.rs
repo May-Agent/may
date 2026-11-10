@@ -397,6 +397,52 @@ impl WireAgentEvent {
     }
 }
 
+/// How far a compaction of a session has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    /// A compaction began.
+    Started,
+    /// The compaction replaced the context with its handoff.
+    Applied,
+    /// There was no conversation to compact.
+    NothingToCompact,
+    /// The compaction failed; the failure is reported where it was asked
+    /// for, and the context is as it was.
+    Failed,
+    /// A newer compaction superseded this one before it landed.
+    Discarded,
+}
+
+impl CompactionPhase {
+    /// The phase a compaction event reports, or `None` for any other event.
+    #[must_use]
+    pub const fn from_event(event: &AgentEvent) -> Option<Self> {
+        use aither_agent::CompactionOutcome;
+        Some(match event {
+            AgentEvent::CompactionStarted => Self::Started,
+            AgentEvent::CompactionFinished { outcome } => match outcome {
+                CompactionOutcome::Applied(_) => Self::Applied,
+                CompactionOutcome::NothingToCompact => Self::NothingToCompact,
+                CompactionOutcome::Failed(_) => Self::Failed,
+                CompactionOutcome::Discarded => Self::Discarded,
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// One frame of the `session_compaction` event kind. Compactions run
+/// between turns as well as in them, so the frame belongs to no turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompactionFrame {
+    /// Session being compacted.
+    pub session_id: String,
+    /// Where the compaction stands.
+    pub phase: CompactionPhase,
+}
+
 /// How a daemon run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -802,11 +848,19 @@ pub struct WorkspacePollItem {
     pub session_id: Option<String>,
 }
 
+/// `POST /api/session-names` response body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssuedSessionName {
+    /// A session name no session was ever named by.
+    pub name: String,
+}
+
 /// `POST /api/sessions` request body.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
-    /// Session id the client pre-generated; the daemon assigns one otherwise.
+    /// Session name the daemon issued to this client through
+    /// `/api/session-names`; the daemon issues one otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Model to bind.

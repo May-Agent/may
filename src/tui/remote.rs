@@ -517,6 +517,19 @@ async fn follow_session(
                             .await;
                     }
                 }
+                "session_compaction" => {
+                    if let Ok(frame) =
+                        serde_json::from_str::<crate::client::SessionCompactionFrame>(&event.data)
+                    {
+                        let _ = forwarding
+                            .app_events
+                            .send(AppEvent::Compaction {
+                                session_id: frame.session_id,
+                                phase: frame.phase,
+                            })
+                            .await;
+                    }
+                }
                 "session_recap" => {
                     if let Ok(frame) =
                         serde_json::from_str::<crate::client::RecapFrame>(&event.data)

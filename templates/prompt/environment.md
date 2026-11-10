@@ -18,5 +18,5 @@ Session directory: {{ session_dir }}. The terminal starts there.
 {% endif %}{% if !modalities.is_empty() %}You can take these inputs directly: {{ modalities|join(", ") }}.
 {% endif %}{% if let Some(remote) = remote %}
 Remote hosts are connected. Run a command on one with `terminal` `location: "<name>"`. The paths above and the May commands in the catalog exist only on this machine, not on a remote host.
-{% for host in remote.hosts() %}- {{ host.name }} ({{ host.target }})
+{% for host in remote.hosts() %}- {{ host.name }} ({{ host.target }}), {{ host.platform }}
 {% endfor %}{% endif %}</environment>

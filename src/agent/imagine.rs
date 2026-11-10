@@ -45,6 +45,8 @@ pub struct ImagineArgs {
 pub struct ImagineTool {
     pub(crate) generator: Option<ImageGeneratorConfig>,
     pub(crate) artifacts_dir: PathBuf,
+    /// The session's pool of model-facing ids, which names each image.
+    pub(crate) ids: aither_core::AnyIdAllocator,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,15 +127,13 @@ impl ImagineTool {
         }
 
         let image = latest.ok_or(ImagineToolError::EmptyResponse)?;
-        let mut filename = crate::id::new();
-        filename.push_str(".png");
-        let path = self.artifacts_dir.join(&filename);
         async_fs::create_dir_all(&self.artifacts_dir)
             .await
             .map_err(ImagineToolError::CreateArtifactsDir)?;
-        async_fs::write(&path, image)
-            .await
-            .map_err(ImagineToolError::WriteImage)?;
+        let filename =
+            crate::model_ids::write_word_file(&self.ids, &self.artifacts_dir, "png", &image)
+                .await
+                .map_err(ImagineToolError::WriteImage)?;
 
         let mut artifact_path = String::with_capacity(filename.len() + 10);
         artifact_path.push_str("artifacts/");

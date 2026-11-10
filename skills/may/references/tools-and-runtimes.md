@@ -40,6 +40,12 @@ The interpreter is installed into the same tree as the tools, under `<key>/bin/.
 
 A session's `PATH` is the prepared directory `<key>/bin` first, then the host's own `PATH` (so `cargo`, `git`, `gh`, and anything else on the host stay reachable). Managed tools therefore win over a system tool of the same name (the system `python3`, `jq`, `rg`, `ls`, ... are shadowed); a host tool with no managed counterpart is found as usual. The terminal also sets `HOME` and `TMPDIR` to the session directory (`TMPDIR` to its `tmp/`), `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` under it, and `PYTHONPATH` to start with the session's `skills/python`, followed by any inherited value.
 
+Commands a connected ACP agent runs through ACP `terminal/*` get the same `PATH`: the session's managed directory first, then the host's, and the managed directory is readable and executable in their sandbox. The agent's own process keeps the host `PATH`. `may exec` and scheduled commands prepare the same tools as a session's terminal.
+
+## Read policy
+
+A sandboxed command reads everywhere on the machine except credential stores and keys (for example `~/.ssh`, `~/.config/gh` and keychain items); it writes only the session directory and granted workdirs. A command that needs a denied path or the host environment as it is runs as an `unsafe` command with the user's approval.
+
 ## Python projects and uv
 
 The environment exports `UV_CACHE_DIR=~/.may/tools/runtimes/uv/cache`, `UV_PYTHON_INSTALL_DIR=~/.may/tools/runtimes/uv/python` and `UV_PYTHON_PREFERENCE=system`. Effects:
@@ -47,3 +53,9 @@ The environment exports `UV_CACHE_DIR=~/.may/tools/runtimes/uv/cache`, `UV_PYTHO
 - `python3` is always the managed 3.13.18. A project that asks for no particular Python gets that interpreter from `PATH` through `uv` (`system` preference) instead of whichever interpreter `uv` last installed for another project.
 - A project's `.python-version` or `requires-python`, or an existing `.venv`, that the `PATH` interpreter does not satisfy is not refused: `uv` installs the requested Python into `UV_PYTHON_INSTALL_DIR` (shared by all sessions) or uses the one the `.venv` was built with. Use `uv venv`, `uv sync`, `uv run` and `uv pip` for project environments.
 - The first run of the first session downloads and verifies artifacts and installs Python, so it is slow; later sessions reuse the directory.
+
+## Ids the agent sees
+
+A session is named by two common English words joined by `-` (`amber-river`): that name is the session's id and the id of its main agent (`agent list`, `agent send`, issue owners, `session` results). The daemon issues every name from one generator, records it, and never issues it again, even after its session is deleted; a session keeps its name for life, archived or not.
+
+Every other id the agent reads or types back is one common English word that is a single token (checked against `o200k_base`), from the pool of the session it belongs to: background job ids, stored output files (`outputs/<word>.<ext>`), subagents, `ask_user` questions (`BLOCKING <word>`, `withdraw_ask_user`), tunnels (`/tunnel/<session>/<word>/`), scheduled tasks, browser screenshots (`artifacts/browser/<word>.<ext>`) and `imagine` images. No two live ids of one session share a word whatever they name, and none is ever a session name, since a pool word has no `-`. A word is free again once its thing can no longer be addressed: a job forgotten, a subagent past its cache lifetime, a question answered or withdrawn, a tunnel closed, a task deleted; a screenshot or image keeps its file name, and its word is only held while the file is named. Open questions and scheduled tasks keep their word across daemon restarts; the web UI and the API keep addressing them by their request and task ids.
