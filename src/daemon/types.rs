@@ -709,6 +709,25 @@ impl RequestLogEntry {
         }
     }
 
+    /// The row this entry is stored as.
+    pub(crate) fn as_params(&self) -> crate::db::RequestLogParams<'_> {
+        crate::db::RequestLogParams {
+            session_id: self.session_id.as_str(),
+            timestamp: self.timestamp.as_str(),
+            model: self.model.as_str(),
+            provider_id: self.provider_id.as_str(),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            context_window: self.context_window,
+            elapsed_ms: self.elapsed_ms,
+            ok: self.ok,
+            error: self.error.as_deref(),
+        }
+    }
+
     pub(crate) const fn success(mut self, elapsed_ms: u64) -> Self {
         self.ok = true;
         self.elapsed_ms = elapsed_ms;

@@ -110,6 +110,25 @@ impl SessionRuns {
         self
     }
 
+    /// Records a request that only refreshed `entry`'s session's prompt
+    /// cache with the session's usage, marked as such.
+    pub(crate) async fn record_keep_warm_request(
+        &self,
+        entry: crate::daemon::types::RequestLogEntry,
+    ) {
+        let logged = match self.db.append_request_log(entry.as_params()).await {
+            Ok(logged) => logged,
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist a keep-warm request");
+                return;
+            }
+        };
+        if let Err(error) = self.db.mark_request_keep_warm(&logged).await {
+            tracing::warn!(%error, "failed to mark a keep-warm request");
+        }
+        self.ui_event_bus.publish(UiEventTopics::REQUEST_LOGS);
+    }
+
     fn live_runs(&self) -> std::sync::MutexGuard<'_, HashMap<String, LiveRun>> {
         self.live.lock().expect("session runs map is poisoned")
     }

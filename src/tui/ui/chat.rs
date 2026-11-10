@@ -1879,6 +1879,15 @@ impl UsageWallClock {
     }
 }
 
+/// A model's request count on its `/usage` row, with the requests that only
+/// kept the prompt cache warm.
+#[derive(askama::Template)]
+#[template(path = "usage_model_requests.txt", escape = "none")]
+struct UsageModelRequests {
+    requests: u64,
+    keep_warm: u64,
+}
+
 /// A model's cache misses under its `/usage` row.
 #[derive(askama::Template)]
 #[template(path = "usage_model_cache_misses.txt", escape = "none")]
@@ -1990,7 +1999,15 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled(model.model.clone(), value),
-            Span::styled(format!("  {} requests", model.requests), dim),
+            Span::styled(
+                UsageModelRequests {
+                    requests: model.requests,
+                    keep_warm: model.keep_warm_requests,
+                }
+                .render()
+                .expect("the model requests template renders"),
+                dim,
+            ),
         ]));
         let cost_suffix = model
             .cost_usd
@@ -4395,6 +4412,7 @@ mod tests {
                 cache_misses: 2,
                 cache_miss_tokens: 30_000,
                 cost_usd: None,
+                keep_warm_requests: 1,
             }],
             cache_miss_causes: vec![
                 crate::agent::CacheMissCauseRow {
@@ -4430,6 +4448,12 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.ends_with("3 requests (1 keep-warm)")),
+            "{rendered:?}"
+        );
         let misses = rendered
             .iter()
             .skip_while(|line| !line.starts_with("    cache misses"))

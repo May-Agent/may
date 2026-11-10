@@ -315,6 +315,7 @@ mod tests {
             assemble_usage_report(
                 SESSION,
                 &[],
+                &[],
                 &misses,
                 &SessionIntervals::default(),
                 Some(START_MS),

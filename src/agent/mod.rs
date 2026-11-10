@@ -29,6 +29,9 @@ mod host_load_tests;
 pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
+pub mod keep_warm;
+#[cfg(test)]
+mod keep_warm_tests;
 #[cfg(test)]
 mod live_content_tests;
 mod live_limits;

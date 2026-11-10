@@ -1,0 +1,1 @@
+  {{ requests }} requests{% if keep_warm > 0 %} ({{ keep_warm }} keep-warm){% endif %}

@@ -38,6 +38,10 @@ pub struct ModelUsageRow {
     /// Cost in USD when the model's pricing is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// How many of `requests` only refreshed the prompt cache while a
+    /// background command ran; their cost is part of the row's totals.
+    #[serde(default)]
+    pub keep_warm_requests: u64,
 }
 
 /// Aggregated provider usage of one session, answer of `/usage`.
@@ -118,11 +122,13 @@ fn stored_cause(row: &cache_misses::Model) -> CacheMissCause {
         .unwrap_or_else(|error| panic!("cache_misses row {}: {error}", row.id))
 }
 
-/// Fold the session's request log into a usage report.
+/// Fold the session's request log into a usage report. `keep_warm` holds the
+/// ids of the logged requests that only refreshed the prompt cache.
 #[must_use]
 pub fn assemble_usage_report(
     session_id: &str,
     rows: &[request_logs::Model],
+    keep_warm: &[i32],
     misses: &[cache_misses::Model],
     intervals: &SessionIntervals,
     created_at_ms: Option<i64>,
@@ -141,6 +147,7 @@ pub fn assemble_usage_report(
         cache_misses: 0,
         cache_miss_tokens: 0,
         cost_usd: None,
+        keep_warm_requests: 0,
     };
     for row in rows {
         let index = models
@@ -152,6 +159,7 @@ pub fn assemble_usage_report(
             });
         let entry = &mut models[index];
         entry.requests += 1;
+        entry.keep_warm_requests += u64::from(keep_warm.contains(&row.id));
         entry.prompt_tokens += u64::try_from(row.prompt_tokens.unwrap_or(0)).unwrap_or_default();
         entry.completion_tokens +=
             u64::try_from(row.completion_tokens.unwrap_or(0)).unwrap_or_default();
@@ -299,8 +307,15 @@ mod tests {
     }
 
     fn report(rows: &[request_logs::Model]) -> ModelUsageRow {
-        let mut report =
-            assemble_usage_report("s", rows, &[], &SessionIntervals::default(), None, 1_000);
+        let mut report = assemble_usage_report(
+            "s",
+            rows,
+            &[],
+            &[],
+            &SessionIntervals::default(),
+            None,
+            1_000,
+        );
         report.models.remove(0)
     }
 
