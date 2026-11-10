@@ -70,6 +70,7 @@ pub mod subagent_tracker;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
+pub(crate) mod webfetch_tool;
 mod usage;
 mod wall_clock;
 pub mod work_tracker;
