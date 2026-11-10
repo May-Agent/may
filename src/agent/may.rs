@@ -1667,7 +1667,14 @@ pub async fn test_agent(
         .await
         .expect("open test db");
     let session_id = SessionId::from_string("amber-river");
+    // A fixed clock, so two agents built for one test stamp the same time.
+    let clock = aither_agent::ManualClock::at_utc(
+        "2026-11-10T12:00:00Z"
+            .parse()
+            .expect("a valid test timestamp"),
+    );
     let inner = Agent::builder(llm.llm.clone())
+        .clock(clock)
         .request_parameters(llm.parameters.clone())
         .system_layout(tag::layout())
         .agent_kind(AgentKind::Chatbot)
