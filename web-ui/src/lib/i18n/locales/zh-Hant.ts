@@ -196,6 +196,7 @@ export const zhHant: Messages = {
     escalated: '已提升權限',
     sshLocation: 'SSH',
     viewFullOutput: '檢視完整輸出',
+    invalidArguments: '參數無效',
     card: {
       tasksAdded: '已新增任務',
       tasksStarted: '已開始任務',

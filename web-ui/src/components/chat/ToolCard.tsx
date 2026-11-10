@@ -25,6 +25,7 @@ import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, terminalLocation, type OutputStream } from '@/lib/terminalResult';
+import { invalidToolArguments } from '@/lib/toolArguments';
 import { recognisesAny } from '@/lib/commandReading';
 import { CommandCardView } from './CommandCardView';
 import { CommandReadingView } from './CommandReadingView';
@@ -289,6 +290,25 @@ function TerminalDetails({
   );
 }
 
+/** A terminal-family call whose arguments did not match its schema: the raw arguments and why. */
+function InvalidArgumentsDetails({ tool, error }: { tool: TurnToolState; error: string }) {
+  const { t } = useTranslation();
+  const resultText = extractGenericResultText(tool.result);
+  return (
+    <div className="space-y-2">
+      <div className="text-[11px] text-destructive">
+        {t('tools.invalidArguments')}: {error}
+      </div>
+      {tool.argumentsRaw.length > 0 && (
+        <pre className="text-xs font-mono text-foreground/80 whitespace-pre-wrap break-all max-h-48 overflow-auto scrollbar-thin">
+          {tool.argumentsRaw}
+        </pre>
+      )}
+      {resultText !== null && <OutputBlock text={resultText} />}
+    </div>
+  );
+}
+
 function GenericDetails({ tool }: { tool: TurnToolState }) {
   const parsed = useMemo(() => parsePartialJson(tool.argumentsRaw), [tool.argumentsRaw]);
   const hasArgs =
@@ -338,9 +358,18 @@ function ExpandableToolCard({ tool }: ToolCardProps) {
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const Icon = VARIANT_ICON[tool.variant] ?? Wrench;
   const variantLabel = t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic');
-  const primary = pickPrimaryLabel(tool, variantLabel);
   const streaming = tool.status === 'streaming';
-  const details = selectDetails(tool, primary);
+  const invalid = streaming ? null : invalidToolArguments(tool.variant, tool.argumentsRaw);
+  const primary =
+    invalid === null
+      ? pickPrimaryLabel(tool, variantLabel)
+      : `${variantLabel} (${t('tools.invalidArguments')})`;
+  const details =
+    invalid === null ? (
+      selectDetails(tool, primary)
+    ) : (
+      <InvalidArgumentsDetails tool={tool} error={invalid} />
+    );
   const streamTerminalDetails = streaming && isTerminalVariant(tool.variant);
 
   useEffect(() => {

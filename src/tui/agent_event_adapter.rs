@@ -36,6 +36,17 @@ pub enum ToolStartKind {
         /// Task identifier of the target background job.
         task_id: String,
     },
+    /// A known terminal tool whose model-written arguments did not match
+    /// its schema. The daemon returns an argument error to the model; the
+    /// frontend shows the call as it was written.
+    Malformed {
+        /// Tool name.
+        name: String,
+        /// Raw arguments payload.
+        arguments: String,
+        /// The deserialization error text.
+        error: String,
+    },
     /// Any other tool invocation.
     Generic {
         /// Tool name.
@@ -107,48 +118,52 @@ pub const COMPACT_TOOL: &str = "compact";
 
 /// Parse tool-call start payload into a minimal start event.
 ///
-/// # Panics
-///
-/// Panics when `name` is a known terminal tool but `arguments` does not
-/// deserialize as that tool's args — the agent and its tool schema are
-/// versioned together, so a malformed payload indicates a bug.
+/// The arguments are written by the model, so a known terminal tool whose
+/// arguments do not deserialize is ordinary input: it becomes
+/// [`ToolStartKind::Malformed`] with the error text.
 #[must_use]
 pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
+    fn parse<T: serde::de::DeserializeOwned>(
+        name: &str,
+        arguments: &str,
+        build: impl FnOnce(T) -> ToolStartKind,
+    ) -> ToolStartKind {
+        serde_json::from_str::<T>(arguments).map_or_else(
+            |error| ToolStartKind::Malformed {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+                error: error.to_string(),
+            },
+            build,
+        )
+    }
     match name {
-        "terminal" => {
-            let args = serde_json::from_str::<TerminalArgs>(arguments)
-                .unwrap_or_else(|e| panic!("invalid terminal tool args payload: {e}"));
+        "terminal" => parse(name, arguments, |args: TerminalArgs| {
             ToolStartKind::Terminal {
                 description: args.description,
                 script: args.script,
                 mode: args.mode,
                 location: location_name(args.location.as_deref()),
             }
-        }
-        "terminal_input" => {
-            let args = serde_json::from_str::<InputTerminalArgs>(arguments)
-                .unwrap_or_else(|e| panic!("invalid terminal_input tool args payload: {e}"));
+        }),
+        "terminal_input" => parse(name, arguments, |args: InputTerminalArgs| {
             ToolStartKind::Stdin {
                 task_id: args.task_id,
                 input: args.input,
             }
-        }
-        "terminal_kill" => {
-            let args = serde_json::from_str::<KillTerminalArgs>(arguments)
-                .unwrap_or_else(|e| panic!("invalid terminal_kill tool args payload: {e}"));
+        }),
+        "terminal_kill" => parse(name, arguments, |args: KillTerminalArgs| {
             ToolStartKind::JobControl {
                 action: JobControlAction::Kill,
                 task_id: args.task_id,
             }
-        }
-        "terminal_read" => {
-            let args = serde_json::from_str::<ReadTerminalDeltaArgs>(arguments)
-                .unwrap_or_else(|e| panic!("invalid terminal_read tool args payload: {e}"));
+        }),
+        "terminal_read" => parse(name, arguments, |args: ReadTerminalDeltaArgs| {
             ToolStartKind::JobControl {
                 action: JobControlAction::Read,
                 task_id: args.task_id,
             }
-        }
+        }),
         _ => ToolStartKind::Generic {
             name: name.to_string(),
             summary: generic_summary(arguments),
@@ -375,6 +390,32 @@ mod tests {
                 }
                 _ => panic!("expected terminal start event"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_malformed_terminal_arguments() {
+        let ToolStartKind::Malformed {
+            name,
+            arguments,
+            error,
+        } = parse_tool_start("terminal", r#"{"command":"ls"}"#)
+        else {
+            panic!("expected malformed start kind");
+        };
+        assert_eq!(name, "terminal");
+        assert_eq!(arguments, r#"{"command":"ls"}"#);
+        assert!(error.contains("script"), "{error}");
+    }
+
+    #[test]
+    fn parse_tool_start_malformed_other_terminal_tools() {
+        for tool in ["terminal_input", "terminal_kill", "terminal_read"] {
+            let ToolStartKind::Malformed { name, error, .. } = parse_tool_start(tool, "[1]") else {
+                panic!("expected malformed start kind for {tool}");
+            };
+            assert_eq!(name, tool);
+            assert_ne!(error, "");
         }
     }
 

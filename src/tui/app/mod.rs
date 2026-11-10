@@ -4368,6 +4368,25 @@ impl App {
                 output: None,
                 pinned: None,
             },
+            ToolStartKind::Malformed {
+                name,
+                arguments,
+                error,
+            } => {
+                let mut detail = vec![format!("invalid arguments: {error}")];
+                detail.extend(pretty_arguments(&arguments));
+                ToolDisplay::Action {
+                    chip: name,
+                    task_id: None,
+                    summary: "invalid arguments".to_string(),
+                    detail,
+                    status: super::ui::chat::ToolStatus::Failed(format!(
+                        "invalid arguments: {error}"
+                    )),
+                    output: None,
+                    pinned: None,
+                }
+            }
             ToolStartKind::Generic {
                 name,
                 summary,
@@ -4978,6 +4997,40 @@ mod tests {
             .draw(|frame| crate::tui::ui::render(frame, app))
             .expect("draw");
         crate::tui::ui::test_screen::buffer_screen(frame.buffer)
+    }
+
+    /// A `terminal` call whose arguments miss `script` shows as that call
+    /// with the invalid-arguments marker and the parse error, as a failed
+    /// call, and nothing panics.
+    #[tokio::test]
+    async fn a_terminal_call_with_malformed_arguments_renders_with_its_error() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for tool in ["terminal", "terminal_kill"] {
+            let kind =
+                crate::tui::agent_event_adapter::parse_tool_start(tool, r#"{"command":"ls"}"#);
+            app.show_tool_start(format!("call-{tool}"), kind);
+            let display = app.chat.get_tool(&format!("call-{tool}")).expect("shown");
+            let super::ToolDisplay::Action {
+                chip,
+                summary,
+                detail,
+                status,
+                ..
+            } = display
+            else {
+                panic!("malformed call renders as an action");
+            };
+            assert_eq!(chip, tool);
+            assert_eq!(summary, "invalid arguments");
+            assert!(detail[0].starts_with("invalid arguments: "), "{detail:?}");
+            assert!(
+                matches!(status, crate::tui::ui::chat::ToolStatus::Failed(error) if error.contains("missing field")),
+                "{status:?}"
+            );
+        }
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("invalid arguments"), "{screen}");
     }
 
     /// The Preferences tab lists the jobserver pool size (automatic until
