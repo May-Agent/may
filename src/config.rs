@@ -1369,6 +1369,9 @@ pub struct MayConfig {
     /// How long an agent's `tasks.md` may grow.
     #[serde(default)]
     pub tasks: TasksSettings,
+    /// The shell's time bounds and output budgets.
+    #[serde(default)]
+    pub shell: ShellSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1857,6 +1860,76 @@ impl Default for TasksSettings {
     }
 }
 
+/// `[shell]` section: how long a script may run and how much of its output
+/// reaches the model. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ShellSettings {
+    /// How long a `terminal` call waits before its script becomes a
+    /// background task.
+    #[serde(with = "duration_text")]
+    pub foreground_wait: Duration,
+    /// The longest `timeout` a script may ask for.
+    #[serde(with = "duration_text")]
+    pub timeout_cap: Duration,
+    /// How long a background task runs before the agent is told it is
+    /// still running.
+    #[serde(with = "duration_text")]
+    pub long_job_alert: Duration,
+    /// The longest a `monitor` may run.
+    #[serde(with = "duration_text")]
+    pub monitor_max_timeout: Duration,
+    /// Seconds between a `monitor`'s deliveries when its call states none.
+    #[serde(with = "duration_text")]
+    pub monitor_default_interval: Duration,
+    /// How long the agent has to act on a final memory warning.
+    #[serde(with = "duration_text")]
+    pub response_window: Duration,
+    /// Bytes a subagent's sandbox may send while its commits are imported.
+    pub subagent_import_bytes: u64,
+    /// Output bytes returned inline before the rest is saved to a file.
+    pub inline_output_bytes: usize,
+    /// Bytes of a saved output kept as its preview.
+    pub preview_bytes: usize,
+    /// Output lines returned inline when a call states no `max_lines`.
+    pub default_lines: u32,
+    /// The most output lines a call may ask for.
+    pub ceiling_lines: u32,
+    /// Bytes a `terminal_read` returns when its call states no `max_bytes`.
+    pub read_bytes: usize,
+    /// Pixels of the longer side of media delivered at `low` resolution.
+    pub media_low: u32,
+    /// Pixels of the longer side of media delivered at `medium` resolution.
+    pub media_medium: u32,
+    /// Pixels of the longer side of media delivered at `high` resolution.
+    pub media_high: u32,
+    /// Characters of a job's script shown in the job list.
+    pub job_preview_bytes: usize,
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            foreground_wait: Duration::from_secs(10),
+            timeout_cap: Duration::from_secs(120 * 60),
+            long_job_alert: Duration::from_secs(40 * 60),
+            monitor_max_timeout: Duration::from_secs(7200),
+            monitor_default_interval: Duration::from_secs(10),
+            response_window: Duration::from_secs(120),
+            subagent_import_bytes: 1024 * 1024 * 1024,
+            inline_output_bytes: 16_000,
+            preview_bytes: 16_000,
+            default_lines: 200,
+            ceiling_lines: 800,
+            read_bytes: 32 * 1024,
+            media_low: 512,
+            media_medium: 1024,
+            media_high: 2048,
+            job_preview_bytes: 50,
+        }
+    }
+}
+
 /// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
 mod duration_text {
     use std::time::Duration;
@@ -1916,6 +1989,7 @@ impl Default for MayConfig {
             host_load: HostLoadSettings::default(),
             disk: DiskSettings::default(),
             tasks: TasksSettings::default(),
+            shell: ShellSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
