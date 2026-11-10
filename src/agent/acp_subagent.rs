@@ -1075,18 +1075,21 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&work).expect("work dir");
         std::fs::create_dir_all(&outside).expect("outside dir");
+        // Only a read-denied path is unreadable outside the grants: the
+        // sandbox denies the paths of heel's credential table and what the
+        // session names with `deny_read`.
         let secret = outside.join("hosts.yml");
         std::fs::write(&secret, "oauth_token: hunter2\n").expect("secret file");
 
+        let session_dir = dir.path().join("session");
+        let raw = super::super::acp_sandbox::test_sandbox(&session_dir).await;
+        let grants = raw.grants().clone();
+        grants.add_readable(fixtures_dir());
+        grants.add_writable(work.clone());
+        grants.deny_read(secret.clone());
         let reply = fake_turn(
             dir.path(),
-            sandbox(
-                &dir.path().join("session"),
-                Vec::new(),
-                vec![work.clone()],
-                None,
-            )
-            .await,
+            SessionSandbox::for_session(raw, None, job_broker(&session_dir)),
             &work,
             &format!("RUN cat {}", secret.display()),
         )
@@ -1098,6 +1101,15 @@ mod tests {
         );
         assert!(reply.contains("exit:"), "{reply}");
         assert!(!reply.contains("exit:0"), "the denied read fails: {reply}");
+        let after = grants.snapshot();
+        assert!(
+            after
+                .writable
+                .iter()
+                .all(|path| !secret.starts_with(path) && !outside.starts_with(path)),
+            "naming the file granted a write: {:?}",
+            after.writable
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
