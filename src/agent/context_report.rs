@@ -10,7 +10,7 @@
 //! alongside the messages. Numbers are estimates at ~4 bytes per token,
 //! the same heuristic the agent uses for its own context budgeting.
 
-use aither_agent::{ContextPolicy, ContextWindowMetrics, ContextWindowPhase, InstructionSlot};
+use aither_agent::{ContextPolicy, ContextWindowMetrics, ContextWindowPhase};
 use aither_core::llm::tool::ToolDefinition;
 
 use super::runtime_context::tag;

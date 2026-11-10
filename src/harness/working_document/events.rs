@@ -6,7 +6,7 @@
 //! document takes them at the next request and, when a turn leaves the
 //! document as it was, alerts once per event, naming the rows it affects.
 
-use super::reference::WorkRef;
+use super::WorkRef;
 
 /// A state change a row of the working document may have to follow.
 #[derive(Debug, Clone, PartialEq, Eq)]

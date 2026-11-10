@@ -31,6 +31,7 @@ mod host_load_tests;
 pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
+mod job_events;
 pub mod keep_warm;
 #[cfg(test)]
 mod keep_warm_tests;
@@ -83,6 +84,7 @@ pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
+pub use job_events::{BackgroundWake, JobFact};
 pub use live_limits::LiveLimits;
 pub use live_settings::AgentLiveSettings;
 pub(crate) use may::side_slot;

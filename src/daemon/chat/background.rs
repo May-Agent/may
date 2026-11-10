@@ -435,20 +435,18 @@ pub async fn get_job(
     let Some((job, info)) = state.session_background.job_with(&session_id, pid).await else {
         return Ok(Json(WireJobDetail {
             job: None,
-            stdout: None,
-            stderr: None,
+            output: None,
         }));
     };
     // The shell keeps one buffer per job, in which the two streams are
-    // interleaved as they arrived, so the output is served whole as `stdout`.
-    let stdout = match job.read(0, usize::MAX).await {
+    // interleaved as they arrived.
+    let output = match job.read(0, usize::MAX).await {
         Ok(JobRead::Delta(delta)) => Some(delta.bytes),
         Ok(JobRead::Unchanged { .. }) | Err(_) => None,
     };
     Ok(Json(WireJobDetail {
         job: Some(WireJob::from(&info)),
-        stdout,
-        stderr: None,
+        output,
     }))
 }
 

@@ -6,10 +6,10 @@ use std::path::Path;
 use askama::Template;
 use futures::StreamExt;
 
+use super::WorkRef;
 use super::blocker::AnyBlockerResolver;
 use super::events::{Subject, WorkEvent, WorkEvents};
 use super::file::{self, DocumentFile, Snapshot};
-use super::reference::WorkRef;
 use super::review::{Blockers, DocumentAlertItem, DocumentReview, Statuses};
 use super::schema::{AnyDocumentSchema, DocumentRow, DocumentSpec, ParsedDocument};
 use super::tracker::{AnyWorkTracker, WorkItem, WorkTrackerError, kind_label};

@@ -1223,23 +1223,12 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
                 },
             );
             let mut lines: Vec<Line<'_>> = Vec::new();
-            if let Some((stdout, stderr)) = &state.output {
+            if let Some(output) = &state.output {
                 lines.extend(
-                    String::from_utf8_lossy(stdout)
+                    String::from_utf8_lossy(output)
                         .lines()
                         .map(|line| Line::from(line.to_string())),
                 );
-                if !stderr.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "── stderr ──".to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    lines.extend(
-                        String::from_utf8_lossy(stderr)
-                            .lines()
-                            .map(|line| Line::from(line.to_string())),
-                    );
-                }
             }
             if lines.is_empty() {
                 lines.push(Line::from(Span::styled(

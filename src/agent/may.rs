@@ -9,7 +9,9 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
     model::{Parameters, ReasoningEffort},
 };
-use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, Grants, Interpreter, SshServer};
+use aither_sandbox::{
+    AnyContainerExec, ContainerShellRuntime, Grants, Interpreter, ShellEvents, SshServer,
+};
 use executor_core::DefaultExecutor;
 
 use super::agents_md;
@@ -17,6 +19,7 @@ use super::compaction_report::CompactionReporter;
 use super::context_dump::ContextDump;
 use super::hooks::MayHooks;
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
+use super::job_events::{BackgroundWake, JobFact, JobReport, JobReports};
 use super::permission::PermissionApprover;
 use super::provider::{ModelSlot, ProviderLlm, resolve_provider_runtime};
 use super::runtime_context::{
@@ -60,10 +63,6 @@ use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::tools::ToolEnvironments;
 use crate::workspace::Workspace as MayWorkspace;
 use crate::workspace_request::WorkspaceRequestBroker;
-
-/// The cache lifetime at or below which a provider's cache can go cold while
-/// a subagent waits, and its keep-alives are on.
-const KEEP_ALIVE_BELOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How many keep-alives in one run count as idling frequently.
 const FREQUENT_IDLE_THRESHOLD: usize = 3;
@@ -380,6 +379,16 @@ pub struct MayAgent {
     inner: MayAgentInner,
     /// The session's shell: its jobs, events and grants.
     shell: Arc<SessionShell>,
+    /// The facts the shell raises about its jobs, which the idle agent waits
+    /// on.
+    job_events: ShellEvents,
+    /// Where a fact of a main-agent job is told to the clients that show it.
+    job_facts_tx: async_channel::Sender<JobFact>,
+    /// The other end of [`Self::job_facts_tx`].
+    job_facts: async_channel::Receiver<JobFact>,
+    /// Set when the user stopped the run: facts wait for the user's next
+    /// input instead of waking the session.
+    interrupted: bool,
     /// The live grants of the session's sandbox: an approved workspace
     /// request reaches the shell through them.
     grants: Grants,
@@ -892,7 +901,7 @@ impl MayAgent {
         let cache_lifetime: aither_agent::context::CacheLifetime = config.cache_lifetime.into();
         let keep_alive = matches!(
             config.cache_lifetime,
-            crate::cache_lifetime::CacheLifetime::Limited(lifetime) if lifetime <= KEEP_ALIVE_BELOW
+            crate::cache_lifetime::CacheLifetime::Limited(_)
         )
         .then_some(KeepAlive {
             frequent_idle_threshold: FREQUENT_IDLE_THRESHOLD,
@@ -1049,6 +1058,7 @@ impl MayAgent {
         )
         .into_sources();
 
+        let (job_facts_tx, job_facts) = async_channel::unbounded();
         let mut builder = AgentBuilder::new(llm)
             .hooks(hooks)
             .system_layout(tag::layout())
@@ -1065,7 +1075,8 @@ impl MayAgent {
             .fork_source(shared_terminal_commands.fork_source.clone())
             .subagents(subagent_tracker.runs().clone())
             .context_source(conditions)
-            .context_source(events);
+            .context_source(events)
+            .context_source(JobReports::new(shell.jobs().events(), job_facts_tx.clone()));
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }
@@ -1123,6 +1134,10 @@ impl MayAgent {
         Ok(Self {
             inner: agent,
             sandbox_dir: shell.working_dir().to_path_buf(),
+            job_events: shell.jobs().events(),
+            job_facts_tx,
+            job_facts,
+            interrupted: false,
             shell,
             grants,
             session_id: config.session_id,
@@ -1319,6 +1334,7 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        self.interrupted = false;
         self.inner.run(prompt, attachments)
     }
 
@@ -1343,7 +1359,45 @@ impl MayAgent {
     /// to act on what a background command reported. Driven like
     /// [`Self::run`].
     pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        self.interrupted = false;
         self.inner.resume()
+    }
+
+    /// Waits, between runs, for a fact about the session's jobs that the
+    /// agent has yet to read: a detached command ended, a monitor reported,
+    /// a job blocked on its stdin. The facts are put into the context, and
+    /// the wake says whether the model has something to act on, which the
+    /// host continues with [`Self::resume`]. Cancel-safe: nothing is taken
+    /// until the wait completes.
+    pub async fn wait_background(&mut self) -> BackgroundWake {
+        let first = self.job_events.recv().await;
+        let mut report = JobReport::default();
+        report.take(first, &self.job_facts_tx);
+        while let Some(event) = self.job_events.try_recv() {
+            report.take(event, &self.job_facts_tx);
+        }
+        for alert in report.alerts {
+            self.inner
+                .context_mut()
+                .push_block_alert(&aither_agent::Block::new("system-reminder", alert));
+        }
+        BackgroundWake {
+            pending: report.pending,
+            starts_run: report.needs_model && !self.interrupted,
+        }
+    }
+
+    /// The user stopped the run: what the session's jobs report from now on
+    /// waits for the user's next input instead of starting a run.
+    pub const fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// Where the facts of the session's main-agent jobs queue, for the
+    /// clients that show them: the agent tells one when it reads the fact,
+    /// whether a run or the idle wait does.
+    pub fn job_facts(&self) -> async_channel::Receiver<JobFact> {
+        self.job_facts.clone()
     }
 
     /// Whether the last run ended for the `compact` tool's request, which

@@ -1915,17 +1915,68 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
 /// Answers each request on `queue` with `handler`'s result until the queue
 /// closes. A request whose handler panics is dropped unanswered, so its
 /// caller sees the closed reply channel, and the next request is served.
-async fn dispatch_requests<Args: Clone, Response, Fut: Future<Output = Response>>(
+async fn dispatch_requests<Queue: RequestQueue, Fut: Future<Output = Queue::Response>>(
     worker: &'static str,
-    queue: crate::harness::tool_request::ToolRequestQueue<Args, Response>,
-    handler: impl Fn(Args) -> Fut,
+    queue: Queue,
+    handler: impl Fn(Queue::Args) -> Fut,
 ) {
-    while let Some(request) = queue.next().await {
-        if let Some(result) =
-            crate::panic_boundary::round(worker, handler(request.args.clone())).await
-        {
-            let _ = request.respond(result);
+    while let Some(request) = queue.next_request().await {
+        if let Some(result) = crate::panic_boundary::round(worker, handler(request.args)).await {
+            (request.reply)(result);
         }
+    }
+}
+
+/// A request waiting on a queue, and how it is answered.
+struct QueuedRequest<Args, Response> {
+    args: Args,
+    reply: Box<dyn FnOnce(Response) + Send>,
+}
+
+/// A queue of tool requests, May's own or the browser crate's, which each
+/// define the same one.
+trait RequestQueue {
+    type Args;
+    type Response;
+
+    /// Waits for the next request; `None` once every broker is gone.
+    fn next_request(
+        &self,
+    ) -> impl Future<Output = Option<QueuedRequest<Self::Args, Self::Response>>>;
+}
+
+impl<Args: Clone + Send + 'static, Response: Send + 'static> RequestQueue
+    for crate::harness::tool_request::ToolRequestQueue<Args, Response>
+{
+    type Args = Args;
+    type Response = Response;
+
+    async fn next_request(&self) -> Option<QueuedRequest<Args, Response>> {
+        let request = self.next().await?;
+        Some(QueuedRequest {
+            args: request.args.clone(),
+            reply: Box::new(move |response| {
+                let _ = request.respond(response);
+            }),
+        })
+    }
+}
+
+impl RequestQueue for crate::agent::browser_tool::BrowserQueue {
+    type Args = crate::agent::browser_tool::BrowserRequest;
+    type Response = Result<
+        crate::agent::browser_tool::BrowserResult,
+        crate::agent::browser_tool::BrowserToolError,
+    >;
+
+    async fn next_request(&self) -> Option<QueuedRequest<Self::Args, Self::Response>> {
+        let request = self.next().await?;
+        Some(QueuedRequest {
+            args: request.args.clone(),
+            reply: Box::new(move |response| {
+                let _ = request.respond(response);
+            }),
+        })
     }
 }
 
@@ -1938,6 +1989,43 @@ struct TurnRun<'r> {
     /// committed transcript instead of resubmitting the prompt.
     continue_from_transcript: bool,
     attempt: usize,
+}
+
+/// What the handler of a turn's run works on: the turn, the facts of the
+/// session's jobs not yet shown, and the run's checkpoints.
+struct TurnStep<'a, 't, 's, S> {
+    turn: &'a mut turn_events::TurnEvents<'t, 's, S>,
+    facts: async_channel::Receiver<crate::agent::JobFact>,
+    checkpoints: aither_agent::Checkpoints,
+}
+
+/// The handler [`aither_agent::Run::drive`] calls with each event of a
+/// turn's run: the job facts the agent read before it are shown first, and a
+/// checkpoint is persisted before its event is handled, so a crash mid-run
+/// loses no completed turn.
+async fn step_turn<'a, 't, 's, S: ChatSink>(
+    step: TurnStep<'a, 't, 's, S>,
+    timed: aither_agent::TimedEvent,
+) -> ControlFlow<turn_events::TurnStop, TurnStep<'a, 't, 's, S>> {
+    while let Ok(fact) = step.facts.try_recv() {
+        if let ControlFlow::Break(stop) = step.turn.job_fact(fact).await {
+            return ControlFlow::Break(stop);
+        }
+    }
+    if matches!(timed.event, aither_agent::AgentEvent::Checkpoint { .. })
+        && let Err(error) = crate::session::persist_run_checkpoint(
+            &step.turn.state.db(),
+            step.turn.guard.fence(),
+            &step.checkpoints,
+        )
+        .await
+    {
+        return ControlFlow::Break(turn_events::TurnStop::Persist(error));
+    }
+    match step.turn.handle(timed).await {
+        ControlFlow::Continue(()) => ControlFlow::Continue(step),
+        ControlFlow::Break(stop) => ControlFlow::Break(stop),
+    }
 }
 
 /// Runs one attempt of a turn on `agent`, handing each event to `turn`
@@ -1953,29 +2041,26 @@ async fn drive_turn<S: ChatSink>(
     let stop = async {
         turn_events::TurnStop::Cancelled(cancellation_reason_of(&guard.cancellation().recv().await))
     };
+    let facts = agent.job_facts();
     let driven = match kind {
         TurnKind::Prompt if !run.continue_from_transcript => {
-            agent
-                .run_with_hidden_context(run.prompt, run.hidden_context, run.attachments)
-                .drive(&mut *turn, stop, turn_events::step)
-                .await
+            let run =
+                agent.run_with_hidden_context(run.prompt, run.hidden_context, run.attachments);
+            let step = TurnStep {
+                turn: &mut *turn,
+                facts,
+                checkpoints: run.checkpoints(),
+            };
+            run.drive(step, stop, step_turn).await
         }
-        TurnKind::Prompt | TurnKind::Resume(_) => {
-            // The wake events reach clients with the first attempt only; a
-            // retry would show them twice.
-            if let TurnKind::Resume(wake_events) = kind
-                && run.attempt == 0
-            {
-                for timed in wake_events.iter().cloned() {
-                    if let ControlFlow::Break(stop) = turn.handle(timed).await {
-                        return Err(stop);
-                    }
-                }
-            }
-            agent
-                .resume()
-                .drive(&mut *turn, stop, turn_events::step)
-                .await
+        TurnKind::Prompt | TurnKind::Resume => {
+            let run = agent.resume();
+            let step = TurnStep {
+                turn: &mut *turn,
+                facts,
+                checkpoints: run.checkpoints(),
+            };
+            run.drive(step, stop, step_turn).await
         }
     };
     match driven {
@@ -2659,28 +2744,28 @@ fn run_agent_loop_attempts<'a>(
 const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
     matches!(
         event,
-        aither_agent::AgentEvent::Text(_)
-            | aither_agent::AgentEvent::ToolCallDelta { .. }
-            | aither_agent::AgentEvent::ToolCallStart { .. }
-            | aither_agent::AgentEvent::BuiltInToolCall { .. }
-            | aither_agent::AgentEvent::TurnComplete {
-                has_tool_calls: false,
+        aither_agent::AgentEvent::BlockDelta {
+            kind: aither_agent::OutputKind::Text,
+            ..
+        } | aither_agent::AgentEvent::ToolCallDelta { .. }
+            | aither_agent::AgentEvent::ToolCallStarted { .. }
+            | aither_agent::AgentEvent::TurnEnded { tool_calls: 0, .. }
+            | aither_agent::AgentEvent::RunEnded {
+                outcome: aither_agent::RunOutcome::Failed { .. },
                 ..
             }
-            | aither_agent::AgentEvent::Error(_)
     )
 }
 
-/// Starts a turn for `session_id` whose idle agent collected background
-/// commands that need the model (`events`), the wake `resuming` serves. An
-/// idle agent waits on background commands only after the run that parked
-/// it released the session, so the only thing that can hold the session
-/// here is a new turn, which takes the parked agent and sees the results;
-/// nothing runs then.
+/// Starts a turn for `session_id` whose idle agent read what its background
+/// commands reported and has something to act on, the wake `resuming`
+/// serves. An idle agent waits on background commands only after the run
+/// that parked it released the session, so the only thing that can hold the
+/// session here is a new turn, which takes the parked agent and sees the
+/// results; nothing runs then.
 pub(super) async fn start_background_turn(
     state: &Arc<DaemonState>,
     session_id: &str,
-    events: Vec<aither_agent::TimedEvent>,
     resuming: background::ResumePending,
 ) {
     if !state.parked_agents.contains(session_id) {
@@ -2701,12 +2786,12 @@ pub(super) async fn start_background_turn(
         delivery_mode: crate::session::PendingUserMessageMode::default(),
         pending_entry_id: None,
     };
-    tracing::info!(%session_id, events = events.len(), "background commands resume the session");
+    tracing::info!(%session_id, "background commands resume the session");
     if let Err(error) = Box::pin(run_published_turn(
         state.clone(),
         req,
         guard,
-        TurnKind::Resume(events),
+        TurnKind::Resume,
         Some(resuming),
     ))
     .await
@@ -4136,7 +4221,7 @@ fn build_session_agent<'a>(
         };
 
         let subagents = state.session_background.subagents(ctx.session_id.as_str());
-        cards::forward_updates(state, ctx.session_id.as_str(), subagents.tracker.cards());
+        cards::forward_updates(state, ctx.session_id.as_str(), subagents.cards());
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
             crate::agent::MayAgentSessionInput {
@@ -4191,7 +4276,7 @@ fn build_session_agent<'a>(
                         .metrics
                         .prompt_cache_epoch
                 }),
-                subagents: Some(subagents),
+                subagent_tracker: Some(subagents),
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
                 limits: state.live_limits.clone(),
@@ -4202,10 +4287,10 @@ fn build_session_agent<'a>(
         .map_err(UiChatPreparationError::BuildAgent)?;
         state
             .runtime_service
-            .set_terminal_grants(ctx.session_id.as_str(), agent.terminal_grants());
+            .set_terminal_grants(ctx.session_id.as_str(), agent.grants());
         state
             .session_background
-            .add_job_registry(ctx.session_id.as_str(), agent.job_registry());
+            .add_jobs(ctx.session_id.as_str(), agent.jobs());
 
         if let Some(snapshot) = ctx.context_snapshot.as_ref() {
             // Restore the checkpoint, then append only transcript entries
@@ -4287,14 +4372,14 @@ pub enum TurnKind {
     /// A user message, or a queued one.
     #[default]
     Prompt,
-    /// The session's idle agent collected background commands that need the
-    /// model; their events open the turn.
-    Resume(Vec<aither_agent::TimedEvent>),
+    /// The session's idle agent read what its background commands reported
+    /// and has something to act on.
+    Resume,
 }
 
 impl TurnKind {
     const fn is_resume(&self) -> bool {
-        matches!(self, Self::Resume(_))
+        matches!(self, Self::Resume)
     }
 }
 

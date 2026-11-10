@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 use super::blocker::BlockerError;
 use super::events::WorkEvent;
-use super::reference::{WorkKind, WorkRef};
 use super::schema::{DocumentRow, ParsedDocument};
 use super::tracker::{WorkState, WorkStatus, WorkTrackerError};
+use super::{WorkKind, WorkRef};
 
 /// What every blocker of the document resolved to, each once.
 pub type Blockers = HashMap<String, Result<bool, BlockerError>>;

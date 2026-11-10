@@ -295,6 +295,44 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
         ControlFlow::Continue(())
     }
 
+    /// Handles a fact about one of the session's jobs, which the agent read
+    /// before the next event of the run: a command detached, or ended and
+    /// reported to the model.
+    pub(super) async fn job_fact(&mut self, fact: crate::agent::JobFact) -> ControlFlow<TurnStop> {
+        let shown = match fact {
+            crate::agent::JobFact::Started {
+                task_id,
+                output_preview,
+                output_file,
+            } => {
+                self.saw_tool_activity = true;
+                set_terminal_runtime_state(
+                    self.state,
+                    self.session_id.as_str(),
+                    TerminalRuntimeState {
+                        task_id: Some(task_id),
+                        output_file: Some(output_file),
+                        output_preview: Some(output_preview),
+                        input_notice: None,
+                    },
+                )
+                .await
+            }
+            crate::agent::JobFact::Ended { .. } => {
+                self.saw_tool_activity = true;
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                match clear_terminal_runtime_state(self.state, self.session_id.as_str()).await {
+                    Ok(()) => mark_run_running(self.state, self.guard.fence()).await,
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match shown {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(TurnStop::Persist(error)),
+        }
+    }
+
     /// Ends the reasoning phase a run that failed left open, the way the
     /// failure's own event would have.
     pub(super) async fn close_reasoning_phase(&mut self) -> ControlFlow<TurnStop> {

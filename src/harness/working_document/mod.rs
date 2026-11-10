@@ -16,7 +16,6 @@ mod blocker;
 mod document;
 mod events;
 pub(crate) mod file;
-mod reference;
 mod review;
 mod schema;
 #[cfg(test)]
@@ -26,7 +25,7 @@ mod tracker;
 pub use blocker::{AnyBlockerResolver, BlockerError, BlockerResolver};
 pub use document::{DocumentCheckpoint, WorkingDocument};
 pub use events::{WorkEvent, WorkEvents};
-pub use reference::{WorkKind, WorkRef, words};
+pub use may_tasks::{WorkKind, WorkRef, words};
 pub use review::{DocumentAlertItem, DocumentReview};
 pub use schema::{AnyDocumentSchema, DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument};
 pub use tracker::{

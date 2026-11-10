@@ -28,8 +28,8 @@ use acpsub::{
 };
 use aither_acp::{PermissionOption, PermissionOptionKind, RequestPermissionOutcome};
 use aither_sandbox::{
-    Backend, ChildExit, CommandFifo, Grants, HostLaunch, JobBroker, SandboxMode, SandboxedChild,
-    SpawnGrant, SpawnSpec, TreeLifetime,
+    Backend, ChildExit, CommandFifo, Grants, JobBroker, SandboxMode, SandboxedChild, SpawnGrant,
+    SpawnSpec, TreeLifetime,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -115,19 +115,12 @@ impl SessionSandbox {
             .collect::<io::Result<Vec<_>>>()?;
         let grants = Grants::new();
         grants.add_writable(root);
-        // A scratch process only ever runs a program, never a script, so the
-        // backend's shell is never started.
-        let sandbox = aither_sandbox::Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: HostLaunch::new("bash"),
-            },
-            DefaultExecutor,
-            root,
-        )
-        .with_grants(grants)
-        .with_environment(environment)
-        .with_fixed_grants(toolchain_grants);
+        // A scratch process only ever runs a program, which a host sandbox
+        // spawns without a shell.
+        let sandbox = aither_sandbox::Sandbox::new(Backend::Host { heel }, DefaultExecutor, root)
+            .with_grants(grants)
+            .with_environment(environment)
+            .with_fixed_grants(toolchain_grants);
         Ok(Self {
             sandbox,
             launch_dir: Some(root.to_path_buf()),
@@ -604,19 +597,12 @@ pub(crate) async fn test_sandbox(root: &Path) -> aither_sandbox::Sandbox {
     std::fs::create_dir_all(root).expect("session dir");
     let tmp = root.join("tmp");
     let path = std::env::var("PATH").expect("PATH is set and UTF-8");
-    aither_sandbox::Sandbox::new(
-        Backend::Host {
-            heel,
-            launch: HostLaunch::new("bash"),
-        },
-        DefaultExecutor,
-        root,
-    )
-    .with_grants(grants)
-    .with_environment(vec![
-        ("PATH".to_string(), path),
-        ("TMPDIR".to_string(), tmp.to_string_lossy().into_owned()),
-    ])
+    aither_sandbox::Sandbox::new(Backend::Host { heel }, DefaultExecutor, root)
+        .with_grants(grants)
+        .with_environment(vec![
+            ("PATH".to_string(), path),
+            ("TMPDIR".to_string(), tmp.to_string_lossy().into_owned()),
+        ])
 }
 
 #[cfg(test)]

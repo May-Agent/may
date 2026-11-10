@@ -118,6 +118,26 @@ async fn persist_checkpoint(
     Ok(())
 }
 
+/// Persist the newest checkpoint `checkpoints` holds as the session's context
+/// snapshot, as the run holding `fence`. A run hands one out with
+/// [`aither_agent::Run::checkpoints`]; each time it emits a checkpoint event,
+/// the handler calls this, so a crash mid-run loses no completed turn. Before
+/// the run's first checkpoint there is nothing to persist.
+///
+/// # Errors
+///
+/// Returns the storage error when the snapshot cannot be stored.
+pub async fn persist_run_checkpoint(
+    db: &ChatDb,
+    fence: &RunFence,
+    checkpoints: &aither_agent::Checkpoints,
+) -> Result<(), crate::db::ChatDbError> {
+    match checkpoints.latest() {
+        Some(checkpoint) => persist_checkpoint(db, fence, checkpoint).await,
+        None => Ok(()),
+    }
+}
+
 /// Export the agent's checkpoint and persist it as the session's context
 /// snapshot, as the run holding `fence`.
 ///

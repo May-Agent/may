@@ -27,7 +27,7 @@ pub use binding::{BindingError, RepoBinding, group_sessions, project_label};
 pub use context_snapshot::{
     PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_watermark,
     load_persisted_context_snapshot, parse_persisted_context_snapshot,
-    persist_agent_context_snapshot,
+    persist_agent_context_snapshot, persist_run_checkpoint,
 };
 pub use directory::SessionDirectory;
 pub use history::{

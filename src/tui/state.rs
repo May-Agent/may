@@ -191,8 +191,8 @@ pub struct JobDetailState {
     pub target: JobDetailTarget,
     /// Latest job info for a `Job` target; `None` once the pid is gone.
     pub job: Option<aither_sandbox::JobInfo>,
-    /// Latest buffered `(stdout, stderr)` for a `Job` target.
-    pub output: Option<(Vec<u8>, Vec<u8>)>,
+    /// Latest buffered output for a `Job` target.
+    pub output: Option<Vec<u8>>,
     /// Latest snapshot for a `Subagent` target; kept after the run ends.
     pub subagent: Option<crate::agent::SubagentRunSnapshot>,
     /// Whether the followed entry has finished.

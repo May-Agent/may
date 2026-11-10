@@ -129,7 +129,11 @@ where
         for server in &self.ssh_servers {
             sessions.add_ssh_server(server.clone(), self.tools.clone())?;
         }
-        let builder = Shell::builder(sandbox)
+        let builder = match &self.container {
+            Some(_) => Shell::builder(sandbox),
+            None => Shell::builder_on_host(sandbox, self.tools.host_launch()?),
+        };
+        let builder = builder
             .interpreters(self.interpreters)
             .limits(self.budgets.limits())
             .output(self.budgets.output())
@@ -184,18 +188,11 @@ where
                 let path = heel.path().to_path_buf();
                 let heel = blocking::unblock(move || HeelBinary::verify(path)).await?;
                 let session = HostSession::prepare(&self.working_dir, tools).await?;
-                Sandbox::new(
-                    Backend::Host {
-                        heel,
-                        launch: self.tools.host_launch()?,
-                    },
-                    executor,
-                    &self.working_dir,
-                )
-                .with_fixed_grants(session.grants)
-                .with_environment(session.environment)
-                .with_write_denylist(session.write_denylist)
-                .with_audit_log(self.audit_log.clone())
+                Sandbox::new(Backend::Host { heel }, executor, &self.working_dir)
+                    .with_fixed_grants(session.grants)
+                    .with_environment(session.environment)
+                    .with_write_denylist(session.write_denylist)
+                    .with_audit_log(self.audit_log.clone())
             }
         };
         let sandbox = match &self.env_source {

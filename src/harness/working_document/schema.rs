@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::reference::{WorkRef, words};
+use super::{WorkRef, words};
 
 /// Reads a working document into what the harness tracks of it.
 ///

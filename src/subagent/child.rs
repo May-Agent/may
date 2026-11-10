@@ -31,9 +31,6 @@ use crate::agent::subagent_tracker::RunUsage;
 use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
 use crate::ipc::SessionShell;
 
-/// How long before its cache goes cold a keep-alive is sent.
-const KEEP_ALIVE_LEAD: Duration = Duration::from_secs(30);
-
 /// The decisions a child's loop makes at its control points.
 #[derive(Debug)]
 pub struct ChildHooks {
@@ -343,12 +340,14 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
     async fn await_jobs(&mut self, cancel: &CancelSignal) -> Option<Woke> {
         let jobs = self.shell.jobs();
         let mut waiting = Vec::new();
+        let mut infos = Vec::new();
         for info in jobs.list().await {
             if (matches!(info.status, aither_sandbox::JobStatus::Running)
                 || info.status.completion_pending())
                 && let Some(job) = jobs.get(&info.task_id).await
             {
                 waiting.push(job);
+                infos.push(info);
             }
         }
         if waiting.is_empty() {
@@ -358,15 +357,18 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             "waiting on background task {}",
             waiting[0].task_id()
         ));
-        let keep_alive = self
-            .parts
-            .keep_alive
-            .and_then(|_| self.agent.cache_warmth().cold_in())
-            .map(|cold_in| {
-                cold_in
-                    .saturating_sub(KEEP_ALIVE_LEAD)
-                    .max(Duration::from_secs(1))
-            });
+        // The keep-alive is due where the main session's refresh is: before
+        // the entry the provider's cache lifetime bounds goes cold, and only
+        // when a job outlives it.
+        let keep_alive = match (self.parts.keep_alive, self.lifetime) {
+            (Some(_), CacheLifetime::Limited(lifetime)) => crate::agent::keep_warm::refresh_in(
+                self.agent.cache_warmth().cold_in(),
+                lifetime,
+                &infos,
+            )
+            .map(|after| after.max(Duration::from_secs(1))),
+            _ => None,
+        };
         let ended = async {
             let (finished, _, _) =
                 select_all(waiting.iter().map(|job| {

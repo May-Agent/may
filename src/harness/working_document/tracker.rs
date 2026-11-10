@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use super::reference::{WorkKind, WorkRef};
+use super::{WorkKind, WorkRef};
 
 /// How many items a lookup fetches at once.
 const FETCH_CONCURRENCY: usize = 8;
