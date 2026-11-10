@@ -137,7 +137,7 @@ enum Body<LLM: LanguageModel + 'static> {
     /// from.
     External {
         session: Box<AcpSession>,
-        _shell: Option<SessionShell>,
+        _shell: Option<Box<SessionShell>>,
     },
 }
 
@@ -364,7 +364,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             working_copies,
             body: Body::External {
                 session: Box::new(session),
-                _shell: Some(shell),
+                _shell: Some(Box::new(shell)),
             },
         })
     }
@@ -471,8 +471,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             .toolkit
             .register(builder, &shell, Some(valve.clone()));
         if let Some(spec) = &settings.document {
-            let mut document =
-                WorkingDocument::new(spec, shell.working_dir(), settings.work.clone());
+            // Its own inbox: the main agent's holds the starts and ends of
+            // the main agent's runs, which are not this one's to answer.
+            let mut document = WorkingDocument::new(spec, shell.working_dir(), WorkEvents::new());
             if let Some(reminder) = &settings.continue_reminder {
                 document = document.with_continue_reminder(reminder.clone());
             }

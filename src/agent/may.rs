@@ -1030,16 +1030,21 @@ impl MayAgent {
             .clock
             .clone()
             .map_or_else(AnyClock::default, AnyClock::new);
-        let reader = match &config.host_reader {
-            Some(source) => source.reader(),
-            None => SystemReader::new().map_or_else(
-                |error| {
-                    tracing::warn!(%error, "this host's load cannot be read; it is not watched");
-                    AnyHostReader::new(UnwatchedHost)
-                },
-                AnyHostReader::new,
-            ),
-        };
+        let reader = config.host_reader.as_ref().map_or_else(
+            || {
+                SystemReader::new().map_or_else(
+                    |error| {
+                        tracing::warn!(
+                            %error,
+                            "this host's load cannot be read; it is not watched"
+                        );
+                        AnyHostReader::new(UnwatchedHost)
+                    },
+                    AnyHostReader::new,
+                )
+            },
+            HostReaderSource::reader,
+        );
         let monitor = HostLoadMonitor::new(
             reader,
             config.host_load.clone(),
@@ -1135,7 +1140,7 @@ impl MayAgent {
             .collect();
         Ok(Self {
             inner: agent,
-            sandbox_dir: shell.working_dir().to_path_buf(),
+            sandbox_dir: shell.working_dir().clone(),
             job_events: shell.jobs().events(),
             job_facts_tx,
             job_facts,
@@ -1398,6 +1403,7 @@ impl MayAgent {
     /// Where the facts of the session's main-agent jobs queue, for the
     /// clients that show them: the agent tells one when it reads the fact,
     /// whether a run or the idle wait does.
+    #[must_use]
     pub fn job_facts(&self) -> async_channel::Receiver<JobFact> {
         self.job_facts.clone()
     }
@@ -1874,7 +1880,7 @@ fn apply_runtime_context(
             browser_cdp_endpoint: cdp_endpoint,
             ..
         } => {
-            browser_cdp_endpoint = cdp_endpoint.clone();
+            browser_cdp_endpoint.clone_from(cdp_endpoint);
         }
         AgentEnvironment::Local => {
             runtime_system_context =

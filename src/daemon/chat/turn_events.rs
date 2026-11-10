@@ -260,17 +260,6 @@ async fn record_prompt_cache(state: &Arc<DaemonState>, request: crate::db::Promp
     }
 }
 
-/// The handler [`aither_agent::Run::drive`] calls with each event.
-pub(super) async fn step<'a, 't, 's, S: ChatSink>(
-    turn: &'a mut TurnEvents<'t, 's, S>,
-    timed: TimedEvent,
-) -> ControlFlow<TurnStop, &'a mut TurnEvents<'t, 's, S>> {
-    match turn.handle(timed).await {
-        ControlFlow::Continue(()) => ControlFlow::Continue(turn),
-        ControlFlow::Break(stop) => ControlFlow::Break(stop),
-    }
-}
-
 impl<S: ChatSink> TurnEvents<'_, '_, S> {
     /// Handles one event of the run.
     pub(super) async fn handle(&mut self, timed: TimedEvent) -> ControlFlow<TurnStop> {
@@ -279,13 +268,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
         if !timed.agent.is_main() {
             return ControlFlow::Continue(());
         }
-        self.sink.on_agent_event(&timed, self.context_window);
-        let at = timed.at;
-        let event = timed.event;
-        self.last_event_at = Some(at);
         // The first visible output of a call closes the pending reasoning
         // phase; its marker goes out before the event.
-        if closes_reasoning_phase(&event)
+        if closes_reasoning_phase(&timed.event)
             && let Some(started) = self.reasoning_phase.take()
             && !self
                 .sink
@@ -296,6 +281,10 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 "client disconnected during reasoning end",
             ));
         }
+        self.sink.on_agent_event(&timed, self.context_window);
+        let at = timed.at;
+        let event = timed.event;
+        self.last_event_at = Some(at);
         match self.event(at, event).await {
             Ok(ControlFlow::Continue(())) => {}
             Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),
