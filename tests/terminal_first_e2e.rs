@@ -4159,8 +4159,9 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
     assert_eq!(
         usage["cacheMissCauses"],
         // The mock reports no writes, so the second request is credited with
-        // its whole prompt, all of which the expired cache lost.
-        serde_json::json!([{ "cause": "expired", "misses": 1, "missedTokens": 4_000 }]),
+        // its prompt rounded down to the route's block, inferred from its one
+        // read of 3,000 tokens; the expired cache lost all of it.
+        serde_json::json!([{ "cause": "expired", "misses": 1, "missedTokens": 3_000 }]),
         "usage: {usage}; server logs:\n{}",
         server.log.contents().await
     );
