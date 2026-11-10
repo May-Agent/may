@@ -247,7 +247,7 @@ impl RuntimeSystemContext {
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         let instructions = context.instructions_mut();
         for slot in &tag::MAY_INSTRUCTIONS {
-            if *slot == tag::PROJECT_RULES {
+            if *slot == tag::PROJECT_RULES || *slot == tag::COMMANDS {
                 continue;
             }
             match self.instructions.get(slot) {
@@ -257,6 +257,14 @@ impl RuntimeSystemContext {
                 }
             }
         }
+        // A command added or dropped mid-session is announced once as a
+        // diff; the prompt's table changes only on reassembly.
+        context.update_live(&COMMANDS_CONTENT, |update| {
+            update.instruction(
+                &tag::COMMANDS,
+                self.instructions.get(&tag::COMMANDS).cloned(),
+            );
+        });
         context.update_live(&MEMORY_CONTENT, |update| {
             update.external(&tag::MEMORY, Some(self.memory_block()));
         });
@@ -452,6 +460,10 @@ impl RuntimeSystemContext {
         }
     }
 }
+
+/// The table of the commands a script can call, announced when a command is
+/// added or removed mid-session.
+const COMMANDS_CONTENT: LiveContent = LiveContent::new("The command table", "commands_diff");
 
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
@@ -746,6 +758,17 @@ struct CommandRow {
     description: String,
 }
 
+impl CommandRow {
+    /// A row of the table: a name and its one-line description, without the
+    /// full stop that closes it.
+    fn new(name: &str, description: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.trim_end().trim_end_matches('.').to_string(),
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "commands.txt", escape = "none")]
 struct CommandTableTemplate {
@@ -761,17 +784,11 @@ pub fn build_commands(
 ) -> String {
     let mut commands: Vec<CommandRow> = descriptions
         .iter()
-        .map(|(name, description)| CommandRow {
-            name: name.clone(),
-            description: description.clone(),
-        })
+        .map(|(name, description)| CommandRow::new(name, description))
         .collect();
     for definition in sets.iter().flat_map(crate::ipc::AnyCommandSet::definitions) {
         if commands.iter().all(|row| row.name != definition.name()) {
-            commands.push(CommandRow {
-                name: definition.name().to_string(),
-                description: definition.description().to_string(),
-            });
+            commands.push(CommandRow::new(definition.name(), definition.description()));
         }
     }
     CommandTableTemplate { commands }
