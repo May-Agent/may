@@ -1328,6 +1328,7 @@ impl DaemonState {
         config: MayConfig,
         connectivity: aither_connectivity::Connectivity,
     ) -> anyhow::Result<Self> {
+        crate::test_support::install_global_executor();
         let db = crate::db::ChatDb::open(&may_dir.join("history.db")).await?;
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
         let (session_change_tx, session_change_rx) = async_channel::unbounded();

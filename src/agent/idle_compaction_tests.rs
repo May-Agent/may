@@ -275,6 +275,7 @@ pub struct SessionParts {
 
 impl SessionParts {
     pub(super) async fn new(dir: std::path::PathBuf) -> Self {
+        crate::test_support::install_global_executor();
         std::fs::create_dir_all(dir.join(".may")).expect("create the may dir");
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
