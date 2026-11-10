@@ -258,6 +258,10 @@ mod tests {
         assert!(other.reading.is_none());
     }
 
+    /// `terminal` arguments carrying every field `TerminalArgs` requires.
+    const VALID_TERMINAL_ARGUMENTS: &str =
+        "{\"description\":\"List files\",\"script\":\"ls\",\"timeout\":10}";
+
     #[test]
     fn complete_arguments_that_miss_the_tool_schema_report_the_error() {
         let missing = "{\"command\":\"ls\"}";
@@ -276,7 +280,7 @@ mod tests {
                 "{variant:?}"
             );
         }
-        let valid = project_tool_summary("{\"script\":\"ls\"}", ToolVariant::Terminal);
+        let valid = project_tool_summary(VALID_TERMINAL_ARGUMENTS, ToolVariant::Terminal);
         assert!(valid.arguments_error.is_none());
         assert!(
             project_tool_summary(missing, ToolVariant::WebSearch)
@@ -305,7 +309,7 @@ mod tests {
         let summary = project_final_tool_summary("not json", ToolVariant::Terminal);
         assert!(summary.arguments_error.is_some());
         assert!(
-            project_final_tool_summary("{\"script\":\"ls\"}", ToolVariant::Terminal)
+            project_final_tool_summary(VALID_TERMINAL_ARGUMENTS, ToolVariant::Terminal)
                 .arguments_error
                 .is_none()
         );
