@@ -25,7 +25,6 @@ import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, terminalLocation, type OutputStream } from '@/lib/terminalResult';
-import { invalidToolArguments } from '@/lib/toolArguments';
 import { recognisesAny } from '@/lib/commandReading';
 import { CommandCardView } from './CommandCardView';
 import { CommandReadingView } from './CommandReadingView';
@@ -359,7 +358,7 @@ function ExpandableToolCard({ tool }: ToolCardProps) {
   const Icon = VARIANT_ICON[tool.variant] ?? Wrench;
   const variantLabel = t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic');
   const streaming = tool.status === 'streaming';
-  const invalid = streaming ? null : invalidToolArguments(tool.variant, tool.argumentsRaw);
+  const invalid = tool.summary?.argumentsError ?? null;
   const primary =
     invalid === null
       ? pickPrimaryLabel(tool, variantLabel)

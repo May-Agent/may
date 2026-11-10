@@ -357,6 +357,8 @@ export interface ToolSummary {
   prompt?: string | null;
   /** How the daemon read a terminal call's script, once the call is complete. */
   reading?: CommandReading | null;
+  /** Why a terminal-family call's complete arguments do not match the tool's schema. */
+  argumentsError?: string | null;
   /** The card of a call that ran one of May's commands, once the daemon built it. */
   card?: CommandCard | null;
 }
