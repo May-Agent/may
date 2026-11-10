@@ -14,8 +14,7 @@ use std::path::Path;
 use aither_agent::working_document::words;
 use askama::Template;
 
-use super::schema::violation_sentence;
-use super::{Row, Section, TasksFile, numbered};
+use super::{Row, Section, TasksFile, numbered, violation_sentence};
 
 #[cfg(test)]
 mod tests;

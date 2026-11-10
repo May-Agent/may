@@ -137,12 +137,12 @@ pub struct AnswerCard {
     pub text: String,
 }
 
-impl Row {
-    fn view(&self) -> RowView {
-        RowView {
-            section: self.section().heading().to_owned(),
-            title: self.title().to_owned(),
-            detail: self.details().collect::<Vec<_>>().join("\n"),
+impl From<&Row> for RowView {
+    fn from(row: &Row) -> Self {
+        Self {
+            section: row.section().heading().to_owned(),
+            title: row.title().to_owned(),
+            detail: row.details().collect::<Vec<_>>().join("\n"),
         }
     }
 }
@@ -233,16 +233,16 @@ impl Card {
             Op::Add { .. } => RowChange {
                 change: RowChangeKind::Added,
                 before: None,
-                after: Some(added.first()?.view()),
+                after: Some(RowView::from(*added.first()?)),
             },
             Op::Start(number) => RowChange {
                 change: RowChangeKind::Started,
-                before: Some(row(*number)?.view()),
-                after: Some(added.first()?.view()),
+                before: Some(RowView::from(row(*number)?)),
+                after: Some(RowView::from(*added.first()?)),
             },
             Op::Finish(number) => RowChange {
                 change: RowChangeKind::Finished,
-                before: Some(row(*number)?.view()),
+                before: Some(RowView::from(row(*number)?)),
                 after: None,
             },
             Op::Block { row: number, .. } => {
@@ -265,8 +265,8 @@ impl Card {
 fn rewritten(kind: RowChangeKind, before: &Row, added: &[&Row]) -> Option<RowChange> {
     Some(RowChange {
         change: kind,
-        before: Some(before.view()),
-        after: Some(added.first()?.view()),
+        before: Some(RowView::from(before)),
+        after: Some(RowView::from(*added.first()?)),
     })
 }
 

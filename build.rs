@@ -98,7 +98,7 @@ fn emit_image_refs(heel_lib_version: &str) {
         PathBuf::from(TOOL_DISTRIBUTION_MANIFEST),
         workspace_dir.to_path_buf(),
     ];
-    inputs.extend(image_ref::TASKS_SOURCES.iter().map(PathBuf::from));
+    inputs.extend(image_ref::tasks_sources(Path::new(".")).expect("tasks crate must be readable"));
     inputs.extend(
         image_ref::workspace_hash_inputs(workspace_dir)
             .expect("workspace context must be readable")

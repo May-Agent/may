@@ -13,7 +13,7 @@ use aither_agent::{
 };
 use askama::Template;
 
-use super::{FILE, LineViolation, TasksFile, Violation};
+use super::{FILE, TasksFile, violation_sentence};
 
 /// Lines `tasks.md` may hold unless `[tasks] line_limit` says otherwise.
 pub const DEFAULT_LINE_LIMIT: usize = 60;
@@ -84,22 +84,6 @@ pub(crate) fn working_document(
 #[derive(Debug, Clone, Default)]
 pub struct TasksSchema {
     limit: LineLimit,
-}
-
-#[derive(Template)]
-#[template(path = "tasks_violation.txt", escape = "none")]
-struct ViolationTemplate<'a> {
-    line: usize,
-    violation: &'a Violation,
-}
-
-pub(super) fn violation_sentence(violation: &LineViolation) -> String {
-    ViolationTemplate {
-        line: violation.line,
-        violation: &violation.violation,
-    }
-    .render()
-    .expect("the tasks.md violation template renders typed input")
 }
 
 impl DocumentSchema for TasksSchema {

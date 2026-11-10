@@ -5627,6 +5627,7 @@ dependencies = [
  "keyring",
  "libc",
  "linkify",
+ "may-tasks",
  "mediax-codec",
  "mime",
  "mime_guess",
@@ -5690,6 +5691,15 @@ dependencies = [
  "yuv",
  "zenwave",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "may-tasks"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "askama 0.16.1",
+ "tempfile",
 ]
 
 [[package]]
