@@ -430,6 +430,10 @@ async fn a_session_with_ssh_servers_runs_local_commands_in_the_job_pool() {
     session.parts.ssh_servers = vec![crate::config::SshServerConfig {
         name: "remote".to_string(),
         target: "ssh://nobody@127.0.0.1:1".to_string(),
+        platform: crate::config::SshPlatformConfig {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+        },
     }];
     session.rebuild(&config).await;
 
