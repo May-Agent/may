@@ -38,6 +38,7 @@ pub mod tag {
     pub const IDENTITY: InstructionSlot = InstructionSlot::new("identity");
     pub const PROFILE_PERSONA: InstructionSlot = InstructionSlot::new("profile_persona");
     pub const ENVIRONMENT: InstructionSlot = InstructionSlot::new("environment");
+    pub const SESSION: InstructionSlot = InstructionSlot::new("session");
     pub const REPO_CLONES: InstructionSlot = InstructionSlot::new("repo_clones");
     pub const TERMINAL: InstructionSlot = InstructionSlot::new("terminal");
     pub const EFFICIENCY: InstructionSlot = InstructionSlot::new("efficiency");
@@ -63,35 +64,42 @@ pub mod tag {
     /// The instruction slots May writes, in prompt order. aither's
     /// `prepared_tools`, `commands` and `languages` blocks sit between them
     /// in [`layout`].
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 15] = [
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 16] = [
         IDENTITY,
+        HARNESS,
+        EVIDENCE,
         PROFILE_PERSONA,
         ENVIRONMENT,
-        REPO_CLONES,
         TERMINAL,
         EFFICIENCY,
         CAPABILITIES,
         BROWSER,
         WORK,
-        PROJECT_RULES,
-        PLAN_MODE,
         PERMISSIONS,
-        HARNESS,
-        EVIDENCE,
         TIME,
+        SESSION,
+        REPO_CLONES,
+        PLAN_MODE,
+        PROJECT_RULES,
     ];
 
-    /// The system prompt's order: identity, environment, terminal,
-    /// efficiency, capabilities and the command table, work, permissions,
-    /// harness, evidence, time and languages; then the external content.
+    /// The system prompt's order, from most shared to least shared, so
+    /// sessions share the longest cached prefix. Text every session of a
+    /// build has comes first: identity, harness and evidence. Text that
+    /// depends on the installation and its configuration follows: persona,
+    /// environment, terminal, prepared tools, efficiency, capabilities and
+    /// the command table, browser, work, permissions, time and languages.
+    /// Text specific to the session comes last: the session section, repo
+    /// clones, plan mode and project rules, then the external content.
     #[must_use]
     pub fn layout() -> SystemLayout {
         SystemLayout::new(
             [
                 IDENTITY,
+                HARNESS,
+                EVIDENCE,
                 PROFILE_PERSONA,
                 ENVIRONMENT,
-                REPO_CLONES,
                 TERMINAL,
                 InstructionSlot::PREPARED_TOOLS,
                 EFFICIENCY,
@@ -99,13 +107,13 @@ pub mod tag {
                 InstructionSlot::COMMANDS,
                 BROWSER,
                 WORK,
-                PROJECT_RULES,
-                PLAN_MODE,
                 PERMISSIONS,
-                HARNESS,
-                EVIDENCE,
                 TIME,
                 InstructionSlot::LANGUAGES,
+                SESSION,
+                REPO_CLONES,
+                PLAN_MODE,
+                PROJECT_RULES,
             ],
             [
                 MEMORY,
@@ -658,8 +666,6 @@ impl RemoteHosts {
 struct EnvironmentTemplate<'a> {
     model_id: &'a str,
     home: HomeEnvironment,
-    session_dir: String,
-    launch_dir: Option<String>,
     modalities: Vec<&'static str>,
     remote: Option<RemoteHosts>,
 }
@@ -681,21 +687,18 @@ fn native_inputs(model_info: Option<&aither_models::ModelEntry>) -> Vec<&'static
     .collect()
 }
 
-/// The environment section: where the agent runs, the session directory and
-/// its layout, and the remote hosts while any is connected.
+/// The environment section: where the agent runs, the layout of the session
+/// directory and the remote hosts while any is connected. It refers to the
+/// session directory by role; [`build_session`] holds the path.
 pub fn build_environment(
     model_id: &str,
     environment: &AgentEnvironment,
-    session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
     remote_hosts: Vec<SshServerConfig>,
-    launch_dir: Option<String>,
 ) -> String {
     EnvironmentTemplate {
         model_id,
         home: HomeEnvironment::of(environment),
-        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
-        launch_dir,
         modalities: native_inputs(model_info),
         remote: RemoteHosts::connected(remote_hosts),
     }
@@ -704,22 +707,45 @@ pub fn build_environment(
 }
 
 #[derive(Template)]
+#[template(path = "prompt/session.md", escape = "none")]
+struct SessionTemplate<'a> {
+    session_dir: String,
+    launch_dir: Option<String>,
+    issue_repository: Option<&'a str>,
+}
+
+/// The session section, where the values only this session has are stated:
+/// its directory, the launch directory and the issue repository.
+pub fn build_session(
+    environment: &AgentEnvironment,
+    session_paths: &SessionPaths,
+    launch_dir: Option<String>,
+    issue_backend: &crate::issue::IssueBackendInfo,
+) -> String {
+    SessionTemplate {
+        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
+        launch_dir,
+        issue_repository: issue_backend.repository.as_deref(),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render session: {error}"))
+}
+
+#[derive(Template)]
 #[template(path = "prompt/terminal.md", escape = "none")]
 struct TerminalTemplate {
-    session_dir: String,
     /// Whether scripts run in the managed bash, which May's command policy
     /// confines to `rg`, `fd` and line-range `sed`.
     managed_bash: bool,
 }
 
 /// The terminal section: how to run commands.
-pub fn build_terminal(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
+pub fn build_terminal(environment: &AgentEnvironment) -> String {
     TerminalTemplate {
         managed_bash: crate::command_policy::runs_managed_bash(matches!(
             environment,
             AgentEnvironment::Container { .. }
         )),
-        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render terminal: {error}"))
@@ -820,14 +846,13 @@ pub async fn build_capabilities(
 #[template(path = "prompt/work.md", escape = "none")]
 struct WorkTemplate<'a> {
     issue_backend_name: &'a str,
-    issue_repository: Option<&'a str>,
 }
 
-/// The work section: issues, PRs, `tasks.md`, artifacts and memory.
+/// The work section: issues, PRs, `tasks.md`, artifacts and memory. The
+/// issue repository is the session's, so the session section names it.
 pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo) -> String {
     WorkTemplate {
         issue_backend_name: issue_backend.name,
-        issue_repository: issue_backend.repository.as_deref(),
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render work: {error}"))

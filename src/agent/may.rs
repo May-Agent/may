@@ -25,8 +25,8 @@ use super::runtime_context::{
     RepoCloneEntry, RuntimeSystemContext, build_agents_md_blocks, build_browser_context,
     build_capabilities, build_efficiency, build_environment, build_evidence, build_harness,
     build_identity, build_permissions, build_plan_mode_context, build_profile_memories,
-    build_profile_persona, build_repo_clones_context, build_terminal, build_time, build_work,
-    build_workspace_workdirs_context, tag,
+    build_profile_persona, build_repo_clones_context, build_session, build_terminal, build_time,
+    build_work, build_workspace_workdirs_context, tag,
 };
 use super::tool_environment_cache::{
     Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
@@ -593,16 +593,11 @@ impl MayAgent {
                 build_environment(
                     &config.model_id,
                     &config.environment,
-                    &session_paths,
                     aither_models::lookup(config.model_id.as_str()),
                     config.ssh_servers.clone(),
-                    (!is_container).then(|| config.cwd.display().to_string()),
                 ),
             )
-            .with_instruction(
-                tag::TERMINAL,
-                build_terminal(&config.environment, &session_paths),
-            )
+            .with_instruction(tag::TERMINAL, build_terminal(&config.environment))
             .with_instruction(
                 tag::PERMISSIONS,
                 build_permissions(
@@ -948,6 +943,15 @@ impl MayAgent {
             .with_instruction(
                 tag::WORK,
                 build_work(&crate::issue::IssueStore::info(&issue_store)),
+            )
+            .with_instruction(
+                tag::SESSION,
+                build_session(
+                    &config.environment,
+                    &session_paths,
+                    (!is_container).then(|| config.cwd.display().to_string()),
+                    &crate::issue::IssueStore::info(&issue_store),
+                ),
             );
         builder = builder
             .host_load(config.host_load.clone())
