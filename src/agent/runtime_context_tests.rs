@@ -513,6 +513,20 @@ fn container_clone_outside_the_session_directory_panics() {
 }
 
 #[test]
+fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
+    let prompt = build_efficiency(&[]);
+    assert!(
+        prompt.contains("Fix with automated tools before hand edits"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("`cargo clippy --fix`"), "{prompt}");
+    assert!(
+        prompt.contains("Hand a large batch of small manual fixes to a subagent"),
+        "{prompt}"
+    );
+}
+
+#[test]
 fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
     let prompt = build_efficiency(&[]);
     assert!(
