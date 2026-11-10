@@ -1812,8 +1812,6 @@ mod tests {
         SchedulerPermissionHandler, TaskFilePlacement, TaskRuntime, TaskScript, TaskTimeout,
         run_terminal_command, task_execution_command, task_file_validation_command,
     };
-    use aither_sandbox::{Configured, TerminalTool};
-    use executor_core::DefaultExecutor;
     use tempfile::tempdir;
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
@@ -1835,10 +1833,13 @@ mod tests {
                 network_policy: None,
             };
             assert_eq!(
-                aither_sandbox::permission::PermissionHandler::check_domain(
+                aither_sandbox::DomainApprover::approve(
                     &handler,
-                    "example.com",
-                    443
+                    &aither_sandbox::DomainRequest {
+                        host: "example.com".to_string(),
+                        port: 443,
+                        agent: None,
+                    }
                 )
                 .await,
                 allow_network
@@ -2098,7 +2099,7 @@ mod tests {
     /// way scheduled runs prepare theirs.
     async fn scheduler_test_terminal(
         dir: &std::path::Path,
-    ) -> TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> {
+    ) -> (Arc<crate::ipc::SessionShell>, std::path::PathBuf) {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let may_dir = dir.join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
@@ -2114,31 +2115,38 @@ mod tests {
         )
         .await
         .expect("task runtime should load");
-        runtime
-            .local_terminal_tool(
+        let shell = runtime
+            .local_shell(
+                &crate::config::MayConfig::default(),
                 "profile",
                 NetworkAccessSource::TaskLocal,
                 &TaskScript {
                     content: String::new(),
-                    host_working_dir: workspace,
+                    host_working_dir: workspace.clone(),
                 },
                 false,
                 None,
             )
             .await
-            .expect("terminal should initialize")
+            .expect("terminal should initialize");
+        (shell, workspace)
     }
 
     #[tokio::test]
     async fn task_runs_past_the_foreground_wait() {
         let dir = tempdir().expect("temp dir should be created");
-        let terminal = scheduler_test_terminal(dir.path()).await;
-        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_WAIT.as_secs())
-            .expect("the foreground wait fits in u32 seconds")
+        let (terminal, workspace) = scheduler_test_terminal(dir.path()).await;
+        let runtime_secs = u32::try_from(
+            crate::config::ShellSettings::default()
+                .foreground_wait
+                .as_secs(),
+        )
+        .expect("the foreground wait fits in u32 seconds")
             + 2;
 
         let output = run_terminal_command(
             &terminal,
+            &workspace,
             format!("sleep {runtime_secs}; echo finished"),
             TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
         )
@@ -2151,10 +2159,11 @@ mod tests {
     #[tokio::test]
     async fn task_past_its_own_timeout_fails_with_timeout_error() {
         let dir = tempdir().expect("temp dir should be created");
-        let terminal = scheduler_test_terminal(dir.path()).await;
+        let (terminal, workspace) = scheduler_test_terminal(dir.path()).await;
 
         let error = run_terminal_command(
             &terminal,
+            &workspace,
             "sleep 60; echo finished".to_string(),
             TaskTimeout::new(2).expect("timeout is within the cap"),
         )
@@ -2225,8 +2234,12 @@ mod tests {
     fn task_timeout_is_bounded_by_the_background_cap() {
         assert!(TaskTimeout::new(0).is_err());
         assert!(TaskTimeout::new(1).is_ok());
-        let cap = u32::try_from(aither_sandbox::DEFAULT_TIMEOUT_CAP.as_secs())
-            .expect("the background cap fits in u32 seconds");
+        let cap = u32::try_from(
+            crate::config::ShellSettings::default()
+                .timeout_cap
+                .as_secs(),
+        )
+        .expect("the background cap fits in u32 seconds");
         assert!(TaskTimeout::new(cap).is_ok());
         assert!(TaskTimeout::new(cap + 1).is_err());
         assert!(TaskTimeout::from_stored(-1).is_err());

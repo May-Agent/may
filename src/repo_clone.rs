@@ -993,36 +993,48 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RepoCloneError> {
 pub(crate) mod test_sandbox {
     use std::path::{Path, PathBuf};
 
-    use aither_sandbox::permission::PermissionError;
-    use aither_sandbox::{Configured, SandboxMode, TerminalTool, ToolRegistryBuilder};
-    use executor_core::tokio::TokioGlobal;
+    use std::sync::Arc;
+
+    use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
+    use aither_sandbox::{DomainApprover, DomainRequest, Grants, Interpreter};
 
     use super::CloneSandbox;
+    use crate::agent::command_env::CommandEnv;
+    use crate::ipc::{CommandRegistryBuilder, SessionShell};
 
-    /// Runs sandboxed commands and refuses every unsafe one.
+    /// Runs sandboxed commands and refuses every unsandboxed one and every
+    /// connection.
+    #[derive(Debug, Clone, Copy)]
     pub struct SandboxedOnly;
 
-    impl aither_sandbox::PermissionHandler for SandboxedOnly {
-        fn check(
+    impl Approver for SandboxedOnly {
+        fn approve(
             &self,
-            mode: TerminalMode,
-            _script: &str,
-            _language: aither_sandbox::ScriptLanguage,
-            _location: aither_sandbox::CommandLocation<'_>,
-        ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-            std::future::ready(Ok(matches!(mode, SandboxMode::Sandboxed)))
+            _request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
+            std::future::ready(Ok(Approval::Denied {
+                reason: "the test terminal runs sandboxed scripts only".to_string(),
+            }))
         }
     }
 
-    /// A session terminal working in `session_root`, as May builds one: the
+    impl DomainApprover for SandboxedOnly {
+        fn approve(&self, _request: &DomainRequest) -> impl Future<Output = bool> + Send {
+            std::future::ready(false)
+        }
+    }
+
+    /// A session shell working in `session_root`, as May builds one: the
     /// root is its only writable place. Dropping it ends its sandbox.
     pub struct TestTerminal {
-        terminal: TerminalTool<SandboxedOnly, TokioGlobal, Configured>,
+        shell: Arc<SessionShell>,
+        timeout: std::time::Duration,
+        _audit: tempfile::TempDir,
     }
 
     impl TestTerminal {
         pub async fn new(session_root: &Path) -> Self {
-            Self::with_registry(session_root, ToolRegistryBuilder::new()).await
+            Self::configured(session_root, CommandRegistryBuilder::new(), None).await
         }
 
         /// A terminal as the daemon builds one for a session that signs: the
@@ -1037,78 +1049,77 @@ pub(crate) mod test_sandbox {
                 .install_sandbox_git(session_root, None)
                 .await
                 .unwrap();
-            let mut builder = ToolRegistryBuilder::new();
-            builder.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
-            Self::with_registry(session_root, builder).await
+            let mut commands = CommandRegistryBuilder::new();
+            commands.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
+            Self::configured(session_root, commands, None).await
         }
 
         /// A terminal whose commands see the environment `env` supplies.
-        pub async fn with_env(
-            session_root: &Path,
-            env: impl aither_sandbox::TerminalEnvSource + 'static,
-        ) -> Self {
-            Self::configured(session_root, ToolRegistryBuilder::new(), |terminal| {
-                terminal.with_env_source(env)
-            })
-            .await
-        }
-
-        async fn with_registry(session_root: &Path, builder: ToolRegistryBuilder) -> Self {
-            Self::configured(session_root, builder, |terminal| terminal).await
+        pub async fn with_env(session_root: &Path, env: CommandEnv) -> Self {
+            Self::configured(session_root, CommandRegistryBuilder::new(), Some(env)).await
         }
 
         async fn configured(
             session_root: &Path,
-            builder: ToolRegistryBuilder,
-            configure: impl FnOnce(
-                TerminalTool<SandboxedOnly, TokioGlobal>,
-            ) -> TerminalTool<SandboxedOnly, TokioGlobal>,
+            commands: CommandRegistryBuilder,
+            env_source: Option<CommandEnv>,
         ) -> Self {
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
             let cache = crate::tools::test_tool_cache();
             std::fs::create_dir_all(&cache).unwrap();
-            let terminal = TerminalTool::new_exact(session_root, SandboxedOnly, TokioGlobal)
-                .await
-                .expect("the terminal starts");
-            let terminal = configure(terminal)
-                .initialize_tools(&distribution, &cache)
+            std::fs::create_dir_all(session_root).unwrap();
+            let tools = crate::tools::ToolEnvironments::prepare_host(&distribution, &cache)
                 .await
                 .expect("the baseline tools prepare");
-            let registry = builder.build(terminal.output_store().clone());
-            let terminal = terminal.with_registry(std::sync::Arc::new(registry));
-            Self { terminal }
+            let audit = tempfile::tempdir().expect("an audit directory");
+            let audit_log = aither_sandbox::open_network_audit_log(audit.path(), 1)
+                .await
+                .expect("the audit log opens");
+            let grants = Grants::new();
+            grants.add_writable(session_root);
+            let settings = crate::config::ShellSettings::default();
+            let shell = crate::shell::ShellAssembly {
+                tools,
+                container: None,
+                working_dir: session_root.to_path_buf(),
+                grants,
+                priority: heel::ProcessPriority::default(),
+                audit_log,
+                permissions: SandboxedOnly,
+                env_source,
+                budgets: crate::shell::ShellBudgets::of(&settings),
+                interpreters: vec![Interpreter::Shell],
+                policies: crate::command_policy::PolicySet {
+                    managed_bash: crate::command_policy::runs_managed_bash(false),
+                    refused: crate::command_policy::RefusedReads::default(),
+                },
+                slot: crate::ipc::ShellSlot::new(),
+                ssh_servers: Vec::new(),
+                ids: None,
+                spaces: None,
+                pool: None,
+                connectivity: None,
+            }
+            .build(commands.build())
+            .await
+            .expect("the shell builds");
+            Self {
+                shell,
+                timeout: settings.timeout_cap,
+                _audit: audit,
+            }
         }
 
-        /// What a terminal-bound command of this terminal is built from.
-        pub const fn binding(&self) -> &aither_sandbox::TerminalBinding {
-            self.terminal.binding()
+        /// The session shell, as a command that launches work from it gets it.
+        pub fn shell(&self) -> &SessionShell {
+            &self.shell
         }
 
-        /// The prepared managed tools of this terminal, as a connected ACP
-        /// agent's sandbox is given them.
-        pub fn managed_tools(&self) -> crate::agent::acp_sandbox::ManagedTools {
-            let bin = self
-                .terminal
-                .shell_sessions()
-                .local_tools()
-                .expect("the tools are prepared locally")
-                .bin_dir()
-                .clone();
-            std::sync::Arc::new(std::sync::OnceLock::from(bin))
-        }
-
-        /// The terminal's sandbox, as a terminal-bound command gets it.
+        /// The terminal's sandbox, as a shell-bound command gets it.
         pub fn sandbox(&self) -> CloneSandbox {
-            CloneSandbox::new(self.terminal.binding().runner().clone())
+            CloneSandbox::new(self.shell.clone(), self.timeout)
         }
-    }
-
-    /// The managed tools a session sandbox is given, prepared as a session
-    /// terminal prepares them.
-    pub async fn managed_tools() -> crate::agent::acp_sandbox::ManagedTools {
-        let scratch = tempfile::tempdir().expect("scratch dir");
-        TestTerminal::new(scratch.path()).await.managed_tools()
     }
 
     /// Every executable setting a repository can carry for itself, set in
