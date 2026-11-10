@@ -272,6 +272,9 @@ pub struct App {
     pub activity_phase: crate::tui::ui::chat::ActivityPhase,
     /// Context window size for current model
     pub context_window: Option<u32>,
+    /// What the status bar's context meter shows in place of the usage while
+    /// a compaction runs and just after it.
+    pub compaction: crate::tui::state::CompactionMeter,
     /// Current model being used by the agent
     pub current_model: Option<String>,
     /// MCP server info for display (cached)
@@ -705,6 +708,7 @@ impl App {
             spinner_frame: 0,
             activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
+            compaction: crate::tui::state::CompactionMeter::default(),
             current_model: None,
             mcp_servers: Vec::new(),
             mcp_selected: 0,
@@ -1979,6 +1983,7 @@ impl App {
 
         // The daemon sends the window with the session's next usage.
         self.context_window = None;
+        self.compaction.cancel();
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
@@ -5684,6 +5689,56 @@ mod tests {
             None,
             "a new model drops the old window"
         );
+    }
+
+    #[tokio::test]
+    async fn the_context_meter_follows_a_compaction_and_returns_to_the_usage() {
+        use crate::client::CompactionPhase;
+        use crate::tui::state::{COMPACTED_HOLD, CompactionMeter};
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        let frame = |session_id: &str, phase| AppEvent::Compaction {
+            session_id: session_id.to_string(),
+            phase,
+        };
+        assert_eq!(app.compaction, CompactionMeter::Idle);
+
+        app.handle_event(frame("another-session", CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Idle, "another session");
+
+        app.handle_event(frame(&id, CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Compacting);
+
+        app.handle_event(frame(&id, CompactionPhase::Applied))
+            .expect("frame");
+        let CompactionMeter::Compacted { until } = app.compaction else {
+            panic!(
+                "a finished compaction reads Compacted: {:?}",
+                app.compaction
+            );
+        };
+
+        let start = until.checked_sub(COMPACTED_HOLD).expect("hold start");
+        app.compaction
+            .clear_expired(start + COMPACTED_HOLD.mul_f32(0.5));
+        assert!(app.compaction.is_holding(), "held for the whole hold");
+        app.compaction.clear_expired(until);
+        assert_eq!(app.compaction, CompactionMeter::Idle);
+
+        // A compaction that changed nothing restores the usage figure.
+        for ended in [
+            CompactionPhase::NothingToCompact,
+            CompactionPhase::Failed,
+            CompactionPhase::Discarded,
+        ] {
+            app.handle_event(frame(&id, CompactionPhase::Started))
+                .expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Compacting);
+            app.handle_event(frame(&id, ended)).expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Idle, "{ended:?}");
+        }
     }
 
     #[tokio::test]
