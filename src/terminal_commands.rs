@@ -1,11 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aither_agent::sandbox::builtin::AskCommand;
-use aither_agent::specialized::{SubagentFileMount, SubagentTool};
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
-use aither_sandbox::ToolRegistryBuilder;
 use askama::Template;
 use executor_core::DefaultExecutor;
 
@@ -23,6 +20,8 @@ use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, Usage
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::agent::webfetch_tool::MayWebFetch;
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
+use crate::ipc::ask::AskCommand;
+use crate::ipc::{CommandRegistryBuilder, schema_to_help};
 use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
@@ -94,7 +93,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub issue_store: crate::issue::ResolvedIssueStore,
     /// The main agent's `tasks.md` inbox: `issue`, `pr`, `ask_user` and
     /// `subagent` record the state changes its rows track on it.
-    pub task_events: aither_agent::WorkEvents,
+    pub task_events: crate::harness::working_document::WorkEvents,
     /// Asks the user before an issue, PR or comment is published, when the
     /// session can ask; `None` publishes without asking.
     pub publish_gate: Option<crate::agent::publish_approval::PublishGate>,
@@ -105,7 +104,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     /// The session's language guard: `ask_user`, `issue`, `pr` and `agent`
     /// refuse text outside the languages it enforces.
-    pub languages: Option<aither_agent::LanguageGuard>,
+    pub languages: Option<crate::harness::language::LanguageGuard>,
     /// Connected ACP agents, registered as subagent types; `None` outside
     /// the daemon.
     pub acp: Option<crate::agent::acp_subagent::AcpAgents>,
@@ -113,6 +112,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// and key commits in the sandbox are signed with, and runs every host
     /// git `pr` needs.
     pub git: crate::host_git::HostGit,
+    /// The shell's live `timeout_cap`, which bounds what `pr` runs in a clone.
+    pub timeout_cap: aither_sandbox::LiveDuration,
     /// Lines a `tasks.md` may hold, the main agent's and every subagent's.
     pub tasks_line_limit: crate::tasks_md::schema::LineLimit,
     /// Daemon handles for the `computer` command — present when the
@@ -182,7 +183,7 @@ pub enum TerminalCommandsError {
 /// The registered sandboxed `gh` panics if its compiled-in refusal template
 /// fails to render.
 pub async fn register_shared_terminal_commands<LLM>(
-    builder: &mut ToolRegistryBuilder,
+    builder: &mut CommandRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,
 ) -> Result<SharedTerminalCommands, TerminalCommandsError>
 where
@@ -190,13 +191,6 @@ where
 {
     let mut descriptions = Vec::new();
     let mut usages = Vec::new();
-    crate::command_policy::register(
-        builder,
-        crate::command_policy::runs_managed_bash(matches!(
-            config.task_runtime,
-            TaskRuntimeKind::Container
-        )),
-    );
 
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, MayWebFetch::new());
@@ -350,14 +344,14 @@ where
     );
     describe_tool(&mut descriptions, &ci_tool);
     builder.configure_tool(ci_tool);
-    let mut pr_command = PrCommand::new(pr_context);
+    let mut pr_command = PrCommand::new(pr_context, config.timeout_cap.clone());
     if let Some(guard) = &config.languages {
         pr_command = pr_command.with_languages(guard.clone());
     }
     describe_arguments::<PrArgs>(&mut descriptions, "pr");
     // Built per terminal: git inside a session clone and the project checks
     // run on that terminal's sandbox.
-    builder.configure_terminal_bound_tool("pr", move |binding| pr_command.for_terminal(binding));
+    builder.configure_bound_tool("pr", move |binding| pr_command.for_terminal(binding));
 
     let repo_context = RepoContext {
         cwd: config.cwd.clone(),
@@ -592,7 +586,7 @@ where
 /// The usage `--help` prints for `tool`'s command: the text aither's registry
 /// builds from the schema of the tool's own arguments.
 fn tool_usage<T: Tool>(_tool: &T) -> String {
-    aither_sandbox::schema_to_help(
+    schema_to_help(
         &serde_json::to_value(schemars::schema_for!(T::Arguments)).expect("a schema serializes"),
     )
 }
@@ -603,7 +597,7 @@ fn tool_usage<T: Tool>(_tool: &T) -> String {
 struct GhRefused;
 
 fn register_tool_with_description<T>(
-    builder: &mut ToolRegistryBuilder,
+    builder: &mut CommandRegistryBuilder,
     descriptions: &mut Vec<(String, String)>,
     tool: T,
 ) where

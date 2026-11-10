@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use aither_core::llm::{Tool, ToolResult};
-use aither_sandbox::{CommandRole, TerminalBinding};
+use crate::ipc::{Binding, Role as CommandRole};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -106,15 +106,18 @@ pub enum PrArgs {
 pub struct PrCommand {
     context: PrContext,
     languages: Option<crate::harness::language::LanguageGuard>,
+    timeout_cap: aither_sandbox::LiveDuration,
 }
 
 impl PrCommand {
-    /// The command for one session's PRs.
+    /// The command for one session's PRs; what it runs in a clone is killed
+    /// at the shell's `timeout_cap`.
     #[must_use]
-    pub const fn new(context: PrContext) -> Self {
+    pub const fn new(context: PrContext, timeout_cap: aither_sandbox::LiveDuration) -> Self {
         Self {
             context,
             languages: None,
+            timeout_cap,
         }
     }
 
@@ -129,11 +132,16 @@ impl PrCommand {
     /// session clone runs in that terminal's sandbox, and a subagent's
     /// terminal answers the reading actions alone.
     #[must_use]
-    pub fn for_terminal(&self, binding: &TerminalBinding) -> PrTool {
+    ///
+    /// # Panics
+    /// Panics when the registry serves no shell: the command runs git in the
+    /// shell's sandbox.
+    pub fn for_terminal(&self, binding: &Binding<'_>) -> PrTool {
+        let shell = binding.shell.expect("`pr` runs in a session's shell");
         PrTool {
             store: PrStore::new(
                 self.context.clone(),
-                CloneSandbox::new(binding.runner().clone()),
+                CloneSandbox::new(shell.clone(), self.timeout_cap.get()),
             ),
             languages: self.languages.clone(),
             role: binding.role(),

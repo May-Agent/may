@@ -23,8 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-use aither_core::llm::{CommandOutcome, CommandStream};
-use aither_sandbox::{TerminalRunner, TerminalScript};
+use aither_core::llm::CommandStream;
+use aither_sandbox::{RunOutcome, Script, ScriptResult};
+use askama::Template;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -71,10 +72,6 @@ pub enum RepoCloneError {
     },
 }
 
-/// How long a script in the sandbox may run: the terminal's own cap, so a
-/// check runs as long as any agent command may.
-const SANDBOX_TIMEOUT: std::time::Duration = aither_sandbox::DEFAULT_TIMEOUT_CAP;
-
 /// The session's terminal sandbox, where everything inside an
 /// agent-writable repository runs.
 ///
@@ -82,14 +79,36 @@ const SANDBOX_TIMEOUT: std::time::Duration = aither_sandbox::DEFAULT_TIMEOUT_CAP
 /// so it gets no more authority than the agent's own commands.
 #[derive(Debug, Clone)]
 pub struct CloneSandbox {
-    runner: TerminalRunner,
+    shell: crate::ipc::SessionShell,
+    /// How long a script may run: the shell's own cap, so a check runs as
+    /// long as any agent command may.
+    timeout: std::time::Duration,
+}
+
+/// Why a script of a clone's sandbox did not exit 0.
+#[derive(Template)]
+#[template(path = "clone_script_failure.txt", escape = "none")]
+struct ScriptFailure<'a> {
+    exit: Option<i32>,
+    stderr: &'a str,
 }
 
 impl CloneSandbox {
-    /// Run scripts on the terminal `runner` belongs to.
+    /// Run scripts on `shell`, each killed after `timeout`.
     #[must_use]
-    pub const fn new(runner: TerminalRunner) -> Self {
-        Self { runner }
+    pub const fn new(shell: crate::ipc::SessionShell, timeout: std::time::Duration) -> Self {
+        Self { shell, timeout }
+    }
+
+    /// What a failed script printed on stderr, when it printed text.
+    async fn stderr_text(result: &ScriptResult) -> String {
+        match &result.stderr {
+            Some(CommandStream::Inline { text }) => text.clone(),
+            Some(CommandStream::Stored { file, .. }) => {
+                async_fs::read_to_string(&file.path).await.unwrap_or_default()
+            }
+            Some(CommandStream::Image { .. }) | None => String::new(),
+        }
     }
 
     /// Run `script` in `dir` inside the sandbox and return its stdout once
@@ -104,19 +123,32 @@ impl CloneSandbox {
             reason,
         };
         let result = self
-            .runner
-            .run(TerminalScript::new(script, dir, SANDBOX_TIMEOUT))
+            .shell
+            .run(Script::new(script, dir, self.timeout))
             .await
             .map_err(|error| failed(error.to_string()))?;
         match result.outcome {
-            CommandOutcome::Exited { code: 0 } => match result.stdout {
+            RunOutcome::Exited { code: 0 } => match result.stdout {
                 CommandStream::Inline { text } => Ok(text),
                 CommandStream::Stored { file, .. } => {
                     Ok(async_fs::read_to_string(&file.path).await?)
                 }
                 CommandStream::Image { .. } => Err(failed("printed an image".to_string())),
             },
-            _ => Err(failed(result.render_for_model())),
+            _ => {
+                let exit = match result.outcome {
+                    RunOutcome::Exited { code } => Some(code),
+                    RunOutcome::Killed(_) => None,
+                };
+                let stderr = Self::stderr_text(&result).await;
+                let reason = ScriptFailure {
+                    exit,
+                    stderr: stderr.trim(),
+                }
+                .render()
+                .expect("the script failure template renders typed input");
+                Err(failed(reason))
+            }
         }
     }
 }
@@ -962,7 +994,7 @@ pub(crate) mod test_sandbox {
     use std::path::{Path, PathBuf};
 
     use aither_sandbox::permission::PermissionError;
-    use aither_sandbox::{Configured, TerminalMode, TerminalTool, ToolRegistryBuilder};
+    use aither_sandbox::{Configured, SandboxMode, TerminalTool, ToolRegistryBuilder};
     use executor_core::tokio::TokioGlobal;
 
     use super::CloneSandbox;
@@ -978,7 +1010,7 @@ pub(crate) mod test_sandbox {
             _language: aither_sandbox::ScriptLanguage,
             _location: aither_sandbox::CommandLocation<'_>,
         ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-            std::future::ready(Ok(matches!(mode, TerminalMode::Sandboxed)))
+            std::future::ready(Ok(matches!(mode, SandboxMode::Sandboxed)))
         }
     }
 
