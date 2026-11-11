@@ -1,40 +1,46 @@
-//! Argument parsing for the `may` top-level binary.
+//! The `may` command line, declared with clap and resolved into a [`CliMode`].
 //!
-//! The parser is hand-rolled (no clap dependency) so startup is fast
-//! for the common TUI case and so unknown arguments are treated as the
-//! beginning of a one-shot prompt rather than rejected.
+//! `may` alone is the TUI; a trailing positional is a one-shot prompt; every
+//! other first word is a subcommand. clap refuses anything else.
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use aither_core::llm::model::ReasoningEffort;
 use aither_sandbox::SandboxMode;
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
+use may_agent::session::SessionLaunch;
 
 /// Top-level CLI mode the binary resolves from argv.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliMode {
     Tui(TuiArgs),
     Resume(ResumeArgs),
-    Ui(Vec<String>),
-    Rest(Vec<String>),
+    Ui,
+    /// The API-only daemon, on this address.
+    Rest(SocketAddr),
     Daemon(DaemonCommand),
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
     /// The computer-agent helper: its May dir, and the file its stderr
     /// goes to (a `LaunchServices` launch has no terminal).
     ComputerAgent {
-        may_dir: std::path::PathBuf,
-        stderr: Option<std::path::PathBuf>,
+        may_dir: PathBuf,
+        stderr: Option<PathBuf>,
     },
     OneShot(OneShotArgs),
-    Help(&'static str),
+    /// Print the completion script of a shell.
+    Completion(Shell),
 }
 
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiArgs {
-    /// How the TUI starts its sessions: in the launch directory (`may`), as
-    /// repo-less chats (`may chat`), or on a repository (`may --repo
-    /// <owner/repo or path>`).
-    pub launch: may_agent::session::SessionLaunch,
+    /// How the TUI starts its sessions.
+    pub launch: SessionLaunch,
 }
 
 /// Parsed `may resume` invocation.
@@ -65,12 +71,6 @@ pub enum DaemonCommand {
     Status,
     /// Stop the running daemon.
     Stop,
-}
-
-impl DaemonCommand {
-    pub const fn help_text() -> &'static str {
-        "Usage: may daemon [install|uninstall|status|stop]\n\nWithout a subcommand, run the May daemon in the foreground. The daemon runs every agent loop, scheduled task and search index; the TUI and web UI are its clients and start it on demand. `install` keeps it running as a login service."
-    }
 }
 
 /// Parsed `may exec` invocation.
@@ -107,393 +107,406 @@ pub enum BrowserCliCommand {
     Provision,
     Kill,
     Service {
-        socket_path: std::path::PathBuf,
+        socket_path: PathBuf,
     },
 }
 
-impl OneShotArgs {
-    pub const fn help_text() -> &'static str {
-        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may resume [session-id]\n       may ui [args...]\n       may rest [args...]\n       may daemon [install|uninstall|status|stop]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
-    }
+/// May: a terminal-first AI assistant.
+///
+/// Without arguments it opens the TUI in the current directory. Words that
+/// are not a subcommand are a one-shot prompt: the assistant's text streams
+/// to stdout and process events to stderr.
+#[derive(Debug, Parser)]
+#[command(name = "may", version, args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    launch: LaunchArgs,
 }
 
-impl ResumeArgs {
-    pub const fn help_text() -> &'static str {
-        "Usage: may resume [session-id]\n\nOpen the TUI on an existing session. Without a session id, the most recently active session resumes."
-    }
+/// The TUI on a repository, or a one-shot prompt.
+#[derive(Debug, Args)]
+struct LaunchArgs {
+    /// Open the TUI on a repository (`owner/repo` or a local path).
+    #[arg(long, value_name = "OWNER/REPO|PATH", conflicts_with_all = ["model", "reasoning_effort", "prompt"])]
+    repo: Option<String>,
+    /// Model id for the one-shot run.
+    #[arg(long, value_name = "ID", requires = "prompt")]
+    model: Option<String>,
+    /// Reasoning effort for the one-shot run.
+    #[arg(long, value_enum, ignore_case = true, requires = "prompt")]
+    reasoning_effort: Option<EffortArg>,
+    /// The one-shot prompt; several words are joined with spaces.
+    #[arg(value_name = "PROMPT")]
+    prompt: Vec<String>,
 }
 
-pub struct UiArgs;
-
-impl UiArgs {
-    pub const fn help_text() -> &'static str {
-        "Usage: may ui\n\nStart the May daemon if it is not running and open its web UI in the browser."
-    }
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Open the TUI with repo-less chats (no directory, no repository).
+    Chat,
+    /// Reopen a session in the TUI.
+    Resume {
+        /// Session id; the most recently active session when omitted.
+        session: Option<String>,
+    },
+    /// Start the daemon if needed and open its web UI in the browser.
+    Ui(ListenArgs),
+    /// Run the daemon in the foreground, API only, without the embedded web UI.
+    Rest(ListenArgs),
+    /// Run the daemon in the foreground, or manage it.
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
+    /// Run a terminal command in a session's home environment.
+    Exec(ExecCli),
+    /// Inspect or maintain the managed browser runtime.
+    Browser {
+        #[command(subcommand)]
+        command: Option<BrowserSubcommand>,
+    },
+    /// The computer-agent helper the daemon launches.
+    #[command(hide = true)]
+    ComputerAgent {
+        /// The May directory; the default one when omitted.
+        #[arg(long)]
+        may_dir: Option<PathBuf>,
+        /// File the helper's stderr is appended to.
+        #[arg(long)]
+        stderr: Option<PathBuf>,
+    },
+    /// Print the completion script of a shell.
+    Completion {
+        /// The shell to complete for.
+        shell: Shell,
+    },
 }
 
-pub struct RestArgs;
-
-impl RestArgs {
-    pub const fn help_text() -> &'static str {
-        "Usage: may rest [--host <addr>] [--port <port>]\n\nRun the May daemon in the foreground serving the REST API without the embedded web UI, on the given address."
-    }
+/// The address `may rest` serves on.
+#[derive(Debug, Args)]
+struct ListenArgs {
+    /// Address to bind.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: IpAddr,
+    /// Port to bind.
+    #[arg(long, default_value_t = may_agent::daemon::DEFAULT_PORT)]
+    port: u16,
 }
 
-impl ExecArgs {
-    pub const fn help_text() -> &'static str {
-        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--] <command...>\n\nExec runs a terminal command in the session home environment. Use --ssh-server to target an attached SSH environment, and container profile sessions execute inside the configured container environment."
-    }
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Install and start the login service.
+    Install,
+    /// Stop and remove the login service.
+    Uninstall,
+    /// Report whether a daemon runs and its state.
+    Status,
+    /// Stop the running daemon.
+    Stop,
 }
 
-impl BrowserCliArgs {
-    pub const fn help_text() -> &'static str {
-        "Usage: may browser <status|open|close|targets|contexts|cdp-endpoint|read <url> [--detail <brief|standard|full>] [--screenshot <off|viewport|full-page>]|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
-    }
+#[derive(Debug, Args)]
+struct ExecCli {
+    /// Session whose home environment runs the command.
+    #[arg(long, value_name = "ID")]
+    session: String,
+    /// Sandbox mode of the command.
+    #[arg(long, value_enum, ignore_case = true)]
+    mode: Option<ModeArg>,
+    /// Attached SSH environment to run on.
+    #[arg(long, value_name = "ID")]
+    ssh_server: Option<String>,
+    /// Seconds before the command is killed.
+    #[arg(long, value_name = "SEC", default_value_t = 300)]
+    timeout: u64,
+    /// Lines of output kept.
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    max_lines: u32,
+    /// Print the output unprocessed.
+    #[arg(long)]
+    raw: bool,
+    /// The command; its words are joined with spaces.
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    command: Vec<String>,
 }
 
-/// Parse argv into a [`CliMode`].
-pub fn parse_cli_mode(args: &[String]) -> CliMode {
-    match args.get(1).map(String::as_str) {
-        Some("--help" | "-h") => CliMode::Help(OneShotArgs::help_text()),
-        Some("ui") => match args.get(2).map(String::as_str) {
-            Some("--help" | "-h") => CliMode::Help(UiArgs::help_text()),
-            _ => CliMode::Ui(args[2..].to_vec()),
-        },
-        Some("rest") => match args.get(2).map(String::as_str) {
-            Some("--help" | "-h") => CliMode::Help(RestArgs::help_text()),
-            _ => CliMode::Rest(args[2..].to_vec()),
-        },
-        Some("daemon") => match args.get(2).map(String::as_str) {
-            None => CliMode::Daemon(DaemonCommand::Run),
-            Some("install") => CliMode::Daemon(DaemonCommand::Install),
-            Some("uninstall") => CliMode::Daemon(DaemonCommand::Uninstall),
-            Some("status") => CliMode::Daemon(DaemonCommand::Status),
-            Some("stop") => CliMode::Daemon(DaemonCommand::Stop),
-            // `--help`, `-h` and anything unknown.
-            Some(_) => CliMode::Help(DaemonCommand::help_text()),
-        },
-        Some("resume") => match args.get(2).map(String::as_str) {
-            Some("--help" | "-h") => CliMode::Help(ResumeArgs::help_text()),
-            _ => CliMode::Resume(parse_resume_args(&args[2..])),
-        },
-        Some("computer-agent") => {
-            let value = |flag: &str| {
-                args.iter()
-                    .position(|a| a == flag)
-                    .and_then(|i| args.get(i + 1))
-                    .map(std::path::PathBuf::from)
-            };
-            let may_dir = value("--may-dir").unwrap_or_else(|| {
-                may_agent::MayConfig::may_dir()
-                    .expect("the May directory must resolve for the computer agent")
-            });
-            CliMode::ComputerAgent {
-                may_dir,
-                stderr: value("--stderr"),
-            }
+#[derive(Debug, Subcommand)]
+enum BrowserSubcommand {
+    /// Report the browser runtime's state (the default).
+    Status,
+    /// Start the browser.
+    Open,
+    /// Stop the browser.
+    Close,
+    /// List the open targets.
+    Targets,
+    /// List the browser contexts.
+    Contexts,
+    /// Print the CDP endpoint.
+    CdpEndpoint,
+    /// Read a page.
+    Read {
+        url: String,
+        /// How much of the page to return.
+        #[arg(long, value_enum, default_value = "standard")]
+        detail: DetailArg,
+        /// Whether to attach a screenshot.
+        #[arg(long, value_enum, default_value = "viewport")]
+        screenshot: ScreenshotArg,
+    },
+    /// Download the browser runtime.
+    Provision,
+    /// Kill the browser processes.
+    Kill,
+    /// The browser service process the daemon launches.
+    #[command(hide = true)]
+    Service {
+        #[arg(long)]
+        socket: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EffortArg {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModeArg {
+    /// Run in the sandbox.
+    Default,
+    /// Run outside the sandbox.
+    Unsafe,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DetailArg {
+    Brief,
+    Standard,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ScreenshotArg {
+    Off,
+    Viewport,
+    FullPage,
+}
+
+impl From<EffortArg> for ReasoningEffort {
+    fn from(value: EffortArg) -> Self {
+        match value {
+            EffortArg::Low => Self::Low,
+            EffortArg::Medium => Self::Medium,
+            EffortArg::High => Self::High,
         }
-        Some("browser") => match args.get(2).map(String::as_str) {
-            Some("--help" | "-h") => CliMode::Help(BrowserCliArgs::help_text()),
-            _ => CliMode::Browser(parse_browser_args(&args[2..])),
-        },
-        Some("exec") => match args.get(2).map(String::as_str) {
-            Some("--help" | "-h") => CliMode::Help(ExecArgs::help_text()),
-            _ => CliMode::Exec(parse_exec_args(&args[2..])),
-        },
-        None => CliMode::Tui(TuiArgs::default()),
-        Some("chat") => CliMode::Tui(TuiArgs {
-            launch: may_agent::session::SessionLaunch::RepoLess,
-        }),
-        Some("--repo") => CliMode::Tui(TuiArgs {
-            launch: args.get(2).cloned().map_or_else(
-                may_agent::session::SessionLaunch::default,
-                may_agent::session::SessionLaunch::Repo,
-            ),
-        }),
-        Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
     }
 }
 
-fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
-    let command = match args.first().map_or("status", String::as_str) {
-        "--help" | "-h" => panic!("{}", BrowserCliArgs::help_text()),
-        "status" => BrowserCliCommand::Status,
-        "open" => BrowserCliCommand::Start,
-        "close" => BrowserCliCommand::Stop,
-        "targets" => BrowserCliCommand::Targets,
-        "contexts" => BrowserCliCommand::Contexts,
-        "cdp-endpoint" => BrowserCliCommand::Endpoint,
-        "provision" => BrowserCliCommand::Provision,
-        "kill" => BrowserCliCommand::Kill,
-        "read" => {
-            let url = args.get(1).cloned().unwrap_or_else(|| {
-                panic!("may browser read requires <url>");
-            });
-            let mut detail = BrowserReadDetail::default();
-            let mut screenshot = BrowserScreenshotMode::default();
-            let mut index = 2;
-            while index < args.len() {
-                match args[index].as_str() {
-                    "--detail" => {
-                        let value = args.get(index + 1).unwrap_or_else(|| {
-                            panic!("may browser read requires --detail <brief|standard|full>")
-                        });
-                        detail = match value.as_str() {
-                            "brief" => BrowserReadDetail::Brief,
-                            "standard" => BrowserReadDetail::Standard,
-                            "full" => BrowserReadDetail::Full,
-                            other => panic!(
-                                "invalid may browser read detail '{other}'; expected brief, standard, or full"
-                            ),
-                        };
-                        index += 2;
-                    }
-                    "--screenshot" => {
-                        let value = args.get(index + 1).unwrap_or_else(|| {
-                            panic!(
-                                "may browser read requires --screenshot <off|viewport|full-page>"
-                            )
-                        });
-                        screenshot = match value.as_str() {
-                            "off" => BrowserScreenshotMode::Off,
-                            "viewport" => BrowserScreenshotMode::Viewport,
-                            "full-page" => BrowserScreenshotMode::FullPage,
-                            other => panic!(
-                                "invalid may browser read screenshot mode '{other}'; expected off, viewport, or full-page"
-                            ),
-                        };
-                        index += 2;
-                    }
-                    other => panic!("unexpected may browser read argument '{other}'"),
-                }
-            }
-            BrowserCliCommand::Read {
+impl From<ModeArg> for SandboxMode {
+    fn from(value: ModeArg) -> Self {
+        match value {
+            ModeArg::Default => Self::Sandboxed,
+            ModeArg::Unsafe => Self::Unsandboxed,
+        }
+    }
+}
+
+impl From<DetailArg> for BrowserReadDetail {
+    fn from(value: DetailArg) -> Self {
+        match value {
+            DetailArg::Brief => Self::Brief,
+            DetailArg::Standard => Self::Standard,
+            DetailArg::Full => Self::Full,
+        }
+    }
+}
+
+impl From<ScreenshotArg> for BrowserScreenshotMode {
+    fn from(value: ScreenshotArg) -> Self {
+        match value {
+            ScreenshotArg::Off => Self::Off,
+            ScreenshotArg::Viewport => Self::Viewport,
+            ScreenshotArg::FullPage => Self::FullPage,
+        }
+    }
+}
+
+impl From<BrowserSubcommand> for BrowserCliCommand {
+    fn from(value: BrowserSubcommand) -> Self {
+        match value {
+            BrowserSubcommand::Status => Self::Status,
+            BrowserSubcommand::Open => Self::Start,
+            BrowserSubcommand::Close => Self::Stop,
+            BrowserSubcommand::Targets => Self::Targets,
+            BrowserSubcommand::Contexts => Self::Contexts,
+            BrowserSubcommand::CdpEndpoint => Self::Endpoint,
+            BrowserSubcommand::Read {
                 url,
                 detail,
                 screenshot,
-            }
+            } => Self::Read {
+                url,
+                detail: detail.into(),
+                screenshot: screenshot.into(),
+            },
+            BrowserSubcommand::Provision => Self::Provision,
+            BrowserSubcommand::Kill => Self::Kill,
+            BrowserSubcommand::Service { socket } => Self::Service {
+                socket_path: socket,
+            },
         }
-        "service" => {
-            let mut socket_path = None;
-            let mut index = 1;
-            while index < args.len() {
-                match args[index].as_str() {
-                    "--socket" => {
-                        let value = args.get(index + 1).unwrap_or_else(|| {
-                            panic!("may browser service requires --socket <path>")
-                        });
-                        socket_path = Some(std::path::PathBuf::from(value));
-                        index += 2;
+    }
+}
+
+impl From<Option<DaemonAction>> for DaemonCommand {
+    fn from(value: Option<DaemonAction>) -> Self {
+        match value {
+            None => Self::Run,
+            Some(DaemonAction::Install) => Self::Install,
+            Some(DaemonAction::Uninstall) => Self::Uninstall,
+            Some(DaemonAction::Status) => Self::Status,
+            Some(DaemonAction::Stop) => Self::Stop,
+        }
+    }
+}
+
+/// The prompt words joined with spaces; blank when every word is.
+fn joined(words: &[String]) -> String {
+    words.join(" ").trim().to_string()
+}
+
+fn empty_error(what: &str) -> clap::Error {
+    Cli::command().error(ErrorKind::InvalidValue, format!("{what} must not be empty"))
+}
+
+impl Cli {
+    fn into_mode(self) -> Result<CliMode, clap::Error> {
+        Ok(match self.command {
+            None => {
+                let LaunchArgs {
+                    repo,
+                    model,
+                    reasoning_effort,
+                    prompt,
+                } = self.launch;
+                if prompt.is_empty() {
+                    CliMode::Tui(TuiArgs {
+                        launch: repo.map_or_else(SessionLaunch::default, SessionLaunch::Repo),
+                    })
+                } else {
+                    let prompt = joined(&prompt);
+                    if prompt.is_empty() {
+                        return Err(empty_error("the prompt"));
                     }
-                    other => panic!("unexpected may browser service argument '{other}'"),
+                    CliMode::OneShot(OneShotArgs {
+                        prompt,
+                        model,
+                        reasoning_effort: reasoning_effort.map(Into::into),
+                    })
                 }
             }
-            BrowserCliCommand::Service {
-                socket_path: socket_path
-                    .unwrap_or_else(|| panic!("may browser service requires --socket <path>")),
+            Some(Command::Chat) => CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::RepoLess,
+            }),
+            Some(Command::Resume { session }) => CliMode::Resume(ResumeArgs { session }),
+            // `may ui` always opens the configured port; the pair is accepted
+            // for compatibility and not used.
+            Some(Command::Ui(_)) => CliMode::Ui,
+            Some(Command::Rest(listen)) => CliMode::Rest(SocketAddr::new(listen.host, listen.port)),
+            Some(Command::Daemon { action }) => CliMode::Daemon(action.into()),
+            Some(Command::Exec(exec)) => {
+                let script = joined(&exec.command);
+                if script.is_empty() {
+                    return Err(empty_error("the command"));
+                }
+                CliMode::Exec(ExecArgs {
+                    session_id: exec.session,
+                    script,
+                    mode: exec.mode.map(Into::into),
+                    ssh_server_id: exec.ssh_server,
+                    timeout: exec.timeout,
+                    raw: exec.raw,
+                    max_lines: exec.max_lines,
+                })
             }
-        }
-        other => panic!(
-            "invalid browser command '{other}'; expected one of: status, open, close, targets, contexts, cdp-endpoint, read, provision, kill"
-        ),
-    };
-    if !matches!(
-        command,
-        BrowserCliCommand::Service { .. } | BrowserCliCommand::Read { .. }
-    ) && args.len() > 1
-    {
-        panic!("may browser accepts exactly one subcommand");
+            Some(Command::Browser { command }) => CliMode::Browser(BrowserCliArgs {
+                command: command.map_or(BrowserCliCommand::Status, Into::into),
+            }),
+            Some(Command::ComputerAgent { may_dir, stderr }) => CliMode::ComputerAgent {
+                may_dir: may_dir.unwrap_or_else(|| {
+                    may_agent::MayConfig::may_dir()
+                        .expect("the May directory must resolve for the computer agent")
+                }),
+                stderr,
+            },
+            Some(Command::Completion { shell }) => CliMode::Completion(shell),
+        })
     }
-    BrowserCliArgs { command }
 }
 
-fn parse_resume_args(args: &[String]) -> ResumeArgs {
-    let session = match args {
-        [] => None,
-        [id] => Some(id.clone()),
-        _ => panic!("{}", ResumeArgs::help_text()),
-    };
-    ResumeArgs { session }
+/// Parse argv (program name first) into a [`CliMode`]. Help and version are
+/// reported as the [`clap::Error`] clap uses for them.
+pub fn parse_cli_mode<I, T>(args: I) -> Result<CliMode, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    Cli::try_parse_from(args)?.into_mode()
 }
 
+/// Parse the process's argv; help, version and a refusal print and exit.
 pub fn parse_cli_mode_from_env() -> CliMode {
-    let args: Vec<String> = std::env::args().collect();
-    parse_cli_mode(&args)
+    parse_cli_mode(std::env::args_os()).unwrap_or_else(|error| error.exit())
 }
 
-fn parse_exec_args(args: &[String]) -> ExecArgs {
-    let mut session_id = None;
-    let mut script_parts = Vec::new();
-    let mut mode = None;
-    let mut ssh_server_id = None;
-    let mut timeout = 300;
-    let mut raw = false;
-    let mut max_lines = 200;
-    let mut literal_script = false;
-    let mut index = 0;
-
-    while index < args.len() {
-        let value = &args[index];
-        if literal_script {
-            script_parts.push(value.clone());
-            index += 1;
-            continue;
-        }
-
-        match value.as_str() {
-            "--help" | "-h" => panic!("{}", ExecArgs::help_text()),
-            "--" => {
-                literal_script = true;
-                index += 1;
-            }
-            "--session" => {
-                let next = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--session requires a value"));
-                session_id = Some(next.clone());
-                index += 2;
-            }
-            "--mode" => {
-                let next = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--mode requires a value"));
-                mode = Some(parse_terminal_execution_mode(next));
-                index += 2;
-            }
-            "--ssh-server" => {
-                let next = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--ssh-server requires a value"));
-                ssh_server_id = Some(next.clone());
-                index += 2;
-            }
-            "--timeout" => {
-                let next = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--timeout requires a value"));
-                timeout = next
-                    .parse::<u64>()
-                    .unwrap_or_else(|_| panic!("invalid --timeout '{next}'"));
-                index += 2;
-            }
-            "--max-lines" => {
-                let next = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--max-lines requires a value"));
-                max_lines = next
-                    .parse::<u32>()
-                    .unwrap_or_else(|_| panic!("invalid --max-lines '{next}'"));
-                index += 2;
-            }
-            "--raw" => {
-                raw = true;
-                index += 1;
-            }
-            other => {
-                script_parts.push(other.to_string());
-                index += 1;
-            }
-        }
-    }
-
-    let session_id = session_id.unwrap_or_else(|| panic!("--session is required"));
-    let script = script_parts.join(" ").trim().to_string();
-    assert!(!script.is_empty(), "exec command must not be empty");
-
-    ExecArgs {
-        session_id,
-        script,
-        mode,
-        ssh_server_id,
-        timeout,
-        raw,
-        max_lines,
-    }
-}
-
-fn parse_oneshot_args(args: &[String]) -> OneShotArgs {
-    let mut prompt_parts = Vec::new();
-    let mut model = None;
-    let mut reasoning_effort = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--help" | "-h" => panic!("{}", OneShotArgs::help_text()),
-            "--model" => {
-                let value = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--model requires a value"));
-                model = Some(value.clone());
-                index += 2;
-            }
-            "--reasoning-effort" => {
-                let value = args
-                    .get(index + 1)
-                    .unwrap_or_else(|| panic!("--reasoning-effort requires a value"));
-                reasoning_effort = Some(parse_reasoning_effort(value));
-                index += 2;
-            }
-            value => {
-                prompt_parts.push(value.to_string());
-                index += 1;
-            }
-        }
-    }
-
-    let prompt = prompt_parts.join(" ").trim().to_string();
-    assert!(!prompt.is_empty(), "oneshot prompt must not be empty");
-
-    OneShotArgs {
-        prompt,
-        model,
-        reasoning_effort,
-    }
-}
-
-pub fn parse_reasoning_effort(value: &str) -> ReasoningEffort {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "low" => ReasoningEffort::Low,
-        "medium" => ReasoningEffort::Medium,
-        "high" => ReasoningEffort::High,
-        _ => panic!("invalid --reasoning-effort '{value}'; expected one of: low, medium, high"),
-    }
-}
-
-fn parse_terminal_execution_mode(value: &str) -> SandboxMode {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "default" => SandboxMode::Sandboxed,
-        "unsafe" => SandboxMode::Unsandboxed,
-        _ => panic!("invalid --mode '{value}'; expected one of: default, unsafe"),
-    }
+/// The completion script of `shell` for the whole command line.
+pub fn completion_script(shell: Shell) -> Vec<u8> {
+    let mut command = Cli::command();
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut command, "may", &mut script);
+    script
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, SandboxMode, TuiArgs,
-        parse_cli_mode, parse_reasoning_effort,
-    };
-    use aither_core::llm::model::ReasoningEffort;
-    use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
+    use super::*;
+    use clap::error::ContextKind;
 
-    fn args(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|part| (*part).to_string()).collect()
+    fn parse(parts: &[&str]) -> CliMode {
+        parse_cli_mode(parts).expect("the invocation parses")
+    }
+
+    fn refusal(parts: &[&str]) -> clap::Error {
+        parse_cli_mode(parts).expect_err("the invocation is refused")
+    }
+
+    fn oneshot(prompt: &str) -> OneShotArgs {
+        OneShotArgs {
+            prompt: prompt.to_string(),
+            model: None,
+            reasoning_effort: None,
+        }
     }
 
     #[test]
-    fn parse_cli_mode_defaults_to_tui() {
-        assert_eq!(
-            parse_cli_mode(&args(&["may"])),
-            CliMode::Tui(TuiArgs::default())
-        );
+    fn defaults_to_tui() {
+        assert_eq!(parse(&["may"]), CliMode::Tui(TuiArgs::default()));
     }
 
     #[test]
-    fn parse_cli_mode_chat_is_a_repo_less_tui() {
-        use may_agent::session::SessionLaunch;
+    fn chat_is_a_repo_less_tui() {
         assert_eq!(
-            parse_cli_mode(&args(&["may", "chat"])),
+            parse(&["may", "chat"]),
             CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::RepoLess
             })
@@ -501,10 +514,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_mode_repo_starts_on_a_repository() {
-        use may_agent::session::SessionLaunch;
+    fn repo_starts_on_a_repository() {
         assert_eq!(
-            parse_cli_mode(&args(&["may", "--repo", "acme/app"])),
+            parse(&["may", "--repo", "acme/app"]),
             CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::Repo("acme/app".to_string())
             })
@@ -512,59 +524,87 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_mode_detects_resume_subcommand() {
+    fn resume_takes_an_optional_session() {
         assert_eq!(
-            parse_cli_mode(&args(&["may", "resume"])),
-            CliMode::Resume(super::ResumeArgs { session: None })
+            parse(&["may", "resume"]),
+            CliMode::Resume(ResumeArgs { session: None })
         );
         assert_eq!(
-            parse_cli_mode(&args(&["may", "resume", "calm-river-stone-lake"])),
-            CliMode::Resume(super::ResumeArgs {
+            parse(&["may", "resume", "calm-river-stone-lake"]),
+            CliMode::Resume(ResumeArgs {
                 session: Some("calm-river-stone-lake".to_string()),
             })
         );
     }
 
     #[test]
-    fn parse_cli_mode_detects_ui_subcommand() {
+    fn ui_accepts_the_listen_pair() {
+        assert_eq!(parse(&["may", "ui"]), CliMode::Ui);
+        assert_eq!(parse(&["may", "ui", "--host", "127.0.0.1"]), CliMode::Ui);
+    }
+
+    #[test]
+    fn rest_resolves_its_address() {
         assert_eq!(
-            parse_cli_mode(&args(&["may", "ui", "--host", "127.0.0.1"])),
-            CliMode::Ui(vec!["--host".to_string(), "127.0.0.1".to_string()])
+            parse(&["may", "rest", "--port", "9000"]),
+            CliMode::Rest("127.0.0.1:9000".parse().unwrap())
+        );
+        assert_eq!(
+            parse(&["may", "rest", "--host=0.0.0.0", "--port=1"]),
+            CliMode::Rest("0.0.0.0:1".parse().unwrap())
+        );
+        assert_eq!(
+            parse(&["may", "rest"]),
+            CliMode::Rest("127.0.0.1:8787".parse().unwrap())
         );
     }
 
     #[test]
-    fn parse_cli_mode_detects_rest_subcommand() {
-        assert_eq!(
-            parse_cli_mode(&args(&["may", "rest", "--port", "8787"])),
-            CliMode::Rest(vec!["--port".to_string(), "8787".to_string()])
-        );
+    fn daemon_actions() {
+        for (word, command) in [
+            (None, DaemonCommand::Run),
+            (Some("install"), DaemonCommand::Install),
+            (Some("uninstall"), DaemonCommand::Uninstall),
+            (Some("status"), DaemonCommand::Status),
+            (Some("stop"), DaemonCommand::Stop),
+        ] {
+            let mut argv = vec!["may", "daemon"];
+            argv.extend(word);
+            assert_eq!(parse(&argv), CliMode::Daemon(command));
+        }
     }
 
     #[test]
-    fn parse_cli_mode_detects_browser_subcommand() {
+    fn browser_commands() {
+        let browser = |command| CliMode::Browser(BrowserCliArgs { command });
         assert_eq!(
-            parse_cli_mode(&args(&["may", "browser", "contexts"])),
-            CliMode::Browser(BrowserCliArgs {
-                command: BrowserCliCommand::Contexts,
+            parse(&["may", "browser"]),
+            browser(BrowserCliCommand::Status)
+        );
+        for (word, command) in [
+            ("status", BrowserCliCommand::Status),
+            ("open", BrowserCliCommand::Start),
+            ("close", BrowserCliCommand::Stop),
+            ("targets", BrowserCliCommand::Targets),
+            ("contexts", BrowserCliCommand::Contexts),
+            ("cdp-endpoint", BrowserCliCommand::Endpoint),
+            ("provision", BrowserCliCommand::Provision),
+            ("kill", BrowserCliCommand::Kill),
+        ] {
+            assert_eq!(parse(&["may", "browser", word]), browser(command));
+        }
+        assert_eq!(
+            parse(&["may", "browser", "service", "--socket", "/tmp/b.sock"]),
+            browser(BrowserCliCommand::Service {
+                socket_path: "/tmp/b.sock".into()
             })
         );
     }
 
     #[test]
-    fn parse_cli_mode_detects_browser_open_command() {
+    fn browser_read_flags() {
         assert_eq!(
-            parse_cli_mode(&args(&["may", "browser", "open"])),
-            CliMode::Browser(BrowserCliArgs {
-                command: BrowserCliCommand::Start,
-            })
-        );
-    }
-
-    #[test]
-    fn parse_cli_mode_detects_browser_read_flags() {
-        assert_eq!(
-            parse_cli_mode(&args(&[
+            parse(&[
                 "may",
                 "browser",
                 "read",
@@ -573,7 +613,7 @@ mod tests {
                 "full",
                 "--screenshot",
                 "full-page",
-            ])),
+            ]),
             CliMode::Browser(BrowserCliArgs {
                 command: BrowserCliCommand::Read {
                     url: "https://example.com".to_string(),
@@ -582,24 +622,87 @@ mod tests {
                 },
             })
         );
-    }
-
-    #[test]
-    fn parse_cli_mode_joins_prompt_into_oneshot() {
         assert_eq!(
-            parse_cli_mode(&args(&["may", "fix", "the", "bug"])),
-            CliMode::OneShot(OneShotArgs {
-                prompt: "fix the bug".to_string(),
-                model: None,
-                reasoning_effort: None,
+            parse(&["may", "browser", "read", "https://example.com"]),
+            CliMode::Browser(BrowserCliArgs {
+                command: BrowserCliCommand::Read {
+                    url: "https://example.com".to_string(),
+                    detail: BrowserReadDetail::default(),
+                    screenshot: BrowserScreenshotMode::default(),
+                },
             })
         );
     }
 
     #[test]
-    fn parse_cli_mode_detects_exec_subcommand() {
+    fn computer_agent_flags() {
         assert_eq!(
-            parse_cli_mode(&args(&[
+            parse(&[
+                "may",
+                "computer-agent",
+                "--may-dir",
+                "/tmp/may",
+                "--stderr",
+                "/tmp/log"
+            ]),
+            CliMode::ComputerAgent {
+                may_dir: "/tmp/may".into(),
+                stderr: Some("/tmp/log".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_words_are_joined() {
+        assert_eq!(
+            parse(&["may", "fix", "the", "bug"]),
+            CliMode::OneShot(oneshot("fix the bug"))
+        );
+        assert_eq!(
+            parse(&["may", "fix the bug"]),
+            CliMode::OneShot(oneshot("fix the bug"))
+        );
+        assert_eq!(
+            parse(&["may", "--", "--version"]),
+            CliMode::OneShot(oneshot("--version"))
+        );
+    }
+
+    #[test]
+    fn oneshot_flags_in_any_position() {
+        let expected = CliMode::OneShot(OneShotArgs {
+            prompt: "inspect repo".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some(ReasoningEffort::Low),
+        });
+        assert_eq!(
+            parse(&[
+                "may",
+                "--model",
+                "gpt-5.4",
+                "--reasoning-effort",
+                "low",
+                "inspect",
+                "repo",
+            ]),
+            expected
+        );
+        assert_eq!(
+            parse(&[
+                "may",
+                "inspect repo",
+                "--reasoning-effort",
+                "LOW",
+                "--model=gpt-5.4",
+            ]),
+            expected
+        );
+    }
+
+    #[test]
+    fn exec_flags_and_command() {
+        assert_eq!(
+            parse(&[
                 "may",
                 "exec",
                 "--session",
@@ -613,7 +716,7 @@ mod tests {
                 "--raw",
                 "--",
                 "pwd",
-            ])),
+            ]),
             CliMode::Exec(ExecArgs {
                 session_id: "session-123".to_string(),
                 script: "pwd".to_string(),
@@ -624,32 +727,117 @@ mod tests {
                 max_lines: 42,
             })
         );
-    }
-
-    #[test]
-    fn parse_cli_mode_accepts_oneshot_flags() {
         assert_eq!(
-            parse_cli_mode(&args(&[
+            parse(&[
                 "may",
-                "--model",
-                "gpt-5.4",
-                "--reasoning-effort",
-                "low",
-                "inspect",
-                "repo",
-            ])),
-            CliMode::OneShot(OneShotArgs {
-                prompt: "inspect repo".to_string(),
-                model: Some("gpt-5.4".to_string()),
-                reasoning_effort: Some(ReasoningEffort::Low),
+                "exec",
+                "--session",
+                "s",
+                "--mode",
+                "unsafe",
+                "--ssh-server",
+                "box",
+                "ls",
+                "-la",
+                "/tmp",
+            ]),
+            CliMode::Exec(ExecArgs {
+                session_id: "s".to_string(),
+                script: "ls -la /tmp".to_string(),
+                mode: Some(SandboxMode::Unsandboxed),
+                ssh_server_id: Some("box".to_string()),
+                timeout: 300,
+                raw: false,
+                max_lines: 200,
             })
         );
     }
 
     #[test]
-    fn parse_reasoning_effort_accepts_low_medium_high() {
-        assert_eq!(parse_reasoning_effort("low"), ReasoningEffort::Low);
-        assert_eq!(parse_reasoning_effort("medium"), ReasoningEffort::Medium);
-        assert_eq!(parse_reasoning_effort("high"), ReasoningEffort::High);
+    fn completion_names_the_shell() {
+        assert_eq!(
+            parse(&["may", "completion", "fish"]),
+            CliMode::Completion(Shell::Fish)
+        );
+    }
+
+    #[test]
+    fn completion_script_is_not_empty() {
+        let script = String::from_utf8(completion_script(Shell::Fish)).unwrap();
+        assert!(script.contains("complete -c may"), "{script}");
+    }
+
+    #[test]
+    fn version_is_the_package_version() {
+        let error = refusal(&["may", "--version"]);
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string().trim(),
+            format!("may {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(refusal(&["may", "-V"]).kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn help_is_displayed_for_may_and_subcommands() {
+        for argv in [
+            &["may", "--help"][..],
+            &["may", "-h"],
+            &["may", "exec", "--help"],
+            &["may", "browser", "read", "--help"],
+        ] {
+            assert_eq!(refusal(argv).kind(), ErrorKind::DisplayHelp, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_mistyped_flag_is_refused_with_a_suggestion() {
+        let error = refusal(&["may", "--modle", "x"]);
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        let suggested = error
+            .get(ContextKind::SuggestedArg)
+            .map(ToString::to_string);
+        assert_eq!(suggested.as_deref(), Some("--model"));
+        assert_eq!(
+            refusal(&["may", "--bogus"]).kind(),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn a_mistyped_subcommand_is_refused_with_a_suggestion() {
+        let error = refusal(&["may", "browser", "staus"]);
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+        let suggested = error
+            .get(ContextKind::SuggestedSubcommand)
+            .map(ToString::to_string);
+        assert_eq!(suggested.as_deref(), Some("status"));
+    }
+
+    #[test]
+    fn invalid_values_are_refused() {
+        for argv in [
+            &["may", "completion", "tcsh"][..],
+            &["may", "--reasoning-effort", "extreme", "hi"],
+            &["may", "--model", "x"],
+            &["may", "--repo", "a/b", "hi"],
+            &["may", "rest", "--port", "http"],
+            &["may", "exec", "--session", "s"],
+            &["may", "exec", "--mode", "root", "--session", "s", "ls"],
+            &["may", "browser", "read"],
+            &["may", "resume", "a", "b"],
+            &["may", "daemon", "restart"],
+        ] {
+            assert!(parse_cli_mode(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_blank_prompt_is_refused() {
+        assert_eq!(refusal(&["may", " "]).kind(), ErrorKind::InvalidValue);
+        assert_eq!(
+            refusal(&["may", "exec", "--session", "s", ""]).kind(),
+            ErrorKind::InvalidValue
+        );
     }
 }
