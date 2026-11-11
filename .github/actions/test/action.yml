@@ -59,10 +59,17 @@ runs:
     # The merge queue already tested the tree a push to dev lands, so that
     # push only builds, to seed dev's caches; it still tests when the test
     # downloads missed, since the tests are what fetch them.
-    - name: cargo test
+    #
+    # nextest runs every test of every binary in one pool, where `cargo test`
+    # runs the binaries one after another. May has no Rust doc-tests (its doc
+    # code blocks are text, bash, toml or `ignore`), so there is no
+    # `cargo test --doc` step.
+    - if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
+      uses: taiki-e/install-action@nextest
+    - name: cargo nextest
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
-      run: cargo test --locked --all-targets --timings
+      run: cargo nextest run --locked --all-targets --timings
     - name: Upload cargo timings
       if: always()
       uses: actions/upload-artifact@v4
