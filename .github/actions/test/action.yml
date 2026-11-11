@@ -43,7 +43,22 @@ runs:
         packages: nasm
     - name: cargo build
       shell: bash
-      run: cargo build --locked --all-targets --timings
+      run: |
+        if [ "${RUNNER_OS}" = macOS ]; then
+          sysctl hw.ncpu hw.memsize
+          (while sleep 15; do
+            echo "$(date -u +%T) pressure=$(sysctl -n kern.memorystatus_vm_pressure_level) $(sysctl -n vm.swapusage)"
+            ps -Ao rss=,comm= | sort -rn | head -3 | awk '{printf "  %d MB %s\n", $1/1024, $2}'
+          done) > "${RUNNER_TEMP}/memory.log" 2>&1 &
+          echo "$!" > "${RUNNER_TEMP}/memory.pid"
+        fi
+        cargo build --locked --all-targets --timings
+    - name: Memory during the build
+      if: always() && runner.os == 'macOS'
+      shell: bash
+      run: |
+        kill "$(cat "${RUNNER_TEMP}/memory.pid")" || true
+        cat "${RUNNER_TEMP}/memory.log"
     # Every run keeps the debug may it built, so a commit can be tested on
     # another machine without building it there. It is packed as a tarball
     # because artifacts drop the executable bit.
