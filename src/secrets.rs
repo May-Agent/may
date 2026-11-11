@@ -832,18 +832,21 @@ mod tests {
     fn a_missing_index_holds_no_secrets() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = store_in(&dir);
-        assert!(store.values().expect("no index reads as empty").is_empty());
-        assert!(
+        assert_eq!(
+            store.values().expect("no index reads as empty"),
+            [] as [(String, String); 0]
+        );
+        assert_eq!(
             store
                 .session_values("session")
-                .expect("no index reads as empty")
-                .is_empty()
+                .expect("no index reads as empty"),
+            [] as [(String, String); 0]
         );
-        assert!(
+        assert_eq!(
             store
                 .session_env("session")
-                .expect("no index reads as empty")
-                .is_empty()
+                .expect("no index reads as empty"),
+            [] as [(String, String); 0]
         );
     }
 

@@ -285,7 +285,7 @@ async fn a_broken_secrets_index_sends_no_request() {
         "the request fails on the secrets"
     );
     assert!(stream.next().await.is_none());
-    assert!(provider_traffic(&requests).await.is_empty());
+    assert_eq!(provider_traffic(&requests).await, [] as [String; 0]);
 }
 
 /// A broken index ends the run at the first tool result instead of showing
