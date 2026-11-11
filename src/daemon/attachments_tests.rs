@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use skyzen::StatusCode;
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -32,7 +33,7 @@ async fn session(state: &DaemonState, id: &str) {
 async fn an_uploaded_attachment_serves_its_bytes_with_their_content_type() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let bytes = b"\x89PNG\r\n\x1a\nbytes".to_vec();
     let upload = hyper::Request::builder()
@@ -86,7 +87,7 @@ async fn an_uploaded_attachment_serves_its_bytes_with_their_content_type() {
 async fn a_file_path_escaping_files_is_rejected() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     for path in ["../secrets", "..%2Fsecrets", "%2e%2e/secrets"] {
         if let Ok(response) = router
@@ -150,7 +151,7 @@ const NO_SCRIPT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; s
 async fn session_html_and_svg_files_are_served_inert() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     write_session_file(&state, "files", "page.html", b"<script>alert(1)</script>").await;
     write_session_file(
         &state,
@@ -180,7 +181,7 @@ async fn session_html_and_svg_files_are_served_inert() {
 async fn a_session_image_keeps_its_type_and_gets_nosniff_only() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     write_session_file(&state, "files", "shot.png", b"\x89PNG\r\n\x1a\n").await;
 
     let response = get(&router, &format!("/api/sessions/{SESSION}/files/shot.png")).await;
@@ -194,7 +195,7 @@ async fn a_session_image_keeps_its_type_and_gets_nosniff_only() {
 async fn an_artifact_download_is_an_attachment_with_nosniff_and_a_sandbox() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     write_session_file(&state, "artifacts", "page.html", b"<script>1</script>").await;
 
     let response = get(
