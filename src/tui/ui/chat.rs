@@ -22,7 +22,7 @@ use super::super::queue::Attachment;
 use super::band;
 use super::chat_layout::{self, ChatLayout};
 use super::markdown;
-use super::streaming_markdown::IMAGE_HEIGHT;
+use super::streaming_markdown::{IMAGE_HEIGHT, IncrementalMarkdown};
 use crate::agent::ContextReport;
 use crate::command_reading::{
     Card, CommandReading, DiffLine, DiffOp, FileChange, FileEdit, Intent, Link, RowChangeKind,
@@ -498,18 +498,44 @@ pub struct ChatStream {
     response_floor: usize,
     /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
     tunnel_base: String,
+    /// The reply streaming text was last appended to: an identity unique
+    /// across every stream of the process, under which a layout cache keeps
+    /// what it rendered of the reply, and the revision the append left.
+    streaming_reply: Option<(u64, u64)>,
+}
+
+/// The `<tunnel id="…"/>` control tag.
+fn tunnel_tag() -> &'static regex::Regex {
+    static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        regex::Regex::new(r#"<tunnel\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*/>"#)
+            .expect("tunnel tag pattern must compile")
+    })
 }
 
 /// Renders `<tunnel id="…"/>` control tags as daemon URLs so the terminal
 /// shows a link instead of the raw marker.
 fn resolve_tunnel_tags<'a>(content: &'a str, tunnel_base: &str) -> std::borrow::Cow<'a, str> {
-    static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = TAG.get_or_init(|| {
-        regex::Regex::new(r#"<tunnel\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*/>"#)
-            .expect("tunnel tag pattern must compile")
-    });
-    re.replace_all(content, |captures: &regex::Captures<'_>| {
+    tunnel_tag().replace_all(content, |captures: &regex::Captures<'_>| {
         format!("{tunnel_base}/{}/", &captures[1])
+    })
+}
+
+/// Whether appended text can no longer change the tunnel tags of `content`.
+///
+/// It holds when every `<tunnel` opening lies inside a tag found in
+/// `content` or meets a `>` before any quote: a tag holds a `>` only
+/// inside its quoted id, so such an opening is no tag whatever follows.
+fn tunnel_tags_settled(content: &str) -> bool {
+    let tags: Vec<std::ops::Range<usize>> = tunnel_tag()
+        .find_iter(content)
+        .map(|tag| tag.range())
+        .collect();
+    content.match_indices("<tunnel").all(|(start, _)| {
+        tags.iter().any(|tag| tag.contains(&start))
+            || content[start..]
+                .find(['>', '"', '\''])
+                .is_some_and(|at| content[start + at..].starts_with('>'))
     })
 }
 
@@ -1003,11 +1029,32 @@ impl ChatStream {
 
     /// Start a new assistant text block.
     pub fn start_assistant(&mut self) {
+        self.push_reply(String::new());
+    }
+
+    /// Append a streaming reply holding `content` so far.
+    fn push_reply(&mut self, content: String) {
         self.push_element(ChatElement::AssistantText {
-            content: String::new(),
+            content,
             streaming: true,
             translation: None,
         });
+        self.streaming_reply = Some((Self::next_revision(), self.revision_of_last()));
+    }
+
+    /// Identity of the reply in the last element, when the last change to
+    /// that element appended text to it.
+    ///
+    /// Between two calls that return the same identity, the reply only
+    /// had text appended.
+    pub(super) fn streaming_reply(&self) -> Option<u64> {
+        self.streaming_reply
+            .and_then(|(reply, revision)| (revision == self.revision_of_last()).then_some(reply))
+    }
+
+    /// Revision of the last element; `0` when there is none.
+    fn revision_of_last(&self) -> u64 {
+        self.revisions.last().copied().unwrap_or_default()
     }
 
     /// Attach the display translation of the reply streamed last: the
@@ -1043,14 +1090,13 @@ impl ChatStream {
         }) = self.elements.last_mut()
         {
             content.push_str(chunk);
+            // When anything else changed the last element since text was
+            // last appended to it, the reply streams under a new identity.
+            let reply = self.streaming_reply().unwrap_or_else(Self::next_revision);
             self.touch_last();
+            self.streaming_reply = Some((reply, self.revision_of_last()));
         } else {
-            // Create new streaming element
-            self.push_element(ChatElement::AssistantText {
-                content: chunk.to_string(),
-                streaming: true,
-                translation: None,
-            });
+            self.push_reply(chunk.to_string());
         }
     }
 
@@ -1516,14 +1562,24 @@ fn artifact_tag_url(tag: &str) -> Option<&str> {
 /// Replaces `<artifact url="path" … />` control tags with a readable
 /// markdown line; a malformed or still-streaming tag is left alone.
 fn artifact_tag_text(content: &str) -> std::borrow::Cow<'_, str> {
+    replace_artifact_tags(content).0
+}
+
+/// [`artifact_tag_text`], and whether every `<artifact` opening was closed.
+///
+/// An opening with no `/>` after it can still become a tag when text is
+/// appended.
+fn replace_artifact_tags(content: &str) -> (std::borrow::Cow<'_, str>, bool) {
     if !content.contains("<artifact") {
-        return std::borrow::Cow::Borrowed(content);
+        return (std::borrow::Cow::Borrowed(content), true);
     }
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
+    let mut closed = true;
     while let Some(start) = rest.find("<artifact") {
         let after = &rest[start..];
         let Some(end) = after.find("/>") else {
+            closed = false;
             break;
         };
         let Some(path) = artifact_tag_url(&after[..end]) else {
@@ -1546,7 +1602,7 @@ fn artifact_tag_text(content: &str) -> std::borrow::Cow<'_, str> {
         rest = &after[end + 2..];
     }
     out.push_str(rest);
-    std::borrow::Cow::Owned(out)
+    (std::borrow::Cow::Owned(out), closed)
 }
 
 /// The artifact path names a raster image the TUI can decode.
@@ -2463,6 +2519,152 @@ fn live_thinking_body(content: &str, width: u16) -> &str {
     }
 }
 
+/// One past the last row reserved for the images at these line indices.
+fn reserved_end(images: &[(String, usize, String)]) -> usize {
+    images
+        .iter()
+        .map(|(_, pos, _)| pos + IMAGE_HEIGHT)
+        .max()
+        .unwrap_or(0)
+}
+
+/// End a reply's markdown lines as the transcript shows them.
+///
+/// `lines` are the last of the reply's lines; the `before` lines that
+/// precede them are left alone. Trailing blank rows are stripped so a
+/// message does not end in a run of them — but never into the rows
+/// reserved for an image (below line `reserved`): those are blank on
+/// purpose, and dropping them let the image overlay paint over whatever
+/// followed the message. A streaming reply then gets its cursor, and
+/// every reply a closing blank row.
+fn finish_reply(
+    lines: &mut Vec<Line<'static>>,
+    before: usize,
+    reserved: usize,
+    streaming: bool,
+    width: u16,
+) {
+    while before + lines.len() > reserved && lines.last().is_some_and(|l| l.spans.is_empty()) {
+        lines.pop();
+    }
+    if streaming {
+        // Append cursor to the last line of text (inline), unless that line
+        // exactly fills the width — a full-width table row would wrap its
+        // closing border away — then on a line of its own.
+        if let Some(last_line) = lines
+            .last_mut()
+            .filter(|line| line.width() != usize::from(width))
+        {
+            last_line
+                .spans
+                .push(Span::styled("_", Style::default().fg(Color::DarkGray)));
+        } else {
+            // No content yet, show cursor on its own line
+            lines.push(Line::from(Span::styled(
+                "_",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+}
+
+/// A streaming reply laid out frame after frame.
+///
+/// Each frame works only on what earlier frames left unfinished. The
+/// reply's display text (control tags replaced) settles at the
+/// reply's last line break once no `<artifact` or `<tunnel` opening
+/// before it can still become a tag ([`replace_artifact_tags`],
+/// [`tunnel_tags_settled`]): no tag then spans the break, so both passes
+/// give the same text run over the whole reply as over its two sides. An
+/// opening still waiting for its end keeps the text from its line on
+/// unsettled. Settled text goes to the markdown renderer as final, the
+/// rest as its tail.
+#[derive(Debug)]
+pub(super) struct StreamingReply {
+    /// Bytes of the reply whose display text has settled.
+    settled: usize,
+    markdown: IncrementalMarkdown,
+}
+
+/// One frame of a [`StreamingReply`].
+///
+/// Its lines are the reply's markdown lines finished as [`element_lines`]
+/// finishes a reply's.
+#[derive(Debug)]
+pub(super) struct ReplyFrame<'a> {
+    /// Leading lines no later text changes.
+    pub settled: &'a [Line<'static>],
+    /// `(url, line index, caption)` of the images among `settled`.
+    pub settled_images: &'a [(String, usize, String)],
+    /// The lines after `settled`.
+    pub open: Vec<Line<'static>>,
+    /// The images among `open`, their line indices counted from the first
+    /// settled line.
+    pub open_images: Vec<(String, usize, String)>,
+}
+
+impl StreamingReply {
+    /// A reply with no text yet, laid out at `width` columns.
+    pub(super) fn new(images_supported: bool, width: u16) -> Self {
+        Self {
+            settled: 0,
+            markdown: IncrementalMarkdown::new(images_supported, usize::from(width)),
+        }
+    }
+
+    /// Lay out the reply holding `content`.
+    ///
+    /// `content` is the previous frame's content with text appended.
+    pub(super) fn render(
+        &mut self,
+        content: &str,
+        tunnel_base: &str,
+        width: u16,
+    ) -> ReplyFrame<'_> {
+        let pending = &content[self.settled..];
+        let cut = pending.rfind('\n').map_or(0, |at| at + 1);
+        let (head, tail) = pending.split_at(cut);
+        let (head_text, closed) = replace_artifact_tags(head);
+        let head_is_final = closed && tunnel_tags_settled(&head_text);
+        let (settled_text, open_source) = if head_is_final {
+            self.settled += cut;
+            (resolve_tunnel_tags(&head_text, tunnel_base), tail)
+        } else {
+            (Cow::Borrowed(""), pending)
+        };
+        let open_text = artifact_tag_text(open_source);
+        let open_text = resolve_tunnel_tags(&open_text, tunnel_base);
+        let frame = self.markdown.render(&settled_text, &open_text);
+
+        let committed = frame.committed;
+        let committed_images = frame.committed_images;
+        // Lines below `kept` stay in the reply whatever follows: each is
+        // not blank or lies in an image's reserved rows, so stripping stops
+        // above them. The last of them may still take the cursor.
+        let kept = committed
+            .iter()
+            .rposition(|line| !line.spans.is_empty())
+            .map_or(0, |at| at + 1)
+            .max(reserved_end(committed_images))
+            .min(committed.len());
+        let settled = kept.saturating_sub(1);
+        let settled_images = committed_images.partition_point(|(_, line, _)| *line < settled);
+        let mut open = committed[settled..].to_vec();
+        open.extend(frame.open);
+        let mut open_images = committed_images[settled_images..].to_vec();
+        open_images.extend(frame.open_images);
+        let reserved = reserved_end(committed_images).max(reserved_end(&open_images));
+        finish_reply(&mut open, settled, reserved, true, width);
+        ReplyFrame {
+            settled: &committed[..settled],
+            settled_images: &committed_images[..settled_images],
+            open,
+            open_images,
+        }
+    }
+}
+
 /// Lay out one element as styled lines (before wrapping).
 pub(super) fn element_lines(
     elem: &ChatElement,
@@ -2537,52 +2739,16 @@ pub(super) fn element_lines(
             let content = resolve_tunnel_tags(&display, tunnel_base);
             let md_result =
                 markdown::render_markdown_with_positions(&content, image_mode, usize::from(width));
+            let reserved = reserved_end(&md_result.image_positions);
             let mut md_lines = md_result.lines;
-            // Strip trailing empties from the markdown renderer so a message
-            // does not end in a run of blank rows — but never into the rows
-            // reserved for an image: those are blank on purpose, and
-            // dropping them let the image overlay paint over whatever
-            // followed the message.
-            let reserved_end = md_result
-                .image_positions
-                .iter()
-                .map(|(_, pos, _)| pos + IMAGE_HEIGHT)
-                .max()
-                .unwrap_or(0);
-            while md_lines.len() > reserved_end
-                && md_lines.last().is_some_and(|l| l.spans.is_empty())
-            {
-                md_lines.pop();
-            }
+            finish_reply(&mut md_lines, 0, reserved, *streaming, width);
 
             // Collect image positions with offset adjustment
             for (url, pos, caption) in md_result.image_positions {
                 images.push((url, line_offset + pos, caption));
             }
 
-            if *streaming {
-                // Append cursor to the last line of text (inline), unless
-                // that line exactly fills the width — a full-width table
-                // row would wrap its closing border away — then on a line
-                // of its own.
-                if let Some(last_line) = md_lines
-                    .last_mut()
-                    .filter(|line| line.width() != usize::from(width))
-                {
-                    last_line
-                        .spans
-                        .push(Span::styled("_", Style::default().fg(Color::DarkGray)));
-                } else {
-                    // No content yet, show cursor on its own line
-                    md_lines.push(Line::from(Span::styled(
-                        "_",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-
             lines.extend(md_lines);
-            lines.push(Line::from(""));
         }
 
         ChatElement::ToolCall { id, display } => {
