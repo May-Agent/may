@@ -45,7 +45,10 @@ async fn resolve(names: &[&str]) -> Vec<(String, String)> {
 async fn base_commands_resolve_to_the_managed_directory_and_the_toolchain_to_the_host() {
     let resolved = resolve(&[MANAGED, HOST].concat()).await;
     for (name, path) in &resolved {
-        let managed = path.contains("/runtimes/") && path.ends_with(&format!("/bin/{name}"));
+        // python3 resolves through the shim beside the managed tools.
+        let directory = if name == "python3" { "shims" } else { "bin" };
+        let managed =
+            path.contains("/runtimes/") && path.ends_with(&format!("/{directory}/{name}"));
         if MANAGED.contains(&name.as_str()) {
             assert!(managed, "{name} resolved to {path:?}, not a managed copy");
         } else {

@@ -1143,7 +1143,15 @@ impl<D> PreparedTools<D> {
 }
 
 impl PreparedTools<PathBuf> {
-    #[doc = "Rejects writable host grants that expose the managed executable directory."]
+    /// The directory of the shims that lead a session's `PATH` ahead of
+    /// [`bin_dir`](Self::bin_dir), beside it and, like it, never writable by
+    /// the sandbox.
+    #[must_use]
+    pub fn shim_dir(&self) -> PathBuf {
+        self.bin_dir.with_file_name("shims")
+    }
+
+    #[doc = "Rejects writable host grants that expose the managed executable or shim directory."]
     #[doc = "# Errors"]
     #[doc = "Returns path resolution errors or a writable-directory conflict."]
     pub async fn ensure_readonly<'a>(
@@ -1153,9 +1161,11 @@ impl PreparedTools<PathBuf> {
         use futures::{StreamExt, TryStreamExt};
         let paths = paths.into_iter().cloned().collect::<Vec<_>>();
         let bin_dir = async_fs::canonicalize(&self.bin_dir).await?;
+        let shim_dir = bin_dir.with_file_name("shims");
         futures::stream::iter(paths)
             .map(|path| {
                 let bin_dir = &bin_dir;
+                let shim_dir = &shim_dir;
                 async move {
                     // A grant that no longer exists cannot contain the tool directory.
                     let canonical = match async_fs::canonicalize(&path).await {
@@ -1167,7 +1177,9 @@ impl PreparedTools<PathBuf> {
                             return Err(ToolRuntimeError::GrantPath { path, source });
                         }
                     };
-                    if bin_dir.starts_with(&canonical) || canonical.starts_with(bin_dir) {
+                    let exposes =
+                        |dir: &PathBuf| dir.starts_with(&canonical) || canonical.starts_with(dir);
+                    if exposes(bin_dir) || exposes(shim_dir) {
                         return Err(ToolRuntimeError::WritableToolDirectory(canonical));
                     }
                     Ok(())
