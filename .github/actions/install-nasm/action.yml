@@ -1,0 +1,46 @@
+name: Install nasm
+description: Put the pinned nasm on PATH, restored from the Actions cache and downloaded from an Ubuntu mirror only on a miss, never through apt.
+inputs:
+  save:
+    description: Whether a cache miss saves the download. Only dev saves caches, as in the Rust caches.
+    default: ${{ github.ref == 'refs/heads/dev' }}
+runs:
+  using: composite
+  steps:
+    # rav1e's x86_64 assembly is built with nasm. The package is noble's
+    # universe nasm_2.16.01-1build1_amd64.deb; the digest is that file's
+    # SHA256 in the signed noble/universe binary-amd64 Packages index, and a
+    # version bump replaces both.
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/nasm
+        key: nasm-2.16.01-1build1-${{ runner.os }}-${{ runner.arch }}
+    - if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        package=pool/universe/n/nasm/nasm_2.16.01-1build1_amd64.deb
+        sha256=22eede0f2dd62343b0298182f62f7485704fe02f166395b02c92a8883377e0b3
+        archive="${RUNNER_TEMP}/nasm.deb"
+        # archive.ubuntu.com first; kernel.org's full mirror resolves through
+        # other DNS when Ubuntu's names do not. Each attempt is bounded so a
+        # stalled mirror moves on to the next.
+        for mirror in https://archive.ubuntu.com/ubuntu https://mirrors.edge.kernel.org/ubuntu; do
+          if curl --fail --location --silent --show-error --connect-timeout 10 --max-time 60 \
+            --retry 2 --retry-all-errors --output "${archive}" "${mirror}/${package}"; then
+            break
+          fi
+        done
+        echo "${sha256}  ${archive}" | sha256sum --check -
+        dpkg-deb --extract "${archive}" "${RUNNER_TEMP}/nasm"
+    - if: steps.restore.outputs.cache-hit != 'true' && inputs.save == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/nasm
+        key: nasm-2.16.01-1build1-${{ runner.os }}-${{ runner.arch }}
+    - shell: bash
+      run: |
+        set -euo pipefail
+        echo "${RUNNER_TEMP}/nasm/usr/bin" >> "${GITHUB_PATH}"
+        "${RUNNER_TEMP}/nasm/usr/bin/nasm" -v

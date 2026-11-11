@@ -38,9 +38,7 @@ runs:
     # rav1e's x86_64 assembly is built with nasm.
     - name: Install nasm
       if: runner.os == 'Linux' && runner.arch == 'X64'
-      uses: ./.github/actions/apt-install
-      with:
-        packages: nasm
+      uses: ./.github/actions/install-nasm
     - name: cargo build
       shell: bash
       run: cargo build --locked --all-targets --timings
