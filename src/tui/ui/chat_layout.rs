@@ -25,7 +25,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::chat::{
-    ChatElement, ChatStream, ClickRegion, ElementState, collapsible_id, element_lines,
+    ChatElement, ChatStream, ClickRegion, ElementState, StreamingReply, collapsible_id,
+    element_lines,
 };
 use super::links::{self, LinkHit, LinkId, LinkRun, ScreenRun};
 use super::streaming_markdown::IMAGE_HEIGHT;
@@ -110,6 +111,32 @@ struct Entry {
     user: bool,
     /// Scratch render, built on first use (at build for linked elements).
     scratch: OnceLock<Scratch>,
+    /// The streaming reply this entry lays out frame after frame; `None`
+    /// for an entry laid out in one pass.
+    stream: Option<Box<StreamingEntry>>,
+}
+
+/// The reply streaming in the last element, laid out frame after frame.
+#[derive(Debug)]
+struct StreamingEntry {
+    /// [`ChatStream::streaming_reply`] of the reply.
+    reply: u64,
+    render: StreamingReply,
+    /// How much of the entry no later frame changes.
+    settled: Settled,
+    /// Lines wrapped (and link-marked and scratch-rendered) so far.
+    #[cfg(test)]
+    wrapped_lines: usize,
+}
+
+/// Counts of an entry's settled lines and of what was derived from them.
+#[derive(Debug, Default, Clone, Copy)]
+struct Settled {
+    lines: usize,
+    rows: usize,
+    images: usize,
+    link_targets: usize,
+    link_runs: usize,
 }
 
 impl Entry {
@@ -171,6 +198,7 @@ impl Entry {
             marked,
             user: matches!(elem, ChatElement::UserMessage { .. }),
             scratch: OnceLock::new(),
+            stream: None,
         };
         // Link cells are needed every frame: find them now, with the
         // layout, not in the draw path.
@@ -178,6 +206,145 @@ impl Entry {
             entry.scratch(width);
         }
         entry
+    }
+
+    /// Lay out `content`, the streaming reply `reply` of `elem`, as
+    /// [`Self::build`] would.
+    ///
+    /// It continues `previous`, this reply's entry of the last frame: its
+    /// settled lines keep their rows, links and plain rows, and only the
+    /// lines after them are laid out again.
+    #[allow(clippy::too_many_arguments)]
+    fn streaming(
+        previous: Option<Self>,
+        elem: &ChatElement,
+        content: &str,
+        reply: u64,
+        revision: u64,
+        state: ElementState,
+        width: u16,
+        images_supported: bool,
+        tunnel_base: &str,
+    ) -> Self {
+        let (mut entry, mut stream) = previous
+            .and_then(|mut entry| entry.stream.take().map(|stream| (entry, stream)))
+            .unwrap_or_else(|| {
+                let stream = StreamingEntry {
+                    reply,
+                    render: StreamingReply::new(images_supported, width),
+                    settled: Settled::default(),
+                    #[cfg(test)]
+                    wrapped_lines: 0,
+                };
+                (Self::empty(elem, revision, state), Box::new(stream))
+            });
+
+        let settled = stream.settled;
+        entry.lines.truncate(settled.lines);
+        entry.line_starts.truncate(settled.lines);
+        entry.rows = settled.rows;
+        entry.images.truncate(settled.images);
+        entry.link_targets.truncate(settled.link_targets);
+        let mut mirror = entry.scratch.take().unwrap_or_default();
+        mirror.plain.truncate(settled.rows);
+        mirror.runs.truncate(settled.link_runs);
+
+        let frame = stream.render.render(content, tunnel_base, width);
+        let fresh = &frame.settled[settled.lines..];
+        #[cfg(test)]
+        let wrapped = fresh.len() + frame.open.len();
+        for line in fresh {
+            entry.push_line(line.clone(), width, &mut mirror);
+        }
+        for (key, index, caption) in &frame.settled_images[settled.images..] {
+            entry.push_image(key.clone(), *index, caption.clone());
+        }
+        let now_settled = Settled {
+            lines: entry.lines.len(),
+            rows: entry.rows,
+            images: entry.images.len(),
+            link_targets: entry.link_targets.len(),
+            link_runs: mirror.runs.len(),
+        };
+        for line in frame.open {
+            entry.push_line(line, width, &mut mirror);
+        }
+        for (key, index, caption) in frame.open_images {
+            entry.push_image(key, index, caption);
+        }
+
+        stream.settled = now_settled;
+        #[cfg(test)]
+        {
+            stream.wrapped_lines += wrapped;
+        }
+        entry.revision = revision;
+        entry.state = state;
+        entry.scratch = OnceLock::from(mirror);
+        entry.stream = Some(stream);
+        entry
+    }
+
+    /// An entry of `elem` with no lines yet.
+    fn empty(elem: &ChatElement, revision: u64, state: ElementState) -> Self {
+        Self {
+            revision,
+            state,
+            lines: Vec::new(),
+            line_starts: Vec::new(),
+            rows: 0,
+            images: Vec::new(),
+            collapsible: collapsible_id(elem).map(str::to_string),
+            sub_regions: Vec::new(),
+            markdown_images: true,
+            link_targets: Vec::new(),
+            marked: None,
+            user: false,
+            scratch: OnceLock::new(),
+            stream: None,
+        }
+    }
+
+    /// Append `line`, wrapped at `width`, with its link targets.
+    ///
+    /// Its scratch-rendered rows go to `mirror`, the entry's scratch render.
+    fn push_line(&mut self, line: Line<'static>, width: u16, mirror: &mut Scratch) {
+        let rows = line_rows(&line, width);
+        let first =
+            u32::try_from(self.link_targets.len()).expect("link count fits the marker space");
+        let marked = links::mark_line(&line, first);
+        let drawn = scratch(
+            std::slice::from_ref(marked.as_ref().map_or(&line, |(marked, _)| marked)),
+            width,
+            rows,
+        );
+        if let Some((_, targets)) = marked {
+            self.link_targets.extend(targets);
+        }
+        mirror.plain.extend(drawn.plain);
+        let offset = self.rows;
+        mirror
+            .runs
+            .extend(drawn.runs.into_iter().map(|run| LinkRun {
+                row: run.row + offset,
+                ..run
+            }));
+        self.line_starts.push(self.rows);
+        self.rows += rows;
+        self.lines.push(line);
+    }
+
+    /// Anchor an image at line `index`, among the lines pushed so far.
+    fn push_image(&mut self, key: String, index: usize, caption: String) {
+        let row = self.line_starts.get(index).copied().unwrap_or(self.rows);
+        self.images.push((key, row, caption));
+    }
+
+    /// Whether this entry lays out the streaming reply `reply`.
+    fn streams(&self, reply: u64) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|stream| stream.reply == reply)
     }
 
     fn scratch(&self, width: u16) -> &Scratch {
@@ -283,13 +450,48 @@ impl ChatLayout {
             });
             let entry = reused.unwrap_or_else(|| {
                 self.rebuilt += 1;
-                Entry::build(
-                    elem,
-                    revision,
-                    state,
-                    width,
-                    images_supported,
-                    chat.tunnel_base(),
+                // The reply streaming in the last element continues the
+                // entry it had last frame.
+                let streaming = match elem {
+                    ChatElement::AssistantText {
+                        content,
+                        streaming: true,
+                        translation: None,
+                    } if index + 1 == elements.len() => {
+                        chat.streaming_reply().map(|reply| (reply, content))
+                    }
+                    _ => None,
+                };
+                streaming.map_or_else(
+                    || {
+                        Entry::build(
+                            elem,
+                            revision,
+                            state,
+                            width,
+                            images_supported,
+                            chat.tunnel_base(),
+                        )
+                    },
+                    |(reply, content)| {
+                        let previous = old
+                            .iter()
+                            .rposition(|slot| {
+                                slot.as_ref().is_some_and(|entry| entry.streams(reply))
+                            })
+                            .and_then(|at| old[at].take());
+                        Entry::streaming(
+                            previous,
+                            elem,
+                            content,
+                            reply,
+                            revision,
+                            state,
+                            width,
+                            images_supported,
+                            chat.tunnel_base(),
+                        )
+                    },
                 )
             });
             entries.push(entry);
@@ -739,5 +941,150 @@ mod tests {
         click(&mut chat, 3, 60);
         let open = rows(&chat, 60);
         assert!(open.iter().any(|l| l.contains("only body")), "{open:?}");
+    }
+
+    /// A reply with CJK text (Chinese, Japanese, Korean), a URL and a path,
+    /// an image artifact tag, a tunnel tag spanning two lines next to a
+    /// stray `<tunnel>`, a table, a fenced code block and a list.
+    const STREAMED_REPLY: &str = "# 报告 レポート 보고서\n\
+\n\
+See https://example.com/docs/路径 and /tmp/notes.md for the 詳細.\n\
+\n\
+<artifact url=\"out/plot.png\" />\n\
+\n\
+Open <tunnel id=\"web\"\n\
+port=\"8080\"/> to view; <tunnel> stays text.\n\
+\n\
+| 名前 | 値\n\
+|---|---|\n\
+| あ | 1\n\
+\n\
+```rust\n\
+fn main() { println!(\"안녕\"); }\n\
+```\n\
+\n\
+- 항목 **bold**\n\
+- second 二番目\n";
+
+    /// Byte offsets cutting `text` every `size` characters, both ends
+    /// included.
+    fn cuts(text: &str, size: usize) -> Vec<usize> {
+        text.char_indices()
+            .map(|(at, _)| at)
+            .step_by(size)
+            .chain([text.len()])
+            .collect()
+    }
+
+    /// Assert that the layout's entry of the streaming reply equals a
+    /// one-pass layout of the same element.
+    fn assert_matches_one_pass(
+        layout: &ChatLayout,
+        chat: &ChatStream,
+        width: u16,
+        images_supported: bool,
+    ) {
+        let index = chat.active_elements().len() - 1;
+        let elem = &chat.active_elements()[index];
+        let full = Entry::build(
+            elem,
+            chat.revision(index),
+            ElementState::of(elem, None, false, 0),
+            width,
+            images_supported,
+            chat.tunnel_base(),
+        );
+        let entry = layout.entries.last().expect("the reply has an entry");
+        assert!(
+            entry.stream.is_some(),
+            "the reply is laid out incrementally"
+        );
+        assert_eq!(entry.lines, full.lines);
+        assert_eq!(entry.line_starts, full.line_starts);
+        assert_eq!(entry.rows, full.rows);
+        assert_eq!(entry.images, full.images);
+        assert_eq!(entry.link_targets, full.link_targets);
+        assert_eq!(entry.plain(width), full.plain(width));
+        assert_eq!(entry.scratch(width).runs, full.scratch(width).runs);
+    }
+
+    /// Lines the layout has wrapped for the streaming reply so far.
+    fn wrapped_lines(layout: &ChatLayout) -> usize {
+        layout
+            .entries
+            .last()
+            .and_then(|entry| entry.stream.as_ref())
+            .map_or(0, |stream| stream.wrapped_lines)
+    }
+
+    #[test]
+    fn streaming_reply_entry_matches_one_pass_layout() {
+        const WIDTH: u16 = 50;
+        for images_supported in [false, true] {
+            for size in [3, 5, 7] {
+                let mut chat = ChatStream::new();
+                let mut layout = ChatLayout::default();
+                for pair in cuts(STREAMED_REPLY, size).windows(2) {
+                    chat.push_text(&STREAMED_REPLY[pair[0]..pair[1]]);
+                    layout.sync(&chat, WIDTH, images_supported, false, None, 0);
+                    assert_matches_one_pass(&layout, &chat, WIDTH, images_supported);
+                }
+                let shown: String = layout.entries[0].plain(WIDTH).concat();
+                assert!(shown.contains("/tunnel/web/"), "{shown}");
+                assert!(!shown.contains("<artifact"), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_reply_wraps_only_new_lines() {
+        use std::fmt::Write as _;
+
+        const WIDTH: u16 = 60;
+        const SIZE: usize = 4;
+        /// Lines a frame wraps besides the ones it settles: the last line
+        /// that stays, held back for the cursor, and the blank rows after
+        /// it (two after the fence), the unfinished line, the cursor's own
+        /// line and the closing blank row.
+        const FRAME_LINES: usize = 6;
+        const CODE_LINES: usize = 200;
+        let mut reply = String::from("Intro 说明 説明 설명 https://example.com/a/b:\n\n```rust\n");
+        for index in 0..CODE_LINES {
+            writeln!(
+                reply,
+                "let value_{index} = compute({index}); // 行 {index} 줄"
+            )
+            .expect("writing to a String cannot fail");
+        }
+        reply.push_str("```\n\nDone, see /tmp/out.md.\n");
+        let lines_in_reply = reply.lines().count();
+
+        let mut chat = ChatStream::new();
+        let mut layout = ChatLayout::default();
+        let bounds = cuts(&reply, SIZE);
+        let mut frames = 0;
+        let mut last = 0;
+        for (index, pair) in bounds.windows(2).enumerate() {
+            chat.push_text(&reply[pair[0]..pair[1]]);
+            layout.sync(&chat, WIDTH, false, false, None, 0);
+            frames += 1;
+            let wrapped = wrapped_lines(&layout) - last;
+            last = wrapped_lines(&layout);
+            // A chunk of `SIZE` characters settles at most `SIZE` source
+            // lines, one rendered line each here (two at the fence's end).
+            assert!(
+                wrapped <= SIZE + 1 + FRAME_LINES,
+                "{wrapped} lines wrapped for one append of {SIZE} characters"
+            );
+            // A one-pass layout costs the whole reply: compare a sample.
+            if index % 50 == 0 || index + 2 == bounds.len() {
+                assert_matches_one_pass(&layout, &chat, WIDTH, false);
+            }
+        }
+        let total = wrapped_lines(&layout);
+        assert!(
+            total <= lines_in_reply + 2 + frames * FRAME_LINES,
+            "{total} lines wrapped for {lines_in_reply} lines in {frames} frames"
+        );
     }
 }

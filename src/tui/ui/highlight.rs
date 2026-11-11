@@ -4,12 +4,13 @@
 //! line, colored with a dark syntect theme (the TUI assumes a dark
 //! terminal).
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use ratatui::prelude::*;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{
+    FontStyle, HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
 /// Bundled default syntaxes; loaded once, immutable afterwards.
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -41,24 +42,50 @@ fn to_style(style: syntect::highlighting::Style) -> Style {
     out
 }
 
+/// Highlights a source text line by line, carrying the syntax parse state
+/// and the style state from one line to the next.
+///
+/// syntect's `HighlightLines` does the same but cannot be cloned; this
+/// one can, so a renderer can highlight a line on a copy and keep its own
+/// state where the last complete line left it.
+#[derive(Debug, Clone)]
+pub(super) struct LineHighlighter {
+    /// The theme's selectors, shared by every copy.
+    highlighter: Arc<Highlighter<'static>>,
+    parse: ParseState,
+    highlight: HighlightState,
+}
+
 /// A highlighter for `language` — a fence token like `rust` or `rs`
 /// matched against syntax names and extensions; `None` when no syntax
 /// knows it.
-pub(super) fn highlighter(language: &str) -> Option<HighlightLines<'static>> {
-    SYNTAXES
-        .find_syntax_by_token(language)
-        .map(|syntax| HighlightLines::new(syntax, &THEME))
+pub(super) fn highlighter(language: &str) -> Option<LineHighlighter> {
+    SYNTAXES.find_syntax_by_token(language).map(|syntax| {
+        let highlighter = Highlighter::new(&THEME);
+        let highlight = HighlightState::new(&highlighter, ScopeStack::new());
+        LineHighlighter {
+            highlighter: Arc::new(highlighter),
+            parse: ParseState::new(syntax),
+            highlight,
+        }
+    })
 }
 
 /// Highlight one source line, keeping parse state in `highlighter` so
 /// quotes, heredocs and open scopes carry across lines.
-pub(super) fn line_spans(highlighter: &mut HighlightLines<'_>, line: &str) -> Vec<Span<'static>> {
-    highlighter
-        .highlight_line(line, &SYNTAXES)
-        .expect("bundled syntaxes highlight without missing references")
-        .into_iter()
-        .map(|(style, text)| Span::styled(text.to_string(), to_style(style)))
-        .collect()
+pub(super) fn line_spans(highlighter: &mut LineHighlighter, line: &str) -> Vec<Span<'static>> {
+    let ops = highlighter
+        .parse
+        .parse_line(line, &SYNTAXES)
+        .expect("bundled syntaxes highlight without missing references");
+    HighlightIterator::new(
+        &mut highlighter.highlight,
+        &ops,
+        line,
+        &highlighter.highlighter,
+    )
+    .map(|(style, text)| Span::styled(text.to_string(), to_style(style)))
+    .collect()
 }
 
 /// Highlight `script` as bash, returning one span vector per source line.

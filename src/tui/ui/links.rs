@@ -177,27 +177,39 @@ pub fn mark_lines(lines: &[Line<'static>]) -> Option<(Vec<Line<'static>>, Vec<St
     let mut targets: Vec<String> = Vec::new();
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let found = if text.contains('/') {
-            detect(&text)
-        } else {
-            Vec::new()
-        };
-        if found.is_empty() {
-            out.push(line.clone());
-            continue;
-        }
         let first = u32::try_from(targets.len()).expect("link count fits the marker space");
-        targets.extend(found.iter().map(|link| link.uri.clone()));
-        let mut marked = line.clone();
-        marked.spans = tag_spans(&line.spans, &found, first);
-        out.push(marked);
+        out.push(mark_line(line, first).map_or_else(
+            || line.clone(),
+            |(marked, found)| {
+                targets.extend(found);
+                marked
+            },
+        ));
     }
     (!targets.is_empty()).then_some((out, targets))
+}
+
+/// Copy of `line` with its links tagged, and their targets.
+///
+/// Links are tagged by [`marker`], numbered from `first`; `None` when the
+/// line holds no link.
+#[must_use]
+pub fn mark_line(line: &Line<'static>, first: u32) -> Option<(Line<'static>, Vec<String>)> {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    if !text.contains('/') {
+        return None;
+    }
+    let found = detect(&text);
+    if found.is_empty() {
+        return None;
+    }
+    let mut marked = line.clone();
+    marked.spans = tag_spans(&line.spans, &found, first);
+    Some((marked, found.into_iter().map(|link| link.uri).collect()))
 }
 
 /// Split `spans` at the link boundaries and tag the link parts.
