@@ -204,12 +204,12 @@ impl TimeTriggerType {
                 let expression = cron_expression.ok_or("a cron task has no cron_expression")?;
                 let schedule = cron::Schedule::from_str(expression)
                     .map_err(|error| format!("invalid cron expression {expression:?}: {error}"))?;
-                let after = chrono::DateTime::from_timestamp(
-                    after.as_second(),
-                    u32::try_from(after.subsec_nanosecond())
-                        .expect("jiff subsecond nanos are non-negative"),
-                )
-                .expect("jiff timestamp must fit within chrono DateTime range");
+                // Cron fires on whole seconds, so the fraction of `after`
+                // cannot move the first fire after it.
+                let after =
+                    chrono::DateTime::from_timestamp(after.as_second(), 0).ok_or_else(|| {
+                        format!("{after} is outside the range a cron schedule covers")
+                    })?;
                 let next = schedule
                     .after(&after)
                     .next()
