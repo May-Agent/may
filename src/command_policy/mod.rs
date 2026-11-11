@@ -2,9 +2,10 @@
 //!
 //! Every script of a shell built with a [`PolicySet`] is put to them before it
 //! runs: one that kills processes by name or pattern, or is not valid shell
-//! and so cannot be checked for that; a foreground `sleep`; a re-read of
-//! files unchanged since their last read; an `apply_patch` hunk that only
-//! changes whitespace; and, in the managed bash, the host `grep`, `awk` and
+//! and so cannot be checked for that; a foreground `sleep`; a script that
+//! only repeats a read of files unchanged since; an `apply_patch` hunk that
+//! only changes whitespace where it carries no meaning; and, in the managed
+//! bash, the host `grep`, `awk` and
 //! `find` and the `sed` forms `aither_sed::supports` does not accept. Each
 //! refusal names what to do instead. None of them approves a script that
 //! leaves the sandbox: each [passes](ScriptDecision::Pass) one it has no
@@ -13,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use aither_core::llm::tool::CallIdentity;
@@ -22,8 +23,11 @@ use aither_sandbox::{
     ScriptRefusal, ShellBuilder, ShellCommand, ShellScript,
 };
 use askama::Template;
+use syntect::parsing::{ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxReference, SyntaxSet};
 
-use crate::command_reading::{CommandReading, DiffLine, DiffOp, FileChange, Intent};
+use crate::command_reading::{
+    CommandReading, DiffLine, DiffOp, FileChange, Hunk, Intent, Link, SearchTool,
+};
 
 /// Whether the scripts of a session run in the managed bash: always inside a
 /// container, and on the host everywhere but Windows, where `cmd.exe` runs
@@ -235,39 +239,39 @@ impl ScriptPolicy for ForegroundSleep {
     }
 }
 
-/// Programs that print a file's content. `tail -f` follows instead of
-/// re-reading and is not collected.
-const READERS: &[&str] = &["cat", "head", "tail", "less", "more", "bat", "view"];
-
-/// The words `script` reads files from: the positional words of every
-/// reader, `tail`'s follow forms excluded. Words that name no file are
-/// dropped when the caller finds no file under them.
-fn file_reads(script: &ShellScript) -> Vec<&str> {
-    let mut reads = Vec::new();
-    for command in script.commands() {
-        if !READERS.contains(&command.program()) {
-            continue;
-        }
-        let follows = command.program() == "tail"
-            && command.arguments().iter().any(|argument| {
-                argument == "-f"
-                    || argument == "-F"
-                    || argument.starts_with("--follow")
-                    || argument
-                        .strip_prefix('-')
-                        .is_some_and(|flags| !flags.starts_with('-') && flags.contains('f'))
-            });
-        if !follows {
-            reads.extend(
-                command
-                    .arguments()
-                    .iter()
-                    .filter(|argument| !argument.starts_with('-'))
-                    .map(String::as_str),
-            );
+/// The files `reading` reads when the script does nothing but read: every
+/// step a recognised file read, or an `rg` search of the output piped into
+/// it. `None` for a script with any other step — a `cd`, a program that could
+/// write, a redirect to a file, a wrapper, a compound command or a word
+/// computed at run time all read as unknown steps — and for one that reads
+/// no file.
+fn pure_read(reading: &CommandReading) -> Option<Vec<&str>> {
+    let mut files = Vec::new();
+    for step in &reading.steps {
+        match &step.intent {
+            Intent::Read { path, .. } => files.push(path.as_str()),
+            // `rg` without a path searches its standard input.
+            Intent::Search {
+                tool: SearchTool::Rg,
+                pattern: Some(_),
+                paths,
+            } if step.link == Link::Pipe && paths.is_empty() => {}
+            _ => return None,
         }
     }
-    reads
+    (!files.is_empty()).then_some(files)
+}
+
+/// What a read shows besides the files' content: the directory its relative
+/// paths resolve against, how each step follows the one before, and every
+/// command's words — the reader, its arguments and what its output is piped
+/// into. Two reads with the same identity of files with the same stamps
+/// print the same output.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadIdentity {
+    dir: PathBuf,
+    links: Vec<Link>,
+    commands: Vec<Vec<String>>,
 }
 
 /// A file's `(len, modified)` stamp as a read found it: two reads whose
@@ -282,10 +286,10 @@ pub struct FileReads {
 
 #[derive(Debug, Default)]
 struct FileReadsInner {
-    /// Path → the stamp its last successful read returned with.
-    recorded: HashMap<PathBuf, Fingerprint>,
-    /// Task id → the stamps its script's reads were admitted with.
-    pending: HashMap<String, Vec<(PathBuf, Fingerprint)>>,
+    /// Read → the stamps of its files when it last succeeded.
+    recorded: HashMap<ReadIdentity, Vec<(PathBuf, Fingerprint)>>,
+    /// Task id → the read its script was admitted as, with its stamps.
+    pending: HashMap<String, (ReadIdentity, Vec<(PathBuf, Fingerprint)>)>,
 }
 
 impl FileReads {
@@ -302,17 +306,20 @@ struct UnchangedFileReadRefused<'a> {
     paths: &'a [&'a Path],
 }
 
-/// Refuses a `terminal` script whose every file read is of a file unchanged
-/// since its last successful read: re-reading it spends a turn for nothing,
-/// and only a background event can say something new.
+/// Refuses a `terminal` script that does nothing but repeat a read that
+/// last succeeded with the same files unchanged: the same commands with the
+/// same words, from the same directory. It would print what the last one
+/// did, spending a turn for nothing; only a background event can say
+/// something new.
 #[derive(Debug, Clone)]
 pub struct UnchangedFileReads {
     refused: RefusedReads,
 }
 
-/// The stamp of every existing file `reads` names, relative paths resolved
-/// against `working_dir`, the directory the script starts in.
-async fn fingerprints(working_dir: &Path, reads: &[&str]) -> Vec<(PathBuf, Fingerprint)> {
+/// The stamp of every file `reads` names, relative paths resolved against
+/// `working_dir`, the directory the script starts in; `None` when one is not
+/// an existing regular file.
+async fn fingerprints(working_dir: &Path, reads: &[&str]) -> Option<Vec<(PathBuf, Fingerprint)>> {
     let stamps = futures_util::future::join_all(reads.iter().map(|read| async move {
         let path = working_dir.join(read);
         match async_fs::metadata(&path).await {
@@ -321,7 +328,7 @@ async fn fingerprints(working_dir: &Path, reads: &[&str]) -> Vec<(PathBuf, Finge
         }
     }))
     .await;
-    stamps.into_iter().flatten().collect()
+    stamps.into_iter().collect()
 }
 
 impl ScriptPolicy for UnchangedFileReads {
@@ -338,20 +345,23 @@ impl ScriptPolicy for UnchangedFileReads {
         let Some(start) = script.start.host() else {
             return ScriptDecision::Pass;
         };
-        let reads = file_reads(shell);
-        if reads.is_empty() {
+        let reading = CommandReading::of(script.script);
+        let Some(files) = pure_read(&reading) else {
             return ScriptDecision::Pass;
-        }
-        let stamps = fingerprints(start, &reads).await;
-        if stamps.is_empty() {
-            return ScriptDecision::Pass;
-        }
-        let unchanged = {
-            let inner = state.inner();
-            stamps
-                .iter()
-                .all(|(path, stamp)| inner.recorded.get(path) == Some(stamp))
         };
+        let Some(stamps) = fingerprints(start, &files).await else {
+            return ScriptDecision::Pass;
+        };
+        let identity = ReadIdentity {
+            dir: start.to_path_buf(),
+            links: reading.steps.iter().map(|step| step.link).collect(),
+            commands: shell
+                .commands()
+                .iter()
+                .map(|command| command.argv().to_vec())
+                .collect(),
+        };
+        let unchanged = state.inner().recorded.get(&identity) == Some(&stamps);
         if unchanged {
             let paths: Vec<&Path> = stamps.iter().map(|(path, _)| path.as_path()).collect();
             if let Some(call) = script.call {
@@ -362,18 +372,18 @@ impl ScriptPolicy for UnchangedFileReads {
         state
             .inner()
             .pending
-            .insert(script.task_id.to_string(), stamps);
+            .insert(script.task_id.to_string(), (identity, stamps));
         ScriptDecision::Pass
     }
 
     fn ended(&self, end: &ScriptEnd<'_>, state: &FileReads) -> impl Future<Output = ()> + Send {
-        let stamps = state.inner().pending.remove(end.task_id);
+        let read = state.inner().pending.remove(end.task_id);
         // Only a read that succeeded counts: a denied or failed read must
         // run again and show its failure.
-        if let Some(stamps) = stamps
+        if let Some((identity, stamps)) = read
             && end.outcome == (ScriptOutcome::Exited { code: 0 })
         {
-            state.inner().recorded.extend(stamps);
+            state.inner().recorded.insert(identity, stamps);
         }
         std::future::ready(())
     }
@@ -474,62 +484,288 @@ struct WhitespacePatchRefused<'a> {
 }
 
 /// Refuses a script whose `apply_patch` patch has a hunk that removes and
-/// adds the same text apart from whitespace: formatting by hand, which the
-/// project's formatter does.
+/// adds the same code apart from whitespace that carries no meaning in the
+/// file's language: formatting by hand, which the project's formatter does.
+///
+/// Whitespace inside a string literal is meaning, and so are each line's
+/// indentation and the line breaks in an [indentation-sensitive
+/// language](INDENTATION_SENSITIVE); between two word characters a run of
+/// whitespace keeps them two words. A hunk is lexed where it applies: the
+/// file is lexed from its top down to the hunk, so a string opened above the
+/// hunk is still open in it. A file of a language syntect does not lex, a
+/// file that cannot be read and a hunk that does not place in its file are
+/// never refused: there is nothing to judge, and a hunk that does not place
+/// fails on its own.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WhitespacePatch;
 
-/// The file whose hunk removes and adds lines that are equal once all
-/// whitespace is stripped.
-fn whitespace_only_hunk(reading: &CommandReading) -> Option<&str> {
-    let significant = |lines: &[DiffLine], op: DiffOp| -> Vec<char> {
-        lines
+/// syntect's bundled syntaxes, loaded the first time a hunk needs them.
+#[derive(Debug, Clone, Default)]
+pub struct Syntaxes(Arc<OnceLock<SyntaxSet>>);
+
+/// The syntect syntaxes of languages whose indentation and line breaks carry
+/// meaning: the off-side rule (Python, Haskell, YAML, Haml and Sass), a
+/// Makefile's tab-led recipes, Markdown's and reStructuredText's nested
+/// blocks, a diff's line markers.
+const INDENTATION_SENSITIVE: &[&str] = &[
+    "Python",
+    "YAML",
+    "Haskell",
+    "Literate Haskell",
+    "Ruby Haml",
+    "Makefile",
+    "Markdown",
+    "reStructuredText",
+    "Diff",
+];
+
+/// What a side of a hunk means, once whitespace that carries none is gone.
+#[derive(Debug, PartialEq, Eq)]
+enum Meaning {
+    /// A character of code, or any character of a string literal.
+    Char(char),
+    /// Whitespace that keeps two word characters apart.
+    Gap,
+    /// A line break followed by this indentation, in an
+    /// indentation-sensitive language.
+    Line(String),
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The syntax of the language `path` is written in, matched on its file
+/// name and then its extension; `None` for one syntect does not lex.
+fn language<'s>(syntaxes: &'s SyntaxSet, path: &str) -> Option<&'s SyntaxReference> {
+    let path = Path::new(path);
+    let by = |part: Option<&std::ffi::OsStr>| {
+        part.and_then(std::ffi::OsStr::to_str)
+            .and_then(|part| syntaxes.find_syntax_by_extension(part))
+    };
+    let syntax = by(path.file_name()).or_else(|| by(path.extension()))?;
+    (syntax.name != syntaxes.find_syntax_plain_text().name).then_some(syntax)
+}
+
+/// syntect partway through a file: the parser's state and the scopes open
+/// after the last line it lexed. A clone continues from the same point.
+#[derive(Debug, Clone)]
+struct Lexer<'s> {
+    syntaxes: &'s SyntaxSet,
+    state: ParseState,
+    scopes: ScopeStack,
+    /// The scope every string literal's scope starts with.
+    string: Scope,
+}
+
+impl<'s> Lexer<'s> {
+    /// A lexer at the top of a file written in `syntax`.
+    fn new(syntax: &SyntaxReference, syntaxes: &'s SyntaxSet) -> Self {
+        Self {
+            syntaxes,
+            state: ParseState::new(syntax),
+            scopes: ScopeStack::new(),
+            string: Scope::new("string").expect("`string` is a valid scope"),
+        }
+    }
+
+    /// The scope operations of `text` as the next line, with the line as
+    /// syntect lexes it: ending in a line break.
+    fn parse(&mut self, text: &str) -> Option<(String, Vec<(usize, ScopeStackOp)>)> {
+        let mut line = String::with_capacity(text.len() + 1);
+        line.push_str(text);
+        line.push('\n');
+        let ops = self.state.parse_line(&line, self.syntaxes).ok()?;
+        Some((line, ops))
+    }
+
+    /// Lexes `text` as the next line; `None` when syntect cannot.
+    fn skip(&mut self, text: &str) -> Option<()> {
+        let (_, ops) = self.parse(text)?;
+        ops.iter()
+            .try_for_each(|(_, op)| self.scopes.apply(op).ok())
+    }
+
+    /// Lexes `text` as the next line, telling `each` every character of it,
+    /// its line break included, and whether it sits in a string literal;
+    /// `None` when syntect cannot.
+    fn line(&mut self, text: &str, mut each: impl FnMut(char, bool)) -> Option<()> {
+        let (line, ops) = self.parse(text)?;
+        let mut ops = ops.into_iter().peekable();
+        for (offset, c) in line.char_indices() {
+            while let Some((_, op)) = ops.next_if(|(at, _)| *at <= offset) {
+                self.scopes.apply(&op).ok()?;
+            }
+            let string = self.string;
+            each(
+                c,
+                self.scopes
+                    .as_slice()
+                    .iter()
+                    .any(|scope| string.is_prefix_of(*scope)),
+            );
+        }
+        // An operation at the end of the line holds for the next one.
+        ops.try_for_each(|(_, op)| self.scopes.apply(&op).ok())
+    }
+}
+
+/// The meaning of `lines` lexed by `lexer`, which stands where they start;
+/// `layout` keeps each line's indentation. `None` when syntect cannot lex
+/// them.
+fn meaning<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    mut lexer: Lexer<'_>,
+    layout: bool,
+) -> Option<Vec<Meaning>> {
+    let mut meaning = Vec::new();
+    // Whether whitespace came since the last character kept; a line break
+    // is whitespace too.
+    let mut gap = false;
+    for text in lines {
+        if layout && !text.trim().is_empty() {
+            let indentation = text.strip_suffix(text.trim_start()).unwrap_or_default();
+            meaning.push(Meaning::Line(indentation.to_owned()));
+        }
+        lexer.line(text, |c, in_string| {
+            if in_string {
+                meaning.push(Meaning::Char(c));
+            } else if c.is_whitespace() {
+                gap = true;
+                return;
+            } else {
+                if gap
+                    && is_word(c)
+                    && matches!(meaning.last(), Some(Meaning::Char(p)) if is_word(*p))
+                {
+                    meaning.push(Meaning::Gap);
+                }
+                meaning.push(Meaning::Char(c));
+            }
+            gap = false;
+        })?;
+    }
+    Some(meaning)
+}
+
+/// Whether `hunk` removes and adds lines.
+fn replaces(hunk: &Hunk) -> bool {
+    let has = |op| hunk.lines.iter().any(|line| line.op == op);
+    has(DiffOp::Removed) && has(DiffOp::Added)
+}
+
+/// The lines of `hunk` before (`Removed`) or after (`Added`) it applies.
+fn side(hunk: &Hunk, dropped: DiffOp) -> impl Iterator<Item = &str> {
+    hunk.lines
+        .iter()
+        .filter(move |line| line.op != dropped)
+        .map(|line| line.text.as_str())
+}
+
+/// Whether `hunk`'s two sides are equal once all whitespace is stripped: the
+/// only hunks whose whitespace is worth lexing.
+fn differs_only_in_whitespace(hunk: &Hunk) -> bool {
+    let stripped = |op: DiffOp| -> Vec<char> {
+        hunk.lines
             .iter()
-            .filter(|line| line.op == op)
+            .filter(|line: &&DiffLine| line.op == op)
             .flat_map(|line| line.text.chars().filter(|c| !c.is_whitespace()))
             .collect()
     };
+    replaces(hunk) && stripped(DiffOp::Removed) == stripped(DiffOp::Added)
+}
+
+/// The hunks of every file `reading`'s patches update, each with the file's
+/// path as the patch names it.
+fn updated_hunks(reading: CommandReading) -> impl Iterator<Item = (String, Hunk)> {
     reading
         .steps
-        .iter()
-        .filter_map(|step| match &step.intent {
+        .into_iter()
+        .filter_map(|step| match step.intent {
             Intent::Edit { files } => Some(files),
             _ => None,
         })
         .flatten()
-        .find_map(|file| {
-            let FileChange::Update { hunks, .. } = &file.change else {
-                return None;
-            };
-            hunks
-                .iter()
-                .any(|hunk| {
-                    let has = |op| hunk.lines.iter().any(|line| line.op == op);
-                    has(DiffOp::Removed)
-                        && has(DiffOp::Added)
-                        && significant(&hunk.lines, DiffOp::Removed)
-                            == significant(&hunk.lines, DiffOp::Added)
-                })
-                .then_some(file.path.as_str())
+        .filter_map(|file| match file.change {
+            FileChange::Update { hunks, .. } => Some((file.path, hunks)),
+            FileChange::Add { .. } | FileChange::Delete => None,
         })
+        .flat_map(|(path, hunks)| hunks.into_iter().map(move |hunk| (path.clone(), hunk)))
+}
+
+/// Whether `hunk` of the file at `path`, whose text is `file`, only changes
+/// whitespace that carries no meaning in the file's language. `hunk` carries
+/// the line numbers of where it places in `file`; one that does not place
+/// carries none and is not judged.
+fn meaningless_whitespace(syntaxes: &SyntaxSet, path: &str, file: &str, hunk: &Hunk) -> bool {
+    let judged = || {
+        let syntax = language(syntaxes, path)?;
+        // The hunk's first line that is in the file, numbered from 1.
+        let first = hunk.lines.iter().find_map(|line| line.old)?;
+        let above = usize::try_from(first).ok()?.checked_sub(1)?;
+        let mut lexer = Lexer::new(syntax, syntaxes);
+        for line in file.lines().take(above) {
+            lexer.skip(line)?;
+        }
+        let layout = INDENTATION_SENSITIVE.contains(&syntax.name.as_str());
+        let before = meaning(side(hunk, DiffOp::Added), lexer.clone(), layout)?;
+        let after = meaning(side(hunk, DiffOp::Removed), lexer, layout)?;
+        Some(before == after)
+    };
+    judged().unwrap_or(false)
 }
 
 impl ScriptPolicy for WhitespacePatch {
-    type State = ();
+    type State = Syntaxes;
 
-    fn check(
-        &self,
-        script: &ScriptCheck<'_>,
-        (): &(),
-    ) -> impl Future<Output = ScriptDecision> + Send {
-        let decision = parsed(script)
-            .and_then(|_| {
-                whitespace_only_hunk(&CommandReading::of(script.script)).map(str::to_owned)
-            })
-            .map_or(ScriptDecision::Pass, |path| {
-                refuse(&WhitespacePatchRefused { path: &path })
-            });
-        std::future::ready(decision)
+    async fn check(&self, script: &ScriptCheck<'_>, syntaxes: &Syntaxes) -> ScriptDecision {
+        if parsed(script).is_none() {
+            return ScriptDecision::Pass;
+        }
+        // A patch on a server edits files this host cannot read.
+        let Some(start) = script.start.host() else {
+            return ScriptDecision::Pass;
+        };
+        let paths: HashSet<String> = updated_hunks(CommandReading::of(script.script))
+            .filter(|(_, hunk)| differs_only_in_whitespace(hunk))
+            .map(|(path, _)| path)
+            .collect();
+        if paths.is_empty() {
+            return ScriptDecision::Pass;
+        }
+        // Each file as the patch tool resolves it, against the directory the
+        // script starts in; one that cannot be read is not judged.
+        let files: HashMap<String, String> =
+            futures_util::future::join_all(paths.into_iter().map(|path| async move {
+                let text = async_fs::read_to_string(start.join(&path)).await.ok()?;
+                Some((path, text))
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        if files.is_empty() {
+            return ScriptDecision::Pass;
+        }
+        let script = script.script.to_owned();
+        let start = start.to_path_buf();
+        let syntaxes = syntaxes.0.clone();
+        // Placing the hunks, loading the syntaxes and lexing are blocking
+        // work. Reading the script in its directory places each hunk with
+        // the patch tool's own matching.
+        let refused = blocking::unblock(move || {
+            let syntaxes = syntaxes.get_or_init(SyntaxSet::load_defaults_newlines);
+            updated_hunks(CommandReading::of_in(&script, &start))
+                .filter(|(_, hunk)| differs_only_in_whitespace(hunk))
+                .find_map(|(path, hunk)| {
+                    let file = files.get(&path)?;
+                    meaningless_whitespace(syntaxes, &path, file, &hunk).then_some(path)
+                })
+        })
+        .await;
+        refused.map_or(ScriptDecision::Pass, |path| {
+            refuse(&WhitespacePatchRefused { path: &path })
+        })
     }
 }
 
