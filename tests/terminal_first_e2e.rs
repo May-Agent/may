@@ -1059,8 +1059,8 @@ fn verify_initial_tool_contract(request: &Value) -> Result<(), String> {
         .filter_map(|message| message.get("content").and_then(Value::as_str))
         .find(|content| content.contains("<prepared_tools>"))
         .ok_or_else(|| "initial model request has no prepared tool catalog".to_string())?;
-    for command in ["apply_patch ", "rg ", "ast-grep ", "jq "] {
-        if !catalog.contains(command) {
+    for command in ["apply_patch", "rg", "ast-grep", "jq"] {
+        if !catalog.contains(&format!("\n- {command}\n")) {
             return Err(format!("prepared tool catalog omits {command}"));
         }
     }
