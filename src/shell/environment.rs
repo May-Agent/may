@@ -55,7 +55,7 @@ impl HostSession {
         tools: &PreparedTools<PathBuf>,
     ) -> Result<Self, SessionEnvironmentError> {
         write_git_shim(tools).await?;
-        python_shim::install(&python_shim::shim_directory(working_dir)).await?;
+        python_shim::install(&tools.shim_dir()).await?;
         let environment = environment(working_dir, tools).await?;
         let mut grants = tool_grants(tools)?;
         grants.extend(path_directory_grants(&environment)?);
@@ -211,8 +211,7 @@ async fn environment(
         .unwrap_or_else(|| heel::default_sandbox_path().into());
     let managed_path = tools.prepend_path(Some(host_path.as_os_str()))?;
     let path = std::env::join_paths(
-        std::iter::once(python_shim::shim_directory(working_dir))
-            .chain(std::env::split_paths(&managed_path)),
+        std::iter::once(tools.shim_dir()).chain(std::env::split_paths(&managed_path)),
     )
     .map_err(|error| std::io::Error::other(format!("session PATH: {error}")))?
     .into_string()

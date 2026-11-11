@@ -3,11 +3,13 @@
 //! `python3`.
 //!
 //! The managed `python3` is a verified link inside the prepared tools
-//! directory, so the commands live in a directory of their own, which leads
-//! the session's `PATH`. They resolve at run time, from the directory the
-//! command runs in.
+//! directory, so the commands live in the tools' shim directory
+//! ([`PreparedTools::shim_dir`](crate::tools::PreparedTools::shim_dir)),
+//! which leads the session's `PATH` and is read-only to the sandbox like the
+//! tools themselves. They resolve at run time, from the directory the command
+//! runs in.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The shim both commands are.
 const PYTHON_SHIM: &str = include_str!("../../templates/python_shim");
@@ -15,32 +17,34 @@ const PYTHON_SHIM: &str = include_str!("../../templates/python_shim");
 /// The commands the shim is installed as.
 const COMMANDS: [&str; 2] = ["python3", "python"];
 
-/// The directory of a session's shims.
-pub(super) fn shim_directory(working_dir: &Path) -> PathBuf {
-    working_dir.join(".cache").join("shims")
-}
-
 /// Installs the shims into `directory`, rewriting one whose content differs
-/// from the template.
+/// from the template. Every session installs into the same directory, so a
+/// shim is replaced by a rename and a command already running it keeps its
+/// file.
 #[cfg(unix)]
 pub(super) async fn install(directory: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     async_fs::create_dir_all(directory).await?;
     for command in COMMANDS {
         let shim = directory.join(command);
-        let current = match async_fs::read(&shim).await {
-            Ok(current) => Some(current),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        match async_fs::read(&shim).await {
+            Ok(current) if current == PYTHON_SHIM.as_bytes() => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-        };
-        if current.as_deref() == Some(PYTHON_SHIM.as_bytes()) {
-            continue;
         }
-        let staged = directory.join(format!(".{command}.{}", std::process::id()));
-        async_fs::write(&staged, PYTHON_SHIM).await?;
-        async_fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).await?;
-        async_fs::rename(&staged, &shim).await?;
+        let directory = directory.to_path_buf();
+        blocking::unblock(move || {
+            use std::io::Write as _;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+            file.write_all(PYTHON_SHIM.as_bytes())?;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            file.persist(&shim).map_err(|error| error.error)?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await?;
     }
     Ok(())
 }
