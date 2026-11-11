@@ -2056,6 +2056,24 @@ impl App {
         });
     }
 
+    /// Whether the open dialog holds a request a run waits on (a permission
+    /// or workspace approval, or a blocking question). Such a request is
+    /// shown once, so the dialog must stay until it is answered.
+    fn holds_pending_request(&self) -> bool {
+        match &self.mode {
+            AppMode::PermissionConfirm(_) | AppMode::WorkspaceConfirm(_) => true,
+            AppMode::AskUser(state) => {
+                state.request.is_some()
+                    || self
+                        .session_runtime
+                        .waiting_ask_user
+                        .as_ref()
+                        .is_some_and(|waiting| waiting.id == state.request_id)
+            }
+            _ => false,
+        }
+    }
+
     /// Close the permission dialog once its request is no longer the one the
     /// session waits on: another client answered it, or it was withdrawn.
     pub fn close_resolved_permission(&mut self) {
@@ -2499,6 +2517,13 @@ impl App {
                 // can use it.
                 KeyCode::Char('v' | 'V') => {
                     self.handle_paste();
+                    return Ok(None);
+                }
+                // Ctrl+Left (open questions), Ctrl+N (new session) and Ctrl+P
+                // (profiles / sessions) replace the screen or the session; a
+                // dialog a run waits on is answered first, so they do nothing
+                // while one is open.
+                KeyCode::Left | KeyCode::Char('n' | 'p') if self.holds_pending_request() => {
                     return Ok(None);
                 }
                 KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
@@ -6194,6 +6219,115 @@ mod tests {
             matches!(app.mode, crate::tui::AppMode::Chat),
             "the stale snapshot must not reopen the answered request"
         );
+    }
+
+    /// Every global shortcut that replaces the screen or the session.
+    fn mode_shortcuts() -> [KeyCode; 3] {
+        [KeyCode::Left, KeyCode::Char('n'), KeyCode::Char('p')]
+    }
+
+    /// Ctrl+Left, Ctrl+N and Ctrl+P leave an open permission dialog in
+    /// place, and the request is then answered.
+    #[tokio::test]
+    async fn global_shortcuts_keep_a_pending_permission_dialog() {
+        for shortcut in mode_shortcuts() {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _) = app_with_session(dir.path()).await;
+            app.handle_event(waiting_permission_snapshot(Some("p1")))
+                .expect("snapshot");
+            app.open_waiting_permission();
+            let action = app
+                .handle_key(shortcut, KeyModifiers::CONTROL)
+                .expect("key");
+            assert!(action.is_none(), "{shortcut:?} emits no action");
+            assert!(
+                matches!(app.mode, crate::tui::AppMode::PermissionConfirm(_)),
+                "{shortcut:?} dropped the permission dialog"
+            );
+            let answer = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(
+                    answer,
+                    Some(SendAction::RespondPermission { ref request_id, approved: true })
+                        if request_id == "p1"
+                ),
+                "{shortcut:?}: the request is answered"
+            );
+        }
+    }
+
+    /// The same for a workspace approval.
+    #[tokio::test]
+    async fn global_shortcuts_keep_a_pending_workspace_dialog() {
+        for shortcut in mode_shortcuts() {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _) = app_with_session(dir.path()).await;
+            app.mode =
+                crate::tui::AppMode::WorkspaceConfirm(crate::tui::state::WorkspaceConfirmState {
+                    request_id: "w1".to_string(),
+                    path: "/tmp/elsewhere".to_string(),
+                    reason: "build".to_string(),
+                    request: None,
+                });
+            let action = app
+                .handle_key(shortcut, KeyModifiers::CONTROL)
+                .expect("key");
+            assert!(action.is_none(), "{shortcut:?} emits no action");
+            assert!(
+                matches!(app.mode, crate::tui::AppMode::WorkspaceConfirm(_)),
+                "{shortcut:?} dropped the workspace dialog"
+            );
+            let answer = press(&mut app, KeyCode::Esc);
+            assert!(
+                matches!(
+                    answer,
+                    Some(SendAction::RespondWorkspace { ref request_id, approved: false, .. })
+                        if request_id == "w1"
+                ),
+                "{shortcut:?}: the request is answered"
+            );
+        }
+    }
+
+    /// The same for a question a run blocks on, shown from the runtime
+    /// snapshot.
+    #[tokio::test]
+    async fn global_shortcuts_keep_a_blocking_question_dialog() {
+        for shortcut in mode_shortcuts() {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _) = app_with_session(dir.path()).await;
+            let request = crate::session::PersistedAskUserRequest {
+                id: "q1".to_string(),
+                questions: vec![crate::session::PersistedAskUserQuestion {
+                    section: String::new(),
+                    question: "Which database?".to_string(),
+                    option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
+                    multi_select: false,
+                    secret: None,
+                }],
+            };
+            app.session_runtime.waiting_ask_user = Some(request.clone());
+            app.show_blocking_prompt(crate::tui::AppMode::AskUser(
+                crate::tui::AskUserState::for_open_question(request),
+            ));
+            let action = app
+                .handle_key(shortcut, KeyModifiers::CONTROL)
+                .expect("key");
+            assert!(action.is_none(), "{shortcut:?} emits no action");
+            assert!(
+                matches!(app.mode, crate::tui::AppMode::AskUser(_)),
+                "{shortcut:?} dropped the question"
+            );
+            let answer = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(
+                    answer,
+                    Some(SendAction::RespondAskUser { ref request_id, .. })
+                        if request_id == "q1"
+                ),
+                "{shortcut:?}: the question is answered"
+            );
+        }
     }
 
     #[tokio::test]
