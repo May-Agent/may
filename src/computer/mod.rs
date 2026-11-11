@@ -13,6 +13,8 @@ pub(crate) mod client;
 #[cfg(target_os = "macos")]
 pub(crate) mod input;
 #[cfg(target_os = "macos")]
+mod launch;
+#[cfg(target_os = "macos")]
 pub mod main_thread;
 pub(crate) mod proto;
 #[cfg(target_os = "macos")]
