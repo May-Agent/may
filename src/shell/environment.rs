@@ -264,31 +264,80 @@ async fn environment(
 /// whatever `.git` its subagent wrote.
 const GIT_SHIM: &str = include_str!("../../templates/git_shim");
 
-/// Writes the `git` shim into the prepared tools directory once.
+/// Writes the `git` shim into the prepared tools directory.
 #[cfg(unix)]
 async fn write_git_shim(tools: &PreparedTools<PathBuf>) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+    write_shim(tools.bin_dir().join("git"), GIT_SHIM).await
+}
 
-    use futures_lite::io::AsyncWriteExt as _;
-    let shim = tools.bin_dir().join("git");
-    match async_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&shim)
-        .await
-    {
-        Ok(mut file) => {
-            file.write_all(GIT_SHIM.as_bytes()).await?;
-            file.flush().await?;
-            async_fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).await
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
+/// Makes the executable at `path` hold `content`: a shim another build wrote
+/// is replaced by a rename, so a command already running it keeps its file.
+#[cfg(unix)]
+async fn write_shim(path: PathBuf, content: &'static str) -> std::io::Result<()> {
+    match async_fs::read(&path).await {
+        Ok(current) if current == content.as_bytes() => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
+    blocking::unblock(move || {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the shim path {} has no parent", path.display()),
+            )
+        })?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(content.as_bytes())?;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        file.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await
 }
 
 /// Windows commands run no `sh`: no shim.
 #[cfg(not(unix))]
 async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::write_shim;
+
+    #[test]
+    fn a_stale_shim_is_replaced_and_a_current_one_kept() {
+        futures_lite::future::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let shim = dir.path().join("git");
+            std::fs::write(&shim, "#!/bin/sh\necho stale\n").unwrap();
+
+            write_shim(shim.clone(), "#!/bin/sh\necho current\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&shim).unwrap(),
+                "#!/bin/sh\necho current\n"
+            );
+            let mode = std::fs::metadata(&shim).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+
+            let before = std::fs::metadata(&shim).unwrap().modified().unwrap();
+            write_shim(shim.clone(), "#!/bin/sh\necho current\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(&shim).unwrap().modified().unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        });
+    }
 }
