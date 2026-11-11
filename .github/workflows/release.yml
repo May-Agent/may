@@ -27,7 +27,39 @@ jobs:
         id: crates-io-auth
         continue-on-error: true
       - uses: MarcoIeni/release-plz-action@v0.5
+        id: release-plz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+      # A tag created with GITHUB_TOKEN starts no workflow, so the tool
+      # releases' binaries are built by calling tool-artifacts.yml from here.
+      # The action's `releases` output lists only what this run released, so a
+      # release cut by an earlier run never triggers a second upload.
+      - name: Select the tool releases
+        id: tools
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          set -euo pipefail
+          tags="$(jq -c '[.[] | select(.package_name == "may-patch" or .package_name == "may-sed") | .tag]' <<<"${RELEASES:-[]}")"
+          {
+            echo "tags=${tags}"
+            echo "ref=$(jq -r '.[0] // empty' <<<"${tags}")"
+          } >> "${GITHUB_OUTPUT}"
+    outputs:
+      tool-tags: ${{ steps.tools.outputs.tags }}
+      tool-ref: ${{ steps.tools.outputs.ref }}
+
+  # Both tools of one release run are tagged on the commit release-plz
+  # released, so one build at the first tag serves every tag of the run.
+  tool-artifacts:
+    name: Tool artifacts
+    needs: release-plz
+    if: needs.release-plz.outputs.tool-ref != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/tool-artifacts.yml
+    with:
+      ref: ${{ needs.release-plz.outputs.tool-ref }}
+      tags: ${{ needs.release-plz.outputs.tool-tags }}
 

@@ -450,14 +450,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aither-patch"
-version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
-dependencies = [
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "aither-sandbox"
 version = "0.30.0"
 source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
@@ -505,14 +497,6 @@ dependencies = [
  "uuid",
  "vte",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "aither-sed"
-version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
-dependencies = [
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5532,9 +5516,7 @@ dependencies = [
  "aither-mcp",
  "aither-models",
  "aither-openai",
- "aither-patch",
  "aither-sandbox",
- "aither-sed",
  "anyhow",
  "arboard",
  "arc-swap",
@@ -5595,6 +5577,8 @@ dependencies = [
  "libc",
  "linkify",
  "lzma-rust2 0.24.0",
+ "may-patch",
+ "may-sed",
  "may-tasks",
  "mediax-codec",
  "mime",
@@ -5664,6 +5648,22 @@ dependencies = [
  "yuv",
  "zenwave",
  "zip 9.5.0",
+]
+
+[[package]]
+name = "may-patch"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "may-sed"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
