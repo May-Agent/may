@@ -46,13 +46,20 @@ runs:
       run: |
         if [ "${RUNNER_OS}" = macOS ]; then
           sysctl hw.ncpu hw.memsize
+          sudo mdutil -a -i off || true
+          sudo killall mediaanalysisd || true
           (while sleep 15; do
             echo "$(date -u +%T) pressure=$(sysctl -n kern.memorystatus_vm_pressure_level) $(sysctl -n vm.swapusage)"
             ps -Ao rss=,comm= | sort -rn | head -3 | awk '{printf "  %d MB %s\n", $1/1024, $2}'
           done) > "${RUNNER_TEMP}/memory.log" 2>&1 &
           echo "$!" > "${RUNNER_TEMP}/memory.pid"
         fi
+        start=$(date +%s)
+        cargo build --locked --lib --timings
+        echo "lib alone: $(( $(date +%s) - start )) s"
+        start=$(date +%s)
         cargo build --locked --all-targets --timings
+        echo "remaining targets: $(( $(date +%s) - start )) s"
     - name: Memory during the build
       if: always() && runner.os == 'macOS'
       shell: bash
