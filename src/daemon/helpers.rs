@@ -56,20 +56,6 @@ pub(super) async fn load_session_paths(
     Ok(paths)
 }
 
-pub(super) fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
-    for (idx, arg) in args.iter().enumerate() {
-        if let Some(value) = arg.strip_prefix(&format!("{key}=")) {
-            return Some(value.to_string());
-        }
-        if arg == key
-            && let Some(value) = args.get(idx + 1)
-        {
-            return Some(value.clone());
-        }
-    }
-    None
-}
-
 /// Convert `Duration::as_millis()` (u128) to u64 with saturation.
 pub(super) fn elapsed_ms_saturating(started_at: &std::time::Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)

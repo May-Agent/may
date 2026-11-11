@@ -160,6 +160,10 @@ async fn async_main() -> anyhow::Result<()> {
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
+    if let CliMode::Completion(shell) = cli_mode {
+        io::stdout().write_all(&cli::completion_script(shell))?;
+        return Ok(());
+    }
     if let CliMode::ComputerAgent {
         stderr: Some(path), ..
     } = &cli_mode
@@ -170,7 +174,7 @@ async fn async_main() -> anyhow::Result<()> {
     // diagnostics go there too.
     let is_server_mode = matches!(
         cli_mode,
-        CliMode::Ui(_)
+        CliMode::Ui
             | CliMode::Rest(_)
             | CliMode::Daemon(cli::DaemonCommand::Run)
             | CliMode::ComputerAgent { .. }
@@ -237,9 +241,7 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::warn!("fatal-signal log dump not installed: {error}");
     }
 
-    if !matches!(cli_mode, CliMode::Help(_)) {
-        may_agent::startup::validate_configuration().await?;
-    }
+    may_agent::startup::validate_configuration().await?;
 
     let resume = match &cli_mode {
         CliMode::Resume(args) => Some(args.clone()),
@@ -250,20 +252,12 @@ async fn async_main() -> anyhow::Result<()> {
         _ => may_agent::session::SessionLaunch::default(),
     };
     match cli_mode {
-        CliMode::Help(help_text) => {
-            use std::io::Write as _;
-            io::stdout().write_all(help_text.as_bytes())?;
-            io::stdout().write_all(
-                b"
-",
-            )?;
-            return Ok(());
-        }
-        CliMode::Ui(_) => return open_web_ui().await,
-        CliMode::Rest(rest_args) => {
+        CliMode::Completion(_) => unreachable!("handled before the configuration check"),
+        CliMode::Ui => return open_web_ui().await,
+        CliMode::Rest(address) => {
             return may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
                 mode: may_agent::daemon::DaemonMode::Rest,
-                tcp: Some(may_agent::daemon::parse_listen_args(&rest_args)?),
+                tcp: Some(address),
             })
             .await;
         }

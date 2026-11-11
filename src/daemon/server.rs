@@ -1,7 +1,6 @@
 //! The daemon's API server: state construction, background workers, and
 //! the REST/SSE router every client (TUI, oneshot, web UI) talks to.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,21 +57,6 @@ impl DaemonMode {
             )),
         }
     }
-}
-
-/// Parses `--host` / `--port` from `may ui` / `may rest` arguments.
-///
-/// # Errors
-/// Fails when the pair does not form a socket address.
-pub fn parse_listen_args(args: &[String]) -> anyhow::Result<SocketAddr> {
-    let host =
-        super::helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = super::helpers::parse_arg_value(args, "--port")
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_PORT);
-    format!("{host}:{port}")
-        .parse()
-        .with_context(|| format!("Invalid host/port: {host}:{port}"))
 }
 
 /// TCP port the daemon serves the API and web UI on by default.

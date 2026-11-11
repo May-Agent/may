@@ -88,7 +88,7 @@ pub use chat::{
     BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, ProgressReport,
     RecapRecord,
 };
-pub use server::{DEFAULT_PORT, DaemonMode, parse_listen_args};
+pub use server::{DEFAULT_PORT, DaemonMode};
 pub(crate) use server::{start, sync_remote_access};
 pub use types::DaemonHealth;
 
