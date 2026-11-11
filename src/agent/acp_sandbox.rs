@@ -1,18 +1,19 @@
-//! Where connected ACP agents run: inside the session's sandbox.
+//! Where connected ACP agents run: in the space of the subagent run they
+//! serve.
 //!
 //! acpsub starts two kinds of process, the agent itself and each command the
 //! agent runs through ACP `terminal/*`. Both start through
-//! [`SandboxExecutor`] on the [`Sandbox`] of the session's shell, so they run
-//! with the session's live grants, environment and network policy exactly as
-//! its own commands do. The agent's permission requests go through
-//! [`ApprovalPermissions`] to the session's [`PermissionApprover`]; nothing
-//! is answered without it.
+//! [`SandboxExecutor`] on the [`Sandbox`](aither_sandbox::Sandbox) of the
+//! run's subagent shell, so they hold exactly the grants a native subagent's
+//! commands hold: they write the run's own space and the worktrees the run
+//! was granted, and read, but never write, what the launching agent can
+//! write, the session's `tasks.md` and approved workdirs included. The
+//! agent's permission requests go through [`ApprovalPermissions`] to the
+//! session's [`PermissionApprover`]; nothing is answered without it.
 //!
-//! A [`SessionSandbox`] is the boundary of one session. The executor and the
-//! permission handler read it through a shared cell, so an agent rebuilt for
-//! the session installs its sandbox for every process started afterwards. A
-//! running agent keeps the grants it started with, as a running terminal
-//! command does.
+//! An [`AcpSandbox`] is the boundary of one run's processes; the
+//! [`SessionServices`] every run of a session shares make one from the
+//! run's sandbox.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -42,10 +43,51 @@ use heel::{Access, Grant, HeelBinary, ResolvedPath};
 use crate::agent::PermissionApprover;
 use crate::config::MayConfig;
 
-/// The boundary of one session's ACP processes.
+/// What the ACP processes of one session share, whichever space they run
+/// in: who answers the agents' permission requests, and the machine-wide
+/// jobserver pool their commands draw jobs from.
 #[derive(Clone)]
-pub struct SessionSandbox {
-    /// The sandbox the session's shell spawns in.
+pub struct SessionServices {
+    /// Asks the user about the agents' permission requests; without it every
+    /// request is refused.
+    approver: Option<PermissionApprover>,
+    /// The machine-wide jobserver pool.
+    jobs: JobBroker,
+}
+
+impl std::fmt::Debug for SessionServices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionServices")
+            .field("approves", &self.approver.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionServices {
+    /// The services of a session whose agents' requests `approver` answers
+    /// and whose commands draw from `jobs`.
+    #[must_use]
+    pub const fn new(approver: Option<PermissionApprover>, jobs: JobBroker) -> Self {
+        Self { approver, jobs }
+    }
+
+    /// The boundary of a run whose processes start in `sandbox`: the sandbox
+    /// of the run's subagent shell.
+    #[must_use]
+    pub fn sandbox(&self, sandbox: aither_sandbox::Sandbox) -> AcpSandbox {
+        AcpSandbox {
+            sandbox,
+            launch_dir: None,
+            approver: self.approver.clone(),
+            jobs: Some(self.jobs.clone()),
+        }
+    }
+}
+
+/// The boundary of one ACP agent's processes.
+#[derive(Clone)]
+pub struct AcpSandbox {
+    /// The sandbox its processes spawn in.
     sandbox: aither_sandbox::Sandbox,
     /// Overrides the working directory a process asks for, when the caller
     /// has none of its own to give (a probe starts in the daemon's).
@@ -58,31 +100,16 @@ pub struct SessionSandbox {
     jobs: Option<JobBroker>,
 }
 
-impl std::fmt::Debug for SessionSandbox {
+impl std::fmt::Debug for AcpSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionSandbox")
+        f.debug_struct("AcpSandbox")
             .field("root", &self.sandbox.working_dir())
             .field("grants", &self.sandbox.grants().snapshot())
             .finish_non_exhaustive()
     }
 }
 
-impl SessionSandbox {
-    /// The boundary of the session whose shell spawns in `sandbox`.
-    #[must_use]
-    pub const fn for_session(
-        sandbox: aither_sandbox::Sandbox,
-        approver: Option<PermissionApprover>,
-        jobs: JobBroker,
-    ) -> Self {
-        Self {
-            sandbox,
-            launch_dir: None,
-            approver,
-            jobs: Some(jobs),
-        }
-    }
-
+impl AcpSandbox {
     /// A sandbox granting nothing but `root`, which every process starts in,
     /// with no network and answering no permission request: a command under
     /// probe or trial belongs to no session. Its supervisor is run by `heel`.
@@ -138,7 +165,7 @@ enum Process {
     Terminal,
 }
 
-impl SessionSandbox {
+impl AcpSandbox {
     /// Starts `spec` as `process` in the sandbox with the grants of this
     /// moment.
     async fn launch(
@@ -147,9 +174,15 @@ impl SessionSandbox {
         process: &Process,
     ) -> io::Result<(SandboxedChild, Option<CommandFifo>)> {
         let cwd = self.launch_dir.as_deref().unwrap_or(&spec.cwd);
+        // Temporary files go to the sandbox's own directory, which it
+        // writes: a run's sandbox only reads the session's.
         let tmp = self.sandbox.working_dir().join("tmp");
         async_fs::create_dir_all(&tmp).await?;
-        let mut env: Vec<(String, String)> = Vec::new();
+        let tmp = os_text("TMPDIR", canonical(&tmp)?.into_os_string())?;
+        let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+            .into_iter()
+            .map(|name| (name.to_string(), tmp.clone()))
+            .collect();
         let mut grants: Vec<SpawnGrant> = Vec::new();
         let program = match process {
             Process::Agent { state } => {
@@ -309,10 +342,10 @@ fn resolve_program(program: &str, search_path: &OsStr, cwd: &Path) -> io::Result
     })
 }
 
-/// Starts ACP processes in the sandbox of the session installed in `cell`.
+/// Starts ACP processes in one agent's sandbox.
 #[derive(Debug, Clone)]
 pub struct SandboxExecutor {
-    cell: Arc<ArcSwap<SessionSandbox>>,
+    sandbox: Arc<AcpSandbox>,
     config: Arc<ArcSwap<MayConfig>>,
 }
 
@@ -442,12 +475,11 @@ fn piped<T>(stream: Option<T>, name: &str) -> io::Result<T> {
 }
 
 impl SandboxExecutor {
-    /// An executor starting processes in whatever sandbox `cell` holds when
-    /// they start, giving an agent the grants `config` lists for its command
-    /// when it starts.
+    /// An executor starting processes in `sandbox`, giving an agent the
+    /// grants `config` lists for its command when it starts.
     #[must_use]
-    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>, config: Arc<ArcSwap<MayConfig>>) -> Self {
-        Self { cell, config }
+    pub const fn new(sandbox: Arc<AcpSandbox>, config: Arc<ArcSwap<MayConfig>>) -> Self {
+        Self { sandbox, config }
     }
 
     /// The directories the connections of `spec`'s command grant their
@@ -477,7 +509,7 @@ impl Executor for SandboxExecutor {
         let process = Process::Agent {
             state: self.state_dirs(&spec)?,
         };
-        let (mut child, job_fifo) = self.cell.load_full().launch(&spec, &process).await?;
+        let (mut child, job_fifo) = self.sandbox.launch(&spec, &process).await?;
         let stdin = ChunkWriter {
             chunks: piped(child.take_stdin(), "stdin")?,
         };
@@ -492,11 +524,7 @@ impl Executor for SandboxExecutor {
     }
 
     async fn spawn_terminal(&self, spec: AcpSpawn) -> io::Result<TerminalProcess<Self>> {
-        let (mut child, job_fifo) = self
-            .cell
-            .load_full()
-            .launch(&spec, &Process::Terminal)
-            .await?;
+        let (mut child, job_fifo) = self.sandbox.launch(&spec, &Process::Terminal).await?;
         let stdout = ChunkReader::new(piped(child.take_stdout(), "stdout")?);
         let stderr = ChunkReader::new(piped(child.take_stderr(), "stderr")?);
         Ok(TerminalProcess {
@@ -520,21 +548,20 @@ struct PermissionText<'a> {
 /// switch are those of an `unsafe` terminal request.
 #[derive(Debug, Clone)]
 pub struct ApprovalPermissions {
-    cell: Arc<ArcSwap<SessionSandbox>>,
+    sandbox: Arc<AcpSandbox>,
 }
 
 impl ApprovalPermissions {
-    /// A handler asking the approver of whatever sandbox `cell` holds.
+    /// A handler asking the approver of `sandbox`.
     #[must_use]
-    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>) -> Self {
-        Self { cell }
+    pub const fn new(sandbox: Arc<AcpSandbox>) -> Self {
+        Self { sandbox }
     }
 }
 
 impl PermissionHandler for ApprovalPermissions {
     async fn decide(&self, request: PermissionRequest) -> RequestPermissionOutcome {
-        let sandbox = self.cell.load_full();
-        let approved = match &sandbox.approver {
+        let approved = match &self.sandbox.approver {
             Some(approver) => {
                 let script = PermissionText {
                     title: &request.params.tool_call.title,
@@ -638,16 +665,14 @@ mod tests {
     /// Starts the fake agent, ends it as `ending` says, and returns what the
     /// executor reports for its exit.
     async fn exit_status_after(
-        sandbox: SessionSandbox,
+        sandbox: AcpSandbox,
         cwd: &Path,
         ending: Ending,
     ) -> Result<ExitStatus, String> {
         // The sandbox spawns on the daemon's global executor.
         crate::test_support::install_global_executor();
-        let executor = SandboxExecutor::new(
-            Arc::new(ArcSwap::from_pointee(sandbox)),
-            Arc::<ArcSwap<MayConfig>>::default(),
-        );
+        let executor =
+            SandboxExecutor::new(Arc::new(sandbox), Arc::<ArcSwap<MayConfig>>::default());
         let agent = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             executor.spawn_agent(fake_agent_spec(cwd)),
@@ -690,12 +715,9 @@ mod tests {
         (dir, server)
     }
 
-    async fn session_sandbox(root: &Path, server: &crate::jobserver::JobServer) -> SessionSandbox {
-        SessionSandbox::for_session(
-            test_sandbox(root).await,
-            None,
-            server.broker().expect("pool broker"),
-        )
+    async fn session_sandbox(root: &Path, server: &crate::jobserver::JobServer) -> AcpSandbox {
+        SessionServices::new(None, server.broker().expect("pool broker"))
+            .sandbox(test_sandbox(root).await)
     }
 
     /// A command the agent runs through ACP holds the pool's tokens while it
@@ -708,10 +730,8 @@ mod tests {
         let root = dir.path().join("session");
         let sandbox = session_sandbox(&root, &server).await;
         let report = root.join("tmp/held");
-        let executor = SandboxExecutor::new(
-            Arc::new(ArcSwap::from_pointee(sandbox)),
-            Arc::<ArcSwap<MayConfig>>::default(),
-        );
+        let executor =
+            SandboxExecutor::new(Arc::new(sandbox), Arc::<ArcSwap<MayConfig>>::default());
         assert_eq!(server.tokens_in_pool(), SIZE);
         let mut spec = fake_agent_spec(&root);
         spec.args = vec![
@@ -751,7 +771,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scratch_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let sandbox = SessionSandbox::scratch(dir.path(), crate::tools::test_heel().await)
+        let sandbox = AcpSandbox::scratch(dir.path(), crate::tools::test_heel().await)
             .expect("the scratch sandbox");
         let status = exit_status_after(sandbox, dir.path(), Ending::StdinCloses)
             .await
@@ -762,7 +782,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_killed_scratch_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let sandbox = SessionSandbox::scratch(dir.path(), crate::tools::test_heel().await)
+        let sandbox = AcpSandbox::scratch(dir.path(), crate::tools::test_heel().await)
             .expect("the scratch sandbox");
         let status = exit_status_after(sandbox, dir.path(), Ending::Killed)
             .await
