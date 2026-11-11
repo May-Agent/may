@@ -1443,7 +1443,7 @@ pub(super) enum WaitingTurnResume {
     /// A live run (possibly in another process) holds the lease. It was or
     /// will be answered through its own prompt, so nothing was written: no
     /// state change and no reminder that would reach the model after it.
-    RunLive(crate::session::SessionRuntimeSummary),
+    RunLive(Box<crate::session::SessionRuntimeSummary>),
 }
 
 /// Take the lease of a session whose run is gone and queue the reminder for
@@ -1471,7 +1471,7 @@ pub(super) async fn queue_waiting_turn_resume(
             return runtime_service
                 .get(session_id)
                 .await
-                .map(WaitingTurnResume::RunLive)
+                .map(|runtime| WaitingTurnResume::RunLive(Box::new(runtime)))
                 .map_err(ScheduleWaitingTurnError::Lease);
         }
         Err(AcquireError::Storage(error)) => return Err(ScheduleWaitingTurnError::Lease(error)),
@@ -1508,7 +1508,7 @@ pub(super) async fn schedule_waiting_turn_resume(
             spawn_continued_run(state.clone(), guard);
             Ok(*runtime)
         }
-        WaitingTurnResume::RunLive(runtime) => Ok(runtime),
+        WaitingTurnResume::RunLive(runtime) => Ok(*runtime),
     }
 }
 
