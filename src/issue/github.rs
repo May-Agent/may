@@ -5,6 +5,8 @@
 //! as an `Authorization` header — it is never logged or put in model
 //! context.
 
+use std::sync::Arc;
+
 use zenwave::header::{ACCEPT, LINK, USER_AGENT};
 use zenwave::{Client, Method, ResponseExt};
 
@@ -61,6 +63,9 @@ impl GitHubTokenSource for GhCliTokenSource {
 pub struct GitHubRest<T> {
     api_base: String,
     token_source: T,
+    /// The token read from `token_source`, shared by clones of this client;
+    /// replaced only after GitHub answers 401.
+    token: Arc<async_lock::Mutex<Option<String>>>,
 }
 
 impl<T: GitHubTokenSource> GitHubRest<T> {
@@ -76,7 +81,20 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
         Self {
             api_base: api_base.trim_end_matches('/').to_string(),
             token_source,
+            token: Arc::new(async_lock::Mutex::new(None)),
         }
+    }
+
+    /// The cached token, read from the source on first use or when `renew`
+    /// is set (after an authentication failure).
+    async fn token(&self, renew: bool) -> Result<String, IssueError> {
+        let mut cached = self.token.lock().await;
+        if !renew && let Some(token) = cached.as_ref() {
+            return Ok(token.clone());
+        }
+        let token = self.token_source.token().await?;
+        *cached = Some(token.clone());
+        Ok(token)
     }
 
     /// The API base URL, without a trailing slash.
@@ -126,10 +144,32 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
         url: String,
         body: Option<serde_json::Value>,
     ) -> Result<zenwave::Response, IssueError> {
-        let token = self.token_source.token().await?;
+        let response = self
+            .send(
+                method.clone(),
+                &url,
+                body.as_ref(),
+                self.token(false).await?,
+            )
+            .await?;
+        if response.status().as_u16() != 401 {
+            return Ok(response);
+        }
+        // The cached token was rejected: read the login again, once.
+        self.send(method, &url, body.as_ref(), self.token(true).await?)
+            .await
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&serde_json::Value>,
+        token: String,
+    ) -> Result<zenwave::Response, IssueError> {
         let mut client = zenwave::client();
         let mut request = client
-            .method(method, url.as_str())
+            .method(method, url)
             .map_err(|error| IssueError::GitHub(error.to_string()))?
             .bearer_auth(token)
             .header(ACCEPT, "application/vnd.github+json")
@@ -137,7 +177,7 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
             .map_err(|error| IssueError::GitHub(error.to_string()))?;
         if let Some(body) = body {
             request = request
-                .json_body(&body)
+                .json_body(body)
                 .map_err(|error| IssueError::GitHub(error.to_string()))?;
         }
         match request.await {
@@ -549,26 +589,39 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         labels: &[String],
         limit: i64,
     ) -> Result<Vec<IssueSummary>, IssueError> {
-        let mut url = format!(
-            "{}/repos/{}/issues?state={}&per_page={}",
+        let mut url = url::Url::parse(&format!(
+            "{}/repos/{}/issues",
             self.api_base(),
-            self.repository,
-            state.as_str(),
-            limit.clamp(1, 100)
-        );
-        if !labels.is_empty() {
-            url.push_str("&labels=");
-            url.push_str(&labels.join(","));
+            self.repository
+        ))
+        .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("state", state.as_str())
+                .append_pair("per_page", &limit.clamp(1, 100).to_string());
+            if !labels.is_empty() {
+                query.append_pair("labels", &labels.join(","));
+            }
         }
-        let response = self.request(Method::GET, url, None).await?;
-        let issues = response
-            .into_json::<Vec<GhIssue>>()
-            .await
-            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        // The issues endpoint also returns pull requests: pages are read
+        // until `limit` issues are held or the listing ends.
+        let mut issues: Vec<GhIssue> = Vec::new();
+        let mut next = Some(url.to_string());
+        while issues.len() < limit
+            && let Some(url) = next
+        {
+            let (page, following) = self.request_page::<GhIssue>(url).await?;
+            issues.extend(
+                page.into_iter()
+                    .filter(|issue| issue.pull_request.is_none()),
+            );
+            next = following;
+        }
         issues
             .into_iter()
-            .filter(|issue| issue.pull_request.is_none())
-            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .take(limit)
             .map(|issue| {
                 let labels = issue.label_names();
                 Ok(IssueSummary {
@@ -1270,6 +1323,104 @@ mod tests {
             .expect("list");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].number, 3);
+    }
+
+    #[tokio::test]
+    async fn list_encodes_labels_in_the_query() {
+        let (api_base, requests) = mock_api(|method, path, _body| match (method, path) {
+            ("GET", path) if path.starts_with("/repos/o/r/issues?") => {
+                (200, serde_json::json!([gh_issue_json(1, "one", "open")]))
+            }
+            _ => panic!("unexpected request {method} {path}"),
+        })
+        .await;
+        let labels = ["good first issue", "C++", "a&b"].map(String::from);
+        store(&api_base)
+            .list(IssueListState::Open, &labels, 10)
+            .await
+            .expect("list");
+        let sent = requests.lock().expect("requests").clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1,
+            "/repos/o/r/issues?state=open&per_page=10&labels=good+first+issue%2CC%2B%2B%2Ca%26b"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_reads_the_next_page_when_pull_requests_fill_the_first() {
+        let mut pr = gh_issue_json(2, "a pr", "open");
+        pr["pull_request"] = serde_json::json!({"url": "https://example/pr"});
+        let first = serde_json::json!([gh_issue_json(1, "one", "open"), pr]);
+        let second = serde_json::json!([
+            gh_issue_json(3, "three", "open"),
+            gh_issue_json(4, "four", "open")
+        ]);
+        let (api_base, requests) =
+            mock_paged_api(move |method, path, _body| match (method, path) {
+                ("GET", "/repos/o/r/issues?page=2") => (200, second.clone(), None),
+                ("GET", path) if path.starts_with("/repos/o/r/issues?") => (
+                    200,
+                    first.clone(),
+                    Some("/repos/o/r/issues?page=2".to_string()),
+                ),
+                _ => panic!("unexpected request {method} {path}"),
+            })
+            .await;
+        let issues = store(&api_base)
+            .list(IssueListState::All, &[], 2)
+            .await
+            .expect("list");
+        assert_eq!(
+            issues.iter().map(|issue| issue.number).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(requests.lock().expect("requests").len(), 2);
+    }
+
+    /// Hands out `token-1`, `token-2`, … and counts the reads.
+    #[derive(Debug, Clone, Default)]
+    struct CountingToken(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl GitHubTokenSource for CountingToken {
+        fn token(&self) -> impl Future<Output = Result<String, IssueError>> + Send {
+            let read = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            std::future::ready(Ok(format!("token-{read}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_token_is_read_once_and_again_only_after_a_401() {
+        let rejected = std::sync::atomic::AtomicBool::new(false);
+        let (api_base, requests) = mock_api(move |_method, _path, _body| {
+            if rejected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                (200, serde_json::json!({"login": "me"}))
+            } else {
+                (401, serde_json::json!({"message": "Bad credentials"}))
+            }
+        })
+        .await;
+        let tokens = CountingToken::default();
+        let rest = GitHubRest::with_api_base(tokens.clone(), &api_base);
+        for _ in 0..3 {
+            assert_eq!(rest.viewer_login().await.expect("login"), "me");
+        }
+        assert_eq!(tokens.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let auth: Vec<_> = requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|(_, _, auth, _)| auth.clone())
+            .collect();
+        assert_eq!(
+            auth,
+            [
+                "Bearer token-1",
+                "Bearer token-2",
+                "Bearer token-2",
+                "Bearer token-2"
+            ]
+        );
     }
 
     fn issue_at(number: i64, updated_at: &str) -> serde_json::Value {
