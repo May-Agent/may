@@ -82,6 +82,31 @@ impl ChatDb {
         .collect()
     }
 
+    /// The stored cards of the session's calls `call_ids`, by call id, in
+    /// one query.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or an unreadable card.
+    pub async fn tool_cards_for(
+        &self,
+        session_id: &str,
+        call_ids: &[&str],
+    ) -> Result<HashMap<String, Card>, ChatDbError> {
+        let call_ids = serde_json::to_string(call_ids)
+            .map_err(|error| ChatDbError::Storage(error.to_string()))?;
+        query!(
+            self.db,
+            "SELECT call_id, card FROM message_tool_cards WHERE session_id = ? AND call_id IN (SELECT value FROM json_each(?))",
+            session_id,
+            call_ids
+        )
+        .fetch_all::<CardRow>()
+        .await?
+        .into_iter()
+        .map(decode)
+        .collect()
+    }
+
     /// Settles every stored subagent card still running as interrupted: no
     /// run survives a daemon exit, so a card left running never ends.
     /// Returns how many cards changed.
