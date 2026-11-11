@@ -393,3 +393,134 @@ async fn the_history_get_is_gone_and_rewind_index_is_rejected() {
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+fn long_session() -> Vec<ChatMessage> {
+    let at = Timestamp::now();
+    (0..100)
+        .flat_map(|turn| {
+            [
+                ChatMessage::user(format!("question {turn}")),
+                ChatMessage::assistant(format!("answer {turn}"), at),
+            ]
+        })
+        .collect()
+}
+
+/// A page reads the rows it returns and no others: the query behind it
+/// hands back exactly `limit` rows of a 200-row session, wherever the page
+/// sits.
+#[tokio::test]
+async fn a_page_of_a_long_session_loads_only_its_own_rows() {
+    let state = state().await;
+    let row_ids = seed(&state, &long_session()).await;
+    let db = state.db();
+
+    let newest = db
+        .transcript_rows(SESSION, None, Some(5))
+        .await
+        .expect("page");
+    assert_eq!(newest.entries.len(), 5);
+    assert_eq!(newest.completions.len(), 0);
+    assert!(newest.has_more);
+    assert_eq!(
+        newest.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        row_ids[195..].to_vec()
+    );
+
+    let middle = db
+        .transcript_rows(SESSION, Some(i64::from(row_ids[100])), Some(7))
+        .await
+        .expect("page");
+    assert_eq!(
+        middle.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        row_ids[93..100].to_vec()
+    );
+
+    let oldest = db
+        .transcript_rows(SESSION, Some(i64::from(row_ids[3])), Some(10))
+        .await
+        .expect("page");
+    assert_eq!(oldest.entries.len(), 3);
+    assert!(!oldest.has_more);
+
+    let all = db.transcript_rows(SESSION, None, None).await.expect("all");
+    assert_eq!(all.entries.len(), 200);
+}
+
+#[tokio::test]
+async fn a_page_over_a_long_session_serves_its_entries_through_the_endpoint() {
+    let state = state().await;
+    let row_ids = seed(&state, &long_session()).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let page = page(&router, &format!("?limit=4&before={}", row_ids[100])).await;
+    assert_eq!(
+        ids_of(&page),
+        row_ids[96..100]
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(page["hasMore"], true);
+}
+
+/// A call that opens on the page and completes on a row after it is
+/// finished by loading that one completing row, and nothing else.
+#[tokio::test]
+async fn a_call_completing_after_the_page_still_shows_its_result() {
+    let state = state().await;
+    let at = Timestamp::now();
+    let start = ToolEventRecord::Start {
+        id: "c1".into(),
+        name: "terminal".into(),
+        arguments: "{}".into(),
+        reading: None,
+    };
+    let end = ToolEventRecord::End {
+        id: "c1".into(),
+        name: "terminal".into(),
+        result: aither_core::llm::ToolResult::text("done!"),
+    };
+    let rows = vec![
+        ChatMessage::user("a"),
+        ChatMessage::tool("c1", serde_json::to_string(&start).unwrap(), at),
+        ChatMessage::assistant("b", at),
+        ChatMessage::user("c"),
+        ChatMessage::tool("c1", serde_json::to_string(&end).unwrap(), at),
+        ChatMessage::assistant("d", at),
+    ];
+    let row_ids = seed(&state, &rows).await;
+    let rows = state
+        .db()
+        .transcript_rows(SESSION, Some(i64::from(row_ids[5])), Some(3))
+        .await
+        .expect("page");
+    assert_eq!(
+        rows.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        row_ids[1..4].to_vec()
+    );
+    assert_eq!(
+        rows.completions.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![row_ids[4]]
+    );
+
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let page = page(&router, &format!("?limit=3&before={}", row_ids[5])).await;
+    assert_eq!(page["entries"][0]["callId"], "c1");
+    assert_eq!(page["entries"][0]["status"], "done");
+    assert_eq!(page["hasMore"], true);
+
+    // The completing row opens no entry, so it cannot be a `before`.
+    let response = router
+        .go(hyper::Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/sessions/{SESSION}/transcript?before={}",
+                row_ids[4]
+            ))
+            .body(skyzen::Body::empty())
+            .expect("request"))
+        .await;
+    if let Ok(r) = response {
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+}

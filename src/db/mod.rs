@@ -32,6 +32,7 @@ mod sleep_log;
 mod sql;
 mod task;
 mod tool_cards;
+mod transcript_rows;
 
 use std::path::Path;
 
@@ -64,6 +65,7 @@ pub use repo_usage::RepoUsage;
 pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 pub use session_intervals::SessionIntervals;
 pub use session_run::RunFence;
+pub use transcript_rows::TranscriptRows;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,

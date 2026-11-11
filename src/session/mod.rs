@@ -38,8 +38,8 @@ pub use history::{
 pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{
     RewindPoint, Session, SessionError, SessionId, SessionLaunch, SessionManager, SessionSummary,
-    initialize_session_persistence, list_summaries_from_db, load_history_from_db,
-    reconcile_container_profile_sessions, summarize_db_sessions,
+    chat_message_from_row, initialize_session_persistence, list_summaries_from_db,
+    load_history_from_db, reconcile_container_profile_sessions, summarize_db_sessions,
 };
 pub(crate) use persisted_message::{PersistedMessage, PersistedMessageError};
 pub use plan::SessionPlanState;

@@ -244,30 +244,62 @@ pub(super) async fn get_transcript(
 ) -> SkyResult<Json<TranscriptPage>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let cursor = state.session_cursor(&id);
-    let history = crate::session::load_history_from_db(&state.db(), &id)
+    let db = state.db();
+    let before = query
+        .before
+        .as_deref()
+        .map(|before| {
+            let row = before
+                .parse::<i64>()
+                .map_err(|_| bad_request_error("unknown `before` entry id"))?;
+            Ok::<_, SkyError>(row)
+        })
+        .transpose()?;
+    if let Some(row) = before
+        && !db
+            .is_transcript_entry(&id, row)
+            .await
+            .map_err(internal_error)?
+    {
+        return Err(bad_request_error("unknown `before` entry id"));
+    }
+    let page = db
+        .transcript_rows(&id, before, query.limit)
         .await
         .map_err(internal_error)?;
-    let mut entries = build_entries(history.messages());
-    let mut cards = state.db().tool_cards(&id).await.map_err(internal_error)?;
+    let mut rows = page
+        .entries
+        .into_iter()
+        .chain(page.completions)
+        .map(crate::session::chat_message_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_error)?;
+    rows.sort_by_key(|row| row.id);
+    let mut entries = build_entries(&rows);
+    let call_ids = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::ToolCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut cards = if call_ids.is_empty() {
+        HashMap::new()
+    } else {
+        db.tool_cards_for(&id, &call_ids)
+            .await
+            .map_err(internal_error)?
+    };
     for entry in &mut entries {
         if let TranscriptEntry::ToolCall { call_id, card, .. } = entry
             && let Some(stored) = cards.remove(call_id.as_str())
         {
-            *card = Some(super::chat::cards::with_answers(&state.db(), stored).await);
+            *card = Some(super::chat::cards::with_answers(&db, stored).await);
         }
     }
-    let end = match &query.before {
-        Some(before) => entries
-            .iter()
-            .position(|e| e.id() == before)
-            .ok_or_else(|| bad_request_error("unknown `before` entry id"))?,
-        None => entries.len(),
-    };
-    let limit = query.limit.map_or(end, |l| (l as usize).min(end));
-    let start = end - limit;
     Ok(Json(TranscriptPage {
-        has_more: start > 0,
-        entries: entries[start..end].to_vec(),
+        has_more: page.has_more,
+        entries,
         cursor,
     }))
 }

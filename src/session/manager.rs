@@ -300,6 +300,69 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
     }
 }
 
+/// Decode one stored `messages` row into a [`ChatMessage`].
+///
+/// # Errors
+/// Returns [`SessionError`] when the row's role, attachments, reasoning,
+/// tool calls or translation are malformed.
+pub fn chat_message_from_row(
+    msg: crate::db::entity::messages::Model,
+) -> Result<ChatMessage, SessionError> {
+    let persisted = PersistedMessage::try_from(&msg)?;
+    let role = persisted.role.clone();
+    let timestamp = persisted.timestamp;
+    let attachments = persisted.attachments;
+    let stats = map_db_message_stats(&msg);
+    let reasoning = msg
+        .reasoning
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })?
+        .unwrap_or_default();
+    let tool_calls = msg
+        .tool_calls
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })?
+        .unwrap_or_default();
+    let translation = msg
+        .translation
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })?;
+
+    Ok(ChatMessage {
+        id: Some(msg.id),
+        role,
+        content: msg.content,
+        attachments,
+        timestamp,
+        tool_call_id: msg.tool_call_id,
+        stats,
+        reasoning,
+        tool_calls,
+        translation,
+        reading: None,
+        card: None,
+        thinking: msg.thinking,
+    })
+}
+
 /// Load the persisted chat history for a session from the database.
 ///
 /// # Errors
@@ -319,59 +382,7 @@ pub async fn load_history_from_db(
     }
 
     for msg in db_messages {
-        let persisted = PersistedMessage::try_from(&msg)?;
-        let role = persisted.role.clone();
-        let timestamp = persisted.timestamp;
-        let attachments = persisted.attachments;
-        let stats = map_db_message_stats(&msg);
-        let reasoning = msg
-            .reasoning
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|source| PersistedMessageError::InvalidAttachments {
-                session_id: msg.session_id.clone(),
-                message_id: msg.id,
-                source,
-            })?
-            .unwrap_or_default();
-        let tool_calls = msg
-            .tool_calls
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|source| PersistedMessageError::InvalidAttachments {
-                session_id: msg.session_id.clone(),
-                message_id: msg.id,
-                source,
-            })?
-            .unwrap_or_default();
-        let translation = msg
-            .translation
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|source| PersistedMessageError::InvalidAttachments {
-                session_id: msg.session_id.clone(),
-                message_id: msg.id,
-                source,
-            })?;
-
-        history.push(ChatMessage {
-            id: Some(msg.id),
-            role,
-            content: msg.content,
-            attachments,
-            timestamp,
-            tool_call_id: msg.tool_call_id,
-            stats,
-            reasoning,
-            tool_calls,
-            translation,
-            reading: None,
-            card: None,
-            thinking: msg.thinking,
-        });
+        history.push(chat_message_from_row(msg)?);
     }
 
     Ok(history)
