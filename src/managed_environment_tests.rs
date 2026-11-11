@@ -2,7 +2,9 @@
 //! the base tools first, the host's own toolchain after them.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
 use aither_sandbox::SubagentGrant;
 
