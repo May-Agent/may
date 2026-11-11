@@ -194,15 +194,16 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
     let dir = tempfile::tempdir().expect("session root");
     let terminal = TestTerminal::new(dir.path()).await;
-    let hooks = MayHooks::new(
-        None,
-        &SessionId::from_string("amber-river"),
-        redactor.clone(),
-        RefusedReads::default(),
-        terminal.shell().jobs(),
-        Arc::new(CompactSignal::default()),
-        Arc::new(AtomicBool::new(false)),
-    );
+    let hooks = MayHooks {
+        runtime: None,
+        session_id: SessionId::from_string("amber-river"),
+        redactor: redactor.clone(),
+        refused: RefusedReads::default(),
+        jobs: terminal.shell().jobs(),
+        valve: Arc::new(CompactSignal::default()),
+        compaction: Arc::new(AtomicBool::new(false)),
+        loops: crate::agent::loop_watch::LoopWatch::new(crate::agent::LoopLimits::default()),
+    };
     let mut agent = Agent::builder(model(&base_url, redactor))
         .tool(LeakTool)
         .hooks(hooks)

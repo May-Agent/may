@@ -9,6 +9,7 @@ import { groupBrowserRuns } from '@/lib/browser/activity';
 import { TodoBlock } from './TodoBlock';
 import { openCount } from '@/lib/tasks/rows';
 import { useTranslation } from '@/lib/i18n';
+import { isTurnStop } from '@/lib/turnStop';
 
 interface AssistantTurnProps {
   turn: TurnState;
@@ -115,14 +116,14 @@ export function AssistantTurn({
       {turn.error && (
         <div
           className={
-            turn.error.code === 'repo_declined'
+            isTurnStop(turn.error.code)
               ? 'flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground'
               : 'flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive'
           }
         >
           <AlertCircle className="mt-0.5 size-4 shrink-0" />
           <div>
-            {turn.error.code !== 'repo_declined' && (
+            {!isTurnStop(turn.error.code) && (
               <div className="font-medium">{turn.error.code}</div>
             )}
             <div className="text-xs opacity-80">{turn.error.message}</div>

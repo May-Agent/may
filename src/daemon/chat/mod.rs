@@ -2742,6 +2742,15 @@ fn run_agent_loop_attempts<'a>(
                 record_request_log(state, entry).await;
             }
 
+            // A turn the loop detection ended tells its clients why, on the
+            // path that reports why any turn stopped; the turn itself is
+            // complete and stored, and the session takes the next message.
+            if let Some(pattern) = agent.take_loop_stop() {
+                let _ = sink
+                    .on_error(ApiErrorCode::LoopStopped, &pattern.stop_notice(), false)
+                    .await;
+            }
+
             // Post-completion hooks
             schedule_profile_memory_processing(state, profile_id.as_deref()).await;
             title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
@@ -6424,6 +6433,149 @@ mod tests {
         assert_eq!(done.user_message_id.as_deref(), Some(rest_user.id.as_str()));
         assert_eq!(done.message_ids, rest_assistants);
         assert_eq!(done.assistant.id, rest_assistants[0]);
+    }
+
+    /// The `session_turn` events of `frames`, as `(event, data)`.
+    fn turn_events(
+        frames: &[std::sync::Arc<super::hub::TurnFrame>],
+    ) -> Vec<(String, serde_json::Value)> {
+        frames
+            .iter()
+            .filter(|frame| frame.kind == "session_turn")
+            .map(|frame| {
+                let frame: serde_json::Value =
+                    serde_json::from_str(&frame.data).expect("a turn frame is JSON");
+                (
+                    frame["event"]
+                        .as_str()
+                        .expect("the frame names its event")
+                        .to_string(),
+                    frame["data"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// An agent that repeats one call is alerted once at the alert threshold
+    /// and its turn ended at the end threshold: every client of the session
+    /// hears why, the turn is stored as complete, and the session takes the
+    /// next message. The thresholds are lowered live, after the daemon
+    /// started, as a saved config change does.
+    #[tokio::test]
+    async fn a_looping_turn_is_alerted_once_ended_and_the_next_message_runs() {
+        const ALERT: &str = "Retrying the same way cannot work";
+        const NOTICE: &str = "The turn was ended because the agent was looping: it made the same call 4 times in a row. Send a message to continue.";
+        let arguments = serde_json::json!({
+            "script": "echo looping",
+            "description": "repeats one command",
+            "timeout": 10
+        })
+        .to_string();
+        let mut script: Vec<String> = (1..=4)
+            .map(|call| sse_tool_call(&format!("call_{call}"), "terminal", &arguments))
+            .collect();
+        script.push(sse_text("I stopped repeating it."));
+        let provider = stub_provider(script).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut config = (*state.config_snapshot()).clone();
+        config.loop_detection = crate::config::LoopDetectionSettings {
+            cycle_alert: 2,
+            cycle_end: 4,
+            failure_alert: 2,
+            failure_end: 4,
+        };
+        state.live_limits.apply(&config);
+
+        let request = |content: &str| ChatRequest {
+            session_id: "session".to_string(),
+            content: content.to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let clients = state.turn_hub.subscribe_live("session");
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        super::run_published_turn(
+            state.clone(),
+            request("run it"),
+            guard,
+            TurnKind::Prompt,
+            None,
+        )
+        .await
+        .expect("the looping turn settles");
+
+        // The prompt, then one request after each of the first three calls;
+        // the fourth call ends the turn before another request.
+        let bodies = [
+            last_body(&provider, 1).await,
+            last_body(&provider, 1).await,
+            last_body(&provider, 1).await,
+            last_body(&provider, 1).await,
+        ];
+        let alerts: Vec<usize> = bodies
+            .iter()
+            .map(|body| body.matches(ALERT).count())
+            .collect();
+        assert_eq!(
+            alerts,
+            [0, 0, 1, 1],
+            "the alert comes with the request after the second call, once, and stays"
+        );
+
+        let events = turn_events(&clients.take_unread().expect("the subscription is open"));
+        let stop = events
+            .iter()
+            .position(|(event, _)| event == "error")
+            .expect("the clients hear why the turn ended");
+        assert_eq!(events[stop].1["code"], "loop_stopped");
+        assert_eq!(events[stop].1["message"], NOTICE);
+        assert_eq!(events[stop].1["retryable"], false);
+        let (last, end) = events.last().expect("the turn ended");
+        assert_eq!(last, "end");
+        assert_eq!(
+            end["outcome"], "completed",
+            "the turn is complete, not failed"
+        );
+        assert!(
+            events.iter().any(|(event, _)| event == "done"),
+            "the turn's messages are announced: {events:?}"
+        );
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("the session takes the next message");
+        super::run_published_turn(
+            state.clone(),
+            request("go on"),
+            guard,
+            TurnKind::Prompt,
+            None,
+        )
+        .await
+        .expect("the next turn settles");
+        assert_eq!(
+            stored_assistant_texts(&state)
+                .await
+                .last()
+                .map(String::as_str),
+            Some("I stopped repeating it.")
+        );
+        let events = turn_events(&clients.take_unread().expect("the subscription is open"));
+        assert!(
+            !events.iter().any(|(event, _)| event == "error"),
+            "the next turn runs as usual: {events:?}"
+        );
     }
 
     /// A takeover can pause a turn before it stored any reply: the `paused`

@@ -13,7 +13,9 @@
 //!   the name;
 //! - the park rule ends a run whose turn only re-read unchanged output while
 //!   background commands still run: another request would read the same
-//!   output again, and only a background event can say something new.
+//!   output again, and only a background event can say something new;
+//! - loop detection feeds every tool turn to the agent's [`LoopWatch`] and
+//!   ends the run once a loop goes on past its alert.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aither_agent::{AfterTool, Hooks, ToolOutcome, TurnBoundaryAction, TurnBoundaryContext};
 use aither_sandbox::{JobStatus, Jobs, Refused, UnchangedRead};
 
+use super::loop_watch::LoopWatch;
 use crate::command_policy::RefusedReads;
 use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
 use crate::secrets::SecretRedactor;
@@ -29,45 +32,32 @@ use crate::session::{SessionId, SessionRuntimeService};
 /// What a May agent decides at the loop's control points.
 #[derive(Debug, Clone)]
 pub(super) struct MayHooks {
-    runtime: Option<Arc<SessionRuntimeService>>,
-    session_id: String,
-    redactor: SecretRedactor,
-    refused: RefusedReads,
-    jobs: Jobs,
+    /// The session's persisted runtime, where a waiting steer message shows.
+    pub(super) runtime: Option<Arc<SessionRuntimeService>>,
+    pub(super) session_id: SessionId,
+    pub(super) redactor: SecretRedactor,
+    pub(super) refused: RefusedReads,
+    pub(super) jobs: Jobs,
     /// The `compact` tool's valve: a request it holds ends the turn.
-    valve: Arc<CompactSignal>,
+    pub(super) valve: Arc<CompactSignal>,
     /// Set when the valve ended a turn for a compaction; the runner takes it.
-    compaction: Arc<AtomicBool>,
+    pub(super) compaction: Arc<AtomicBool>,
+    /// The loop detection every tool turn is fed to.
+    pub(super) loops: LoopWatch,
 }
 
 impl MayHooks {
-    pub(super) fn new(
-        runtime: Option<Arc<SessionRuntimeService>>,
-        session_id: &SessionId,
-        redactor: SecretRedactor,
-        refused: RefusedReads,
-        jobs: Jobs,
-        valve: Arc<CompactSignal>,
-        compaction: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            runtime,
-            session_id: session_id.as_str().to_string(),
-            redactor,
-            refused,
-            jobs,
-            valve,
-            compaction,
-        }
-    }
-
     /// Whether the persisted runtime holds a user message waiting to steer
     /// the conversation.
     async fn steer_pending(&self) -> bool {
         let Some(service) = &self.runtime else {
             return false;
         };
-        let Ok(runtime) = service.db().get_session_runtime(&self.session_id).await else {
+        let Ok(runtime) = service
+            .db()
+            .get_session_runtime(self.session_id.as_str())
+            .await
+        else {
             tracing::warn!(
                 session_id = %self.session_id,
                 "failed to inspect runtime for steer boundary"
@@ -112,6 +102,8 @@ impl Hooks for MayHooks {
     }
 
     async fn on_turn_boundary(&self, cx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
+        // Every tool turn is counted, whichever rule ends the run.
+        let looped = self.loops.observe_turn(cx.outcomes);
         if self.steer_pending().await {
             return TurnBoundaryAction::EndTurn;
         }
@@ -130,6 +122,14 @@ impl Hooks for MayHooks {
             tracing::info!(
                 turn = cx.turn,
                 "every call re-read unchanged output; parking the run until background work reports"
+            );
+            return TurnBoundaryAction::EndTurn;
+        }
+        if looped {
+            tracing::info!(
+                session_id = %self.session_id,
+                turn = cx.turn,
+                "the agent kept looping after its alert; ending the run"
             );
             return TurnBoundaryAction::EndTurn;
         }

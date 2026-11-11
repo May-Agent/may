@@ -26,6 +26,7 @@ import { isConfigUsable } from '@/lib/api/config';
 import { endSleep, parseSleepCommand, startSleep } from '@/lib/api/sleep';
 import { useRuntimeStore } from '@/lib/stores/runtime';
 import { cn } from '@/lib/utils';
+import { isTurnStop } from '@/lib/turnStop';
 import { formatGroupTime, startsGroup } from '@/lib/chat/time';
 import { chatRows, type ChatRow } from '@/lib/chat/rows';
 
@@ -364,24 +365,24 @@ interface TurnErrorCardProps {
 
 function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErrorCardProps) {
   const { t } = useTranslation();
-  // Declining the session's repository question is the user's choice, not a failure.
-  const declined = code === 'repo_declined';
+  // A declined repository or a loop the daemon ended stops the turn; nothing failed.
+  const stopped = isTurnStop(code);
   return (
     <div
       className={cn(
         'flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm',
-        declined
+        stopped
           ? 'border-border bg-muted/40 text-muted-foreground'
           : 'border-destructive/40 bg-destructive/5 text-destructive',
       )}
     >
-      {declined ? (
+      {stopped ? (
         <Info className="mt-0.5 size-4 shrink-0" />
       ) : (
         <AlertCircle className="mt-0.5 size-4 shrink-0" />
       )}
       <div className="flex-1 min-w-0">
-        {!declined && <div className="font-medium">{humanizeErrorCode(code)}</div>}
+        {!stopped && <div className="font-medium">{humanizeErrorCode(code)}</div>}
         <div className="text-xs opacity-80 break-words">{message}</div>
       </div>
       <div className="flex items-center gap-1 shrink-0">
