@@ -902,7 +902,7 @@ mod tests {
         let config = crate::config::MayConfig::default();
         let secrets = Secrets::load(&store, &config).expect("the index reads");
         assert_eq!(secrets.names(), ["API_TOKEN"]);
-        std::fs::write(dir.path().join("secrets.json"), "[]").expect("corrupt the index");
+        std::fs::write(dir.path().join("secrets.json"), "{ not json").expect("corrupt the index");
         assert!(Secrets::load(&store, &config).is_err());
         assert!(Secrets::load_for_session(&store, &config, "session").is_err());
     }
