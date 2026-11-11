@@ -237,7 +237,10 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::warn!("fatal-signal log dump not installed: {error}");
     }
 
-    if !matches!(cli_mode, CliMode::Help(_)) {
+    if !matches!(
+        cli_mode,
+        CliMode::Help(_) | CliMode::Version | CliMode::UnknownFlag(_)
+    ) {
         may_agent::startup::validate_configuration().await?;
     }
 
@@ -250,6 +253,17 @@ async fn async_main() -> anyhow::Result<()> {
         _ => may_agent::session::SessionLaunch::default(),
     };
     match cli_mode {
+        CliMode::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliMode::UnknownFlag(flag) => {
+            eprintln!(
+                "unknown option '{flag}'\n\n{}",
+                cli::OneShotArgs::help_text()
+            );
+            std::process::exit(2);
+        }
         CliMode::Help(help_text) => {
             use std::io::Write as _;
             io::stdout().write_all(help_text.as_bytes())?;

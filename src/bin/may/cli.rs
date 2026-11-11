@@ -1,8 +1,8 @@
 //! Argument parsing for the `may` top-level binary.
 //!
 //! The parser is hand-rolled (no clap dependency) so startup is fast
-//! for the common TUI case and so unknown arguments are treated as the
-//! beginning of a one-shot prompt rather than rejected.
+//! for the common TUI case. Arguments that are not a flag are the
+//! beginning of a one-shot prompt; an unknown first flag is refused.
 
 use aither_core::llm::model::ReasoningEffort;
 use aither_sandbox::TerminalExecutionMode;
@@ -26,6 +26,10 @@ pub enum CliMode {
     },
     OneShot(OneShotArgs),
     Help(&'static str),
+    /// `--version` / `-V`: print the package version.
+    Version,
+    /// An unknown flag in the first position: refused with the usage text.
+    UnknownFlag(String),
 }
 
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
@@ -155,6 +159,7 @@ impl BrowserCliArgs {
 pub fn parse_cli_mode(args: &[String]) -> CliMode {
     match args.get(1).map(String::as_str) {
         Some("--help" | "-h") => CliMode::Help(OneShotArgs::help_text()),
+        Some("--version" | "-V") => CliMode::Version,
         Some("ui") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(UiArgs::help_text()),
             _ => CliMode::Ui(args[2..].to_vec()),
@@ -210,6 +215,8 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
                 may_agent::session::SessionLaunch::Repo,
             ),
         }),
+        Some("--model" | "--reasoning-effort") => CliMode::OneShot(parse_oneshot_args(&args[1..])),
+        Some(flag) if flag.starts_with('-') => CliMode::UnknownFlag(flag.to_string()),
         Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
     }
 }
@@ -643,6 +650,27 @@ mod tests {
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some(ReasoningEffort::Low),
             })
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_detects_version_flags() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "--version"])),
+            CliMode::Version
+        );
+        assert_eq!(parse_cli_mode(&args(&["may", "-V"])), CliMode::Version);
+    }
+
+    #[test]
+    fn parse_cli_mode_refuses_unknown_first_flag() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "--bogus", "fix", "it"])),
+            CliMode::UnknownFlag("--bogus".to_string())
+        );
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "-x"])),
+            CliMode::UnknownFlag("-x".to_string())
         );
     }
 
