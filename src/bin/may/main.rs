@@ -63,6 +63,14 @@ use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 const PANIC_MESSAGE: &str = include_str!("../../texts/panic_message.txt");
 const ERR_WORKER_BUSY: &str = include_str!("../../texts/agent_worker_busy.txt");
 
+/// The refusal of an unknown first flag, ahead of the usage text.
+#[derive(askama::Template)]
+#[template(path = "cli_unknown_option.txt", escape = "none")]
+struct UnknownOption<'a> {
+    flag: &'a str,
+    usage: &'a str,
+}
+
 /// Header of a `/bug` or panic snapshot, rendered ahead of the ring dump.
 #[derive(askama::Template)]
 #[template(path = "bug_report.txt", escape = "none")]
@@ -254,14 +262,19 @@ async fn async_main() -> anyhow::Result<()> {
     };
     match cli_mode {
         CliMode::Version => {
-            println!("{}", env!("CARGO_PKG_VERSION"));
+            use std::io::Write as _;
+            io::stdout().write_all(concat!(env!("CARGO_PKG_VERSION"), "\n").as_bytes())?;
             return Ok(());
         }
         CliMode::UnknownFlag(flag) => {
-            eprintln!(
-                "unknown option '{flag}'\n\n{}",
-                cli::OneShotArgs::help_text()
-            );
+            use std::io::Write as _;
+            let refusal = UnknownOption {
+                flag: &flag,
+                usage: cli::OneShotArgs::help_text(),
+            }
+            .render()
+            .context("Failed to render the unknown option refusal")?;
+            io::stderr().write_all(refusal.as_bytes())?;
             std::process::exit(2);
         }
         CliMode::Help(help_text) => {
