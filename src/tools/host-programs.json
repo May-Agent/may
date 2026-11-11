@@ -123,6 +123,22 @@
       },
       "executable_sha256": "454163dc2fa82953b8f8a56c1ac851e783102fc8d1120427d1bcbf94f21ae52e",
       "size": 4865536
+    },
+    {
+      "tool": "podman",
+      "version": "6.2.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/podman-container-tools/podman/releases/download/v6.2.0/podman-remote-release-darwin_arm64.zip",
+      "sha256": "34b4a24e2a749d1ad5e2edacaf01efcf2c2cc89175e5db8c953fd46ba663d17e",
+      "encoding": {
+        "format": "zip",
+        "executable": "podman-6.2.0/usr/bin/podman"
+      },
+      "executable_sha256": "8e3b114af315589ea12428725f12a72fe5a34c4d99e1a65db0ad57eee27e0c04",
+      "size": 26140403
     }
   ]
 }

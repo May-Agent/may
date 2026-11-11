@@ -47,7 +47,7 @@ const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
-    "45bf578da67330b729b57d5d8e81d78fb2b1ee864e9e30437cd860d4077212a3";
+    "2e7e687d383a61e877ec3e86554387bc88280dcffa1172b738aedbd08055da2d";
 
 /// Loads the distribution: aither's embedded, hash-pinned baseline tools with
 /// May's own host programs in place of the baseline's.
@@ -161,6 +161,31 @@ mod tests {
                 "windows-aarch64",
                 "windows-x86_64",
             ]
+        );
+    }
+
+    /// Managed Podman is pinned for Apple silicon alone: Intel Macs are not
+    /// supported.
+    #[test]
+    fn podman_is_pinned_for_macos_arm64_only() {
+        let pins: serde_json::Value = serde_json::from_slice(HOST_PROGRAMS).unwrap();
+        let podman = pins["host_programs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|program| program["tool"] == "podman")
+            .collect::<Vec<_>>();
+        let [pin] = podman.as_slice() else {
+            panic!("expected exactly one podman pin, found {}", podman.len());
+        };
+        assert_eq!(pin["target"]["os"], "macos");
+        assert_eq!(pin["target"]["arch"], "aarch64");
+        let version = pin["version"].as_str().unwrap();
+        assert_eq!(
+            pin["url"],
+            format!(
+                "https://github.com/podman-container-tools/podman/releases/download/v{version}/podman-remote-release-darwin_arm64.zip"
+            )
         );
     }
 
