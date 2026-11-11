@@ -887,11 +887,8 @@ fn parse_value(s: &str, expected_type: Option<&str>) -> Value {
 pub fn schema_to_help(schema: &Value) -> String {
     let mut help = String::new();
 
-    // Title and description
-    if let Some(title) = schema.get("title").and_then(Value::as_str) {
-        help.push_str(title);
-        help.push('\n');
-    }
+    // The schema's title is the argument struct's Rust type name, which is
+    // no part of the command line; only the description is shown.
     if let Some(desc) = schema.get("description").and_then(Value::as_str) {
         help.push_str(desc);
         help.push('\n');
@@ -975,16 +972,29 @@ pub fn schema_to_help(schema: &Value) -> String {
             let is_array = get_instance_type(prop, prop) == Some("array");
             let flag = name.replace('_', "-");
 
-            let short = field_to_short.get(name).copied();
-            help.push_str(render_flag_prefix(flag.as_str(), short).as_str());
-            if is_array {
-                help.push_str(" <value>  (repeatable");
-                if is_required {
-                    help.push_str(", required");
+            if positional_names.iter().any(|positional| positional == name) {
+                // A positional argument is given as a bare word, never as a flag.
+                help.push_str("  <");
+                help.push_str(flag.as_str());
+                help.push('>');
+                if is_array {
+                    help.push_str("...");
                 }
-                help.push(')');
-            } else if is_required {
-                help.push_str(" (required)");
+                if is_required {
+                    help.push_str(" (required)");
+                }
+            } else {
+                let short = field_to_short.get(name).copied();
+                help.push_str(render_flag_prefix(flag.as_str(), short).as_str());
+                if is_array {
+                    help.push_str(" <value>  (repeatable");
+                    if is_required {
+                        help.push_str(", required");
+                    }
+                    help.push(')');
+                } else if is_required {
+                    help.push_str(" (required)");
+                }
             }
 
             if let Some(desc) = prop.get("description").and_then(Value::as_str) {
@@ -1161,6 +1171,18 @@ mod tests {
         assert!(help_in(&["--help"]));
         assert!(help_in(&["--verbose", "-h"]));
         assert!(!help_in(&["--verbose"]));
+    }
+
+    #[test]
+    fn usage_shows_no_type_name_and_no_flag_for_a_positional() {
+        let schema = serde_json::to_value(schemars::schema_for!(Args)).expect("a schema");
+        let help = super::schema_to_help(&schema);
+        assert!(!help.contains("Args"), "{help}");
+        assert!(help.contains("  <prompt> [options]"), "{help}");
+        assert!(help.contains("  <prompt> (required)"), "{help}");
+        assert!(!help.contains("--prompt"), "{help}");
+        assert!(help.contains("--body"), "{help}");
+        assert!(help.contains("--verbose"), "{help}");
     }
 
     #[test]

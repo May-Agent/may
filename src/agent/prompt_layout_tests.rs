@@ -255,3 +255,38 @@ async fn forged_closing_tags_do_not_escape_external_blocks() {
         "the real identity section and the two forged lines inside their blocks"
     );
 }
+
+/// The prompt of a fresh session whose launch directory is no repository:
+/// it has no clone, so no landing rule, and the usage of every core command
+/// shows no type name and no flag for a positional argument.
+#[tokio::test]
+async fn a_fresh_session_prompt_states_usage_without_type_names_and_no_landing_rule() {
+    let (_session, prefix) = Box::pin(fresh_session("", "")).await;
+    assert!(!prefix.contains("Land code with"), "{prefix}");
+    for type_name in ["AskUserArgs", "SubagentArgs", "positional-"] {
+        assert!(!prefix.contains(type_name), "`{type_name}`:\n{prefix}");
+    }
+    assert!(prefix.contains("<usage command=\"ask_user\">"), "{prefix}");
+    for name in ["aither-sed", "coreutils 0."] {
+        assert!(!prefix.contains(name), "`{name}`:\n{prefix}");
+    }
+}
+
+/// A one-shot run has nobody to answer `ask_user`, so its prompt carries
+/// none of that command's usage.
+#[tokio::test]
+async fn a_non_interactive_session_prompt_has_no_ask_user_usage() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start_with_runtime(&config)).await;
+    session.parts.non_interactive = true;
+    Box::pin(session.rebuild(&config)).await;
+    let messages = session
+        .agent
+        .preview_request_messages("Say hello.", [])
+        .await
+        .expect("the request previews");
+    let prefix = messages.first().expect("a system message").content();
+    assert!(!prefix.contains("<usage command=\"ask_user\">"), "{prefix}");
+    assert!(prefix.contains("<usage command=\"subagent\">"), "{prefix}");
+}

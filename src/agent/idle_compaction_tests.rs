@@ -269,6 +269,8 @@ pub struct SessionParts {
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     /// The SSH servers the session is built with.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
+    /// Whether the session is a one-shot run nobody answers.
+    pub non_interactive: bool,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -304,6 +306,7 @@ impl SessionParts {
             rules_import: None,
             agent_messaging: None,
             ssh_servers: Vec::new(),
+            non_interactive: false,
             _queues: (workspace_queue, ask_user_queue),
         }
     }
@@ -321,6 +324,7 @@ impl SessionParts {
             workspace_request_broker: self.workspace_broker.clone(),
             agent_messaging: self.agent_messaging.clone(),
             ask_user_broker: self.ask_user_broker.clone(),
+            non_interactive: self.non_interactive,
             db: self.db.clone(),
             model: "session::session-model",
             reasoning_effort: None,

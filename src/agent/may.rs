@@ -238,6 +238,8 @@ pub struct MayAgentConfig {
     pub workspace_request_broker: WorkspaceRequestBroker,
     /// Channel for ask user requests.
     pub ask_user_broker: AskUserBroker,
+    /// Whether nobody answers this session's prompts: a one-shot run.
+    pub non_interactive: bool,
     /// Image generation provider and model.
     pub image_generator: Option<ImageGeneratorConfig>,
     /// Preconfigured SSH servers a `terminal` command names as its `location`.
@@ -318,6 +320,8 @@ pub struct MayAgentSessionInput<'a> {
     pub workspace_request_broker: WorkspaceRequestBroker,
     /// Channel for ask-user requests.
     pub ask_user_broker: AskUserBroker,
+    /// Whether nobody answers this session's prompts: a one-shot run.
+    pub non_interactive: bool,
     /// Database handle for runtime memory/state lookups.
     pub db: crate::db::ChatDb,
     /// Concrete model identifier selected for this request.
@@ -841,6 +845,7 @@ impl MayAgent {
                 tracing::warn!(%error, "failed to create session repo clone");
             }
         }
+        let works_in_clone = !repo_clones.is_empty();
         if let Some(repo_clones) =
             build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
         {
@@ -980,9 +985,17 @@ impl MayAgent {
         // The command table, the capabilities and the efficiency rules are
         // rendered from the commands registered above.
         let command_descriptions = shared_terminal_commands.descriptions.clone();
+        // A one-shot run has nobody to answer `ask_user`, so its usage is
+        // not carried.
+        let core_usages = shared_terminal_commands
+            .usages
+            .iter()
+            .filter(|usage| !(config.non_interactive && usage.name == "ask_user"))
+            .cloned()
+            .collect::<Vec<_>>();
         let capabilities = build_capabilities(
             &command_descriptions,
-            &shared_terminal_commands.usages,
+            &core_usages,
             &config.request_parameters,
             &skills_dir,
         )
@@ -996,7 +1009,10 @@ impl MayAgent {
             )
             .with_instruction(
                 tag::WORK,
-                build_work(&crate::issue::IssueStore::info(&issue_store)),
+                build_work(
+                    &crate::issue::IssueStore::info(&issue_store),
+                    works_in_clone,
+                ),
             )
             .with_instruction(
                 tag::SESSION,
@@ -1230,6 +1246,7 @@ impl MayAgent {
             session_id,
             workspace_request_broker,
             ask_user_broker,
+            non_interactive,
             db,
             model,
             reasoning_effort,
@@ -1332,6 +1349,7 @@ impl MayAgent {
             languages: may_config.language.languages(),
             workspace_request_broker,
             ask_user_broker,
+            non_interactive,
             image_generator: resolve_image_generator_config(may_config),
             ssh_servers,
             permission_approver,

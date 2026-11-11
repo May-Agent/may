@@ -10,7 +10,7 @@ Command output has each run of blank lines collapsed before the agent reads it. 
 
 ## What May provides
 
-May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.24.0.json`, the byte-exact release asset of aither's `patch-v0.24.0`). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them.
+May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.24.0.json`, the byte-exact release asset of aither's `patch-v0.24.0`). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them. The agent reads the prepared tools as a list of command names (no versions; `aither-sed` appears as `sed`), and the `terminal` tool description sends it to `rg`, `head` and `tail`, or `ask` for a summary, for saved output, since the managed shell refuses `grep`.
 
 | command | what | version |
 | --- | --- | --- |
