@@ -122,6 +122,21 @@ pub enum MouseButtonInput {
     Middle,
 }
 
+/// Bits of the `modifiers` field of [`MouseInput`] and [`KeyboardInput`], in
+/// the web client's CDP order. Only the macOS input path reads them; the web
+/// client sends them as numbers.
+#[cfg(target_os = "macos")]
+pub mod modifier_bits {
+    /// Alt / Option.
+    pub const ALT: u64 = 1;
+    /// Control.
+    pub const CTRL: u64 = 2;
+    /// Meta / Command.
+    pub const META: u64 = 4;
+    /// Shift.
+    pub const SHIFT: u64 = 8;
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyboardInput {

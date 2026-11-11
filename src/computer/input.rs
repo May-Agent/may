@@ -118,10 +118,7 @@ pub fn post(input: &mut Input, message: InputMessage) -> Result<(), InputError> 
 }
 
 fn modifiers(bits: Option<u64>) -> Result<Modifiers, InputError> {
-    const ALT: u64 = 1;
-    const CTRL: u64 = 2;
-    const META: u64 = 4;
-    const SHIFT: u64 = 8;
+    use super::proto::modifier_bits::{ALT, CTRL, META, SHIFT};
     let bits = bits.unwrap_or(0);
     if bits & !(ALT | CTRL | META | SHIFT) != 0 {
         return Err(InputError::UnknownModifiers(bits));
