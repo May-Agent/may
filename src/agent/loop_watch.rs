@@ -270,10 +270,10 @@ pub fn failure_text(result: &ToolResult) -> Option<String> {
 
 /// The error text the model received from the call `outcome`, if it failed.
 fn outcome_failure(outcome: &ToolOutcome) -> Option<String> {
-    match &outcome.result {
-        Ok(result) => failure_text(result),
-        Err(_) => Some(outcome.for_model().render_for_model()),
-    }
+    outcome.result.as_ref().map_or_else(
+        |_| Some(outcome.for_model().render_for_model()),
+        failure_text,
+    )
 }
 
 /// The loop thresholds every agent of the daemon counts to.

@@ -1863,11 +1863,11 @@ impl Default for TasksSettings {
     }
 }
 
-/// `[loop_detection]` section: when the consecutive tool calls of a turn
-/// count as a loop. Each value is a number of repetitions in a row: at the
-/// alert threshold the agent is told once, at the end threshold the turn
-/// ends and the user is told why. A change applies to running sessions at
-/// once.
+/// `[loop_detection]` section: when a turn's tool calls count as a loop.
+///
+/// Each value is a number of repetitions in a row: at the alert threshold the
+/// agent is told once, at the end threshold the turn ends and the user is told
+/// why. A change applies to running sessions at once.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LoopDetectionSettings {
