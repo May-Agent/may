@@ -38,8 +38,9 @@ runs:
     # rav1e's x86_64 assembly is built with nasm.
     - name: Install nasm
       if: runner.os == 'Linux' && runner.arch == 'X64'
-      shell: bash
-      run: sudo apt-get update && sudo apt-get install -y nasm
+      uses: ./.github/actions/apt-install
+      with:
+        packages: nasm
     - name: cargo build
       shell: bash
       run: cargo build --locked --all-targets --timings
