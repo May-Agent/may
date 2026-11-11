@@ -298,15 +298,16 @@ async fn a_broken_secrets_index_ends_the_run_before_the_tool_result_is_shown() {
     let dir = tempfile::tempdir().expect("secrets root");
     let session = tempfile::tempdir().expect("session root");
     let terminal = TestTerminal::new(session.path()).await;
-    let hooks = MayHooks::new(
-        None,
-        &SessionId::from_string("amber-river"),
-        broken_redactor(&dir),
-        RefusedReads::default(),
-        terminal.shell().jobs(),
-        Arc::new(CompactSignal::default()),
-        Arc::new(AtomicBool::new(false)),
-    );
+    let hooks = MayHooks {
+        runtime: None,
+        session_id: SessionId::from_string("amber-river"),
+        redactor: broken_redactor(&dir),
+        refused: RefusedReads::default(),
+        jobs: terminal.shell().jobs(),
+        valve: Arc::new(CompactSignal::default()),
+        compaction: Arc::new(AtomicBool::new(false)),
+        loops: crate::agent::loop_watch::LoopWatch::new(crate::agent::LoopLimits::default()),
+    };
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
     let mut agent = Agent::builder(model(&base_url, redactor))
         .tool(LeakTool)
