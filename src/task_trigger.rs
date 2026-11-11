@@ -734,14 +734,17 @@ fn crontab_weekday_field(field: &str) -> Result<String, String> {
 
 /// Crontab weekdays (0-7) a numeric item covers, or `None` when the item is not purely numeric.
 ///
-/// Accepts `*`, `?`, `n`, `a-b`, and each of them with `/step`; a bare `n/step` runs from `n` to 7,
-/// as in the `cron` crate.
+/// Accepts `n`, `a-b`, and `*`, `?` and each of those with `/step`; a bare `n/step` runs from `n` to
+/// 7, as in the `cron` crate. A bare `*` or `?` is every day in both numberings and is not numeric.
 fn crontab_weekday_item(item: &str) -> Result<Option<Vec<usize>>, String> {
     let (base, step) = match item.split_once('/') {
         Some((base, step)) => (base, Some(step)),
         None => (item, None),
     };
     let (start, end) = if matches!(base, "*" | "?") {
+        if step.is_none() {
+            return Ok(None);
+        }
         (0, 6)
     } else if let Some((start, end)) = base.split_once('-') {
         match (ascii_number(start), ascii_number(end)) {
