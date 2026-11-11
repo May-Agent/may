@@ -62,8 +62,34 @@ fn render_flag_prefix(flag: &str, short: Option<char>) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if the arguments don't match the schema.
+/// Returns an error if the arguments don't match the schema, or if they ask
+/// for help: the caller answers [`requests_help`] before it parses.
 pub fn cli_to_json(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
+    match parse_args(schema, args)? {
+        Parsed::Args(value) => Ok(value),
+        Parsed::Help => anyhow::bail!("help requested"),
+    }
+}
+
+/// What parsing a command line found.
+#[derive(Debug)]
+enum Parsed {
+    /// A `-h` or `--help` in option position, found before anything else
+    /// could fail.
+    Help,
+    /// The arguments as a JSON value.
+    Args(Value),
+}
+
+/// Whether an option parser consumed an option or met a help request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionOutcome {
+    Consumed,
+    Help,
+}
+
+/// Parses `args` against the command's schema.
+fn parse_args(schema: &Value, args: &[String]) -> anyhow::Result<Parsed> {
     // Check if this is a tagged enum (oneOf with discriminator)
     if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
         // Look for serde tag annotation in schema
@@ -107,12 +133,9 @@ fn parse_tagged_enum(
     variants: &[Value],
     tag: &str,
     args: &[String],
-) -> anyhow::Result<Value> {
-    let args = if args.first().map(std::string::String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
-    };
+) -> anyhow::Result<Parsed> {
+    let terminated = args.first().map(std::string::String::as_str) == Some("--");
+    let args = if terminated { &args[1..] } else { args };
 
     if args.is_empty() {
         let variant_names: Vec<_> = variants
@@ -125,6 +148,10 @@ fn parse_tagged_enum(
     let subcommand = &args[0];
     let remaining = &args[1..];
 
+    if !terminated && (subcommand == "-h" || subcommand == "--help") {
+        return Ok(Parsed::Help);
+    }
+
     // Find matching variant
     for variant in variants {
         if let Some(name) = get_variant_name(variant, tag)
@@ -133,14 +160,17 @@ fn parse_tagged_enum(
             let mut variant_schema = variant.clone();
             remove_required_field(&mut variant_schema, tag);
             // Parse the variant's fields
-            let mut result = parse_object(root_schema, &variant_schema, remaining)?;
+            let Parsed::Args(mut result) = parse_object(root_schema, &variant_schema, remaining)?
+            else {
+                return Ok(Parsed::Help);
+            };
 
             // Add the tag field
             if let Value::Object(ref mut map) = result {
                 map.insert(tag.to_string(), Value::String(name));
             }
 
-            return Ok(result);
+            return Ok(Parsed::Args(result));
         }
     }
 
@@ -185,30 +215,23 @@ fn get_variant_name(schema: &Value, tag: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Returns true if args contain -h/--help before "--".
-pub(super) fn has_help_flag(args: &[String]) -> bool {
-    let args = if args.first().map(std::string::String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
+/// Whether `args` ask for the command's usage.
+///
+/// Help is `-h` or `--help` in option position: an option's value, a word
+/// after `--` and text piped on stdin are never read as flags. `schema` is
+/// the command's argument schema, which says which options take a value; a
+/// command without one (a raw handler) takes no options this module knows,
+/// so only a bare `-h` or `--help` counts.
+pub(super) fn requests_help(schema: Option<&Value>, args: &[String]) -> bool {
+    let Some(schema) = schema else {
+        return args
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "-h" || arg == "--help");
     };
-    let mut end_of_options = false;
-    for arg in args {
-        if end_of_options {
-            break;
-        }
-        if arg == "--" {
-            end_of_options = true;
-            continue;
-        }
-        if arg == "--help" || arg == "-h" {
-            return true;
-        }
-        if arg.starts_with('-') && !arg.starts_with("--") && arg.chars().skip(1).any(|c| c == 'h') {
-            return true;
-        }
-    }
-    false
+    // A parse error before any help flag means help was not requested: the
+    // command runs and reports the error itself.
+    matches!(parse_args(schema, args), Ok(Parsed::Help))
 }
 
 fn build_short_option_maps(
@@ -255,12 +278,7 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 }
 
 /// Parses an object schema from CLI arguments.
-fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow::Result<Value> {
-    let args = if args.first().map(std::string::String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
-    };
+fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow::Result<Parsed> {
     let schema = ObjectParseSchema::new(root_schema, schema)?;
     let mut state = ObjectParseState::default();
     let mut i = 0;
@@ -274,14 +292,18 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
         }
 
         if !state.end_of_options && arg.starts_with("--") {
-            parse_long_option(root_schema, args, &mut i, &schema, &mut state)?;
+            if parse_long_option(root_schema, args, &mut i, &schema, &mut state)?
+                == OptionOutcome::Help
+            {
+                return Ok(Parsed::Help);
+            }
         } else if !state.end_of_options
             && arg.starts_with('-')
             && arg.len() > 1
             && arg != "-"
             && !is_negative_number_operand(root_schema, &schema, &state, arg)
         {
-            parse_short_options(
+            let outcome = parse_short_options(
                 root_schema,
                 arg,
                 args,
@@ -290,6 +312,9 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
                 &schema.short_to_field,
                 &mut state.result,
             )?;
+            if outcome == OptionOutcome::Help {
+                return Ok(Parsed::Help);
+            }
         } else {
             parse_positional_arg(root_schema, &schema, &mut state, arg)?;
         }
@@ -303,7 +328,9 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
         }
     }
 
-    Ok(Value::Object(state.result.into_iter().collect()))
+    Ok(Parsed::Args(Value::Object(
+        state.result.into_iter().collect(),
+    )))
 }
 
 struct ObjectParseSchema {
@@ -579,9 +606,12 @@ fn parse_long_option(
     i: &mut usize,
     schema: &ObjectParseSchema,
     state: &mut ObjectParseState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<OptionOutcome> {
     let arg = &args[*i];
     let flag = &arg[2..];
+    if flag == "help" {
+        return Ok(OptionOutcome::Help);
+    }
     let (mut name, value) = flag.find('=').map_or_else(
         || (flag.to_string(), None),
         |eq_pos| {
@@ -610,7 +640,7 @@ fn parse_long_option(
         parsed_value,
         prop_schema,
     );
-    Ok(())
+    Ok(OptionOutcome::Consumed)
 }
 
 fn parse_long_option_value(
@@ -658,7 +688,7 @@ fn parse_short_options(
     properties: &serde_json::Map<String, Value>,
     short_to_field: &HashMap<char, String>,
     result: &mut HashMap<String, Value>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<OptionOutcome> {
     let mut cluster = &arg[1..];
     let mut value_from_eq = None;
     if let Some(eq_pos) = cluster.find('=') {
@@ -668,6 +698,10 @@ fn parse_short_options(
 
     let mut chars = cluster.chars().peekable();
     while let Some(ch) = chars.next() {
+        // `h` is reserved: no field is given it as a short option.
+        if ch == 'h' {
+            return Ok(OptionOutcome::Help);
+        }
         let field_name = short_to_field
             .get(&ch)
             .ok_or_else(|| anyhow::anyhow!("unknown option: -{ch}"))?
@@ -726,7 +760,7 @@ fn parse_short_options(
         break;
     }
 
-    Ok(())
+    Ok(OptionOutcome::Consumed)
 }
 
 fn insert_value(
@@ -1066,5 +1100,90 @@ fn flatten_named_arg_to_cli(cli_args: &mut Vec<String>, key: &str, value: &Value
             push_long_option(cli_args, key);
             cli_args.push(value.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    use super::requests_help;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct Args {
+        /// The first word.
+        prompt: String,
+        /// A body.
+        #[serde(default)]
+        body: Option<String>,
+        /// A switch.
+        #[serde(default)]
+        verbose: bool,
+    }
+
+    fn words(line: &[&str]) -> Vec<String> {
+        line.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    fn help_in(line: &[&str]) -> bool {
+        let schema = serde_json::to_value(schemars::schema_for!(Args)).expect("a schema");
+        requests_help(Some(&schema), &words(line))
+    }
+
+    #[test]
+    fn help_flags_in_option_position_request_help() {
+        assert!(help_in(&["-h"]));
+        assert!(help_in(&["--help"]));
+        assert!(help_in(&["word", "--verbose", "--help"]));
+        assert!(help_in(&["-vh"]));
+    }
+
+    #[test]
+    fn an_option_value_is_never_a_help_request() {
+        assert!(!help_in(&["word", "--body", "- fixed the crash"]));
+        assert!(!help_in(&["word", "--body=-h"]));
+        assert!(!help_in(&["word", "-b", "--help"]));
+        assert!(!help_in(&["word", "-b-h"]));
+    }
+
+    #[test]
+    fn words_after_the_terminator_are_not_flags() {
+        assert!(!help_in(&["--", "-h"]));
+        assert!(!help_in(&["word", "--", "--help"]));
+    }
+
+    #[test]
+    fn help_is_read_before_required_arguments_are_checked() {
+        // `prompt` is required and absent.
+        assert!(help_in(&["--help"]));
+        assert!(help_in(&["--verbose", "-h"]));
+        assert!(!help_in(&["--verbose"]));
+    }
+
+    #[test]
+    fn a_raw_command_takes_only_the_bare_flags() {
+        assert!(requests_help(None, &words(&["--help"])));
+        assert!(!requests_help(None, &words(&["--", "-h"])));
+        assert!(!requests_help(None, &words(&["- the notes"])));
+    }
+
+    #[test]
+    fn a_tagged_enum_reads_help_after_its_subcommand() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(tag = "operation", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Op {
+            Comment { number: u64, body: String },
+            Close { number: u64 },
+        }
+        let schema: Value = serde_json::to_value(schemars::schema_for!(Op)).expect("a schema");
+        let help = |line: &[&str]| requests_help(Some(&schema), &words(line));
+        assert!(help(&["--help"]));
+        assert!(help(&["comment", "--help"]));
+        assert!(!help(&["comment", "12", "--body", "- fixed the crash"]));
+        assert!(!help(&["comment", "12", "-b", "- the thing"]));
     }
 }

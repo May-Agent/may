@@ -19,7 +19,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::SessionShell;
-use super::cli::{cli_to_json, detect_stdin_arg, schema_to_help, validate_positional_layout};
+use super::cli::{
+    cli_to_json, detect_stdin_arg, requests_help, schema_to_help, validate_positional_layout,
+};
 use super::command_set::{AnyCommandSet, CommandSet};
 use super::payload::{
     CommandEnvelope, ReservedForMain, ToolUsageError, UnknownCommand, answer, tool_usage_error,
@@ -146,6 +148,9 @@ enum SubagentSide {
 #[derive(Clone)]
 struct Entry {
     help: String,
+    /// The argument schema the command line is parsed against; a raw
+    /// handler has none.
+    schema: Option<Value>,
     stdin_arg: Option<String>,
     main: Factory,
     subagent: SubagentSide,
@@ -325,11 +330,12 @@ where
     let name = tool.name().to_string();
     let help = schema_to_help(&schema);
     let stdin_arg = detect_stdin_arg(&schema);
-    let handler = tool_handler(Arc::new(tool), schema, None);
+    let handler = tool_handler(Arc::new(tool), schema.clone(), None);
     (
         name,
         Entry {
             help,
+            schema: Some(schema),
             stdin_arg,
             main: Arc::new(move |_| handler.clone()),
             subagent: SubagentSide::Same,
@@ -353,6 +359,7 @@ fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, E
         name,
         Entry {
             help,
+            schema: Some(schema),
             stdin_arg,
             main: Arc::new(move |_| handler.clone()),
             subagent: SubagentSide::Same,
@@ -452,6 +459,7 @@ impl CommandRegistryBuilder {
         let help = schema_to_help(&schema);
         let stdin_arg = detect_stdin_arg(&schema);
         let bound_name = name.clone();
+        let entry_schema = schema.clone();
         let factory: Factory = Arc::new(move |binding| {
             let tool = bind(binding);
             assert_eq!(
@@ -465,6 +473,7 @@ impl CommandRegistryBuilder {
             name,
             Entry {
                 help,
+                schema: Some(entry_schema),
                 stdin_arg,
                 main: factory,
                 subagent: SubagentSide::Same,
@@ -487,6 +496,7 @@ impl CommandRegistryBuilder {
             name.into(),
             Entry {
                 help: help.into(),
+                schema: None,
                 stdin_arg: None,
                 main: Arc::new(move |_| handler.clone()),
                 subagent: SubagentSide::Same,
@@ -715,6 +725,16 @@ impl CommandRegistry {
                     .exists(Role::of(launch), launch.mode)
                     .then(|| entry.help.clone())
             },
+        )
+    }
+
+    /// Whether `args` ask for the usage of `name` as `launch` sees it.
+    #[must_use]
+    pub fn requests_help(&self, launch: &LaunchInfo, name: &str, args: &[String]) -> bool {
+        let asks = |entry: &Entry| requests_help(entry.schema.as_ref(), args);
+        self.entries.get(name).map_or_else(
+            || self.set_entry(name).is_some_and(|entry| asks(&entry)),
+            |entry| entry.exists(Role::of(launch), launch.mode) && asks(entry),
         )
     }
 
