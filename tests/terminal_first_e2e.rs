@@ -4660,7 +4660,7 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
             server.log.contents().await
         );
         assert!(
-            stdout.contains("jq "),
+            stdout.contains("jq-"),
             "a prepared tool should run from the tools mount: {stdout}"
         );
         let nice: i32 = stdout

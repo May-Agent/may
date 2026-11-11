@@ -125,8 +125,10 @@ async fn the_host_rust_toolchain_builds_and_tests_a_crate() {
 }
 
 /// Removes a credentials file this test created when the host had none.
+#[cfg(target_os = "macos")]
 struct CreatedFile(Option<PathBuf>);
 
+#[cfg(target_os = "macos")]
 impl Drop for CreatedFile {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
@@ -181,6 +183,10 @@ fn host_git(dir: &Path, args: &[&str]) {
             "commit.gpgsign=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=May Test",
+            "-c",
+            "user.email=test@may.invalid",
         ])
         .args(args)
         .output()
