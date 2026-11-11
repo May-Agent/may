@@ -257,7 +257,7 @@ async fn forged_closing_tags_do_not_escape_external_blocks() {
 }
 
 /// The system prefix of `session`'s first request.
-async fn system_prefix(session: &Session) -> String {
+async fn system_prefix(session: &mut Session) -> String {
     let messages = session
         .agent
         .preview_request_messages("Say hello.", [])
@@ -297,8 +297,8 @@ async fn messaging_commands_carry_their_usage_only_in_a_session_with_agent_messa
     let stub = StubModel::spawn(SESSION_MODEL).await;
     let config = saved_config(&stub, None);
 
-    let with = Box::pin(Session::start_with_messaging(&config, messaging)).await;
-    let prefix = system_prefix(&with).await;
+    let mut with = Box::pin(Session::start_with_messaging(&config, messaging)).await;
+    let prefix = system_prefix(&mut with).await;
     for command in ["agent", "btw", "subagent", "explore", "tasks"] {
         assert!(
             prefix.contains(&format!("<usage command=\"{command}\">")),
@@ -306,8 +306,8 @@ async fn messaging_commands_carry_their_usage_only_in_a_session_with_agent_messa
         );
     }
 
-    let without = Box::pin(Session::start_with_runtime(&config)).await;
-    let prefix = system_prefix(&without).await;
+    let mut without = Box::pin(Session::start_with_runtime(&config)).await;
+    let prefix = system_prefix(&mut without).await;
     for command in ["agent", "btw"] {
         assert!(
             !prefix.contains(&format!("<usage command=\"{command}\">")),
