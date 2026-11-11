@@ -7,7 +7,10 @@
 //! - Every other listener ([`RequireIdentity`]): each request must prove who
 //!   it comes from. A request the accepted sources cannot attribute gets
 //!   `401`, never a guess — the resolved [`Identity`] rides the request
-//!   extensions so handlers and the request log record it.
+//!   extensions so handlers and the request log record it. The network
+//!   attaches that identity to whatever the user's browser sends, so an
+//!   identified request whose `Origin` is not the origin it was addressed to
+//!   gets `403`.
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -58,18 +61,23 @@ impl Middleware for LoopbackOnly {
     }
 }
 
-/// The request's authority — the URI's in absolute form, else `Host` — names
-/// a loopback host. A request naming no authority is refused.
-fn has_loopback_host(request: &Request) -> bool {
+/// The authority the request was addressed to: the URI's (HTTP/2's
+/// `:authority`, or an absolute-form target), else `Host`.
+fn request_authority(request: &Request) -> Option<Authority> {
     if let Some(authority) = request.uri().authority() {
-        return is_loopback_name(authority.host());
+        return Some(authority.clone());
     }
     request
         .headers()
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<Authority>().ok())
-        .is_some_and(|authority| is_loopback_name(authority.host()))
+}
+
+/// The request's authority names a loopback host. A request naming no
+/// authority is refused.
+fn has_loopback_host(request: &Request) -> bool {
+    request_authority(request).is_some_and(|authority| is_loopback_name(authority.host()))
 }
 
 /// No `Origin`, or an http(s) origin whose host is a loopback name.
@@ -120,11 +128,42 @@ pub enum IdentitySourceKind {
     TailnetWhois,
 }
 
+/// The scheme a remote request was addressed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// Plain HTTP.
+    Http,
+    /// HTTP over TLS.
+    Https,
+}
+
+impl Scheme {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
+    /// The port an authority without one implies (RFC 9110 §4.2.1, §4.2.2).
+    const fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+}
+
 /// One way a remote request can prove an identity. Sources are tried in
 /// order; the first to accept wins.
 pub trait IdentitySource: Send + Sync {
     /// The request's identity, or `None` when this source does not trust it.
     fn authenticate(&self, request: &Request) -> Option<Identity>;
+
+    /// The scheme the request was addressed with, as the path this source
+    /// trusts reports it. With the request's authority it makes the origin
+    /// the request was addressed to.
+    fn scheme(&self, request: &Request) -> Scheme;
 }
 
 /// The `401` every unauthenticated remote request gets.
@@ -132,8 +171,38 @@ fn unauthorized() -> Error {
     Error::msg("the remote listener needs an identity").set_status(StatusCode::UNAUTHORIZED)
 }
 
-/// Rejects remote requests no registered source accepts, and publishes the
-/// accepted [`Identity`] into the request extensions for handlers and logs.
+/// The `403` an identified request from another origin gets.
+fn foreign_origin() -> Error {
+    Error::msg("the remote listener refuses requests from a foreign Origin")
+        .set_status(StatusCode::FORBIDDEN)
+}
+
+/// No `Origin`, or exactly the origin the request was addressed to:
+/// `scheme` with the request's authority, whose missing port is the
+/// scheme's default. `null`, an opaque origin, an unparsable one and any
+/// origin when the request names no authority are foreign.
+fn has_addressed_origin_or_none(request: &Request, scheme: Scheme) -> bool {
+    let Some(origin) = request.headers().get(ORIGIN) else {
+        return true;
+    };
+    let Some(addressed) = request_authority(request).and_then(|authority| {
+        let host = url::Host::parse(authority.host()).ok()?;
+        let port = authority.port_u16().unwrap_or(scheme.default_port());
+        Some(url::Origin::Tuple(scheme.name().to_owned(), host, port))
+    }) else {
+        return false;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|origin| url::Url::parse(origin).ok())
+        .is_some_and(|origin| origin.origin() == addressed)
+}
+
+/// Rejects remote requests no registered source accepts, and those an
+/// accepted source identifies but whose `Origin` is not the origin they were
+/// addressed to. Publishes the accepted [`Identity`] into the request
+/// extensions for handlers and logs.
 pub struct RequireIdentity {
     sources: Vec<Box<dyn IdentitySource>>,
 }
@@ -151,6 +220,17 @@ impl Middleware for RequireIdentity {
             if let Some(identity) = source.authenticate(request) {
                 let method = request.method().clone();
                 let path = request.uri().path().to_owned();
+                if !has_addressed_origin_or_none(request, source.scheme(request)) {
+                    tracing::warn!(
+                        login = %identity.login,
+                        source = ?identity.source,
+                        origin = ?request.headers().get(ORIGIN),
+                        %method,
+                        %path,
+                        "remote request from a foreign Origin refused"
+                    );
+                    return Err(foreign_origin());
+                }
                 tracing::info!(
                     login = %identity.login,
                     source = ?identity.source,
@@ -226,6 +306,12 @@ impl IdentitySource for TailnetWhoisIdentitySource {
                 source: IdentitySourceKind::TailnetWhois,
             })
     }
+
+    /// A direct bind serves plain HTTP to the peer itself: no proxy stands in
+    /// between, so a forwarding header is the peer's own and never read.
+    fn scheme(&self, _request: &Request) -> Scheme {
+        Scheme::Http
+    }
 }
 
 impl IdentitySource for TailscaleServeIdentitySource {
@@ -248,5 +334,22 @@ impl IdentitySource for TailscaleServeIdentitySource {
                 login,
                 source: IdentitySourceKind::TailscaleServe,
             })
+    }
+
+    /// `tailscale serve` terminates TLS and then sets `X-Forwarded-Proto:
+    /// https`; its proxy (Go's `httputil.ReverseProxy` with `Rewrite`) strips
+    /// the client's own forwarding headers first, so the header is the
+    /// proxy's. Without it the request reached serve over plain HTTP. The
+    /// proxy forwards the browser's `Host` unchanged.
+    fn scheme(&self, request: &Request) -> Scheme {
+        if request
+            .headers()
+            .get("X-Forwarded-Proto")
+            .is_some_and(|proto| proto == "https")
+        {
+            Scheme::Https
+        } else {
+            Scheme::Http
+        }
     }
 }
