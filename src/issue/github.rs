@@ -94,6 +94,7 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
         }
         let token = self.token_source.token().await?;
         *cached = Some(token.clone());
+        drop(cached);
         Ok(token)
     }
 
