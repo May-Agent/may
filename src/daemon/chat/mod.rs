@@ -1438,7 +1438,7 @@ pub(super) enum WaitingTurnResume {
     /// resume reminder, and the guard dispatches it.
     Dispatch {
         guard: SessionRunGuard,
-        runtime: crate::session::SessionRuntimeSummary,
+        runtime: Box<crate::session::SessionRuntimeSummary>,
     },
     /// A live run (possibly in another process) holds the lease. It was or
     /// will be answered through its own prompt, so nothing was written: no
@@ -1484,7 +1484,10 @@ pub(super) async fn queue_waiting_turn_resume(
         )
         .await
     {
-        Ok(runtime) => Ok(WaitingTurnResume::Dispatch { guard, runtime }),
+        Ok(runtime) => Ok(WaitingTurnResume::Dispatch {
+            guard,
+            runtime: Box::new(runtime),
+        }),
         Err(error) => {
             finish_failed_run(guard).await;
             Err(ScheduleWaitingTurnError::Enqueue(error))
@@ -1503,7 +1506,7 @@ pub(super) async fn schedule_waiting_turn_resume(
     {
         WaitingTurnResume::Dispatch { guard, runtime } => {
             spawn_continued_run(state.clone(), guard);
-            Ok(runtime)
+            Ok(*runtime)
         }
         WaitingTurnResume::RunLive(runtime) => Ok(runtime),
     }
