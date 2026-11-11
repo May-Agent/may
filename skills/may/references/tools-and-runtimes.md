@@ -26,7 +26,7 @@ May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.24.0.
 | `uv` | Python package and project manager | 0.13.7 |
 | `python3` | CPython installed by `uv` when the tools are prepared | 3.13.18 |
 
-Not every platform has every tool: macOS arm64, Linux arm64 and Linux x86_64 get all of them; Windows gets only `rg`, `ast-grep`, `jq` and `apply_patch`. Separately, `src/tools/host-programs.json` pins programs the harness itself runs (the repo-search daemon, `search`, version 0.0.13); they are never put on a command `PATH`.
+Not every platform has every tool: macOS arm64, Linux arm64 and Linux x86_64 get all of them; Windows gets only `rg`, `ast-grep`, `jq` and `apply_patch`. Separately, `src/tools/host-programs.json` pins programs the harness itself runs (the repo-search daemon, `search`, version 0.0.13, and on macOS arm64 the `podman` client of the managed container runtime, which is downloaded on first use, hash-verified and re-verified before every start); they are never put on a command `PATH`.
 
 ## Where they live
 

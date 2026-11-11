@@ -2269,9 +2269,12 @@ where
                         })
                         .detach();
                     }
-                    Some(SendAction::RunBash { call_id, command }) => {
+                    Some(SendAction::RunBash {
+                        call_id,
+                        command,
+                        secrets,
+                    }) => {
                         let tx = events.sender();
-                        let secrets = app.secrets.clone();
                         let cwd = app.cwd.clone();
                         spawn(async move {
                             let mut outcome = blocking::unblock(move || {

@@ -505,7 +505,15 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.scroll = usize::MAX;
 
             // The agent sees the same masked transcript the TUI shows.
-            let (masked_command, _) = app.secrets.mask(&outcome.command);
+            // When the stored secrets cannot be read the transcript cannot be
+            // masked, so nothing is sent to the agent.
+            let masked_command = match &app.secrets {
+                Ok(secrets) => secrets.mask(&outcome.command).0,
+                Err(error) => {
+                    app.chat.push_error(&error.to_string());
+                    return Ok(None);
+                }
+            };
             let mut content = format!("! {masked_command}\n");
             if let Some(error) = &outcome.error {
                 let _ = write!(content, "\n<error>{error}</error>");
@@ -543,6 +551,9 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                         &crate::secrets::SecretStore::new(app.session_manager.may_dir()),
                         &app.config,
                     );
+                    if let Err(error) = &app.secrets {
+                        app.chat.push_error(&error.to_string());
+                    }
                     app.chat.push_notice(&format!(
                         "Secret {key} stored in the OS keychain — injected into shell environments"
                     ));

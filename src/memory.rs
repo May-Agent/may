@@ -45,7 +45,7 @@ enum MemoryProcessingError {
     #[error("all memory extraction providers failed: {details}")]
     AllProvidersFailed { details: String },
     #[error("memory extraction LLM error: {0}")]
-    Llm(#[from] aither_cloud::CloudError),
+    Llm(#[from] crate::agent::RedactedError<aither_cloud::CloudError>),
 }
 
 /// A provider candidate for memory extraction, tried in order.
