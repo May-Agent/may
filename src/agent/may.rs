@@ -88,6 +88,9 @@ pub enum MayAgentError {
     /// The session's shell could not be assembled.
     #[error(transparent)]
     Shell(#[from] ShellAssemblyError),
+    /// The stored secrets could not be read, so nothing could be redacted.
+    #[error(transparent)]
+    Secrets(#[from] crate::secrets::SecretError),
     /// I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -1304,7 +1307,7 @@ impl MayAgent {
             &crate::secrets::SecretStore::new(&may_dir),
             may_config,
             session_id.as_str(),
-        );
+        )?;
         Ok(MayAgentConfig {
             subagent_tracker,
             connectivity,

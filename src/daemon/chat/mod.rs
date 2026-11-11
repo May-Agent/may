@@ -1855,7 +1855,8 @@ pub(super) async fn run_bash(
     let secrets = crate::secrets::Secrets::load(
         &crate::secrets::SecretStore::new(&state.may_dir),
         state.config.load().as_ref(),
-    );
+    )
+    .map_err(internal_error)?;
     let run_secrets = secrets.clone();
     let outcome =
         blocking::unblock(move || crate::bash::run_bash_command(&command, &cwd, &run_secrets))

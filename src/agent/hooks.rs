@@ -100,7 +100,12 @@ impl Hooks for MayHooks {
         if outcome.name != COMPACT_TOOL_NAME {
             self.valve.acted();
         }
-        let redactions = self.redactor.current().await;
+        // A tool result is never shown to the model unredacted: when the
+        // stored secrets cannot be read, the run ends with that error.
+        let redactions = match self.redactor.current().await {
+            Ok(redactions) => redactions,
+            Err(error) => return AfterTool::Abort(error.to_string()),
+        };
         let shown = outcome.for_model();
         let mut result = shown.clone();
         redactions.redact_tool_result(&mut result);

@@ -13,8 +13,10 @@ use aither_cloud::{
     CloudProvider, claude::Claude, codex::Codex, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
 use aither_core::LanguageModel;
+use std::pin::Pin;
+
 use aither_core::llm::{
-    Event as LlmEvent, GenerateError, LLMRequest, TokenCounting,
+    Classify, Event as LlmEvent, Failure, GenerateError, LLMRequest, TokenCounting,
     model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use futures_lite::{Stream, StreamExt as _};
@@ -69,8 +71,41 @@ fn resolve_model_selector(
     Ok(provider_instance)
 }
 
+/// Why a [`RedactedModel`] request failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RedactedError<E> {
+    /// The stored secrets could not be read; the request was not sent.
+    #[error(transparent)]
+    Secrets(crate::secrets::SecretError),
+    /// The inner model failed.
+    #[error(transparent)]
+    Model(E),
+}
+
+impl<E: Classify> Classify for RedactedError<E> {
+    fn failure(&self) -> Failure {
+        match self {
+            Self::Secrets(_) => Failure::permanent(),
+            Self::Model(error) => error.failure(),
+        }
+    }
+}
+
+impl<E> RedactedError<E> {
+    /// Wraps the inner failure of a token count.
+    fn of_count(error: GenerateError<E>) -> GenerateError<Self> {
+        match error {
+            GenerateError::Provider(error) => GenerateError::Provider(Self::Model(error)),
+            GenerateError::Parse { source, response } => GenerateError::Parse { source, response },
+        }
+    }
+}
+
 /// A [`LanguageModel`] that replaces every stored secret value in a request
 /// with the secret's name before the request reaches the inner model.
+///
+/// A request is never sent when the stored secrets cannot be read: it fails
+/// with [`RedactedError::Secrets`] instead.
 ///
 /// The secrets are read when each request is sent, so one added mid-session
 /// applies from its next request. `respond` and the endpoint token count
@@ -108,7 +143,7 @@ impl<M> LanguageModel for RedactedModel<M>
 where
     M: LanguageModel,
 {
-    type Error = M::Error;
+    type Error = RedactedError<M::Error>;
 
     fn respond(
         &self,
@@ -119,15 +154,28 @@ where
         // awaits this stream.
         Box::pin(
             futures_lite::stream::once_future(async move {
-                self.redactor.current().await.redact_request(&mut request);
-                self.inner.respond(request)
+                let events: Pin<Box<dyn Stream<Item = Result<LlmEvent, Self::Error>> + Send + '_>> =
+                    match self.redactor.current().await {
+                        Ok(redactions) => {
+                            redactions.redact_request(&mut request);
+                            Box::pin(
+                                self.inner
+                                    .respond(request)
+                                    .map(|event| event.map_err(RedactedError::Model)),
+                            )
+                        }
+                        Err(error) => Box::pin(futures_lite::stream::once(Err(
+                            RedactedError::Secrets(error),
+                        ))),
+                    };
+                events
             })
             .flatten(),
         )
     }
 
-    async fn profile(&self) -> Result<ModelProfile, M::Error> {
-        let mut profile = self.inner.profile().await?;
+    async fn profile(&self) -> Result<ModelProfile, Self::Error> {
+        let mut profile = self.inner.profile().await.map_err(RedactedError::Model)?;
         if let Some(window) = self.context_window {
             profile.context_length = window;
         }
@@ -143,11 +191,19 @@ where
     fn count_tokens(
         &self,
         request: &LLMRequest,
-    ) -> impl Future<Output = Result<Option<u32>, GenerateError<M::Error>>> + Send {
+    ) -> impl Future<Output = Result<Option<u32>, GenerateError<Self::Error>>> + Send {
         let mut request = request.clone();
         async move {
-            self.redactor.current().await.redact_request(&mut request);
-            self.inner.count_tokens(&request).await
+            let redactions = self
+                .redactor
+                .current()
+                .await
+                .map_err(|error| GenerateError::Provider(RedactedError::Secrets(error)))?;
+            redactions.redact_request(&mut request);
+            self.inner
+                .count_tokens(&request)
+                .await
+                .map_err(RedactedError::of_count)
         }
     }
 

@@ -29,7 +29,13 @@ impl CommandEnv {
 
 impl EnvSource for CommandEnv {
     fn env(&self, _launch: &LaunchInfo) -> Vec<(String, String)> {
-        let mut env = self.secrets.env();
+        // `EnvSource` cannot fail a launch. A command that starts without its
+        // secrets sends nothing unredacted anywhere; its result then fails the
+        // redaction hook, which ends the run with the same error.
+        let mut env = self.secrets.env().unwrap_or_else(|error| {
+            tracing::error!(%error, "the session's secrets cannot be read; the command starts without them");
+            Vec::new()
+        });
         env.retain(|(name, _)| name != crate::tasks_md::ENV);
         env.push((crate::tasks_md::ENV.to_string(), self.tasks_md.clone()));
         env
