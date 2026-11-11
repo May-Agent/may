@@ -181,6 +181,46 @@ impl FromStr for TimeTriggerType {
     }
 }
 
+impl TimeTriggerType {
+    /// The first time this trigger fires strictly after `after`: the first
+    /// cron match, or `run_at` for a one-time trigger.
+    ///
+    /// # Errors
+    /// Returns a message when the field the trigger needs is absent or does
+    /// not parse, or a cron schedule never fires again.
+    pub fn next_fire(
+        self,
+        cron_expression: Option<&str>,
+        run_at: Option<&str>,
+        after: jiff::Timestamp,
+    ) -> Result<jiff::Timestamp, String> {
+        match self {
+            Self::Once => {
+                let run_at = run_at.ok_or("a one-time task has no run_at")?;
+                jiff::Timestamp::from_str(run_at)
+                    .map_err(|error| format!("invalid run_at {run_at:?}: {error}"))
+            }
+            Self::Cron => {
+                let expression = cron_expression.ok_or("a cron task has no cron_expression")?;
+                let schedule = cron::Schedule::from_str(expression)
+                    .map_err(|error| format!("invalid cron expression {expression:?}: {error}"))?;
+                // Cron fires on whole seconds, so the fraction of `after`
+                // cannot move the first fire after it.
+                let after =
+                    chrono::DateTime::from_timestamp(after.as_second(), 0).ok_or_else(|| {
+                        format!("{after} is outside the range a cron schedule covers")
+                    })?;
+                let next = schedule
+                    .after(&after)
+                    .next()
+                    .ok_or_else(|| format!("cron expression {expression:?} never fires again"))?;
+                jiff::Timestamp::from_second(next.timestamp())
+                    .map_err(|error| format!("cron fire time out of range: {error}"))
+            }
+        }
+    }
+}
+
 impl FromStr for TaskTriggerKind {
     type Err = String;
 
@@ -798,6 +838,25 @@ mod tests {
         TimeTriggerType, normalize_event_name, normalize_trigger, normalize_utc_timestamp,
         webhook_path,
     };
+
+    #[test]
+    fn next_fire_is_the_first_cron_match_after_the_instant() {
+        let after: jiff::Timestamp = "2026-11-11T10:30:00Z".parse().expect("timestamp");
+        let next = TimeTriggerType::Cron
+            .next_fire(Some("0 0 * * * *"), None, after)
+            .expect("hourly schedule fires");
+        assert_eq!(next.to_string(), "2026-11-11T11:00:00Z");
+        let once = TimeTriggerType::Once
+            .next_fire(None, Some("2020-01-01T00:00:00Z"), after)
+            .expect("one-time trigger");
+        assert_eq!(once.to_string(), "2020-01-01T00:00:00Z");
+        assert!(TimeTriggerType::Cron.next_fire(None, None, after).is_err());
+        assert!(
+            TimeTriggerType::Cron
+                .next_fire(Some("nonsense"), None, after)
+                .is_err()
+        );
+    }
 
     #[test]
     fn task_trigger_kind_parses_case_insensitive_values() {

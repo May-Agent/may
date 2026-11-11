@@ -218,10 +218,6 @@ const fn task_db_error(message: String) -> crate::db::ChatDbError {
     crate::db::ChatDbError::Storage(message)
 }
 
-fn task_field_error(task_id: &str, prefix: &str, field: &str) -> crate::db::ChatDbError {
-    task_db_error(format!("{prefix}{task_id} is missing {field}"))
-}
-
 fn task_value_error(
     task_id: &str,
     prefix: &str,
@@ -466,6 +462,7 @@ impl TaskRuntime {
             job_server: None,
             session_prompts: None,
         };
+        runtime.db.backfill_next_fire_times().await?;
         runtime.reload_active_tasks().await?;
         Ok(runtime)
     }
@@ -736,27 +733,38 @@ impl TaskRuntime {
         self.spawn_task(task, TaskInvocation::Manual).await
     }
 
-    /// Check for due tasks and execute them.
+    /// Start every enabled, approved time-triggered task whose stored next
+    /// fire time has passed. A task that cannot be read or started is
+    /// reported and skipped; the others still run.
     ///
     /// # Errors
-    /// Returns [`crate::db::ChatDbError`] when task rows fail to load or spawn.
-    ///
-    /// # Panics
-    /// Panics if `is_due` reports a non-time trigger as due (internal invariant).
+    /// Returns [`crate::db::ChatDbError`] when the task rows fail to load.
     pub async fn tick_due_tasks(&self) -> Result<(), crate::db::ChatDbError> {
-        let tasks = self.active_tasks.load();
+        let tasks = self.db.list_due_tasks().await?;
         let now = jiff::Timestamp::now();
 
-        for task in &tasks.tasks {
-            let trigger = stored_task_trigger(task)?;
-            let is_due = Self::is_due(task, &trigger, now)?;
-
-            if is_due {
-                let PersistedTaskTrigger::Time { trigger_type } = trigger else {
-                    panic!("is_due only returns true for time triggers");
-                };
-                self.spawn_task(task.clone(), TaskInvocation::Time { trigger_type })
-                    .await?;
+        for task in &tasks {
+            let Some(due) = task.next_fire_at.as_deref() else {
+                continue;
+            };
+            let trigger_type = match stored_task_trigger(task) {
+                Ok(PersistedTaskTrigger::Time { trigger_type }) => trigger_type,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::error!(task_id = %task.id, %error, "scheduled task is unreadable; skipped");
+                    continue;
+                }
+            };
+            match jiff::Timestamp::from_str(due) {
+                Ok(due_at) if due_at <= now => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::error!(task_id = %task.id, next_fire_at = due, %error, "scheduled task has an unreadable next fire time; skipped");
+                    continue;
+                }
+            }
+            if let Err(error) = self.fire_time_task(task, trigger_type, due, now).await {
+                tracing::error!(task_id = %task.id, %error, "scheduled task failed to start; skipped");
             }
         }
 
@@ -917,91 +925,38 @@ impl TaskRuntime {
         })
     }
 
-    fn is_due(
+    /// Start the run of one time-triggered task whose stored next fire time
+    /// is `due`, and advance that time past `now` in the same write; a
+    /// cron task that missed several fires runs once. Returns whether this
+    /// call started the run.
+    async fn fire_time_task(
+        &self,
         task: &scheduled_tasks::Model,
-        trigger: &PersistedTaskTrigger,
+        trigger_type: TimeTriggerType,
+        due: &str,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
-        match trigger {
-            PersistedTaskTrigger::Time {
-                trigger_type: TimeTriggerType::Cron,
-            } => Self::is_cron_due(task, now),
-            PersistedTaskTrigger::Time {
-                trigger_type: TimeTriggerType::Once,
-            } => Self::is_once_due(task, now),
-            PersistedTaskTrigger::Event { .. } | PersistedTaskTrigger::Webhook { .. } => Ok(false),
-        }
-    }
-
-    /// Check if a cron task is due.
-    fn is_cron_due(
-        task: &scheduled_tasks::Model,
-        now: jiff::Timestamp,
-    ) -> Result<bool, crate::db::ChatDbError> {
-        let Some(ref expr) = task.cron_expression else {
-            return Err(task_field_error(
-                task.id.as_str(),
-                "cron task ",
-                "cron_expression",
-            ));
+        let next = match trigger_type {
+            TimeTriggerType::Once => None,
+            TimeTriggerType::Cron => task.next_fire_after(now, false).map_err(|error| {
+                task_value_error(task.id.as_str(), "invalid schedule stored in task ", &error)
+            })?,
         };
-
-        let schedule = cron::Schedule::from_str(expr).map_err(|error| {
-            task_value_error(
-                task.id.as_str(),
-                "invalid cron expression stored in task ",
-                &error,
-            )
-        })?;
-
-        // Check if any scheduled time falls within the last 30 seconds.
-        let now_chrono = timestamp_to_chrono(now);
-        let window_start = now_chrono - chrono::Duration::seconds(30);
-
-        // Skip if we already ran within this window.
-        if let Some(ref last_run) = task.last_run_at {
-            let last = jiff::Timestamp::from_str(last_run).map_err(|error| {
-                task_value_error(
-                    task.id.as_str(),
-                    "invalid last_run_at stored in task ",
-                    &error,
-                )
-            })?;
-            let last_chrono = timestamp_to_chrono(last);
-            if last_chrono > window_start {
-                return Ok(false);
-            }
-        }
-
-        Ok(schedule
-            .after(&window_start)
-            .take(1)
-            .any(|next| next <= now_chrono))
-    }
-
-    /// Check if a one-time task is due.
-    fn is_once_due(
-        task: &scheduled_tasks::Model,
-        now: jiff::Timestamp,
-    ) -> Result<bool, crate::db::ChatDbError> {
-        let Some(ref run_at) = task.run_at else {
-            return Err(task_field_error(
-                task.id.as_str(),
-                "one-time task ",
-                "run_at",
-            ));
-        };
-
-        // Skip if already executed.
-        if task.last_run_at.is_some() {
+        let run_id = crate::id::new();
+        if !self.db.start_time_run(&run_id, task, due, next).await? {
             return Ok(false);
         }
-
-        let target = jiff::Timestamp::from_str(run_at).map_err(|error| {
-            task_value_error(task.id.as_str(), "invalid run_at stored in task ", &error)
-        })?;
-
-        Ok(now >= target)
+        let runtime = self.clone();
+        let task = task.clone();
+        tokio::spawn(async move {
+            Box::pin(runtime.execute_task(
+                run_id.as_str(),
+                &task,
+                TaskInvocation::Time { trigger_type },
+            ))
+            .await;
+        });
+        Ok(true)
     }
 
     async fn spawn_task(
@@ -1795,15 +1750,6 @@ fn build_validation_command(script: &TaskScript) -> String {
     .expect("task validation template must render")
 }
 
-/// Convert a `jiff::Timestamp` to `chrono::DateTime`<chrono::Utc> for cron compatibility.
-fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(
-        ts.as_second(),
-        u32::try_from(ts.subsec_nanosecond()).expect("jiff subsecond nanos are non-negative"),
-    )
-    .expect("jiff timestamp must fit within chrono DateTime range")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2319,7 +2265,7 @@ mod tests {
                 name: "Nightly check",
                 trigger,
                 cron_expression: None,
-                run_at: None,
+                run_at: Some(FAR_FUTURE),
                 script_path: Some(script_path.to_str().expect("utf-8 path")),
                 script_inline: None,
                 needs_network: false,
@@ -2364,7 +2310,7 @@ mod tests {
             name: "Inline",
             trigger: &TIME_ONCE,
             cron_expression: None,
-            run_at: None,
+            run_at: Some(FAR_FUTURE),
             script_path: None,
             script_inline: Some("echo hi; pwd -P"),
             needs_network: false,
@@ -2414,7 +2360,7 @@ mod tests {
             name: "Inline",
             trigger: &TIME_ONCE,
             cron_expression: None,
-            run_at: None,
+            run_at: Some(FAR_FUTURE),
             script_path: None,
             script_inline: Some("echo hi"),
             needs_network: false,
@@ -2601,5 +2547,261 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(host.wakes.is_empty());
+    }
+
+    const FAR_FUTURE: &str = "2999-01-01T00:00:00Z";
+    const TIME_CRON: PersistedTaskTrigger = PersistedTaskTrigger::Time {
+        trigger_type: crate::task_trigger::TimeTriggerType::Cron,
+    };
+
+    impl WakeHost {
+        /// An approved, enabled time task running `script`.
+        async fn time_task(
+            &self,
+            id: &str,
+            trigger: &PersistedTaskTrigger,
+            cron_expression: Option<&str>,
+            run_at: Option<&str>,
+            script: &str,
+        ) {
+            let db = self.runtime_service.db();
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id,
+                profile_id: self.profile_id.as_str(),
+                session_id: None,
+                name: id,
+                trigger,
+                cron_expression,
+                run_at,
+                script_path: None,
+                script_inline: Some(script),
+                needs_network: false,
+                timeout_secs: 60,
+            })
+            .await
+            .expect("task should persist");
+            db.approve_scheduled_task(id).await.expect("task approves");
+        }
+
+        async fn set_next_fire(&self, id: &str, next_fire_at: Option<&str>) {
+            let value = next_fire_at.map_or_else(|| "NULL".to_string(), |at| format!("'{at}'"));
+            self.runtime_service
+                .db()
+                .execute_for_test(&format!(
+                    "UPDATE scheduled_tasks SET next_fire_at = {value} WHERE id = '{id}'"
+                ))
+                .await
+                .expect("next fire time is set");
+        }
+
+        async fn task_row(&self, id: &str) -> crate::db::entity::scheduled_tasks::Model {
+            self.runtime_service
+                .db()
+                .get_scheduled_task(id)
+                .await
+                .expect("task reads")
+                .expect("task exists")
+        }
+
+        async fn runs(&self, id: &str) -> i64 {
+            self.runtime_service
+                .db()
+                .task_run_count(id)
+                .await
+                .expect("runs count")
+        }
+    }
+
+    /// A one-time task whose run outlasts several ticks is started once.
+    #[tokio::test]
+    async fn a_once_task_with_a_long_run_runs_once() {
+        let host = WakeHost::new().await;
+        host.time_task(
+            "once",
+            &TIME_ONCE,
+            None,
+            Some("2020-01-01T00:00:00Z"),
+            "sleep 5",
+        )
+        .await;
+
+        for _ in 0..4 {
+            host.runtime.tick_due_tasks().await.expect("tick");
+        }
+
+        assert_eq!(host.runs("once").await, 1);
+        assert_eq!(host.task_row("once").await.next_fire_at, None);
+    }
+
+    /// Fires missed while the daemon was stopped run once, and the next fire
+    /// is the first one after now.
+    #[tokio::test]
+    async fn missed_cron_fires_run_once_and_the_next_fire_moves_past_now() {
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+
+        host.runtime.tick_due_tasks().await.expect("tick");
+        host.runtime.tick_due_tasks().await.expect("tick");
+
+        assert_eq!(host.runs("cron").await, 1);
+        let next = host
+            .task_row("cron")
+            .await
+            .next_fire_at
+            .expect("a cron task keeps a next fire");
+        let next: jiff::Timestamp = next.parse().expect("stored as a timestamp");
+        assert!(next > jiff::Timestamp::now(), "next fire {next}");
+    }
+
+    /// A tick and a restart (a second claim of the same fire) cannot both
+    /// start it.
+    #[tokio::test]
+    async fn a_fire_is_claimed_once() {
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        let task = host.task_row("cron").await;
+        let db = host.runtime_service.db();
+        let next = Some(jiff::Timestamp::now());
+
+        assert!(
+            db.start_time_run("run-a", &task, "2020-01-01T00:00:00Z", next)
+                .await
+                .expect("claim")
+        );
+        assert!(
+            !db.start_time_run("run-b", &task, "2020-01-01T00:00:00Z", next)
+                .await
+                .expect("claim")
+        );
+        assert_eq!(host.runs("cron").await, 1);
+    }
+
+    /// A row that cannot be read does not stop the tasks after it.
+    #[tokio::test]
+    async fn an_unreadable_task_does_not_stop_the_others() {
+        let host = WakeHost::new().await;
+        host.time_task("bad-cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task("bad-trigger", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task("bad-time", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task(
+            "good",
+            &TIME_ONCE,
+            None,
+            Some("2020-01-01T00:00:00Z"),
+            "true",
+        )
+        .await;
+        let db = host.runtime_service.db();
+        db.execute_for_test(
+            "UPDATE scheduled_tasks SET cron_expression = 'not a schedule' WHERE id = 'bad-cron'",
+        )
+        .await
+        .expect("cron is broken");
+        db.execute_for_test(
+            "UPDATE scheduled_tasks SET trigger_type = 'bogus' WHERE id = 'bad-trigger'",
+        )
+        .await
+        .expect("trigger is broken");
+        for id in ["bad-cron", "bad-trigger", "bad-time"] {
+            host.set_next_fire(id, Some("2020-01-01T00:00:00Z")).await;
+        }
+        host.set_next_fire("bad-time", Some("garbage")).await;
+
+        host.runtime.tick_due_tasks().await.expect("tick");
+
+        assert_eq!(host.runs("good").await, 1);
+        for id in ["bad-cron", "bad-trigger", "bad-time"] {
+            assert_eq!(host.runs(id).await, 0, "{id}");
+        }
+    }
+
+    /// Rows without a next fire time get one when the runtime loads; a
+    /// one-time task that already ran keeps none.
+    #[tokio::test]
+    async fn existing_time_tasks_get_a_next_fire_time() {
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task("once", &TIME_ONCE, None, Some(FAR_FUTURE), "true")
+            .await;
+        host.time_task("ran", &TIME_ONCE, None, Some(FAR_FUTURE), "true")
+            .await;
+        let db = host.runtime_service.db();
+        let ran = host.task_row("ran").await;
+        assert!(
+            db.start_time_run("run-ran", &ran, FAR_FUTURE, None)
+                .await
+                .expect("claim")
+        );
+        for id in ["cron", "once", "ran"] {
+            host.set_next_fire(id, None).await;
+        }
+
+        db.backfill_next_fire_times().await.expect("backfill");
+
+        assert!(host.task_row("cron").await.next_fire_at.is_some());
+        assert_eq!(
+            host.task_row("once").await.next_fire_at.as_deref(),
+            Some(FAR_FUTURE)
+        );
+        assert_eq!(host.task_row("ran").await.next_fire_at, None);
+    }
+
+    /// Editing the trigger, enabling and approving each recompute the next
+    /// fire time.
+    #[tokio::test]
+    async fn trigger_edits_enable_and_approve_recompute_the_next_fire() {
+        use crate::db::UpdateScheduledTaskParams;
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        let db = host.runtime_service.db();
+
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        db.update_scheduled_task(
+            "cron",
+            UpdateScheduledTaskParams {
+                cron_expression: Some(Some("0 0 0 1 1 *")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("trigger edit");
+        let edited = host.task_row("cron").await.next_fire_at.expect("next fire");
+        assert!(edited.parse::<jiff::Timestamp>().expect("timestamp") > jiff::Timestamp::now());
+
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        db.update_scheduled_task(
+            "cron",
+            UpdateScheduledTaskParams {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enable");
+        assert_ne!(
+            host.task_row("cron").await.next_fire_at.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        db.approve_scheduled_task("cron").await.expect("approve");
+        assert_ne!(
+            host.task_row("cron").await.next_fire_at.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
     }
 }
