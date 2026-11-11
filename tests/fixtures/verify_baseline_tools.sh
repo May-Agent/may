@@ -53,7 +53,9 @@ timeout 1 tail -f size.txt || status=$?
 # the caller compares.
 uv --version
 python3 --version
-[ "$(command -v python3)" = "$(dirname "$(command -v uv)")/python3" ]
+# python3 is the shim beside the managed tools, which runs the managed copy
+# outside a project environment.
+[ "$(command -v python3)" = "$(dirname "$(dirname "$(command -v uv)")")/shims/python3" ]
 # uv keeps its cache and the Pythons it installs in one directory shared by
 # every session, outside the session's HOME.
 [ -n "$UV_CACHE_DIR" ] && [ -n "$UV_PYTHON_INSTALL_DIR" ]
@@ -69,6 +71,9 @@ mkdir venv-project
     uv venv --python 3.12 -q
     printf '[project]\nname = "venv-project"\nversion = "0"\nrequires-python = ">=3.12"\n' >pyproject.toml
     uv run python --version | rg -q '^Python 3\.12\.[0-9]+$'
+    # In a project with an environment, python3 and python are its interpreter.
+    [ "$(python3 -c 'import sys; print(sys.prefix)')" = "$(pwd -P)/.venv" ]
+    [ "$(python -c 'import sys; print(sys.prefix)')" = "$(pwd -P)/.venv" ]
 )
 # Without one, uv run uses the managed python3.
 mkdir unpinned
