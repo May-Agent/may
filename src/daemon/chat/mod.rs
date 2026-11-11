@@ -1433,17 +1433,15 @@ fn resume_waiting_turn_reminder(
 }
 
 /// How a resume after a decision was scheduled.
-pub(super) enum WaitingTurnResume {
-    /// The run is gone: this process took the session's lease and queued the
-    /// resume reminder, and the guard dispatches it.
-    Dispatch {
-        guard: SessionRunGuard,
-        runtime: Box<crate::session::SessionRuntimeSummary>,
-    },
-    /// A live run (possibly in another process) holds the lease. It was or
-    /// will be answered through its own prompt, so nothing was written: no
+pub(super) struct WaitingTurnResume {
+    /// The session's runtime state after the attempt.
+    pub(super) runtime: crate::session::SessionRuntimeSummary,
+    /// The session's lease when its run was gone: this process took it and
+    /// queued the resume reminder, and the guard dispatches it. `None` while
+    /// a live run (possibly in another process) holds the lease: it was or
+    /// will be answered through its own prompt, so nothing was written, no
     /// state change and no reminder that would reach the model after it.
-    RunLive(Box<crate::session::SessionRuntimeSummary>),
+    pub(super) dispatch: Option<SessionRunGuard>,
 }
 
 /// Take the lease of a session whose run is gone and queue the reminder for
@@ -1471,7 +1469,10 @@ pub(super) async fn queue_waiting_turn_resume(
             return runtime_service
                 .get(session_id)
                 .await
-                .map(|runtime| WaitingTurnResume::RunLive(Box::new(runtime)))
+                .map(|runtime| WaitingTurnResume {
+                    runtime,
+                    dispatch: None,
+                })
                 .map_err(ScheduleWaitingTurnError::Lease);
         }
         Err(AcquireError::Storage(error)) => return Err(ScheduleWaitingTurnError::Lease(error)),
@@ -1484,9 +1485,9 @@ pub(super) async fn queue_waiting_turn_resume(
         )
         .await
     {
-        Ok(runtime) => Ok(WaitingTurnResume::Dispatch {
-            guard,
-            runtime: Box::new(runtime),
+        Ok(runtime) => Ok(WaitingTurnResume {
+            runtime,
+            dispatch: Some(guard),
         }),
         Err(error) => {
             finish_failed_run(guard).await;
@@ -1501,15 +1502,13 @@ pub(super) async fn schedule_waiting_turn_resume(
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
 ) -> Result<crate::session::SessionRuntimeSummary, ScheduleWaitingTurnError> {
-    match queue_waiting_turn_resume(&state.runtime_service, session_id, request_kind, resolution)
-        .await?
-    {
-        WaitingTurnResume::Dispatch { guard, runtime } => {
-            spawn_continued_run(state.clone(), guard);
-            Ok(*runtime)
-        }
-        WaitingTurnResume::RunLive(runtime) => Ok(*runtime),
+    let resume =
+        queue_waiting_turn_resume(&state.runtime_service, session_id, request_kind, resolution)
+            .await?;
+    if let Some(guard) = resume.dispatch {
+        spawn_continued_run(state.clone(), guard);
     }
+    Ok(resume.runtime)
 }
 
 async fn schedule_browser_takeover_resume(
