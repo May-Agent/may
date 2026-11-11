@@ -12,12 +12,12 @@ pub mod stage;
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use crate::tools::HostProgram;
 use aither_sandbox::{ContainerRuntimeKind, RuntimePreference};
 use bollard::Docker;
 #[cfg(target_os = "macos")]
 use tokio::process::Command;
-#[cfg(target_os = "macos")]
-use zenwave::ResponseExt;
 
 /// How long a socket probe waits for the runtime to answer its ping.
 const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -348,18 +348,29 @@ impl ContainerRuntime {
 
         let may_dir = crate::config::MayConfig::may_dir()
             .map_err(|e| ContainerError::Bootstrap(format!("failed to resolve ~/.may: {e}")))?;
-        let bin_dir = may_dir.join("bin");
-        tokio::fs::create_dir_all(&bin_dir).await?;
-        let podman_bin = bin_dir.join("podman");
+        let host_programs = may_dir.join("cache").join("host-programs");
+        let distribution = crate::tools::embedded_distribution()?;
+        let target = crate::tools::ToolTarget::native()?;
 
-        if !tokio::fs::try_exists(&podman_bin).await? {
+        // A prepared binary that still has its pinned digest needs no
+        // download and no approval; anything else is fetched through the
+        // tool distribution, which verifies it before it is run.
+        let podman_bin = if let Some(prepared) = distribution
+            .cached_host_program(HostProgram::Podman, &target, &host_programs)
+            .await?
+        {
+            prepared
+        } else {
             if !options.allow_managed_podman_download {
                 return Err(ContainerError::ManagedPodmanDownloadApprovalRequired);
             }
-            download_managed_podman_binary(&podman_bin, &may_dir).await?;
-        }
+            tracing::info!("Downloading managed Podman");
+            distribution
+                .prepare_host_program(HostProgram::Podman, &target, &host_programs)
+                .await?
+        };
 
-        let socket_path = ensure_managed_podman_machine(&podman_bin).await?;
+        let socket_path = ensure_managed_podman_machine(podman_bin.path()).await?;
         Ok(Self::try_connect(&socket_path, ContainerRuntimeKind::Podman).await)
     }
 }
@@ -395,236 +406,6 @@ const DOCKER_ENGINE_ENDPOINT: &str = "/var/run/docker.sock";
 /// on Windows hosts.
 #[cfg(windows)]
 const DOCKER_ENGINE_ENDPOINT: &str = r"\\.\pipe\docker_engine";
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, serde::Deserialize)]
-struct GithubRelease {
-    assets: Vec<GithubAsset>,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[cfg(target_os = "macos")]
-fn podman_asset_name_candidates_for_current_arch() -> Result<&'static [&'static str], ContainerError>
-{
-    match std::env::consts::ARCH {
-        // Newer Podman releases ship `.zip`; older releases used `.tar.gz`.
-        "aarch64" => Ok(&[
-            "podman-remote-release-darwin_arm64.zip",
-            "podman-remote-release-darwin_arm64.tar.gz",
-        ]),
-        "x86_64" => Ok(&[
-            "podman-remote-release-darwin_amd64.zip",
-            "podman-remote-release-darwin_amd64.tar.gz",
-        ]),
-        other => Err(ContainerError::Bootstrap(format!(
-            "unsupported macOS architecture for managed Podman bootstrap: {other}"
-        ))),
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn download_managed_podman_binary(
-    podman_bin: &Path,
-    may_dir: &Path,
-) -> Result<(), ContainerError> {
-    let release_response =
-        zenwave::get("https://api.github.com/repos/containers/podman/releases/latest")
-            .await
-            .map_err(|e| {
-                ContainerError::Bootstrap(format!("failed to query Podman release metadata: {e}"))
-            })?;
-    let release: GithubRelease = release_response.into_json().await.map_err(|e| {
-        ContainerError::Bootstrap(format!("failed to parse Podman release metadata: {e}"))
-    })?;
-
-    let asset_name_candidates = podman_asset_name_candidates_for_current_arch()?;
-    let asset = asset_name_candidates
-        .iter()
-        .find_map(|candidate| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name == *candidate)
-                .cloned()
-        })
-        .ok_or_else(|| {
-            ContainerError::Bootstrap(format!(
-                "Podman release asset not found: expected one of [{}]",
-                asset_name_candidates.join(", ")
-            ))
-        })?;
-
-    tracing::info!(asset = %asset.name, "Downloading managed Podman binary");
-    let archive_response = zenwave::get(asset.browser_download_url.as_str())
-        .await
-        .map_err(|e| ContainerError::Bootstrap(format!("failed to download Podman asset: {e}")))?;
-    let bytes = archive_response.into_bytes().await.map_err(|e| {
-        ContainerError::Bootstrap(format!("failed to read Podman asset bytes: {e}"))
-    })?;
-
-    let archive_path = may_dir.join(&asset.name);
-    tokio::fs::write(&archive_path, bytes.as_ref()).await?;
-    extract_podman_binary(&archive_path, &asset.name, podman_bin).await?;
-    tokio::fs::remove_file(&archive_path).await.map_err(|e| {
-        ContainerError::Bootstrap(format!("failed to remove temporary Podman archive: {e}"))
-    })?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn extract_podman_binary(
-    archive_path: &Path,
-    archive_name: &str,
-    destination: &Path,
-) -> Result<(), ContainerError> {
-    let archive_name_lower = archive_name.to_ascii_lowercase();
-    let (stem, last_ext) = archive_name_lower
-        .rsplit_once('.')
-        .unwrap_or((archive_name_lower.as_str(), ""));
-    if last_ext == "zip" {
-        return extract_podman_binary_from_zip(archive_path, destination).await;
-    }
-    if last_ext == "gz"
-        && std::path::Path::new(stem)
-            .extension()
-            .is_some_and(|ext| ext == "tar")
-    {
-        return extract_podman_binary_from_tar_gz(archive_path, destination).await;
-    }
-    Err(ContainerError::Bootstrap(format!(
-        "unsupported Podman archive format for {archive_name}"
-    )))
-}
-
-#[cfg(target_os = "macos")]
-async fn extract_podman_binary_from_tar_gz(
-    archive_path: &Path,
-    destination: &Path,
-) -> Result<(), ContainerError> {
-    let archive_path = archive_path.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::fs::File;
-
-        use flate2::read::GzDecoder;
-
-        let file = File::open(&archive_path)?;
-        let decoder = GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        let mut extracted = false;
-
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let entry_path = entry.path()?.into_owned();
-            let file_name = entry_path.file_name().and_then(|name| name.to_str());
-            if file_name == Some("podman") {
-                let parent = destination.parent().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid podman destination path: {}", destination.display()),
-                    )
-                })?;
-                std::fs::create_dir_all(parent)?;
-                entry.unpack(&destination)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))?;
-                }
-                extracted = true;
-                break;
-            }
-        }
-
-        if !extracted {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "podman binary not found in archive {}",
-                    archive_path.display()
-                ),
-            ));
-        }
-
-        Ok::<(), std::io::Error>(())
-    })
-    .await
-    .map_err(|e| ContainerError::Bootstrap(format!("podman extraction task failed: {e}")))?
-    .map_err(|e| ContainerError::Bootstrap(format!("failed to extract Podman binary: {e}")))?;
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn extract_podman_binary_from_zip(
-    archive_path: &Path,
-    destination: &Path,
-) -> Result<(), ContainerError> {
-    let archive_path = archive_path.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::fs::File;
-        use std::io;
-
-        let file = File::open(&archive_path)?;
-        let mut archive = zip::ZipArchive::new(file).map_err(io::Error::other)?;
-        let mut extracted = false;
-
-        for index in 0..archive.len() {
-            let mut entry = archive.by_index(index).map_err(io::Error::other)?;
-            let entry_name = entry.name().map_err(io::Error::other)?;
-            let Some(file_name) = std::path::Path::new(entry_name.as_ref())
-                .file_name()
-                .and_then(|name| name.to_str())
-            else {
-                continue;
-            };
-            if file_name != "podman" {
-                continue;
-            }
-
-            let parent = destination.parent().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid podman destination path: {}", destination.display()),
-                )
-            })?;
-            std::fs::create_dir_all(parent)?;
-            let mut out = File::create(&destination)?;
-            std::io::copy(&mut entry, &mut out)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))?;
-            }
-            extracted = true;
-            break;
-        }
-
-        if !extracted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "podman binary not found in archive {}",
-                    archive_path.display()
-                ),
-            ));
-        }
-
-        Ok::<(), io::Error>(())
-    })
-    .await
-    .map_err(|e| ContainerError::Bootstrap(format!("podman extraction task failed: {e}")))?
-    .map_err(|e| ContainerError::Bootstrap(format!("failed to extract Podman binary: {e}")))?;
-
-    Ok(())
-}
 
 #[cfg(target_os = "macos")]
 async fn ensure_managed_podman_machine(podman_bin: &Path) -> Result<PathBuf, ContainerError> {
