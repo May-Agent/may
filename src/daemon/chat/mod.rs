@@ -52,9 +52,9 @@ use crate::db::RunFence;
 use crate::prompt_mentions;
 use crate::quota;
 use crate::session::{
-    AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths,
-    MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment, RunOutcome,
-    SessionId, SessionPaths, SessionRunGuard, SessionRuntimeState, SessionStore,
+    AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, FinishError,
+    MayHomePaths, MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment,
+    RunOutcome, SessionId, SessionPaths, SessionRunGuard, SessionRuntimeState, SessionStore,
     TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
@@ -1199,7 +1199,7 @@ enum FollowUpError {
     #[error("follow-up run failed: {0}")]
     Turn(ChatCollectError),
     #[error("failed to release session run after follow-up dispatch: {0}")]
-    Release(crate::db::ChatDbError),
+    Release(crate::session::FinishError),
 }
 
 /// [`dispatch_follow_ups`] for a spawned task, which has no caller to
@@ -2903,6 +2903,9 @@ async fn run_published_turn(
     let response_session_id = req.session_id.clone();
     // Every arm releases the session and records the release before
     // announcing the end of the turn.
+    // A follow-up lookup that failed after the run was recorded as ended: the
+    // turn still ends as it ran, and the error is returned for logging.
+    let mut follow_up_error = None;
     match result {
         Ok(result) => {
             let done_event = done_event_from_run_result(
@@ -2915,7 +2918,16 @@ async fn run_published_turn(
             // a client that sends its next message on `done` is never refused
             // as a concurrent run. Finishing continues the session under a
             // new guard only when there is pending work to dispatch.
-            let continued = guard.finish(RunOutcome::Completed).await?;
+            let continued = match guard.finish(RunOutcome::Completed).await {
+                Ok(continued) => continued,
+                Err(FinishError::Settle(error)) => {
+                    return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+                }
+                Err(FinishError::FollowUp(error)) => {
+                    follow_up_error = Some(error);
+                    None
+                }
+            };
             record_release(&state, resuming).await;
             sink.finish_with("done", &done_event, crate::client::RunEnd::Completed);
             if let Some(continued) = continued {
@@ -2931,7 +2943,16 @@ async fn run_published_turn(
                 response_session_id.clone(),
                 *result,
             );
-            let continued = guard.finish(RunOutcome::Completed).await?;
+            let continued = match guard.finish(RunOutcome::Completed).await {
+                Ok(continued) => continued,
+                Err(FinishError::Settle(error)) => {
+                    return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+                }
+                Err(FinishError::FollowUp(error)) => {
+                    follow_up_error = Some(error);
+                    None
+                }
+            };
             record_release(&state, resuming).await;
             sink.finish_with("paused", &paused_event, crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
@@ -2940,17 +2961,39 @@ async fn run_published_turn(
         }
         // Errors are already published through on_error in run_agent_loop.
         Err(AgentLoopError::Cancelled(_)) => {
-            guard.finish_idle(RunOutcome::Cancelled).await?;
+            if let Err(error) = guard.finish_idle(RunOutcome::Cancelled).await {
+                return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+            }
             record_release(&state, resuming).await;
             sink.finish(crate::client::RunEnd::Cancelled);
         }
         Err(_) => {
-            guard.finish_idle(RunOutcome::Failed).await?;
+            if let Err(error) = guard.finish_idle(RunOutcome::Failed).await {
+                return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+            }
             record_release(&state, resuming).await;
             sink.finish(crate::client::RunEnd::Failed);
         }
     }
-    Ok(())
+    follow_up_error.map_or(Ok(()), Err)
+}
+
+/// Ends a turn whose run could not be settled in storage. The guard already
+/// released the session in memory and retries the write in the background,
+/// so the release is recorded and clients hear the storage error and the
+/// turn's `end` as they would for any failed turn; the error goes back to
+/// the caller, which logs it.
+async fn end_unsettled_turn(
+    state: &DaemonState,
+    sink: &mut HubSink,
+    resuming: Option<background::ResumePending>,
+    error: crate::db::ChatDbError,
+) -> Result<(), crate::db::ChatDbError> {
+    sink.on_error(ApiErrorCode::InternalError, &error.to_string(), false)
+        .await;
+    record_release(state, resuming).await;
+    sink.finish(crate::client::RunEnd::Failed);
+    Err(error)
 }
 
 /// A run just released its session: the background wake it served, if any,
