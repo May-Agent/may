@@ -35,6 +35,30 @@ pub enum SecretError {
     /// Index file contents were malformed.
     #[error("secret index parse error: {0}")]
     Parse(#[from] serde_json::Error),
+    /// The index file exists but could not be read.
+    #[error("cannot read the secrets index {}: {source}", path.display())]
+    ReadIndex {
+        /// The index file.
+        path: PathBuf,
+        /// Why reading failed.
+        source: std::io::Error,
+    },
+    /// The index file exists but is not a valid index.
+    #[error("cannot parse the secrets index {}: {source}", path.display())]
+    ParseIndex {
+        /// The index file.
+        path: PathBuf,
+        /// Why parsing failed.
+        source: serde_json::Error,
+    },
+    /// The index lists a secret whose value the keychain could not read.
+    #[error("cannot read the value of secret {name} from the keychain: {source}")]
+    ReadCredential {
+        /// The secret's name.
+        name: String,
+        /// Why the keychain read failed.
+        source: keyring::Error,
+    },
     /// The key name is not a valid environment variable name.
     #[error("invalid secret name {0:?}: use [A-Za-z_][A-Za-z0-9_]*")]
     InvalidName(String),
@@ -140,11 +164,28 @@ impl SecretStore {
     }
 
     /// Read the names index; an absent file means no stored secrets.
-    fn index(&self) -> Index {
-        std::fs::read_to_string(&self.index_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<Index>(&content).ok())
-            .unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::ReadIndex`] or [`SecretError::ParseIndex`],
+    /// naming the file, when it exists but cannot be read or parsed.
+    fn index(&self) -> Result<Index, SecretError> {
+        let content = match std::fs::read_to_string(&self.index_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Index::default());
+            }
+            Err(source) => {
+                return Err(SecretError::ReadIndex {
+                    path: self.index_path.clone(),
+                    source,
+                });
+            }
+        };
+        serde_json::from_str(&content).map_err(|source| SecretError::ParseIndex {
+            path: self.index_path.clone(),
+            source,
+        })
     }
 
     fn write_index(&self, index: &Index) -> Result<(), SecretError> {
@@ -215,8 +256,8 @@ impl SecretStore {
     /// the keychain and index the name.
     fn store(&self, session: Option<&str>, key: &str, value: &str) -> Result<(), SecretError> {
         Self::validate_name(key)?;
+        let mut index = self.index()?;
         self.write_credential(&Self::account(session, key), value)?;
-        let mut index = self.index();
         let names = match session {
             None => &mut index.names,
             Some(id) => index.sessions.entry(id.to_string()).or_default(),
@@ -276,58 +317,86 @@ impl SecretStore {
     ///
     /// Returns [`SecretError`] when the keychain delete or index write fails.
     pub fn remove(&self, key: &str) -> Result<bool, SecretError> {
+        let mut index = self.index()?;
         let existed = self.delete_credential(&Self::account(None, key))?;
         if existed {
-            let mut index = self.index();
             index.names.retain(|name| name != key);
             self.write_index(&index)?;
         }
         Ok(existed)
     }
 
-    /// `(name, value)` pairs of `names`; names whose keychain read fails are
+    /// `(name, value)` pairs of `names`; a name with no credential is
     /// skipped.
-    fn read_all(&self, session: Option<&str>, names: Vec<String>) -> Vec<(String, String)> {
-        names
-            .into_iter()
-            .filter_map(|name| {
-                self.read_credential(&Self::account(session, &name))
-                    .map_err(|error| {
-                        tracing::warn!(secret = %name, %error, "failed to read secret from keychain");
-                        error
-                    })
-                    .ok()
-                    .flatten()
-                    .map(|value| (name, value))
-            })
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::ReadCredential`] for the first name whose
+    /// keychain read fails.
+    fn read_all(
+        &self,
+        session: Option<&str>,
+        names: Vec<String>,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        let mut pairs = Vec::with_capacity(names.len());
+        for name in names {
+            let credential = self
+                .read_credential(&Self::account(session, &name))
+                .map_err(|error| match error {
+                    SecretError::Keychain(source) => SecretError::ReadCredential {
+                        name: name.clone(),
+                        source,
+                    },
+                    other => other,
+                })?;
+            if let Some(value) = credential {
+                pairs.push((name, value));
+            }
+        }
+        Ok(pairs)
     }
 
     /// All global `(name, value)` pairs.
-    #[must_use]
-    pub fn values(&self) -> Vec<(String, String)> {
-        self.read_all(None, self.index().names)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read.
+    pub fn values(&self) -> Result<Vec<(String, String)>, SecretError> {
+        self.read_all(None, self.index()?.names)
     }
 
     /// All `(name, value)` pairs `session_id` holds alone.
-    #[must_use]
-    pub fn session_values(&self, session_id: &str) -> Vec<(String, String)> {
-        let names = self.index().sessions.remove(session_id).unwrap_or_default();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read.
+    pub fn session_values(&self, session_id: &str) -> Result<Vec<(String, String)>, SecretError> {
+        let names = self
+            .index()?
+            .sessions
+            .remove(session_id)
+            .unwrap_or_default();
         self.read_all(Some(session_id), names)
     }
 
     /// What `session_id`'s terminals see: the global secrets and the
     /// session's own, which win a name both hold.
-    #[must_use]
-    pub fn session_env(&self, session_id: &str) -> Vec<(String, String)> {
-        let own = self.session_values(session_id);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read.
+    pub fn session_env(&self, session_id: &str) -> Result<Vec<(String, String)>, SecretError> {
+        let own = self.session_values(session_id)?;
         let mut env: Vec<(String, String)> = self
-            .values()
+            .values()?
             .into_iter()
             .filter(|(name, _)| !own.iter().any(|(own_name, _)| own_name == name))
             .collect();
         env.extend(own);
-        env
+        Ok(env)
     }
 
     /// Delete every secret `session_id` holds.
@@ -336,7 +405,7 @@ impl SecretStore {
     ///
     /// Returns [`SecretError`] when a keychain delete or the index write fails.
     pub fn remove_session(&self, session_id: &str) -> Result<(), SecretError> {
-        let mut index = self.index();
+        let mut index = self.index()?;
         let Some(names) = index.sessions.remove(session_id) else {
             return Ok(());
         };
@@ -352,7 +421,7 @@ impl SecretStore {
     ///
     /// Returns [`SecretError`] when a keychain delete or the index write fails.
     pub fn remove_all_sessions(&self) -> Result<(), SecretError> {
-        let mut index = self.index();
+        let mut index = self.index()?;
         for (session_id, names) in std::mem::take(&mut index.sessions) {
             for name in &names {
                 self.delete_credential(&Self::account(Some(&session_id), name))?;
@@ -395,30 +464,41 @@ impl Secrets {
     }
 
     /// Load keychain values and configured provider API keys.
-    #[must_use]
-    pub fn load(store: &SecretStore, config: &crate::config::MayConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read.
+    pub fn load(
+        store: &SecretStore,
+        config: &crate::config::MayConfig,
+    ) -> Result<Self, SecretError> {
         let extra_values = config
             .provider
             .values()
             .filter_map(|instance| instance.api_key.clone())
             .filter(|key| !key.is_empty())
             .collect();
-        Self {
-            entries: store.values(),
+        Ok(Self {
+            entries: store.values()?,
             extra_values,
-        }
+        })
     }
 
     /// [`Self::load`] plus the secrets `session_id` holds alone.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read.
     pub fn load_for_session(
         store: &SecretStore,
         config: &crate::config::MayConfig,
         session_id: &str,
-    ) -> Self {
-        let mut secrets = Self::load(store, config);
-        secrets.entries.extend(store.session_values(session_id));
-        secrets
+    ) -> Result<Self, SecretError> {
+        let mut secrets = Self::load(store, config)?;
+        secrets.entries.extend(store.session_values(session_id)?);
+        Ok(secrets)
     }
 
     /// `(name, value)` pairs safe to inject as environment variables.
@@ -556,23 +636,28 @@ impl SecretRedactor {
 
     /// The secrets stored right now. Keychain reads run off the caller's
     /// thread.
-    pub async fn current(&self) -> Redactions {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read: text is never
+    /// redacted against a partial set.
+    pub async fn current(&self) -> Result<Redactions, SecretError> {
         #[cfg(test)]
         if let Some(fixed) = &self.fixed {
-            return Redactions::new(fixed.clone());
+            return Ok(Redactions::new(fixed.clone()));
         }
         let store = self.store.clone();
         let session_id = self.session_id.clone();
-        Redactions::new(
-            blocking::unblock(move || {
-                let mut secrets = store.values();
-                if let Some(session_id) = session_id {
-                    secrets.extend(store.session_values(&session_id));
-                }
-                secrets
-            })
-            .await,
-        )
+        blocking::unblock(move || {
+            let mut secrets = store.values()?;
+            if let Some(session_id) = session_id {
+                secrets.extend(store.session_values(&session_id)?);
+            }
+            Ok::<_, SecretError>(secrets)
+        })
+        .await
+        .map(Redactions::new)
     }
 }
 
@@ -715,8 +800,12 @@ impl SessionEnv {
 
 impl SessionEnv {
     /// The secrets every command of the session starts with.
-    #[must_use]
-    pub fn env(&self) -> Vec<(String, String)> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the names index exists but cannot be read
+    /// or parsed, or a listed secret's value cannot be read.
+    pub fn env(&self) -> Result<Vec<(String, String)>, SecretError> {
         self.store.session_env(&self.session_id)
     }
 }
@@ -733,6 +822,99 @@ mod tests {
         assert!(SecretStore::validate_name("9K").is_err());
         assert!(SecretStore::validate_name("A-B").is_err());
         assert!(SecretStore::validate_name("").is_err());
+    }
+
+    fn store_in(dir: &tempfile::TempDir) -> SecretStore {
+        SecretStore::in_memory(dir.path())
+    }
+
+    #[test]
+    fn a_missing_index_holds_no_secrets() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = store_in(&dir);
+        assert_eq!(
+            store.values().expect("no index reads as empty"),
+            [] as [(String, String); 0]
+        );
+        assert_eq!(
+            store
+                .session_values("session")
+                .expect("no index reads as empty"),
+            [] as [(String, String); 0]
+        );
+        assert_eq!(
+            store
+                .session_env("session")
+                .expect("no index reads as empty"),
+            [] as [(String, String); 0]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_index_is_an_error_naming_the_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // A directory where the file belongs: it exists and cannot be read.
+        std::fs::create_dir(dir.path().join("secrets.json")).expect("create the directory");
+        let error = store_in(&dir).values().expect_err("an unreadable index");
+        assert!(matches!(error, SecretError::ReadIndex { .. }), "{error}");
+        assert!(error.to_string().contains("secrets.json"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_index_is_an_error_naming_the_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(dir.path().join("secrets.json"), "{ not json").expect("write the index");
+        let store = store_in(&dir);
+        for error in [
+            store.values().expect_err("a malformed index"),
+            store
+                .session_values("session")
+                .expect_err("a malformed index"),
+            store.session_env("session").expect_err("a malformed index"),
+        ] {
+            assert!(matches!(error, SecretError::ParseIndex { .. }), "{error}");
+            assert!(error.to_string().contains("secrets.json"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_broken_index_is_never_overwritten() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("secrets.json");
+        std::fs::write(&path, "{ not json").expect("write the index");
+        let store = store_in(&dir);
+        store
+            .set("API_TOKEN", "value-123456")
+            .expect_err("storing needs a readable index");
+        store.remove("API_TOKEN").expect_err("removing needs one");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the index"),
+            "{ not json"
+        );
+        assert_eq!(store.get("API_TOKEN").expect("keychain read"), None);
+    }
+
+    #[test]
+    fn a_stored_secret_loads_and_a_broken_index_fails_the_load() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = store_in(&dir);
+        store.set("API_TOKEN", "value-123456").expect("store");
+        let config = crate::config::MayConfig::default();
+        let secrets = Secrets::load(&store, &config).expect("the index reads");
+        assert_eq!(secrets.names(), ["API_TOKEN"]);
+        std::fs::write(dir.path().join("secrets.json"), "{ not json").expect("corrupt the index");
+        assert!(Secrets::load(&store, &config).is_err());
+        assert!(Secrets::load_for_session(&store, &config, "session").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_redactor_fails_on_a_broken_index_instead_of_redacting_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let redactor = SecretRedactor::over(store_in(&dir), None);
+        assert!(redactor.current().await.is_ok());
+        std::fs::write(dir.path().join("secrets.json"), "{ not json").expect("write the index");
+        let error = redactor.current().await.expect_err("a malformed index");
+        assert!(error.to_string().contains("secrets.json"), "{error}");
     }
 
     #[test]

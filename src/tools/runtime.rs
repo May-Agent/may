@@ -246,11 +246,13 @@ pub enum HostProgram {
     /// The `heel` executable sandboxed commands launch through, always at the
     /// version of the `heel` library this crate links.
     Heel,
+    /// The `podman` client of the managed container runtime on macOS.
+    Podman,
 }
 
 impl HostProgram {
     /// Every host program a distribution can provide.
-    pub const ALL: [Self; 2] = [Self::RepoSearch, Self::Heel];
+    pub const ALL: [Self; 3] = [Self::RepoSearch, Self::Heel, Self::Podman];
 
     /// Name of the program's executable.
     #[must_use]
@@ -258,6 +260,7 @@ impl HostProgram {
         match self {
             Self::RepoSearch => "search",
             Self::Heel => "heel",
+            Self::Podman => "podman",
         }
     }
 

@@ -113,7 +113,9 @@ impl Fixture {
     }
 
     fn env(&self, session: &str) -> Vec<(String, String)> {
-        SessionEnv::new(self.store.clone(), session).env()
+        SessionEnv::new(self.store.clone(), session)
+            .env()
+            .expect("the stored secrets read")
     }
 
     /// Every byte the database files hold.
@@ -206,7 +208,8 @@ async fn a_secret_answer_is_stored_and_only_its_name_travels() {
     // does reach a tool result is replaced by the name for this session.
     let redactions = SecretRedactor::over(fixture.store.clone(), Some("session".to_string()))
         .current()
-        .await;
+        .await
+        .expect("the stored secrets read");
     assert_eq!(
         redactions.redact(&format!("echo {VALUE}")),
         format!("echo {NAME}")
@@ -265,7 +268,8 @@ async fn a_session_secret_stays_in_its_session_and_goes_with_it() {
 
     let other_redactions = SecretRedactor::over(fixture.store.clone(), Some("other".to_string()))
         .current()
-        .await;
+        .await
+        .expect("the stored secrets read");
     assert_eq!(
         other_redactions.redact(VALUE),
         VALUE,

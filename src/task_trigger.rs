@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use schemars::JsonSchema;
@@ -177,6 +177,46 @@ impl FromStr for TimeTriggerType {
             other => Err(format!(
                 "unsupported time trigger_type '{other}', expected '{TRIGGER_TYPE_ONCE}' or '{TRIGGER_TYPE_CRON}'"
             )),
+        }
+    }
+}
+
+impl TimeTriggerType {
+    /// The first time this trigger fires strictly after `after`: the first
+    /// cron match, or `run_at` for a one-time trigger.
+    ///
+    /// # Errors
+    /// Returns a message when the field the trigger needs is absent or does
+    /// not parse, or a cron schedule never fires again.
+    pub fn next_fire(
+        self,
+        cron_expression: Option<&str>,
+        run_at: Option<&str>,
+        after: jiff::Timestamp,
+    ) -> Result<jiff::Timestamp, String> {
+        match self {
+            Self::Once => {
+                let run_at = run_at.ok_or("a one-time task has no run_at")?;
+                jiff::Timestamp::from_str(run_at)
+                    .map_err(|error| format!("invalid run_at {run_at:?}: {error}"))
+            }
+            Self::Cron => {
+                let expression = cron_expression.ok_or("a cron task has no cron_expression")?;
+                let schedule = cron::Schedule::from_str(expression)
+                    .map_err(|error| format!("invalid cron expression {expression:?}: {error}"))?;
+                // Cron fires on whole seconds, so the fraction of `after`
+                // cannot move the first fire after it.
+                let after =
+                    chrono::DateTime::from_timestamp(after.as_second(), 0).ok_or_else(|| {
+                        format!("{after} is outside the range a cron schedule covers")
+                    })?;
+                let next = schedule
+                    .after(&after)
+                    .next()
+                    .ok_or_else(|| format!("cron expression {expression:?} never fires again"))?;
+                jiff::Timestamp::from_second(next.timestamp())
+                    .map_err(|error| format!("cron fire time out of range: {error}"))
+            }
         }
     }
 }
@@ -687,14 +727,22 @@ pub fn normalize_event_name(value: &str) -> Result<String, String> {
 
 /// Validate a cron expression; a 5-field expression is canonicalized to 6 fields with a leading `0` seconds field.
 ///
+/// A 5-field expression follows crontab weekday numbering (0-7, where 0 and 7 are Sunday), which is
+/// translated to the `cron` crate's 1-7 numbering starting at Sunday; weekday names and 6-field
+/// expressions keep the `cron` crate's meaning.
+///
 /// # Errors
-/// Returns a message when the field count is not 5 or 6, or the expression fails to parse.
+/// Returns a message when the field count is not 5 or 6, a numeric weekday is outside crontab's 0-7 or
+/// its range descends or its step is outside 1-7, or the expression fails to parse.
 pub fn normalize_cron_expression(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
-    let field_count = trimmed.split_whitespace().count();
-    let canonical = match field_count {
-        5 => format!("0 {trimmed}"),
-        6 => trimmed.to_string(),
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    let canonical = match fields.as_slice() {
+        [minute, hour, day, month, weekday] => {
+            let weekday = crontab_weekday_field(weekday)?;
+            format!("0 {minute} {hour} {day} {month} {weekday}")
+        }
+        [_, _, _, _, _, _] => trimmed.to_string(),
         _ => {
             return Err(
                 "cron_utc must contain 5 fields (minute-hour-day-month-weekday) or 6 fields (including seconds)"
@@ -705,6 +753,76 @@ pub fn normalize_cron_expression(value: &str) -> Result<String, String> {
     cron::Schedule::from_str(canonical.as_str())
         .map(|_| canonical)
         .map_err(|error| prefixed_error("invalid cron_utc expression: ", &error))
+}
+
+/// Rewrites a crontab weekday field into the `cron` crate's numbering as one explicit list.
+///
+/// Numeric items become the set of days they cover; items with names pass through unchanged, and
+/// anything else is left for the `cron` crate to reject.
+fn crontab_weekday_field(field: &str) -> Result<String, String> {
+    let mut passthrough = Vec::new();
+    let mut ordinals = BTreeSet::new();
+    for item in field.split(',') {
+        match crontab_weekday_item(item)? {
+            Some(days) => ordinals.extend(days.into_iter().map(|day| day % 7 + 1)),
+            None => passthrough.push(item.to_string()),
+        }
+    }
+    passthrough.extend(ordinals.iter().map(usize::to_string));
+    Ok(passthrough.join(","))
+}
+
+/// Crontab weekdays (0-7) a numeric item covers, or `None` when the item is not purely numeric.
+///
+/// Accepts `n`, `a-b`, and `*`, `?` and each of those with `/step`; a bare `n/step` runs from `n` to
+/// 7, as in the `cron` crate. A bare `*` or `?` is every day in both numberings and is not numeric.
+fn crontab_weekday_item(item: &str) -> Result<Option<Vec<usize>>, String> {
+    let (base, step) = match item.split_once('/') {
+        Some((base, step)) => (base, Some(step)),
+        None => (item, None),
+    };
+    let (start, end) = if matches!(base, "*" | "?") {
+        if step.is_none() {
+            return Ok(None);
+        }
+        (0, 6)
+    } else if let Some((start, end)) = base.split_once('-') {
+        match (ascii_number(start), ascii_number(end)) {
+            (Some(start), Some(end)) => (start, end),
+            (None, None) => return Ok(None),
+            // A number beside a name would be read in two numberings.
+            _ => {
+                return Err(format!(
+                    "invalid cron_utc expression: weekday range '{base}' mixes a number and a name"
+                ));
+            }
+        }
+    } else if let Some(day) = ascii_number(base) {
+        (day, if step.is_some() { 7 } else { day })
+    } else {
+        return Ok(None);
+    };
+    let step = match step {
+        None => 1,
+        Some(step) => match ascii_number(step) {
+            Some(step) => step,
+            None => return Ok(None),
+        },
+    };
+    if start > end || end > 7 || !(1..=7).contains(&step) {
+        return Err(format!(
+            "invalid cron_utc expression: weekday '{item}' must lie in 0-7 with an ascending range and a step of 1-7"
+        ));
+    }
+    Ok(Some((start..=end).step_by(step).collect()))
+}
+
+/// A non-empty run of ASCII digits as a number; `None` for anything else, overflow included.
+fn ascii_number(text: &str) -> Option<usize> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 fn normalize_time_trigger(
@@ -791,13 +909,35 @@ fn normalize_optional(value: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::str::FromStr;
+
+    use chrono::{Datelike, TimeZone, Utc};
 
     use super::{
         PersistedTaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerRequest,
-        TimeTriggerType, normalize_event_name, normalize_trigger, normalize_utc_timestamp,
-        webhook_path,
+        TimeTriggerType, normalize_cron_expression, normalize_event_name, normalize_trigger,
+        normalize_utc_timestamp, webhook_path,
     };
+
+    #[test]
+    fn next_fire_is_the_first_cron_match_after_the_instant() {
+        let after: jiff::Timestamp = "2026-11-11T10:30:00Z".parse().expect("timestamp");
+        let next = TimeTriggerType::Cron
+            .next_fire(Some("0 0 * * * *"), None, after)
+            .expect("hourly schedule fires");
+        assert_eq!(next.to_string(), "2026-11-11T11:00:00Z");
+        let once = TimeTriggerType::Once
+            .next_fire(None, Some("2020-01-01T00:00:00Z"), after)
+            .expect("one-time trigger");
+        assert_eq!(once.to_string(), "2020-01-01T00:00:00Z");
+        assert!(TimeTriggerType::Cron.next_fire(None, None, after).is_err());
+        assert!(
+            TimeTriggerType::Cron
+                .next_fire(Some("nonsense"), None, after)
+                .is_err()
+        );
+    }
 
     #[test]
     fn task_trigger_kind_parses_case_insensitive_values() {
@@ -1062,5 +1202,64 @@ mod tests {
         let err = normalize_utc_timestamp("2026-03-12T01:02:03+08:00")
             .expect_err("non-utc timestamp should fail");
         assert!(err.contains("ending with 'Z'"), "unexpected error: {err}");
+    }
+
+    /// Days of the week (0 = Sunday) the normalized schedule fires on, from a fixed Wednesday.
+    fn fire_weekdays(expression: &str) -> Vec<u32> {
+        let normalized = normalize_cron_expression(expression).expect("expression should parse");
+        let schedule = cron::Schedule::from_str(&normalized).expect("normalized form should parse");
+        let start = Utc
+            .with_ymd_and_hms(2026, 11, 11, 0, 0, 0)
+            .single()
+            .expect("fixed instant is valid");
+        let days: BTreeSet<u32> = schedule
+            .after(&start)
+            .take(40)
+            .map(|at| at.weekday().num_days_from_sunday())
+            .collect();
+        days.into_iter().collect()
+    }
+
+    #[test]
+    fn five_field_cron_weekday_one_fires_on_monday() {
+        assert_eq!(fire_weekdays("0 9 * * 1"), vec![1]);
+    }
+
+    #[test]
+    fn five_field_cron_sunday_as_zero_and_seven_fires_on_sunday() {
+        assert_eq!(fire_weekdays("0 9 * * 0"), vec![0]);
+        assert_eq!(fire_weekdays("0 9 * * 7"), vec![0]);
+    }
+
+    #[test]
+    fn five_field_cron_range_lists_and_steps_follow_crontab() {
+        assert_eq!(fire_weekdays("0 9 * * 1-5"), vec![1, 2, 3, 4, 5]);
+        assert_eq!(fire_weekdays("0 9 * * 5-7"), vec![0, 5, 6]);
+        assert_eq!(fire_weekdays("0 9 * * 0-7"), vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(fire_weekdays("0 9 * * 0,3,7"), vec![0, 3]);
+        assert_eq!(fire_weekdays("0 9 * * */2"), vec![0, 2, 4, 6]);
+        assert_eq!(fire_weekdays("0 9 * * 1-5/2"), vec![1, 3, 5]);
+        assert_eq!(fire_weekdays("0 9 * * *"), vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn five_field_cron_weekday_names_keep_their_meaning() {
+        assert_eq!(fire_weekdays("0 9 * * MON"), vec![1]);
+        assert_eq!(fire_weekdays("0 9 * * MON-FRI"), vec![1, 2, 3, 4, 5]);
+        assert_eq!(fire_weekdays("0 9 * * SUN,3"), vec![0, 3]);
+    }
+
+    #[test]
+    fn six_field_cron_keeps_the_cron_crate_weekday_numbering() {
+        assert_eq!(fire_weekdays("0 0 9 * * 1"), vec![0]);
+        assert_eq!(fire_weekdays("0 0 9 * * 2"), vec![1]);
+    }
+
+    #[test]
+    fn five_field_cron_rejects_weekday_outside_crontab_range() {
+        assert!(normalize_cron_expression("0 9 * * 8").is_err());
+        assert!(normalize_cron_expression("0 9 * * 5-1").is_err());
+        assert!(normalize_cron_expression("0 9 * * */0").is_err());
+        assert!(normalize_cron_expression("0 9 * * 1-FRI").is_err());
     }
 }
