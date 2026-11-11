@@ -18,11 +18,11 @@ runs:
       shell: bash
       run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
     - uses: dtolnay/rust-toolchain@stable
-    # Only dev saves; a PR or merge-group cache lives in a scope nothing else
-    # restores, and its size evicts dev's under the cache limit.
+    # Only main saves; a PR or merge-group cache lives in a scope nothing else
+    # restores, and its size evicts main's under the cache limit.
     - uses: Swatinem/rust-cache@v2
       with:
-        save-if: ${{ github.ref == 'refs/heads/dev' }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     # rust-cache prunes the files under target/tmp but keeps its directories,
     # so a restored cache holds an empty skeleton of the tests' shared tool
     # cache that the tests would take for a prepared one.
@@ -56,8 +56,8 @@ runs:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
         path: may-debug.tar.gz
         retention-days: 90
-    # The merge queue already tested the tree a push to dev lands, so that
-    # push only builds, to seed dev's caches; it still tests when the test
+    # The merge queue already tested the tree a push to main lands, so that
+    # push only builds, to seed main's caches; it still tests when the test
     # downloads missed, since the tests are what fetch them.
     - name: cargo test
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
@@ -69,7 +69,7 @@ runs:
       with:
         name: cargo-timings-${{ github.job }}
         path: target/cargo-timings/
-    - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/dev'
+    - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v4
       with:
         path: ${{ steps.downloads.outputs.tools-path }}
