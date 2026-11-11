@@ -15,7 +15,7 @@ use crate::daemon::state::DaemonState;
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest accepted suggestion, in Unicode scalar values.
 const SUGGESTION_MAX_CHARS: usize = 240;
-const PROMPT: &str = include_str!("../../../templates/aux/suggestion.md");
+const PROMPT: &str = include_str!("../../../templates/sidecar/suggestion.md");
 
 /// The user's predicted next message.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -26,7 +26,7 @@ struct GeneratedSuggestion {
     suggestion: Option<String>,
 }
 
-impl super::aux::AuxOutput for GeneratedSuggestion {
+impl super::sidecar::AuxOutput for GeneratedSuggestion {
     fn texts(&self) -> Vec<(&str, usize)> {
         self.suggestion
             .as_deref()
@@ -57,14 +57,14 @@ pub(super) fn suggestions_allowed(state: &DaemonState) -> bool {
 /// session's prompt cache is cold; an aux task already in flight is
 /// superseded.
 pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
-    if !suggestions_allowed(state) || super::aux::warm_cache(state, session_id).is_none() {
+    if !suggestions_allowed(state) || super::sidecar::warm_cache(state, session_id).is_none() {
         return;
     }
     let task_state = Arc::clone(state);
     let task_session = session_id.to_string();
     state.aux_tasks.start(
         session_id,
-        super::aux::AuxKind::Suggestion,
+        super::sidecar::AuxKind::Suggestion,
         |request_id| async move {
             let text = generate(&task_state, &task_session).await;
             // Only the task that still owns the session's slot publishes,
@@ -95,7 +95,7 @@ pub(super) fn apply_settings(state: &Arc<DaemonState>) {
     // Under the slot lock, so no in-flight result can follow the clearing.
     state
         .aux_tasks
-        .cancel_kind(super::aux::AuxKind::Suggestion, |_| {});
+        .cancel_kind(super::sidecar::AuxKind::Suggestion, |_| {});
     state
         .turn_hub
         .publish_to_subscribed("session_suggestion", |session_id| {
@@ -112,7 +112,7 @@ pub(super) fn cancel(state: &Arc<DaemonState>, session_id: &str) {
 }
 
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<String> {
-    let mut messages = match super::aux::context_messages(state, session_id).await {
+    let mut messages = match super::sidecar::context_messages(state, session_id).await {
         Ok(messages) => messages,
         Err(error) => {
             tracing::warn!(%session_id, %error, "suggestion: reading the agent context failed");
@@ -120,7 +120,7 @@ async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<String> 
         }
     };
     messages.push(aither_core::llm::Message::user(PROMPT));
-    match super::aux::generate::<GeneratedSuggestion>(
+    match super::sidecar::generate::<GeneratedSuggestion>(
         state,
         session_id,
         messages,
@@ -169,7 +169,7 @@ fn publish(
 
 #[cfg(test)]
 mod tests {
-    use super::super::aux::{AuxError, generate_with, test_support::Replying};
+    use super::super::sidecar::{AuxError, generate_with, test_support::Replying};
     use super::*;
 
     async fn suggestion_from(reply: &'static str) -> Result<GeneratedSuggestion, AuxError> {
