@@ -98,12 +98,7 @@ impl Host {
 
     async fn ask(&self, question: &str) -> Result<super::BtwAnswer, AgentLinkError> {
         self.messaging
-            .btw(
-                ASKER,
-                RECIPIENT,
-                question,
-                self.asker_terminal.binding().launcher(),
-            )
+            .btw(ASKER, RECIPIENT, question, self.asker_terminal.shell())
             .await
     }
 

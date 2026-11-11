@@ -7,9 +7,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AnswerValue, AskUserArgs, AskUserRequest, AskUserRequestPayload};
-use aither_agent::workspace_request::RequestWorkspaceArgs;
-use aither_sandbox::TerminalMode;
+use crate::harness::ask_user::{AnswerValue, AskUserArgs, AskUserRequest, AskUserRequestPayload};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
+use aither_sandbox::SandboxMode;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -134,7 +134,7 @@ impl Prompt for Permission {
         let runtime = runtime.clone();
         tokio::spawn(async move {
             let accepted = approver
-                .request_and_wait(TerminalMode::Unsafe, "make install".to_string())
+                .request_and_wait(SandboxMode::Unsandboxed, "make install".to_string())
                 .await
                 .expect("the waiter is woken with a decision");
             observe(&runtime, Self::RESPONSE_ROLE, accepted).await
@@ -266,7 +266,7 @@ impl Prompt for Question {
         self.0
             .resolve(
                 id,
-                vec![aither_agent::ask_user::QuestionAnswer {
+                vec![crate::harness::ask_user::QuestionAnswer {
                     section: String::new(),
                     answer: AnswerValue::Selected(vec![answer.to_string()]),
                 }],
@@ -444,8 +444,8 @@ prompt_tests! {
     ask_user => Question,
 }
 
-fn answer(value: &str) -> Vec<aither_agent::ask_user::QuestionAnswer> {
-    vec![aither_agent::ask_user::QuestionAnswer {
+fn answer(value: &str) -> Vec<crate::harness::ask_user::QuestionAnswer> {
+    vec![crate::harness::ask_user::QuestionAnswer {
         section: String::new(),
         answer: AnswerValue::Selected(vec![value.to_string()]),
     }]
@@ -525,7 +525,7 @@ async fn only_selecting_the_allow_option_approves_a_late_answer() {
             .0
             .resolve(
                 &id,
-                vec![aither_agent::ask_user::QuestionAnswer {
+                vec![crate::harness::ask_user::QuestionAnswer {
                     section: String::new(),
                     answer: AnswerValue::Custom(typed.to_string()),
                 }],
@@ -723,7 +723,7 @@ async fn an_approved_workspace_request_persists_and_grants_the_dir() {
     let config_path = may_dir.path().join("workspace.toml");
     std::fs::write(&config_path, "").expect("workspace.toml");
     let approved_dir = tempfile::tempdir().expect("approved dir");
-    let grants = aither_sandbox::TerminalGrants::new();
+    let grants = aither_sandbox::Grants::new();
     fixture
         .runtime
         .set_terminal_grants("session", grants.clone());
@@ -782,7 +782,7 @@ async fn a_denied_workspace_request_grants_nothing() {
     let config_path = may_dir.path().join("workspace.toml");
     std::fs::write(&config_path, "").expect("workspace.toml");
     let denied_dir = tempfile::tempdir().expect("denied dir");
-    let grants = aither_sandbox::TerminalGrants::new();
+    let grants = aither_sandbox::Grants::new();
     fixture
         .runtime
         .set_terminal_grants("session", grants.clone());
@@ -840,7 +840,7 @@ async fn an_approval_with_an_unresolvable_path_leaves_the_request_pending() {
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
     std::fs::write(&config_path, "").expect("workspace.toml");
-    let grants = aither_sandbox::TerminalGrants::new();
+    let grants = aither_sandbox::Grants::new();
     fixture
         .runtime
         .set_terminal_grants("session", grants.clone());
@@ -987,7 +987,7 @@ async fn forgetting_terminal_grants_removes_the_handle() {
         UiEventBus::new(),
         crate::session::MayHomePaths::new(dir.path().join("home")),
     );
-    runtime.set_terminal_grants("session", aither_sandbox::TerminalGrants::new());
+    runtime.set_terminal_grants("session", aither_sandbox::Grants::new());
     assert!(runtime.terminal_grants("session").is_some());
     runtime.forget_terminal_grants("session");
     assert!(

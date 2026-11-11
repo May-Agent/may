@@ -1,121 +1,138 @@
 //! Agent-runtime hooks wired onto [`super::may::MayAgent`].
 //!
-//! [`PendingSteerHook`] watches the persisted session-runtime state
-//! for a queued "immediate" user message and ends the current agent
-//! turn the moment one appears, so steering messages take effect
-//! without waiting for the model to finish the current reasoning loop.
+//! [`MayHooks`] is the one [`Hooks`] value an agent is built with. Its parts:
 //!
-//! [`ContextSnapshotHook`] runs on every aither checkpoint event and
-//! writes the checkpoint payload to SQLite so the session can be
-//! resumed after a restart. Both hooks are no-ops when the agent was
-//! created without a live [`SessionRuntimeService`] (for example in
-//! exec mode). The snapshot is a run-scoped commit, fenced by the lease of
-//! the run in this process; the steer hook also ends the turn of a run that
-//! lost its lease.
-
-use aither_agent::{
-    CheckpointContext, Hook, PostToolAction, ToolResultContext, TurnBoundaryAction,
-    TurnBoundaryContext,
-};
+//! - the pending-steer check ends the current agent turn the moment the
+//!   persisted session-runtime state holds a queued "immediate" user message,
+//!   so steering takes effect without waiting for the model to finish the
+//!   current reasoning loop; it is a no-op when the agent was created without
+//!   a live [`SessionRuntimeService`] (for example in exec mode);
+//! - secret redaction replaces stored secret values in every tool result
+//!   with the secret's name before the agent commits it, so the session
+//!   context, the persisted history and the published events only ever carry
+//!   the name;
+//! - the park rule ends a run whose turn only re-read unchanged output while
+//!   background commands still run: another request would read the same
+//!   output again, and only a background event can say something new.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use aither_agent::{AfterTool, Hooks, ToolOutcome, TurnBoundaryAction, TurnBoundaryContext};
+use aither_sandbox::{JobStatus, Jobs, Refused, UnchangedRead};
+
+use crate::command_policy::RefusedReads;
+use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionRuntimeService};
 
-/// Ends the current agent turn when the host-side session runtime
-/// reports a pending user message waiting to steer the conversation.
+/// What a May agent decides at the loop's control points.
 #[derive(Debug, Clone)]
-pub(super) struct PendingSteerHook {
+pub(super) struct MayHooks {
     runtime: Option<Arc<SessionRuntimeService>>,
     session_id: String,
+    redactor: SecretRedactor,
+    refused: RefusedReads,
+    jobs: Jobs,
+    /// The `compact` tool's valve: a request it holds ends the turn.
+    valve: Arc<CompactSignal>,
+    /// Set when the valve ended a turn for a compaction; the runner takes it.
+    compaction: Arc<AtomicBool>,
 }
 
-impl PendingSteerHook {
-    pub(super) fn new(runtime: Option<Arc<SessionRuntimeService>>, session_id: &SessionId) -> Self {
+impl MayHooks {
+    pub(super) fn new(
+        runtime: Option<Arc<SessionRuntimeService>>,
+        session_id: &SessionId,
+        redactor: SecretRedactor,
+        refused: RefusedReads,
+        jobs: Jobs,
+        valve: Arc<CompactSignal>,
+        compaction: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             runtime,
             session_id: session_id.as_str().to_string(),
+            redactor,
+            refused,
+            jobs,
+            valve,
+            compaction,
         }
     }
-}
 
-impl Hook for PendingSteerHook {
-    async fn on_turn_boundary(&self, _ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
+    /// Whether the persisted runtime holds a user message waiting to steer
+    /// the conversation.
+    async fn steer_pending(&self) -> bool {
         let Some(service) = &self.runtime else {
-            return TurnBoundaryAction::Continue;
+            return false;
         };
         let Ok(runtime) = service.db().get_session_runtime(&self.session_id).await else {
             tracing::warn!(
                 session_id = %self.session_id,
                 "failed to inspect runtime for steer boundary"
             );
-            return TurnBoundaryAction::Continue;
+            return false;
         };
-        if runtime.is_some_and(|summary| summary.has_pending_immediate()) {
-            TurnBoundaryAction::EndTurn
-        } else {
-            TurnBoundaryAction::Continue
+        runtime.is_some_and(|summary| summary.has_pending_immediate())
+    }
+
+    /// Whether every call of the turn re-read unchanged output.
+    ///
+    /// Every outcome is asked, so no refused call stays on the record.
+    fn only_unchanged_reads(&self, outcomes: &[ToolOutcome]) -> bool {
+        outcomes
+            .iter()
+            .map(|outcome| {
+                let refused = self.refused.take(&outcome.call);
+                let polled =
+                    outcome.result.as_ref().err().is_some_and(|error| {
+                        error.downcast_ref::<Refused<UnchangedRead>>().is_some()
+                    });
+                refused || polled
+            })
+            .fold(!outcomes.is_empty(), |all, unchanged| all && unchanged)
+    }
+}
+
+impl Hooks for MayHooks {
+    async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
+        if outcome.name != COMPACT_TOOL_NAME {
+            self.valve.acted();
         }
-    }
-}
-
-/// Replaces stored secret values in every tool result with the secret's
-/// name before the agent commits it, so the session context, the persisted
-/// history and the published events only ever carry the name.
-#[derive(Debug, Clone)]
-pub(super) struct SecretRedactionHook {
-    redactor: SecretRedactor,
-}
-
-impl SecretRedactionHook {
-    pub(super) const fn new(redactor: SecretRedactor) -> Self {
-        Self { redactor }
-    }
-}
-
-impl Hook for SecretRedactionHook {
-    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
         let redactions = self.redactor.current().await;
-        let mut result = ctx.result.clone();
+        let shown = outcome.for_model();
+        let mut result = shown.clone();
         redactions.redact_tool_result(&mut result);
-        if result == *ctx.result {
-            PostToolAction::Keep
+        if result == shown {
+            AfterTool::Keep
         } else {
-            PostToolAction::Replace(result)
+            AfterTool::Replace(result)
         }
     }
-}
 
-/// Persists aither checkpoint payloads into session storage so the
-/// session can be resumed after a restart.
-#[derive(Debug, Clone)]
-pub(super) struct ContextSnapshotHook {
-    runtime: Option<Arc<SessionRuntimeService>>,
-    session_id: String,
-}
-
-impl ContextSnapshotHook {
-    pub(super) fn new(runtime: Option<Arc<SessionRuntimeService>>, session_id: &SessionId) -> Self {
-        Self {
-            runtime,
-            session_id: session_id.as_str().to_string(),
+    async fn on_turn_boundary(&self, cx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
+        if self.steer_pending().await {
+            return TurnBoundaryAction::EndTurn;
         }
-    }
-}
-
-impl Hook for ContextSnapshotHook {
-    async fn on_checkpoint(&self, ctx: &CheckpointContext<'_>) -> Option<String> {
-        let service = self.runtime.as_ref()?;
-        let Some(fence) = service.runs().live_fence(&self.session_id) else {
-            return Some(format!(
-                "session {} checkpointed outside a run lease",
-                self.session_id
-            ));
-        };
-        match crate::session::persist_checkpoint_from_hook(&service.db(), &fence, ctx).await {
-            Ok(()) => None,
-            Err(error) => Some(error.to_string()),
+        if self.valve.take_request() {
+            self.compaction.store(true, Ordering::Release);
+            return TurnBoundaryAction::EndTurn;
         }
+        if self.only_unchanged_reads(cx.outcomes)
+            && self
+                .jobs
+                .list()
+                .await
+                .iter()
+                .any(|job| job.status == JobStatus::Running)
+        {
+            tracing::info!(
+                turn = cx.turn,
+                "every call re-read unchanged output; parking the run until background work reports"
+            );
+            return TurnBoundaryAction::EndTurn;
+        }
+        TurnBoundaryAction::Continue
     }
 }

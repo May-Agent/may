@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
+use crate::harness::ask_user::{AnswerValue, QuestionAnswer};
 use aither_core::llm::{Tool, ToolContext};
 use tempfile::TempDir;
 
@@ -19,8 +19,8 @@ use crate::agent::ask_user_tool::{
     WithdrawAskUserTool,
 };
 use crate::db::ChatDb;
+use crate::harness::working_document::BlockerResolver;
 use crate::ui_event_bus::UiEventBus;
-use aither_agent::BlockerResolver;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
@@ -134,12 +134,20 @@ async fn an_answer_clears_the_marks_naming_it_and_names_the_rows() {
         tasks.parent().expect("a session directory"),
         service.task_events("session"),
     );
-    aither_agent::ContextSource::on_request(&mut document, false).await;
-    let alert = aither_agent::ContextSource::on_tool_turn_end(&mut document).await;
+    aither_agent::ContextSource::blocks(
+        &mut document,
+        aither_agent::Moment::Request { reassembled: false },
+    )
+    .await;
+    let alert =
+        aither_agent::ContextSource::blocks(&mut document, aither_agent::Moment::ToolTurnEnd).await;
     assert!(
-        alert.is_none(),
+        alert.is_empty(),
         "{:?}",
-        alert.map(|a| a.content().to_string())
+        alert
+            .iter()
+            .map(|block| block.block().content().to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -323,16 +331,23 @@ async fn an_answer_is_recorded_on_the_session_tasks_inbox() {
     .expect("tasks.md");
     let mut tasks =
         crate::tasks_md::schema::working_document(sandbox.path(), service.task_events("session"));
-    aither_agent::ContextSource::on_request(&mut tasks, false).await;
-    let alert = aither_agent::ContextSource::on_tool_turn_end(&mut tasks)
+    aither_agent::ContextSource::blocks(
+        &mut tasks,
+        aither_agent::Moment::Request { reassembled: false },
+    )
+    .await;
+    let alert = aither_agent::ContextSource::blocks(&mut tasks, aither_agent::Moment::ToolTurnEnd)
         .await
+        .into_iter()
+        .next()
         .expect("the row waiting on it is told");
     assert!(
         alert
+            .block()
             .content()
             .contains(&format!("Question {asked} was answered")),
         "{}",
-        alert.content()
+        alert.block().content()
     );
 }
 

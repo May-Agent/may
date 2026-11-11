@@ -10,8 +10,7 @@
 //! variant cares about. Each projection is `Option<String>` — `None` when
 //! the field hasn't streamed in yet, `Some(value)` once readable.
 
-use aither_sandbox::TerminalArgs;
-use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalDeltaArgs};
+use aither_sandbox::{JobInputArgs, JobKillArgs, JobReadArgs, ShellArgs};
 use partial_json_fixer::fix_json;
 use serde_json::Value;
 
@@ -94,10 +93,10 @@ fn arguments_error(arguments: &str, variant: ToolVariant) -> Option<String> {
             .map(|error| error.to_string())
     }
     match variant {
-        ToolVariant::Terminal => check::<TerminalArgs>(arguments),
-        ToolVariant::TerminalInput => check::<InputTerminalArgs>(arguments),
-        ToolVariant::TerminalKill => check::<KillTerminalArgs>(arguments),
-        ToolVariant::TerminalRead => check::<ReadTerminalDeltaArgs>(arguments),
+        ToolVariant::Terminal => check::<ShellArgs>(arguments),
+        ToolVariant::TerminalInput => check::<JobInputArgs>(arguments),
+        ToolVariant::TerminalKill => check::<JobKillArgs>(arguments),
+        ToolVariant::TerminalRead => check::<JobReadArgs>(arguments),
         _ => None,
     }
 }

@@ -21,7 +21,7 @@
 use std::future::Future;
 use std::ops::ControlFlow;
 
-use aither_agent::{CompactResult, TimedEvent};
+use aither_agent::{AgentEvent, CompactResult, TimedEvent};
 use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
@@ -94,6 +94,14 @@ pub enum TuiEvent {
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
     Retract,
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it, marked as translated.
+    ReplyTranslated {
+        /// The reply translated into the communication language.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
+    },
     /// The daemon withdrew the turn: it was stopped before any tool call or
     /// response text, so its message left the conversation.
     Withdrawn {
@@ -203,15 +211,15 @@ pub(crate) enum WorkerCommand {
 pub struct AgentWorker {
     /// Sender for commands to the worker.
     command_tx: Sender<WorkerCommand>,
-    /// Background-job registry shared with the session's terminal tool;
-    /// `None` when the agent runs in the daemon.
-    job_registry: Option<aither_sandbox::JobRegistry>,
+    /// The session's background jobs, shared with its shell; `None` when the
+    /// agent runs in the daemon.
+    jobs: Option<aither_sandbox::Jobs>,
     /// Registry of in-flight `subagent` command runs; `None` when the agent
     /// runs in the daemon.
-    subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
+    subagent_runs: Option<aither_agent::SubagentRuns>,
     /// The agent's own language guard; `None` when the agent runs in the
     /// daemon.
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     /// The agent's prompt-cache entry; `None` when the agent runs in the
     /// daemon.
     warmth: Option<aither_agent::CacheWarmth>,
@@ -420,15 +428,15 @@ impl AgentWorker {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
     }
 
-    /// Registry of background terminal jobs for this worker's session.
+    /// The background terminal jobs of this worker's session.
     #[must_use]
-    pub const fn job_registry(&self) -> Option<&aither_sandbox::JobRegistry> {
-        self.job_registry.as_ref()
+    pub const fn jobs(&self) -> Option<&aither_sandbox::Jobs> {
+        self.jobs.as_ref()
     }
 
     /// Registry of in-flight subagent runs — list or cancel them.
     #[must_use]
-    pub const fn subagent_runs(&self) -> Option<&aither_agent::specialized::SubagentRuns> {
+    pub const fn subagent_runs(&self) -> Option<&aither_agent::SubagentRuns> {
         self.subagent_runs.as_ref()
     }
 
@@ -467,7 +475,7 @@ impl AgentWorker {
     /// The communication and working languages the agent was configured
     /// with.
     #[must_use]
-    pub fn languages(&self) -> Option<aither_agent::Languages> {
+    pub fn languages(&self) -> Option<crate::harness::language::Languages> {
         self.languages.as_ref().map(|guard| *guard.languages())
     }
 
@@ -486,7 +494,7 @@ impl AgentWorker {
     ) -> Self {
         Self {
             command_tx,
-            job_registry: None,
+            jobs: None,
             subagent_runs: None,
             languages: None,
             warmth: None,
@@ -575,7 +583,7 @@ pub fn spawn_worker<E: Executor + 'static>(
 #[derive(Debug)]
 pub struct BackgroundWakes {
     /// Receives each wake that needs the model.
-    pub wakes: Sender<aither_agent::BackgroundWake>,
+    pub wakes: Sender<super::BackgroundWake>,
     /// The worker starts waiting on background commands once this fires.
     pub released: crate::session::RunReleased,
 }
@@ -592,7 +600,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     compactions: Option<Sender<CompactionPhase>>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
-    let job_registry = agent.job_registry();
+    let jobs = agent.jobs();
     let subagent_runs = agent.subagent_runs();
     let languages = agent.language_guard();
     let warmth = agent.cache_warmth();
@@ -612,7 +620,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
 
     AgentWorker {
         command_tx,
-        job_registry: Some(job_registry),
+        jobs: Some(jobs),
         subagent_runs: Some(subagent_runs),
         languages: Some(languages),
         warmth: Some(warmth),
@@ -674,6 +682,7 @@ async fn run_worker(
                     &command_rx,
                     &command_tx,
                     &event_tx,
+                    &reporter(),
                 ))
                 .await;
                 if matches!(outcome, WorkOutcome::Shutdown) {
@@ -853,6 +862,8 @@ async fn next_command(
                 {
                     let _ = background.wakes.try_send(wake);
                 }
+                // A wake that starts nothing drops its completions here: the
+                // agent has them in its context, and they are taken.
             }
             IdleStep::Compact => {
                 if let Some(command) =
@@ -874,7 +885,7 @@ enum IdleStep {
     /// The prompt-cache refresh is due.
     KeepWarm,
     /// A detached background command finished or raised an alert.
-    Background(aither_agent::BackgroundWake),
+    Background(super::BackgroundWake),
 }
 
 /// How one idle refresh of the prompt cache ended.
@@ -1117,6 +1128,7 @@ async fn run_agent_prompt(
     command_rx: &Receiver<WorkerCommand>,
     command_tx: &Sender<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
+    reporter: &CompactionReporter,
 ) -> WorkOutcome<()> {
     let PromptRun {
         prompt,
@@ -1126,24 +1138,44 @@ async fn run_agent_prompt(
     } = run;
     agent.sync_runtime_context().await;
     let run = agent.run_with_hidden_context(&prompt, hidden_context.as_deref(), attachments);
+    let checkpoints = run.checkpoints();
+    let fence = &lease.fence;
     // The run stops between events on the lease's cancellation; a cancel
-    // command drops it where it stands.
+    // command drops it where it stands. Each checkpoint the run records is
+    // persisted before the event reaches the TUI, which releases the lease on
+    // `Complete`: a snapshot written after that would be refused.
     let driven = run.drive(
         event_tx,
         async {
             let _ = lease.cancellation.recv().await;
             PromptStop::Stopped
         },
-        |event_tx, timed| async move {
-            if event_tx.send(TuiEvent::Agent(Ok(timed))).await.is_err() {
-                ControlFlow::Break(PromptStop::ReceiverGone)
-            } else {
-                ControlFlow::Continue(event_tx)
+        |event_tx, timed| {
+            let checkpoints = &checkpoints;
+            async move {
+                if matches!(timed.event, AgentEvent::Checkpoint { .. })
+                    && let Err(error) =
+                        crate::session::persist_run_checkpoint(snapshot_db, fence, checkpoints)
+                            .await
+                {
+                    tracing::warn!(session_id = %fence.session_id, %error, "failed to persist the context snapshot");
+                }
+                if event_tx.send(TuiEvent::Agent(Ok(timed))).await.is_err() {
+                    ControlFlow::Break(PromptStop::ReceiverGone)
+                } else {
+                    ControlFlow::Continue(event_tx)
+                }
             }
         },
     );
     match race_against_commands(driven, command_rx, command_tx).await {
-        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {}
+        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {
+            // The `compact` tool ended the turn for a compaction: it runs
+            // before the lease is released, so its snapshot is accepted.
+            if let Err(error) = agent.compact_requested(snapshot_db, fence, reporter).await {
+                tracing::error!(session_id = %fence.session_id, %error, "the requested compaction failed");
+            }
+        }
         WorkOutcome::Finished(Err(error)) => {
             let _ = event_tx.send(TuiEvent::Agent(Err(error))).await;
         }
@@ -1165,7 +1197,6 @@ async fn run_agent_prompt(
             return WorkOutcome::Shutdown;
         }
     }
-    persist_snapshot(snapshot_db, &lease.fence, agent).await;
     let _ = event_tx.send(TuiEvent::Complete).await;
     WorkOutcome::Finished(())
 }
@@ -1228,11 +1259,19 @@ mod tests {
                         .next()
                         .is_some_and(|line| line.contains("/models"))
                     {
-                        let _ = socket
-                            .write_all(
-                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                            )
-                            .await;
+                        let body = serde_json::json!({
+                            "data": [{
+                                "id": crate::agent::idle_compaction_tests::SESSION_MODEL,
+                                "owned_by": "stub",
+                                "context_length": 128_000
+                            }]
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
                         return;
                     }
                     let _ = request_tx.send(()).await;
@@ -1242,24 +1281,20 @@ mod tests {
             }
         });
 
-        let llm = crate::agent::ModelSlot::new(
-            crate::agent::RedactedModel::new(
-                aither_cloud::CloudProvider::OpenAI(
-                    aither_cloud::openai::OpenAI::builder("test-key")
-                        .base_url(format!("http://{addr}"))
-                        .model("gpt-5")
-                        .no_retry()
-                        .build(),
-                ),
-                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
-            ),
-            aither_core::llm::model::Parameters::default(),
-        );
-        let (mut agent, temp) = crate::agent::may::test_agent(llm, "openai", "gpt-5").await;
+        let server = crate::agent::idle_compaction_tests::StubModel {
+            base_url: format!("http://{addr}"),
+            requests: std::sync::Arc::default(),
+        };
+        let session = crate::agent::idle_compaction_tests::Session::start(
+            &crate::agent::idle_compaction_tests::saved_config(&server, None),
+        )
+        .await;
+        let temp = session.temp.path().to_path_buf();
+        let mut agent = session.agent;
         agent.push_message(aither_core::llm::Message::user("first turn"));
         agent.push_message(aither_core::llm::Message::assistant("first answer"));
 
-        let db = crate::db::ChatDb::open(&temp.path().join("worker.db"))
+        let db = crate::db::ChatDb::open(&temp.join("worker.db"))
             .await
             .expect("open worker db");
         let runs =

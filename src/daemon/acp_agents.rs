@@ -53,7 +53,7 @@ pub(super) enum ConnectError {
     #[error("the trial session could not be prepared: {0}")]
     Scratch(std::io::Error),
     #[error("the sandbox's heel could not be prepared: {0}")]
-    Heel(aither_sandbox::ToolRuntimeError),
+    Heel(crate::tools::ToolRuntimeError),
     #[error("the connection could not be saved: {0}")]
     Save(ConfigError),
 }

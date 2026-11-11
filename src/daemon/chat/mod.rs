@@ -121,12 +121,7 @@ trait ChatSink {
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
     /// Every agent event of the run, as the agent emitted it, with the
     /// model's context window.
-    fn on_agent_event(
-        &mut self,
-        _event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
-        _context_window: Option<u32>,
-    ) {
-    }
+    fn on_agent_event(&mut self, _event: &aither_agent::TimedEvent, _context_window: Option<u32>) {}
     fn on_start(
         &mut self,
         session_id: &str,
@@ -136,6 +131,10 @@ trait ChatSink {
     fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
     /// The reply just streamed was not in the communication language:
     /// `text` is its translation, shown instead and marked as translated.
+    #[expect(
+        dead_code,
+        reason = "the redesigned loop has no reply-translation step to call it yet"
+    )]
     fn on_reply_translated(
         &mut self,
         _text: &str,
@@ -307,6 +306,10 @@ impl HubSink {
 /// turn just streamed; the streamed text stays its original.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    dead_code,
+    reason = "the redesigned loop has no reply-translation step to emit it yet"
+)]
 struct SseTranslatedEvent<'a> {
     seq: u64,
     turn_id: &'a str,
@@ -396,18 +399,20 @@ impl ChatSink for HubSink {
         });
     }
 
-    fn on_agent_event(
-        &mut self,
-        event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
-        context_window: Option<u32>,
-    ) {
-        if let Ok(event) = event
-            && let Some(phase) = crate::client::CompactionPhase::from_event(event)
-        {
+    fn on_agent_event(&mut self, timed: &aither_agent::TimedEvent, context_window: Option<u32>) {
+        if let Some(phase) = crate::client::CompactionPhase::from_event(&timed.event) {
             hosts::publish_compaction(&self.hub, &self.session_id, phase);
         }
-        if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
-            self.publish_agent(crate::client::SessionAgentBody::Agent { event });
+        self.publish_agent(crate::client::SessionAgentBody::Agent {
+            event: timed.clone(),
+        });
+        if let Some(tokens) = context_window
+            && matches!(
+                timed.event,
+                aither_agent::AgentEvent::RequestEnded { usage: Some(_), .. }
+            )
+        {
+            self.publish_agent(crate::client::SessionAgentBody::ContextWindow { tokens });
         }
     }
 
@@ -437,6 +442,10 @@ impl ChatSink for HubSink {
                 language_name: &language_name,
             },
         );
+        self.publish_agent(crate::client::SessionAgentBody::ReplyTranslated {
+            text: text.to_owned(),
+            language: language.to_owned(),
+        });
         true
     }
 
@@ -1915,17 +1924,68 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
 /// Answers each request on `queue` with `handler`'s result until the queue
 /// closes. A request whose handler panics is dropped unanswered, so its
 /// caller sees the closed reply channel, and the next request is served.
-async fn dispatch_requests<Args: Clone, Response, Fut: Future<Output = Response>>(
+async fn dispatch_requests<Queue: RequestQueue, Fut: Future<Output = Queue::Response>>(
     worker: &'static str,
-    queue: aither_agent::tool_request::ToolRequestQueue<Args, Response>,
-    handler: impl Fn(Args) -> Fut,
+    queue: Queue,
+    handler: impl Fn(Queue::Args) -> Fut,
 ) {
-    while let Some(request) = queue.next().await {
-        if let Some(result) =
-            crate::panic_boundary::round(worker, handler(request.args.clone())).await
-        {
-            let _ = request.respond(result);
+    while let Some(request) = queue.next_request().await {
+        if let Some(result) = crate::panic_boundary::round(worker, handler(request.args)).await {
+            (request.reply)(result);
         }
+    }
+}
+
+/// A request waiting on a queue, and how it is answered.
+struct QueuedRequest<Args, Response> {
+    args: Args,
+    reply: Box<dyn FnOnce(Response) + Send>,
+}
+
+/// A queue of tool requests, May's own or the browser crate's, which each
+/// define the same one.
+trait RequestQueue {
+    type Args;
+    type Response;
+
+    /// Waits for the next request; `None` once every broker is gone.
+    fn next_request(
+        &self,
+    ) -> impl Future<Output = Option<QueuedRequest<Self::Args, Self::Response>>>;
+}
+
+impl<Args: Clone + Send + 'static, Response: Send + 'static> RequestQueue
+    for crate::harness::tool_request::ToolRequestQueue<Args, Response>
+{
+    type Args = Args;
+    type Response = Response;
+
+    async fn next_request(&self) -> Option<QueuedRequest<Args, Response>> {
+        let request = self.next().await?;
+        Some(QueuedRequest {
+            args: request.args.clone(),
+            reply: Box::new(move |response| {
+                let _ = request.respond(response);
+            }),
+        })
+    }
+}
+
+impl RequestQueue for crate::agent::browser_tool::BrowserQueue {
+    type Args = crate::agent::browser_tool::BrowserRequest;
+    type Response = Result<
+        crate::agent::browser_tool::BrowserResult,
+        crate::agent::browser_tool::BrowserToolError,
+    >;
+
+    async fn next_request(&self) -> Option<QueuedRequest<Self::Args, Self::Response>> {
+        let request = self.next().await?;
+        Some(QueuedRequest {
+            args: request.args.clone(),
+            reply: Box::new(move |response| {
+                let _ = request.respond(response);
+            }),
+        })
     }
 }
 
@@ -1937,7 +1997,43 @@ struct TurnRun<'r> {
     /// Set once a retry follows tool activity: the attempt continues the
     /// committed transcript instead of resubmitting the prompt.
     continue_from_transcript: bool,
-    attempt: usize,
+}
+
+/// What the handler of a turn's run works on: the turn, the facts of the
+/// session's jobs not yet shown, and the run's checkpoints.
+struct TurnStep<'a, 't, 's, S> {
+    turn: &'a mut turn_events::TurnEvents<'t, 's, S>,
+    facts: async_channel::Receiver<crate::agent::JobFact>,
+    checkpoints: aither_agent::Checkpoints,
+}
+
+/// The handler [`aither_agent::Run::drive`] calls with each event of a
+/// turn's run: the job facts the agent read before it are shown first, and a
+/// checkpoint is persisted before its event is handled, so a crash mid-run
+/// loses no completed turn.
+async fn step_turn<'a, 't, 's, S: ChatSink>(
+    step: TurnStep<'a, 't, 's, S>,
+    timed: aither_agent::TimedEvent,
+) -> ControlFlow<turn_events::TurnStop, TurnStep<'a, 't, 's, S>> {
+    while let Ok(fact) = step.facts.try_recv() {
+        if let ControlFlow::Break(stop) = step.turn.job_fact(fact).await {
+            return ControlFlow::Break(stop);
+        }
+    }
+    if matches!(timed.event, aither_agent::AgentEvent::Checkpoint { .. })
+        && let Err(error) = crate::session::persist_run_checkpoint(
+            &step.turn.state.db(),
+            step.turn.guard.fence(),
+            &step.checkpoints,
+        )
+        .await
+    {
+        return ControlFlow::Break(turn_events::TurnStop::Persist(error));
+    }
+    match step.turn.handle(timed).await {
+        ControlFlow::Continue(()) => ControlFlow::Continue(step),
+        ControlFlow::Break(halt) => ControlFlow::Break(halt),
+    }
 }
 
 /// Runs one attempt of a turn on `agent`, handing each event to `turn`
@@ -1953,29 +2049,26 @@ async fn drive_turn<S: ChatSink>(
     let stop = async {
         turn_events::TurnStop::Cancelled(cancellation_reason_of(&guard.cancellation().recv().await))
     };
+    let facts = agent.job_facts();
     let driven = match kind {
         TurnKind::Prompt if !run.continue_from_transcript => {
-            agent
-                .run_with_hidden_context(run.prompt, run.hidden_context, run.attachments)
-                .drive(&mut *turn, stop, turn_events::step)
-                .await
+            let run =
+                agent.run_with_hidden_context(run.prompt, run.hidden_context, run.attachments);
+            let handler = TurnStep {
+                turn: &mut *turn,
+                facts,
+                checkpoints: run.checkpoints(),
+            };
+            run.drive(handler, stop, step_turn).await
         }
-        TurnKind::Prompt | TurnKind::Resume(_) => {
-            // The wake events reach clients with the first attempt only; a
-            // retry would show them twice.
-            if let TurnKind::Resume(wake_events) = kind
-                && run.attempt == 0
-            {
-                for timed in wake_events.iter().cloned() {
-                    if let ControlFlow::Break(stop) = turn.handle(timed).await {
-                        return Err(stop);
-                    }
-                }
-            }
-            agent
-                .resume()
-                .drive(&mut *turn, stop, turn_events::step)
-                .await
+        TurnKind::Prompt | TurnKind::Resume => {
+            let run = agent.resume();
+            let handler = TurnStep {
+                turn: &mut *turn,
+                facts,
+                checkpoints: run.checkpoints(),
+            };
+            run.drive(handler, stop, step_turn).await
         }
     };
     match driven {
@@ -1987,9 +2080,38 @@ async fn drive_turn<S: ChatSink>(
             if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
                 return Err(stop);
             }
-            turn.sink.on_agent_event(Err(&error), turn.context_window);
             Err(turn_events::TurnStop::Failed(error))
         }
+    }
+}
+
+/// Carries out the compaction the `compact` tool asked for when the turn
+/// ended, telling the session's clients how it stands; the next turn starts
+/// on the compacted context. A failure leaves the context as it was.
+async fn compact_after_turn(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    guard: &SessionRunGuard,
+    agent: &mut MayAgent,
+) {
+    let (phases, phase_rx) = async_channel::unbounded();
+    let reporter = crate::agent::CompactionReporter::new(phases);
+    let forward = async {
+        while let Ok(phase) = phase_rx.recv().await {
+            hosts::publish_compaction(&state.turn_hub, session_id, phase);
+        }
+    };
+    let compaction = async {
+        let compacted = agent
+            .compact_requested(&state.db(), guard.fence(), &reporter)
+            .await;
+        // Closes the phase channel, which ends the forwarding.
+        drop(reporter);
+        compacted
+    };
+    let (compacted, ()) = futures_lite::future::zip(compaction, forward).await;
+    if let Err(error) = compacted {
+        tracing::error!(%session_id, %error, "the requested compaction failed");
     }
 }
 
@@ -2241,6 +2363,8 @@ fn run_agent_loop_attempts<'a>(
                 terminal_snapshot: TerminalStateSnapshot::default(),
                 saw_tool_activity: false,
                 tool_arguments_by_id: std::collections::HashMap::new(),
+                tool_names: std::collections::HashMap::new(),
+                hosted_calls: std::collections::HashSet::new(),
                 tool_started_at: std::collections::HashMap::new(),
                 pending_tool_streams: std::collections::HashMap::new(),
                 last_todo_hash: None,
@@ -2262,10 +2386,12 @@ fn run_agent_loop_attempts<'a>(
                     hidden_context: turn_hidden_context_xml.as_deref(),
                     attachments,
                     continue_from_transcript,
-                    attempt,
                 },
             )
             .await;
+            if stopped.is_ok() {
+                compact_after_turn(state, session_id.as_str(), guard, &mut agent).await;
+            }
             let took_action = turn.took_action();
             let turn_events::TurnEvents {
                 sink: _,
@@ -2659,28 +2785,28 @@ fn run_agent_loop_attempts<'a>(
 const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
     matches!(
         event,
-        aither_agent::AgentEvent::Text(_)
-            | aither_agent::AgentEvent::ToolCallDelta { .. }
-            | aither_agent::AgentEvent::ToolCallStart { .. }
-            | aither_agent::AgentEvent::BuiltInToolCall { .. }
-            | aither_agent::AgentEvent::TurnComplete {
-                has_tool_calls: false,
+        aither_agent::AgentEvent::BlockDelta {
+            kind: aither_agent::OutputKind::Text,
+            ..
+        } | aither_agent::AgentEvent::ToolCallDelta { .. }
+            | aither_agent::AgentEvent::ToolCallStarted { .. }
+            | aither_agent::AgentEvent::TurnEnded { tool_calls: 0, .. }
+            | aither_agent::AgentEvent::RunEnded {
+                outcome: aither_agent::RunOutcome::Failed { .. },
                 ..
             }
-            | aither_agent::AgentEvent::Error(_)
     )
 }
 
-/// Starts a turn for `session_id` whose idle agent collected background
-/// commands that need the model (`events`), the wake `resuming` serves. An
-/// idle agent waits on background commands only after the run that parked
-/// it released the session, so the only thing that can hold the session
-/// here is a new turn, which takes the parked agent and sees the results;
-/// nothing runs then.
+/// Starts a turn for `session_id` whose idle agent read what its background
+/// commands reported and has something to act on, the wake `resuming`
+/// serves. An idle agent waits on background commands only after the run
+/// that parked it released the session, so the only thing that can hold the
+/// session here is a new turn, which takes the parked agent and sees the
+/// results; nothing runs then.
 pub(super) async fn start_background_turn(
     state: &Arc<DaemonState>,
     session_id: &str,
-    events: Vec<aither_agent::TimedEvent>,
     resuming: background::ResumePending,
 ) {
     if !state.parked_agents.contains(session_id) {
@@ -2701,12 +2827,12 @@ pub(super) async fn start_background_turn(
         delivery_mode: crate::session::PendingUserMessageMode::default(),
         pending_entry_id: None,
     };
-    tracing::info!(%session_id, events = events.len(), "background commands resume the session");
+    tracing::info!(%session_id, "background commands resume the session");
     if let Err(error) = Box::pin(run_published_turn(
         state.clone(),
         req,
         guard,
-        TurnKind::Resume(events),
+        TurnKind::Resume,
         Some(resuming),
     ))
     .await
@@ -4136,7 +4262,7 @@ fn build_session_agent<'a>(
         };
 
         let subagents = state.session_background.subagents(ctx.session_id.as_str());
-        cards::forward_updates(state, ctx.session_id.as_str(), subagents.tracker.cards());
+        cards::forward_updates(state, ctx.session_id.as_str(), subagents.cards());
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
             crate::agent::MayAgentSessionInput {
@@ -4191,8 +4317,7 @@ fn build_session_agent<'a>(
                         .metrics
                         .prompt_cache_epoch
                 }),
-                subagents: Some(subagents),
-                background_jobs: aither_agent::BackgroundJobPolicy::Detach,
+                subagent_tracker: Some(subagents),
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
                 limits: state.live_limits.clone(),
@@ -4203,10 +4328,10 @@ fn build_session_agent<'a>(
         .map_err(UiChatPreparationError::BuildAgent)?;
         state
             .runtime_service
-            .set_terminal_grants(ctx.session_id.as_str(), agent.terminal_grants());
+            .set_terminal_grants(ctx.session_id.as_str(), agent.grants());
         state
             .session_background
-            .add_job_registry(ctx.session_id.as_str(), agent.job_registry());
+            .add_jobs(ctx.session_id.as_str(), agent.jobs());
 
         if let Some(snapshot) = ctx.context_snapshot.as_ref() {
             // Restore the checkpoint, then append only transcript entries
@@ -4288,14 +4413,14 @@ pub enum TurnKind {
     /// A user message, or a queued one.
     #[default]
     Prompt,
-    /// The session's idle agent collected background commands that need the
-    /// model; their events open the turn.
-    Resume(Vec<aither_agent::TimedEvent>),
+    /// The session's idle agent read what its background commands reported
+    /// and has something to act on.
+    Resume,
 }
 
 impl TurnKind {
     const fn is_resume(&self) -> bool {
-        matches!(self, Self::Resume(_))
+        matches!(self, Self::Resume)
     }
 }
 
@@ -4400,21 +4525,36 @@ mod tests {
 
     #[test]
     fn tool_turn_complete_does_not_close_the_next_reasoning_phase() {
-        assert!(!super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::turn_complete(1, true)
-        ));
+        let event = |json: serde_json::Value| -> aither_agent::AgentEvent {
+            serde_json::from_value(json).expect("an agent event")
+        };
+        let turn_ended = |tool_calls: usize| {
+            event(serde_json::json!({
+                "TurnEnded": {"run": "r1", "turn": 1, "tool_calls": tool_calls}
+            }))
+        };
+        let block_delta = |kind: &str, text: &str| {
+            event(serde_json::json!({
+                "BlockDelta": {"request": 1, "block": 1, "kind": kind, "text": text}
+            }))
+        };
+        assert!(!super::closes_reasoning_phase(&turn_ended(1)));
+        assert!(super::closes_reasoning_phase(&turn_ended(0)));
+        assert!(super::closes_reasoning_phase(&block_delta(
+            "Text", "visible"
+        )));
         assert!(super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::turn_complete(1, false)
+            &aither_agent::AgentEvent::tool_call_started(
+                aither_core::llm::ToolCallId::new("id"),
+                "terminal".to_string(),
+                serde_json::json!({}),
+                aither_agent::ToolOrigin::Local,
+            )
         ));
-        assert!(super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::text("visible")
-        ));
-        assert!(super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::tool_start("id", "terminal", "{}")
-        ));
-        assert!(!super::closes_reasoning_phase(
-            &aither_agent::AgentEvent::reasoning("think")
-        ));
+        assert!(!super::closes_reasoning_phase(&block_delta(
+            "Reasoning",
+            "think"
+        )));
     }
 
     #[test]
@@ -4485,8 +4625,6 @@ mod tests {
                         },
                         messages: Vec::new(),
                     },
-                    has_background_tasks: false,
-                    document: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
@@ -4762,8 +4900,6 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         notes: Option<async_channel::Sender<Note>>,
-        /// How many times the run showed the text `WAKE_TEXT` as an agent event.
-        wake_texts: usize,
         /// The message texts the run withdrew.
         withdrawn: Vec<String>,
         /// Panics when the run starts streaming.
@@ -4771,9 +4907,6 @@ mod tests {
         /// The messages of the errors the run reported.
         errors: Vec<String>,
     }
-
-    /// The text of the background event a test resume turn opens with.
-    const WAKE_TEXT: &str = "background command finished";
 
     impl TestSink {
         fn noting() -> (Self, async_channel::Receiver<Note>) {
@@ -4797,12 +4930,9 @@ mod tests {
     impl super::ChatSink for TestSink {
         fn on_agent_event(
             &mut self,
-            event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+            _event: &aither_agent::TimedEvent,
             _context_window: Option<u32>,
         ) {
-            if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
-                self.wake_texts += 1;
-            }
         }
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
             assert!(!self.panic_on_start, "test panic in the turn runner");
@@ -5143,7 +5273,7 @@ mod tests {
     /// dispatcher serves the next command on the same queue.
     #[tokio::test]
     async fn a_dispatcher_survives_a_panicking_command() {
-        let (broker, queue) = aither_agent::tool_request::channel::<u32, u32>();
+        let (broker, queue) = crate::harness::tool_request::channel::<u32, u32>();
         let worker = tokio::spawn(super::dispatch_requests(
             "test dispatcher",
             queue,
@@ -5467,28 +5597,48 @@ mod tests {
     }
 
     /// A resumed turn whose provider call fails and is retried on the same
-    /// provider continues with the agent it took, and clients see its
-    /// background events once.
+    /// provider continues with the agent it took: the idle agent's wait on
+    /// its jobs put the finished command's report into its context once, and
+    /// the retried request still carries it once.
     #[tokio::test]
     async fn a_resume_turn_retries_with_the_agent_it_took() {
-        let mut script = vec![sse_text("first")];
+        // The turn's wait, and the resume's. A command's `timeout` runs from
+        // its start, so it spans both.
+        const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const MARK: &str = "WAKE-MARK-42";
+        crate::test_support::install_global_executor();
+        let may_dir = tempfile::tempdir().expect("may dir");
+        // The session's `files/` is what the sandboxed command can read.
+        let session_files = may_dir.path().join("sessions/session/files");
+        std::fs::create_dir_all(&session_files).expect("session files");
+        // The command finishes only once the gate opens after the release:
+        // one that finished during the turn would reach the turn's own next
+        // request and leave the idle agent nothing to resume for.
+        let gate = session_files.join("go");
+        let arguments = serde_json::json!({
+            "script": format!(
+                "while [ ! -e {} ]; do sleep 0.05; done; echo WAKE-MARK-$((40 + 2))",
+                gate.display()
+            ),
+            "description": "finishes in the background",
+            "background": true,
+            "timeout": (TURN_WAIT + RESUME_WAIT).as_secs()
+        })
+        .to_string();
+        let mut script = vec![
+            sse_tool_call("call_1", "terminal", &arguments),
+            sse_text("started"),
+        ];
         script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
         script.push(sse_text("resumed"));
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
-        let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
-
-        // A first turn leaves the session's idle agent behind.
-        let mut sink = TestSink::default();
-        run_prompt_turn(&state, &mut sink)
-            .await
-            .expect("the first turn completes");
-        assert!(state.parked_agents.contains("session"));
 
         let req = ChatRequest {
             session_id: "session".to_string(),
-            content: String::new(),
+            content: "start it".to_string(),
             attachments: Vec::new(),
             hidden_context_xml: None,
             delivery_mode: crate::session::PendingUserMessageMode::default(),
@@ -5500,24 +5650,37 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        let wake = vec![aither_agent::TimedEvent {
-            at: jiff::Timestamp::now(),
-            event: aither_agent::AgentEvent::Text(WAKE_TEXT.to_string()),
-        }];
         let mut sink = TestSink::default();
-        let result = run_agent_loop(
-            &state,
-            &req,
-            &mut sink,
-            &guard,
-            false,
-            true,
-            &TurnKind::Resume(wake),
+        tokio::time::timeout(
+            TURN_WAIT,
+            run_agent_loop(
+                &state,
+                &req,
+                &mut sink,
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            ),
         )
-        .await;
-        let result = result.expect("the retried resume completes");
-        assert_eq!(result.full_text, "resumed");
-        assert_eq!(sink.wake_texts, 1, "the background events are shown once");
+        .await
+        .expect("the turn finishes within its wait")
+        .expect("the turn completes");
+        assert!(state.parked_agents.contains("session"));
+
+        // The release lets the idle agent's wait read the finished command,
+        // which resumes the session: the failed attempts, then the retry.
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+        std::fs::write(&gate, "").expect("open the gate");
+        let body = last_body(&provider_a, 2 + OPENAI_CLIENT_ATTEMPTS + 1).await;
+        assert_eq!(
+            body.matches(MARK).count(),
+            1,
+            "the background report reaches the retried request once: {body}"
+        );
     }
 
     /// A background command that finishes after the turn parked its agent but
@@ -5650,7 +5813,7 @@ mod tests {
         };
         let writable_checkout = |agent: &crate::agent::MayAgent| {
             agent
-                .terminal_grants()
+                .grants()
                 .snapshot()
                 .writable
                 .iter()

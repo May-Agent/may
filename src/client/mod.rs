@@ -18,8 +18,8 @@ pub use wire::{
     PrsChangedFrame, RecapFrame, RewindRequest, RunEnd, SessionAgentBody, SessionAgentFrame,
     SessionCompactionFrame, SessionIndexSnapshot, SessionIssuesFrame, SessionRuntimeEvent,
     SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame, SuggestionFrame,
-    UpdateSessionRequest, WarningFrame, WireAgentError, WireAgentEvent, WirePr, WirePrCheck,
-    WirePrChecks, WireSession, WireTranscriptEntry, WireTranscriptPage,
+    UpdateSessionRequest, WarningFrame, WirePr, WirePrCheck, WirePrChecks, WireSession,
+    WireTranscriptEntry, WireTranscriptPage,
 };
 
 use std::path::PathBuf;

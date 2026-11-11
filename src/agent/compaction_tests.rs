@@ -20,14 +20,13 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use super::may::test_agent;
-use super::provider::ModelSlot;
+use super::idle_compaction_tests::{SESSION_MODEL, Session, StubModel as IdleStub, saved_config};
 
 /// A constraint the user states once, before the first compaction, and never
 /// repeats.
 const CONSTRAINT: &str = "vendor-freeze-7731";
 /// Model id the stub serves.
-const MODEL: &str = "test-model";
+const MODEL: &str = SESSION_MODEL;
 /// Opening words of aither's compaction instruction; they identify a
 /// compaction request among the model traffic.
 const COMPACTION_MARKER: &str = "Your context window is being compacted";
@@ -182,21 +181,8 @@ fn roles_mentioning(request: &Value, needle: &str) -> Vec<String> {
 async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() {
     crate::test_support::install_global_executor();
     let stub = StubModel::spawn().await;
-    let llm = ModelSlot::new(
-        crate::agent::RedactedModel::new(
-            aither_cloud::CloudProvider::OpenAI(
-                aither_cloud::openai::OpenAI::builder("test-key")
-                    .base_url(stub.base_url.clone())
-                    .model(MODEL)
-                    .no_retry()
-                    .build()
-                    .with_chat_completions_api(),
-            ),
-            crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
-        ),
-        aither_core::llm::model::Parameters::default(),
-    );
-    let (mut agent, _temp) = test_agent(llm, "openai", MODEL).await;
+    let mut session = agent_on(&stub).await;
+    let agent = &mut session.agent;
 
     agent.push_message(aither_core::llm::Message::user(format!(
         "Port the parser to the new lexer. Constraint for the whole job: never edit files under vendor/ ({CONSTRAINT})."
@@ -254,24 +240,14 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
     assert!(handoff.contains(CONSTRAINT), "stored handoff: {handoff}");
 }
 
-/// Builds the agent of the context-reading tests against `stub`.
-async fn agent_on(stub: &StubModel) -> (super::may::MayAgent, tempfile::TempDir) {
+/// Builds a session agent, the way the TUI does, whose models live on `stub`.
+async fn agent_on(stub: &StubModel) -> Session {
     crate::test_support::install_global_executor();
-    let llm = ModelSlot::new(
-        crate::agent::RedactedModel::new(
-            aither_cloud::CloudProvider::OpenAI(
-                aither_cloud::openai::OpenAI::builder("test-key")
-                    .base_url(stub.base_url.clone())
-                    .model(MODEL)
-                    .no_retry()
-                    .build()
-                    .with_chat_completions_api(),
-            ),
-            crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
-        ),
-        aither_core::llm::model::Parameters::default(),
-    );
-    test_agent(llm, "openai", MODEL).await
+    let server = IdleStub {
+        base_url: stub.base_url.clone(),
+        requests: Arc::default(),
+    };
+    Session::start(&saved_config(&server, None)).await
 }
 
 /// After a compaction, the context a side request reads carries the handoff
@@ -280,7 +256,8 @@ async fn agent_on(stub: &StubModel) -> (super::may::MayAgent, tempfile::TempDir)
 async fn context_messages_after_a_compaction_carry_the_handoff_not_the_replaced_turns() {
     const REPLACED: &str = "replaced-turn-4417";
     let stub = StubModel::spawn().await;
-    let (mut agent, _temp) = agent_on(&stub).await;
+    let mut session = agent_on(&stub).await;
+    let agent = &mut session.agent;
     agent.push_message(aither_core::llm::Message::user(format!(
         "Port the parser to the new lexer ({REPLACED}). Never edit files under vendor/ ({CONSTRAINT})."
     )));
@@ -329,7 +306,8 @@ async fn context_messages_of_a_history_larger_than_the_window_fit_the_window() {
     // The stub's window, at the agent's ~4 bytes per token.
     const WINDOW_BYTES: usize = 128_000 * 4;
     let stub = StubModel::spawn().await;
-    let (mut agent, _temp) = agent_on(&stub).await;
+    let mut session = agent_on(&stub).await;
+    let agent = &mut session.agent;
     let filler = "x".repeat(20_000);
     for _ in 0..40 {
         agent.push_message(aither_core::llm::Message::user(filler.clone()));

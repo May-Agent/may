@@ -345,10 +345,10 @@ pub struct IssueTool<S, T = GhCliTokenSource> {
     targets: Option<IssueTargets<T>>,
     provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
     owners: Option<IssueOwners>,
-    task_events: Option<aither_agent::WorkEvents>,
+    task_events: Option<crate::harness::working_document::WorkEvents>,
     publish: Option<PublishGate>,
 }
 
@@ -484,7 +484,10 @@ impl<S: IssueStore, T> IssueTool<S, T> {
     /// Record every issue created or closed on `events`, the main agent's
     /// `tasks.md` inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
+    pub fn with_task_events(
+        mut self,
+        events: crate::harness::working_document::WorkEvents,
+    ) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -505,7 +508,7 @@ impl<S: IssueStore, T> IssueTool<S, T> {
 
     /// Refuse issue text outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -545,7 +548,7 @@ where
         if let Some(guard) = &self.languages {
             for text in arguments.published_texts() {
                 guard
-                    .check_working(text, aither_agent::WorkingText::Public)
+                    .check_working(text, crate::harness::language::WorkingText::Public)
                     .map_err(super::notices::language_refused)?;
             }
         }
@@ -602,7 +605,7 @@ struct SessionServices<'a> {
     owners: Option<&'a IssueOwners>,
     /// The `tasks.md` inbox that hears of issues the session creates or
     /// closes.
-    events: Option<&'a aither_agent::WorkEvents>,
+    events: Option<&'a crate::harness::working_document::WorkEvents>,
 }
 
 /// Run `args` on the session's store, or on the project its `--repo` names.
@@ -653,7 +656,7 @@ async fn execute<S: IssueStore>(
     origin: &CallOrigin,
     search: Option<&SessionIssueSearch>,
     owners: Option<&IssueOwners>,
-    events: Option<&aither_agent::WorkEvents>,
+    events: Option<&crate::harness::working_document::WorkEvents>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
     let record = |number: i64,
@@ -674,10 +677,14 @@ async fn execute<S: IssueStore>(
         if let Some(events) = events
             && let Ok(number) = u64::try_from(number)
         {
-            let issue = aither_agent::WorkRef::issue(number);
+            let issue = crate::harness::working_document::WorkRef::issue(number);
             match action {
-                IssueAction::Create => events.record(aither_agent::WorkEvent::IssueCreated(issue)),
-                IssueAction::Close => events.record(aither_agent::WorkEvent::IssueClosed(issue)),
+                IssueAction::Create => events.record(
+                    crate::harness::working_document::WorkEvent::IssueCreated(issue),
+                ),
+                IssueAction::Close => events.record(
+                    crate::harness::working_document::WorkEvent::IssueClosed(issue),
+                ),
                 _ => {}
             }
         }
@@ -1404,7 +1411,7 @@ mod tests {
     /// inbox: the row naming it is told, once each.
     #[tokio::test]
     async fn created_and_closed_issues_reach_the_tasks_inbox() {
-        use aither_agent::ContextSource;
+        use aither_agent::{ContextSource, Moment};
         use aither_core::llm::ToolContext;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1412,7 +1419,7 @@ mod tests {
             .await
             .expect("chat db should open");
         let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
-        let events = aither_agent::WorkEvents::new();
+        let events = crate::harness::working_document::WorkEvents::new();
         let tool = IssueTool::new(store, IssueProvenance::new(db, "test".to_string()))
             .with_task_events(events.clone());
         let sandbox = dir.path().join("sandbox");
@@ -1420,7 +1427,7 @@ mod tests {
         std::fs::write(sandbox.join("tasks.md"), "## Doing\n- #1 the login bug\n")
             .expect("tasks.md");
         let mut tasks = crate::tasks_md::schema::working_document(&sandbox, events);
-        tasks.on_request(false).await;
+        tasks.blocks(Moment::Request { reassembled: false }).await;
 
         let created = tool
             .call(
@@ -1447,9 +1454,14 @@ mod tests {
         .await
         .expect("view");
 
-        tasks.on_request(false).await;
-        let alert = tasks.on_tool_turn_end().await.expect("the row is told");
-        let text = alert.content();
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+        let alert = tasks
+            .blocks(Moment::ToolTurnEnd)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row is told");
+        let text = alert.block().content();
         // The row naming #1 already records its creation; its closing is
         // what the row has yet to follow.
         assert_eq!(text.matches("Issue #1 was created").count(), 0, "{text}");

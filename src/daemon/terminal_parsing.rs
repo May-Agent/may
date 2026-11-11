@@ -1,34 +1,34 @@
 //! Native terminal-command tool event parsing for streaming UI updates.
 
 use aither_core::llm::{CommandOutcome, ToolResult};
-use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
+use aither_sandbox::{SandboxMode, ShellArgs};
 
 use super::types::{
     ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
     TerminalStateSnapshot, ToolEventRecord,
 };
 
-const fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
+const fn parse_terminal_mode(mode: SandboxMode) -> TerminalCommandMode {
     match mode {
-        TerminalExecutionMode::Default => TerminalCommandMode::Default,
-        TerminalExecutionMode::Unsafe => TerminalCommandMode::Unsafe,
+        SandboxMode::Sandboxed => TerminalCommandMode::Default,
+        SandboxMode::Unsandboxed => TerminalCommandMode::Unsafe,
     }
 }
 
 pub(super) fn parse_terminal_start(
     arguments: &str,
 ) -> (String, String, Option<TerminalCommandMode>) {
-    match serde_json::from_str::<TerminalArgs>(arguments) {
+    match serde_json::from_str::<ShellArgs>(arguments) {
         Ok(parsed) => (
             parsed.description,
             parsed.script,
-            Some(parse_terminal_mode(parsed.mode)),
+            Some(parse_terminal_mode(parsed.sandbox)),
         ),
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 payload = %arguments,
-                "terminal tool start payload did not satisfy TerminalArgs; surfacing as malformed call"
+                "terminal tool start payload did not satisfy ShellArgs; surfacing as malformed call"
             );
             (String::new(), String::new(), None)
         }

@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use aither_agent::{Agent, AgentEvent};
 use aither_core::llm::{Tool, ToolResult};
@@ -25,9 +26,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use super::hooks::SecretRedactionHook;
+use super::hooks::MayHooks;
 use super::provider::{ProviderLlm, RedactedModel};
+use crate::command_policy::RefusedReads;
+use crate::harness::compact_tool::CompactSignal;
+use crate::repo_clone::test_sandbox::TestTerminal;
 use crate::secrets::SecretRedactor;
+use crate::session::SessionId;
 
 const MODEL: &str = "test-model";
 const SECRET_NAME: &str = "DEPLOY_TOKEN";
@@ -187,9 +192,20 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
     crate::test_support::install_global_executor();
     let (base_url, requests) = spawn_stub().await;
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
-    let mut agent = Agent::builder(model(&base_url, redactor.clone()))
+    let dir = tempfile::tempdir().expect("session root");
+    let terminal = TestTerminal::new(dir.path()).await;
+    let hooks = MayHooks::new(
+        None,
+        &SessionId::from_string("amber-river"),
+        redactor.clone(),
+        RefusedReads::default(),
+        terminal.shell().jobs(),
+        Arc::new(CompactSignal::default()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut agent = Agent::builder(model(&base_url, redactor))
         .tool(LeakTool)
-        .hook(SecretRedactionHook::new(redactor))
+        .hooks(hooks)
         .build();
 
     let mut published = Vec::new();
@@ -199,8 +215,8 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
             &mut published,
             std::future::pending::<()>(),
             |published, timed| async move {
-                if let AgentEvent::ToolCallEnd { result, .. } = &timed.event {
-                    published.push(format!("{result:?}"));
+                if let AgentEvent::ToolCallEnded { result, .. } = &timed.event {
+                    published.push(result.render_for_model());
                 }
                 ControlFlow::Continue(published)
             },

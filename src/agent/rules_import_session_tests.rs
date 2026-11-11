@@ -2,7 +2,7 @@
 //! only in it, `keep` installs the source byte for byte, and `write` installs
 //! a rewrite only after the user answered the agent's question.
 
-use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
+use crate::harness::ask_user::{AnswerValue, QuestionAnswer};
 
 use super::compact_tool_tests::{ScriptedModel, Step, config_for, lease, run, terminal};
 use super::idle_compaction_tests::Session;

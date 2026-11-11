@@ -9,9 +9,8 @@
 
 use std::sync::Arc;
 
-use aither_agent::ask_user;
-
 use crate::agent::browser_tool::BrowserToolError;
+use crate::harness::ask_user;
 use crate::ui_event_bus::UiEventTopics;
 
 use super::super::browser::ensure_browser_runtime_started;

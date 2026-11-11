@@ -544,7 +544,7 @@ pub struct AgentTool {
     sandbox_dir: PathBuf,
     /// Where the sandbox appears inside the session's container, if it has one.
     workspace_mount: Option<aither_sandbox::MountRoot>,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
 }
 
 /// The host file behind a path as the session's terminal spells it. In a
@@ -596,7 +596,7 @@ impl AgentTool {
 
     /// Refuse a message outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -650,7 +650,7 @@ impl Tool for AgentTool {
                 }
                 if let Some(guard) = &self.languages {
                     guard
-                        .check_working(body.trim(), aither_agent::WorkingText::Internal)
+                        .check_working(body.trim(), crate::harness::language::WorkingText::Internal)
                         .map_err(crate::agent::notices::language_refused)?;
                 }
                 let recipient = self

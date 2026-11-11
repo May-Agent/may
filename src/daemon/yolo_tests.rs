@@ -6,21 +6,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::workspace_request::RequestWorkspaceArgs;
-use aither_sandbox::permission::{PermissionError, PermissionHandler};
-use aither_sandbox::{
-    CommandLocation, CommandRole, LocationApproval, ScriptLanguage, SshServer, TerminalMode,
-};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
+use aither_core::llm::{Approval, ApprovalKind, ApprovalRequest, Approver as _};
 use tempfile::TempDir;
 
 use super::state::WorkspaceApprover;
 use crate::agent::PermissionApprover;
+use crate::agent::permission::{SSH_KIND, UNSANDBOXED_KIND};
 use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{ChatDb, CreateScheduledTaskParams};
 use crate::session::SessionRuntimeService;
 use crate::task_trigger::PersistedTaskTrigger;
 use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::ui_event_bus::UiEventBus;
+
+/// A request to run `script` outside the sandbox.
+fn unsandboxed(script: &str) -> ApprovalRequest {
+    ApprovalRequest::new(ApprovalKind::new(UNSANDBOXED_KIND), script)
+}
 
 struct Fixture {
     _dir: TempDir,
@@ -75,29 +78,15 @@ async fn an_unsafe_command_runs_without_a_prompt_in_a_yolo_session() {
     let approver = fixture.approver();
 
     let granted = approver
-        .check(
-            TerminalMode::Unsafe,
-            "make install",
-            ScriptLanguage::Shell,
-            CommandLocation::Local,
-        )
+        .approve(unsandboxed("make install"))
         .await
         .expect("granted");
 
-    assert!(granted);
+    assert!(matches!(granted, Approval::Approved), "{granted:?}");
     let runtime = fixture.runtime.get("session").await.expect("runtime");
     assert!(runtime.yolo);
     assert!(runtime.waiting_permission.is_none());
-    assert!(
-        !approver
-            .will_wait_for_approval(
-                TerminalMode::Unsafe,
-                "x",
-                ScriptLanguage::Shell,
-                CommandLocation::Local
-            )
-            .await
-    );
+    assert!(!approver.will_wait_for_approval().await);
     assert_eq!(fixture.history("permission_request").await, 1);
     assert_eq!(fixture.history("permission_response").await, 1);
 }
@@ -107,17 +96,13 @@ async fn a_subagent_of_a_yolo_session_is_granted_too() {
     let fixture = Fixture::new().await;
     fixture.yolo(true).await;
     let subagent = fixture.approver().for_subagent();
-    assert!(
+    assert!(matches!(
         subagent
-            .check(
-                TerminalMode::Unsafe,
-                "make install",
-                ScriptLanguage::Shell,
-                CommandLocation::Local
-            )
+            .approve(unsandboxed("make install"))
             .await
-            .expect("granted")
-    );
+            .expect("granted"),
+        Approval::Approved
+    ));
 }
 
 #[tokio::test]
@@ -125,63 +110,40 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     let fixture = Fixture::new().await;
     let approver = fixture.approver();
     fixture.yolo(true).await;
-    assert!(
+    assert!(matches!(
         approver
-            .check(
-                TerminalMode::Unsafe,
-                "first",
-                ScriptLanguage::Shell,
-                CommandLocation::Local
-            )
+            .approve(unsandboxed("first"))
             .await
-            .expect("granted")
-    );
+            .expect("granted"),
+        Approval::Approved
+    ));
 
     fixture.yolo(false).await;
-    let error = approver
-        .check(
-            TerminalMode::Unsafe,
-            "second",
-            ScriptLanguage::Shell,
-            CommandLocation::Local,
-        )
+    let denied = approver
+        .approve(unsandboxed("second"))
         .await
-        .expect_err("nobody answers, so the request is denied");
-    let PermissionError::Denied(message) = error else {
-        panic!("expected a denial, got {error:?}");
+        .expect("a request nobody answers is denied");
+    let Approval::Denied { reason } = denied else {
+        panic!("expected a denial, got {denied:?}");
     };
-    assert!(message.contains("not answered"), "{message}");
+    assert!(reason.contains("not answered"), "{reason}");
     assert_eq!(fixture.history("permission_request").await, 2);
-    assert!(
-        approver
-            .will_wait_for_approval(
-                TerminalMode::Unsafe,
-                "x",
-                ScriptLanguage::Shell,
-                CommandLocation::Local
-            )
-            .await
-    );
+    assert!(approver.will_wait_for_approval().await);
 }
 
 #[tokio::test]
 async fn a_session_without_yolo_still_asks() {
     let fixture = Fixture::new().await;
     assert!(!fixture.runtime.get("session").await.expect("runtime").yolo);
-    let error = fixture
+    let denied = fixture
         .approver()
-        .check(
-            TerminalMode::Unsafe,
-            "make install",
-            ScriptLanguage::Shell,
-            CommandLocation::Local,
-        )
+        .approve(unsandboxed("make install"))
         .await
-        .expect_err("unanswered");
-    let PermissionError::Denied(message) = error else {
-        panic!("expected a denial, got {error:?}");
+        .expect("an unanswered request is denied");
+    let Approval::Denied { reason } = denied else {
+        panic!("expected a denial, got {denied:?}");
     };
-    assert!(message.contains("not answered"), "{message}");
+    assert!(reason.contains("not answered"), "{reason}");
 }
 
 #[tokio::test]
@@ -193,25 +155,16 @@ async fn ssh_connect_is_granted_without_asking_in_a_yolo_session() {
     let handler = TerminalPermissionHandler::for_agent(None, None, None).with_ssh_authorizer(
         MaySshAuthorizer::new("session", broker, fixture.runtime.db()),
     );
-    let server = SshServer {
-        name: "build".to_string(),
-        target: "user@host".to_string(),
-    };
-    assert!(
-        !handler
-            .will_wait_for_location(&server, CommandRole::Main)
-            .await
-    );
+    assert!(!handler.will_wait_for_location().await);
 
-    let granted = tokio::time::timeout(
-        Duration::from_secs(10),
-        handler.check_location(&server, CommandRole::Main),
-    )
-    .await
-    .expect("did not ask")
-    .expect("authorized");
+    let request =
+        ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "make").with_reason("user@host");
+    let granted = tokio::time::timeout(Duration::from_secs(10), handler.approve(request))
+        .await
+        .expect("did not ask")
+        .expect("authorized");
 
-    assert_eq!(granted, LocationApproval::Session);
+    assert!(matches!(granted, Approval::Approved), "{granted:?}");
     assert_eq!(fixture.history("permission_response").await, 1);
 }
 

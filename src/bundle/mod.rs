@@ -56,7 +56,7 @@ impl Bundle {
     ///
     /// Panics when an embedded definition is invalid, which a test rules out.
     #[must_use]
-    pub fn subagent_definitions() -> Vec<aither_agent::SubagentDefinition> {
+    pub fn subagent_definitions() -> Vec<crate::harness::subagent_file::SubagentDefinition> {
         SUBAGENTS_DIR
             .files()
             .map(|file| {
@@ -64,7 +64,7 @@ impl Bundle {
                 let source = file
                     .contents_utf8()
                     .unwrap_or_else(|| panic!("subagent definition {path} is not UTF-8"));
-                aither_agent::SubagentDefinition::parse(source)
+                crate::harness::subagent_file::SubagentDefinition::parse(source)
                     .unwrap_or_else(|error| panic!("subagent definition {path}: {error}"))
             })
             .collect()

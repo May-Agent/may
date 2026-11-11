@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use aither_sandbox::permission::PermissionError;
 use askama::Template;
+
+use super::permission::PermissionError;
 
 use crate::PermissionHistoryMode;
 use crate::ask_user::{

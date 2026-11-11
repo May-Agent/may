@@ -10,17 +10,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aither_core::llm::CommandOutcome;
+use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
 use aither_sandbox::{
-    AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
-    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalTool,
-    ToolRegistryBuilder, permission::PermissionError,
+    AnyContainerExec, BollardContainerExec, ContainerLaunchSpec, ContainerShellRuntime,
+    DomainApprover, DomainRequest, Grants, Interpreter, RunOutcome, Script, ScriptResult,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
 use base64::Engine;
-use executor_core::DefaultExecutor;
 use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
@@ -57,7 +54,7 @@ pub struct TaskRuntime {
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
     /// Baseline tool distribution prepared for every task terminal.
-    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    tool_distribution: Arc<crate::tools::ToolDistribution>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
     /// The daemon's connectivity source; task terminals record the outages
@@ -253,6 +250,18 @@ fn invalid_profile_component_error(prefix: &str, error: &impl std::fmt::Display)
     prefixed_error(prefix, error)
 }
 
+/// Where a task's shell works.
+enum TaskHome {
+    /// The machine the daemon runs on.
+    Host,
+    /// The profile's container.
+    Container {
+        runtime: ContainerShellRuntime,
+        exec: AnyContainerExec,
+        id: String,
+    },
+}
+
 /// The task whose run a terminal serves, which gets the `wake` command.
 /// Validation runs have none.
 #[derive(Debug, Clone, Copy)]
@@ -392,18 +401,18 @@ struct SchedulerPermissionHandler {
     network_policy: Option<CompiledNetworkPolicy>,
 }
 
-impl PermissionHandler for SchedulerPermissionHandler {
-    fn check(
+impl Approver for SchedulerPermissionHandler {
+    fn approve(
         &self,
-        _mode: TerminalMode,
-        _script: &str,
-        _language: aither_sandbox::ScriptLanguage,
-        _location: aither_sandbox::CommandLocation<'_>,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-        std::future::ready(Ok(true))
+        _request: ApprovalRequest,
+    ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
+        std::future::ready(Ok(Approval::Approved))
     }
+}
 
-    async fn check_domain(&self, domain: &str, port: u16) -> bool {
+impl DomainApprover for SchedulerPermissionHandler {
+    async fn approve(&self, request: &DomainRequest) -> bool {
+        let (domain, port) = (request.host.as_str(), request.port);
         let reason = if self.allow_network {
             self.network_policy
                 .as_ref()
@@ -441,7 +450,7 @@ impl TaskRuntime {
     pub async fn load(
         db: ChatDb,
         may_dir: PathBuf,
-        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+        tool_distribution: Arc<crate::tools::ToolDistribution>,
     ) -> Result<Self, crate::db::ChatDbError> {
         let runtime = Self {
             db,
@@ -1018,7 +1027,7 @@ impl TaskRuntime {
         script_inline: Option<&str>,
         timeout_secs: u32,
     ) -> Result<(), String> {
-        let timeout = TaskTimeout::new(timeout_secs)?;
+        let timeout = TaskTimeout::new(timeout_secs, self.shell_config().await?.shell.timeout_cap)?;
         let profile_info = self
             .db
             .profile_info_from_model(profile.clone())
@@ -1316,9 +1325,11 @@ impl TaskRuntime {
         script: &TaskScript,
         command: String,
     ) -> Result<String, String> {
-        let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
-        let terminal_tool = self
-            .local_terminal_tool(
+        let config = self.shell_config().await?;
+        let timeout = TaskTimeout::from_stored(task.timeout_secs, config.shell.timeout_cap)?;
+        let shell = self
+            .local_shell(
+                &config,
                 &task.profile_id,
                 NetworkAccessSource::TaskLocal,
                 script,
@@ -1329,7 +1340,7 @@ impl TaskRuntime {
                 }),
             )
             .await?;
-        run_terminal_command(&terminal_tool, command, timeout).await
+        run_terminal_command(&shell, &script.host_working_dir, command, timeout).await
     }
 
     async fn validate_local(
@@ -1339,8 +1350,10 @@ impl TaskRuntime {
         timeout: TaskTimeout,
     ) -> Result<(), String> {
         prepare_working_dir(&script.host_working_dir).await?;
-        let terminal_tool = self
-            .local_terminal_tool(
+        let config = self.shell_config().await?;
+        let shell = self
+            .local_shell(
+                &config,
                 profile_id,
                 NetworkAccessSource::TaskValidationLocal,
                 script,
@@ -1349,150 +1362,168 @@ impl TaskRuntime {
             )
             .await?;
 
-        run_terminal_command(&terminal_tool, build_validation_command(script), timeout)
-            .await
-            .map(|_| ())
+        run_terminal_command(
+            &shell,
+            &script.host_working_dir,
+            build_validation_command(script),
+            timeout,
+        )
+        .await
+        .map(|_| ())
     }
 
-    /// Builds a terminal over `shell_sessions`, grants `workspace` read-write
-    /// access and prepares the baseline tools through
-    /// [`TerminalTool::initialize_tools`], so scheduled commands run the same
-    /// verified tools — including the read-only and version checks — as agent
-    /// terminals. The command priority is read from the current config on
-    /// every launch, so a saved change reaches the next scheduled command
-    /// without global state.
-    async fn initialized_terminal_tool(
+    /// The current config, which every launch reads so a saved change to the
+    /// shell's bounds or the command priority reaches the next scheduled
+    /// command.
+    async fn shell_config(&self) -> Result<crate::config::MayConfig, String> {
+        crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+            .await
+            .map_err(|error| prefixed_error("failed to load May config: ", &error))
+    }
+
+    /// Builds the shell a task runs in, with `workspace` granted read-write,
+    /// over the home environment `tools` prepared: the same verified tools
+    /// and command policies as an agent's shell.
+    async fn task_shell(
         &self,
-        permission_handler: SchedulerPermissionHandler,
-        workspace: PathBuf,
-        shell_sessions: ShellSessionRegistry,
+        config: &crate::config::MayConfig,
+        permissions: SchedulerPermissionHandler,
+        workspace: &Path,
+        home: TaskHome,
         wake: Option<WakeScope<'_>>,
-    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let (terminal_tool, (network_audit, priority)) = futures_lite::future::try_zip(
+    ) -> Result<Arc<crate::ipc::SessionShell>, String> {
+        let tools_dir = crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir();
+        let (tools, audit_log) = futures_lite::future::try_zip(
             async {
-                TerminalTool::new_exact(&workspace, permission_handler, DefaultExecutor)
-                    .await
-                    .map_err(|error| {
-                        init_terminal_tool_error("failed to initialize terminal tool: ", &error)
-                    })
-            },
-            futures_lite::future::try_zip(
-                async {
-                    aither_sandbox::open_network_audit_log(
-                        self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
-                        crate::config::NETWORK_AUDIT_MAX_FILES,
-                    )
-                    .await
-                    .map_err(|error| {
-                        init_terminal_tool_error("failed to open network audit log: ", &error)
-                    })
-                },
-                async {
-                    crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+                match &home {
+                    TaskHome::Host => {
+                        crate::tools::ToolEnvironments::prepare_host(
+                            &self.tool_distribution,
+                            &tools_dir,
+                        )
                         .await
-                        .map(|config| config.sandbox.command_priority.process_priority())
-                        .map_err(|error| {
-                            init_terminal_tool_error(
-                                "failed to load May config for command priority: ",
-                                &error,
-                            )
-                        })
-                },
-            ),
+                    }
+                    TaskHome::Container { exec, id, .. } => {
+                        crate::tools::ToolEnvironments::prepare_container(
+                            exec.clone(),
+                            id,
+                            &self.tool_distribution,
+                            &tools_dir,
+                        )
+                        .await
+                    }
+                }
+                .map_err(|error| {
+                    init_terminal_tool_error("failed to prepare baseline tools: ", &error)
+                })
+            },
+            async {
+                aither_sandbox::open_network_audit_log(
+                    self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+                    crate::config::NETWORK_AUDIT_MAX_FILES,
+                )
+                .await
+                .map_err(|error| {
+                    init_terminal_tool_error("failed to open network audit log: ", &error)
+                })
+            },
         )
         .await?;
-        let mut commands = ToolRegistryBuilder::new();
-        crate::command_policy::register(
-            &mut commands,
-            crate::command_policy::runs_managed_bash(shell_sessions.availability().container),
-        );
+        let in_container = matches!(home, TaskHome::Container { .. });
+        let mut commands = crate::ipc::CommandRegistryBuilder::new();
         if let Some(scope) = wake {
             commands.configure_tool(crate::task_wake::WakeTool::new(
                 self.session_prompts.clone(),
                 scope.task.id.clone(),
                 scope.task.name.clone(),
                 scope.task.session_id.clone(),
-                workspace.clone(),
+                workspace.to_path_buf(),
                 scope
                     .in_container
-                    .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
+                    .then(|| crate::container::lifecycle::workspace_mount(workspace.to_path_buf())),
             ));
         }
-        let registry = Arc::new(commands.build(terminal_tool.output_store().clone()));
-        let terminal_tool = match &self.connectivity {
-            Some(connectivity) => terminal_tool.with_connectivity(connectivity),
-            None => terminal_tool,
+        // Only local commands can open the pool; container tasks run without
+        // one until aither brokers tokens into containers.
+        let pool = match (&self.job_server, in_container) {
+            (Some(job_server), false) => Some(job_server.connect().map_err(|error| {
+                init_terminal_tool_error("failed to connect to the jobserver: ", &error)
+            })?),
+            _ => None,
         };
-        terminal_tool
-            .with_network_audit_log(network_audit)
-            .with_shell_sessions(shell_sessions)
-            .with_writable_paths([workspace.clone()])
-            .with_readable_paths([workspace])
-            .with_process_priority(priority)
-            .initialize_tools(
-                &self.tool_distribution,
-                &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
-            )
-            .await
-            .map(|terminal_tool| terminal_tool.with_registry(registry))
-            .map_err(|error| init_terminal_tool_error("failed to prepare baseline tools: ", &error))
+        let grants = Grants::new();
+        grants.add_writable(workspace);
+        grants.add_readable(workspace);
+        crate::shell::ShellAssembly {
+            tools,
+            container: match home {
+                TaskHome::Host => None,
+                TaskHome::Container { runtime, .. } => Some(runtime),
+            },
+            working_dir: workspace.to_path_buf(),
+            grants,
+            priority: config.sandbox.command_priority.process_priority(),
+            audit_log,
+            permissions,
+            env_source: None,
+            budgets: crate::shell::ShellBudgets::of(&config.shell),
+            interpreters: vec![Interpreter::Shell],
+            policies: crate::command_policy::PolicySet {
+                managed_bash: crate::command_policy::runs_managed_bash(in_container),
+                refused: crate::command_policy::RefusedReads::default(),
+            },
+            slot: crate::ipc::ShellSlot::new(),
+            ssh_servers: Vec::new(),
+            ids: None,
+            spaces: None,
+            pool,
+            connectivity: self.connectivity.clone(),
+        }
+        .build(commands.build())
+        .await
+        .map_err(|error| init_terminal_tool_error("failed to build the task shell: ", &error))
     }
 
-    async fn local_terminal_tool(
+    async fn local_shell(
         &self,
+        config: &crate::config::MayConfig,
         profile_id: &str,
         source: NetworkAccessSource,
         script: &TaskScript,
         allow_network: bool,
         wake: Option<WakeScope<'_>>,
-    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let terminal_tool = self
-            .initialized_terminal_tool(
-                SchedulerPermissionHandler {
-                    db: self.db.clone(),
-                    ui_event_bus: self.ui_event_bus.clone(),
-                    profile_id: profile_id.to_string(),
-                    source,
-                    allow_network,
-                    network_policy: self.network_policy.load().as_ref().clone(),
-                },
-                script.host_working_dir.clone(),
-                ShellSessionRegistry::new(ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                }),
-                wake,
-            )
-            .await?;
-        // Only local commands can open the pool; container tasks run without
-        // one until aither brokers tokens into containers.
-        match &self.job_server {
-            Some(job_server) => {
-                let connection = job_server.connect().map_err(|error| {
-                    init_terminal_tool_error("failed to connect to the jobserver: ", &error)
-                })?;
-                terminal_tool
-                    .with_jobserver_pool(connection.pool, connection.fifo_dir)
-                    .map_err(|error| {
-                        init_terminal_tool_error("failed to share the jobserver: ", &error)
-                    })
-            }
-            None => Ok(terminal_tool),
-        }
+    ) -> Result<Arc<crate::ipc::SessionShell>, String> {
+        self.task_shell(
+            config,
+            SchedulerPermissionHandler {
+                db: self.db.clone(),
+                ui_event_bus: self.ui_event_bus.clone(),
+                profile_id: profile_id.to_string(),
+                source,
+                allow_network,
+                network_policy: self.network_policy.load().as_ref().clone(),
+            },
+            &script.host_working_dir,
+            TaskHome::Host,
+            wake,
+        )
+        .await
     }
 
-    /// Starts the profile's container and builds a terminal that executes in
+    /// Starts the profile's container and builds a shell that executes in
     /// it, storing outputs in the host-side task workspace mounted at
     /// [`CONTAINER_WORKSPACE`](crate::container::lifecycle::CONTAINER_WORKSPACE). Returns the container manager and container ID so callers
-    /// can record activity.
-    async fn container_terminal_tool(
+    /// can record activity, and the workspace the scripts start in.
+    async fn container_shell(
         &self,
+        config: &crate::config::MayConfig,
         profile: &profiles::Model,
         source: NetworkAccessSource,
         task: Option<&scheduled_tasks::Model>,
     ) -> Result<
         (
-            TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
+            Arc<crate::ipc::SessionShell>,
+            PathBuf,
             Arc<ContainerManager>,
             String,
         ),
@@ -1535,16 +1566,15 @@ impl TaskRuntime {
             .ipc_route(&container_id)
             .await
             .map_err(|error| prefixed_error("failed to resolve container IPC route: ", &error))?;
-        let container_runtime = ContainerShellRuntime::new(
-            container_id.clone(),
-            container_ipc_route,
-            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
-                container_manager.runtime().client.clone(),
-            )))),
-        )
-        .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
-        let terminal_tool = self
-            .initialized_terminal_tool(
+        let exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
+            container_manager.runtime().client.clone(),
+        ))));
+        let runtime =
+            ContainerShellRuntime::new(container_id.clone(), container_ipc_route, exec.clone())
+                .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
+        let shell = self
+            .task_shell(
+                config,
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
                     ui_event_bus: self.ui_event_bus.clone(),
@@ -1553,19 +1583,19 @@ impl TaskRuntime {
                     allow_network: true,
                     network_policy: self.network_policy.load().as_ref().clone(),
                 },
-                workspace_dir,
-                ShellSessionRegistry::new(ShellRuntimeAvailability {
-                    local: false,
-                    container: true,
-                })
-                .with_container_runtime(container_runtime),
+                &workspace_dir,
+                TaskHome::Container {
+                    runtime,
+                    exec,
+                    id: container_id.clone(),
+                },
                 task.map(|task| WakeScope {
                     task,
                     in_container: true,
                 }),
             )
             .await?;
-        Ok((terminal_tool, container_manager, container_id))
+        Ok((shell, workspace_dir, container_manager, container_id))
     }
 
     async fn execute_container(
@@ -1574,12 +1604,16 @@ impl TaskRuntime {
         profile: &profiles::Model,
         command: String,
     ) -> Result<String, String> {
-        let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
-        let (terminal_tool, container_manager, container_id) = Box::pin(
-            self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer, Some(task)),
-        )
+        let config = self.shell_config().await?;
+        let timeout = TaskTimeout::from_stored(task.timeout_secs, config.shell.timeout_cap)?;
+        let (shell, workspace, container_manager, container_id) = Box::pin(self.container_shell(
+            &config,
+            profile,
+            NetworkAccessSource::TaskContainer,
+            Some(task),
+        ))
         .await?;
-        let result = run_terminal_command(&terminal_tool, command, timeout).await;
+        let result = run_terminal_command(&shell, &workspace, command, timeout).await;
         container_manager.touch_activity(&container_id);
         result
     }
@@ -1626,14 +1660,15 @@ impl TaskRuntime {
         command: String,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
-        let (terminal_tool, container_manager, container_id) =
-            Box::pin(self.container_terminal_tool(
-                profile,
-                NetworkAccessSource::TaskValidationContainer,
-                None,
-            ))
-            .await?;
-        let result = run_terminal_command(&terminal_tool, command, timeout)
+        let config = self.shell_config().await?;
+        let (shell, workspace, container_manager, container_id) = Box::pin(self.container_shell(
+            &config,
+            profile,
+            NetworkAccessSource::TaskValidationContainer,
+            None,
+        ))
+        .await?;
+        let result = run_terminal_command(&shell, &workspace, command, timeout)
             .await
             .map(|_| ());
         container_manager.touch_activity(&container_id);
@@ -1671,8 +1706,7 @@ impl TaskScheduler {
 struct TaskTimeout(std::time::Duration);
 
 impl TaskTimeout {
-    fn new(secs: u32) -> Result<Self, String> {
-        let cap = aither_sandbox::DEFAULT_TIMEOUT_CAP;
+    fn new(secs: u32, cap: std::time::Duration) -> Result<Self, String> {
         let timeout = std::time::Duration::from_secs(u64::from(secs));
         if secs == 0 || timeout > cap {
             return Err(format!(
@@ -1683,10 +1717,10 @@ impl TaskTimeout {
         Ok(Self(timeout))
     }
 
-    fn from_stored(secs: i64) -> Result<Self, String> {
+    fn from_stored(secs: i64, cap: std::time::Duration) -> Result<Self, String> {
         let secs = u32::try_from(secs)
             .map_err(|_| format!("stored task timeout_secs is out of range: {secs}"))?;
-        Self::new(secs)
+        Self::new(secs, cap)
     }
 
     const fn as_secs(self) -> u64 {
@@ -1694,73 +1728,31 @@ impl TaskTimeout {
     }
 }
 
-/// Runs `script` as a detached terminal job bounded by `timeout` and waits
-/// for its final result; the foreground window does not apply to it.
+/// Runs `script` in `dir` to its end, bounded by `timeout`; the foreground
+/// window does not apply to it.
 async fn run_terminal_command(
-    terminal_tool: &TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
+    shell: &crate::ipc::SessionShell,
+    dir: &Path,
     script: String,
     timeout: TaskTimeout,
 ) -> Result<String, String> {
-    let started = terminal_tool
-        .run_background(TerminalArgs {
-            description: "run the scheduled task script".to_string(),
-            script,
-            language: aither_sandbox::ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
-            location: None,
-            expect: OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: 800,
-            raw: false,
-            timeout: timeout.as_secs(),
-            background: true,
-        })
+    let result = shell
+        .run(Script::new(script, dir, timeout.0))
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
-    if started.is_error() {
-        return Err(started
-            .error_message()
-            .unwrap_or("task terminal execution failed")
-            .to_string());
-    }
-    let CommandOutcome::Running { task_id, .. } = started
-        .command()
-        .ok_or_else(|| "background terminal tool did not return a command result".to_string())?
-        .outcome
-        .clone()
-    else {
-        return Err("background terminal job started without a task id".to_string());
-    };
-
-    let receiver = terminal_tool.background_receiver();
-    let completed = loop {
-        let Some(completed) = receiver.recv().await else {
-            return Err("background terminal channel closed before the task finished".to_string());
-        };
-        if completed.task_id == task_id {
-            break completed;
-        }
-    };
-
-    let killed = terminal_tool
-        .job_registry()
-        .get_by_task_id(&task_id)
-        .await
-        .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
-    if killed {
-        return Err(format!(
-            "task timed out after {} seconds and was killed",
-            timeout.as_secs()
-        ));
-    }
-    let result = completed
-        .result
-        .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
-
-    parse_terminal_result(&result)
+    parse_terminal_result(&result, timeout)
 }
 
-fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
+fn parse_terminal_result(result: &ScriptResult, timeout: TaskTimeout) -> Result<String, String> {
+    let code = match result.outcome {
+        RunOutcome::Exited { code } => code,
+        RunOutcome::Killed(_) => {
+            return Err(format!(
+                "task timed out after {} seconds and was killed",
+                timeout.as_secs()
+            ));
+        }
+    };
     let output = combine_output(
         &crate::command_output::stream_text(&result.stdout),
         result
@@ -1768,8 +1760,8 @@ fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
             .as_ref()
             .map(crate::command_output::stream_text),
     );
-    if result.exit_code != 0 {
-        return Err(task_script_failure(result.exit_code, output.as_str()));
+    if code != 0 {
+        return Err(task_script_failure(code, output.as_str()));
     }
 
     Ok(output)
@@ -1820,8 +1812,6 @@ mod tests {
         SchedulerPermissionHandler, TaskFilePlacement, TaskRuntime, TaskScript, TaskTimeout,
         run_terminal_command, task_execution_command, task_file_validation_command,
     };
-    use aither_sandbox::{Configured, TerminalTool};
-    use executor_core::DefaultExecutor;
     use tempfile::tempdir;
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
@@ -1843,10 +1833,13 @@ mod tests {
                 network_policy: None,
             };
             assert_eq!(
-                aither_sandbox::permission::PermissionHandler::check_domain(
+                aither_sandbox::DomainApprover::approve(
                     &handler,
-                    "example.com",
-                    443
+                    &aither_sandbox::DomainRequest {
+                        host: "example.com".to_string(),
+                        port: 443,
+                        agent: None,
+                    }
                 )
                 .await,
                 allow_network
@@ -2077,15 +2070,15 @@ mod tests {
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("db should initialize");
-        let empty_distribution =
-            aither_sandbox::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
-                .expect("an empty distribution is well-formed");
+        let empty_distribution = crate::tools::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
+            .expect("an empty distribution is well-formed");
         let runtime = TaskRuntime::load(db, may_dir.clone(), Arc::new(empty_distribution))
             .await
             .expect("task runtime should load");
 
         let error = runtime
-            .local_terminal_tool(
+            .local_shell(
+                &crate::config::MayConfig::default(),
                 "profile",
                 NetworkAccessSource::TaskValidationLocal,
                 &TaskScript {
@@ -2107,7 +2100,7 @@ mod tests {
     /// way scheduled runs prepare theirs.
     async fn scheduler_test_terminal(
         dir: &std::path::Path,
-    ) -> TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> {
+    ) -> (Arc<crate::ipc::SessionShell>, std::path::PathBuf) {
         crate::test_support::install_global_executor();
         let may_dir = dir.join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
@@ -2123,33 +2116,44 @@ mod tests {
         )
         .await
         .expect("task runtime should load");
-        runtime
-            .local_terminal_tool(
+        let shell = runtime
+            .local_shell(
+                &crate::config::MayConfig::default(),
                 "profile",
                 NetworkAccessSource::TaskLocal,
                 &TaskScript {
                     content: String::new(),
-                    host_working_dir: workspace,
+                    host_working_dir: workspace.clone(),
                 },
                 false,
                 None,
             )
             .await
-            .expect("terminal should initialize")
+            .expect("terminal should initialize");
+        (shell, workspace)
     }
 
     #[tokio::test]
     async fn task_runs_past_the_foreground_wait() {
         let dir = tempdir().expect("temp dir should be created");
-        let terminal = scheduler_test_terminal(dir.path()).await;
-        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_WAIT.as_secs())
-            .expect("the foreground wait fits in u32 seconds")
+        let (terminal, workspace) = scheduler_test_terminal(dir.path()).await;
+        let runtime_secs = u32::try_from(
+            crate::config::ShellSettings::default()
+                .foreground_wait
+                .as_secs(),
+        )
+        .expect("the foreground wait fits in u32 seconds")
             + 2;
 
         let output = run_terminal_command(
             &terminal,
+            &workspace,
             format!("sleep {runtime_secs}; echo finished"),
-            TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
+            TaskTimeout::new(
+                runtime_secs + 60,
+                crate::config::ShellSettings::default().timeout_cap,
+            )
+            .expect("timeout is within the cap"),
         )
         .await
         .expect("a task longer than the foreground wait should complete");
@@ -2160,12 +2164,14 @@ mod tests {
     #[tokio::test]
     async fn task_past_its_own_timeout_fails_with_timeout_error() {
         let dir = tempdir().expect("temp dir should be created");
-        let terminal = scheduler_test_terminal(dir.path()).await;
+        let (terminal, workspace) = scheduler_test_terminal(dir.path()).await;
 
         let error = run_terminal_command(
             &terminal,
+            &workspace,
             "sleep 60; echo finished".to_string(),
-            TaskTimeout::new(2).expect("timeout is within the cap"),
+            TaskTimeout::new(2, crate::config::ShellSettings::default().timeout_cap)
+                .expect("timeout is within the cap"),
         )
         .await
         .expect_err("a task past its timeout must fail");
@@ -2232,13 +2238,13 @@ mod tests {
 
     #[test]
     fn task_timeout_is_bounded_by_the_background_cap() {
-        assert!(TaskTimeout::new(0).is_err());
-        assert!(TaskTimeout::new(1).is_ok());
-        let cap = u32::try_from(aither_sandbox::DEFAULT_TIMEOUT_CAP.as_secs())
-            .expect("the background cap fits in u32 seconds");
-        assert!(TaskTimeout::new(cap).is_ok());
-        assert!(TaskTimeout::new(cap + 1).is_err());
-        assert!(TaskTimeout::from_stored(-1).is_err());
+        let limit = crate::config::ShellSettings::default().timeout_cap;
+        assert!(TaskTimeout::new(0, limit).is_err());
+        assert!(TaskTimeout::new(1, limit).is_ok());
+        let cap = u32::try_from(limit.as_secs()).expect("the background cap fits in u32 seconds");
+        assert!(TaskTimeout::new(cap, limit).is_ok());
+        assert!(TaskTimeout::new(cap + 1, limit).is_err());
+        assert!(TaskTimeout::from_stored(-1, limit).is_err());
     }
 
     /// A daemon's `history.db` with a task runtime whose runs can `wake`.

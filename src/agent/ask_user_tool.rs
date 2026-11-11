@@ -8,12 +8,13 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use aither_agent::{Block, ContextSource};
+use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 use aither_core::llm::{Tool, ToolContext, ToolResult};
 use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::working_document::{BlockerError, BlockerResolver};
 use crate::secrets::{SecretScope, SecretStore};
 use crate::session::{
     PersistedAskUserQuestion, PersistedAskUserRequest, PersistedSecretRequest,
@@ -74,8 +75,8 @@ struct OpenQuestionsText<'a> {
 pub struct AskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
-    languages: Option<aither_agent::LanguageGuard>,
-    task_events: Option<aither_agent::WorkEvents>,
+    languages: Option<crate::harness::language::LanguageGuard>,
+    task_events: Option<crate::harness::working_document::WorkEvents>,
     cards: Option<super::command_cards::CommandCards>,
 }
 
@@ -102,14 +103,17 @@ impl AskUserTool {
     /// Record every question asked on `events`, the main agent's `tasks.md`
     /// inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
+    pub fn with_task_events(
+        mut self,
+        events: crate::harness::working_document::WorkEvents,
+    ) -> Self {
         self.task_events = Some(events);
         self
     }
 
     /// Refuse a question outside the communication language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -292,7 +296,9 @@ impl Tool for AskUserTool {
             ask: crate::session::UserAsk::question(&request),
         });
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::WorkEvent::QuestionAsked(word.clone()));
+            events.record(crate::harness::working_document::WorkEvent::QuestionAsked(
+                word.clone(),
+            ));
         }
         Ok(ToolResult::text(
             AskedText { request_id: &word }
@@ -314,7 +320,7 @@ pub struct WithdrawAskUserArgs {
 pub struct WithdrawAskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
-    task_events: Option<aither_agent::WorkEvents>,
+    task_events: Option<crate::harness::working_document::WorkEvents>,
 }
 
 impl WithdrawAskUserTool {
@@ -331,7 +337,10 @@ impl WithdrawAskUserTool {
     /// Record every question withdrawn on `events`, the main agent's
     /// `tasks.md` inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
+    pub fn with_task_events(
+        mut self,
+        events: crate::harness::working_document::WorkEvents,
+    ) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -372,9 +381,11 @@ impl Tool for WithdrawAskUserTool {
             return Err(AskUserToolError::NotOpen(args.request_id).into());
         }
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::WorkEvent::QuestionWithdrawn(
-                args.request_id.clone(),
-            ));
+            events.record(
+                crate::harness::working_document::WorkEvent::QuestionWithdrawn(
+                    args.request_id.clone(),
+                ),
+            );
         }
         Ok(ToolResult::text(
             WithdrawnText {
@@ -408,9 +419,9 @@ impl AskUserBlockerResolver {
     }
 }
 
-impl aither_agent::BlockerResolver for AskUserBlockerResolver {
-    async fn is_open(&self, mark: &str) -> Result<bool, aither_agent::BlockerError> {
-        let unavailable = |error: crate::db::ChatDbError| aither_agent::BlockerError::Unavailable {
+impl BlockerResolver for AskUserBlockerResolver {
+    async fn is_open(&self, mark: &str) -> Result<bool, BlockerError> {
+        let unavailable = |error: crate::db::ChatDbError| BlockerError::Unavailable {
             blocker: mark.to_string(),
             reason: error.to_string(),
         };
@@ -454,7 +465,18 @@ impl OpenQuestionsContext {
 }
 
 impl ContextSource for OpenQuestionsContext {
-    async fn render(&self) -> Option<Block> {
+    fn id(&self) -> SourceId {
+        SourceId::new(OPEN_QUESTIONS_TAG)
+    }
+
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        self.peek(moment).await
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+        if !matches!(moment, Moment::Request { .. }) {
+            return Vec::new();
+        }
         let open = match self
             .runtime
             .db()
@@ -464,18 +486,18 @@ impl ContextSource for OpenQuestionsContext {
             Ok(open) => open,
             Err(error) => {
                 tracing::error!(session_id = %self.session_id, %error, "failed to load open questions for the request context");
-                return None;
+                return Vec::new();
             }
         };
         if open.is_empty() {
-            return None;
+            return Vec::new();
         }
-        Some(Block::new(
+        vec![ContextBlock::tail(
             OPEN_QUESTIONS_TAG,
             OpenQuestionsText { requests: &open }
                 .render()
                 .expect("open questions template must render"),
-        ))
+        )]
     }
 }
 
@@ -483,14 +505,13 @@ impl ContextSource for OpenQuestionsContext {
 mod tests {
     use std::sync::Arc;
 
-    use aither_sandbox::ToolRegistryBuilder;
+    use crate::ipc::CommandRegistryBuilder;
+    use crate::test_support::{TestCommands, main_launch};
 
     use super::{ASK_USER_DESCRIPTION, AskUserTool};
 
     /// The `ask_user` command on a fresh session's database, and that database.
-    async fn ask_user_registry(
-        dir: &tempfile::TempDir,
-    ) -> (aither_sandbox::ToolRegistry, crate::db::ChatDb) {
+    async fn ask_user_registry(dir: &tempfile::TempDir) -> (TestCommands, crate::db::ChatDb) {
         let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("chat db opens");
@@ -502,10 +523,10 @@ mod tests {
             crate::ui_event_bus::UiEventBus::new(),
             crate::session::MayHomePaths::new(dir.path().join("home")),
         ));
-        let mut builder = ToolRegistryBuilder::new();
+        let mut builder = CommandRegistryBuilder::new();
         builder.configure_tool(AskUserTool::new(runtime, "session"));
         (
-            builder.build(crate::test_support::test_output_store(dir.path().join("outputs")).await),
+            TestCommands::build(builder, dir.path().join("outputs")).await,
             db,
         )
     }
@@ -518,7 +539,8 @@ mod tests {
         let (registry, db) = ask_user_registry(&dir).await;
         let words = shell_words::split(r#""Which database?" --option PostgreSQL --option SQLite"#)
             .expect("shell syntax");
-        let reply = registry.query_tool_handler("ask_user", &words).await;
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let reply = registry.call(&main_launch(), "ask_user", &words).await;
         assert!(reply.ok, "{reply:?}");
 
         let open = db
@@ -534,7 +556,8 @@ mod tests {
 
         let twice = shell_words::split(r#""Which database?" --question "Which DB?""#)
             .expect("shell syntax");
-        let reply = registry.query_tool_handler("ask_user", &twice).await;
+        let twice: Vec<&str> = twice.iter().map(String::as_str).collect();
+        let reply = registry.call(&main_launch(), "ask_user", &twice).await;
         assert!(!reply.ok, "a question given twice is refused: {reply:?}");
     }
 
@@ -552,7 +575,8 @@ mod tests {
         assert_eq!(examples.len(), 3, "single, several and secret questions");
         for example in examples {
             let words = shell_words::split(example).expect("the example is shell syntax");
-            let reply = registry.query_tool_handler("ask_user", &words[1..]).await;
+            let words: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+            let reply = registry.call(&main_launch(), "ask_user", &words).await;
             assert!(reply.ok, "{example}: {reply:?}");
         }
     }

@@ -1,7 +1,7 @@
 //! The environment every command of a session gets: the session's secrets
 //! and the path of its `tasks.md`.
 
-use aither_sandbox::TerminalEnvSource;
+use aither_sandbox::{EnvSource, LaunchInfo};
 
 use crate::secrets::SessionEnv;
 
@@ -27,8 +27,8 @@ impl CommandEnv {
     }
 }
 
-impl TerminalEnvSource for CommandEnv {
-    fn env(&self) -> Vec<(String, String)> {
+impl EnvSource for CommandEnv {
+    fn env(&self, _launch: &LaunchInfo) -> Vec<(String, String)> {
         let mut env = self.secrets.env();
         env.retain(|(name, _)| name != crate::tasks_md::ENV);
         env.push((crate::tasks_md::ENV.to_string(), self.tasks_md.clone()));
@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn the_tasks_path_is_the_last_word_on_its_name() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let env = env_of(dir.path(), "/workspace/tasks.md").env();
+        let env = env_of(dir.path(), "/workspace/tasks.md").env(&LaunchInfo::default());
         let ours: Vec<_> = env
             .iter()
             .filter(|(name, _)| name == crate::tasks_md::ENV)

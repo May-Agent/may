@@ -1,0 +1,27 @@
+Execute terminal commands in a sandboxed environment.
+
+The primary interface to all system capabilities. Scripts run in a sandbox with full read access to the host filesystem but writes contained to a dedicated working directory.
+
+## Output Handling
+
+By default, stdout is **compressed** before being returned. Compression is semantics-preserving: the meaning is identical to the raw output, but the representation may differ. Specifically:
+
+- **JSON** outputs (arrays of objects or single objects) are automatically converted to **TSV** with dot-notation flattened column headers, but only when the TSV is smaller than the original JSON.
+- **Source code** outputs (detected via content analysis) are folded using syntax-aware block folding with line numbers. The full raw output is saved to a file whose URL is included in the result.
+- **Empty lines** and **invisible/control characters** are stripped.
+
+If you need the exact verbatim output (e.g., for checksums, binary protocols, or diffing), either set `raw: true`, pipe through further processing in the script, or redirect to a file within the script.
+
+Large outputs are automatically saved to file to manage context. When this happens, you receive the file path and can process it using standard Unix tools (head, tail, grep, less) or pipe through `ask` for summarization.
+
+## Built-in Commands
+
+IPC-backed commands are configured by the host application and are exposed inside the terminal runtime as ordinary CLI commands. Inspect the application-provided command list and each command's `--help` output instead of assuming a fixed built-in command inventory.
+
+## Execution
+
+Each call starts a fresh shell; only a successful `cd` carries over to the next call. `timeout` is required: it is the job's maximum runtime in seconds — the job and its process tree are killed when it passes — and it may be at most {{ timeout_cap_minutes }} minutes.
+
+By default the call waits in the foreground for up to {{ foreground_secs }} seconds. A command still running then **promotes to a background task**: the call returns the task id and the output captured so far, and the job keeps running under its `timeout` bound. Manage it with `{{ read }}` (incremental output), `{{ input }}` (stdin) and `{{ kill }}`. Set `background: true` to detach immediately instead of waiting.
+
+`interpreter` is `shell` by default; `python` runs `script` as Python source, without a shell wrapper.

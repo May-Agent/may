@@ -2,7 +2,7 @@
 //! compaction lists exactly the questions still open, and the user's view
 //! (the runtime summary) agrees with it.
 
-use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
+use crate::harness::ask_user::{AnswerValue, QuestionAnswer};
 use aither_core::llm::{Tool, ToolContext};
 
 use super::ask_user_tool::{AskUserArgs, AskUserTool, WithdrawAskUserArgs, WithdrawAskUserTool};

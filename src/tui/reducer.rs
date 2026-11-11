@@ -566,7 +566,7 @@ pub fn jobs_rows(app: &App) -> Vec<JobRow> {
         .map(JobRow::Subagent)
         .collect();
     let mut jobs: Vec<aither_sandbox::JobInfo> = app.jobs.clone();
-    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::job_registry::JobStatus::Running));
+    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::JobStatus::Running));
     rows.extend(jobs.into_iter().map(JobRow::Job));
     rows
 }

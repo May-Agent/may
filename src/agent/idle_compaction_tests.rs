@@ -32,6 +32,9 @@ use super::may::{
 };
 use super::tool_environment_cache::ToolEnvironmentCache;
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
+use crate::harness::host_load::{
+    AnyHostReader, HostReader, MachineLoad, MemoryPressure, ReadError,
+};
 use crate::model_selector::ModelSelector;
 use crate::session::{SessionId, SessionPlanState};
 
@@ -230,18 +233,18 @@ impl ScriptedHost {
 
     fn source(&self) -> HostReaderSource {
         let host = self.clone();
-        HostReaderSource::new(move || aither_agent::AnyHostReader::new(host.clone()))
+        HostReaderSource::new(move || AnyHostReader::new(host.clone()))
     }
 }
 
-impl aither_agent::HostReader for ScriptedHost {
-    fn memory_pressure(&mut self) -> Result<aither_agent::MemoryPressure, aither_agent::ReadError> {
-        Ok(aither_agent::MemoryPressure::Normal)
+impl HostReader for ScriptedHost {
+    fn memory_pressure(&mut self) -> Result<MemoryPressure, ReadError> {
+        Ok(MemoryPressure::Normal)
     }
 
-    fn machine_load(&mut self) -> Result<aither_agent::MachineLoad, aither_agent::ReadError> {
+    fn machine_load(&mut self) -> Result<MachineLoad, ReadError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        Ok(aither_agent::MachineLoad(f64::from_bits(
+        Ok(MachineLoad(f64::from_bits(
             self.load_bits.load(Ordering::SeqCst),
         )))
     }
@@ -276,7 +279,7 @@ pub struct SessionParts {
 impl SessionParts {
     pub(super) async fn new(dir: std::path::PathBuf) -> Self {
         crate::test_support::install_global_executor();
-        std::fs::create_dir_all(dir.join(".may")).expect("create the may dir");
+        std::fs::create_dir_all(dir.join(".may/skills")).expect("create the may dir");
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
             .expect("open test db");
@@ -345,8 +348,7 @@ impl SessionParts {
             tool_environments: self.tool_environments.clone(),
             job_server: self.job_server.clone(),
             provider_attempt: 0,
-            subagents: None,
-            background_jobs: aither_agent::BackgroundJobPolicy::Await,
+            subagent_tracker: None,
             connectivity: aither_connectivity::Connectivity::manual(true).0,
             rules_import: self.rules_import.clone(),
             limits: crate::agent::LiveLimits::of(&MayConfig::default()),
@@ -482,6 +484,7 @@ impl Session {
     ) -> MayAgent {
         let mut input = parts.input().await;
         input.prompt_cache_epoch = prompt_cache_epoch;
+        input.limits = crate::agent::LiveLimits::of(config);
         let mut agent_config: MayAgentConfig = MayAgent::session_config(config, input)
             .await
             .expect("the session config resolves");

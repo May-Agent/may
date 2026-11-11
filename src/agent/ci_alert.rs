@@ -7,7 +7,7 @@
 //! next request or the end of the tool turn that waited on the checks,
 //! whichever comes first.
 
-use aither_agent::{Block, ContextSource};
+use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 
 use crate::db::{ChatDb, ChatDbError};
 
@@ -30,16 +30,37 @@ impl CiAlertContext {
         }
     }
 
-    async fn take(&self) -> Option<Block> {
+    async fn take(&self) -> Vec<ContextBlock> {
         let (findings, checks) = futures_lite::future::zip(
             self.db.take_ci_alerts(&self.session_id),
             self.db.take_pr_check_alerts(&self.session_id),
         )
         .await;
+        self.block(findings, checks)
+    }
+
+    async fn peek_waiting(&self) -> Vec<ContextBlock> {
+        let (findings, checks) = futures_lite::future::zip(
+            self.db.waiting_ci_alerts(&self.session_id),
+            self.db.waiting_pr_check_alerts(&self.session_id),
+        )
+        .await;
+        self.block(findings, checks)
+    }
+
+    fn block(
+        &self,
+        findings: Result<Vec<String>, ChatDbError>,
+        checks: Result<Vec<String>, ChatDbError>,
+    ) -> Vec<ContextBlock> {
         let mut alerts = Vec::new();
         self.collect(&mut alerts, findings);
         self.collect(&mut alerts, checks);
-        (!alerts.is_empty()).then(|| Block::new(TAG, alerts.join("\n\n")))
+        if alerts.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContextBlock::stable(TAG, alerts.join("\n\n"))]
+        }
     }
 
     fn collect(&self, alerts: &mut Vec<String>, taken: Result<Vec<String>, ChatDbError>) {
@@ -53,16 +74,27 @@ impl CiAlertContext {
 }
 
 impl ContextSource for CiAlertContext {
-    async fn on_request(&mut self, _reassembled: bool) -> Option<Block> {
-        self.take().await
+    fn id(&self) -> SourceId {
+        SourceId::new(TAG)
     }
 
-    async fn on_tool_turn_end(&mut self) -> Option<Block> {
-        self.take().await
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        match moment {
+            Moment::Request { .. } | Moment::ToolTurnEnd => self.take().await,
+            _ => Vec::new(),
+        }
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+        match moment {
+            Moment::Request { .. } | Moment::ToolTurnEnd => self.peek_waiting().await,
+            _ => Vec::new(),
+        }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -71,16 +103,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = ChatDb::open(&dir.path().join("history.db")).await.unwrap();
         let mut source = CiAlertContext::new(db.clone(), "s");
-        assert!(source.on_tool_turn_end().await.is_none());
+        assert!(source.blocks(Moment::ToolTurnEnd).await.is_empty());
         db.add_ci_finding("s", 1, "abc", "warning", "alert text")
             .await
             .unwrap();
         db.add_ci_finding("other", 2, "def", "warning", "not mine")
             .await
             .unwrap();
-        let block = source.on_tool_turn_end().await.expect("one alert");
-        assert_eq!(block.content(), "alert text");
-        assert!(source.on_tool_turn_end().await.is_none());
-        assert!(source.on_request(false).await.is_none());
+        let peeked = source.peek(Moment::ToolTurnEnd).await;
+        assert_eq!(peeked.len(), 1, "a preview shows the alert");
+        let blocks = source.blocks(Moment::ToolTurnEnd).await;
+        let [block] = blocks.as_slice() else {
+            panic!("one alert: {blocks:?}");
+        };
+        assert_eq!(block.block().content(), "alert text");
+        assert!(source.blocks(Moment::ToolTurnEnd).await.is_empty());
+        assert!(
+            source
+                .blocks(Moment::Request { reassembled: false })
+                .await
+                .is_empty()
+        );
     }
 }

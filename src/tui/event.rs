@@ -217,8 +217,8 @@ pub enum AppEvent {
     JobDetailLoaded {
         /// Refreshed job info, when the pid still exists.
         job: Option<aither_sandbox::JobInfo>,
-        /// Buffered `(stdout, stderr)`, when the registry still serves it.
-        output: Option<(Vec<u8>, Vec<u8>)>,
+        /// Buffered output, when the registry still serves it.
+        output: Option<Vec<u8>>,
     },
     /// Incremental terminal-output poll for running tool calls.
     TerminalOutputs(Vec<TerminalOutputDelta>),

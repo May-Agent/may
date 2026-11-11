@@ -5,7 +5,7 @@ export type BackgroundJobStatus =
   | { state: 'running' }
   | { state: 'completed'; exit_code: number }
   | { state: 'failed'; error: string }
-  | { state: 'killed'; cause: { kind: 'user' } | { kind: 'memory_runaway'; footprint_bytes: number; capacity_bytes: number; domain: 'machine' | 'container' } };
+  | { state: 'killed'; cause: { kind: 'user' } | { kind: 'timeout'; timeoutMs: number; started: string; killed: string } | { kind: 'memory_runaway'; footprint_bytes: number; capacity_bytes: number; domain: 'machine' | 'container' } };
 
 /** One background terminal job of a session (`WireJob`). */
 export interface BackgroundJob {

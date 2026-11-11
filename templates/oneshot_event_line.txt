@@ -13,11 +13,8 @@ Tool finished: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if
 {%- endmatch -%}
 {%- when LineKind::ToolFailed { name, label, elapsed, message } -%}
 Tool failed: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if let Some(elapsed) = elapsed %} in {{ elapsed }}{% endif %}: {{ message }}
-{%- when LineKind::BackgroundStarted { task_id, output_file } -%}Background task started: {{ task_id }} (output: {{ output_file }})
-{%- when LineKind::BackgroundCompleted { task_id } -%}Background task completed: {{ task_id }}
 {%- when LineKind::Paused { reason } -%}Paused: {{ reason }}
 {%- when LineKind::Resumed { reason } -%}Resumed: {{ reason }}
-{%- when LineKind::SkillActivated { name } -%}Skill activated: {{ name }}
 {%- when LineKind::Usage { prompt, cache_read, cache_write, completion, total } -%}
 Usage:{% if let Some(tokens) = prompt %} prompt={{ tokens }}{% endif %}{% if let Some(tokens) = cache_read %} cache_read={{ tokens }}{% endif %}{% if let Some(tokens) = cache_write %} cache_write={{ tokens }}{% endif %}{% if let Some(tokens) = completion %} completion={{ tokens }}{% endif %}{% if let Some(tokens) = total %} total={{ tokens }}{% endif %}
 {%- when LineKind::CompactionRecovery { error, alerts_removed, outputs_spilled } -%}
