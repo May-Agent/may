@@ -306,9 +306,10 @@ struct UnchangedFileReadRefused<'a> {
     paths: &'a [&'a Path],
 }
 
-/// Refuses a `terminal` script that does nothing but repeat a read that
-/// last succeeded with the same files unchanged: the same commands with the
-/// same words, from the same directory. It would print what the last one
+/// Refuses a `terminal` script that only repeats its last successful read.
+///
+/// A repeat is the same commands with the same words, from the same
+/// directory, of files unchanged since. It would print what the last one
 /// did, spending a turn for nothing; only a background event can say
 /// something new.
 #[derive(Debug, Clone)]
@@ -483,11 +484,11 @@ struct WhitespacePatchRefused<'a> {
     path: &'a str,
 }
 
-/// Refuses a script whose `apply_patch` patch has a hunk that removes and
-/// adds the same code apart from whitespace that carries no meaning in the
-/// file's language: formatting by hand, which the project's formatter does.
+/// Refuses an `apply_patch` script that formats code by hand.
 ///
-/// Whitespace inside a string literal is meaning, and so are each line's
+/// That is a hunk that removes and adds the same code apart from whitespace
+/// that carries no meaning in the file's language, which the project's
+/// formatter does. Whitespace inside a string literal is meaning, and so are each line's
 /// indentation and the line breaks in an [indentation-sensitive
 /// language](INDENTATION_SENSITIVE); between two word characters a run of
 /// whitespace keeps them two words. A hunk is lexed where it applies: the

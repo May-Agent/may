@@ -259,7 +259,6 @@ async fn a_script_that_does_more_than_repeat_a_read_runs() {
     std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write");
     std::fs::create_dir(dir.path().join("tasks")).expect("mkdir");
     std::fs::write(dir.path().join("tasks/Cargo.toml"), "[package]\n").expect("write");
-    let state = FileReads::default();
     let policy = unchanged_reads();
     for (before, after) in [
         // The script rewrites the file it reads.
@@ -275,6 +274,8 @@ async fn a_script_that_does_more_than_repeat_a_read_runs() {
         ("cat a.rs", "cat a.rs | sh"),
         ("cat a.rs", "sudo cat a.rs"),
     ] {
+        // Each pair starts with nothing read.
+        let state = FileReads::default();
         assert_eq!(
             read_in(&policy, &state, dir.path(), before).await,
             ScriptDecision::Pass,
@@ -287,6 +288,7 @@ async fn a_script_that_does_more_than_repeat_a_read_runs() {
         );
     }
     // A script that does more than read is never a repeated read.
+    let state = FileReads::default();
     for script in [
         "./gen.sh && cat out.json",
         "cd tasks && cat Cargo.toml",
