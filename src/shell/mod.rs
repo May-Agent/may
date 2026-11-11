@@ -7,6 +7,7 @@ mod assembly;
 mod budgets;
 mod environment;
 mod output_treatment;
+mod python_shim;
 mod settings;
 mod tools;
 mod wording;

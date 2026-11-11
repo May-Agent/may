@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use heel::{Access, Grant, ResolvedPath};
 
+use super::python_shim;
 use crate::tools::{PreparedTools, ToolRuntimeError, UV_PYTHON_PREFERENCE};
 
 /// Why a session's environment could not be prepared.
@@ -54,6 +55,7 @@ impl HostSession {
         tools: &PreparedTools<PathBuf>,
     ) -> Result<Self, SessionEnvironmentError> {
         write_git_shim(tools).await?;
+        python_shim::install(&python_shim::shim_directory(working_dir)).await?;
         let environment = environment(working_dir, tools).await?;
         let mut grants = tool_grants(tools)?;
         grants.extend(path_directory_grants(&environment)?);
@@ -207,10 +209,14 @@ async fn environment(
     let host_path = std::env::var_os("PATH")
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| heel::default_sandbox_path().into());
-    let path = tools
-        .prepend_path(Some(host_path.as_os_str()))?
-        .into_string()
-        .map_err(|_| ToolRuntimeError::InvalidCache(tools.bin_dir().clone()))?;
+    let managed_path = tools.prepend_path(Some(host_path.as_os_str()))?;
+    let path = std::env::join_paths(
+        std::iter::once(python_shim::shim_directory(working_dir))
+            .chain(std::env::split_paths(&managed_path)),
+    )
+    .map_err(|error| std::io::Error::other(format!("session PATH: {error}")))?
+    .into_string()
+    .map_err(|_| ToolRuntimeError::InvalidCache(tools.bin_dir().clone()))?;
     let mut env = vec![
         ("PATH".to_string(), path),
         ("TMPDIR".to_string(), tmp.clone()),
