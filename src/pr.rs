@@ -96,7 +96,7 @@ pub struct PrContext {
     pub cwd: PathBuf,
     /// Workspace config — `[[projects]]` backends and checks.
     pub workspace_config: crate::workspace::WorkspaceConfig,
-    /// Outbound screen: `Ok(true)` publishes, anything else blocks. Wired
+    /// Outbound screen: only `Ok(ScreenVerdict::Pass)` publishes. Wired
     /// to the fast model by the command registration.
     pub screen: Option<std::sync::Arc<ScreenFn>>,
     /// The user's signing configuration: every commit of a PR must carry
@@ -162,9 +162,61 @@ impl PrContext {
 pub type ScreenFn = dyn Fn(
         &str,
         &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScreenVerdict, String>> + Send>>
     + Send
     + Sync;
+
+/// What the outbound screen's reply says, parsed once from the reply text.
+/// Only [`ScreenVerdict::Pass`] publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenVerdict {
+    /// The reply is exactly the pass token.
+    Pass,
+    /// The reply starts with the block token; the one-line reason follows.
+    Block(String),
+    /// The reply is neither: empty, reasoning only, or a decorated token.
+    Unreadable,
+}
+
+impl ScreenVerdict {
+    /// The pass token the screen prompt asks for.
+    const PASS: &'static str = "ALLOW";
+    /// The block token the screen prompt asks for, followed by `: <reason>`.
+    const BLOCK: &'static str = "BLOCK";
+
+    /// Parse the screen's whole reply. Surrounding whitespace is ignored and
+    /// nothing else: markup around a token or text before it is unreadable.
+    #[must_use]
+    pub fn parse(reply: &str) -> Self {
+        let reply = reply.trim();
+        if reply == Self::PASS {
+            return Self::Pass;
+        }
+        match reply.strip_prefix(Self::BLOCK) {
+            Some("") => Self::Block(String::new()),
+            Some(rest) if rest.starts_with(':') => {
+                Self::Block(rest.trim_start_matches(':').trim().to_string())
+            }
+            _ => Self::Unreadable,
+        }
+    }
+
+    /// Why the text is withheld, `None` when it publishes.
+    #[must_use]
+    pub fn refusal(self) -> Option<String> {
+        match self {
+            Self::Pass => None,
+            Self::Block(reason) if reason.is_empty() => {
+                Some("withheld by the outbound screen".to_string())
+            }
+            Self::Block(reason) => Some(reason),
+            Self::Unreadable => Some(
+                "the outbound screen gave no explicit pass; its reply was unreadable".to_string(),
+            ),
+        }
+    }
+}
 
 impl std::fmt::Debug for PrContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -940,12 +992,12 @@ impl PrStore {
             return Ok(None);
         }
         let Some(screen) = self.context.screen.as_ref() else {
-            tracing::warn!("pr.screen is set but no screen is wired");
-            return Ok(None);
+            return Ok(Some(
+                "pr.screen is set but no outbound screen is wired".to_string(),
+            ));
         };
         Ok(match screen(title, body).await {
-            Ok(true) => None,
-            Ok(false) => Some("withheld by the outbound screen".to_string()),
+            Ok(verdict) => verdict.refusal(),
             Err(reason) => Some(reason),
         })
     }
@@ -1024,25 +1076,19 @@ impl PrStore {
         };
         // Read before queueing: the bound and the removals that predate it.
         let before = merge_watch::Upstream::snapshot(&github).await?;
+        ensure_head_pinned(external, head_sha, &before.head_sha)?;
         let expected = merge_watch::Upstream::expected_checks(&github).await?;
         self.event(pr, "queued", None).await;
         // Serialized land: the lock covers queueing the PR, not the wait for
         // it to land.
         blocking::unblock({
             let owner_repo = owner_repo.clone();
+            let head_sha = head_sha.to_string();
             move || -> Result<(), String> {
                 let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
-                gh(&[
-                    "pr",
-                    "merge",
-                    &external.to_string(),
-                    "--repo",
-                    &owner_repo,
-                    "--auto",
-                    "--squash",
-                ])
-                .map(drop)
-                .map_err(|e| e.to_string())
+                let args = merge_args(external, &owner_repo, &head_sha);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                gh(&args).map(drop).map_err(|e| e.to_string())
             }
         })
         .await
@@ -1931,7 +1977,8 @@ fn github_owner_repo(url: &str) -> Option<String> {
     Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
 
-/// Screen published text through the fast model: `true` publishes. The
+/// Screen published text through the fast model; only an explicit pass
+/// publishes. The
 /// registration site wraps this in the session's screen closure.
 ///
 /// # Errors
@@ -1940,7 +1987,7 @@ pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
     llm: &LLM,
     title: &str,
     body: &str,
-) -> Result<bool, String> {
+) -> Result<ScreenVerdict, String> {
     use aither_core::llm::{Event, oneshot};
     use futures_lite::StreamExt;
     let input = format!("TITLE: {title}\n\n{body}");
@@ -1953,13 +2000,39 @@ pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
             Err(error) => return Err(error.to_string()),
         }
     }
-    Ok(!text.trim_start().to_ascii_uppercase().starts_with("BLOCK"))
+    Ok(ScreenVerdict::parse(&text))
 }
 
-const SCREEN_PROMPT: &str = "You screen pull request text before it is published to GitHub. \
-The project tracks issues and plans in an internal tool — published text must not mention \
-'may', internal issue numbers, agent or session details, or local filesystem paths. \
-Reply with exactly ALLOW if the text is safe to publish, or BLOCK: <one-line reason>.";
+const SCREEN_PROMPT: &str = include_str!("../templates/pr_screen_prompt.txt");
+
+/// The `gh pr merge` arguments of a merge that names the commit it checked:
+/// GitHub refuses it when the PR's head is any other commit.
+fn merge_args(number: i64, owner_repo: &str, head_sha: &str) -> Vec<String> {
+    [
+        "pr",
+        "merge",
+        &number.to_string(),
+        "--repo",
+        owner_repo,
+        "--auto",
+        "--squash",
+        "--match-head-commit",
+        head_sha,
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+/// Fails when the PR's head on GitHub is not the commit pinned at `pr update`.
+fn ensure_head_pinned(number: i64, pinned: &str, upstream: &str) -> Result<(), PrError> {
+    if pinned == upstream {
+        return Ok(());
+    }
+    Err(PrError::State(format!(
+        "PR #{number}'s head moved: GitHub holds {upstream}, the checked commit is {pinned} — \
+         run `pr update {number}` to pin the current head and check it again"
+    )))
+}
 
 /// `git` on the host through `host`, with its stdout trimmed.
 fn host_git(
@@ -2703,7 +2776,7 @@ mod tests {
         let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, body: &str| {
             seen.lock().unwrap().push(title.to_string());
             seen.lock().unwrap().push(body.to_string());
-            Box::pin(async { Ok(false) })
+            Box::pin(async { Ok(super::ScreenVerdict::Block("internal".to_string())) })
         });
         add_github_origin(&fx);
         // A `prs-only` project as existing files carry it: no `repository`
@@ -2756,6 +2829,108 @@ mod tests {
             *screened.lock().unwrap(),
             vec!["a title".to_string(), "- a subject\n".to_string()]
         );
+    }
+
+    #[test]
+    fn the_screen_publishes_only_on_the_explicit_pass() {
+        use super::ScreenVerdict::{Block, Pass, Unreadable};
+        assert_eq!(super::ScreenVerdict::parse("ALLOW"), Pass);
+        assert_eq!(super::ScreenVerdict::parse("  ALLOW\n"), Pass);
+        assert_eq!(
+            super::ScreenVerdict::parse("BLOCK: names an issue"),
+            Block("names an issue".to_string())
+        );
+        // Anything else refuses: empty, reasoning only, decorated tokens.
+        assert_eq!(super::ScreenVerdict::parse(""), Unreadable);
+        assert_eq!(super::ScreenVerdict::parse("  \n"), Unreadable);
+        assert_eq!(
+            super::ScreenVerdict::parse("The text mentions nothing internal."),
+            Unreadable
+        );
+        assert_eq!(super::ScreenVerdict::parse("**BLOCK**"), Unreadable);
+        assert_eq!(super::ScreenVerdict::parse("**BLOCK: a path**"), Unreadable);
+        assert_eq!(super::ScreenVerdict::parse("**ALLOW**"), Unreadable);
+        assert_eq!(super::ScreenVerdict::parse("BLOCKED"), Unreadable);
+        assert_eq!(super::ScreenVerdict::parse("Looks fine. ALLOW"), Unreadable);
+        assert!(Pass.refusal().is_none());
+        assert!(Unreadable.refusal().is_some());
+        assert!(Block(String::new()).refusal().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_outbound_screen_refuses_an_empty_reply_a_decorated_block_and_no_screen() {
+        let fx = Fixture::new().await;
+        add_github_origin(&fx);
+        let config_path = fx.tmp.path().join("screen-workspace.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[projects]]\npath = {:?}\n\n[projects.pr]\nbackend = \"github\"\nscreen = true\n",
+                fx.checkout
+            ),
+        )
+        .unwrap();
+        for reply in ["", "**BLOCK**", "thinking about it", "ALLOW"] {
+            let screen: Arc<super::ScreenFn> = Arc::new(move |_: &str, _: &str| {
+                Box::pin(async move { Ok(super::ScreenVerdict::parse(reply)) })
+            });
+            let config = WorkspaceConfig::load(&config_path).unwrap();
+            let store = trusted_store(
+                &fx,
+                "s1",
+                config,
+                PrContext::default_github_api(),
+                Some(screen),
+            )
+            .await;
+            let seeded = store
+                .repos()
+                .unwrap()
+                .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+            std::fs::create_dir_all(&seeded).unwrap();
+            let resolved = store.resolve(None).await.unwrap();
+            let verdict = store
+                .screen_outbound(&resolved.record, "a title", "- a subject\n")
+                .await
+                .unwrap();
+            assert_eq!(verdict.is_none(), reply == "ALLOW", "reply {reply:?}");
+        }
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
+        let seeded = store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(&seeded).unwrap();
+        let resolved = store.resolve(None).await.unwrap();
+        let verdict = store
+            .screen_outbound(&resolved.record, "a title", "- a subject\n")
+            .await
+            .unwrap();
+        assert!(verdict.is_some(), "no wired screen refuses");
+    }
+
+    #[test]
+    fn a_merge_names_the_checked_commit_and_fails_when_the_head_moved() {
+        let args = super::merge_args(7, "o/r", "abc123");
+        assert_eq!(
+            args,
+            [
+                "pr",
+                "merge",
+                "7",
+                "--repo",
+                "o/r",
+                "--auto",
+                "--squash",
+                "--match-head-commit",
+                "abc123"
+            ]
+        );
+        assert!(super::ensure_head_pinned(7, "abc123", "abc123").is_ok());
+        let err = super::ensure_head_pinned(7, "abc123", "def456").unwrap_err();
+        assert!(matches!(err, super::PrError::State(_)), "{err}");
+        assert!(err.to_string().contains("head moved"), "{err}");
     }
 
     /// A store whose cwd is no repository at all, for session `id`.
