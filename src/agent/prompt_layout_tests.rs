@@ -271,22 +271,3 @@ async fn a_fresh_session_prompt_states_usage_without_type_names_and_no_landing_r
         assert!(!prefix.contains(name), "`{name}`:\n{prefix}");
     }
 }
-
-/// A one-shot run has nobody to answer `ask_user`, so its prompt carries
-/// none of that command's usage.
-#[tokio::test]
-async fn a_non_interactive_session_prompt_has_no_ask_user_usage() {
-    let stub = StubModel::spawn(SESSION_MODEL).await;
-    let config = saved_config(&stub, None);
-    let mut session = Box::pin(Session::start_with_runtime(&config)).await;
-    session.parts.non_interactive = true;
-    Box::pin(session.rebuild(&config)).await;
-    let messages = session
-        .agent
-        .preview_request_messages("Say hello.", [])
-        .await
-        .expect("the request previews");
-    let prefix = messages.first().expect("a system message").content();
-    assert!(!prefix.contains("<usage command=\"ask_user\">"), "{prefix}");
-    assert!(prefix.contains("<usage command=\"subagent\">"), "{prefix}");
-}

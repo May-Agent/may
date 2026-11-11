@@ -4273,7 +4273,6 @@ fn build_session_agent<'a>(
                 session_id: ctx.session_id.clone(),
                 workspace_request_broker: brokers.workspace,
                 ask_user_broker: brokers.ask_user,
-                non_interactive: ctx.non_interactive,
                 db: state.db(),
                 model: &ctx.current_model,
                 reasoning_effort: ctx.reasoning_effort,
