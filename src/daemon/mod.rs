@@ -330,7 +330,7 @@ struct TcpRouters {
 
 impl TcpRouters {
     /// The router serving a bind on `addr`.
-    fn router_for(&self, addr: SocketAddr) -> &Arc<Router> {
+    const fn router_for(&self, addr: SocketAddr) -> &Arc<Router> {
         if addr.ip().is_loopback() {
             &self.loopback
         } else {
