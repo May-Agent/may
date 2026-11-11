@@ -106,7 +106,7 @@ pub struct PrContext {
     pub github_api: GitHubRest<PrTokenSource>,
     /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
     /// rejected or closes.
-    pub task_events: Option<aither_agent::WorkEvents>,
+    pub task_events: Option<crate::harness::working_document::WorkEvents>,
     /// Asks the user before a PR is opened on a repository they do not own;
     /// `None` publishes without asking.
     pub publish: Option<crate::agent::publish_approval::PublishGate>,
@@ -479,7 +479,10 @@ impl PrStore {
             .await?;
         self.event(&pr, "opened", Some(&format!("base {base_sha}")))
             .await;
-        self.task_event(&pr, aither_agent::WorkEvent::PullRequestOpened);
+        self.task_event(
+            &pr,
+            crate::harness::working_document::WorkEvent::PullRequestOpened,
+        );
         if let Some(n) = external_number {
             self.event(&pr, "opened", Some(&format!("github PR #{n}")))
                 .await;
@@ -577,7 +580,10 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
-                self.task_event(&pr, aither_agent::WorkEvent::PullRequestMerged);
+                self.task_event(
+                    &pr,
+                    crate::harness::working_document::WorkEvent::PullRequestMerged,
+                );
                 let clone = self.retire_clone(&resolved, &head_sha).await?;
                 Ok(PrMerged {
                     number,
@@ -595,7 +601,10 @@ impl PrStore {
                     .update_pr(pr.id, "rejected", Some(&head_sha), None, None)
                     .await?;
                 self.event(&pr, "rejected", Some(&reason)).await;
-                self.task_event(&pr, aither_agent::WorkEvent::PullRequestRejected);
+                self.task_event(
+                    &pr,
+                    crate::harness::working_document::WorkEvent::PullRequestRejected,
+                );
                 Err(PrError::Rejected(reason))
             }
         }
@@ -637,7 +646,10 @@ impl PrStore {
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
-        self.task_event(&pr, aither_agent::WorkEvent::PullRequestClosed);
+        self.task_event(
+            &pr,
+            crate::harness::working_document::WorkEvent::PullRequestClosed,
+        );
         if resolved.record.local {
             drop_ref(
                 self.context.signing.host(),
@@ -1059,7 +1071,10 @@ impl PrStore {
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
                 self.record_queue_wait(pr).await;
-                self.task_event(pr, aither_agent::WorkEvent::PullRequestMerged);
+                self.task_event(
+                    pr,
+                    crate::harness::working_document::WorkEvent::PullRequestMerged,
+                );
                 let pull_sync = self.pull_sync(&resolved.record, &owner_repo).await;
                 let clone = self.retire_clone(resolved, head_sha).await?;
                 let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
@@ -1085,7 +1100,10 @@ impl PrStore {
                             .update_pr(pr.id, "closed", Some(head_sha), None, None)
                             .await?;
                         self.event(pr, "closed", Some(&report)).await;
-                        self.task_event(pr, aither_agent::WorkEvent::PullRequestClosed);
+                        self.task_event(
+                            pr,
+                            crate::harness::working_document::WorkEvent::PullRequestClosed,
+                        );
                         Err(PrError::State(report))
                     }
                     merge_watch::Stopped::CheckFailed(_) => {
@@ -1363,12 +1381,16 @@ impl PrStore {
     fn task_event(
         &self,
         pr: &crate::db::PrRow,
-        change: fn(aither_agent::WorkRef) -> aither_agent::WorkEvent,
+        change: fn(
+            crate::harness::working_document::WorkRef,
+        ) -> crate::harness::working_document::WorkEvent,
     ) {
         if let Some(events) = &self.context.task_events
             && let Ok(number) = u64::try_from(pr.number)
         {
-            events.record(change(aither_agent::WorkRef::pull_request(number)));
+            events.record(change(
+                crate::harness::working_document::WorkRef::pull_request(number),
+            ));
         }
     }
 
@@ -2472,11 +2494,11 @@ mod tests {
     /// the row naming it is told of each change once.
     #[tokio::test]
     async fn an_opened_and_closed_pr_reaches_the_tasks_inbox() {
-        use aither_agent::ContextSource;
+        use aither_agent::{ContextSource, Moment};
 
         let fx = Fixture::new().await;
         let (mut store, clone) = fx.store("s1", None).await;
-        let events = aither_agent::WorkEvents::new();
+        let events = crate::harness::working_document::WorkEvents::new();
         store.context.task_events = Some(events.clone());
         let sandbox = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2485,15 +2507,20 @@ mod tests {
         )
         .unwrap();
         let mut tasks = crate::tasks_md::schema::working_document(sandbox.path(), events);
-        tasks.on_request(false).await;
+        tasks.blocks(Moment::Request { reassembled: false }).await;
 
         commit_file(&clone, "work.txt");
         store.open(None, Some("work"), None, true).await.unwrap();
         store.close(1, None).await.unwrap();
 
-        tasks.on_request(false).await;
-        let alert = tasks.on_tool_turn_end().await.expect("the row is told");
-        let text = alert.content();
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+        let alert = tasks
+            .blocks(Moment::ToolTurnEnd)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row is told");
+        let text = alert.block().content();
         // The row naming PR #1 already records its opening.
         assert_eq!(text.matches("PR #1 was opened").count(), 0, "{text}");
         assert_eq!(text.matches("PR #1 was closed").count(), 1, "{text}");

@@ -9,6 +9,8 @@
 #            only through the `ui` feature, which the tests do not enable.
 #   web_ui   reads web-ui/ and src/texts/artifact_runtime_bridge.js, which its
 #            tests load.
+#   acceptance  the `verify-tools` and `container-acceptance` jobs run the
+#            whole of `may exec`, so they read everything the tests read.
 #
 # A change under .github/ (workflows, actions, this script) selects every job.
 # The repository documents nothing builds or reads select none.
@@ -39,8 +41,10 @@ while IFS= read -r path; do
       ;;
   esac
 done
+acceptance=${test}
 
 echo "fmt=${fmt}"
 echo "clippy=${clippy}"
 echo "test=${test}"
 echo "web_ui=${web_ui}"
+echo "acceptance=${acceptance}"

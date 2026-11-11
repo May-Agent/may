@@ -9,24 +9,25 @@
 //! what the recipient's context holds, reads the recipient's warm prompt
 //! cache, and never touches the recipient's own agent: a running turn keeps
 //! running, and nothing the fork does reaches the recipient's context or
-//! history. The fork's terminal is gated to refuse every command, so it
-//! answers from its context and changes nothing.
+//! history. The fork's hooks refuse every tool call, so it answers from its
+//! context and changes nothing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use aither_agent::AgentOptions as _;
 use aither_core::llm::{AgentIdentity, Message, SubagentIdentity, Tool, ToolContext, ToolResult};
-use aither_sandbox::{
-    AnyCommandGate, CommandGate, GateDecision, SubagentGrant, TerminalBinding, TerminalToolFactory,
-};
+use aither_sandbox::SubagentGrant;
 use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::{Activity, AgentLinkError, AgentMessaging, AttributeText, UntrustedText, status_name};
 use crate::agent::{ModelSlot, ProviderLlm};
+use crate::harness::compact_tool::CompactSignal;
+use crate::ipc::{Binding, SessionShell};
+use crate::shell::ShellToolkit;
+use crate::subagent::ChildHooks;
 
 /// The subagent name a btw fork's tool calls carry.
 const BTW_FORK: &str = "btw";
@@ -40,22 +41,25 @@ struct ForkHost {
     /// The session's own model; the fork's request carries the parameters
     /// and prompt-cache identity of the request it forks.
     model: ModelSlot<ProviderLlm>,
-    /// The terminal the session's agent launches forks' terminals from.
+    /// The shell the session's agent launches forks' shells from.
     launcher: ForkLauncher,
+    /// The tools the session's agents register, which a fork must present
+    /// exactly as the request it forks did.
+    toolkit: ShellToolkit,
     /// The session's communication and working languages.
-    languages: aither_agent::Languages,
+    languages: crate::harness::language::Languages,
 }
 
-/// The terminal launcher of a session's main agent, filled when the agent's
-/// terminal is built.
+/// The shell of a session's main agent, filled when the agent's shell is
+/// built.
 #[derive(Debug, Clone, Default)]
-pub struct ForkLauncher(Arc<OnceLock<TerminalToolFactory>>);
+pub struct ForkLauncher(Arc<OnceLock<SessionShell>>);
 
 impl ForkLauncher {
-    fn set(&self, launcher: &TerminalToolFactory) {
-        // A terminal bound later belongs to the same agent; the first
-        // launcher stays.
-        let _ = self.0.set(launcher.clone());
+    /// Records `shell` as the one the session's forks launch from.
+    pub fn set(&self, shell: &SessionShell) {
+        // A shell bound later belongs to the same agent; the first stays.
+        let _ = self.0.set(shell.clone());
     }
 }
 
@@ -76,29 +80,31 @@ enum ForkOutcome {
 }
 
 impl ForkHost {
-    /// Runs `task` on a read-only fork of `snapshot` whose terminal is
+    /// Runs `task` on a read-only fork of `snapshot` whose shell is
     /// launched from `launcher`, then removes the fork's space.
     async fn run_fork(
         &self,
         snapshot: &aither_agent::ForkSnapshot,
-        launcher: &TerminalToolFactory,
+        launcher: &SessionShell,
         task: ForkTask<'_>,
     ) -> Result<ForkOutcome, AgentLinkError> {
-        let terminal = launcher
-            .create(
-                SubagentGrant::new(),
-                None,
-                Some(AnyCommandGate::new(ReadOnlyFork)),
-                None,
-            )
+        let shell = launcher
+            .subagent(SubagentGrant::new(), None, "btw")
             .await
             .map_err(|error| AgentLinkError::Fork(error.to_string()))?;
-        let space = terminal.working_dir().clone();
-        let mut fork = aither_agent::AgentBuilder::new(self.model.llm.clone())
-            .forked_from(snapshot, terminal)
+        let space = shell.working_dir().clone();
+        let refusal = ForkCommandRefused
+            .render()
+            .expect("btw refusal template must render");
+        let builder = aither_agent::AgentBuilder::new(self.model.llm.clone())
+            .hooks(ChildHooks::denying(refusal))
+            .forked_from(snapshot)
             .identity(AgentIdentity::Subagent(SubagentIdentity::new(
                 BTW_FORK, None,
-            )))
+            )));
+        let mut fork = self
+            .toolkit
+            .register(builder, &shell, Some(Arc::new(CompactSignal::default())))
             .build();
         let outcome = match task {
             ForkTask::Answer(prompt) => fork.query(prompt).await.map(ForkOutcome::Answer),
@@ -128,7 +134,7 @@ pub struct SideContext {
     /// The agent's model under the prompt-cache key its requests carry.
     pub model: ModelSlot<ProviderLlm>,
     /// The agent's communication and working languages.
-    pub languages: aither_agent::Languages,
+    pub languages: crate::harness::language::Languages,
 }
 
 /// The fork source and model of every session agent the daemon hosts.
@@ -161,7 +167,8 @@ impl ForkHosts {
         source: aither_agent::ForkSource,
         model: ModelSlot<ProviderLlm>,
         launcher: ForkLauncher,
-        languages: aither_agent::Languages,
+        toolkit: ShellToolkit,
+        languages: crate::harness::language::Languages,
     ) -> ForkRegistration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.hosts().insert(
@@ -171,6 +178,7 @@ impl ForkHosts {
                 source,
                 model,
                 launcher,
+                toolkit,
                 languages,
             },
         );
@@ -217,20 +225,6 @@ impl Drop for ForkRegistration {
 #[template(path = "agent_btw_refused.txt", escape = "none")]
 struct ForkCommandRefused;
 
-/// Refuses every command of a btw fork's terminal: the fork answers from
-/// its context and runs nothing.
-struct ReadOnlyFork;
-
-impl CommandGate for ReadOnlyFork {
-    fn check(&self, _command: &str) -> impl Future<Output = GateDecision> + Send {
-        std::future::ready(GateDecision::Block {
-            reason: ForkCommandRefused
-                .render()
-                .expect("btw refusal template must render"),
-        })
-    }
-}
-
 #[derive(Template)]
 #[template(path = "agent_btw_question.txt", escape = "none")]
 struct BtwQuestionText<'a> {
@@ -261,9 +255,9 @@ pub struct BtwAnswer {
 impl AgentMessaging {
     /// Answers `question` from a read-only fork of the context of the live
     /// agent addressed by `target`, made from the request it sent last,
-    /// whether it is working or idle. The fork's terminal comes from
-    /// `launcher`, the asking agent's, and refuses every command; the fork
-    /// is discarded once it answers. An idle recipient whose prompt cache is
+    /// whether it is working or idle. The fork's shell comes from
+    /// `launcher`, the asking agent's, and its hooks refuse every tool call;
+    /// the fork is discarded once it answers. An idle recipient whose prompt cache is
     /// cold is refused before any model call.
     ///
     /// # Errors
@@ -276,7 +270,7 @@ impl AgentMessaging {
         sender_session_id: &str,
         target: &str,
         question: &str,
-        launcher: &TerminalToolFactory,
+        launcher: &SessionShell,
     ) -> Result<BtwAnswer, AgentLinkError> {
         let live = self.directory.live().await?;
         let recipient = super::addressed(&live, target)?;
@@ -342,7 +336,7 @@ impl AgentMessaging {
         let Some(snapshot) = host.source.latest() else {
             return Ok(None);
         };
-        let Some(launcher) = host.launcher.0.get().cloned() else {
+        let Some(launcher) = host.launcher.0.get() else {
             return Ok(None);
         };
         let name = status_name(&self.runtime_service, session_id).await?;
@@ -361,7 +355,7 @@ impl AgentMessaging {
             messages,
             cache_epoch,
         } = host
-            .run_fork(&snapshot, &launcher, ForkTask::ReadContext)
+            .run_fork(&snapshot, launcher, ForkTask::ReadContext)
             .await?
         else {
             unreachable!("a context-reading fork gives its context");
@@ -394,7 +388,7 @@ pub struct BtwArgs {
 pub struct BtwCommand {
     messaging: AgentMessaging,
     session_id: String,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     fork_launcher: Option<ForkLauncher>,
 }
 
@@ -410,8 +404,8 @@ impl BtwCommand {
         }
     }
 
-    /// Hand the launcher of the terminal serving this command to
-    /// `launcher`, for the forks answering the session's side requests.
+    /// Hand the shell serving this command to `launcher`, for the forks
+    /// answering the session's side requests.
     #[must_use]
     pub fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
         self.fork_launcher = Some(launcher);
@@ -420,30 +414,37 @@ impl BtwCommand {
 
     /// Refuse a question outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
 
-    /// The command as `binding`'s terminal serves it: a fork's terminal is
-    /// launched from that terminal.
+    /// The command as `binding`'s shell serves it: a fork's shell is
+    /// launched from that shell.
+    ///
+    /// # Panics
+    /// Panics when the registry is bound to no shell: only the main agent's
+    /// registry holds `btw`, and it always has one.
     #[must_use]
-    pub fn for_terminal(&self, binding: &TerminalBinding) -> BtwTool {
+    pub fn bind(&self, binding: &Binding<'_>) -> BtwTool {
+        let shell = binding
+            .shell
+            .expect("the btw command is registered for the main agent's shell");
         if let Some(launcher) = &self.fork_launcher {
-            launcher.set(binding.launcher());
+            launcher.set(shell);
         }
         BtwTool {
             command: self.clone(),
-            launcher: binding.launcher().clone(),
+            launcher: shell.clone(),
         }
     }
 }
 
-/// The `btw` terminal command; reserved for the main agent.
+/// The `btw` command; reserved for the main agent.
 #[derive(Debug, Clone)]
 pub struct BtwTool {
     command: BtwCommand,
-    launcher: TerminalToolFactory,
+    launcher: SessionShell,
 }
 
 impl Tool for BtwTool {
@@ -465,7 +466,7 @@ impl Tool for BtwTool {
         }
         if let Some(guard) = &self.command.languages {
             guard
-                .check_working(question, aither_agent::WorkingText::Internal)
+                .check_working(question, crate::harness::language::WorkingText::Internal)
                 .map_err(crate::agent::notices::language_refused)?;
         }
         let answer = self

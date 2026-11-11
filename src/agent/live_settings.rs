@@ -86,7 +86,7 @@ mod tests {
         assert_ne!(timezone_changed, AgentLiveSettings::of(&config));
         assert_eq!(
             config.host_load.monitor_config().load_threshold,
-            aither_agent::MachineLoad(2.0)
+            crate::harness::host_load::MachineLoad(2.0)
         );
     }
 
@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(monitor.high_load_foreground_wait, Duration::from_mins(2));
         assert_eq!(
             monitor.end_after,
-            aither_agent::HostLoadConfig::new().end_after,
+            crate::harness::host_load::HostLoadConfig::new().end_after,
             "an unset duration keeps aither's default"
         );
 

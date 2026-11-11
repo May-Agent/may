@@ -11,7 +11,7 @@ use std::fmt;
 use std::io::Write as _;
 use std::path::Path;
 
-use aither_agent::working_document::words;
+use crate::words;
 use askama::Template;
 
 use super::{Row, Section, TasksFile, numbered, violation_sentence};

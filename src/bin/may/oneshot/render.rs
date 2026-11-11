@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 
-use aither_agent::{AgentError, AgentEvent, TimedEvent};
+use aither_agent::{AgentError, AgentEvent, OutputKind, TimedEvent, ToolOrigin};
 use aither_core::llm::tool::{CommandOutcome, ToolResult};
 use askama::Template;
 use jiff::{SignedDuration, Timestamp};
@@ -23,7 +23,10 @@ const MESSAGE_LIMIT: usize = 300;
 /// What a tool call is shown as, remembered from its start event.
 struct StartedCall {
     at: Timestamp,
+    name: String,
     label: String,
+    /// Whether the provider runs the call itself.
+    hosted: bool,
 }
 
 /// The arguments of `terminal` the start line reads.
@@ -81,21 +84,11 @@ enum LineKind<'a> {
         elapsed: Option<Elapsed>,
         message: &'a str,
     },
-    BackgroundStarted {
-        task_id: &'a str,
-        output_file: &'a str,
-    },
-    BackgroundCompleted {
-        task_id: &'a str,
-    },
     Paused {
         reason: String,
     },
     Resumed {
         reason: String,
-    },
-    SkillActivated {
-        name: &'a str,
     },
     /// Token counts; a count the provider did not report is omitted.
     Usage {
@@ -230,47 +223,43 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
         let at = result
             .as_ref()
             .map_or_else(|_| Timestamp::now(), |timed| timed.at);
-        let event = match result {
-            Ok(timed) => &timed.event,
+        let timed = match result {
+            Ok(timed) => timed,
             Err(error) => return self.write_line(at, LineKind::Error { error }),
         };
-        match event {
-            AgentEvent::RunStart { .. } => self.write_line(at, LineKind::RunStart),
-            AgentEvent::Reasoning(text) if !text.trim().is_empty() => {
-                self.write_line(at, LineKind::Thinking { text })
-            }
-            // UI progress — oneshot mode ignores deltas.
-            AgentEvent::ToolCallDelta { .. }
-            | AgentEvent::TurnComplete { .. }
-            | AgentEvent::Checkpoint { .. }
-            | AgentEvent::Reasoning(_)
-            | AgentEvent::Complete { .. }
-            | AgentEvent::BuiltInToolResult { .. }
-            | AgentEvent::ReplyTranslated { .. }
-            | AgentEvent::PromptPrefix(_)
-            | AgentEvent::CompactionStarted
-            | AgentEvent::CompactionFinished { .. }
-            | AgentEvent::ResponseRetry { .. }
-            | AgentEvent::Text(_) => Ok(()),
-            AgentEvent::ToolCallStart {
-                id,
+        // A subagent's events ride its parent's stream; its own runs report
+        // elsewhere.
+        if !timed.agent.is_main() {
+            return Ok(());
+        }
+        match &timed.event {
+            AgentEvent::RunStarted { .. } => self.write_line(at, LineKind::RunStart),
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Reasoning,
+                text,
+                ..
+            } if !text.trim().is_empty() => self.write_line(at, LineKind::Thinking { text }),
+            AgentEvent::ToolCallStarted {
+                call,
                 name,
                 arguments,
+                origin: ToolOrigin::Hosted,
+                ..
             } => {
-                let label = call_label(name, arguments);
-                self.write_line(
-                    at,
-                    LineKind::ToolStart {
-                        name,
-                        label: &label,
+                let detail = arguments
+                    .as_str()
+                    .map_or_else(|| arguments.to_string(), str::to_owned);
+                let detail = one_line(&detail, SUMMARY_LIMIT);
+                let (label, rest) = hosted_headline(name, &detail);
+                self.calls.insert(
+                    call.as_str().to_owned(),
+                    StartedCall {
+                        at,
+                        name: name.clone(),
+                        label: String::new(),
+                        hosted: true,
                     },
-                )?;
-                self.calls.insert(id.clone(), StartedCall { at, label });
-                Ok(())
-            }
-            AgentEvent::BuiltInToolCall { tool, detail, .. } => {
-                let detail = one_line(detail, SUMMARY_LIMIT);
-                let (label, rest) = hosted_headline(tool, &detail);
+                );
                 self.write_line(
                     at,
                     LineKind::BuiltInTool {
@@ -279,12 +268,42 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                     },
                 )
             }
-            AgentEvent::ToolCallEnd { id, name, result } => {
-                let started = self.calls.remove(id);
-                let label = started.as_ref().map_or("", |call| call.label.as_str());
-                let elapsed = started
-                    .as_ref()
-                    .map(|call| Elapsed(at.duration_since(call.at)));
+            AgentEvent::ToolCallStarted {
+                call,
+                name,
+                arguments,
+                ..
+            } => {
+                let label = call_label(name, &arguments.to_string());
+                self.write_line(
+                    at,
+                    LineKind::ToolStart {
+                        name,
+                        label: &label,
+                    },
+                )?;
+                self.calls.insert(
+                    call.as_str().to_owned(),
+                    StartedCall {
+                        at,
+                        name: name.clone(),
+                        label,
+                        hosted: false,
+                    },
+                );
+                Ok(())
+            }
+            AgentEvent::ToolCallEnded { call, result, .. } => {
+                let Some(started) = self.calls.remove(call.as_str()) else {
+                    return Ok(());
+                };
+                // The provider's own result is not a line of its own.
+                if started.hosted {
+                    return Ok(());
+                }
+                let name = started.name.as_str();
+                let label = started.label.as_str();
+                let elapsed = Some(Elapsed(at.duration_since(started.at)));
                 match result {
                     ToolResult::Error { message } => {
                         let message = one_line(message, MESSAGE_LIMIT);
@@ -323,36 +342,21 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                     }
                 }
             }
-            AgentEvent::BackgroundTaskStarted {
-                task_id,
-                output_file,
-                ..
-            } => self.write_line(
-                at,
-                LineKind::BackgroundStarted {
-                    task_id,
-                    output_file,
-                },
-            ),
-            AgentEvent::BackgroundTaskCompleted { task_id, .. } => {
-                self.write_line(at, LineKind::BackgroundCompleted { task_id })
-            }
-            AgentEvent::RunPaused { reason, .. } => self.write_line(
+            AgentEvent::Paused { kind, subject, .. } => self.write_line(
                 at,
                 LineKind::Paused {
-                    reason: format!("{reason:?}"),
+                    reason: format!("{kind}: {subject}"),
                 },
             ),
-            AgentEvent::RunResumed { reason, .. } => self.write_line(
+            AgentEvent::Resumed { pause, .. } => self.write_line(
                 at,
                 LineKind::Resumed {
-                    reason: format!("{reason:?}"),
+                    reason: format!("pause {pause}"),
                 },
             ),
-            AgentEvent::SkillActivated { name, .. } => {
-                self.write_line(at, LineKind::SkillActivated { name })
-            }
-            AgentEvent::Usage(usage) => self.write_line(
+            AgentEvent::RequestEnded {
+                usage: Some(usage), ..
+            } => self.write_line(
                 at,
                 LineKind::Usage {
                     prompt: usage.prompt_tokens,
@@ -366,6 +370,7 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                 error,
                 alerts_removed,
                 outputs_spilled,
+                ..
             } => self.write_line(
                 at,
                 LineKind::CompactionRecovery {
@@ -374,7 +379,9 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                     outputs_spilled: *outputs_spilled,
                 },
             ),
-            AgentEvent::Error(error) => self.write_line(at, LineKind::Error { error }),
+            // The failure of a run reaches the stream as its error, and the
+            // rest is UI progress: one-shot mode ignores it.
+            _ => Ok(()),
         }
     }
 }

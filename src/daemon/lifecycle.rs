@@ -486,8 +486,9 @@ fn sweep_stale_jobs(
         else {
             continue;
         };
-        if !plist.try_exists()? {
-            launchctl.bootout(&service).map_err(launch)?;
+        if !plist.try_exists()?
+            && crate::repo_search::boot_out_loaded(launchctl, &service).map_err(launch)?
+        {
             removed.push(service);
         }
     }

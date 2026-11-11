@@ -16,7 +16,7 @@ pub use code_search::CodeSearchTool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aither_sandbox::{HostProgram, ToolRuntimeError, ToolTarget};
+use crate::tools::{HostProgram, ToolRuntimeError, ToolTarget};
 use async_lock::OnceCell;
 use repo_search_client::client::{Client, ClientError};
 use repo_search_client::launcher::{self, ConnectError, Launcher as _};
@@ -201,8 +201,9 @@ fn boot_out_relocated(
     let mut removed = Vec::new();
     for label in [server, daemon] {
         let service = format!("{domain}/{label}");
-        if launchctl.service(&service).map_err(launch)?.is_some() {
-            launchctl.bootout(&service).map_err(launch)?;
+        if launchctl.service(&service).map_err(launch)?.is_some()
+            && boot_out_loaded(launchctl, &service).map_err(launch)?
+        {
             removed.push(service);
         }
     }
@@ -341,13 +342,40 @@ fn sweep_stale(
         else {
             continue;
         };
-        if !plist.try_exists()? {
-            launchctl.bootout(&service).map_err(launch)?;
+        if !plist.try_exists()? && boot_out_loaded(launchctl, &service).map_err(launch)? {
             removed.push(service);
         }
     }
     await_bootouts(launchctl, &removed)?;
     Ok(removed)
+}
+
+/// Boots out `service`, returning whether this call removed it.
+///
+/// Concurrent sweeps (every daemon and client start runs one) find the same
+/// stale service; the loser's `bootout` fails because the winner's already
+/// took it out. A refused `bootout` of a service launchd still holds stays an
+/// error.
+///
+/// # Errors
+/// The `bootout` error, when the service is still loaded after it.
+#[cfg(target_os = "macos")]
+pub(crate) fn boot_out_loaded(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    service: &str,
+) -> Result<bool, repo_search_client::launcher::install::LaunchctlError> {
+    match launchctl.bootout(service) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if launchctl
+                .service(service)
+                .is_ok_and(|loaded| loaded.is_none()) =>
+        {
+            tracing::debug!(%service, %error, "another sweep booted the service out first");
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

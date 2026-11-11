@@ -1,9 +1,9 @@
 //! Limits every agent of the daemon shares and a saved config change moves
 //! while they run.
 
-use aither_agent::DiskThresholds;
-
 use crate::config::MayConfig;
+use crate::harness::disk::DiskThresholds;
+use crate::shell::ShellBudgets;
 use crate::tasks_md::schema::LineLimit;
 
 /// The handles agents are built with whose values follow the config.
@@ -14,6 +14,7 @@ use crate::tasks_md::schema::LineLimit;
 pub struct LiveLimits {
     disk: DiskThresholds,
     tasks_lines: LineLimit,
+    shell: ShellBudgets,
 }
 
 impl LiveLimits {
@@ -23,6 +24,7 @@ impl LiveLimits {
         let limits = Self {
             disk: DiskThresholds::default(),
             tasks_lines: LineLimit::default(),
+            shell: ShellBudgets::of(&config.shell),
         };
         limits.apply(config);
         limits
@@ -37,6 +39,13 @@ impl LiveLimits {
             disk.final_free_bytes,
         );
         self.tasks_lines.set(config.tasks.line_limit);
+        self.shell.apply(&config.shell);
+    }
+
+    /// The time bounds and output budgets every shell is built with.
+    #[must_use]
+    pub fn shell(&self) -> ShellBudgets {
+        self.shell.clone()
     }
 
     /// The lines an agent's `tasks.md` may hold.
@@ -54,7 +63,7 @@ impl LiveLimits {
 
 #[cfg(test)]
 mod tests {
-    use aither_agent::DiskPressure;
+    use crate::harness::disk::DiskPressure;
 
     use super::*;
 

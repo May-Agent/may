@@ -23,8 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-use aither_core::llm::{CommandOutcome, CommandStream};
-use aither_sandbox::{TerminalRunner, TerminalScript};
+use aither_core::llm::CommandStream;
+use aither_sandbox::{RunOutcome, Script, ScriptResult};
+use askama::Template;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -71,10 +72,6 @@ pub enum RepoCloneError {
     },
 }
 
-/// How long a script in the sandbox may run: the terminal's own cap, so a
-/// check runs as long as any agent command may.
-const SANDBOX_TIMEOUT: std::time::Duration = aither_sandbox::DEFAULT_TIMEOUT_CAP;
-
 /// The session's terminal sandbox, where everything inside an
 /// agent-writable repository runs.
 ///
@@ -82,14 +79,36 @@ const SANDBOX_TIMEOUT: std::time::Duration = aither_sandbox::DEFAULT_TIMEOUT_CAP
 /// so it gets no more authority than the agent's own commands.
 #[derive(Debug, Clone)]
 pub struct CloneSandbox {
-    runner: TerminalRunner,
+    shell: crate::ipc::SessionShell,
+    /// How long a script may run: the shell's own cap, so a check runs as
+    /// long as any agent command may.
+    timeout: std::time::Duration,
+}
+
+/// Why a script of a clone's sandbox did not exit 0.
+#[derive(Template)]
+#[template(path = "clone_script_failure.txt", escape = "none")]
+struct ScriptFailure<'a> {
+    exit: Option<i32>,
+    stderr: &'a str,
 }
 
 impl CloneSandbox {
-    /// Run scripts on the terminal `runner` belongs to.
+    /// Run scripts on `shell`, each killed after `timeout`.
     #[must_use]
-    pub const fn new(runner: TerminalRunner) -> Self {
-        Self { runner }
+    pub const fn new(shell: crate::ipc::SessionShell, timeout: std::time::Duration) -> Self {
+        Self { shell, timeout }
+    }
+
+    /// What a failed script printed on stderr, when it printed text.
+    async fn stderr_text(result: &ScriptResult) -> String {
+        match &result.stderr {
+            Some(CommandStream::Inline { text }) => text.clone(),
+            Some(CommandStream::Stored { file, .. }) => async_fs::read_to_string(&file.path)
+                .await
+                .unwrap_or_default(),
+            Some(CommandStream::Image { .. }) | None => String::new(),
+        }
     }
 
     /// Run `script` in `dir` inside the sandbox and return its stdout once
@@ -98,25 +117,41 @@ impl CloneSandbox {
     /// # Errors
     /// Fails when the terminal refuses or cannot run the script, or the
     /// script exits nonzero or is killed at its timeout.
+    ///
+    /// # Panics
+    /// Panics when the failure template fails to render, which typed input
+    /// never does.
     pub async fn run(&self, dir: &Path, script: &str) -> Result<String, RepoCloneError> {
         let failed = |reason: String| RepoCloneError::Sandbox {
             script: script.to_string(),
             reason,
         };
         let result = self
-            .runner
-            .run(TerminalScript::new(script, dir, SANDBOX_TIMEOUT))
+            .shell
+            .run(Script::new(script, dir, self.timeout))
             .await
             .map_err(|error| failed(error.to_string()))?;
-        match result.outcome {
-            CommandOutcome::Exited { code: 0 } => match result.stdout {
+        if result.outcome == (RunOutcome::Exited { code: 0 }) {
+            match result.stdout {
                 CommandStream::Inline { text } => Ok(text),
                 CommandStream::Stored { file, .. } => {
                     Ok(async_fs::read_to_string(&file.path).await?)
                 }
                 CommandStream::Image { .. } => Err(failed("printed an image".to_string())),
-            },
-            _ => Err(failed(result.render_for_model())),
+            }
+        } else {
+            let exit = match result.outcome {
+                RunOutcome::Exited { code } => Some(code),
+                RunOutcome::Killed(_) => None,
+            };
+            let stderr = Self::stderr_text(&result).await;
+            let reason = ScriptFailure {
+                exit,
+                stderr: stderr.trim(),
+            }
+            .render()
+            .expect("the script failure template renders typed input");
+            Err(failed(reason))
         }
     }
 }
@@ -961,36 +996,48 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RepoCloneError> {
 pub(crate) mod test_sandbox {
     use std::path::{Path, PathBuf};
 
-    use aither_sandbox::permission::PermissionError;
-    use aither_sandbox::{Configured, TerminalMode, TerminalTool, ToolRegistryBuilder};
-    use executor_core::tokio::TokioGlobal;
+    use std::sync::Arc;
+
+    use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
+    use aither_sandbox::{DomainApprover, DomainRequest, Grants, Interpreter};
 
     use super::CloneSandbox;
+    use crate::agent::command_env::CommandEnv;
+    use crate::ipc::{CommandRegistryBuilder, SessionShell};
 
-    /// Runs sandboxed commands and refuses every unsafe one.
+    /// Runs sandboxed commands and refuses every unsandboxed one and every
+    /// connection.
+    #[derive(Debug, Clone, Copy)]
     pub struct SandboxedOnly;
 
-    impl aither_sandbox::PermissionHandler for SandboxedOnly {
-        fn check(
+    impl Approver for SandboxedOnly {
+        fn approve(
             &self,
-            mode: TerminalMode,
-            _script: &str,
-            _language: aither_sandbox::ScriptLanguage,
-            _location: aither_sandbox::CommandLocation<'_>,
-        ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-            std::future::ready(Ok(matches!(mode, TerminalMode::Sandboxed)))
+            _request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
+            std::future::ready(Ok(Approval::Denied {
+                reason: "the test terminal runs sandboxed scripts only".to_string(),
+            }))
         }
     }
 
-    /// A session terminal working in `session_root`, as May builds one: the
+    impl DomainApprover for SandboxedOnly {
+        fn approve(&self, _request: &DomainRequest) -> impl Future<Output = bool> + Send {
+            std::future::ready(false)
+        }
+    }
+
+    /// A session shell working in `session_root`, as May builds one: the
     /// root is its only writable place. Dropping it ends its sandbox.
     pub struct TestTerminal {
-        terminal: TerminalTool<SandboxedOnly, TokioGlobal, Configured>,
+        shell: Arc<SessionShell>,
+        timeout: std::time::Duration,
+        _audit: tempfile::TempDir,
     }
 
     impl TestTerminal {
         pub async fn new(session_root: &Path) -> Self {
-            Self::with_registry(session_root, ToolRegistryBuilder::new()).await
+            Self::configured(session_root, CommandRegistryBuilder::new(), None).await
         }
 
         /// A terminal as the daemon builds one for a session that signs: the
@@ -1005,78 +1052,110 @@ pub(crate) mod test_sandbox {
                 .install_sandbox_git(session_root, None)
                 .await
                 .unwrap();
-            let mut builder = ToolRegistryBuilder::new();
-            builder.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
-            Self::with_registry(session_root, builder).await
+            let mut commands = CommandRegistryBuilder::new();
+            commands.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
+            Self::configured(session_root, commands, None).await
+        }
+
+        /// A terminal whose scripts can call the commands `commands` holds.
+        pub async fn with_commands(session_root: &Path, commands: CommandRegistryBuilder) -> Self {
+            Self::configured(session_root, commands, None).await
         }
 
         /// A terminal whose commands see the environment `env` supplies.
-        pub async fn with_env(
-            session_root: &Path,
-            env: impl aither_sandbox::TerminalEnvSource + 'static,
-        ) -> Self {
-            Self::configured(session_root, ToolRegistryBuilder::new(), |terminal| {
-                terminal.with_env_source(env)
-            })
-            .await
-        }
-
-        async fn with_registry(session_root: &Path, builder: ToolRegistryBuilder) -> Self {
-            Self::configured(session_root, builder, |terminal| terminal).await
+        pub async fn with_env(session_root: &Path, env: CommandEnv) -> Self {
+            Self::configured(session_root, CommandRegistryBuilder::new(), Some(env)).await
         }
 
         async fn configured(
             session_root: &Path,
-            builder: ToolRegistryBuilder,
-            configure: impl FnOnce(
-                TerminalTool<SandboxedOnly, TokioGlobal>,
-            ) -> TerminalTool<SandboxedOnly, TokioGlobal>,
+            commands: CommandRegistryBuilder,
+            env_source: Option<CommandEnv>,
         ) -> Self {
+            // A shell spawns its job registry on the global executor, which
+            // the `may` binary installs at startup.
+            crate::test_support::install_global_executor();
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
             let cache = crate::tools::test_tool_cache();
             std::fs::create_dir_all(&cache).unwrap();
-            let terminal = TerminalTool::new_exact(session_root, SandboxedOnly, TokioGlobal)
-                .await
-                .expect("the terminal starts");
-            let terminal = configure(terminal)
-                .initialize_tools(&distribution, &cache)
+            std::fs::create_dir_all(session_root).unwrap();
+            let tools = crate::tools::ToolEnvironments::prepare_host(&distribution, &cache)
                 .await
                 .expect("the baseline tools prepare");
-            let registry = builder.build(terminal.output_store().clone());
-            let terminal = terminal.with_registry(std::sync::Arc::new(registry));
-            Self { terminal }
+            let audit = tempfile::tempdir().expect("an audit directory");
+            let audit_log = aither_sandbox::open_network_audit_log(audit.path(), 1)
+                .await
+                .expect("the audit log opens");
+            let grants = Grants::new();
+            grants.add_writable(session_root);
+            let settings = crate::config::ShellSettings::default();
+            let shell = crate::shell::ShellAssembly {
+                tools,
+                container: None,
+                working_dir: session_root.to_path_buf(),
+                grants,
+                priority: heel::ProcessPriority::default(),
+                audit_log,
+                permissions: SandboxedOnly,
+                env_source,
+                budgets: crate::shell::ShellBudgets::of(&settings),
+                // As a session's shell, whose tool definition a fork must
+                // present unchanged.
+                interpreters: vec![Interpreter::Shell, Interpreter::Python],
+                policies: crate::command_policy::PolicySet {
+                    managed_bash: crate::command_policy::runs_managed_bash(false),
+                    refused: crate::command_policy::RefusedReads::default(),
+                },
+                slot: crate::ipc::ShellSlot::new(),
+                ssh_servers: Vec::new(),
+                ids: None,
+                spaces: None,
+                pool: None,
+                connectivity: None,
+            }
+            .build(commands.build())
+            .await
+            .expect("the shell builds");
+            Self {
+                shell,
+                timeout: settings.timeout_cap,
+                _audit: audit,
+            }
         }
 
-        /// What a terminal-bound command of this terminal is built from.
-        pub const fn binding(&self) -> &aither_sandbox::TerminalBinding {
-            self.terminal.binding()
+        /// The session shell, as a command that launches work from it gets it.
+        pub fn shell(&self) -> &SessionShell {
+            &self.shell
         }
 
-        /// The prepared managed tools of this terminal, as a connected ACP
-        /// agent's sandbox is given them.
-        pub fn managed_tools(&self) -> crate::agent::acp_sandbox::ManagedTools {
-            let bin = self
-                .terminal
-                .shell_sessions()
-                .local_tools()
-                .expect("the tools are prepared locally")
-                .bin_dir()
-                .clone();
-            std::sync::Arc::new(std::sync::OnceLock::from(bin))
+        /// Starts a background job that sleeps for a minute, and returns it
+        /// with its pid.
+        pub async fn sleeping_job(&self) -> (aither_sandbox::Job, u32) {
+            let job = self
+                .shell
+                .run_background(aither_sandbox::ShellArgs {
+                    description: "sleeps".to_string(),
+                    script: "sleep 60".to_string(),
+                    interpreter: aither_sandbox::Interpreter::default(),
+                    sandbox: aither_sandbox::SandboxMode::Sandboxed,
+                    location: None,
+                    resolution: aither_sandbox::MediaResolution::default(),
+                    max_lines: None,
+                    raw: false,
+                    timeout: 120,
+                    background: true,
+                })
+                .await
+                .expect("the job starts");
+            let pid = job.info().await.pid;
+            (job, pid)
         }
 
-        /// The terminal's sandbox, as a terminal-bound command gets it.
+        /// The terminal's sandbox, as a shell-bound command gets it.
         pub fn sandbox(&self) -> CloneSandbox {
-            CloneSandbox::new(self.terminal.binding().runner().clone())
+            CloneSandbox::new(SessionShell::clone(&self.shell), self.timeout)
         }
-    }
-
-    /// The managed tools a session sandbox is given, prepared as a session
-    /// terminal prepares them.
-    pub async fn managed_tools() -> crate::agent::acp_sandbox::ManagedTools {
-        let scratch = tempfile::tempdir().expect("scratch dir");
-        TestTerminal::new(scratch.path()).await.managed_tools()
     }
 
     /// Every executable setting a repository can carry for itself, set in

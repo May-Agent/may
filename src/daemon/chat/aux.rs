@@ -221,7 +221,7 @@ pub async fn context_messages(
 pub async fn languages(
     state: &Arc<DaemonState>,
     session_id: &str,
-) -> Result<aither_agent::Languages, AuxError> {
+) -> Result<crate::harness::language::Languages, AuxError> {
     let worker = super::hosts::idle_agent(state, session_id)
         .await
         .map_err(|error| AuxError::Session(error.to_string()))?;

@@ -140,7 +140,8 @@ fn message_dump(index: usize, message: &LlmMessage) -> ContextMessageDump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_agent::{ContextWindowMetrics, ContextWindowPhase, InstructionSlot};
+    use crate::agent::runtime_context::tag;
+    use aither_agent::{ContextWindowMetrics, ContextWindowPhase};
 
     fn test_metrics() -> ContextWindowMetrics {
         ContextWindowMetrics {
@@ -159,13 +160,13 @@ mod tests {
 
     #[test]
     fn dump_renders_the_request_in_wire_order() {
-        let mut context = aither_agent::Context::default();
+        let mut context = aither_agent::Context::with_layout(tag::layout());
         context
             .instructions_mut()
-            .insert(&InstructionSlot::BASE_SYSTEM, "remember this");
+            .insert(&tag::CAPABILITIES, "remember this");
         context
             .instructions_mut()
-            .insert(&InstructionSlot::PERSONA, "be brief");
+            .insert(&tag::PROFILE_PERSONA, "be brief");
         context.push(LlmMessage::user("hello"));
         context.push(LlmMessage::assistant("hi there"));
         let snapshot = ContextWindowSnapshot {
@@ -189,17 +190,17 @@ mod tests {
     fn example_render() {
         use aither_core::llm::{Attachment, ReasoningState, ToolCall};
 
-        let mut context = aither_agent::Context::default();
+        let mut context = aither_agent::Context::with_layout(tag::layout());
         context.instructions_mut().insert(
-            &InstructionSlot::BASE_SYSTEM,
+            &tag::CAPABILITIES,
             "You run in a terminal-first environment.\n\n<commands>\n- websearch <query>: search the web\n- browser <action>: drive the managed browser\n</commands>\n\n<skills>\n- pdf/ — read and write PDFs\n</skills>",
         );
         context.instructions_mut().insert(
-            &InstructionSlot::PERSONA,
+            &tag::PROFILE_PERSONA,
             "You are May. Be warm, lead with the point, prefer prose over lists.",
         );
         context.instructions_mut().insert(
-            &InstructionSlot::PERMISSIONS,
+            &tag::PERMISSIONS,
             "Read access to the entire filesystem. Write access is restricted to the session sandbox and approved workdirs. Destructive or irreversible commands require approval.",
         );
         context.push(LlmMessage::user("为什么这个函数会 panic"));
@@ -236,7 +237,10 @@ mod tests {
         let dump = ContextDump::assemble("o4-mini-high", "custom", "mighty-pine-fjord", &snapshot);
         let text = dump.render();
 
-        assert!(text.contains("[0] role: system\nYou run in a terminal-first environment."));
+        // The instructions render in the layout's order, not insertion order.
+        assert!(text.contains(
+            "[0] role: system\nYou are May. Be warm, lead with the point, prefer prose over lists.\nYou run in a terminal-first environment."
+        ));
         assert!(text.contains(
             "[2] role: assistant\nreasoning: claude (25 bytes)\ntool_calls:\n  - name: terminal\n    arguments: {\"command\":\"cargo test reproduce -- --nocapture\",\"timeout\":120}"
         ));

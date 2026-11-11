@@ -873,8 +873,8 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
             reason: reason.to_string(),
         })
     };
-    match aither_agent::validate_subagent_name(name) {
-        Err(aither_agent::DefinitionError::Reserved(_)) => {
+    match crate::harness::subagent_file::validate_subagent_name(name) {
+        Err(crate::harness::subagent_file::DefinitionError::Reserved(_)) => {
             return reject("the name belongs to a built-in subagent type");
         }
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
@@ -1369,6 +1369,9 @@ pub struct MayConfig {
     /// How long an agent's `tasks.md` may grow.
     #[serde(default)]
     pub tasks: TasksSettings,
+    /// The shell's time bounds and output budgets.
+    #[serde(default)]
+    pub shell: ShellSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1559,13 +1562,13 @@ impl Default for SessionsConfig {
 /// name or an ISO 639-3 code, rejected at load when unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct ConfiguredLanguage(pub aither_agent::Language);
+pub struct ConfiguredLanguage(pub crate::harness::language::Language);
 
 impl TryFrom<String> for ConfiguredLanguage {
     type Error = String;
 
     fn try_from(name: String) -> Result<Self, String> {
-        name.parse::<aither_agent::Language>()
+        name.parse::<crate::harness::language::Language>()
             .map(Self)
             .map_err(|error| error.to_string())
     }
@@ -1594,11 +1597,11 @@ pub struct LanguageConfig {
 impl LanguageConfig {
     /// The languages the session's agent is held to.
     #[must_use]
-    pub fn languages(&self) -> aither_agent::Languages {
+    pub fn languages(&self) -> crate::harness::language::Languages {
         let languages = self
             .communication
-            .map_or_else(aither_agent::Languages::unset, |language| {
-                aither_agent::Languages::new(language.0)
+            .map_or_else(crate::harness::language::Languages::unset, |language| {
+                crate::harness::language::Languages::new(language.0)
             });
         self.working
             .map_or(languages, |working| languages.with_working(working.0))
@@ -1786,7 +1789,7 @@ pub struct HostLoadSettings {
 
 impl Default for HostLoadSettings {
     fn default() -> Self {
-        let defaults = aither_agent::HostLoadConfig::new();
+        let defaults = crate::harness::host_load::HostLoadConfig::new();
         Self {
             load_threshold: defaults.load_threshold.0,
             start_after: defaults.start_after,
@@ -1800,9 +1803,9 @@ impl Default for HostLoadSettings {
 impl HostLoadSettings {
     /// The aither monitor configuration these settings describe.
     #[must_use]
-    pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
-        aither_agent::HostLoadConfig::new()
-            .load_threshold(aither_agent::MachineLoad(self.load_threshold))
+    pub const fn monitor_config(&self) -> crate::harness::host_load::HostLoadConfig {
+        crate::harness::host_load::HostLoadConfig::new()
+            .load_threshold(crate::harness::host_load::MachineLoad(self.load_threshold))
             .start_after(self.start_after)
             .end_after(self.end_after)
             .poll_interval(self.poll_interval)
@@ -1853,6 +1856,76 @@ impl Default for TasksSettings {
     fn default() -> Self {
         Self {
             line_limit: crate::tasks_md::schema::DEFAULT_LINE_LIMIT,
+        }
+    }
+}
+
+/// `[shell]` section: how long a script may run and how much of its output
+/// reaches the model. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ShellSettings {
+    /// How long a `terminal` call waits before its script becomes a
+    /// background task.
+    #[serde(with = "duration_text")]
+    pub foreground_wait: Duration,
+    /// The longest `timeout` a script may ask for.
+    #[serde(with = "duration_text")]
+    pub timeout_cap: Duration,
+    /// How long a background task runs before the agent is told it is
+    /// still running.
+    #[serde(with = "duration_text")]
+    pub long_job_alert: Duration,
+    /// The longest a `monitor` may run.
+    #[serde(with = "duration_text")]
+    pub monitor_max_timeout: Duration,
+    /// Seconds between a `monitor`'s deliveries when its call states none.
+    #[serde(with = "duration_text")]
+    pub monitor_default_interval: Duration,
+    /// How long the agent has to act on a final memory warning.
+    #[serde(with = "duration_text")]
+    pub response_window: Duration,
+    /// Bytes a subagent's sandbox may send while its commits are imported.
+    pub subagent_import_bytes: u64,
+    /// Output bytes returned inline before the rest is saved to a file.
+    pub inline_output_bytes: usize,
+    /// Bytes of a saved output kept as its preview.
+    pub preview_bytes: usize,
+    /// Output lines returned inline when a call states no `max_lines`.
+    pub default_lines: u32,
+    /// The most output lines a call may ask for.
+    pub ceiling_lines: u32,
+    /// Bytes a `terminal_read` returns when its call states no `max_bytes`.
+    pub read_bytes: usize,
+    /// Pixels of the longer side of media delivered at `low` resolution.
+    pub media_low: u32,
+    /// Pixels of the longer side of media delivered at `medium` resolution.
+    pub media_medium: u32,
+    /// Pixels of the longer side of media delivered at `high` resolution.
+    pub media_high: u32,
+    /// Characters of a job's script shown in the job list.
+    pub job_preview_bytes: usize,
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            foreground_wait: Duration::from_secs(10),
+            timeout_cap: Duration::from_mins(120),
+            long_job_alert: Duration::from_mins(40),
+            monitor_max_timeout: Duration::from_secs(7200),
+            monitor_default_interval: Duration::from_secs(10),
+            response_window: Duration::from_secs(120),
+            subagent_import_bytes: 1024 * 1024 * 1024,
+            inline_output_bytes: 16_000,
+            preview_bytes: 16_000,
+            default_lines: 200,
+            ceiling_lines: 800,
+            read_bytes: 32 * 1024,
+            media_low: 512,
+            media_medium: 1024,
+            media_high: 2048,
+            job_preview_bytes: 50,
         }
     }
 }
@@ -1916,6 +1989,7 @@ impl Default for MayConfig {
             host_load: HostLoadSettings::default(),
             disk: DiskSettings::default(),
             tasks: TasksSettings::default(),
+            shell: ShellSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
@@ -2285,7 +2359,11 @@ mod tests {
             .await
             .expect_err("an unresolvable host has no platform");
         assert!(
-            matches!(error, aither_sandbox::SshProbeError::Failed { .. }),
+            matches!(
+                error,
+                aither_sandbox::SshProbeError::Upload(_)
+                    | aither_sandbox::SshProbeError::Failed { .. }
+            ),
             "{error}"
         );
     }

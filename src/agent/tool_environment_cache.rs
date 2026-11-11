@@ -1,26 +1,25 @@
 //! Per-session cache of prepared tool environments.
 //!
-//! Preparing a session's tool environments downloads and verifies the managed
-//! tools, probes their versions and, for attached SSH servers, asks the user
-//! for consent. Front ends that rebuild the agent for every turn or provider
-//! retry keep the prepared [`ShellSessionRegistry`] here and hand it to the
-//! next builder instead of preparing again.
+//! Preparing a session's home environment downloads and verifies the managed
+//! tools and probes their versions. Front ends that rebuild the agent for
+//! every turn or provider retry keep the prepared [`ToolEnvironments`] here
+//! and hand it to the next builder instead of preparing again. An SSH server
+//! is prepared when its first command names it, so it is not part of the
+//! cache.
 //!
 //! A single actor task owns the map. Requesters ask it for a session's
-//! environment and either receive the cached registry or a
-//! [`PreparationLease`] that makes them the only preparer of that session;
-//! concurrent requesters for the same session queue behind the lease and are
-//! answered once it completes, so the user is never asked for SSH consent
-//! twice for one preparation.
+//! environment and either receive the cached one or a [`PreparationLease`]
+//! that makes them the only preparer of that session; concurrent requesters
+//! for the same session queue behind the lease and are answered once it
+//! completes.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
-use aither_sandbox::{
-    BridgeAddress, ContainerIpcRoute, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
-};
+use aither_sandbox::HostRoute;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::session::SessionId;
+use crate::tools::ToolEnvironments;
 
 /// The backend that runs a session's commands on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,59 +30,20 @@ pub enum HomeBackend {
     Container {
         /// Id of the container the tools are mounted into.
         container_id: String,
-        /// Host the container reaches the IPC bridge on. A restarted
-        /// container keeps its id but can come back on another address, so
-        /// the route is part of the key.
-        ipc_host: String,
-        /// Address the host binds the IPC bridge on.
-        ipc_bind: BridgeAddress,
+        /// How the container reaches the host. A restarted container keeps
+        /// its id but can come back on another address, so the route is part
+        /// of the key.
+        route: HostRoute,
     },
 }
 
 impl HomeBackend {
     /// The container backend reached through `route`.
     #[must_use]
-    pub fn container(container_id: &str, route: &ContainerIpcRoute) -> Self {
+    pub fn container(container_id: &str, route: &HostRoute) -> Self {
         Self::Container {
             container_id: container_id.to_owned(),
-            ipc_host: route.host().to_owned(),
-            ipc_bind: route.bind(),
-        }
-    }
-}
-
-/// The configuration a prepared registry is bound to: its home backend,
-/// container and SSH server set.
-///
-/// The builder's backend setters are fed from the same values the key is
-/// built from ([`Self::availability`] and the SSH servers passed to
-/// [`Self::new`]), so equal keys describe the registry the builder would have
-/// prepared.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolEnvironmentKey {
-    home: HomeBackend,
-    ssh_servers: BTreeSet<(String, String)>,
-}
-
-impl ToolEnvironmentKey {
-    /// Key for a home backend with the given attached SSH servers.
-    #[must_use]
-    pub fn new(home: HomeBackend, ssh_servers: &[SshServer]) -> Self {
-        Self {
-            home,
-            ssh_servers: ssh_servers
-                .iter()
-                .map(|server| (server.name.clone(), server.target.clone()))
-                .collect(),
-        }
-    }
-
-    /// Shell backends the terminal offers for this configuration.
-    #[must_use]
-    pub fn availability(&self) -> ShellRuntimeAvailability {
-        ShellRuntimeAvailability {
-            local: self.home == HomeBackend::Local,
-            container: matches!(self.home, HomeBackend::Container { .. }),
+            route: route.clone(),
         }
     }
 }
@@ -100,7 +60,7 @@ pub enum ToolEnvironmentCacheError {
 #[derive(Debug)]
 pub enum Acquired {
     /// Adopt this registry, prepared for an equal key.
-    Ready(Box<ShellSessionRegistry>),
+    Ready(Box<ToolEnvironments>),
     /// Prepare the environment and report the result through the lease.
     Prepare(PreparationLease),
 }
@@ -124,7 +84,7 @@ impl PreparationLease {
     ///
     /// Panics if the lease's request channel was already taken, which cannot
     /// happen through the public API.
-    pub fn complete(mut self, registry: ShellSessionRegistry) {
+    pub fn complete(mut self, registry: ToolEnvironments) {
         let requests = self
             .requests
             .take()
@@ -183,7 +143,7 @@ impl ToolEnvironmentCache {
     pub async fn acquire(
         &self,
         session: &SessionId,
-        key: ToolEnvironmentKey,
+        key: HomeBackend,
     ) -> Result<Acquired, ToolEnvironmentCacheError> {
         let (reply, response) = oneshot::channel();
         self.send(Request::Acquire(Waiter {
@@ -222,7 +182,7 @@ enum Request {
     Complete {
         session: SessionId,
         generation: u64,
-        registry: Box<ShellSessionRegistry>,
+        registry: Box<ToolEnvironments>,
     },
     Abandon {
         session: SessionId,
@@ -235,18 +195,18 @@ enum Request {
 #[derive(Debug)]
 struct Waiter {
     session: SessionId,
-    key: ToolEnvironmentKey,
+    key: HomeBackend,
     reply: oneshot::Sender<Acquired>,
 }
 
 #[derive(Debug)]
 enum Slot {
     Ready {
-        key: ToolEnvironmentKey,
-        registry: Box<ShellSessionRegistry>,
+        key: HomeBackend,
+        registry: Box<ToolEnvironments>,
     },
     Preparing {
-        key: ToolEnvironmentKey,
+        key: HomeBackend,
         generation: u64,
         waiters: VecDeque<Waiter>,
     },
@@ -338,7 +298,7 @@ impl CacheState {
         }
     }
 
-    fn complete(&mut self, session: SessionId, generation: u64, registry: ShellSessionRegistry) {
+    fn complete(&mut self, session: SessionId, generation: u64, registry: ToolEnvironments) {
         let Some((key, waiters)) = self.take_preparation(&session, generation) else {
             tracing::debug!(
                 session_id = %session,
@@ -375,7 +335,7 @@ impl CacheState {
         &mut self,
         session: &SessionId,
         generation: u64,
-    ) -> Option<(ToolEnvironmentKey, VecDeque<Waiter>)> {
+    ) -> Option<(HomeBackend, VecDeque<Waiter>)> {
         match self.slots.remove(session) {
             Some(Slot::Preparing {
                 key,
@@ -396,36 +356,29 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::tools::{PreparedTools, ToolCatalog};
 
-    fn registry() -> ShellSessionRegistry {
-        ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        })
-    }
-
-    fn server(name: &str, target: &str) -> SshServer {
-        SshServer {
-            name: name.to_string(),
-            target: target.to_string(),
-        }
-    }
-
-    fn route(host: &str) -> ContainerIpcRoute {
-        ContainerIpcRoute::new(
-            host,
-            BridgeAddress::try_from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap(),
+    fn registry() -> ToolEnvironments {
+        ToolEnvironments::with_test_tools(
+            PreparedTools {
+                bin_dir: std::path::PathBuf::new(),
+                uv_dir: None,
+                heel: None,
+                catalog: ToolCatalog::empty(),
+            },
+            &crate::tools::embedded_distribution().expect("the embedded distribution validates"),
+            std::path::Path::new(""),
         )
     }
 
-    fn local_key(servers: &[SshServer]) -> ToolEnvironmentKey {
-        ToolEnvironmentKey::new(HomeBackend::Local, servers)
+    fn route(host: &str) -> HostRoute {
+        HostRoute::new(host, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap()
     }
 
     async fn acquire(
         cache: &ToolEnvironmentCache,
         session: &SessionId,
-        key: ToolEnvironmentKey,
+        key: HomeBackend,
     ) -> Acquired {
         tokio::time::timeout(Duration::from_secs(5), cache.acquire(session, key))
             .await
@@ -436,7 +389,7 @@ mod tests {
     async fn lease(
         cache: &ToolEnvironmentCache,
         session: &SessionId,
-        key: ToolEnvironmentKey,
+        key: HomeBackend,
     ) -> PreparationLease {
         match acquire(cache, session, key).await {
             Acquired::Prepare(lease) => lease,
@@ -447,8 +400,8 @@ mod tests {
     async fn ready(
         cache: &ToolEnvironmentCache,
         session: &SessionId,
-        key: ToolEnvironmentKey,
-    ) -> ShellSessionRegistry {
+        key: HomeBackend,
+    ) -> ToolEnvironments {
         match acquire(cache, session, key).await {
             Acquired::Ready(registry) => *registry,
             Acquired::Prepare(_) => panic!("expected the cached registry"),
@@ -466,32 +419,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn key_ignores_ssh_server_order_and_derives_availability() {
-        let a = server("a", "user@a");
-        let b = server("b", "user@b");
-        assert_eq!(
-            local_key(&[a.clone(), b.clone()]),
-            local_key(&[b, a.clone()])
-        );
-        assert_ne!(
-            local_key(std::slice::from_ref(&a)),
-            local_key(&[server("a", "user@c")])
-        );
-
-        let container =
-            ToolEnvironmentKey::new(HomeBackend::container("c1", &route("10.0.0.1")), &[a])
-                .availability();
-        assert!(!container.local && container.container);
-        let local = local_key(&[]).availability();
-        assert!(local.local && !local.container);
-    }
-
     #[tokio::test]
     async fn equal_key_prepares_once_then_adopts() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let key = local_key(&[server("a", "user@a")]);
+        let key = HomeBackend::Local;
 
         lease(&cache, &session, key.clone())
             .await
@@ -504,45 +436,25 @@ mod tests {
     async fn changed_configuration_prepares_again() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let attached = local_key(&[server("a", "user@a")]);
+        let local = HomeBackend::Local;
 
-        lease(&cache, &session, attached.clone())
+        lease(&cache, &session, local.clone())
             .await
             .complete(registry());
 
-        let detached = local_key(&[]);
-        lease(&cache, &session, detached.clone())
-            .await
-            .complete(registry());
-        ready(&cache, &session, detached).await;
-
-        let retargeted = local_key(&[server("a", "user@b")]);
-        lease(&cache, &session, retargeted.clone())
-            .await
-            .complete(registry());
-
-        let container = ToolEnvironmentKey::new(
-            HomeBackend::container("c1", &route("10.0.0.1")),
-            &[server("a", "user@b")],
-        );
+        let container = HomeBackend::container("c1", &route("10.0.0.1"));
         lease(&cache, &session, container.clone())
             .await
             .complete(registry());
         ready(&cache, &session, container).await;
 
-        let restarted = ToolEnvironmentKey::new(
-            HomeBackend::container("c1", &route("10.0.0.2")),
-            &[server("a", "user@b")],
-        );
+        let restarted = HomeBackend::container("c1", &route("10.0.0.2"));
         lease(&cache, &session, restarted.clone())
             .await
             .complete(registry());
         ready(&cache, &session, restarted).await;
 
-        let other_container = ToolEnvironmentKey::new(
-            HomeBackend::container("c2", &route("10.0.0.2")),
-            &[server("a", "user@b")],
-        );
+        let other_container = HomeBackend::container("c2", &route("10.0.0.2"));
         lease(&cache, &session, other_container).await;
     }
 
@@ -550,7 +462,7 @@ mod tests {
     async fn concurrent_requests_share_one_preparation() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let key = local_key(&[server("a", "user@a")]);
+        let key = HomeBackend::Local;
 
         let first = lease(&cache, &session, key.clone()).await;
         let mut waiters = (0..3)
@@ -578,7 +490,7 @@ mod tests {
     async fn failed_preparation_is_not_cached() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let key = local_key(&[]);
+        let key = HomeBackend::Local;
 
         let first = lease(&cache, &session, key.clone()).await;
         let waiter = tokio::spawn({
@@ -602,7 +514,7 @@ mod tests {
     async fn cancelled_requester_does_not_hold_the_preparation() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let key = local_key(&[]);
+        let key = HomeBackend::Local;
 
         let first = lease(&cache, &session, key.clone()).await;
         let mut cancelled = tokio::spawn({
@@ -624,7 +536,7 @@ mod tests {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
         let other = SessionId::from_string("two");
-        let key = local_key(&[]);
+        let key = HomeBackend::Local;
 
         lease(&cache, &session, key.clone())
             .await
@@ -644,7 +556,7 @@ mod tests {
     async fn eviction_fails_waiters_and_discards_inflight_preparation() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let key = local_key(&[]);
+        let key = HomeBackend::Local;
 
         let first = lease(&cache, &session, key.clone()).await;
         let waiter = tokio::spawn({

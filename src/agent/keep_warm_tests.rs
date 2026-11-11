@@ -9,8 +9,6 @@
 
 use std::time::Duration;
 
-use aither_sandbox::TerminalMode;
-
 use super::idle_compaction_tests::{
     SESSION_MODEL, Session, StubModel, run_short_turn, saved_config,
 };
@@ -21,35 +19,39 @@ use crate::config::MayConfig;
 /// Half a minute short of the default one-hour lifetime.
 const DUE: Duration = Duration::from_secs(59 * 60 + 30);
 
-/// Registers a running job on `agent`'s terminal, bounded by `timeout` when
-/// given.
-async fn start_job(
-    registry: &aither_sandbox::JobRegistry,
-    pid: u32,
-    timeout: Option<Duration>,
-) -> aither_core::IdLease {
-    let lease = crate::model_ids::SessionIds::restore([])
-        .expect("a pool")
-        .lease()
-        .expect("a free word");
-    if let Some(timeout) = timeout {
-        registry.bound_by_timeout(&lease, timeout).await;
-    }
-    registry
-        .register(
-            pid,
-            &lease,
-            "key",
-            "sleep 9999",
-            TerminalMode::Sandboxed,
-            None,
-        )
-        .await;
-    lease
+/// A deadline past every cache lifetime the tests use and past the default
+/// cap on a command's `timeout`, which [`config_allowing_long_commands`] lifts.
+const LONG: Duration = Duration::from_hours(3);
+
+/// A saved config whose shell lets a command run for [`LONG`].
+fn config_allowing_long_commands(stub: &StubModel) -> MayConfig {
+    let mut config = saved_config(stub, None);
+    config.shell.timeout_cap = Duration::from_hours(4);
+    config
+}
+
+/// Starts a running job on the session's shell, killed once `timeout` has
+/// passed since it started.
+async fn start_job(shell: &crate::ipc::SessionShell, timeout: Duration) -> aither_sandbox::Job {
+    shell
+        .run_background(aither_sandbox::ShellArgs {
+            description: "sleeps".to_string(),
+            script: "sleep 9999".to_string(),
+            interpreter: aither_sandbox::Interpreter::default(),
+            sandbox: aither_sandbox::SandboxMode::Sandboxed,
+            location: None,
+            resolution: aither_sandbox::MediaResolution::default(),
+            max_lines: None,
+            raw: false,
+            timeout: timeout.as_secs(),
+            background: true,
+        })
+        .await
+        .expect("the job starts")
 }
 
 fn config_with_lifetime(stub: &StubModel, lifetime: CacheLifetime) -> MayConfig {
-    let mut config = saved_config(stub, None);
+    let mut config = config_allowing_long_commands(stub);
     config
         .provider
         .get_mut("session")
@@ -65,8 +67,8 @@ fn config_with_lifetime(stub: &StubModel, lifetime: CacheLifetime) -> MayConfig 
 #[tokio::test]
 async fn a_running_command_past_the_cold_point_schedules_a_refresh() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
-    let mut session = Box::pin(Session::start(&saved_config(&stub, None))).await;
-    let registry = session.agent.job_registry();
+    let mut session = Box::pin(Session::start(&config_allowing_long_commands(&stub))).await;
+    let shell = session.agent.shell().clone();
 
     assert_eq!(
         session.agent.keep_warm_due_in().await,
@@ -80,14 +82,14 @@ async fn a_running_command_past_the_cold_point_schedules_a_refresh() {
         "no command runs"
     );
 
-    let _short = start_job(&registry, 1, Some(Duration::from_mins(30))).await;
+    let _short = start_job(&shell, Duration::from_mins(30)).await;
     assert_eq!(
         session.agent.keep_warm_due_in().await,
         None,
         "the only command ends before the entry cools"
     );
 
-    let _long = start_job(&registry, 2, Some(Duration::from_hours(3))).await;
+    let _long = start_job(&shell, LONG).await;
     assert_eq!(session.agent.keep_warm_due_in().await, Some(DUE));
 
     session.clock.advance(Duration::from_mins(10));
@@ -101,10 +103,12 @@ async fn a_running_command_past_the_cold_point_schedules_a_refresh() {
 #[tokio::test]
 async fn a_command_without_a_deadline_schedules_a_refresh() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
-    let mut session = Box::pin(Session::start(&saved_config(&stub, None))).await;
+    let mut session = Box::pin(Session::start(&config_allowing_long_commands(&stub))).await;
     run_short_turn(&mut session.agent).await;
 
-    let _job = start_job(&session.agent.job_registry(), 1, None).await;
+    // A command's deadline is bounded by the shell's cap; one at the cap is
+    // past the cold point.
+    let _job = start_job(session.agent.shell(), LONG).await;
     assert_eq!(session.agent.keep_warm_due_in().await, Some(DUE));
 }
 
@@ -113,7 +117,7 @@ async fn a_command_without_a_deadline_schedules_a_refresh() {
 #[tokio::test]
 async fn a_refresh_sends_a_request_and_leaves_the_conversation_alone() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
-    let mut session = Box::pin(Session::start(&saved_config(&stub, None))).await;
+    let mut session = Box::pin(Session::start(&config_allowing_long_commands(&stub))).await;
     run_short_turn(&mut session.agent).await;
     let before = session.agent.context_messages().await.expect("messages");
     let sent = stub.requests.lock().await.len();
@@ -131,7 +135,7 @@ async fn a_refresh_sends_a_request_and_leaves_the_conversation_alone() {
         session.agent.context_messages().await.expect("messages"),
         before
     );
-    let _job = start_job(&session.agent.job_registry(), 1, None).await;
+    let _job = start_job(session.agent.shell(), LONG).await;
     assert_eq!(
         session.agent.keep_warm_due_in().await,
         Some(DUE),
@@ -154,10 +158,13 @@ struct Idle {
     worker: AgentWorker,
     db: crate::db::ChatDb,
     session_id: String,
+    _job: aither_sandbox::Job,
     _temp: tempfile::TempDir,
 }
 
-async fn idle_worker(stub: &StubModel, lifetime: Duration) -> Idle {
+/// An idle worker whose session runs a command killed `deadline` after it
+/// started, under a cache lifetime of `lifetime`.
+async fn idle_worker(stub: &StubModel, lifetime: Duration, deadline: Duration) -> Idle {
     let config = config_with_lifetime(stub, CacheLifetime::Limited(lifetime));
     let Session {
         mut agent,
@@ -166,12 +173,14 @@ async fn idle_worker(stub: &StubModel, lifetime: Duration) -> Idle {
         ..
     } = Box::pin(Session::start_on_system_clock(&config)).await;
     run_short_turn(&mut agent).await;
+    let job = start_job(agent.shell(), deadline).await;
     let db = parts.db.clone();
     let runs = crate::session::SessionRuns::new(db.clone(), crate::ui_event_bus::UiEventBus::new());
     Idle {
         worker: spawn_worker(executor_core::DefaultExecutor, agent, db.clone(), runs),
         db,
         session_id: parts.session_id.as_str().to_string(),
+        _job: job,
         _temp: temp,
     }
 }
@@ -187,10 +196,9 @@ async fn the_idle_worker_refreshes_and_a_turn_cancels_it() {
         worker,
         db,
         session_id,
+        _job,
         _temp,
-    } = idle_worker(&stub, Duration::from_secs(2)).await;
-    let registry = worker.job_registry().expect("a registry").clone();
-    let _job = start_job(&registry, 1, None).await;
+    } = idle_worker(&stub, Duration::from_secs(2), LONG).await;
     // A refresh is logged after its response ends, so wait on the log, not
     // on the stub, which counts a request when it arrives.
     eventually(
@@ -249,9 +257,7 @@ async fn the_idle_worker_refreshes_and_a_turn_cancels_it() {
 #[tokio::test]
 async fn the_idle_worker_sends_nothing_when_every_command_ends_first() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
-    let idle = idle_worker(&stub, Duration::from_secs(2)).await;
-    let registry = idle.worker.job_registry().expect("a registry").clone();
-    let _job = start_job(&registry, 1, Some(Duration::from_secs(1))).await;
+    let _idle = idle_worker(&stub, Duration::from_secs(2), Duration::from_secs(1)).await;
     let sent = stub.requests.lock().await.len();
 
     tokio::time::sleep(Duration::from_secs(4)).await;

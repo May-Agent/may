@@ -5,7 +5,7 @@
 //! beginning of a one-shot prompt; an unknown first flag is refused.
 
 use aither_core::llm::model::ReasoningEffort;
-use aither_sandbox::TerminalExecutionMode;
+use aither_sandbox::SandboxMode;
 use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 
 /// Top-level CLI mode the binary resolves from argv.
@@ -82,7 +82,7 @@ impl DaemonCommand {
 pub struct ExecArgs {
     pub session_id: String,
     pub script: String,
-    pub mode: Option<TerminalExecutionMode>,
+    pub mode: Option<SandboxMode>,
     pub ssh_server_id: Option<String>,
     pub timeout: u64,
     pub raw: bool,
@@ -467,10 +467,10 @@ pub fn parse_reasoning_effort(value: &str) -> ReasoningEffort {
     }
 }
 
-fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
+fn parse_terminal_execution_mode(value: &str) -> SandboxMode {
     match value.trim().to_ascii_lowercase().as_str() {
-        "default" => TerminalExecutionMode::Default,
-        "unsafe" => TerminalExecutionMode::Unsafe,
+        "default" => SandboxMode::Sandboxed,
+        "unsafe" => SandboxMode::Unsandboxed,
         _ => panic!("invalid --mode '{value}'; expected one of: default, unsafe"),
     }
 }
@@ -478,8 +478,8 @@ fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, TerminalExecutionMode,
-        TuiArgs, parse_cli_mode, parse_reasoning_effort,
+        BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, SandboxMode, TuiArgs,
+        parse_cli_mode, parse_reasoning_effort,
     };
     use aither_core::llm::model::ReasoningEffort;
     use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
@@ -624,7 +624,7 @@ mod tests {
             CliMode::Exec(ExecArgs {
                 session_id: "session-123".to_string(),
                 script: "pwd".to_string(),
-                mode: Some(TerminalExecutionMode::Default),
+                mode: Some(SandboxMode::Sandboxed),
                 ssh_server_id: None,
                 timeout: 5,
                 raw: true,

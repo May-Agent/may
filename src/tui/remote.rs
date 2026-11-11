@@ -11,15 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aither_agent::CompactResult;
+use aither_agent::{AgentEvent, CompactResult, RunOutcome, TimedEvent};
 use async_channel::{Receiver, Sender, unbounded};
 
 use crate::agent::runner::WorkerCommand;
 use crate::agent::{AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, TuiEvent};
 use crate::client::background::{RemoteBackground, SessionBackgroundSnapshot};
 use crate::client::{
-    DaemonClient, RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot,
-    WireAgentEvent, session_path,
+    DaemonClient, RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, session_path,
 };
 use crate::daemon::{CompactResponse, ContextDumpResponse};
 use crate::tui::event::{AppEvent, EventSender};
@@ -141,13 +140,24 @@ impl ForwardedTurn {
     }
 
     /// Forward one agent event; a `Complete` waits for [`Self::end`].
-    async fn agent(&mut self, event: WireAgentEvent, at: jiff::Timestamp) {
-        if self.withdrawn {
+    async fn agent(&mut self, timed: TimedEvent) {
+        // A subagent's events ride its parent's stream; the subagent views
+        // show them.
+        if self.withdrawn || !timed.agent.is_main() {
             return;
         }
-        self.saw_error |= matches!(event, WireAgentEvent::Error { .. });
-        let complete = matches!(event, WireAgentEvent::Complete { .. });
-        let event = TuiEvent::Agent(event.into_timed(at));
+        // The failure of the run is the error the TUI shows, as it is for a
+        // run in this process.
+        let failure = match &timed.event {
+            AgentEvent::RunEnded {
+                outcome: RunOutcome::Failed { error, .. },
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        };
+        self.saw_error |= failure.is_some();
+        let complete = failure.is_none() && matches!(timed.event, AgentEvent::RunEnded { .. });
+        let event = TuiEvent::Agent(failure.map_or(Ok(timed), Err));
         if complete {
             self.held_complete = Some(event);
             return;
@@ -621,16 +631,24 @@ async fn forward_agent_frame(
             }
         },
         SessionAgentBody::Agent { event } => {
-            if let Some(window) = event.context_window() {
-                let _ = app_events
-                    .send(AppEvent::ContextWindow {
-                        session_id: frame.session_id,
-                        window,
-                    })
-                    .await;
-            }
             if let Some(turn) = current.as_mut() {
-                turn.agent(event, frame.at).await;
+                turn.agent(event).await;
+            }
+        }
+        SessionAgentBody::ContextWindow { tokens } => {
+            let _ = app_events
+                .send(AppEvent::ContextWindow {
+                    session_id: frame.session_id,
+                    window: tokens,
+                })
+                .await;
+        }
+        SessionAgentBody::ReplyTranslated { text, language } => {
+            if let Some(turn) = current.as_mut() {
+                let _ = turn
+                    .events
+                    .send(TuiEvent::ReplyTranslated { text, language })
+                    .await;
             }
         }
         SessionAgentBody::ReasoningEnd { seconds } => {
@@ -901,9 +919,32 @@ mod tests {
 
     fn text(chunk: &str) -> SessionAgentBody {
         SessionAgentBody::Agent {
-            event: WireAgentEvent::Text {
-                text: chunk.to_string(),
-            },
+            event: TimedEvent::now(
+                aither_agent::AgentPath::main(),
+                AgentEvent::block_delta(
+                    aither_agent::RequestId::new(1),
+                    aither_agent::BlockId::new(0),
+                    aither_agent::OutputKind::Text,
+                    chunk.to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// The end of the main agent's run, as aither reports a finished one.
+    fn run_completed(final_text: &str) -> SessionAgentBody {
+        SessionAgentBody::Agent {
+            event: serde_json::from_value(serde_json::json!({
+                "at": "2026-01-01T00:00:00Z",
+                "agent": [],
+                "event": {
+                    "RunEnded": {
+                        "run": "r1",
+                        "outcome": { "Completed": { "final_text": final_text } },
+                    },
+                },
+            }))
+            .expect("a timed event"),
         }
     }
 
@@ -913,8 +954,13 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 TuiEvent::Agent(Ok(timed)) => {
-                    if let aither_agent::AgentEvent::Text(chunk) = timed.event {
-                        out.push_str(&chunk);
+                    if let AgentEvent::BlockDelta {
+                        kind: aither_agent::OutputKind::Text,
+                        text,
+                        ..
+                    } = timed.event
+                    {
+                        out.push_str(&text);
                     }
                 }
                 TuiEvent::Complete => completed = true,
@@ -944,8 +990,8 @@ mod tests {
             task_id: "t".to_string(),
             execution_key: "k".to_string(),
             script: "sleep 1".to_string(),
-            mode: aither_sandbox::TerminalMode::Sandboxed,
-            language: aither_sandbox::ScriptLanguage::Shell,
+            mode: aither_sandbox::SandboxMode::Sandboxed,
+            interpreter: aither_sandbox::Interpreter::Shell,
             elapsed_ms: 0,
             status: crate::client::background::WireJobStatus::Running,
             output_path: None,
@@ -1094,12 +1140,7 @@ mod tests {
                 content: WITHDRAWN.to_string(),
                 attachments: Vec::new(),
             },
-            SessionAgentBody::Agent {
-                event: WireAgentEvent::Complete {
-                    final_text: String::new(),
-                    turns: 1,
-                },
-            },
+            run_completed(""),
             SessionAgentBody::End {
                 outcome: RunEnd::Cancelled,
             },
@@ -1188,8 +1229,8 @@ mod tests {
         let is_complete = |event: &TuiEvent| {
             matches!(
                 event,
-                TuiEvent::Agent(Ok(aither_agent::TimedEvent {
-                    event: aither_agent::AgentEvent::Complete { .. },
+                TuiEvent::Agent(Ok(TimedEvent {
+                    event: AgentEvent::RunEnded { .. },
                     ..
                 }))
             )
@@ -1201,13 +1242,7 @@ mod tests {
         })
         .await;
         forward(text("done")).await;
-        forward(SessionAgentBody::Agent {
-            event: WireAgentEvent::Complete {
-                final_text: "done".to_string(),
-                turns: 1,
-            },
-        })
-        .await;
+        forward(run_completed("done")).await;
         let before_end: Vec<TuiEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(before_end.len(), 1, "only the text arrives before the end");
         assert!(!before_end.iter().any(is_complete));

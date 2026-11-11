@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aither_sandbox::{HostProgram, ToolTarget};
+use crate::tools::{HostProgram, ToolTarget};
 
 use crate::tools::embedded_distribution;
 
@@ -14,7 +14,7 @@ pub enum StageContextError {
     UnsupportedArch(String),
     /// Baseline tool or `heel` loading or staging failed.
     #[error("tool staging failed: {0}")]
-    Tools(#[source] aither_sandbox::ToolRuntimeError),
+    Tools(#[source] crate::tools::ToolRuntimeError),
     /// The distribution's `heel` could not be copied into the context.
     #[error("staging the heel binary failed: {0}")]
     Heel(#[source] std::io::Error),

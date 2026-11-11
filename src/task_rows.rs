@@ -5,8 +5,8 @@
 //! sends (`todo_update` events, `GET /api/sessions/{id}/tasks`) and the TUI
 //! reads.
 
-use aither_agent::WorkRef;
-use aither_agent::working_document::WorkKind;
+use crate::harness::working_document::WorkKind;
+use crate::harness::working_document::WorkRef;
 
 use crate::tasks_md::{Section, TasksFile};
 
@@ -99,7 +99,7 @@ pub fn task_rows(content: &str) -> Vec<TaskRow> {
             detail: row
                 .details()
                 .filter(|line| {
-                    !aither_agent::working_document::words(line).any(|w| w == "BLOCKING")
+                    !crate::harness::working_document::words(line).any(|w| w == "BLOCKING")
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),

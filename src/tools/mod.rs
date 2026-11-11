@@ -2,8 +2,28 @@
 
 use std::path::Path;
 
-use aither_sandbox::{HostProgram, ToolDistribution, ToolRuntimeError, ToolTarget};
 use heel::HeelBinary;
+
+mod distribution;
+mod environment;
+mod python;
+mod runtime;
+mod transport;
+
+pub use distribution::{
+    HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
+    ToolDistribution,
+};
+pub use environment::ToolEnvironments;
+pub use python::{PythonPin, PythonRuntime};
+pub use runtime::{
+    HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool, PreparedTools, ToolBinary,
+    ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget, UV_PYTHON_PREFERENCE,
+};
+pub use transport::{
+    ContainerToolTransport, LocalToolTransport, SshToolTransport, ToolEnvironmentInfo,
+    ToolTransport,
+};
 
 #[cfg(test)]
 mod fixture;
@@ -27,7 +47,7 @@ const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
-    "f8e2e8115411da5e848cd11c5ff1cd0ed67a2d7b051df957ab6bfb0b1ed4e6c3";
+    "45bf578da67330b729b57d5d8e81d78fb2b1ee864e9e30437cd860d4077212a3";
 
 /// Loads the distribution: aither's embedded, hash-pinned baseline tools with
 /// May's own host programs in place of the baseline's.

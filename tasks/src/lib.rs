@@ -1,5 +1,4 @@
-//! `tasks.md`: the session's working document, kept on aither's
-//! working-document mechanism.
+//! `tasks.md`: the session's working document.
 //!
 //! The document holds current state only, in up to five `##` sections:
 //! `Roots` (the root issues the session serves), `Doing` (work in progress),
@@ -17,12 +16,12 @@
 //! file, which refuses at write time what the parser reports as a violation.
 
 pub mod edit;
+mod reference;
 
 use std::fmt::Write as _;
 
-use aither_agent::WorkRef;
-use aither_agent::working_document::words;
 use askama::Template;
+pub use reference::{WorkKind, WorkRef, words};
 
 #[derive(Template)]
 #[template(path = "tasks_violation.txt", escape = "none")]

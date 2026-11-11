@@ -5,11 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayload};
-use aither_agent::workspace_request::RequestWorkspaceArgs;
-use aither_core::llm::{Tool, ToolContext};
-use aither_sandbox::permission::PermissionHandler;
-use aither_sandbox::{CommandLocation, ScriptLanguage, TerminalMode};
+use crate::harness::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayload};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
+use aither_core::llm::{ApprovalKind, ApprovalRequest, Approver as _, Tool, ToolContext};
 use base64::Engine;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,6 +15,7 @@ use tokio::sync::broadcast::{Receiver, error::TryRecvError};
 
 use super::state::{AskUserApprover, DaemonState, WorkspaceApprover};
 use crate::agent::ask_user_tool::{AskUserArgs as ToolArgs, AskUserTool};
+use crate::agent::permission::UNSANDBOXED_KIND;
 use crate::agent::{OnTimeout, PermissionApprover, PermissionRequestMode};
 use crate::config::MayConfig;
 use crate::db::ChatDb;
@@ -80,12 +79,10 @@ async fn an_unsafe_command_approval_announces_the_command() {
     let mut fixture = Fixture::new().await;
     let approver = fixture.approver();
     let _ = approver
-        .check(
-            TerminalMode::Unsafe,
+        .approve(ApprovalRequest::new(
+            ApprovalKind::new(UNSANDBOXED_KIND),
             "make install",
-            ScriptLanguage::Shell,
-            CommandLocation::Local,
-        )
+        ))
         .await;
 
     assert_eq!(

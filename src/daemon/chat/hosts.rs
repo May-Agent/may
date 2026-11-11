@@ -120,7 +120,7 @@ impl ParkedAgents {
                 let resuming = wake_state
                     .session_background
                     .resume_pending(&session_id, wake.pending);
-                super::start_background_turn(&wake_state, &session_id, wake.events, resuming).await;
+                super::start_background_turn(&wake_state, &session_id, resuming).await;
             }
         });
     }

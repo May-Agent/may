@@ -25,9 +25,6 @@ use crate::model_selector::ModelSelector;
 const COMPACTION_MARKER: &str = "Your context window is being compacted";
 /// The task the scripted handoff records.
 const HANDOFF_TASK: &str = "HANDOFF-TASK-OF-THE-SCRIPTED-COMPACTION";
-/// Bound on how long a held compaction waits for a turn request; past it the
-/// scripted server fails the test instead of hanging.
-const COMPACTION_HOLD_LIMIT: Duration = Duration::from_secs(60);
 /// How long the scripted model takes to answer a turn request.
 const STEP_DELAY: Duration = Duration::from_millis(150);
 
@@ -58,33 +55,17 @@ struct Traffic {
     requests: Vec<String>,
     turns: usize,
     compactions: usize,
-    /// A compaction request is held unanswered.
-    compaction_open: bool,
-    /// Turn requests that arrived while a compaction was unanswered.
-    served_during_compaction: usize,
 }
 
 /// A scripted `OpenAI`-compatible server: `script` answers turn requests by
-/// their index. A server built with [`ScriptedModel::spawn_holding_compaction`]
-/// holds each compaction reply until a turn request has been served.
+/// their index and every compaction request with a handoff.
 pub(super) struct ScriptedModel {
     base_url: String,
     traffic: Arc<tokio::sync::Mutex<Traffic>>,
 }
 
-/// Signalled by each turn request served while a compaction is held.
-type CompactionGate = Option<Arc<tokio::sync::Notify>>;
-
 impl ScriptedModel {
     pub(super) async fn spawn(script: fn(usize) -> Step) -> Self {
-        Self::start(script, None).await
-    }
-
-    async fn spawn_holding_compaction(script: fn(usize) -> Step) -> Self {
-        Self::start(script, Some(Arc::new(tokio::sync::Notify::new()))).await
-    }
-
-    async fn start(script: fn(usize) -> Step, gate: CompactionGate) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scripted model server");
@@ -94,11 +75,9 @@ impl ScriptedModel {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let shared = shared.clone();
-                let gate = gate.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |request| {
-                        answer(request, script, shared.clone(), gate.clone())
-                    });
+                    let service =
+                        service_fn(move |request| answer(request, script, shared.clone()));
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -126,7 +105,6 @@ async fn answer(
     request: Request<Incoming>,
     script: fn(usize) -> Step,
     traffic: Arc<tokio::sync::Mutex<Traffic>>,
-    gate: CompactionGate,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() == Method::GET && request.uri().path().ends_with("/models") {
         let models = json!({
@@ -147,29 +125,6 @@ async fn answer(
     let text = String::from_utf8(body.to_vec()).expect("request is UTF-8");
     let (delay, frames) = plan(&mut *traffic.lock().await, script, &text);
     tokio::time::sleep(delay).await;
-    if text.contains(COMPACTION_MARKER) {
-        if let Some(gate) = &gate {
-            tokio::time::timeout(COMPACTION_HOLD_LIMIT, gate.notified())
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "no turn request was served within {COMPACTION_HOLD_LIMIT:?} \
-                         while the compaction was held"
-                    )
-                });
-        }
-        traffic.lock().await.compaction_open = false;
-    } else {
-        let held = {
-            let mut traffic = traffic.lock().await;
-            let held = traffic.compaction_open;
-            traffic.served_during_compaction += usize::from(held);
-            held
-        };
-        if let Some(gate) = gate.as_ref().filter(|_| held) {
-            gate.notify_one();
-        }
-    }
     let stream = [frames, vec!["data: [DONE]\n\n".to_string()]]
         .concat()
         .concat();
@@ -182,7 +137,6 @@ fn plan(traffic: &mut Traffic, script: fn(usize) -> Step, text: &str) -> (Durati
     {
         if text.contains(COMPACTION_MARKER) {
             traffic.compactions += 1;
-            traffic.compaction_open = true;
             let handoff = json!({
                 "current_task": HANDOFF_TASK,
                 "key_decisions": [],
@@ -261,6 +215,8 @@ pub(super) async fn run(session: &mut Session, filler_chars: usize, prompt: &str
         .push_message(aither_core::llm::Message::assistant(
             "x".repeat(filler_chars),
         ));
+    // A served turn reconciles the session's context before it runs.
+    session.agent.sync_runtime_context().await;
     let _ = session
         .agent
         .run(prompt, [])
@@ -271,8 +227,28 @@ pub(super) async fn run(session: &mut Session, filler_chars: usize, prompt: &str
         .expect("the turn runs");
 }
 
+/// [`run`], then the compaction the turn's `compact` call asked for, as a
+/// served turn does under `lease`.
+async fn run_and_compact(
+    session: &mut Session,
+    lease: &crate::session::SessionRunGuard,
+    filler_chars: usize,
+    prompt: &str,
+) {
+    run(session, filler_chars, prompt).await;
+    session
+        .agent
+        .compact_requested(
+            &session.parts.db,
+            lease.fence(),
+            &crate::agent::CompactionReporter::silent(),
+        )
+        .await
+        .expect("the requested compaction runs");
+}
+
 /// Holds the run lease the way a served run does, so checkpoints persist.
-pub(super) async fn lease(session: &Session) -> impl Drop + use<> {
+pub(super) async fn lease(session: &Session) -> crate::session::SessionRunGuard {
     let runtime = session.parts.runtime.clone().expect("a runtime");
     runtime
         .runs()
@@ -285,35 +261,31 @@ fn compact_then_work(index: usize) -> Step {
     match index {
         0 => terminal("echo BEFORE-COMPACT"),
         1 => Step::Tool("compact", json!({})),
-        2..=5 => terminal("echo AFTER-COMPACT"),
         _ => Step::Text("done"),
     }
 }
 
-/// The model calls `compact`, the run keeps asking the model while the
-/// compaction is in flight, and the handoff replaces the conversation in the
-/// agent and in the persisted context snapshot.
+/// The model calls `compact`, the turn ends there, the compaction runs and
+/// the handoff replaces the conversation in the agent and in the persisted
+/// context snapshot; the next turn starts on the compacted context.
 #[tokio::test]
 async fn the_compact_tool_compacts_in_the_background_and_the_handoff_is_persisted() {
-    let model = ScriptedModel::spawn_holding_compaction(compact_then_work).await;
+    let model = ScriptedModel::spawn(compact_then_work).await;
     let mut session = Box::pin(Session::start_with_runtime(&config_for(
         &model,
         ContextConfig::default(),
     )))
     .await;
-    let _lease = lease(&session).await;
+    let lease = lease(&session).await;
 
-    run(&mut session, 8 * 20_000, "Start the work.").await;
+    run_and_compact(&mut session, &lease, 8 * 20_000, "Start the work.").await;
 
-    let (compactions, served_during) = {
+    let (turns, compactions) = {
         let traffic = model.traffic.lock().await;
-        (traffic.compactions, traffic.served_during_compaction)
+        (traffic.turns, traffic.compactions)
     };
+    assert_eq!(turns, 2, "the turn ends at the compact call");
     assert_eq!(compactions, 1, "the call starts one compaction");
-    assert!(
-        served_during >= 1,
-        "the run keeps asking the model while the compaction is in flight"
-    );
     let session_id = session.agent.session_id().as_str().to_string();
     let snapshot = crate::session::load_persisted_context_snapshot(&session.parts.db, &session_id)
         .await

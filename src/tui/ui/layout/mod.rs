@@ -1223,23 +1223,12 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
                 },
             );
             let mut lines: Vec<Line<'_>> = Vec::new();
-            if let Some((stdout, stderr)) = &state.output {
+            if let Some(output) = &state.output {
                 lines.extend(
-                    String::from_utf8_lossy(stdout)
+                    String::from_utf8_lossy(output)
                         .lines()
                         .map(|line| Line::from(line.to_string())),
                 );
-                if !stderr.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "── stderr ──".to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    lines.extend(
-                        String::from_utf8_lossy(stderr)
-                            .lines()
-                            .map(|line| Line::from(line.to_string())),
-                    );
-                }
             }
             if lines.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -2940,9 +2929,9 @@ mod tests {
             task_id: "amber".to_string(),
             execution_key: String::new(),
             script: "true".to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
+            interpreter: aither_sandbox::Interpreter::Shell,
             place: aither_sandbox::JobPlace::Host,
-            mode: aither_sandbox::TerminalMode::default(),
+            mode: aither_sandbox::SandboxMode::default(),
             started_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(age_secs))
                 .expect("instant in range"),
@@ -3680,7 +3669,7 @@ mod tests {
         let display = ToolDisplay::Terminal {
             description: "运行测试".to_string(),
             command: "cargo test --workspace".to_string(),
-            mode: aither_sandbox::TerminalExecutionMode::Default,
+            mode: aither_sandbox::SandboxMode::Sandboxed,
             location: None,
             reading: None,
             card: None,

@@ -16,6 +16,7 @@ mod compact_tool_tests;
 mod compaction_report;
 #[cfg(test)]
 mod compaction_tests;
+mod compaction_watch;
 #[cfg(target_os = "macos")]
 pub mod computer_tool;
 mod context_dump;
@@ -31,6 +32,7 @@ mod host_load_tests;
 pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
+mod job_events;
 pub mod keep_warm;
 #[cfg(test)]
 mod keep_warm_tests;
@@ -79,10 +81,12 @@ pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
 pub use compaction_report::CompactionReporter;
+pub use compaction_watch::MayRun;
 pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
+pub use job_events::{BackgroundWake, JobFact};
 pub use live_limits::LiveLimits;
 pub use live_settings::AgentLiveSettings;
 pub(crate) use may::side_slot;
@@ -103,15 +107,11 @@ pub use runner::{
     AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
     spawn_idle_worker, spawn_worker,
 };
-pub use subagent_tracker::{
-    SubagentHandles, SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
-};
+pub use subagent_tracker::{RunCard, RunUsage, SubagentRunSnapshot, SubagentTracker, TrackedRun};
 pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,
 };
-pub use tool_environment_cache::{
-    HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
-};
+pub use tool_environment_cache::{HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError};
 pub use usage::{
     CacheMissCauseRow, CacheMissRow, ModelUsageRow, SessionUsageReport, assemble_usage_report,
 };

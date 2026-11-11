@@ -713,8 +713,10 @@ impl SessionEnv {
     }
 }
 
-impl aither_sandbox::TerminalEnvSource for SessionEnv {
-    fn env(&self) -> Vec<(String, String)> {
+impl SessionEnv {
+    /// The secrets every command of the session starts with.
+    #[must_use]
+    pub fn env(&self) -> Vec<(String, String)> {
         self.store.session_env(&self.session_id)
     }
 }

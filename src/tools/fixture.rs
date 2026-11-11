@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aither_sandbox::{ManagedTool, ToolDistribution, ToolTarget};
+use super::{ManagedTool, ToolDistribution, ToolTarget};
 use askama::Template;
 use sha2::{Digest, Sha256};
 

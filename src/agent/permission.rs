@@ -1,20 +1,43 @@
 //! Permission approval for terminal tool escalations.
 //!
-//! `PermissionApprover` is the [`aither_sandbox::PermissionHandler`]
-//! implementation used by `MayAgent`. It binds to a session, routes
-//! escalation requests through the runtime service so they are
-//! persisted and visible in the UI, and blocks the terminal tool
-//! until the user responds (or the request is interrupted).
+//! `PermissionApprover` is the [`aither_core::llm::Approver`] used by
+//! `MayAgent`. It binds to a session, routes escalation requests through the
+//! runtime service so they are persisted and visible in the UI, and blocks
+//! the call until the user responds (or the request is interrupted).
 
-use std::future::Future;
 use std::sync::Arc;
 
-use aither_sandbox::{
-    CommandLocation, ScriptLanguage, TerminalMode,
-    permission::{PermissionError, PermissionHandler},
-};
+use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
+use aither_sandbox::SandboxMode;
 
 use crate::live_response::LiveResponseRegistry;
+
+/// The [`aither_core::llm::ApprovalKind`] of a script that runs outside the
+/// sandbox.
+pub const UNSANDBOXED_KIND: &str = "unsandboxed";
+
+/// The kind of a script that runs on an SSH server; the request's reason is
+/// the server's target.
+pub const SSH_KIND: &str = "ssh";
+
+/// Why a permission request did not end in an approval.
+#[derive(Debug, thiserror::Error)]
+pub enum PermissionError {
+    /// The request was denied.
+    #[error("{0}")]
+    Denied(String),
+    /// The run was interrupted while the request was pending.
+    #[error("the permission request was interrupted")]
+    Interrupted,
+    /// The request could not be recorded or read.
+    #[error(transparent)]
+    Internal(anyhow::Error),
+}
+
+/// How a script's mode is phrased in a sentence about it.
+const fn describe(mode: SandboxMode) -> &'static str {
+    mode.description()
+}
 
 /// How long an escalation from the main agent stays pending before it
 /// resolves as denied. The operator is not assumed to be at the screen.
@@ -82,11 +105,11 @@ impl core::str::FromStr for PermissionRequestMode {
     }
 }
 
-impl From<TerminalMode> for PermissionRequestMode {
-    fn from(value: TerminalMode) -> Self {
+impl From<SandboxMode> for PermissionRequestMode {
+    fn from(value: SandboxMode) -> Self {
         match value {
-            TerminalMode::Sandboxed => Self::Default,
-            TerminalMode::Unsafe => Self::Unsafe,
+            SandboxMode::Sandboxed => Self::Default,
+            SandboxMode::Unsandboxed => Self::Unsafe,
         }
     }
 }
@@ -148,11 +171,11 @@ impl core::str::FromStr for PermissionHistoryMode {
     }
 }
 
-impl From<TerminalMode> for PermissionHistoryMode {
-    fn from(value: TerminalMode) -> Self {
+impl From<SandboxMode> for PermissionHistoryMode {
+    fn from(value: SandboxMode) -> Self {
         match value {
-            TerminalMode::Sandboxed => Self::Sandboxed,
-            TerminalMode::Unsafe => Self::Unsafe,
+            SandboxMode::Sandboxed => Self::Sandboxed,
+            SandboxMode::Unsandboxed => Self::Unsafe,
         }
     }
 }
@@ -293,7 +316,7 @@ impl PermissionApprover {
         self
     }
 
-    fn unavailable_error(mode: TerminalMode, context: &'static str) -> PermissionError {
+    fn unavailable_error(mode: SandboxMode, context: &'static str) -> PermissionError {
         PermissionError::Denied(format!(
             "sandbox blocked {} execution; approval is required to escalate this command, but approval is unavailable in {context}",
             mode.description()
@@ -378,7 +401,7 @@ impl PermissionApprover {
     /// Returns [`PermissionError`] when the request cannot be delivered or the wait is interrupted.
     pub async fn request_and_wait(
         &self,
-        mode: TerminalMode,
+        mode: SandboxMode,
         script: String,
     ) -> Result<bool, PermissionError> {
         if self.yolo().await? {
@@ -561,43 +584,38 @@ impl Default for PermissionApprover {
     }
 }
 
-impl PermissionHandler for PermissionApprover {
-    async fn check(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        _language: ScriptLanguage,
-        _location: CommandLocation<'_>,
-    ) -> Result<bool, PermissionError> {
-        match mode {
-            TerminalMode::Sandboxed => Ok(true),
-            TerminalMode::Unsafe => {
-                let approved = self.request_and_wait(mode, script.to_string()).await?;
-                if approved {
-                    Ok(true)
-                } else {
-                    Err(PermissionError::Denied(format!(
-                        "{} mode denied for script",
-                        mode.description()
-                    )))
-                }
-            }
+impl Approver for PermissionApprover {
+    /// Asks the user about a script that runs outside the sandbox. Every
+    /// other kind of request reaches the approver only through a surface
+    /// that answers it itself.
+    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        assert_eq!(
+            request.kind().as_str(),
+            UNSANDBOXED_KIND,
+            "the permission approver answers scripts that run outside the sandbox"
+        );
+        match self
+            .request_and_wait(SandboxMode::Unsandboxed, request.subject().to_string())
+            .await
+        {
+            Ok(true) => Ok(Approval::Approved),
+            Ok(false) => Ok(Approval::Denied {
+                reason: format!(
+                    "{} mode denied for script",
+                    describe(SandboxMode::Unsandboxed)
+                ),
+            }),
+            Err(PermissionError::Denied(reason)) => Ok(Approval::Denied { reason }),
+            Err(error) => Err(ApproverFailure::new(error)),
         }
     }
+}
 
-    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
-        std::future::ready(true)
-    }
-
-    async fn will_wait_for_approval(
-        &self,
-        mode: TerminalMode,
-        _script: &str,
-        _language: ScriptLanguage,
-        _location: CommandLocation<'_>,
-    ) -> bool {
+impl PermissionApprover {
+    /// Whether the user would be asked about an unsandboxed script now:
+    /// interactive, and the session's yolo switch is off.
+    pub async fn will_wait_for_approval(&self) -> bool {
         !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
-            && matches!(mode, TerminalMode::Unsafe)
             && !self.yolo().await.unwrap_or_else(|error| {
                 tracing::warn!(%error, "failed to read the session yolo switch");
                 false
@@ -657,7 +675,7 @@ mod tests {
             .with_approval_timeout(std::time::Duration::from_millis(50))
             .for_session("session-1");
         let error = approver
-            .request_and_wait(TerminalMode::Unsafe, "cargo build".to_string())
+            .request_and_wait(SandboxMode::Unsandboxed, "cargo build".to_string())
             .await
             .expect_err("an unanswered request must not succeed");
         let PermissionError::Denied(message) = error else {
@@ -674,7 +692,7 @@ mod tests {
         let responder = approver.clone();
         let wait = tokio::spawn(async move {
             approver
-                .request_and_wait(TerminalMode::Unsafe, "cargo build".to_string())
+                .request_and_wait(SandboxMode::Unsandboxed, "cargo build".to_string())
                 .await
         });
         // The request id is internal; approve whatever is pending.

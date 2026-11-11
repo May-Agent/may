@@ -8,12 +8,13 @@
 
 use std::borrow::Cow;
 
-use aither_agent::specialized::SubagentArgs;
 use aither_core::llm::tool::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
-use aither_sandbox::CommandUsage;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+use crate::ipc::CommandUsage;
+use crate::subagent::SubagentArgs;
 
 /// The subagent this command runs.
 const EXPLORE: &str = "explore";

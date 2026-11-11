@@ -145,8 +145,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "723435e901e66d4e40c133546136eb2c4d81fb595589e1bf0a2d058e51346657"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -166,15 +165,12 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f43dd3130b42a0418508a4b3dd6bda1c8ca08ca532422d5f3b68cffaaa8fe834"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
- "aho-corasick",
  "aither-attachments",
  "aither-connectivity",
  "aither-core",
  "aither-mcp",
- "aither-sandbox",
  "aither-skills",
  "aither-webfetch",
  "anyhow",
@@ -183,22 +179,13 @@ dependencies = [
  "async-channel",
  "async-fs",
  "async-io",
- "async-process",
  "async-stream",
- "basic-toml",
- "blocking",
- "dunce",
- "event-listener",
- "executor-core",
  "futures",
  "futures-core",
  "futures-lite",
  "indexmap",
  "jiff",
- "libc",
- "notify",
  "num-traits",
- "regex",
  "rustix 1.1.6",
  "schemars",
  "serde",
@@ -209,15 +196,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
- "whatlang",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "aither-attachments"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04ed541db8c0dd5536146f5e4e84a0862a9d6968b325bd41d95ef3eae21204dc"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -230,12 +215,11 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "347666ce8eb88011b8b0db0c73efbca808b9fafce901e105d501d32df6282a3f"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
- "aither-agent",
  "aither-core",
  "askama 0.16.1",
+ "async-channel",
  "schemars",
  "serde",
  "thiserror 2.0.21",
@@ -244,8 +228,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9afe5b4c3c3be098e0edfc1060eb9135d55abc80c6e6c9240f7492c99f116a4"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -263,8 +246,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "933deb4b1d964f343d4e818e265c0a518d09bc500fbe6168c484c401c536ffc3"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -281,8 +263,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d618a21cbd842126213a2d345ee22eaf04fd4cf0521260be774e8ea886ac4767"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -306,8 +287,7 @@ dependencies = [
 [[package]]
 name = "aither-connectivity"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75ad4297a4e17bbd49578bd9d13d4def4b2435c5e36ae59b0603eb3fdef25ba1"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -332,8 +312,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f41fa13e32607a06ce589a10c933694785423100b96b7a9f5bc82598b7b328e"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -353,8 +332,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f17f9be3acbd6e1ccea333b8d94c6670d170717c4436550ff464303c91c5606"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -362,6 +340,7 @@ dependencies = [
  "async-channel",
  "async-io",
  "base64 0.22.1",
+ "event-listener",
  "futures-core",
  "futures-lite",
  "gloo-timers 0.4.0",
@@ -382,8 +361,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e784389818b2c7475278c9690fca31596b425948815596037f000e5dae42ed"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -394,8 +372,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b5f7e2a8d331ba734ac84e8985d94e554227ba50e88c9beb864a5ce5d2f2a03"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -418,11 +395,9 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d9c0dfb12e3bf812ec5ec8e36107a650e8016d93e54407adf1200de03db83d"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-core",
- "aither-sandbox",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -433,6 +408,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "mime",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -443,8 +419,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ccf70fbfa9242a17ef943635dfd01157a16e608dae0bffac1c96722448e622"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-core",
  "serde",
@@ -454,8 +429,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f8e13d0c8cfd4082cae21a5f4d81ef0bced5dfb52d283768d964e2b9858bb02"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -478,8 +452,7 @@ dependencies = [
 [[package]]
 name = "aither-patch"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c25c1c314c6dfeb94c69a54f634a357ff829d6e05d3e03a409a082289e6c61e4"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -487,8 +460,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30388010c57da05f263a44e31f4d1c0db6e864be628a47032ebb91833c4a591a"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -505,8 +477,6 @@ dependencies = [
  "brush-parser",
  "dunce",
  "executor-core",
- "fd-lock",
- "flate2",
  "futures",
  "futures-lite",
  "globset",
@@ -515,42 +485,32 @@ dependencies = [
  "image",
  "jiff",
  "libc",
- "lzma-rust2 0.24.0",
  "magika",
  "ort",
- "percent-encoding",
  "polling",
  "regex",
- "rmp-serde",
  "rs-tree-sitter-languages",
  "rustix 1.1.6",
  "schemars",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "shell-words",
- "strsim",
- "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tree-sitter",
- "typed-path",
- "url",
+ "typed-path 0.12.3",
  "uuid",
  "vte",
  "windows-sys 0.61.2",
- "zenwave",
- "zip 9.0.5",
 ]
 
 [[package]]
 name = "aither-sed"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb6dd952ecbd94721ac0aa73311acc00645292bf03a7f5c1dfcfdda7e930f7da"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -558,8 +518,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ee2debe43acbf83ce83c338c90bf6dd5d2880c0e80508828e67fca559d80684"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -571,12 +530,12 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9bd10b5e22842391dccc216ae10b27b7762964bcb05c3c6daaa226c1c9f4338"
+source = "git+https://github.com/May-Agent/aither?branch=dev#398db2255f68080930a730b6ffc1ab8edb787775"
 dependencies = [
  "aither-core",
  "anyhow",
  "async-net",
+ "dom_query",
  "dom_smoothie",
  "htmd",
  "html-escape 0.3.0",
@@ -669,7 +628,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -680,7 +639,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -712,9 +671,6 @@ name = "arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
-dependencies = [
- "derive_arbitrary",
-]
 
 [[package]]
 name = "arboard"
@@ -1438,7 +1394,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3560a7b1951efe814fcd721938313adc56753ca39f4b23847d7e9a2402f5dbff"
 dependencies = [
  "arrayvec",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
 ]
 
 [[package]]
@@ -2104,6 +2060,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2385,7 +2350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.7",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2444,7 +2409,7 @@ dependencies = [
  "openssl-sys",
  "schannel",
  "socket2 0.6.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2460,7 +2425,7 @@ dependencies = [
  "openssl-sys",
  "pkg-config",
  "vcpkg",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2691,17 +2656,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.7",
-]
-
-[[package]]
 name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2774,7 +2728,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3092,7 +3046,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4036,9 +3990,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44aee3e64342927784c4d19609382aebd125baf3080b7ca6c00c1d081a6c0c40"
+checksum = "ddad4d8fba11b64ecaf2265fdf4b0330da314c92ac5c249d4ffe33afa3e9d0bf"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -5557,6 +5511,7 @@ version = "0.1.0"
 dependencies = [
  "acpsub",
  "ahash",
+ "aho-corasick",
  "aither-acp",
  "aither-agent",
  "aither-browser",
@@ -5604,6 +5559,7 @@ dependencies = [
  "fd-lock",
  "flate2",
  "fs_extra",
+ "futures",
  "futures-lite",
  "futures-util",
  "getrandom 0.4.3",
@@ -5627,6 +5583,7 @@ dependencies = [
  "keyring",
  "libc",
  "linkify",
+ "lzma-rust2 0.24.0",
  "may-tasks",
  "mediax-codec",
  "mime",
@@ -5642,6 +5599,7 @@ dependencies = [
  "open",
  "p256",
  "partial-json-fixer",
+ "percent-encoding",
  "petname",
  "pulldown-cmark",
  "ratatui",
@@ -5653,6 +5611,7 @@ dependencies = [
  "rustix 1.1.6",
  "rustls",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "serde_yml",
@@ -5661,11 +5620,13 @@ dependencies = [
  "shell-escape",
  "shell-words",
  "shlex",
+ "similar",
  "skyzen",
  "skyzen-core",
  "skyzen-services",
  "smol-hyper",
  "streamdown-parser",
+ "strsim",
  "subtle",
  "syntect",
  "tar",
@@ -5687,18 +5648,19 @@ dependencies = [
  "waterkit-screen",
  "web-push",
  "webrtc",
+ "whatlang",
  "which 8.0.6",
  "yuv",
  "zenwave",
- "zip 2.4.2",
+ "zip 9.5.0",
 ]
 
 [[package]]
 name = "may-tasks"
 version = "0.1.0"
 dependencies = [
- "aither-agent",
  "askama 0.16.1",
+ "serde",
  "tempfile",
 ]
 
@@ -6246,7 +6208,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7680,7 +7642,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7719,9 +7681,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8224,7 +8186,7 @@ dependencies = [
 [[package]]
 name = "repo-search-client"
 version = "0.0.8"
-source = "git+https://github.com/May-Agent/repo-search?branch=dev#522dd83e847c64de8491c39dbe7832ff60903632"
+source = "git+https://github.com/May-Agent/repo-search?branch=dev#a0bb9a37fdfe69ea3ff4f335a80bb6e0f5dd713a"
 dependencies = [
  "askama 0.16.1",
  "etcetera",
@@ -8514,7 +8476,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8573,7 +8535,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9374,7 +9336,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9631,7 +9593,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9984,10 +9946,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10009,7 +9971,7 @@ dependencies = [
  "parking_lot",
  "rustix 1.1.6",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10653,6 +10615,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10672,7 +10640,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset 0.9.1",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11598,7 +11566,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12481,23 +12449,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "crossbeam-utils",
- "displaydoc",
- "flate2",
- "indexmap",
- "memchr",
- "thiserror 2.0.21",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
 version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
@@ -12506,21 +12457,26 @@ dependencies = [
  "flate2",
  "indexmap",
  "memchr",
- "typed-path",
+ "typed-path 0.12.3",
 ]
 
 [[package]]
 name = "zip"
-version = "9.0.5"
+version = "9.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
+checksum = "0700e6c427aff64acdbf02e85fbfd946c2ee12319d1af013092f3a2178914ff8"
 dependencies = [
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap",
+ "libc",
  "memchr",
  "nix 0.31.3",
- "typed-path",
+ "typed-path 0.13.0",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -12534,18 +12490,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zopfli"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
-dependencies = [
- "bumpalo",
- "crc32fast",
- "log",
- "simd-adler32",
-]
 
 [[package]]
 name = "zruntime"

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
+use crate::harness::ask_user::{AnswerValue, QuestionAnswer};
 use aither_core::llm::{Tool, ToolContext};
 
 use super::{GlobalRulesArgs, GlobalRulesTool, RulesImport, SkillCopyReport, copy_skills};

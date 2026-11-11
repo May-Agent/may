@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aither_agent::context::LiveContent;
-use aither_agent::{AgentOptions, ExternalContent, InstructionSlot};
+use aither_agent::{ExternalContent, InstructionSlot};
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
@@ -47,12 +47,16 @@ pub mod tag {
     pub const WORK: InstructionSlot = InstructionSlot::new("work");
     pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
     pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
-    /// aither's built-in permissions slot, holding May's text.
-    pub const PERMISSIONS: InstructionSlot = InstructionSlot::PERMISSIONS;
+    pub const PERMISSIONS: InstructionSlot = InstructionSlot::new("permissions");
     pub const HARNESS: InstructionSlot = InstructionSlot::new("harness");
     pub const EVIDENCE: InstructionSlot = InstructionSlot::new("evidence");
-    /// aither's built-in knowledge-and-time slot, holding May's text.
-    pub const TIME: InstructionSlot = InstructionSlot::KNOWLEDGE_AND_TIME;
+    pub const TIME: InstructionSlot = InstructionSlot::new("knowledge_and_time");
+    /// The prepared tools of the home environment.
+    pub const PREPARED_TOOLS: InstructionSlot = InstructionSlot::new("prepared_tools");
+    /// The table of the commands a script can call.
+    pub const COMMANDS: InstructionSlot = InstructionSlot::new("commands");
+    /// The languages the session talks and works in.
+    pub const LANGUAGES: InstructionSlot = InstructionSlot::new("languages");
 
     pub const MEMORY: ExternalSlot = ExternalSlot::new("memory");
     pub const PROFILE_MEMORIES: ExternalSlot = ExternalSlot::new("profile_memories");
@@ -61,22 +65,23 @@ pub mod tag {
     pub const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
-    /// The instruction slots May writes, in prompt order. aither's
-    /// `prepared_tools`, `commands` and `languages` blocks sit between them
-    /// in [`layout`].
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 16] = [
+    /// The instruction slots May writes, in prompt order.
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
         IDENTITY,
         HARNESS,
         EVIDENCE,
         PROFILE_PERSONA,
         ENVIRONMENT,
         TERMINAL,
+        PREPARED_TOOLS,
         EFFICIENCY,
         CAPABILITIES,
+        COMMANDS,
         BROWSER,
         WORK,
         PERMISSIONS,
         TIME,
+        LANGUAGES,
         SESSION,
         REPO_CLONES,
         PLAN_MODE,
@@ -101,15 +106,15 @@ pub mod tag {
                 PROFILE_PERSONA,
                 ENVIRONMENT,
                 TERMINAL,
-                InstructionSlot::PREPARED_TOOLS,
+                PREPARED_TOOLS,
                 EFFICIENCY,
                 CAPABILITIES,
-                InstructionSlot::COMMANDS,
+                COMMANDS,
                 BROWSER,
                 WORK,
                 PERMISSIONS,
                 TIME,
-                InstructionSlot::LANGUAGES,
+                LANGUAGES,
                 SESSION,
                 REPO_CLONES,
                 PLAN_MODE,
@@ -190,6 +195,12 @@ impl RuntimeSystemContext {
         self
     }
 
+    /// Replaces the command table; the next [`reconcile`](Self::reconcile)
+    /// announces the change.
+    pub(crate) fn set_commands(&mut self, table: String) {
+        self.instructions.insert(tag::COMMANDS, table);
+    }
+
     pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
         self.profile_memories = memories;
         self
@@ -230,34 +241,13 @@ impl RuntimeSystemContext {
         ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str())
     }
 
-    /// Hands every block to the agent builder, so the first request carries
-    /// them before any reconcile.
-    pub(crate) fn install<B: AgentOptions>(&self, mut builder: B) -> B {
-        for (slot, text) in &self.instructions {
-            builder = builder.system_text(slot, text.clone());
-        }
-        if let Some(rules) = &self.agents.rules {
-            builder = builder.system_text(&tag::PROJECT_RULES, rules.clone());
-        }
-        builder = builder.external_content(&tag::MEMORY, self.memory_block());
-        for (slot, block) in [
-            (&tag::PROFILE_MEMORIES, &self.profile_memories),
-            (&tag::GLOBAL_AGENTS_MD, &self.agents.global),
-            (&tag::AGENTS_MD, &self.agents.root),
-            (&tag::HANDOFF_AGENTS_MD, &self.agents.handoff),
-            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
-        ] {
-            if let Some(block) = block {
-                builder = builder.external_content(slot, block.clone());
-            }
-        }
-        builder
-    }
-
+    /// Brings the blocks of `context` to this state. A context no request
+    /// has carried yet takes them as they are; a later one stages the
+    /// difference and announces it once.
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         let instructions = context.instructions_mut();
         for slot in &tag::MAY_INSTRUCTIONS {
-            if *slot == tag::PROJECT_RULES {
+            if *slot == tag::PROJECT_RULES || *slot == tag::COMMANDS {
                 continue;
             }
             match self.instructions.get(slot) {
@@ -267,6 +257,14 @@ impl RuntimeSystemContext {
                 }
             }
         }
+        // A command added or dropped mid-session is announced once as a
+        // diff; the prompt's table changes only on reassembly.
+        context.update_live(&COMMANDS_CONTENT, |update| {
+            update.instruction(
+                &tag::COMMANDS,
+                self.instructions.get(&tag::COMMANDS).cloned(),
+            );
+        });
         context.update_live(&MEMORY_CONTENT, |update| {
             update.external(&tag::MEMORY, Some(self.memory_block()));
         });
@@ -462,6 +460,10 @@ impl RuntimeSystemContext {
         }
     }
 }
+
+/// The table of the commands a script can call, announced when a command is
+/// added or removed mid-session.
+const COMMANDS_CONTENT: LiveContent = LiveContent::new("The command table", "commands_diff");
 
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
@@ -749,6 +751,77 @@ pub fn build_terminal(environment: &AgentEnvironment) -> String {
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render terminal: {error}"))
+}
+
+struct CommandRow {
+    name: String,
+    description: String,
+}
+
+impl CommandRow {
+    /// A row of the table: a name and its one-line description, without the
+    /// full stop that closes it.
+    fn new(name: &str, description: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.trim_end().trim_end_matches('.').to_string(),
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "commands.txt", escape = "none")]
+struct CommandTableTemplate {
+    commands: Vec<CommandRow>,
+}
+
+/// The table of the commands a script can call: the ones registered by name
+/// with their descriptions, then the tools of every command set as they are
+/// now, so a tool an MCP server added mid-session is announced.
+pub fn build_commands(
+    descriptions: &[(String, String)],
+    sets: &[crate::ipc::AnyCommandSet],
+) -> String {
+    let mut commands: Vec<CommandRow> = descriptions
+        .iter()
+        .map(|(name, description)| CommandRow::new(name, description))
+        .collect();
+    for definition in sets.iter().flat_map(crate::ipc::AnyCommandSet::definitions) {
+        if commands.iter().all(|row| row.name != definition.name()) {
+            commands.push(CommandRow::new(definition.name(), definition.description()));
+        }
+    }
+    CommandTableTemplate { commands }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render commands: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "languages.txt", escape = "none")]
+struct LanguagesTemplate<'a> {
+    communication: &'a str,
+    working: &'a str,
+}
+
+/// The languages section: set when the session has a communication language.
+pub fn build_languages(languages: &crate::harness::language::Languages) -> Option<String> {
+    let communication = languages.communication()?;
+    Some(
+        LanguagesTemplate {
+            communication: communication.name(),
+            working: languages.working().name(),
+        }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render languages: {error}")),
+    )
+}
+
+/// The prepared-tools section of the home environment's catalog.
+///
+/// # Errors
+/// Fails when the catalog does not render.
+pub fn build_prepared_tools(catalog: &crate::tools::ToolCatalog) -> Result<String, MayAgentError> {
+    Ok(catalog.render()?)
 }
 
 #[derive(Template)]

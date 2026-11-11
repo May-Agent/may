@@ -1,4 +1,4 @@
-use aither_agent::WorkTracker;
+use crate::harness::working_document::WorkTracker;
 
 use super::*;
 use crate::db::RepoCloneRow;
