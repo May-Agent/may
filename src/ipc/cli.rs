@@ -629,7 +629,7 @@ fn parse_long_option(
     name = normalized_name;
     let field_name = name.replace('-', "_");
     let Some(prop_schema) = schema.properties.get(&field_name) else {
-        return bail_unknown_long_option(&name, &schema.long_names);
+        return Err(unknown_long_option(&name, &schema.long_names));
     };
     let parsed_value =
         parse_long_option_value(root_schema, args, i, &name, value, negated, prop_schema)?;
@@ -672,12 +672,12 @@ fn parse_long_option_value(
     )
 }
 
-fn bail_unknown_long_option(name: &str, long_names: &[String]) -> anyhow::Result<()> {
+fn unknown_long_option(name: &str, long_names: &[String]) -> anyhow::Error {
     let suggestion = find_similar_option(name, long_names.iter().map(String::as_str));
-    if let Some(similar) = suggestion {
-        anyhow::bail!("unknown option: --{name}. Did you mean --{similar}?");
+    match suggestion {
+        Some(similar) => anyhow::anyhow!("unknown option: --{name}. Did you mean --{similar}?"),
+        None => anyhow::anyhow!("unknown option: --{name}"),
     }
-    anyhow::bail!("unknown option: --{name}");
 }
 
 fn parse_short_options(
