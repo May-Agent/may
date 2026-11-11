@@ -4518,6 +4518,169 @@ async fn exec_applies_local_command_priority() {
     }
 }
 
+/// The acceptance script of the managed baseline tools. It ends by printing
+/// the line [`BASELINE_ACCEPTANCE_PASSED`] and prints the managed `uv` and
+/// `python3` versions for the test to compare with the pins.
+const BASELINE_TOOLS_SCRIPT: &str = include_str!("fixtures/verify_baseline_tools.sh");
+const BASELINE_ACCEPTANCE_PASSED: &str = "baseline acceptance passed";
+
+/// The version the embedded distribution pins for `key` of `entries` on this
+/// host, the `uv` artifact or the managed Python.
+fn pinned_version(entries: &str, tool: Option<&str>) -> String {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../src/tools/tool-distribution-0.24.0.json"))
+            .expect("the embedded distribution is JSON");
+    let target = ToolTarget::native().expect("test host should have a tool target");
+    manifest[entries]
+        .as_array()
+        .expect("the distribution lists its entries")
+        .iter()
+        .find(|entry| {
+            entry["target"]["os"] == target.os()
+                && entry["target"]["arch"] == target.arch()
+                && tool.is_none_or(|tool| entry["tool"] == tool)
+        })
+        .and_then(|entry| entry["version"].as_str())
+        .unwrap_or_else(|| panic!("the distribution pins {entries} {tool:?} for this host"))
+        .to_owned()
+}
+
+/// Runs the baseline-tools acceptance script through the real sandboxed
+/// terminal of `may exec` against the real managed tools, which the harness
+/// downloads and prepares from the embedded distribution. Run by the
+/// `verify-tools` CI job on Linux and macOS, which restores the downloads
+/// from a cache keyed on the pins.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+#[serial]
+#[ignore = "downloads the pinned tools; run by the verify-tools CI job"]
+async fn the_baseline_tools_pass_their_acceptance_script_in_the_sandbox() {
+    let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
+    let session = harness.create_session().await;
+    let home = harness.home_path().to_path_buf();
+    let session_id = session.id.clone();
+    let binary = may_binary_path();
+    let output = blocking::unblock(move || {
+        std::process::Command::new(&binary)
+            .arg("exec")
+            .arg("--session")
+            .arg(&session_id)
+            .arg("--mode")
+            .arg("default")
+            .arg("--")
+            .arg(BASELINE_TOOLS_SCRIPT)
+            .env("HOME", &home)
+            .envs(hermetic_git_env(&home))
+            .output()
+    })
+    .await
+    .expect("may exec should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(BASELINE_ACCEPTANCE_PASSED),
+        "the acceptance script failed: stdout={stdout} stderr={stderr}"
+    );
+    if ToolTarget::native()
+        .expect("test host should have a tool target")
+        .provides_python()
+    {
+        let uv = pinned_version("artifacts", Some("uv"));
+        let python = pinned_version("python", None);
+        assert!(
+            stdout.contains(&format!("uv {uv} ")),
+            "uv {uv} missing: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("Python {python}")),
+            "Python {python} missing: {stdout}"
+        );
+    }
+}
+
+/// A command of a container session runs at the configured nice level, with
+/// the tools mount on its `PATH`, and reaches May's IPC commands through the
+/// relayed endpoint. The level is measured against the same session's
+/// unprioritised baseline, as in [`exec_applies_local_command_priority`].
+/// Needs Docker, which the Ubuntu runners of the `container-acceptance` CI
+/// job have.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial]
+#[ignore = "needs Docker; run by the container-acceptance CI job"]
+async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("unused".to_string())).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Container
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let binary = may_binary_path();
+
+    let mut observed = Vec::new();
+    for priority in [CommandPriority::Normal, CommandPriority::Low] {
+        let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
+            .await
+            .expect("harness config should load");
+        config.sandbox.command_priority = priority;
+        config
+            .save_to(&harness.may_dir.join("config.toml"))
+            .await
+            .expect("harness config should save");
+
+        let home = harness.home_path().to_path_buf();
+        let binary = binary.clone();
+        let session_id = session_id.clone();
+        let output = blocking::unblock(move || {
+            std::process::Command::new(&binary)
+                .arg("exec")
+                .arg("--session")
+                .arg(&session_id)
+                .arg("--mode")
+                .arg("default")
+                .arg("--")
+                .arg(
+                    "printf 'nice=%s\\n' \"$(nice)\"; jq --version; \
+                     session --help >/dev/null; printf 'ipc_exit=%s\\n' \"$?\"",
+                )
+                .env("HOME", &home)
+                .envs(hermetic_git_env(&home))
+                .output()
+        })
+        .await
+        .expect("may exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        println!("container script output at {priority:?}:\n{stdout}");
+        assert!(
+            output.status.success() && stdout.contains("ipc_exit=0"),
+            "the container command at {priority:?} failed: stdout={stdout} stderr={}; server logs:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            server.log.contents().await
+        );
+        assert!(
+            stdout.contains("jq "),
+            "a prepared tool should run from the tools mount: {stdout}"
+        );
+        let nice: i32 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("nice="))
+            .and_then(|nice| nice.trim().parse().ok())
+            .unwrap_or_else(|| panic!("the script should print its nice level: {stdout}"));
+        observed.push(nice);
+    }
+    // Low maps to nice +10, which the kernel clamps at 19.
+    assert_eq!(
+        observed[1],
+        (observed[0] + 10).min(19),
+        "the container command should run at the configured nice level: {observed:?}"
+    );
+
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
 /// A chat turn against a provider nobody listens on must end with the
 /// provider's error on the stream, and the server must survive it.
 #[tokio::test]
