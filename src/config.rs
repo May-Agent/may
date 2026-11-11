@@ -1369,6 +1369,9 @@ pub struct MayConfig {
     /// How long an agent's `tasks.md` may grow.
     #[serde(default)]
     pub tasks: TasksSettings,
+    /// When the repeated calls of a turn count as a loop.
+    #[serde(default)]
+    pub loop_detection: LoopDetectionSettings,
     /// The shell's time bounds and output budgets.
     #[serde(default)]
     pub shell: ShellSettings,
@@ -1860,6 +1863,46 @@ impl Default for TasksSettings {
     }
 }
 
+/// `[loop_detection]` section: when a turn's tool calls count as a loop.
+///
+/// Each value is a number of repetitions in a row: at the alert threshold the
+/// agent is told once, at the end threshold the turn ends and the user is told
+/// why. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LoopDetectionSettings {
+    /// Repetitions of one group of calls (same tools, same arguments) at
+    /// which the agent is alerted.
+    pub cycle_alert: usize,
+    /// Repetitions of one group of calls at which the turn ends.
+    pub cycle_end: usize,
+    /// Calls in a row failing with the same error at which the agent is
+    /// alerted.
+    pub failure_alert: usize,
+    /// Calls in a row failing with the same error at which the turn ends.
+    pub failure_end: usize,
+}
+
+impl Default for LoopDetectionSettings {
+    fn default() -> Self {
+        Self {
+            // Gemini CLI's loop detection service alerts at 5 identical
+            // calls in a row (`TOOL_CALL_LOOP_THRESHOLD`).
+            cycle_alert: 5,
+            // Twice the alert: after the alert the agent gets as many calls
+            // again as it took to raise it, while one that heeds the alert
+            // breaks the cycle with its next call.
+            cycle_end: 10,
+            // The cycle's value: a run of identical failures is at least as
+            // strong a sign of a loop as a run of identical calls, so it is
+            // raised no later.
+            failure_alert: 5,
+            // Twice the alert, as for the cycle.
+            failure_end: 10,
+        }
+    }
+}
+
 /// `[shell]` section: how long a script may run and how much of its output
 /// reaches the model. A change applies to running sessions at once.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1989,6 +2032,7 @@ impl Default for MayConfig {
             host_load: HostLoadSettings::default(),
             disk: DiskSettings::default(),
             tasks: TasksSettings::default(),
+            loop_detection: LoopDetectionSettings::default(),
             shell: ShellSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
