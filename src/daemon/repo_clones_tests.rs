@@ -5,6 +5,7 @@ use std::process::Command;
 
 use skyzen::{Request, StatusCode};
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -37,7 +38,7 @@ async fn the_endpoint_lists_the_registered_clones() {
             .await
             .expect("daemon state"),
     );
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let db = state.db();
     db.create_session("s1", Some("S"), Some("m"))
         .await

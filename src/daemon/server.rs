@@ -67,14 +67,18 @@ pub const DEFAULT_PORT: u16 = 8787;
 pub struct StartedDaemon {
     /// Shared server state.
     pub(crate) state: Arc<DaemonState>,
-    /// Router serving the API (and the web UI when embedded), unauthenticated
-    /// for the loopback listener.
-    pub(crate) router: Router,
+    /// Router serving the API (and the web UI when embedded) on the unix
+    /// socket, whose file mode is its access control.
+    pub(crate) socket_router: Router,
+    /// The same routes for loopback TCP binds, admitting only loopback
+    /// `Host` and `Origin` headers.
+    pub(crate) loopback_router: Router,
     /// The same routes behind the identity layer, for the remote listener
     /// `tailscale serve` targets.
     pub(crate) remote_router: Router,
-    /// The same routes behind an identity layer with no trusted source yet,
-    /// for direct non-loopback `[daemon] listen` binds: every request is 401.
+    /// The same routes behind an identity layer accepting the peer's
+    /// `WhoIs`-resolved login, for non-loopback TCP binds (`--host` and
+    /// `[daemon] listen`).
     pub(crate) direct_router: Router,
     /// The webhook routes alone, for the public listener Tailscale Funnel
     /// targets. It holds no other route.
@@ -381,25 +385,27 @@ pub async fn start(
     let remote_router = build_router(
         state.clone(),
         mode,
-        Some(vec![Box::new(
+        super::auth::RequireIdentity::new(vec![Box::new(
             state.remote_access_manager.tailscale_identity(),
         )]),
     );
     let direct_router = build_router(
         state.clone(),
         mode,
-        Some(vec![Box::new(
+        super::auth::RequireIdentity::new(vec![Box::new(
             state
                 .remote_access_manager
                 .tailscale_identity()
                 .whois_source(),
         )]),
     );
-    let router = build_router(state.clone(), mode, None);
+    let socket_router = build_router(state.clone(), mode, super::auth::SocketOwner);
+    let loopback_router = build_router(state.clone(), mode, super::auth::LoopbackOnly);
     let webhook_router = build_webhook_router(state.clone());
     Ok(StartedDaemon {
         state,
-        router,
+        socket_router,
+        loopback_router,
         remote_router,
         direct_router,
         webhook_router,
@@ -661,10 +667,13 @@ pub(super) fn build_webhook_router(state: Arc<DaemonState>) -> Router {
     Route::new((api,)).middleware(State(state)).build()
 }
 
+/// The daemon's routes behind `policy`, the listener's access policy (see
+/// [`super::auth`]). It is the outermost layer, so it decides before any
+/// route, 404 or the tunnel `Referer` fallback runs.
 pub(super) fn build_router(
     state: Arc<DaemonState>,
     mode: DaemonMode,
-    auth: Option<Vec<Box<dyn super::auth::IdentitySource>>>,
+    policy: impl skyzen::middleware::Middleware,
 ) -> Router {
     let api = "/api"
         .route(api_routes())
@@ -673,29 +682,26 @@ pub(super) fn build_router(
     let artifact_pages = "/profile".route(artifact_page_routes());
     let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());
 
-    // The remote listener keeps the same routes but requires an identity
-    // first; the local loopback listener trusts the machine's user.
+    // Layers run outermost-first in registration order.
     match mode {
-        DaemonMode::Rest => {
-            let mut routes = Route::new((api, tunnel, artifact_pages));
-            if let Some(sources) = auth {
-                routes = routes.middleware(super::auth::RequireIdentity::new(sources));
-            }
-            routes.middleware(State(state)).build().layer(fallback)
-        }
+        DaemonMode::Rest => Route::new((api, tunnel, artifact_pages))
+            .layer(policy)
+            .layer(fallback)
+            .middleware(State(state))
+            .build(),
         DaemonMode::Ui => {
             #[cfg(feature = "ui")]
             {
-                let mut routes = Route::new((
+                Route::new((
                     api,
                     tunnel,
                     artifact_pages,
                     EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
-                ));
-                if let Some(sources) = auth {
-                    routes = routes.middleware(super::auth::RequireIdentity::new(sources));
-                }
-                routes.middleware(State(state)).build().layer(fallback)
+                ))
+                .layer(policy)
+                .layer(fallback)
+                .middleware(State(state))
+                .build()
             }
             #[cfg(not(feature = "ui"))]
             {

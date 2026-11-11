@@ -7,6 +7,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use skyzen::StatusCode;
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -79,7 +80,7 @@ fn sample_rows() -> Vec<ChatMessage> {
 async fn a_transcript_returns_everything_without_a_limit() {
     let state = state().await;
     let row_ids = seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let page = page(&router, "").await;
     assert_eq!(
         ids_of(&page),
@@ -95,7 +96,7 @@ async fn a_transcript_returns_everything_without_a_limit() {
 async fn a_limit_alone_returns_the_newest_entries() {
     let state = state().await;
     let row_ids = seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let page = page(&router, "?limit=2").await;
     assert_eq!(
         ids_of(&page),
@@ -108,7 +109,7 @@ async fn a_limit_alone_returns_the_newest_entries() {
 async fn before_pages_back_and_paging_to_the_start_equals_the_full_list() {
     let state = state().await;
     let row_ids = seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let first = page(&router, "?limit=2").await;
     let second = page(&router, &format!("?limit=2&before={}", ids_of(&first)[0])).await;
@@ -135,7 +136,7 @@ async fn before_pages_back_and_paging_to_the_start_equals_the_full_list() {
 async fn rows_written_while_paging_neither_repeat_nor_disappear() {
     let state = state().await;
     let row_ids = seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let first = page(&router, "?limit=2").await;
     // A new turn lands between pages.
     let extra = seed_extra(&state).await;
@@ -172,7 +173,7 @@ async fn seed_extra(state: &DaemonState) -> Vec<i32> {
 async fn an_unknown_before_is_a_bad_request() {
     let state = state().await;
     seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let response = router
         .go(hyper::Request::builder()
             .method("GET")
@@ -219,7 +220,7 @@ async fn a_tool_call_folds_start_end_and_stopped_rows_into_one_entry() {
         ChatMessage::assistant("fin", at),
     ];
     seed(&state, &rows).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let page = page(&router, "").await;
     let entries = page["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 4);
@@ -254,7 +255,7 @@ async fn a_stored_terminal_call_carries_its_reading() {
         at,
     )];
     seed(&state, &rows).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let page = page(&router, "").await;
     let entries = page["entries"].as_array().expect("entries");
     let wanted = serde_json::to_value(&live).unwrap();
@@ -301,7 +302,7 @@ async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
 
     let state_a = state().await;
     seed(&state_a, &rows).await;
-    let router_a = build_router(state_a.clone(), DaemonMode::Rest, None);
+    let router_a = build_router(state_a.clone(), DaemonMode::Rest, SocketOwner);
     let full = page(&router_a, "").await;
     let user_entry = full["entries"]
         .as_array()
@@ -327,7 +328,7 @@ async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
         vec![row_ids[0], row_ids[1]],
         "the prompt and the hidden context before it are cut"
     );
-    let router_b = build_router(state_b.clone(), DaemonMode::Rest, None);
+    let router_b = build_router(state_b.clone(), DaemonMode::Rest, SocketOwner);
 
     // A non-user entryId is a 400.
     let bad = router_b
@@ -347,7 +348,7 @@ async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
 async fn the_session_read_no_longer_embeds_messages() {
     let state = state().await;
     seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let response = router
         .go(hyper::Request::builder()
             .method("GET")
@@ -368,7 +369,7 @@ async fn the_session_read_no_longer_embeds_messages() {
 async fn the_history_get_is_gone_and_rewind_index_is_rejected() {
     let state = state().await;
     seed(&state, &sample_rows()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let history = router
         .go(hyper::Request::builder()
             .method("GET")

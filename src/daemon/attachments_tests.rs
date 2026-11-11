@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use skyzen::StatusCode;
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -32,7 +33,7 @@ async fn session(state: &DaemonState, id: &str) {
 async fn an_uploaded_attachment_serves_its_bytes_with_their_content_type() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let bytes = b"\x89PNG\r\n\x1a\nbytes".to_vec();
     let upload = hyper::Request::builder()
@@ -86,7 +87,7 @@ async fn an_uploaded_attachment_serves_its_bytes_with_their_content_type() {
 async fn a_file_path_escaping_files_is_rejected() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     for path in ["../secrets", "..%2Fsecrets", "%2e%2e/secrets"] {
         if let Ok(response) = router
