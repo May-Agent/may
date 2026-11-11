@@ -432,6 +432,53 @@ impl ToolDistribution {
         target: &ToolTarget,
         cache_root: &Path,
     ) -> Result<HostProgramPath, ToolRuntimeError> {
+        let (pinned, executable_sha256) = self.pinned_host_program(program, target)?;
+        let bin = cache_root.join("bin");
+        if let Some(path) =
+            Self::cached_executable(&bin, program, target, executable_sha256).await?
+        {
+            return Ok(path);
+        }
+        let artifacts = cache_root.join("artifacts");
+        async_fs::create_dir_all(&artifacts).await?;
+        let bytes = load_artifact(&pinned.artifact, &artifacts, self.github_token.as_ref()).await?;
+        let target = target.clone();
+        blocking::unblock(move || {
+            if digest(&bytes) != executable_sha256 {
+                return Err(ToolRuntimeError::Integrity {
+                    tool: program.into(),
+                });
+            }
+            HostProgramPath::write(&bin, program, &target, &executable_sha256, &bytes)
+        })
+        .await
+    }
+
+    /// The executable [`Self::prepare_host_program`] would return, when it is
+    /// already prepared under `cache_root` with the pinned digest; nothing is
+    /// downloaded. `None` when it is absent, truncated or altered.
+    ///
+    /// # Errors
+    /// Fails like [`Self::prepare_host_program`] when the distribution has no
+    /// (or more than one) artifact for the program and target, and on I/O
+    /// failure.
+    pub async fn cached_host_program(
+        &self,
+        program: HostProgram,
+        target: &ToolTarget,
+        cache_root: &Path,
+    ) -> Result<Option<HostProgramPath>, ToolRuntimeError> {
+        let (_, executable_sha256) = self.pinned_host_program(program, target)?;
+        Self::cached_executable(&cache_root.join("bin"), program, target, executable_sha256).await
+    }
+
+    /// The single pin for `program` on `target` and its decoded executable
+    /// digest.
+    fn pinned_host_program(
+        &self,
+        program: HostProgram,
+        target: &ToolTarget,
+    ) -> Result<(&HostProgramArtifact, [u8; 32]), ToolRuntimeError> {
         let mut selected = self
             .host_programs
             .iter()
@@ -449,28 +496,18 @@ impl ToolDistribution {
         }
         let mut executable_sha256 = [0; 32];
         hex::decode_to_slice(&pinned.executable_sha256, &mut executable_sha256)?;
-        let bin = cache_root.join("bin");
-        let cached = {
-            let (bin, target) = (bin.clone(), target.clone());
-            blocking::unblock(move || {
-                HostProgramPath::cached(&bin, program, &target, &executable_sha256)
-            })
-            .await?
-        };
-        if let Some(path) = cached {
-            return Ok(path);
-        }
-        let artifacts = cache_root.join("artifacts");
-        async_fs::create_dir_all(&artifacts).await?;
-        let bytes = load_artifact(&pinned.artifact, &artifacts, self.github_token.as_ref()).await?;
-        let target = target.clone();
+        Ok((pinned, executable_sha256))
+    }
+
+    async fn cached_executable(
+        bin: &Path,
+        program: HostProgram,
+        target: &ToolTarget,
+        executable_sha256: [u8; 32],
+    ) -> Result<Option<HostProgramPath>, ToolRuntimeError> {
+        let (bin, target) = (bin.to_path_buf(), target.clone());
         blocking::unblock(move || {
-            if digest(&bytes) != executable_sha256 {
-                return Err(ToolRuntimeError::Integrity {
-                    tool: program.into(),
-                });
-            }
-            HostProgramPath::write(&bin, program, &target, &executable_sha256, &bytes)
+            HostProgramPath::cached(&bin, program, &target, &executable_sha256)
         })
         .await
     }
@@ -1488,11 +1525,17 @@ pub mod tests {
 
     impl HostFixture {
         async fn new() -> Self {
+            Self::for_program(HostProgram::RepoSearch, "repo-search/search").await
+        }
+
+        /// A distribution whose only host program is `program`, shipped as a
+        /// tar.xz archive holding its executable at `member`.
+        async fn for_program(program: HostProgram, member: &'static str) -> Self {
             let directory = unlocking_tempdir();
             let target = ToolTarget::native().unwrap();
             let executable: &'static [u8] = b"host program fixture";
-            let archive = directory.path().join("search.tar.xz");
-            let encoded = tar_xz("repo-search/search", executable);
+            let archive = directory.path().join("host-program.tar.xz");
+            let encoded = tar_xz(member, executable);
             async_fs::write(&archive, &encoded).await.unwrap();
             let fixture_tools =
                 script_distribution(&target, "1.0.0", directory.path(), file_artifact);
@@ -1501,14 +1544,14 @@ pub mod tests {
                 python: fixture_tools.python,
                 host_programs: vec![HostProgramArtifact {
                     artifact: PinnedArtifact {
-                        tool: HostProgram::RepoSearch,
+                        tool: program,
                         version: "0.0.3".into(),
                         target,
                         url: ToolArtifactLocation::Download(Url::from_file_path(&archive).unwrap()),
                         sha256: hex::encode(digest(&encoded)),
                         size: encoded.len() as u64,
                         encoding: ToolArtifactFormat::TarXz {
-                            executable: "repo-search/search".into(),
+                            executable: member.into(),
                         },
                     },
                     executable_sha256: hex::encode(digest(executable)),
@@ -1678,6 +1721,125 @@ pub mod tests {
             .unwrap();
         assert_eq!(repaired, prepared);
         assert_eq!(std::fs::read(repaired.path()).unwrap(), fixture.executable);
+    }
+
+    async fn podman_fixture() -> HostFixture {
+        HostFixture::for_program(HostProgram::Podman, "podman-6.2.0/usr/bin/podman").await
+    }
+
+    #[tokio::test]
+    async fn podman_with_a_wrong_pinned_digest_is_not_installed() {
+        let mut fixture = podman_fixture().await;
+        let pin = hex::encode(digest(b"another executable"));
+        fixture.distribution.host_programs[0].executable_sha256 = pin.clone();
+        let cache = fixture.directory.path().join("cache");
+        let target = ToolTarget::native().unwrap();
+        assert!(matches!(
+            fixture
+                .distribution
+                .prepare_host_program(HostProgram::Podman, &target, &cache)
+                .await,
+            Err(ToolRuntimeError::Integrity {
+                tool: DistributedTool::Host(HostProgram::Podman)
+            })
+        ));
+        assert!(!cache.join("bin").join(pin).exists());
+    }
+
+    #[tokio::test]
+    async fn podman_cached_lookup_never_downloads_and_rejects_altered_bytes() {
+        let fixture = podman_fixture().await;
+        let target = ToolTarget::native().unwrap();
+        let cache = fixture.directory.path().join("cache");
+        assert!(
+            fixture
+                .distribution
+                .cached_host_program(HostProgram::Podman, &target, &cache)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let prepared = fixture
+            .distribution
+            .prepare_host_program(HostProgram::Podman, &target, &cache)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .distribution
+                .cached_host_program(HostProgram::Podman, &target, &cache)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut permissions = std::fs::metadata(prepared.path()).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(prepared.path(), permissions).unwrap();
+        std::fs::write(prepared.path(), b"altered").unwrap();
+        assert!(
+            fixture
+                .distribution
+                .cached_host_program(HostProgram::Podman, &target, &cache)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// An install cut off after writing part of the binary leaves a short
+    /// file at the final path; the next preparation replaces it.
+    #[tokio::test]
+    async fn podman_truncated_by_an_interrupted_install_is_replaced() {
+        let fixture = podman_fixture().await;
+        let target = ToolTarget::native().unwrap();
+        let cache = fixture.directory.path().join("cache");
+        let prepared = fixture
+            .distribution
+            .prepare_host_program(HostProgram::Podman, &target, &cache)
+            .await
+            .unwrap();
+        let mut permissions = std::fs::metadata(prepared.path()).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(prepared.path(), permissions).unwrap();
+        let whole = std::fs::read(prepared.path()).unwrap();
+        std::fs::write(prepared.path(), &whole[..whole.len() / 2]).unwrap();
+        let repaired = fixture
+            .distribution
+            .prepare_host_program(HostProgram::Podman, &target, &cache)
+            .await
+            .unwrap();
+        assert_eq!(repaired, prepared);
+        assert_eq!(std::fs::read(repaired.path()).unwrap(), fixture.executable);
+    }
+
+    /// A download cut off mid-transfer is a short archive: it is rejected
+    /// before anything is staged or installed.
+    #[tokio::test]
+    async fn podman_truncated_download_is_rejected_and_installs_nothing() {
+        let fixture = podman_fixture().await;
+        let target = ToolTarget::native().unwrap();
+        let cache = fixture.directory.path().join("cache");
+        let archive = async_fs::read(&fixture.archive).await.unwrap();
+        async_fs::write(&fixture.archive, &archive[..archive.len() / 2])
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .distribution
+                .prepare_host_program(HostProgram::Podman, &target, &cache)
+                .await,
+            Err(ToolRuntimeError::ArtifactSize { .. })
+        ));
+        assert!(
+            fixture
+                .distribution
+                .cached_host_program(HostProgram::Podman, &target, &cache)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

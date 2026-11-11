@@ -117,3 +117,102 @@ async fn a_file_path_escaping_files_is_rejected() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+async fn get(router: &skyzen::routing::Router, uri: &str) -> skyzen::Response {
+    router
+        .go(hyper::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(skyzen::Body::empty())
+            .expect("request"))
+        .await
+        .expect("response")
+}
+
+fn header<'a>(response: &'a skyzen::Response, name: &str) -> Option<&'a str> {
+    response.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+async fn write_session_file(state: &DaemonState, dir: &str, name: &str, bytes: &[u8]) {
+    let paths = super::helpers::load_session_paths(state, SESSION)
+        .await
+        .expect("paths");
+    let dir = match dir {
+        "files" => paths.files_dir(),
+        _ => paths.artifacts_dir(),
+    };
+    async_fs::create_dir_all(&dir).await.expect("mkdir");
+    async_fs::write(dir.join(name), bytes).await.expect("write");
+}
+
+const NO_SCRIPT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+#[tokio::test]
+async fn session_html_and_svg_files_are_served_inert() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    write_session_file(&state, "files", "page.html", b"<script>alert(1)</script>").await;
+    write_session_file(
+        &state,
+        "files",
+        "pic.svg",
+        b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+    )
+    .await;
+
+    for (name, content_type) in [
+        ("page.html", "text/html; charset=utf-8"),
+        ("pic.svg", "image/svg+xml; charset=utf-8"),
+    ] {
+        let response = get(&router, &format!("/api/sessions/{SESSION}/files/{name}")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        assert_eq!(header(&response, "content-type"), Some(content_type));
+        assert_eq!(header(&response, "x-content-type-options"), Some("nosniff"));
+        assert_eq!(
+            header(&response, "content-security-policy"),
+            Some(NO_SCRIPT_POLICY),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_session_image_keeps_its_type_and_gets_nosniff_only() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    write_session_file(&state, "files", "shot.png", b"\x89PNG\r\n\x1a\n").await;
+
+    let response = get(&router, &format!("/api/sessions/{SESSION}/files/shot.png")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), Some("image/png"));
+    assert_eq!(header(&response, "x-content-type-options"), Some("nosniff"));
+    assert_eq!(header(&response, "content-security-policy"), None);
+}
+
+#[tokio::test]
+async fn an_artifact_download_is_an_attachment_with_nosniff_and_a_sandbox() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    write_session_file(&state, "artifacts", "page.html", b"<script>1</script>").await;
+
+    let response = get(
+        &router,
+        &format!("/profile/-/session/{SESSION}/artifacts/page.html?download"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        header(&response, "content-disposition")
+            .is_some_and(|value| value.starts_with("attachment; filename=\"page.html\"")),
+        "{:?}",
+        response.headers()
+    );
+    assert_eq!(header(&response, "x-content-type-options"), Some("nosniff"));
+    assert_eq!(
+        header(&response, "content-security-policy"),
+        Some("sandbox allow-scripts")
+    );
+}

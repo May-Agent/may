@@ -42,7 +42,7 @@ pub struct Step {
 }
 
 /// How a command follows the previous one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Link {
     /// The first command.

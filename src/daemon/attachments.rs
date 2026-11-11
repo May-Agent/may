@@ -19,6 +19,7 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 use crate::agent::generate_session_title;
 use crate::session::AttachmentKind;
 
+use super::artifacts::{content_type_for_path, session_file_response};
 use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::{load_session_paths, parse_safe_relative_path};
 use super::state::DaemonState;
@@ -914,19 +915,11 @@ pub(super) async fn get_session_file(
         ));
     }
     let bytes = async_fs::read(&canonical).await.map_err(internal_error)?;
-    let mime = mime_guess::from_path(&canonical).first_or_octet_stream();
-    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
-    response.headers_mut().insert(
-        skyzen::header::CONTENT_TYPE,
-        mime.as_ref().parse().map_err(internal_error)?,
-    );
-    response.headers_mut().insert(
-        skyzen::header::CACHE_CONTROL,
-        "public, max-age=31536000, immutable"
-            .parse()
-            .map_err(internal_error)?,
-    );
-    Ok(response)
+    Ok(session_file_response(
+        bytes,
+        &content_type_for_path(&canonical),
+        "public, max-age=31536000, immutable",
+    ))
 }
 
 /// The daemon-relative URL a stored session file is served at.

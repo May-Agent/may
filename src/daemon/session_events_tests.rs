@@ -316,6 +316,25 @@ async fn the_same_runtime_value_publishes_once_to_every_subscriber() {
     }
 }
 
+/// The agent taking the completion of job `pid`, which ended in
+/// `terminal`'s shell: the end the shell raises for it is received and its
+/// completion taken, returning once the registry recorded the take.
+async fn take_completion(terminal: &crate::repo_clone::test_sandbox::TestTerminal, pid: u32) {
+    let events = terminal.shell().jobs().events();
+    loop {
+        let event = events
+            .recv_timeout(Duration::from_secs(10))
+            .await
+            .expect("the job's end within 10s");
+        if let aither_sandbox::ShellEvent::JobEnded(ended) = event {
+            let (info, _, _, pending) = ended.into_parts();
+            assert_eq!(info.pid, pid, "the end of the killed job");
+            pending.expect("no waiter took the completion").take().await;
+            return;
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_job_added_then_removed_upserts_then_removes() {
     let state = state().await;
@@ -344,7 +363,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     // The finished shell falls out of the snapshot once its completion
     // is taken and it is no longer the newest: the job leaves as a removal.
     assert!(job.kill().await, "the job was running");
-    job.wait().await.expect("the completion is taken");
+    take_completion(&terminal, pid).await;
     let next = crate::repo_clone::test_sandbox::TestTerminal::new(&dir.path().join("next")).await;
     state
         .session_background

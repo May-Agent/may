@@ -188,7 +188,7 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
     assert!(!policy.refused.take(&call), "and answered once");
     assert!(
         refused.text().contains(&format!(
-            "`{}`, unchanged since the last read",
+            "repeats your last read of `{}`, unchanged since",
             log.display()
         )),
         "{}",
@@ -226,6 +226,106 @@ async fn a_follow_or_a_missing_file_is_no_reread() {
             state.inner().pending.is_empty(),
             "`{script}` tracks no read"
         );
+    }
+}
+
+/// Puts `script`, started in `dir`, to the unchanged-read policy and, when it
+/// passes, ends it with exit code 0, as a read that succeeded.
+async fn read_in(
+    policy: &UnchangedFileReads,
+    state: &FileReads,
+    dir: &Path,
+    script: &str,
+) -> ScriptDecision {
+    let shell = ShellScript::parse(script);
+    let start = ScriptDir::Host(dir.to_path_buf());
+    let check = check_with(
+        script,
+        script,
+        Some(shell.as_ref()),
+        ScriptOrigin::Foreground,
+        &start,
+    );
+    let decision = policy.check(&check, state).await;
+    policy.ended(&ended(script, 0, &start), state).await;
+    decision
+}
+
+#[tokio::test]
+async fn a_script_that_does_more_than_repeat_a_read_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("out.json"), "{}").expect("write");
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").expect("write");
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write");
+    std::fs::create_dir(dir.path().join("tasks")).expect("mkdir");
+    std::fs::write(dir.path().join("tasks/Cargo.toml"), "[package]\n").expect("write");
+    let policy = unchanged_reads();
+    for (before, after) in [
+        // The script rewrites the file it reads.
+        ("cat out.json", "./gen.sh && cat out.json"),
+        // Another part of the same file.
+        ("head -n 50 a.rs", "head -n 200 a.rs"),
+        ("cat a.rs | rg x", "cat a.rs | rg y"),
+        ("cat a.rs", "cat -n a.rs"),
+        // A file never read: `tasks/Cargo.toml`.
+        ("cat Cargo.toml", "cd tasks && cat Cargo.toml"),
+        // Output written or run rather than shown.
+        ("cat a.rs", "cat a.rs > copy.rs"),
+        ("cat a.rs", "cat a.rs | sh"),
+        ("cat a.rs", "sudo cat a.rs"),
+    ] {
+        // Each pair starts with nothing read.
+        let state = FileReads::default();
+        assert_eq!(
+            read_in(&policy, &state, dir.path(), before).await,
+            ScriptDecision::Pass,
+            "`{before}` is a first read"
+        );
+        assert_eq!(
+            read_in(&policy, &state, dir.path(), after).await,
+            ScriptDecision::Pass,
+            "`{after}` after `{before}` runs"
+        );
+    }
+    // A script that does more than read is never a repeated read.
+    let state = FileReads::default();
+    for script in [
+        "./gen.sh && cat out.json",
+        "cd tasks && cat Cargo.toml",
+        "cat a.rs > copy.rs",
+        "cat a.rs | sh",
+        "sudo cat a.rs",
+    ] {
+        assert_eq!(
+            read_in(&policy, &state, dir.path(), script).await,
+            ScriptDecision::Pass,
+            "`{script}` runs again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeating_the_same_read_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("out.json"), "{}").expect("write");
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").expect("write");
+    let state = FileReads::default();
+    let policy = unchanged_reads();
+    for script in [
+        "cat out.json",
+        "head -n 50 a.rs",
+        "cat a.rs | rg x",
+        "sed -n '1,5p' a.rs",
+        "cat out.json a.rs 2>&1",
+    ] {
+        assert_eq!(
+            read_in(&policy, &state, dir.path(), script).await,
+            ScriptDecision::Pass,
+            "`{script}` reads"
+        );
+        let decision = read_in(&policy, &state, dir.path(), script).await;
+        let text = refusal(&decision).unwrap_or_else(|| panic!("`{script}` again is refused"));
+        assert!(text.contains("repeats your last read of"), "{text}");
     }
 }
 
@@ -381,30 +481,113 @@ fn patch_script(body: &str) -> String {
     format!("apply_patch <<'PATCH'\n*** Begin Patch\n{body}\n*** End Patch\nPATCH")
 }
 
+/// The whitespace policy's decision on a patch of `body`, run in a directory
+/// holding `files`.
+async fn patch_in(syntaxes: &Syntaxes, files: &[(&str, &str)], body: &str) -> ScriptDecision {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (path, text) in files {
+        std::fs::write(dir.path().join(path), text).expect("write");
+    }
+    let script = patch_script(body);
+    let shell = ShellScript::parse(&script);
+    let start = ScriptDir::Host(dir.path().to_path_buf());
+    let check = check_with(
+        "task-a",
+        &script,
+        Some(shell.as_ref()),
+        ScriptOrigin::Foreground,
+        &start,
+    );
+    WhitespacePatch.check(&check, syntaxes).await
+}
+
+/// The whitespace policy's decision on `hunks` of `file`, whose text is
+/// `text`.
+async fn hunks_in(syntaxes: &Syntaxes, file: &str, text: &str, hunks: &str) -> ScriptDecision {
+    patch_in(
+        syntaxes,
+        &[(file, text)],
+        &format!("*** Update File: {file}\n{hunks}"),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn a_whitespace_only_hunk_is_refused() {
-    for body in [
-        "*** Update File: a.rs\n@@\n-fn  main() {}\n+fn main() {}",
-        "*** Update File: a.rs\n@@\n ctx\n-    let x = 1;\n+        let x = 1;",
-        "*** Update File: a.rs\n@@\n-let x = f(a, b);\n+let x = f(\n+    a,\n+    b\n+);",
-        "*** Update File: a.rs\n@@\n-fn a() {}\n+fn a() {}\n*** Update File: b.rs\n@@\n-x\n+y",
-        "*** Update File: a.rs\n@@\n-x\n+y\n@@\n-  z\n+z",
+    let syntaxes = Syntaxes::default();
+    for (file, text, hunks) in [
+        (
+            "a.rs",
+            "fn  main() {}\n",
+            "@@\n-fn  main() {}\n+fn main() {}",
+        ),
+        (
+            "a.rs",
+            "ctx\n    let x = 1;\n",
+            "@@\n ctx\n-    let x = 1;\n+        let x = 1;",
+        ),
+        (
+            "a.rs",
+            "let x = f(a, b);\n",
+            "@@\n-let x = f(a, b);\n+let x = f(\n+    a,\n+    b\n+);",
+        ),
+        ("a.rs", "x\nmid\n  z\n", "@@\n-x\n+y\n@@\n-  z\n+z"),
+        (
+            "a.rs",
+            "let s = \"a b\";  // a  comment\n",
+            "@@\n-let s = \"a b\";  // a  comment\n+let s = \"a b\"; // a comment",
+        ),
+        (
+            "a.rs",
+            "return a\n    + b;\n",
+            "@@\n-return a\n-    + b;\n+return a + b;",
+        ),
+        (
+            "a.rs",
+            "let x = y as\n    u32;\n",
+            "@@\n-let x = y as\n-    u32;\n+let x = y as u32;",
+        ),
+        ("a.py", "x  = f(a,b)\n", "@@\n-x  = f(a,b)\n+x = f(a, b)"),
+        (
+            "a.py",
+            "def f():\n    return  1\n",
+            "@@\n def f():\n-    return  1\n+    return 1",
+        ),
+        (
+            "main.go",
+            "func  main() {}\n",
+            "@@\n-func  main() {}\n+func main() {}",
+        ),
+        ("a.json", "{\"a\":1}\n", "@@\n-{\"a\":1}\n+{ \"a\": 1 }"),
+        // Code below a multi-line string that closed above the hunk.
+        (
+            "a.rs",
+            "let s = r#\"\nfirst\n\"#;\na b\n",
+            "@@\n-a b\n+a  b",
+        ),
+        ("a.js", "const s = `\nfirst\n`;\na b\n", "@@\n-a b\n+a  b"),
     ] {
-        let decision = decide(
-            &WhitespacePatch,
-            &(),
-            &patch_script(body),
-            ScriptOrigin::Foreground,
-        )
-        .await;
-        let text = refusal(&decision).unwrap_or_else(|| panic!("`{body}` is refused"));
-        assert!(text.contains("Do not format by hand"), "{text}");
-        assert!(text.contains(".rs"), "{text}");
+        let decision = hunks_in(&syntaxes, file, text, hunks).await;
+        let refused =
+            refusal(&decision).unwrap_or_else(|| panic!("`{hunks}` of {file} is refused"));
+        assert!(refused.contains("Do not format by hand"), "{refused}");
+        assert!(refused.contains(&format!("`{file}`")), "{refused}");
     }
+    let decision = patch_in(
+        &syntaxes,
+        &[("a.rs", "fn a() {}\n"), ("b.rs", "x\n")],
+        "*** Update File: a.rs\n@@\n-fn a() {}\n+fn a() {}\n*** Update File: b.rs\n@@\n-x\n+y",
+    )
+    .await;
+    assert!(
+        refusal(&decision).is_some_and(|text| text.contains("`a.rs`")),
+        "a patch with one whitespace-only hunk is refused: {decision:?}"
+    );
 }
 
 #[tokio::test]
 async fn a_patch_that_changes_more_than_whitespace_runs() {
+    let syntaxes = Syntaxes::default();
     for body in [
         "*** Update File: a.rs\n@@\n-let x = 1;\n+let x = 2;",
         "*** Add File: a.rs\n+  x\n+y",
@@ -412,15 +595,80 @@ async fn a_patch_that_changes_more_than_whitespace_runs() {
         "*** Update File: a.rs\n@@\n+  inserted",
     ] {
         assert_eq!(
-            decide(
-                &WhitespacePatch,
-                &(),
-                &patch_script(body),
-                ScriptOrigin::Foreground
-            )
-            .await,
+            patch_in(&syntaxes, &[("a.rs", "x\n"), ("b.rs", "y\n")], body).await,
             ScriptDecision::Pass,
             "`{body}` runs"
         );
     }
+}
+
+#[tokio::test]
+async fn whitespace_that_carries_meaning_is_not_formatting() {
+    let syntaxes = Syntaxes::default();
+    for (file, text, hunks) in [
+        // Re-indenting Python under a new `if`.
+        (
+            "a.py",
+            "def f():\n    x = 1\n",
+            "@@\n def f():\n+    if c:\n@@\n-    x = 1\n+        x = 1",
+        ),
+        (
+            "a.py",
+            "for x in xs:\n    a(x)\n    b(x)\n",
+            "@@\n for x in xs:\n     a(x)\n-    b(x)\n+b(x)",
+        ),
+        // Re-nesting YAML.
+        ("ci.yml", "jobs:\ntest:\n", "@@\n jobs:\n-test:\n+  test:"),
+        (
+            "Makefile",
+            "all:\n  cargo build\n",
+            "@@\n all:\n-  cargo build\n+\tcargo build",
+        ),
+        // Whitespace inside a string literal.
+        (
+            "a.rs",
+            "let s = \"a b\";\n",
+            "@@\n-let s = \"a b\";\n+let s = \"a  b\";",
+        ),
+        ("a.py", "x = 'a b'\n", "@@\n-x = 'a b'\n+x = 'a  b'"),
+        (
+            "a.js",
+            "const s = `a\nb`;\n",
+            "@@\n-const s = `a\n-b`;\n+const s = `a\n+  b`;",
+        ),
+        // Inside a multi-line string that opens above the hunk.
+        (
+            "a.rs",
+            "let s = r#\"\nfirst\na b\n\"#;\n",
+            "@@\n-a b\n+a  b",
+        ),
+        ("a.js", "const s = `\nfirst\na b\n`;\n", "@@\n-a b\n+a  b"),
+        ("main.go", "var s = `\nfirst\na b\n`\n", "@@\n-a b\n+a  b"),
+        // Words joined into one.
+        ("a.rs", "return x;\n", "@@\n-return x;\n+returnx;"),
+        // A language May cannot lex.
+        ("a.ts", "let  x = 1;\n", "@@\n-let  x = 1;\n+let x = 1;"),
+        // A hunk that does not place fails on its own.
+        (
+            "a.rs",
+            "fn other() {}\n",
+            "@@\n-fn  main() {}\n+fn main() {}",
+        ),
+    ] {
+        assert_eq!(
+            hunks_in(&syntaxes, file, text, hunks).await,
+            ScriptDecision::Pass,
+            "`{hunks}` of {file} runs"
+        );
+    }
+    assert_eq!(
+        patch_in(
+            &syntaxes,
+            &[],
+            "*** Update File: a.rs\n@@\n-fn  main() {}\n+fn main() {}"
+        )
+        .await,
+        ScriptDecision::Pass,
+        "a file that cannot be read is not judged"
+    );
 }
