@@ -151,7 +151,7 @@ const NO_SCRIPT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; s
 async fn session_html_and_svg_files_are_served_inert() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     write_session_file(&state, "files", "page.html", b"<script>alert(1)</script>").await;
     write_session_file(
         &state,
@@ -181,7 +181,7 @@ async fn session_html_and_svg_files_are_served_inert() {
 async fn a_session_image_keeps_its_type_and_gets_nosniff_only() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     write_session_file(&state, "files", "shot.png", b"\x89PNG\r\n\x1a\n").await;
 
     let response = get(&router, &format!("/api/sessions/{SESSION}/files/shot.png")).await;
@@ -195,7 +195,7 @@ async fn a_session_image_keeps_its_type_and_gets_nosniff_only() {
 async fn an_artifact_download_is_an_attachment_with_nosniff_and_a_sandbox() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     write_session_file(&state, "artifacts", "page.html", b"<script>1</script>").await;
 
     let response = get(
