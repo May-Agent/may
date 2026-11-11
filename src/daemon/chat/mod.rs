@@ -5602,14 +5602,28 @@ mod tests {
     /// the retried request still carries it once.
     #[tokio::test]
     async fn a_resume_turn_retries_with_the_agent_it_took() {
+        // The turn's wait, and the resume's. A command's `timeout` runs from
+        // its start, so it spans both.
         const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
         const MARK: &str = "WAKE-MARK-42";
         crate::test_support::install_global_executor();
+        let may_dir = tempfile::tempdir().expect("may dir");
+        // The session's `files/` is what the sandboxed command can read.
+        let session_files = may_dir.path().join("sessions/session/files");
+        std::fs::create_dir_all(&session_files).expect("session files");
+        // The command finishes only once the gate opens after the release:
+        // one that finished during the turn would reach the turn's own next
+        // request and leave the idle agent nothing to resume for.
+        let gate = session_files.join("go");
         let arguments = serde_json::json!({
-            "script": "echo WAKE-MARK-$((40 + 2))",
+            "script": format!(
+                "while [ ! -e {} ]; do sleep 0.05; done; echo WAKE-MARK-$((40 + 2))",
+                gate.display()
+            ),
             "description": "finishes in the background",
             "background": true,
-            "timeout": TURN_WAIT.as_secs()
+            "timeout": (TURN_WAIT + RESUME_WAIT).as_secs()
         })
         .to_string();
         let mut script = vec![
@@ -5620,9 +5634,6 @@ mod tests {
         script.push(sse_text("resumed"));
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
-        let may_dir = tempfile::tempdir().expect("may dir");
-        std::fs::create_dir_all(may_dir.path().join("sessions/session/files"))
-            .expect("session files");
         let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
@@ -5663,6 +5674,7 @@ mod tests {
             .finish_idle(crate::session::RunOutcome::Completed)
             .await
             .expect("release the run");
+        std::fs::write(&gate, "").expect("open the gate");
         let body = last_body(&provider_a, 2 + OPENAI_CLIENT_ATTEMPTS + 1).await;
         assert_eq!(
             body.matches(MARK).count(),
