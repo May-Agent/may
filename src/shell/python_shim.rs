@@ -124,27 +124,10 @@ mod tests {
         root
     }
 
-    /// A fake `uv`: `venv ... <directory>` builds an environment whose
-    /// interpreters print `session`, anything else prints the `VIRTUAL_ENV` it
-    /// runs with and its arguments. `venv` is slow enough for racing
-    /// commands to overlap.
+    /// Installs the fake `uv` of `tests/fixtures/fake_uv.sh` at `path`.
     fn fake_uv(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
-        let script = r#"#!/bin/sh
-if [ "$1" = venv ]; then
-    for directory; do :; done
-    sleep 0.2
-    mkdir -p "$directory/bin"
-    for python in python python3; do
-        printf '#!/bin/sh\necho session "$@"\n' > "$directory/bin/$python"
-        chmod 755 "$directory/bin/$python"
-    done
-    echo created >> "$HOME/venv-runs"
-    exit 0
-fi
-echo "uv venv=${VIRTUAL_ENV:-unset} $*"
-"#;
-        std::fs::write(path, script).unwrap();
+        std::fs::write(path, include_str!("../../tests/fixtures/fake_uv.sh")).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -286,6 +269,10 @@ echo "uv venv=${VIRTUAL_ENV:-unset} $*"
         let root = fixture();
         let cwd = plain_directory(root.path());
         let outputs = std::thread::scope(|scope| {
+            #[expect(
+                clippy::needless_collect,
+                reason = "every command must start before the first join, or they never race"
+            )]
             let handles = (0..8)
                 .map(|index| {
                     let (root, cwd) = (root.path(), &cwd);
