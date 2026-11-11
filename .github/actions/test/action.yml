@@ -43,14 +43,13 @@ runs:
     - name: cargo build
       shell: bash
       run: cargo build --locked --all-targets --timings
-    # The dev push keeps its debug may for testing without a local build. It is
-    # packed as a tarball because artifacts drop the executable bit.
+    # Every run keeps the debug may it built, so a commit can be tested on
+    # another machine without building it there. It is packed as a tarball
+    # because artifacts drop the executable bit.
     - name: Pack the debug may
-      if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
       shell: bash
       run: tar -czf may-debug.tar.gz -C target/debug may
     - name: Upload the debug may
-      if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
       uses: actions/upload-artifact@v4
       with:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
