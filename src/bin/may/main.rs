@@ -1297,7 +1297,7 @@ where
                             )
                             .await;
                     }
-                    TuiEvent::Declined(message) => {
+                    TuiEvent::Declined(message) | TuiEvent::LoopStopped(message) => {
                         app.chat.push_notice(&message);
                         runtime_deps
                             .finish_agent_task(

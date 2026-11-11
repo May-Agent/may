@@ -579,6 +579,21 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     .await;
                 return Ok(());
             }
+            // A run whose agent looped did not do what it was asked: the
+            // caller of a one-shot run learns that from its exit status.
+            Event::Agent(TuiEvent::LoopStopped(message)) => {
+                writeln!(output.stderr()?, "[stopped] {message}")?;
+                runtime_deps
+                    .finish_agent_task(
+                        &mut app,
+                        &mut None,
+                        &mut pending_title_gen,
+                        &assistant_response,
+                        RunOutcome::Cancelled,
+                    )
+                    .await;
+                anyhow::bail!(message);
+            }
             Event::Agent(TuiEvent::Error(error)) => {
                 writeln!(output.stderr()?, "[error] {error}")?;
                 runtime_deps
