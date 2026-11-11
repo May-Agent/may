@@ -452,7 +452,7 @@ async fn a_page_of_a_long_session_loads_only_its_own_rows() {
 async fn a_page_over_a_long_session_serves_its_entries_through_the_endpoint() {
     let state = state().await;
     let row_ids = seed(&state, &long_session()).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let page = page(&router, &format!("?limit=4&before={}", row_ids[100])).await;
     assert_eq!(
         ids_of(&page),
@@ -504,7 +504,7 @@ async fn a_call_completing_after_the_page_still_shows_its_result() {
         vec![row_ids[4]]
     );
 
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let page = page(&router, &format!("?limit=3&before={}", row_ids[5])).await;
     assert_eq!(page["entries"][0]["callId"], "c1");
     assert_eq!(page["entries"][0]["status"], "done");
