@@ -207,17 +207,17 @@ mod tests {
         type Arguments = NoteArgs;
         type Res = ToolResult;
 
-        async fn call(
+        fn call(
             &self,
             args: Self::Arguments,
             _cx: ToolContext,
-        ) -> aither_core::Result<Self::Res> {
-            Ok(ToolResult::text(format!(
+        ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(ToolResult::text(format!(
                 "ran prompt={} input={} body={}",
                 args.prompt,
                 args.input,
                 args.body.unwrap_or_default()
-            )))
+            ))))
         }
     }
 

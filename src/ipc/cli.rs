@@ -674,10 +674,10 @@ fn parse_long_option_value(
 
 fn unknown_long_option(name: &str, long_names: &[String]) -> anyhow::Error {
     let suggestion = find_similar_option(name, long_names.iter().map(String::as_str));
-    match suggestion {
-        Some(similar) => anyhow::anyhow!("unknown option: --{name}. Did you mean --{similar}?"),
-        None => anyhow::anyhow!("unknown option: --{name}"),
-    }
+    suggestion.map_or_else(
+        || anyhow::anyhow!("unknown option: --{name}"),
+        |similar| anyhow::anyhow!("unknown option: --{name}. Did you mean --{similar}?"),
+    )
 }
 
 fn parse_short_options(
