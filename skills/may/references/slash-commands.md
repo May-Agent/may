@@ -43,7 +43,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 - `/ssh` manages preconfigured SSH servers (`user@host[:port]` targets, a to add, d to remove) and probes a server's OS when it is added, saved in `[[ssh_servers]]`; profiles attach them (see `profiles.md`).
 - `/skill` lists installed skills; a adds (install from a GitHub repository), d removes; typing filters.
 - `/connect` opens a picker of installed ACP agents to use as a subagent type; `/connect <command> [args]` connects that command directly. The connection is stored under `[acp_agents.<name>]` and needs the agent's handshake to finish within `[acp] trial_limit`.
-- `/secret KEY VALUE` stores VALUE in the OS keychain, injected into the shell environment as KEY. The line is removed from input history and never enters the transcript or reaches the agent.
+- `/secret KEY VALUE` stores VALUE in the OS keychain, injected into the shell environment as KEY. The line is removed from input history and never enters the transcript or reaches the agent. Stored values are replaced by their names in tool results and provider requests. A missing `~/.may/secrets.json` means no secrets; one that exists but cannot be read or parsed, or a listed secret the keychain cannot read, fails the request or tool result with an error naming the problem instead of running unredacted, and `!` commands are refused until it is fixed.
 
 ## Diagnostics and help
 

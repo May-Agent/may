@@ -389,8 +389,9 @@ pub struct App {
     pub hosted_tool_calls: std::collections::HashMap<String, String>,
     /// Last time file-diff previews were requested for running calls.
     pub diff_preview_at: Option<std::time::Instant>,
-    /// Loaded secret values for bash-mode masking and env injection.
-    pub secrets: crate::secrets::Secrets,
+    /// Loaded secret values for bash-mode masking and env injection, or why
+    /// they could not be read: bash mode then refuses to run.
+    pub secrets: Result<crate::secrets::Secrets, crate::secrets::SecretError>,
     /// Questions the agent asked that nobody answered yet, for the status bar.
     pub open_question_count: usize,
     /// The session's blocking state as the daemon last reported it on the
@@ -3856,14 +3857,26 @@ impl App {
     /// environment, and show a running terminal block for it.
     fn submit_bash(&mut self) -> Option<SendAction> {
         let command = self.input[1..].trim().to_string();
+        if command.is_empty() {
+            self.input.clear();
+            self.cursor = 0;
+            self.input_char_count = 0;
+            return None;
+        }
+        // Without the stored secrets nothing can be masked: the command is
+        // neither run nor recorded, and stays in the input.
+        let secrets = match &self.secrets {
+            Ok(secrets) => secrets.clone(),
+            Err(error) => {
+                self.chat.push_error(&error.to_string());
+                return None;
+            }
+        };
         self.input.clear();
         self.cursor = 0;
         self.input_char_count = 0;
-        if command.is_empty() {
-            return None;
-        }
 
-        let (masked, had_secret) = self.secrets.mask(&command);
+        let (masked, had_secret) = secrets.mask(&command);
         self.history.push(format!("! {masked}"));
         self.history.save();
         if had_secret {
@@ -3890,6 +3903,7 @@ impl App {
         Some(SendAction::RunBash {
             call_id: id,
             command,
+            secrets,
         })
     }
 
@@ -4966,6 +4980,8 @@ pub enum SendAction {
         call_id: String,
         /// The raw command to execute.
         command: String,
+        /// The secrets the command runs with and its output is masked by.
+        secrets: crate::secrets::Secrets,
     },
     /// Store a secret in the OS keychain and refresh the session env file.
     StoreSecret {
