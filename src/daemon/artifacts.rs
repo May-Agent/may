@@ -247,7 +247,26 @@ pub(super) fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::
     response
 }
 
-const ARTIFACT_SANDBOX_CSP: &str = "sandbox allow-scripts";
+/// What an agent- or user-written file served from the daemon's origin may
+/// execute when it is opened as a document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScriptPolicy {
+    /// Active documents run script in an opaque origin without API access;
+    /// artifact previews are built on this.
+    Sandboxed,
+    /// Active documents run no script, load no subresources and submit no
+    /// forms; plain session files use this.
+    Denied,
+}
+
+impl ScriptPolicy {
+    const fn content_security_policy(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandbox allow-scripts",
+            Self::Denied => "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        }
+    }
+}
 
 fn is_active_artifact_content_type(content_type: &str) -> bool {
     let essence = content_type.split(';').next().map_or("", str::trim);
@@ -257,17 +276,25 @@ fn is_active_artifact_content_type(content_type: &str) -> bool {
         || essence.ends_with("+xml")
 }
 
-fn insert_artifact_security_headers(response: &mut skyzen::Response, content_type: &str) {
+fn insert_security_headers(
+    response: &mut skyzen::Response,
+    content_type: &str,
+    policy: ScriptPolicy,
+) {
     insert_header(response, skyzen::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     if is_active_artifact_content_type(content_type) {
         insert_header(
             response,
             skyzen::header::CONTENT_SECURITY_POLICY,
-            ARTIFACT_SANDBOX_CSP,
+            policy.content_security_policy(),
         );
     }
 }
 
+/// An artifact file response: every session-controlled byte stream served
+/// from the daemon's origin is built by this function or
+/// [`session_file_response`], and both set their security headers through
+/// [`insert_security_headers`].
 pub(super) fn file_response(
     bytes: Vec<u8>,
     content_type: &str,
@@ -278,7 +305,20 @@ pub(super) fn file_response(
     insert_header(&mut response, skyzen::header::CONTENT_TYPE, content_type);
     insert_header(&mut response, skyzen::header::ETAG, etag);
     insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
-    insert_artifact_security_headers(&mut response, content_type);
+    insert_security_headers(&mut response, content_type, ScriptPolicy::Sandboxed);
+    response
+}
+
+/// A response for a file under the session's `files/` directory.
+pub(super) fn session_file_response(
+    bytes: Vec<u8>,
+    content_type: &str,
+    cache_control: &str,
+) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
+    insert_header(&mut response, skyzen::header::CONTENT_TYPE, content_type);
+    insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
+    insert_security_headers(&mut response, content_type, ScriptPolicy::Denied);
     response
 }
 
