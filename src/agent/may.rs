@@ -705,25 +705,22 @@ impl MayAgent {
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),
         };
-        // Connected ACP agents start in the sandbox this session's own
-        // commands run in; a container session has no host sandbox to give
-        // them, so it offers none.
         let sandbox = assembly.sandbox().await?;
+        // A connected ACP agent starts in the sandbox of its run's subagent
+        // shell, derived from this session's; a container session has no
+        // host sandbox to give it, so it offers none.
         let acp = match config.acp.as_ref() {
             Some(hosts) if !is_container => Some(
-                hosts
-                    .agents(
-                        config.session_id.as_str(),
-                        super::acp_sandbox::SessionSandbox::for_session(
-                            sandbox.clone(),
-                            config.permission_approver.clone(),
-                            config
-                                .job_server
-                                .broker()
-                                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
-                        ),
-                    )
-                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                hosts.agents(
+                    config.session_id.as_str(),
+                    super::acp_sandbox::SessionServices::new(
+                        config.permission_approver.clone(),
+                        config
+                            .job_server
+                            .broker()
+                            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                    ),
+                ),
             ),
             Some(_) => {
                 tracing::warn!(

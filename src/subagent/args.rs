@@ -92,7 +92,7 @@ impl Requested<'_> {
 
     /// The writable and the committing directories, relative paths resolved
     /// against `working_dir`.
-    pub fn paths(&self, working_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    fn paths(&self, working_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let resolve = |path: &String| {
             let path = Path::new(path);
             match working_dir {

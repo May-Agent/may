@@ -133,8 +133,8 @@ impl<LLM: LanguageModel + 'static> SubagentService<LLM> {
 enum Body<LLM: LanguageModel + 'static> {
     /// An in-process agent.
     Agent(Box<ChildSession<LLM>>),
-    /// A connected agent behind a protocol, and the shell its grant came
-    /// from.
+    /// A connected agent behind a protocol, and the shell whose space and
+    /// grants its processes run with.
     External {
         session: Box<AcpSession>,
         _shell: Option<Box<SessionShell>>,
@@ -336,7 +336,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
     ) -> anyhow::Result<Held<LLM>> {
         let external = self.settings().externals.get(agent)?;
         let working_dir = self.caller_dir(caller);
-        let (worktrees, commit_worktrees) = requested.paths(Some(working_dir));
+        // The agent and its commands run in the space and with the grants of
+        // this shell, as a native subagent's commands do.
         let shell = self
             .launch(requested.grant(Some(working_dir)), Some(working_dir), agent)
             .await?;
@@ -348,9 +349,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let session = external
             .backend
             .open(ExternalStart {
-                working_dir,
-                worktrees: &worktrees,
-                commit_worktrees: &commit_worktrees,
+                sandbox: shell.sandbox(),
                 working_copies: &working_copies,
             })
             .await

@@ -1,7 +1,7 @@
 //! The connected external agents a session can run as subagents.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent::acp_subagent::AcpSubagent;
@@ -9,12 +9,10 @@ use crate::agent::acp_subagent::AcpSubagent;
 /// What an external session starts from.
 #[derive(Debug)]
 pub struct ExternalStart<'a> {
-    /// Where the call was made from: the session's working directory.
-    pub working_dir: &'a Path,
-    /// The directories granted for writing.
-    pub worktrees: &'a [PathBuf],
-    /// The directories granted for committing in.
-    pub commit_worktrees: &'a [PathBuf],
+    /// The sandbox of the run's subagent shell: its own space as working
+    /// directory, read access to what its launcher can write, and write
+    /// access to the worktrees it was granted.
+    pub sandbox: &'a aither_sandbox::Sandbox,
     /// The working copies the run's space was prepared with.
     pub working_copies: &'a [PathBuf],
 }
