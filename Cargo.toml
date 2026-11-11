@@ -317,20 +317,20 @@ opt-level = 3
 [profile.dev.package.lzma-rust2]
 opt-level = 3
 
-# Temporary: the unreleased aither redesign (May-Agent/aither#593). Replaced
-# by a version bump once it is released.
+# The aither redesign (May-Agent/aither#593) is released once, as a whole;
+# until then May follows aither's dev branch.
 [patch.crates-io]
-aither-core = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-agent = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-patch = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-codex = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-models = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-browser = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-openai = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-sed = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
-aither-acp = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-agent = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-patch = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-codex = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-models = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-browser = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-openai = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-sed = { git = "https://github.com/May-Agent/aither", branch = "dev" }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "dev" }
