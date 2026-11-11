@@ -3745,11 +3745,10 @@ impl App {
 
     /// Apply a queued paste to the UI.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TuiError`] when an attachment-bound paste fails to save or
-    /// the result carries a clipboard failure.
-    pub async fn handle_pending_paste(&mut self, paste: PendingPaste) -> AppResult<()> {
+    /// A paste that cannot be applied (the attachment fails to save, a
+    /// manager is missing) is logged and shown as an error in the chat; the
+    /// client keeps running.
+    pub async fn handle_pending_paste(&mut self, paste: PendingPaste) {
         match paste {
             PendingPaste::Input(text) => {
                 // Clear the "Reading clipboard..." notice: attachment-bound
@@ -3757,9 +3756,14 @@ impl App {
                 // input leaves none behind.
                 self.status = None;
                 self.handle_bracketed_paste(text);
-                Ok(())
             }
-            PendingPaste::Attachment(result) => self.handle_paste_result(result).await,
+            PendingPaste::Attachment(result) => {
+                if let Err(error) = self.handle_paste_result(result).await {
+                    tracing::warn!(%error, "failed to apply a paste");
+                    self.status = None;
+                    self.chat.push_error(&format!("Paste failed: {error}"));
+                }
+            }
         }
     }
 
@@ -5113,6 +5117,39 @@ mod tests {
         }
         let screen = session_screen(&mut app).join("\n");
         assert!(screen.contains("invalid arguments"), "{screen}");
+    }
+
+    /// A pasted image that cannot be saved shows an error in the chat, is not
+    /// attached, and leaves the app running.
+    #[tokio::test]
+    async fn a_paste_that_fails_to_save_shows_an_error_and_keeps_running() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        // A session directory that is a file: the images directory cannot be created.
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").expect("file");
+        app.image_manager = Some(super::ImageManager::new(&not_a_directory));
+
+        let image = crate::tui::clipboard::ClipboardImage {
+            data: vec![1, 2, 3],
+            format: crate::tui::clipboard::ImageFormat::Png,
+        };
+        app.enqueue_clipboard_result(Ok(crate::tui::clipboard::ClipboardPasteResult::image(
+            image,
+        )));
+        let paste = app.dequeue_pending_paste().expect("queued paste");
+        app.handle_pending_paste(paste).await;
+
+        assert!(app.attachments.is_empty());
+        assert!(!app.quit_pending);
+        assert!(
+            app.chat.elements().iter().any(|element| matches!(
+                element,
+                ChatElement::Error { message } if message.starts_with("Paste failed: ")
+            )),
+            "{:?}",
+            app.chat.elements()
+        );
     }
 
     /// The Preferences tab lists the jobserver pool size (automatic until
