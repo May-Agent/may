@@ -235,10 +235,11 @@ mod tests {
     }
 
     /// An option's value that starts with a dash and holds an `h` runs the
-    /// command; it is not a help request.
+    /// command; it is not a help request. `note` declares a stdin field, so
+    /// it reads its stdin to the end: the script gives it an empty one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dash_led_option_value_runs_the_command() {
-        let output = run_note("note first --body \"- fixed the crash\"").await;
+        let output = run_note("note first --body \"- fixed the crash\" </dev/null").await;
         assert_eq!(
             output.trim(),
             "ran prompt=first input= body=- fixed the crash"
