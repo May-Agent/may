@@ -590,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn earlier_agents_jobs_stay_listed_while_they_run() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let backgrounds = SessionBackgrounds::default();
         let (old_shell, old, old_pid) = shell_with_job(&dir.path().join("old")).await;
@@ -628,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_finished_job_reads_as_resuming_until_its_completion_is_taken() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let backgrounds = SessionBackgrounds::default();
         let (shell, job, _) = shell_with_job(dir.path()).await;

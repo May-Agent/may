@@ -184,7 +184,7 @@ impl Agent {
     /// An agent on a machine of `physical` bytes, which shares what it
     /// holds with the other agents of `machine` when given one.
     async fn new(physical: u64, machine: Option<(&Machine, &'static str)>) -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("a session root");
         let terminal = TestTerminal::new(dir.path()).await;
         let footprints = Footprints {

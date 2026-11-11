@@ -55,7 +55,7 @@ runs:
       with:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
         path: may-debug.tar.gz
-        retention-days: 7
+        retention-days: 90
     # The merge queue already tested the tree a push to dev lands, so that
     # push only builds, to seed dev's caches; it still tests when the test
     # downloads missed, since the tests are what fetch them.

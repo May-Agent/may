@@ -1074,7 +1074,7 @@ pub(crate) mod test_sandbox {
         ) -> Self {
             // A shell spawns its job registry on the global executor, which
             // the `may` binary installs at startup.
-            let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+            crate::test_support::install_global_executor();
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
             let cache = crate::tools::test_tool_cache();

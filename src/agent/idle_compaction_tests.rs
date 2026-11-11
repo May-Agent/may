@@ -278,7 +278,7 @@ pub struct SessionParts {
 
 impl SessionParts {
     pub(super) async fn new(dir: std::path::PathBuf) -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         std::fs::create_dir_all(dir.join(".may/skills")).expect("create the may dir");
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
@@ -398,7 +398,6 @@ impl Session {
     /// Starts a session whose cache entry ages on the system clock, for a
     /// test that waits on the idle worker's real timers.
     pub(super) async fn start_on_system_clock(config: &MayConfig) -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let temp = tempfile::tempdir().expect("tempdir");
         let parts = SessionParts::new(temp.path().to_path_buf()).await;
         let clock = ManualClock::new();
@@ -435,7 +434,6 @@ impl Session {
         with_runtime: bool,
         agent_messaging: Option<crate::agent_link::AgentMessaging>,
     ) -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let temp = tempfile::tempdir().expect("tempdir");
         let mut parts = SessionParts::new(temp.path().to_path_buf()).await;
         parts.agent_messaging = agent_messaging;

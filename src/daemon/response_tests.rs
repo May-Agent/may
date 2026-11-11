@@ -23,10 +23,6 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
 
-fn init_executor() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-}
-
 /// Bound `future` by [`WAIT_BOUND`], naming `what` it waits for on expiry.
 async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT_BOUND, future)
@@ -42,7 +38,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        init_executor();
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
@@ -635,7 +631,7 @@ async fn resume_from(process: &SessionRuntimeService) -> super::chat::WaitingTur
 /// the state.
 #[tokio::test]
 async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let holder = fixture
         .runtime
@@ -667,7 +663,7 @@ async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
 /// through its own prompt: a second, stale delivery.
 #[tokio::test]
 async fn a_resume_queues_no_reminder_behind_a_live_run() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let holder = fixture
         .runtime
@@ -697,7 +693,7 @@ async fn a_resume_queues_no_reminder_behind_a_live_run() {
 /// With no live run the resume takes the lease and queues the reminder.
 #[tokio::test]
 async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_lease() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let winner = other_process(&fixture);
 
@@ -721,7 +717,7 @@ async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_
 /// and pushes it into the running terminal's grants before the run wakes.
 #[tokio::test]
 async fn an_approved_workspace_request_persists_and_grants_the_dir() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
@@ -780,7 +776,7 @@ async fn an_approved_workspace_request_persists_and_grants_the_dir() {
 /// A denied request persists nothing and grants nothing.
 #[tokio::test]
 async fn a_denied_workspace_request_grants_nothing() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
@@ -839,7 +835,7 @@ async fn a_denied_workspace_request_grants_nothing() {
 /// `workspace.toml` entry appears.
 #[tokio::test]
 async fn an_approval_with_an_unresolvable_path_leaves_the_request_pending() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
@@ -908,7 +904,7 @@ async fn an_approval_with_an_unresolvable_path_leaves_the_request_pending() {
 /// profile's `workspace.toml` and leaves the global one untouched.
 #[tokio::test]
 async fn an_approved_request_writes_the_profile_workspace_toml() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     fixture
         .runtime

@@ -1328,9 +1328,7 @@ impl DaemonState {
         config: MayConfig,
         connectivity: aither_connectivity::Connectivity,
     ) -> anyhow::Result<Self> {
-        // Shells spawn their job registries on the global executor, which
-        // the `may` binary installs at startup.
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         // The daemon writes the bundled skills there at startup, and a
         // session's shell grants the directory.
         std::fs::create_dir_all(may_dir.join("skills"))?;

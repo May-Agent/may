@@ -832,7 +832,7 @@ mod tests {
 
     /// A broker over a small pool of its own under `root`.
     fn job_broker(root: &Path) -> aither_sandbox::JobBroker {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         // Inside `root`, which the test's own directory removes; one pool
         // per sandbox, as the root is shared by sandboxes of a test.
         let dir = tempfile::tempdir_in(root).expect("pool dir").keep();
@@ -848,7 +848,7 @@ mod tests {
 
     fn hosts(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpHosts {
         // The sandbox spawns on the daemon's global executor.
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let config = MayConfig {
             acp_agents: connected,
             ..MayConfig::default()

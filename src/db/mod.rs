@@ -22,6 +22,7 @@ mod pr_checks;
 mod profile;
 mod repo_clone;
 mod repo_usage;
+mod schema_check;
 mod search_outbox;
 mod session;
 mod session_ids;
@@ -111,10 +112,8 @@ impl ChatDb {
     /// the schema fails.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
         let db = Self::connect(db_path).await?;
-        Self::initialize_schema(&db).await?;
-        Self::ensure_session_context_snapshot_table(&db).await?;
-        Self::ensure_search_outbox(&db).await?;
-        Self::ensure_session_interval_triggers(&db).await?;
+        Self::apply_schema(&db).await?;
+        Self::check_schema(&db, db_path).await?;
         Ok(Self {
             db,
             session_pools: session_ids::SessionPools::default(),
@@ -128,6 +127,13 @@ impl ChatDb {
     pub(crate) async fn execute_for_test(&self, sql: &str) -> Result<(), ChatDbError> {
         query!(self.db, sql).execute().await?;
         Ok(())
+    }
+
+    async fn apply_schema(db: &SkyDb) -> Result<(), ChatDbError> {
+        Self::initialize_schema(db).await?;
+        Self::ensure_session_context_snapshot_table(db).await?;
+        Self::ensure_search_outbox(db).await?;
+        Self::ensure_session_interval_triggers(db).await
     }
 
     async fn initialize_schema(db: &SkyDb) -> Result<(), ChatDbError> {

@@ -179,7 +179,7 @@ fn roles_mentioning(request: &Value, needle: &str) -> Vec<String> {
 /// first handoff, so the second handoff can name the constraint again.
 #[tokio::test]
 async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let stub = StubModel::spawn().await;
     let mut session = agent_on(&stub).await;
     let agent = &mut session.agent;
@@ -242,6 +242,7 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
 
 /// Builds a session agent, the way the TUI does, whose models live on `stub`.
 async fn agent_on(stub: &StubModel) -> Session {
+    crate::test_support::install_global_executor();
     let server = IdleStub {
         base_url: stub.base_url.clone(),
         requests: Arc::default(),

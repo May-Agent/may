@@ -3,11 +3,12 @@
 //! Every script of a shell built with a [`PolicySet`] is put to them before it
 //! runs: one that kills processes by name or pattern, or is not valid shell
 //! and so cannot be checked for that; a foreground `sleep`; a re-read of
-//! files unchanged since their last read; and, in the managed bash, the host
-//! `grep`, `awk` and `find` and the `sed` forms `aither_sed::supports` does
-//! not accept. Each refusal names what to do instead. None of them approves
-//! a script that leaves the sandbox: each [passes](ScriptDecision::Pass) one
-//! it has no objection to.
+//! files unchanged since their last read; an `apply_patch` hunk that only
+//! changes whitespace; and, in the managed bash, the host `grep`, `awk` and
+//! `find` and the `sed` forms `aither_sed::supports` does not accept. Each
+//! refusal names what to do instead. None of them approves a script that
+//! leaves the sandbox: each [passes](ScriptDecision::Pass) one it has no
+//! objection to.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -21,6 +22,8 @@ use aither_sandbox::{
     ScriptRefusal, ShellBuilder, ShellCommand, ShellScript,
 };
 use askama::Template;
+
+use crate::command_reading::{CommandReading, DiffLine, DiffOp, FileChange, Intent};
 
 /// Whether the scripts of a session run in the managed bash: always inside a
 /// container, and on the host everywhere but Windows, where `cmd.exe` runs
@@ -80,7 +83,8 @@ impl PolicySet {
             .policy(UnchangedFileReads {
                 refused: self.refused,
             })
-            .policy(PythonWithUv);
+            .policy(PythonWithUv)
+            .policy(WhitespacePatch);
         if self.managed_bash {
             builder.policy(ManagedShellCommands)
         } else {
@@ -458,6 +462,72 @@ impl ScriptPolicy for PythonWithUv {
                     command: &command,
                     replacement,
                 })
+            });
+        std::future::ready(decision)
+    }
+}
+
+#[derive(Template)]
+#[template(path = "refused_whitespace_patch.txt")]
+struct WhitespacePatchRefused<'a> {
+    path: &'a str,
+}
+
+/// Refuses a script whose `apply_patch` patch has a hunk that removes and
+/// adds the same text apart from whitespace: formatting by hand, which the
+/// project's formatter does.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WhitespacePatch;
+
+/// The file whose hunk removes and adds lines that are equal once all
+/// whitespace is stripped.
+fn whitespace_only_hunk(reading: &CommandReading) -> Option<&str> {
+    let significant = |lines: &[DiffLine], op: DiffOp| -> Vec<char> {
+        lines
+            .iter()
+            .filter(|line| line.op == op)
+            .flat_map(|line| line.text.chars().filter(|c| !c.is_whitespace()))
+            .collect()
+    };
+    reading
+        .steps
+        .iter()
+        .filter_map(|step| match &step.intent {
+            Intent::Edit { files } => Some(files),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|file| {
+            let FileChange::Update { hunks, .. } = &file.change else {
+                return None;
+            };
+            hunks
+                .iter()
+                .any(|hunk| {
+                    let has = |op| hunk.lines.iter().any(|line| line.op == op);
+                    has(DiffOp::Removed)
+                        && has(DiffOp::Added)
+                        && significant(&hunk.lines, DiffOp::Removed)
+                            == significant(&hunk.lines, DiffOp::Added)
+                })
+                .then_some(file.path.as_str())
+        })
+}
+
+impl ScriptPolicy for WhitespacePatch {
+    type State = ();
+
+    fn check(
+        &self,
+        script: &ScriptCheck<'_>,
+        (): &(),
+    ) -> impl Future<Output = ScriptDecision> + Send {
+        let decision = parsed(script)
+            .and_then(|_| {
+                whitespace_only_hunk(&CommandReading::of(script.script)).map(str::to_owned)
+            })
+            .map_or(ScriptDecision::Pass, |path| {
+                refuse(&WhitespacePatchRefused { path: &path })
             });
         std::future::ready(decision)
     }

@@ -643,7 +643,7 @@ mod tests {
         ending: Ending,
     ) -> Result<ExitStatus, String> {
         // The sandbox spawns on the daemon's global executor.
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let executor = SandboxExecutor::new(
             Arc::new(ArcSwap::from_pointee(sandbox)),
             Arc::<ArcSwap<MayConfig>>::default(),
@@ -679,7 +679,7 @@ mod tests {
 
     /// A pool of `size` tokens in a directory of its own.
     async fn pool(size: usize) -> (tempfile::TempDir, crate::jobserver::JobServer) {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("pool dir");
         let server = crate::jobserver::JobServer::start(
             dir.path(),

@@ -376,3 +376,51 @@ async fn uv_and_read_only_pip_forms_run() {
         );
     }
 }
+
+fn patch_script(body: &str) -> String {
+    format!("apply_patch <<'PATCH'\n*** Begin Patch\n{body}\n*** End Patch\nPATCH")
+}
+
+#[tokio::test]
+async fn a_whitespace_only_hunk_is_refused() {
+    for body in [
+        "*** Update File: a.rs\n@@\n-fn  main() {}\n+fn main() {}",
+        "*** Update File: a.rs\n@@\n ctx\n-    let x = 1;\n+        let x = 1;",
+        "*** Update File: a.rs\n@@\n-let x = f(a, b);\n+let x = f(\n+    a,\n+    b\n+);",
+        "*** Update File: a.rs\n@@\n-fn a() {}\n+fn a() {}\n*** Update File: b.rs\n@@\n-x\n+y",
+        "*** Update File: a.rs\n@@\n-x\n+y\n@@\n-  z\n+z",
+    ] {
+        let decision = decide(
+            &WhitespacePatch,
+            &(),
+            &patch_script(body),
+            ScriptOrigin::Foreground,
+        )
+        .await;
+        let text = refusal(&decision).unwrap_or_else(|| panic!("`{body}` is refused"));
+        assert!(text.contains("Do not format by hand"), "{text}");
+        assert!(text.contains(".rs"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_patch_that_changes_more_than_whitespace_runs() {
+    for body in [
+        "*** Update File: a.rs\n@@\n-let x = 1;\n+let x = 2;",
+        "*** Add File: a.rs\n+  x\n+y",
+        "*** Update File: a.rs\n@@\n-x\n*** Delete File: b.rs",
+        "*** Update File: a.rs\n@@\n+  inserted",
+    ] {
+        assert_eq!(
+            decide(
+                &WhitespacePatch,
+                &(),
+                &patch_script(body),
+                ScriptOrigin::Foreground
+            )
+            .await,
+            ScriptDecision::Pass,
+            "`{body}` runs"
+        );
+    }
+}
