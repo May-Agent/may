@@ -160,7 +160,7 @@ pub struct AskUserArgs {
     /// (`ask_user "Which database?" --option PostgreSQL`).
     #[serde(default)]
     #[schemars(extend("x-positional" = true))]
-    pub positional_question: Option<String>,
+    pub question_text: Option<String>,
     /// Option to choose from (use --option flag for each, repeatable).
     #[serde(default, alias = "options", alias = "choices")]
     pub option: Vec<String>,
@@ -190,7 +190,7 @@ impl AskUserArgs {
                 (None, None) => None,
                 _ => return Err(AskUserToolError::IncompleteSecret),
             };
-            let question = match (self.question, self.positional_question) {
+            let question = match (self.question, self.question_text) {
                 (Some(_), Some(_)) => return Err(AskUserToolError::QuestionTwice),
                 (question, None) | (None, question) => question,
             };
