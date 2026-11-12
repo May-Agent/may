@@ -9,7 +9,6 @@ use executor_core::DefaultExecutor;
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::explore_tool::{ExploreArgs, ExploreTool};
-use crate::agent::find_tool::FindTool;
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::pr_tool::{PrArgs, PrCommand};
@@ -244,11 +243,6 @@ where
     register_tool_with_description(
         builder,
         &mut descriptions,
-        FindTool::new(config.may_dir.clone()),
-    );
-    register_tool_with_description(
-        builder,
-        &mut descriptions,
         CodeSearchTool::new(
             RepoSearch::global(&config.may_dir),
             config.cwd.clone(),
@@ -403,6 +397,10 @@ where
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone())
             .with_task_events(config.task_events.clone());
         describe_tool(&mut descriptions, &withdraw);
+        usages.push(CoreCommandUsage {
+            name: withdraw.name().to_string(),
+            usage: tool_usage(&withdraw),
+        });
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
     }
 
@@ -436,6 +434,10 @@ where
             btw = btw.with_languages(guard.clone());
         }
         describe_arguments::<crate::agent_link::BtwArgs>(&mut descriptions, "btw");
+        usages.push(CoreCommandUsage {
+            name: "btw".to_string(),
+            usage: arguments_usage::<crate::agent_link::BtwArgs>(),
+        });
         // Bound per call: the fork answering a question launches its shell
         // from the asking agent's.
         builder.main_only(|reserved| {
@@ -452,6 +454,10 @@ where
             agent = agent.with_languages(guard.clone());
         }
         describe_tool(&mut descriptions, &agent);
+        usages.push(CoreCommandUsage {
+            name: "agent".to_string(),
+            usage: tool_usage(&agent),
+        });
         builder.main_only(|reserved| reserved.configure_tool(agent));
     }
 
@@ -576,6 +582,10 @@ where
         usage: arguments_usage::<SubagentArgs>(),
     });
     describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
+    usages.push(CoreCommandUsage {
+        name: "explore".to_string(),
+        usage: arguments_usage::<ExploreArgs>(),
+    });
     // Built for the main agent's shell alone: a subagent has no `subagent`
     // or `explore` command.
     builder.main_exclusive(|main| {
@@ -849,7 +859,16 @@ mod tests {
         assert!(registry.is_configured(&launch, "ask_user"));
         assert!(registry.is_configured(&launch, "imagine"));
         let names: Vec<_> = usages.iter().map(|usage| usage.name.as_str()).collect();
-        assert_eq!(names, ["ask_user", "subagent", "tasks"]);
+        assert_eq!(
+            names,
+            [
+                "ask_user",
+                "withdraw_ask_user",
+                "subagent",
+                "explore",
+                "tasks"
+            ]
+        );
         // `subagent` is bound to a terminal, which this registry lacks; its
         // usage comes from its tool's arguments the same way.
         assert_eq!(
@@ -860,7 +879,7 @@ mod tests {
         let tasks_help =
             crate::tasks_md::edit::run(std::path::Path::new("unused"), &["--help".to_string()])
                 .expect("tasks --help prints the usage");
-        assert_eq!(usages[2].usage, tasks_help);
+        assert_eq!(usages[4].usage, tasks_help);
         assert!(
             descriptions
                 .iter()
@@ -1236,7 +1255,7 @@ mod tests {
         };
 
         let mut builder = CommandRegistryBuilder::new();
-        register_shared_terminal_commands(
+        let shared = register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1251,7 +1270,7 @@ mod tests {
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
                 db: test_db(temp.path()).await,
-                ask_user: None,
+                ask_user: Some(test_runtime(temp.path()).await),
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
@@ -1283,6 +1302,41 @@ mod tests {
         let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
         let registry = commands.registry();
         let (main, subagent) = (main_launch(), subagent_launch());
+
+        // Every core command's prompt usage is what its --help prints; the
+        // registry answers a bound command's help from its schema too.
+        let names: Vec<_> = shared
+            .usages
+            .iter()
+            .map(|usage| usage.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "ask_user",
+                "withdraw_ask_user",
+                "btw",
+                "agent",
+                "subagent",
+                "explore",
+                "tasks"
+            ]
+        );
+        for core in &shared.usages {
+            // `tasks` is an ordinary program, not a registry command.
+            let help = if core.name == "tasks" {
+                crate::tasks_md::edit::run(std::path::Path::new("unused"), &["--help".to_string()])
+                    .ok()
+            } else {
+                registry.help(&main, &core.name)
+            };
+            assert_eq!(
+                help.as_deref(),
+                Some(core.usage.as_str()),
+                "the prompt's usage of `{}` is what its --help prints",
+                core.name
+            );
+        }
 
         assert!(!registry.is_reserved(&main, "agent"));
         assert!(registry.is_reserved(&subagent, "agent"));
