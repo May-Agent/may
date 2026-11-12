@@ -140,7 +140,7 @@ async fn write_is_refused_until_the_user_answers_a_question() {
         .call(
             AskUserArgs {
                 question: Some("Change `npm` to `bun`?".to_string()),
-                positional_question: None,
+                question_text: None,
                 option: vec!["Change it".to_string(), "Keep npm".to_string()],
                 multi_select: false,
                 secret: None,

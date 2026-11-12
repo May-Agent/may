@@ -1,6 +1,4 @@
-Execute terminal commands in a sandboxed environment.
-
-The primary interface to all system capabilities. Scripts run in a sandbox with full read access to the host filesystem but writes contained to a dedicated working directory.
+Execute terminal commands.
 
 ## Output Handling
 
@@ -12,11 +10,7 @@ By default, stdout is **compressed** before being returned. Compression is seman
 
 If you need the exact verbatim output (e.g., for checksums, binary protocols, or diffing), either set `raw: true`, pipe through further processing in the script, or redirect to a file within the script.
 
-Large outputs are automatically saved to file to manage context. When this happens, you receive the file path and can process it using standard Unix tools (head, tail, grep, less) or pipe through `ask` for summarization.
-
-## Built-in Commands
-
-IPC-backed commands are configured by the host application and are exposed inside the terminal runtime as ordinary CLI commands. Inspect the application-provided command list and each command's `--help` output instead of assuming a fixed built-in command inventory.
+Large outputs are automatically saved to file to manage context. When this happens, you receive the file path and can read it with `rg`, `head` and `tail`, or pipe it through `ask` for a summary.
 
 ## Execution
 
