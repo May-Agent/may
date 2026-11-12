@@ -9,7 +9,7 @@
 use std::{borrow::Cow, collections::HashSet, ops::Range};
 
 use crate::{
-    error::PatchError,
+    error::{Excerpt, ExcerptLine, PatchError},
     parse::{Hunk, HunkLine},
 };
 
@@ -183,9 +183,37 @@ fn place_hunks(
             Err(PatchError::Ambiguous {
                 path: path.to_owned(),
                 hunk: index + 1,
-                starts: starts.iter().map(|start| start + 1).collect(),
+                matches: starts
+                    .iter()
+                    .map(|&start| excerpt(file, start..start + olds[index].len()))
+                    .collect(),
             })
         }
+    }
+}
+
+/// Lines shown above and below a match in an ambiguity error: enough for the
+/// agent to copy a distinguishing line into the hunk, few enough to keep the
+/// error compact.
+const EXCERPT_CONTEXT: usize = 2;
+
+/// The matched `region` (0-based file indices, never empty: an empty old side
+/// has a single place and is never ambiguous) with up to [`EXCERPT_CONTEXT`]
+/// lines on each side, clipped to the file.
+fn excerpt(file: &[String], region: Range<usize>) -> Excerpt {
+    debug_assert!(!region.is_empty(), "an ambiguous match covers lines");
+    let from = region.start.saturating_sub(EXCERPT_CONTEXT);
+    let to = (region.end + EXCERPT_CONTEXT).min(file.len());
+    Excerpt {
+        first: region.start + 1,
+        last: region.end,
+        lines: (from..to)
+            .map(|index| ExcerptLine {
+                number: index + 1,
+                text: file[index].clone(),
+                matched: region.contains(&index),
+            })
+            .collect(),
     }
 }
 
@@ -437,7 +465,76 @@ x",
     #[test]
     fn ambiguity_lists_every_place() {
         let error = run("s\ns\ns", "@@\n-s\n+u", Whitespace::Strict).unwrap_err();
-        assert!(error.contains("lines 1, 2, 3"), "{error}");
+        assert!(error.contains("matches at 3 places"), "{error}");
+        assert!(error.contains("match 1, file lines 1-1"), "{error}");
+        assert!(error.contains("match 3, file lines 3-3"), "{error}");
+    }
+
+    const GO_FILE: &str = "func (c *Client) Get(id string) error {
+\tc.mu.Lock()
+\tdefer c.mu.Unlock()
+\treturn c.fetch(id)
+}
+// Delete removes the entry.
+func (c *Client) Delete(id string) error {
+\tc.mu.Lock()
+\tdefer c.mu.Unlock()
+\treturn c.remove(id)
+}";
+
+    #[test]
+    fn ambiguity_shows_numbered_lines_around_each_match() {
+        let error = run(
+            GO_FILE,
+            "@@\n \tc.mu.Lock()\n-\tdefer c.mu.Unlock()\n+\tdefer c.mu.RUnlock()",
+            Whitespace::Strict,
+        )
+        .unwrap_err();
+        let expected = "Ambiguous patch: in f: hunk 1 matches at 2 places; add surrounding context or an `@@ anchor` line to select one. Lines marked `>` are the matched ones:
+
+match 1, file lines 2-3:
+  1| func (c *Client) Get(id string) error {
+> 2| \tc.mu.Lock()
+> 3| \tdefer c.mu.Unlock()
+  4| \treturn c.fetch(id)
+  5| }
+
+match 2, file lines 8-9:
+  6| // Delete removes the entry.
+  7| func (c *Client) Delete(id string) error {
+> 8| \tc.mu.Lock()
+> 9| \tdefer c.mu.Unlock()
+  10| \treturn c.remove(id)
+  11| }
+";
+        assert_eq!(error, expected);
+    }
+
+    #[test]
+    fn ambiguity_excerpt_is_clipped_at_file_start_and_end() {
+        let error = run("x\ny\nz\nq\nx", "@@\n-x\n+X", Whitespace::Strict).unwrap_err();
+        assert!(error.contains("> 1| x\n  2| y\n  3| z\n"), "{error}");
+        assert!(error.contains("  3| z\n  4| q\n> 5| x\n"), "{error}");
+        assert!(!error.contains("0|") && !error.contains("6|"), "{error}");
+    }
+
+    #[test]
+    fn ambiguity_excerpt_keeps_cjk_lines_whole() {
+        let file = "fn 日本() {\n    // 你好，世界\n    保存();\n}\n\nfn 한국() {\n    // 안녕하세요\n    保存();\n}";
+        let error = run(
+            file,
+            "@@\n-    保存();\n+    保存する();",
+            Whitespace::Strict,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("  2|     // 你好，世界\n> 3|     保存();\n  4| }\n"),
+            "{error}"
+        );
+        assert!(
+            error.contains("  7|     // 안녕하세요\n> 8|     保存();\n  9| }"),
+            "{error}"
+        );
     }
 
     #[test]

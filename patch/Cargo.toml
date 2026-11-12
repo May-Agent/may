@@ -12,6 +12,7 @@ categories = ["command-line-utilities"]
 publish = false
 
 [dependencies]
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 thiserror = "2"
 
 [[bin]]
