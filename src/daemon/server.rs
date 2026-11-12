@@ -380,6 +380,7 @@ pub async fn start(
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
     super::pr_checks::spawn(state.clone());
+    super::auto_update::spawn(state.clone());
     // The tailscale-serve listener trusts Serve's identity header; a direct
     // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
     let remote_router = build_router(

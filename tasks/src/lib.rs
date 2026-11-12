@@ -51,6 +51,26 @@ pub const FILE: &str = "tasks.md";
 /// `tasks.md` path in.
 pub const ENV: &str = "MAY_TASKS";
 
+/// The `tasks` command: applies `args` (the words after the program name)
+/// to the file [`ENV`] names and prints the result.
+#[must_use]
+pub fn run(args: impl IntoIterator<Item = String>) -> std::process::ExitCode {
+    let args: Vec<String> = args.into_iter().collect();
+    let result = std::env::var_os(ENV).map_or(Err(edit::Error::Unset), |path| {
+        edit::run(path.as_ref(), &args)
+    });
+    match result {
+        Ok(output) => {
+            print!("{output}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprint!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// A section of `tasks.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
