@@ -466,13 +466,12 @@ fn object_fields(object: &Value) -> (serde_json::Map<String, Value>, Vec<String>
     let required = object
         .get("required")
         .and_then(Value::as_array)
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(Value::as_str)
                 .map(String::from)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     (properties, required)
 }
 
@@ -923,8 +922,7 @@ pub fn schema_to_help(schema: &Value) -> String {
         let required: Vec<&str> = schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+            .map_or_default(|arr| arr.iter().filter_map(Value::as_str).collect());
 
         // Show positional usage: the fields bare words bind to, optional
         // ones in brackets.
@@ -1023,8 +1021,7 @@ pub(super) fn detect_stdin_arg(schema: &Value) -> Option<String> {
     let required = schema
         .get("required")
         .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-        .unwrap_or_default();
+        .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>());
 
     if required.contains(&"input") {
         return None;

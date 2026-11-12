@@ -830,8 +830,7 @@ impl PrStore {
                     pr.title,
                     pr.merge_commit_sha
                         .as_deref()
-                        .map(|s| format!(" → {s}"))
-                        .unwrap_or_default(),
+                        .map_or_default(|s| format!(" → {s}")),
                     if dead.contains(pr.session_id.as_str()) {
                         " — orphaned"
                     } else {
@@ -912,7 +911,7 @@ impl PrStore {
                     e.created_at,
                     e.kind,
                     e.agent_id,
-                    e.detail.map(|d| format!(" — {d}")).unwrap_or_default()
+                    e.detail.map_or_default(|d| format!(" — {d}"))
                 ),
             );
         }
@@ -2284,8 +2283,7 @@ mod tests {
                             .to_string();
                         let body = http_body_util::BodyExt::collect(body)
                             .await
-                            .map(http_body_util::Collected::to_bytes)
-                            .unwrap_or_default();
+                            .map_or_default(http_body_util::Collected::to_bytes);
                         seen.lock().unwrap().push((
                             parts.method.to_string(),
                             parts.uri.path().to_string(),

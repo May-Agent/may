@@ -208,8 +208,7 @@ impl MemoryProcessor {
         let current_preference = db
             .get_profile_memory(profile_id, "preference")
             .await?
-            .map(|m| m.content)
-            .unwrap_or_default();
+            .map_or_default(|m| m.content);
 
         let preference_result = Box::pin(Self::extract(
             providers,
@@ -229,8 +228,7 @@ impl MemoryProcessor {
         let current_recency = db
             .get_profile_memory(profile_id, "recency")
             .await?
-            .map(|m| m.content)
-            .unwrap_or_default();
+            .map_or_default(|m| m.content);
 
         let recency_result = Box::pin(Self::extract(
             providers,

@@ -98,7 +98,7 @@ impl<A: Actions> Recorder<'_, A> {
                 .collect()
                 .await;
             for ((job, duration), log) in timed.into_iter().zip(job_logs) {
-                let mut timings = log.as_deref().map(logs::parse).unwrap_or_default();
+                let mut timings = log.as_deref().map_or_default(logs::parse);
                 timings.sort_by_key(|timing| std::cmp::Reverse(timing.millis));
                 timings.truncate(KEPT_TIMINGS);
                 let steps: Vec<(String, Duration)> = job

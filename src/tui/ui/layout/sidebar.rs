@@ -309,8 +309,7 @@ fn pr_rows(
         .checks
         .as_ref()
         .filter(|c| c.total() > 0)
-        .map(|c| format!("{}/{} ", c.finished(), c.total()))
-        .unwrap_or_default();
+        .map_or_default(|c| format!("{}/{} ", c.finished(), c.total()));
     let title_width =
         width.saturating_sub(lead.width() + number.width() + progress.width() + icon.width() + 1);
     let title = truncate(&pr.title, title_width);
@@ -355,10 +354,7 @@ fn pr_rows(
             "running" => ("●", Style::default().fg(Color::Yellow)),
             _ => ("○", Style::default().fg(Color::DarkGray)),
         };
-        let time = check
-            .duration_secs(now)
-            .map(format_elapsed)
-            .unwrap_or_default();
+        let time = check.duration_secs(now).map_or_default(format_elapsed);
         let name_width = width.saturating_sub(4 + 2 + time.width() + 1);
         let name = truncate(&check.name, name_width);
         let pad = width.saturating_sub(4 + 2 + name.width() + time.width());

@@ -304,14 +304,12 @@ async fn fetch_openai_compatible_models(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| model_id.clone());
 
-            let abilities = aither_models::lookup(&model_id)
-                .map(|info| {
-                    info.abilities()
-                        .iter()
-                        .map(|ability| ability.label().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let abilities = aither_models::lookup(&model_id).map_or_default(|info| {
+                info.abilities()
+                    .iter()
+                    .map(|ability| ability.label().to_string())
+                    .collect()
+            });
 
             FetchedModel {
                 id: model_id,

@@ -241,8 +241,7 @@ async fn prepare_profile_environment(
             Err(error) => {
                 let recent_logs = state
                     .get_container_prepare_status(profile_id)
-                    .map(|status| status.recent_logs)
-                    .unwrap_or_default();
+                    .map_or_default(|status| status.recent_logs);
 
                 state.set_container_prepare_status(ContainerPrepareStatus {
                     profile_id: profile_id.to_string(),
