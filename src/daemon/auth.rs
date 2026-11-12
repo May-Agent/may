@@ -1,14 +1,104 @@
-//! Identity on the remote listener: every remote request must prove who it
-//! comes from; the local loopback listener keeps trusting the machine's own
-//! user. A request the accepted sources cannot attribute gets `401`, never a
-//! guess — the resolved [`Identity`] rides the request extensions so handlers
-//! and the request log record it.
+//! The access policy of each listener, the outermost layer of the router it
+//! serves, so no route or fallback runs before it.
+//!
+//! - The unix socket ([`SocketOwner`]): its file mode is the access control.
+//! - A loopback TCP bind ([`LoopbackOnly`]): the machine's own user, reached
+//!   through a loopback `Host` and, from a browser, a loopback `Origin`.
+//! - Every other listener ([`RequireIdentity`]): each request must prove who
+//!   it comes from. A request the accepted sources cannot attribute gets
+//!   `401`, never a guess — the resolved [`Identity`] rides the request
+//!   extensions so handlers and the request log record it.
 
 use std::collections::HashSet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use hyper::http::uri::Authority;
+use skyzen::header::{HOST, ORIGIN};
 use skyzen::middleware::{Middleware, Next};
 use skyzen::{Error, Request, Response, StatusCode};
+
+/// The unix socket's policy: only the user owning the socket file can connect
+/// (mode 0600), so every request on it is admitted.
+pub struct SocketOwner;
+
+impl Middleware for SocketOwner {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        next.run(request).await
+    }
+}
+
+/// A loopback TCP bind's policy. Any local process may connect, but so may a
+/// web page the user visits: its requests are refused when they name a
+/// non-loopback `Host` (a DNS-rebinding name) or carry an `Origin` that is not
+/// a loopback origin (`null` included — any site can produce it from a
+/// sandboxed frame). A request without `Origin` is no browser cross-origin
+/// request (curl, the CLI, a same-origin `GET`) and passes on its `Host`.
+///
+/// Any loopback port is admitted in either header: the Vite dev server
+/// proxies the web UI's requests from its own port, and a local process can
+/// reach the listener without a browser anyway.
+pub struct LoopbackOnly;
+
+impl Middleware for LoopbackOnly {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        if !has_loopback_host(request) {
+            return Err(
+                Error::msg("the local listener answers only a loopback Host")
+                    .set_status(StatusCode::FORBIDDEN),
+            );
+        }
+        if !has_loopback_origin_or_none(request) {
+            return Err(
+                Error::msg("the local listener refuses requests from a foreign Origin")
+                    .set_status(StatusCode::FORBIDDEN),
+            );
+        }
+        next.run(request).await
+    }
+}
+
+/// The request's authority — the URI's in absolute form, else `Host` — names
+/// a loopback host. A request naming no authority is refused.
+fn has_loopback_host(request: &Request) -> bool {
+    if let Some(authority) = request.uri().authority() {
+        return is_loopback_name(authority.host());
+    }
+    request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Authority>().ok())
+        .is_some_and(|authority| is_loopback_name(authority.host()))
+}
+
+/// No `Origin`, or an http(s) origin whose host is a loopback name.
+fn has_loopback_origin_or_none(request: &Request) -> bool {
+    let Some(origin) = request.headers().get(ORIGIN) else {
+        return true;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|origin| url::Url::parse(origin).ok())
+        .filter(|origin| matches!(origin.scheme(), "http" | "https"))
+        .is_some_and(|origin| origin.host_str().is_some_and(is_loopback_name))
+}
+
+/// `localhost` or a `.localhost` name (RFC 6761), a 127/8 address, or `[::1]`
+/// — names no DNS answer can point elsewhere. IPv6 comes bracketed, as in a
+/// URL authority.
+fn is_loopback_name(host: &str) -> bool {
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
+    }
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    host.rsplit('.')
+        .next()
+        .is_some_and(|tld| tld.eq_ignore_ascii_case("localhost"))
+}
 
 /// Who a remote request belongs to and which proof brought it in.
 #[derive(Debug, Clone)]

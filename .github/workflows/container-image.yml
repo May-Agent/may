@@ -1,23 +1,11 @@
 name: Container image
 
 # CI calls this workflow ahead of the tests that pull its image, for every
-# pull request, merge group and dev push that selects the tests, so the only
-# standalone trigger left is a push to main. The caller's concurrency group
-# cancels a superseded pull request run, called jobs included.
+# pull request, merge group and main push that selects the tests. The caller's
+# concurrency group cancels a superseded pull request run, called jobs
+# included.
 on:
   workflow_call:
-  push:
-    branches: [main]
-    paths:
-      - 'container/**'
-      - 'src/tools/*.json'
-      - 'src/container/image_ref.rs'
-      - 'tasks/**'
-      - 'templates/python_shim'
-      - 'build.rs'
-      - 'Cargo.lock'
-      - 'examples/container_image.rs'
-      - '.github/workflows/container-image.yml'
 
 permissions:
   contents: read

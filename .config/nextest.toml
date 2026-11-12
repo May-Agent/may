@@ -1,0 +1,5 @@
+# A hung test fails within minutes instead of holding its job until the job
+# timeout. The terminal E2E tests are the slowest: some run past 60 s each on
+# the macOS runner (#812), so a test is ended after five slow periods.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
