@@ -344,8 +344,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let ledger = shell.commit_ledger();
         let working_copies = shell
             .prepared_space()
-            .map(|space| space.working_copies().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|space| space.working_copies().to_vec());
         let session = external
             .backend
             .open(ExternalStart {
@@ -482,8 +481,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let ledger = shell.commit_ledger();
         let working_copies = shell
             .prepared_space()
-            .map(|space| space.working_copies().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|space| space.working_copies().to_vec());
         tracing::info!(subagent = %name, model = %model, "Starting subagent");
         let session = ChildSession::new(
             agent,

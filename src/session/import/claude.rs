@@ -75,21 +75,18 @@ fn map_call(id: &str, name: &str, input: &Value) -> ToolCall {
             }],
         ),
         "MultiEdit" => {
-            let edits: Vec<Edit> = input["edits"]
-                .as_array()
-                .map(|list| {
-                    list.iter()
-                        .map(|e| Edit {
-                            old: e.get("old_string").and_then(Value::as_str).unwrap_or(""),
-                            new: e.get("new_string").and_then(Value::as_str).unwrap_or(""),
-                            all: e
-                                .get("replace_all")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let edits: Vec<Edit> = input["edits"].as_array().map_or_default(|list| {
+                list.iter()
+                    .map(|e| Edit {
+                        old: e.get("old_string").and_then(Value::as_str).unwrap_or(""),
+                        new: e.get("new_string").and_then(Value::as_str).unwrap_or(""),
+                        all: e
+                            .get("replace_all")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                    .collect()
+            });
             edit_script(id, s("file_path"), &edits)
         }
         "Grep" => {

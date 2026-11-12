@@ -179,7 +179,7 @@ impl SidebarState {
             self.issues.clear();
         }
         self.tasks = content.map(crate::task_rows::task_rows);
-        let linked = self.tasks.as_deref().map(linked_issues).unwrap_or_default();
+        let linked = self.tasks.as_deref().map_or_default(linked_issues);
         // Keep known lookups in mention order; unknown ones show their
         // number until their lookup arrives. An unresolved number (its
         // issue may not have existed yet) is looked up again.

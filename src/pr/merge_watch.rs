@@ -640,7 +640,7 @@ impl GraphResponse {
             .as_ref()
             .filter(|c| c.page_info.has_next_page)
             .and_then(|c| c.page_info.end_cursor.clone());
-        let checks = contexts.map(|c| c.nodes).unwrap_or_default();
+        let checks = contexts.map_or_default(|c| c.nodes);
         let snapshot = Snapshot {
             state: pr.state,
             queue_position: pr.merge_queue_entry.map(|entry| entry.position),

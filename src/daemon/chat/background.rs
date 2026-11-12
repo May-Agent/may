@@ -148,8 +148,7 @@ impl SessionBackgrounds {
     fn registries(&self, session_id: &str) -> Vec<(u64, Jobs)> {
         self.sessions()
             .get(session_id)
-            .map(|session| session.jobs.clone())
-            .unwrap_or_default()
+            .map_or_default(|session| session.jobs.clone())
     }
 
     fn subagents_of(&self, session_id: &str) -> Option<SubagentTracker> {
@@ -217,8 +216,7 @@ impl SessionBackgrounds {
         let jobs = self.jobs(session_id).await;
         let subagents = self
             .subagents_of(session_id)
-            .map(|tracker| tracker.running())
-            .unwrap_or_default();
+            .map_or_default(|tracker| tracker.running());
         // A finished job whose completion its agent has not taken still owes
         // the session a turn, from the moment the registry records the finish.
         let owed_turn = jobs.iter().any(|job| job.status.completion_pending());

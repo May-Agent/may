@@ -53,7 +53,6 @@ pub const ENV: &str = "MAY_TASKS";
 
 /// The `tasks` command: applies `args` (the words after the program name)
 /// to the file [`ENV`] names and prints the result.
-#[must_use]
 pub fn run(args: impl IntoIterator<Item = String>) -> std::process::ExitCode {
     let args: Vec<String> = args.into_iter().collect();
     let result = std::env::var_os(ENV).map_or(Err(edit::Error::Unset), |path| {

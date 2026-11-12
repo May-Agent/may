@@ -189,8 +189,7 @@ impl IssueOwners {
         let key = store.search_key();
         let before = accepted
             .as_deref()
-            .map(|tasks| numbers_in(tasks, &key))
-            .unwrap_or_default();
+            .map_or_default(|tasks| numbers_in(tasks, &key));
         let gained = numbers_in(&current, &key)
             .difference(&before)
             .copied()

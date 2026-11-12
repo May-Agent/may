@@ -55,8 +55,7 @@ impl UserAsk {
             text: request
                 .questions
                 .first()
-                .map(|question| question.question.clone())
-                .unwrap_or_default(),
+                .map_or_default(|question| question.question.clone()),
         }
     }
 
