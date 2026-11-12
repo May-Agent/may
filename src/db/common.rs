@@ -53,7 +53,7 @@ pub enum ChatDbError {
     #[error("PR is already {state}")]
     PrTerminal {
         /// The terminal state the PR is in.
-        state: String,
+        state: super::PrState,
     },
     /// Every model-facing id of a session is leased.
     #[error(transparent)]

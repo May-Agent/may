@@ -7,6 +7,7 @@ use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::db::PrFilter;
 use crate::pr::{PrContext, PrError, PrStore};
 use crate::repo_clone::CloneSandbox;
 
@@ -69,9 +70,10 @@ pub enum PrArgs {
     },
     /// List PRs, newest first.
     List {
-        /// `open`, `merged`, `closed` or `all`.
+        /// `open` (not merged or closed), `checks_pending`, `failed`,
+        /// `rejected`, `merging`, `merged`, `closed` or `all` (default).
         #[serde(default)]
-        state: Option<String>,
+        state: PrFilter,
         /// Repo key or clone dir; default the session's only clone or all.
         #[serde(default)]
         repo: Option<String>,
@@ -242,9 +244,7 @@ impl Tool for PrTool {
             }
             PrArgs::Update { number, repo } => self.store.update(number, repo.as_deref()).await,
             PrArgs::Merge { number, repo } => self.store.merge(number, repo.as_deref()).await,
-            PrArgs::List { state, repo } => {
-                self.store.list(repo.as_deref(), state.as_deref()).await
-            }
+            PrArgs::List { state, repo } => self.store.list(repo.as_deref(), state).await,
             PrArgs::Show { number, repo } => self.store.show(number, repo.as_deref()).await,
             PrArgs::Close { number, repo } => self.store.close(number, repo.as_deref()).await,
             PrArgs::Adopt { number, repo } => self.store.adopt(number, repo.as_deref()).await,
@@ -258,7 +258,7 @@ impl Tool for PrTool {
 mod tests {
     use aither_core::llm::ToolContext;
 
-    use super::{CommandRole, PrArgs, PrStore, PrTool, Tool};
+    use super::{CommandRole, PrArgs, PrFilter, PrStore, PrTool, Tool};
     use crate::pr::{LandLocks, PrContext};
     use crate::repo_clone::test_sandbox::TestTerminal;
 
@@ -305,7 +305,7 @@ mod tests {
         let listed = tool
             .call(
                 PrArgs::List {
-                    state: None,
+                    state: PrFilter::All,
                     repo: None,
                 },
                 ToolContext::new(),
