@@ -2,25 +2,23 @@
 
 ## Branches
 
-After the first push of `dev`:
+The repository has one permanent branch — its default, `<default>` in the payloads below. The first push already made it the default; confirm:
 
 ```bash
-git push origin dev:main
-gh api -X PATCH repos/OWNER/NAME -f default_branch=dev
-gh api repos/OWNER/NAME --jq .default_branch   # must print: dev
+gh api repos/OWNER/NAME --jq .default_branch   # must print the default branch name
 ```
 
 ## Ruleset
 
-One ruleset covers both branches. Write the payload to `ruleset.json` (outside the repository checkout) and post it:
+One ruleset covers the default branch. Write the payload to `ruleset.json` (outside the repository checkout) and post it:
 
 ```json
 {
-  "name": "protect-dev-main",
+  "name": "protect-default",
   "target": "branch",
   "enforcement": "active",
   "conditions": {
-    "ref_name": { "include": ["refs/heads/dev", "refs/heads/main"], "exclude": [] }
+    "ref_name": { "include": ["refs/heads/<default>"], "exclude": [] }
   },
   "bypass_actors": [],
   "rules": [
@@ -64,15 +62,15 @@ Merge queue is available on organization-owned repositories and on user-owned re
 ## Read back
 
 ```bash
-id=$(gh api repos/OWNER/NAME/rulesets --jq '.[] | select(.name=="protect-dev-main") | .id')
+id=$(gh api repos/OWNER/NAME/rulesets --jq '.[] | select(.name=="protect-default") | .id')
 gh api repos/OWNER/NAME/rulesets/$id --jq '{enforcement, include: .conditions.ref_name.include, bypass: .bypass_actors, rules: [.rules[].type]}'
 ```
 
-Expected: `enforcement` is `active`, `include` is `["refs/heads/dev","refs/heads/main"]`, `bypass` is `[]`, and `rules` contains exactly `deletion`, `non_fast_forward`, `required_signatures`, `pull_request`, `merge_queue` (any order). Anything else is a mismatch.
+Expected: `enforcement` is `active`, `include` is `["refs/heads/<default>"]`, `bypass` is `[]`, and `rules` contains exactly `deletion`, `non_fast_forward`, `required_signatures`, `pull_request`, `merge_queue` (any order). Anything else is a mismatch.
 
 ## Required checks
 
-After the first green CI run on `dev`, add a `required_status_checks` rule to the same ruleset: fetch it, append this rule to `rules` with the `name` of each CI job (exactly as GitHub shows it), and send it back with `gh api -X PUT repos/OWNER/NAME/rulesets/$id --input ruleset.json`.
+After the first green CI run on the default branch, add a `required_status_checks` rule to the same ruleset: fetch it, append this rule to `rules` with the `name` of each CI job (exactly as GitHub shows it), and send it back with `gh api -X PUT repos/OWNER/NAME/rulesets/$id --input ruleset.json`.
 
 ```json
 {
