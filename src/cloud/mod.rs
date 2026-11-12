@@ -11,6 +11,7 @@
 //! [`ProfileCloud`], set with `/cloud`.
 
 pub mod codespaces;
+pub mod home;
 
 use std::fmt;
 use std::time::{Duration, Instant};

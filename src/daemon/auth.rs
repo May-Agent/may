@@ -126,6 +126,9 @@ pub enum IdentitySourceKind {
     /// The peer address of a direct tailnet bind, resolved to a user login
     /// through tailscaled's `WhoIs`.
     TailnetWhois,
+    /// The bearer token of the daemon that fronts this cloud home, the one
+    /// it installed here when it bootstrapped the machine.
+    FrontingDaemon,
 }
 
 /// The scheme a remote request was addressed with.
@@ -353,5 +356,49 @@ impl IdentitySource for TailscaleServeIdentitySource {
         } else {
             Scheme::Http
         }
+    }
+}
+
+/// The bearer token of the daemon that fronts this cloud home: requests it
+/// relays through its forwarded connection carry `Authorization: Bearer`,
+/// and only the token's SHA-256 is kept here. The forward lands on this
+/// machine's loopback, so the token, not the address, is the proof.
+#[derive(Clone)]
+pub struct FrontingTokenIdentitySource {
+    /// SHA-256 of the accepted token.
+    digest: [u8; 32],
+    /// The account the fronting daemon acts for, for logs.
+    owner: String,
+}
+
+impl FrontingTokenIdentitySource {
+    /// Accepts the token whose SHA-256 is `digest`, acting for `owner`.
+    #[must_use]
+    pub const fn new(digest: [u8; 32], owner: String) -> Self {
+        Self { digest, owner }
+    }
+}
+
+impl IdentitySource for FrontingTokenIdentitySource {
+    fn authenticate(&self, request: &Request) -> Option<Identity> {
+        use sha2::Digest as _;
+        use subtle::ConstantTimeEq as _;
+
+        let token = request
+            .headers()
+            .get(skyzen::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")?;
+        let digest = sha2::Sha256::digest(token.as_bytes());
+        bool::from(digest.as_slice().ct_eq(&self.digest)).then(|| Identity {
+            login: self.owner.clone(),
+            source: IdentitySourceKind::FrontingDaemon,
+        })
+    }
+
+    /// The forward delivers plain HTTP to this machine's loopback.
+    fn scheme(&self, _request: &Request) -> Scheme {
+        Scheme::Http
     }
 }

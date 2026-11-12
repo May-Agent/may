@@ -80,6 +80,9 @@ pub struct StartedDaemon {
     /// `WhoIs`-resolved login, for non-loopback TCP binds (`--host` and
     /// `[daemon] listen`).
     pub(crate) direct_router: Router,
+    /// This machine's cloud home record, when a fronting daemon bootstrapped
+    /// it: the remote listener binds its port.
+    pub(crate) cloud_home: Option<crate::cloud::home::CloudHome>,
     /// The webhook routes alone, for the public listener Tailscale Funnel
     /// targets. It holds no other route.
     pub(crate) webhook_router: Router,
@@ -382,13 +385,22 @@ pub async fn start(
     super::pr_checks::spawn(state.clone());
     super::auto_update::spawn(state.clone());
     // The tailscale-serve listener trusts Serve's identity header; a direct
-    // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
+    // non-loopback bind trusts only the peer's `WhoIs`-resolved login. On a
+    // cloud home it also admits the fronting daemon's bearer token.
+    let cloud_home = crate::cloud::home::CloudHome::load(&state.may_dir)
+        .context("failed to read the cloud home record")?;
+    let mut remote_sources: Vec<Box<dyn super::auth::IdentitySource>> =
+        vec![Box::new(state.remote_access_manager.tailscale_identity())];
+    if let Some(home) = &cloud_home {
+        remote_sources.push(Box::new(super::auth::FrontingTokenIdentitySource::new(
+            home.digest().context("the cloud home record is unusable")?,
+            home.owner.clone(),
+        )));
+    }
     let remote_router = build_router(
         state.clone(),
         mode,
-        super::auth::RequireIdentity::new(vec![Box::new(
-            state.remote_access_manager.tailscale_identity(),
-        )]),
+        super::auth::RequireIdentity::new(remote_sources),
     );
     let direct_router = build_router(
         state.clone(),
@@ -410,6 +422,7 @@ pub async fn start(
         remote_router,
         direct_router,
         webhook_router,
+        cloud_home,
     })
 }
 

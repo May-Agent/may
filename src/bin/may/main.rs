@@ -3118,6 +3118,11 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
             eprintln!("The May daemon runs this build.");
             Ok(())
         }
+        cli::DaemonCommand::Start => {
+            lifecycle::ensure_running(&paths, |step| eprintln!("{step}")).await?;
+            eprintln!("The May daemon runs this build.");
+            Ok(())
+        }
         cli::DaemonCommand::Status => {
             let client = may_agent::client::DaemonClient::new(paths.socket());
             match client.health().await {

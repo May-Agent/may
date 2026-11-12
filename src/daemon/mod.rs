@@ -444,9 +444,15 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .with_context(|| format!("failed to listen on {tcp}"))?;
     // Remote access needs identity: it forwards the tailnet to the remote
     // listener, bound on loopback because only the tunnel process connects.
-    let remote_listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .context("failed to bind the remote listener")?;
+    // A cloud home binds the port its fronting daemon forwards to.
+    let remote_port = started
+        .cloud_home
+        .as_ref()
+        .map_or(0, |home| home.remote_port);
+    let remote_listener =
+        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], remote_port)))
+            .await
+            .context("failed to bind the remote listener")?;
     let unix_listener = bind_unix(&paths.socket())?;
     state.remote_access_manager.set_local_listener_addr(
         tcp_listener
