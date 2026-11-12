@@ -11,10 +11,16 @@
 //!   attaches that identity to whatever the user's browser sends, so an
 //!   identified request whose `Origin` is not the origin it was addressed to
 //!   gets `403`.
+//! - A direct tailnet bind ([`DirectListener`]): [`RequireIdentity`] behind a
+//!   `Host` check. The peer's identity says who is connecting, not which site
+//!   the user's browser believes it is talking to, so a request is answered
+//!   only when its `Host` names the node itself ([`NodeNames`]) — a
+//!   DNS-rebinding page's name never does.
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hyper::http::uri::Authority;
 use skyzen::header::{HOST, ORIGIN};
@@ -289,6 +295,174 @@ impl TailscaleServeIdentitySource {
 /// user identity (a tagged node) or the resolution failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailnetLogin(pub String);
+
+/// The local address a connection arrived on, attached to every request of
+/// that connection on a direct bind: the address the listener is bound to, or
+/// for a wildcard bind the node address the peer connected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalAddr(pub SocketAddr);
+
+/// The names a request may address this node by: its tailnet addresses and
+/// its `MagicDNS` name, as tailscaled reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeNames {
+    addresses: HashSet<IpAddr>,
+    /// Lowercase, without the trailing dot.
+    dns_name: Option<String>,
+}
+
+impl NodeNames {
+    /// The node's tailnet addresses (IPv4 and IPv6) and `MagicDNS` name; an
+    /// empty name means the node has none.
+    pub fn new(addresses: impl IntoIterator<Item = IpAddr>, dns_name: &str) -> Self {
+        let dns_name = dns_name.trim_end_matches('.').to_ascii_lowercase();
+        Self {
+            addresses: addresses.into_iter().map(|ip| ip.to_canonical()).collect(),
+            dns_name: (!dns_name.is_empty()).then_some(dns_name),
+        }
+    }
+
+    /// `host` (a URL authority's host: IPv6 bracketed) is one of the node's
+    /// names. A DNS name matches in any case.
+    fn names(&self, host: &str) -> bool {
+        host_ip(host).map_or_else(
+            || {
+                self.dns_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(host.trim_end_matches('.')))
+            },
+            |ip| self.addresses.contains(&ip),
+        )
+    }
+}
+
+/// The IP address an authority host spells, if it spells one.
+fn host_ip(host: &str) -> Option<IpAddr> {
+    let ip = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => IpAddr::V6(v6.parse::<Ipv6Addr>().ok()?),
+        None => IpAddr::V4(host.parse::<Ipv4Addr>().ok()?),
+    };
+    Some(ip.to_canonical())
+}
+
+/// Where a direct listener reads its node's names from.
+pub trait NodeNamesSource: Send + Sync + 'static {
+    /// The node's current names, or why they could not be read.
+    fn read(&self) -> impl Future<Output = Result<NodeNames, String>> + Send;
+}
+
+/// The least time between two reads of the source. A request naming an
+/// unknown host triggers a read, and anyone who can reach the listener can
+/// send such requests, so reads are not unbounded. One a second caps the
+/// `tailscale` processes such a flood starts, and a renamed node is still
+/// answered within a second of its first request.
+const NAMES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The node's names, shared by every connection of a direct listener and
+/// re-read when a `Host` is not among them: the names change (a renamed node,
+/// a new address) without a restart.
+pub struct NodeNamesCache<S> {
+    source: S,
+    names: arc_swap::ArcSwap<NodeNames>,
+    /// When the source was last read. Held across a read, so concurrent
+    /// requests with an unknown host share one read.
+    last_read: async_lock::Mutex<Option<Instant>>,
+}
+
+impl<S: NodeNamesSource> NodeNamesCache<S> {
+    /// A cache with no names yet: the first request to a direct listener
+    /// reads them, so a daemon without one never runs `tailscale`.
+    pub fn new(source: S) -> Arc<Self> {
+        Self::with_names(source, NodeNames::default())
+    }
+
+    /// A cache that starts with `names` and has not read its source.
+    pub fn with_names(source: S, names: NodeNames) -> Arc<Self> {
+        Arc::new(Self {
+            source,
+            names: arc_swap::ArcSwap::from_pointee(names),
+            last_read: async_lock::Mutex::new(None),
+        })
+    }
+
+    /// `host` names the node, re-reading its names once when it does not. A
+    /// failed read keeps the previous names.
+    async fn names(&self, host: &str) -> bool {
+        if self.names.load().names(host) {
+            return true;
+        }
+        let mut last_read = self.last_read.lock().await;
+        // Another request may have refreshed while this one waited.
+        if self.names.load().names(host) {
+            return true;
+        }
+        if (*last_read).is_some_and(|at| at.elapsed() < NAMES_REFRESH_INTERVAL) {
+            return false;
+        }
+        let read = self.source.read().await;
+        *last_read = Some(Instant::now());
+        drop(last_read);
+        match read {
+            Ok(names) => {
+                self.names.store(Arc::new(names));
+                self.names.load().names(host)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the node's tailnet names could not be re-read; keeping the previous ones");
+                false
+            }
+        }
+    }
+}
+
+/// The `403` a request addressed to another host gets.
+fn foreign_host() -> Error {
+    Error::msg("the direct listener answers only requests addressed to this node")
+        .set_status(StatusCode::FORBIDDEN)
+}
+
+/// A direct tailnet bind's policy: the request's `Host` must name the node
+/// itself — one of its tailnet addresses, its `MagicDNS` name, or the address
+/// the connection arrived on ([`LocalAddr`]) — before any identity is
+/// resolved; then [`RequireIdentity`] decides.
+pub struct DirectListener<S> {
+    names: Arc<NodeNamesCache<S>>,
+    identity: RequireIdentity,
+}
+
+impl<S: NodeNamesSource> DirectListener<S> {
+    pub const fn new(names: Arc<NodeNamesCache<S>>, identity: RequireIdentity) -> Self {
+        Self { names, identity }
+    }
+}
+
+impl<S: NodeNamesSource> Middleware for DirectListener<S> {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        let host = request_authority(request).map(|authority| authority.host().to_owned());
+        let local = request
+            .extensions()
+            .get::<LocalAddr>()
+            .map(|local| local.0.ip().to_canonical());
+        let addressed = match host.as_deref() {
+            None => false,
+            Some(host) => {
+                host_ip(host)
+                    .zip(local)
+                    .is_some_and(|(ip, local)| ip == local)
+                    || self.names.names(host).await
+            }
+        };
+        if !addressed {
+            tracing::warn!(host = ?host, "direct request addressed to another host refused");
+            return Err(foreign_host());
+        }
+        self.identity.handle(request, next).await
+    }
+
+    fn provisions(&self) -> Vec<std::any::TypeId> {
+        self.identity.provisions()
+    }
+}
 
 /// The connection's `WhoIs`-resolved login on a direct tailnet bind, accepted
 /// only when it is in the allow-list shared with [`TailscaleServeIdentitySource`].

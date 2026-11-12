@@ -15,9 +15,10 @@ use skyzen::{Request, StatusCode};
 
 use super::TcpRouters;
 use super::auth::{
-    LoopbackOnly, RequireIdentity, SocketOwner, TailnetLogin, TailscaleServeIdentitySource,
+    DirectListener, LocalAddr, LoopbackOnly, NodeNames, NodeNamesCache, NodeNamesSource,
+    RequireIdentity, SocketOwner, TailnetLogin, TailscaleServeIdentitySource,
 };
-use super::remote_access::{parse_whois_login, whois_login};
+use super::remote_access::{parse_node_names, parse_whois_login, whois_login};
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::agent::tunnel_tool::TunnelRequest;
@@ -212,7 +213,10 @@ async fn a_direct_bind_rejects_even_a_listed_tailscale_login() {
     assert_eq!(
         status(
             &router,
-            tailscale_request("GET", "/api/health", "owner@example.com"),
+            with_host(
+                tailscale_request("GET", "/api/health", "owner@example.com"),
+                DIRECT_HOST
+            ),
         )
         .await,
         StatusCode::UNAUTHORIZED,
@@ -224,21 +228,91 @@ const WHOIS_OWNER: &str = include_str!("fixtures/whois_owner.json");
 const WHOIS_GUEST: &str = include_str!("fixtures/whois_guest.json");
 const WHOIS_TAGGED: &str = include_str!("fixtures/whois_tagged.json");
 
+/// The node's names as `tailscale status --json` reports them for the test
+/// node: the addresses and `MagicDNS` name the direct tests address it by.
+fn node_names() -> NodeNames {
+    NodeNames::new(
+        [
+            "100.64.0.10".parse().expect("ipv4"),
+            "fd7a:115c:a1e0::10".parse().expect("ipv6"),
+        ],
+        "mac.tail1234.ts.net.",
+    )
+}
+
+/// A stand-in for the `tailscale status` read: answers what the test set and
+/// counts its reads.
+#[derive(Clone)]
+struct StubNodeNames {
+    answer: Arc<std::sync::Mutex<Result<NodeNames, String>>>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StubNodeNames {
+    fn new(answer: Result<NodeNames, String>) -> Self {
+        Self {
+            answer: Arc::new(std::sync::Mutex::new(answer)),
+            reads: Arc::default(),
+        }
+    }
+
+    fn set(&self, answer: Result<NodeNames, String>) {
+        *self.answer.lock().expect("stub lock") = answer;
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl NodeNamesSource for StubNodeNames {
+    fn read(&self) -> impl Future<Output = Result<NodeNames, String>> + Send {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::ready(self.answer.lock().expect("stub lock").clone())
+    }
+}
+
+fn direct_router_with(
+    state: &Arc<DaemonState>,
+    source: &TailscaleServeIdentitySource,
+    names: &StubNodeNames,
+) -> skyzen::routing::Router {
+    let known = names
+        .answer
+        .lock()
+        .expect("stub lock")
+        .clone()
+        .unwrap_or_default();
+    build_router(
+        state.clone(),
+        DaemonMode::Rest,
+        DirectListener::new(
+            NodeNamesCache::with_names(names.clone(), known),
+            RequireIdentity::new(vec![Box::new(source.whois_source())]),
+        ),
+    )
+}
+
+/// The direct listener of the test node, whose names are known up front.
 fn direct_router(
     state: &Arc<DaemonState>,
     source: &TailscaleServeIdentitySource,
 ) -> skyzen::routing::Router {
-    build_router(
-        state.clone(),
-        DaemonMode::Rest,
-        RequireIdentity::new(vec![Box::new(source.whois_source())]),
-    )
+    direct_router_with(state, source, &StubNodeNames::new(Ok(node_names())))
+}
+
+/// `request` addressed with `host`.
+fn with_host(mut request: Request, host: &str) -> Request {
+    request
+        .headers_mut()
+        .insert("Host", host.parse().expect("host header"));
+    request
 }
 
 /// A request as the accept path delivers it on a direct bind: the login the
 /// connection's `WhoIs` resolved, parsed from a CLI fixture.
 fn whois_request(fixture: &str) -> Request {
-    let mut req = request("GET", "/api/health");
+    let mut req = with_host(request("GET", "/api/health"), DIRECT_HOST);
     if let Some(login) = parse_whois_login(fixture).expect("fixture parses") {
         req.extensions_mut().insert(login);
     }
@@ -313,7 +387,11 @@ async fn a_failed_whois_leaves_the_connection_unattributed() {
     let resolved = whois_login("/nonexistent/tailscale", "100.64.0.10".parse().expect("ip")).await;
     assert_eq!(resolved, None, "a CLI that cannot run resolves nobody");
     assert_eq!(
-        status(&router, request("GET", "/api/health")).await,
+        status(
+            &router,
+            with_host(request("GET", "/api/health"), DIRECT_HOST)
+        )
+        .await,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -332,7 +410,10 @@ async fn whois_is_ignored_on_the_serve_router_and_the_header_on_the_direct_one()
     assert_eq!(
         status(
             &direct,
-            tailscale_request("GET", "/api/health", "owner@example.com")
+            with_host(
+                tailscale_request("GET", "/api/health", "owner@example.com"),
+                DIRECT_HOST
+            )
         )
         .await,
         StatusCode::UNAUTHORIZED
@@ -449,11 +530,20 @@ async fn no_identity_gets_401_on_matched_unmatched_and_tunnel_referer_paths() {
     ];
     for (listener, router) in &routers {
         for (case, req) in [
-            ("a matched route", request("GET", "/api/health")),
-            ("an unmatched path", request("GET", "/src/main.tsx")),
+            (
+                "a matched route",
+                with_host(request("GET", "/api/health"), DIRECT_HOST),
+            ),
+            (
+                "an unmatched path",
+                with_host(request("GET", "/src/main.tsx"), DIRECT_HOST),
+            ),
             (
                 "an unmatched path with a tunnel Referer",
-                with_referer(request("GET", "/src/main.tsx"), &referer),
+                with_referer(
+                    with_host(request("GET", "/src/main.tsx"), DIRECT_HOST),
+                    &referer,
+                ),
             ),
         ] {
             assert_eq!(
@@ -800,7 +890,11 @@ async fn a_non_loopback_host_bind_serves_no_route_without_an_identity() {
         let addr: SocketAddr = bind.parse().expect("bind address");
         for (method, uri) in API_PATHS {
             assert_eq!(
-                status(routers.router_for(addr), local_request(method, uri)).await,
+                status(
+                    routers.router_for(addr),
+                    browser_request(method, uri, DIRECT_HOST, None)
+                )
+                .await,
                 StatusCode::UNAUTHORIZED,
                 "{method} {uri} on a {bind} bind needs an identity"
             );
@@ -919,5 +1013,255 @@ async fn the_web_ui_the_tui_and_curl_keep_working() {
         status(&socket, request("GET", "/api/health")).await,
         StatusCode::OK,
         "the unix socket serves its owner"
+    );
+}
+
+const STATUS_SELF: &str = include_str!("fixtures/status_self.json");
+
+#[test]
+fn status_output_yields_the_nodes_addresses_and_lowercase_name() {
+    assert_eq!(
+        parse_node_names(STATUS_SELF).expect("parses"),
+        node_names(),
+        "Self.TailscaleIPs and Self.DNSName without its trailing dot, lowercased"
+    );
+    assert!(parse_node_names("not json").is_err());
+    assert!(
+        parse_node_names(r#"{"BackendState": "NoState"}"#).is_err(),
+        "a status without a Self node names nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_direct_listener_refuses_a_foreign_host_even_when_identified() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let direct = direct_router(&state, &source);
+    // `rebind.example` re-pointed at the node's address: the peer's `WhoIs`
+    // resolves the user's own device and the browser's `Origin` matches.
+    for host in [
+        "rebind.example:8787",
+        "rebind.example",
+        "100.64.0.11:8787",
+        "mac.tail1234.ts.net.evil.example:8787",
+        "evil.example.mac.tail1234.ts.net",
+        "localhost:8787",
+        "[fd7a:115c:a1e0::11]:8787",
+    ] {
+        let origin = format!("http://{host}");
+        assert_eq!(
+            status(
+                &direct,
+                direct_request("GET", "/api/health", host, Some(origin.as_str()))
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an identified request to {host} is refused"
+        );
+        assert_eq!(
+            status(
+                &direct,
+                browser_request("GET", "/api/health", host, Some(origin.as_str()))
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "a request to {host} is refused before its identity is asked for"
+        );
+    }
+    assert_eq!(
+        status(
+            &direct,
+            with_host(request("GET", "/api/health"), "rebind.example:8787")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    let mut no_host = request("GET", "/api/health");
+    no_host
+        .extensions_mut()
+        .insert(TailnetLogin("owner@example.com".into()));
+    assert_eq!(
+        status(&direct, no_host).await,
+        StatusCode::FORBIDDEN,
+        "a request naming no host is refused"
+    );
+}
+
+#[tokio::test]
+async fn the_direct_listener_answers_requests_addressed_to_the_node() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let direct = direct_router(&state, &source);
+    for host in [
+        "100.64.0.10",
+        "100.64.0.10:8787",
+        "[fd7a:115c:a1e0::10]:8787",
+        "[FD7A:115C:A1E0:0:0:0:0:10]:8787",
+        "mac.tail1234.ts.net",
+        "mac.tail1234.ts.net:8787",
+        "MAC.Tail1234.TS.net",
+        "Mac.Tail1234.Ts.Net:8787",
+        "mac.tail1234.ts.net.:8787",
+    ] {
+        assert_eq!(
+            status(&direct, direct_request("GET", "/api/health", host, None)).await,
+            StatusCode::OK,
+            "a request addressed to {host} is served"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_direct_listener_answers_the_address_it_is_bound_to() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let direct = direct_router(&state, &source);
+    let bound = |req: Request, local: &str| {
+        let mut req = req;
+        req.extensions_mut()
+            .insert(LocalAddr(local.parse().expect("local address")));
+        req
+    };
+    assert_eq!(
+        status(
+            &direct,
+            bound(
+                direct_request("GET", "/api/health", "192.168.1.20:8787", None),
+                "192.168.1.20:8787"
+            )
+        )
+        .await,
+        StatusCode::OK,
+        "the address the connection arrived on names the node"
+    );
+    assert_eq!(
+        status(
+            &direct,
+            bound(
+                direct_request("GET", "/api/health", "[::1]:8787", None),
+                "[::1]:8787"
+            )
+        )
+        .await,
+        StatusCode::OK,
+        "so does an IPv6 bound address"
+    );
+    assert_eq!(
+        status(
+            &direct,
+            bound(
+                direct_request("GET", "/api/health", "192.168.1.21:8787", None),
+                "192.168.1.20:8787"
+            )
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "another address does not"
+    );
+    assert_eq!(
+        status(
+            &direct,
+            direct_request("GET", "/api/health", "192.168.1.20:8787", None)
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an address the node was never reported with is foreign without a bound address"
+    );
+    assert_eq!(
+        status(
+            &direct,
+            bound(
+                direct_request("GET", "/api/health", "rebind.example:8787", None),
+                "192.168.1.20:8787"
+            )
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "a name is never the bound address"
+    );
+}
+
+#[tokio::test]
+async fn a_host_unknown_at_first_passes_once_a_refreshed_status_reports_it() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let names = StubNodeNames::new(Ok(NodeNames::default()));
+    let direct = direct_router_with(&state, &source, &names);
+    assert_eq!(
+        names.reads(),
+        0,
+        "nothing reads the names before a request needs them"
+    );
+    // The node got its address after the listener started.
+    names.set(Ok(node_names()));
+    assert_eq!(
+        status(
+            &direct,
+            direct_request("GET", "/api/health", DIRECT_HOST, None)
+        )
+        .await,
+        StatusCode::OK,
+        "the refreshed status names the address"
+    );
+    assert_eq!(names.reads(), 1);
+    // A known name needs no read, and the refreshed names are kept.
+    assert_eq!(
+        status(
+            &direct,
+            direct_request("GET", "/api/health", "mac.tail1234.ts.net", None)
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(names.reads(), 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_status_keeps_the_previous_names_and_refuses_the_unmatched_host() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let names = StubNodeNames::new(Ok(node_names()));
+    let direct = direct_router_with(&state, &source, &names);
+    names.set(Err("tailscaled is not running".into()));
+    assert_eq!(
+        status(
+            &direct,
+            direct_request("GET", "/api/health", "rebind.example:8787", None)
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(names.reads(), 1, "the unmatched host was re-read once");
+    assert_eq!(
+        status(
+            &direct,
+            direct_request("GET", "/api/health", DIRECT_HOST, None)
+        )
+        .await,
+        StatusCode::OK,
+        "the previous names still answer"
+    );
+}
+
+#[tokio::test]
+async fn foreign_hosts_do_not_make_the_listener_read_the_status_without_bound() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let names = StubNodeNames::new(Ok(node_names()));
+    let direct = direct_router_with(&state, &source, &names);
+    for _ in 0..5 {
+        assert_eq!(
+            status(
+                &direct,
+                direct_request("GET", "/api/health", "rebind.example:8787", None)
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        names.reads(),
+        1,
+        "requests within the refresh interval share one read"
     );
 }

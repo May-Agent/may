@@ -17,7 +17,7 @@ use skyzen::BodyError;
 use skyzen::extract::PeerAddr;
 use skyzen::routing::Router;
 
-use super::auth::TailnetLogin;
+use super::auth::{LocalAddr, TailnetLogin};
 use super::session_ids::ConnectionIds;
 use super::state::DaemonState;
 
@@ -31,6 +31,7 @@ fn into_frame(bytes: bytes::Bytes) -> Frame<bytes::Bytes> {
 async fn handle(
     router: Arc<Router>,
     peer: Option<SocketAddr>,
+    local: Option<LocalAddr>,
     tailnet: Option<TailnetLogin>,
     ids: ConnectionIds,
     request: hyper::Request<Incoming>,
@@ -44,6 +45,9 @@ async fn handle(
     });
     if let Some(peer) = peer {
         request.extensions_mut().insert(PeerAddr(peer));
+    }
+    if let Some(local) = local {
+        request.extensions_mut().insert(local);
     }
     if let Some(login) = tailnet {
         request.extensions_mut().insert(login);
@@ -105,6 +109,7 @@ fn serve_connection<IO>(
     io: IO,
     router: Arc<Router>,
     peer: Option<SocketAddr>,
+    local: Option<LocalAddr>,
     identity: PeerIdentity,
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -122,7 +127,14 @@ fn serve_connection<IO>(
         // connection closes and the service holding them drops.
         let ids = ConnectionIds::default();
         let service = hyper::service::service_fn(move |request| {
-            handle(router.clone(), peer, tailnet.clone(), ids.clone(), request)
+            handle(
+                router.clone(),
+                peer,
+                local,
+                tailnet.clone(),
+                ids.clone(),
+                request,
+            )
         });
         if let Err(error) = hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(io), service)
@@ -159,7 +171,10 @@ async fn accept_tcp(
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, peer)) => serve_connection(stream, router.clone(), Some(peer), identity()),
+            Ok((stream, peer)) => {
+                let local = stream.local_addr().ok().map(LocalAddr);
+                serve_connection(stream, router.clone(), Some(peer), local, identity());
+            }
             Err(error) => {
                 tracing::warn!(%error, "TCP accept failed");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -174,7 +189,9 @@ async fn accept_tcp(
 pub async fn serve_unix(listener: tokio::net::UnixListener, router: Arc<Router>) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => serve_connection(stream, router.clone(), None, PeerIdentity::None),
+            Ok((stream, _)) => {
+                serve_connection(stream, router.clone(), None, None, PeerIdentity::None);
+            }
             Err(error) => {
                 tracing::warn!(%error, "unix socket accept failed");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
