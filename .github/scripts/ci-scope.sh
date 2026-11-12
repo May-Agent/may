@@ -13,7 +13,9 @@
 #            whole of `may exec`, so they read everything the tests read.
 #
 # A change under .github/ (workflows, actions, this script) selects every job.
-# The repository documents nothing builds or reads select none.
+# The repository documents nothing builds or reads select none, and so does
+# the release configuration (release-plz.toml, dist-workspace.toml and the
+# changelogs), which only the release workflows read.
 set -euo pipefail
 
 fmt=false
@@ -24,6 +26,7 @@ web_ui=false
 while IFS= read -r path; do
   case "${path}" in
     AGENTS.md | CLAUDE.md | README.md) ;;
+    release-plz.toml | dist-workspace.toml | CHANGELOG.md | */CHANGELOG.md) ;;
     .github/*)
       fmt=true clippy=true test=true web_ui=true
       ;;
