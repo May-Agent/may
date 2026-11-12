@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::computer::proto::{
-    InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind, MouseInput,
+    InputMessage, KeyboardEventKind, KeyboardInput, LaunchedWindow, MouseButtonInput,
+    MouseEventKind, MouseInput,
 };
 use crate::computer::{
     ComputerAgent,
@@ -50,6 +52,8 @@ pub struct ComputerArgs {
     /// - `type TEXT`: type at the focused element
     /// - `key KEY` or `key MOD+MOD+KEY`: `Enter`, `Tab`, `ArrowLeft`, `F5`,
     ///   a letter or digit, `cmd+l`, `cmd+shift+4`
+    /// - `launch APP [URL ...]`: open an application on the desktop without
+    ///   taking the user's focus; APP is its name, bundle id or `.app` path
     ///
     /// Modifiers: `cmd` (`command`, `meta`), `ctrl` (`control`), `alt`
     /// (`option`), `shift`. `X`/`Y` are points on the desktop (its size is in
@@ -184,7 +188,35 @@ impl ComputerTool {
             "click" | "double-click" | "right-click" | "drag" | "scroll" | "type" | "key" => {
                 self.drive(action, rest).await
             }
+            "launch" => self.launch(rest).await,
             _ => Err(usage().to_owned()),
+        }
+    }
+
+    async fn launch(&self, rest: &[String]) -> Result<ToolResult, String> {
+        let (app, items) = launch_operands(rest)?;
+        self.check_agent_owns_desktop().await?;
+        self.ensure_desktop().await?;
+        match self
+            .handles
+            .agent
+            .request(AgentRequest::Launch {
+                session_id: self.session_id.clone(),
+                app: app.clone(),
+                items: items.to_vec(),
+            })
+            .await?
+        {
+            AgentResponse::Launched { app } => LaunchedText {
+                bundle_id: &app.bundle_id,
+                pid: app.pid,
+                windows: &app.windows,
+            }
+            .render()
+            .map(ToolResult::text)
+            .map_err(|e| e.to_string()),
+            AgentResponse::Error { error } => Err(error),
+            _ => Err("unexpected reply from computer-agent".to_owned()),
         }
     }
 
@@ -388,8 +420,24 @@ fn numbers(form: &str, rest: &[String]) -> Result<Vec<f64>, String> {
         .collect()
 }
 
+/// Splits `launch`'s operands into the application and what it opens.
+fn launch_operands(rest: &[String]) -> Result<(&String, &[String]), String> {
+    rest.split_first().ok_or_else(|| {
+        "expected `computer launch APP [URL ...]`: APP is an application's name, bundle id or .app path".to_owned()
+    })
+}
+
+/// What `computer launch` tells the model.
+#[derive(Template)]
+#[template(path = "computer_launched.txt", escape = "none")]
+struct LaunchedText<'a> {
+    bundle_id: &'a str,
+    pid: i32,
+    windows: &'a [LaunchedWindow],
+}
+
 const fn usage() -> &'static str {
-    "usage: computer <screenshot|observe|click X Y|double-click X Y|right-click X Y|drag X1 Y1 X2 Y2|scroll DX DY|type TEXT|key KEY|key MOD+KEY>"
+    "usage: computer <screenshot|observe|click X Y|double-click X Y|right-click X Y|drag X1 Y1 X2 Y2|scroll DX DY|type TEXT|key KEY|key MOD+KEY|launch APP [URL ...]>"
 }
 
 #[cfg(test)]
@@ -438,6 +486,44 @@ mod tests {
             parsed(&["drag", "1", "2", "3", "4"]).1,
             strings(&["1", "2", "3", "4"])
         );
+    }
+
+    #[test]
+    fn launch_takes_an_app_and_urls() {
+        assert_eq!(
+            parsed(&["launch", "Google Chrome", "https://example.com"]),
+            (
+                "launch".into(),
+                strings(&["Google Chrome", "https://example.com"])
+            )
+        );
+    }
+
+    #[test]
+    fn launch_without_an_app_names_the_form() {
+        let (action, operands) = parsed(&["launch"]);
+        assert_eq!(action, "launch");
+        let error = launch_operands(&operands).unwrap_err();
+        assert!(error.contains("`computer launch APP [URL ...]`"), "{error}");
+    }
+
+    #[test]
+    fn launched_text_reports_app_pid_and_windows() {
+        let text = LaunchedText {
+            bundle_id: "com.google.Chrome",
+            pid: 42,
+            windows: &[LaunchedWindow {
+                id: 7,
+                x: 10.0,
+                y: 20.0,
+                width: 800.0,
+                height: 600.0,
+            }],
+        }
+        .render()
+        .unwrap();
+        assert!(text.contains("com.google.Chrome (pid 42)"), "{text}");
+        assert!(text.contains("Window 7: 800x600 at (10, 20)"), "{text}");
     }
 
     #[test]

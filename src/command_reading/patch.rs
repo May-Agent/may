@@ -1,6 +1,6 @@
 //! The files an `apply_patch` patch changes.
 //!
-//! The text is parsed by `aither-patch`, the parser the harness applies a
+//! The text is parsed by `may-patch`, the parser the harness applies a
 //! patch with, so a patch reads exactly as it will apply. Given the directory
 //! the patch runs in, each hunk is located in the file it edits with the
 //! applier's own matching and its lines carry absolute line numbers; without
@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use aither_patch::{Action, HunkLine, locate_hunks};
+use may_patch::{Action, HunkLine, locate_hunks};
 use serde::{Deserialize, Serialize};
 
 /// One file a patch changes.
@@ -84,11 +84,11 @@ pub struct DiffLine {
     pub new: Option<u32>,
 }
 
-/// Reads `text` as a patch, or `None` when `aither-patch` does not parse it.
+/// Reads `text` as a patch, or `None` when `may-patch` does not parse it.
 /// `dir` is where the patch runs: the files it updates are read from there to
 /// number the hunks.
 pub(super) fn parse(text: &str, dir: Option<&Path>) -> Option<Vec<FileEdit>> {
-    let actions = aither_patch::parse(text).ok()?;
+    let actions = may_patch::parse(text).ok()?;
     (!actions.is_empty()).then(|| actions.iter().map(|action| edit(action, dir)).collect())
 }
 
@@ -162,7 +162,7 @@ fn edit(action: &Action, dir: Option<&Path>) -> FileEdit {
 /// The hunk's lines, numbered from where its old side starts in the file
 /// (zero-based `start`); `shift` is how many lines the earlier hunks of the
 /// file added net. A hunk that was not located is left unnumbered.
-fn number(hunk: &aither_patch::Hunk, start: Option<usize>, shift: i64) -> Vec<DiffLine> {
+fn number(hunk: &may_patch::Hunk, start: Option<usize>, shift: i64) -> Vec<DiffLine> {
     let mut position = start.map(|start| {
         let old = u32::try_from(start + 1).expect("a file has fewer than 2^32 lines");
         let new = u32::try_from(i64::from(old) + shift)

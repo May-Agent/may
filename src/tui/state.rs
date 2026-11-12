@@ -688,11 +688,19 @@ impl PasteFilter {
 /// Represents an active text input field for paste handling.
 #[derive(Debug)]
 pub enum ActiveTextInput<'a> {
-    /// Input with cursor position tracking (insert at cursor)
+    /// The chat composer: inserts at a cursor that is a byte offset on a
+    /// grapheme boundary.
+    Composer {
+        /// The buffer being edited.
+        input: &'a mut String,
+        /// Byte offset of the cursor within the buffer.
+        cursor: &'a mut usize,
+    },
+    /// A settings field with a character-index cursor (insert at cursor)
     Cursored {
         /// The buffer being edited.
         input: &'a mut String,
-        /// Cursor position within the buffer.
+        /// Cursor position within the buffer, in characters.
         cursor: &'a mut usize,
     },
     /// Simple input (append at end) with character filter

@@ -346,11 +346,15 @@ impl RuntimeSystemContext {
             }
         }
 
-        let Some(memories_dir) = self.memory_path.parent() else {
+        let Some(memories_dir) = self.memory_path.parent().map(Path::to_path_buf) else {
             return;
         };
-        let mut next = HashMap::new();
-        scan_memories_dir(memories_dir, memories_dir, &mut next);
+        let next = blocking::unblock(move || {
+            let mut next = HashMap::new();
+            scan_memories_dir(&memories_dir, &memories_dir, &mut next);
+            next
+        })
+        .await;
         let Some(snapshot) = self.memories_snapshot.replace(next.clone()) else {
             // First scan is a silent baseline: nothing counts as changed.
             return;
@@ -919,13 +923,17 @@ pub async fn build_capabilities(
 #[template(path = "prompt/work.md", escape = "none")]
 struct WorkTemplate<'a> {
     issue_backend_name: &'a str,
+    works_in_clone: bool,
 }
 
 /// The work section: issues, PRs, `tasks.md`, artifacts and memory. The
 /// issue repository is the session's, so the session section names it.
-pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo) -> String {
+/// `works_in_clone` is whether the session has a repository clone, the only
+/// place code lands through `pr`.
+pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo, works_in_clone: bool) -> String {
     WorkTemplate {
         issue_backend_name: issue_backend.name,
+        works_in_clone,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render work: {error}"))

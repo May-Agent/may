@@ -1293,10 +1293,14 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<bool, ChatDbError> {
-        let Some(summary) = self.get_session_runtime(session_id).await? else {
-            return Ok(false);
-        };
-        Ok(summary.interactions.browser.takeover_active)
+        Ok(query!(
+            self.db,
+            "SELECT 1 AS value FROM session_runtimes WHERE session_id = ? AND browser_takeover_active = 1",
+            session_id
+        )
+        .fetch_optional::<crate::db::common::OptionalI64ValueRow>()
+        .await?
+        .is_some())
     }
 
     /// Find browser takeover session.

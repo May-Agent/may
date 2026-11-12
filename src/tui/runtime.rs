@@ -922,8 +922,7 @@ impl RuntimeDeps {
 
         app.chat.truncate_prompt_at(history_index);
         app.input = content;
-        app.input_char_count = app.input.chars().count();
-        app.cursor = app.input_char_count;
+        app.cursor = app.input.len();
         app.attachments = attachments;
         // The next send carries a one-shot notice: the conversation rolled
         // back while the world — open and merged PRs — stands. The audit

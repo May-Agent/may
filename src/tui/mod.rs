@@ -18,6 +18,8 @@ pub mod error;
 pub mod event;
 /// Per-session file-diff worker feeding tool-call diffs to the chat stream.
 pub mod file_diff;
+/// Grapheme-boundary cursor arithmetic for the composer.
+pub mod grapheme;
 /// Persistent input history.
 pub mod history;
 /// New Year greeting and fireworks.

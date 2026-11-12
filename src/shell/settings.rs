@@ -221,4 +221,22 @@ mod tests {
         assert!(text.contains("started with `background: true`"), "{text}");
         assert!(text.contains("reads end of file"), "{text}");
     }
+
+    #[test]
+    fn the_shell_description_names_only_commands_the_shell_runs() {
+        let budgets = ShellBudgets::of(&ShellSettings::default());
+        let settings = shell_tool_settings(&budgets);
+        let text = &settings.shell.description;
+        // The managed shell refuses `grep`, and `less` is not in it.
+        for absent in ["grep", "less"] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
+        assert!(text.contains("`rg`, `head` and `tail`"), "{text}");
+        assert!(text.contains("`ask`"), "{text}");
+        // Nothing addressed to the application embedding the tool, and no
+        // restatement of the sandbox rule the permissions section states.
+        for absent in ["host application", "sandbox"] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
+    }
 }
