@@ -14,6 +14,8 @@
 
 mod ci;
 
+pub use ci::CiPlatform;
+
 use std::path::PathBuf;
 
 use crate::issue::{GhCliTokenSource, GitHubTokenSource as _};
@@ -77,6 +79,19 @@ pub enum UpdateError {
         /// The artifact looked for.
         name: String,
     },
+    /// No successful CI run of a commit has the artifact.
+    #[error(
+        "no successful CI run of commit {commit} has the artifact {name}; push the commit and let CI build it"
+    )]
+    NoCommitBuild {
+        /// The artifact looked for.
+        name: String,
+        /// The commit.
+        commit: String,
+    },
+    /// This binary was built without git, so no commit names its build.
+    #[error("this May was built without its commit id, so no CI build of it can be found")]
+    UnknownCommit,
     /// The downloaded artifact is not the one GitHub described.
     #[error("the downloaded artifact has sha256 {actual}, GitHub reports {expected}")]
     DigestMismatch {
@@ -134,8 +149,55 @@ pub async fn update(
     }
 }
 
+/// The commit this binary was built from, when git was available.
+#[must_use]
+pub const fn built_from() -> Option<&'static str> {
+    if BUILT_FROM.is_empty() {
+        None
+    } else {
+        Some(BUILT_FROM)
+    }
+}
+
+/// The debug `may` CI built for `platform` from the commit this binary was
+/// built from, downloaded with `token` and checked against GitHub's digest:
+/// the same build, for another machine. `progress` receives one line per
+/// step, for the caller's loading indicator.
+///
+/// # Errors
+/// [`UpdateError::UnknownCommit`] for a build without its commit id,
+/// [`UpdateError::NoCommitBuild`] when CI has not built the commit;
+/// otherwise the download's failure.
+pub async fn this_build_for(
+    platform: CiPlatform,
+    token: String,
+    mut progress: impl FnMut(&str),
+) -> Result<Vec<u8>, UpdateError> {
+    let commit = built_from().ok_or(UpdateError::UnknownCommit)?;
+    this_commit_from(GITHUB_API, platform, commit, token, &mut progress).await
+}
+
+async fn this_commit_from(
+    api_base: &str,
+    platform: CiPlatform,
+    commit: &str,
+    token: String,
+    progress: &mut impl FnMut(&str),
+) -> Result<Vec<u8>, UpdateError> {
+    let name = platform.artifact();
+    let github = ci::GitHub::new(api_base, token);
+    progress(&format!("Looking for the CI build of {}…", short(commit)));
+    let found = github.artifact_of_commit(name, commit).await?;
+    progress(&format!(
+        "Downloading {name} ({} MB)…",
+        found.artifact.size_in_bytes / 1_000_000
+    ));
+    let zip = github.download(&found.artifact).await?;
+    blocking::unblock(move || ci::extract_executable(&zip)).await
+}
+
 async fn update_dev(progress: &mut impl FnMut(&str)) -> Result<Outcome, UpdateError> {
-    let name = ci::artifact_name()?;
+    let name = CiPlatform::current()?.artifact();
     let token = GhCliTokenSource
         .token()
         .await

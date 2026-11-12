@@ -33,17 +33,37 @@ const RUNS_SCANNED: u32 = 30;
 /// Upper bound of the unpacked executable, far above a debug `may`.
 const EXECUTABLE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
-/// The artifact name CI gives this platform's debug `may`.
-///
-/// # Errors
-/// Fails on a platform CI builds no debug `may` for.
-pub(super) const fn artifact_name() -> Result<&'static str, UpdateError> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Ok("may-debug-macos-arm64")
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Ok("may-debug-linux-x64")
-    } else {
-        Err(UpdateError::UnsupportedPlatform)
+/// A platform CI builds a debug `may` for (`.github/actions/test`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiPlatform {
+    /// macOS on Apple silicon.
+    MacosArm64,
+    /// Linux on x86-64, the platform of every codespace.
+    LinuxX64,
+}
+
+impl CiPlatform {
+    /// The platform this binary runs on.
+    ///
+    /// # Errors
+    /// Fails on a platform CI builds no debug `may` for.
+    pub const fn current() -> Result<Self, UpdateError> {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Ok(Self::MacosArm64)
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Ok(Self::LinuxX64)
+        } else {
+            Err(UpdateError::UnsupportedPlatform)
+        }
+    }
+
+    /// The artifact name CI gives the platform's debug `may`.
+    #[must_use]
+    pub const fn artifact(self) -> &'static str {
+        match self {
+            Self::MacosArm64 => "may-debug-macos-arm64",
+            Self::LinuxX64 => "may-debug-linux-x64",
+        }
     }
 }
 
@@ -131,22 +151,53 @@ impl GitHub {
             "{}/repos/{REPOSITORY}/actions/workflows/ci.yml/runs?branch={BRANCH}&event=push&status=success&per_page={RUNS_SCANNED}",
             self.api_base
         );
-        let runs = parse_runs(&self.get(&runs_url).await?.bytes().await?)?;
+        self.first_artifact(&runs_url, name)
+            .await?
+            .ok_or_else(|| UpdateError::NoArtifact {
+                name: name.to_owned(),
+            })
+    }
+
+    /// The artifact `name` of a successful CI run of `commit`, on any branch
+    /// or event: the build of exactly that commit.
+    pub(super) async fn artifact_of_commit(
+        &self,
+        name: &str,
+        commit: &str,
+    ) -> Result<Found, UpdateError> {
+        let runs_url = format!(
+            "{}/repos/{REPOSITORY}/actions/workflows/ci.yml/runs?head_sha={commit}&status=success&per_page={RUNS_SCANNED}",
+            self.api_base
+        );
+        self.first_artifact(&runs_url, name)
+            .await?
+            .ok_or_else(|| UpdateError::NoCommitBuild {
+                name: name.to_owned(),
+                commit: commit.to_owned(),
+            })
+    }
+
+    /// The artifact `name` of the first run of the listing at `runs_url`
+    /// that has one.
+    async fn first_artifact(
+        &self,
+        runs_url: &str,
+        name: &str,
+    ) -> Result<Option<Found>, UpdateError> {
+        let runs = parse_runs(&self.get(runs_url).await?.bytes().await?)?;
         for run in runs {
             let url = format!(
                 "{}/repos/{REPOSITORY}/actions/runs/{}/artifacts?name={name}",
                 self.api_base, run.id
             );
             if let Some(artifact) = parse_artifact(&self.get(&url).await?.bytes().await?)? {
-                return Ok(Found {
+                return Ok(Some(Found {
                     head_sha: run.head_sha,
                     artifact,
-                });
+                }));
             }
         }
-        Err(UpdateError::NoArtifact {
-            name: name.to_owned(),
-        })
+        Ok(None)
     }
 
     /// The artifact's zip, checked against the digest GitHub reports.
@@ -254,6 +305,65 @@ mod tests {
         assert_eq!(
             artifact.digest.as_deref(),
             Some("sha256:256d53e061d0fd433c854a7d7df28a17bb5a52bb73627e3514c0d78e477eaceb")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_build_of_a_commit_is_the_artifact_of_its_successful_run() {
+        use crate::test_support::{ApiReply, serve_api};
+
+        let commit = "6bbeeed53be58e7e1be3ecde6a781dcc5a5c6711";
+        let (base, requests) = serve_api(|request, _| match request.path.as_str() {
+            path if path.starts_with("/repos/May-Agent/may/actions/workflows/ci.yml/runs?") => {
+                ApiReply::json(200, String::from_utf8_lossy(RUNS).into_owned())
+            }
+            "/repos/May-Agent/may/actions/runs/43155546229/artifacts?name=may-debug-linux-x64" => {
+                ApiReply::json(200, String::from_utf8_lossy(ARTIFACTS).into_owned())
+            }
+            _ => ApiReply::json(404, r#"{"message":"Not Found"}"#),
+        })
+        .await;
+        let github = GitHub::new(&base, "test-token".into());
+
+        let found = github
+            .artifact_of_commit(CiPlatform::LinuxX64.artifact(), commit)
+            .await
+            .expect("the commit's build");
+
+        assert_eq!(found.head_sha, commit);
+        assert_eq!(found.artifact.size_in_bytes, 96_312_803);
+        let requests = requests.lock().expect("requests").clone();
+        assert_eq!(
+            requests[0].path,
+            format!(
+                "/repos/May-Agent/may/actions/workflows/ci.yml/runs?head_sha={commit}&status=success&per_page=30"
+            )
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.authorization == "Bearer test-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_ci_has_not_built_has_no_build() {
+        use crate::test_support::{ApiReply, serve_api};
+
+        let (base, _) =
+            serve_api(|_, _| ApiReply::json(200, r#"{"total_count":0,"workflow_runs":[]}"#)).await;
+        let github = GitHub::new(&base, "test-token".into());
+
+        let error = github
+            .artifact_of_commit(CiPlatform::LinuxX64.artifact(), "0123abc")
+            .await
+            .err()
+            .expect("no build");
+
+        assert!(
+            matches!(&error, UpdateError::NoCommitBuild { name, commit }
+                if name == "may-debug-linux-x64" && commit == "0123abc"),
+            "{error:?}"
         );
     }
 
