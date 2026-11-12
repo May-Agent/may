@@ -51,11 +51,8 @@ runs:
           echo "$!" > "${RUNNER_TEMP}/memory.pid"
         fi
         start=$(date +%s)
-        cargo build --locked --test crash_signal --timings
-        echo "lib with dev features, alone: $(( $(date +%s) - start )) s"
-        start=$(date +%s)
         cargo build --locked --all-targets --timings
-        echo "remaining targets: $(( $(date +%s) - start )) s"
+        echo "all targets in one build: $(( $(date +%s) - start )) s"
     - name: Memory during the build
       if: always() && runner.os == 'macOS'
       shell: bash
