@@ -1,4 +1,3 @@
-mod aux;
 mod background;
 pub mod cards;
 mod hosts;
@@ -7,8 +6,8 @@ mod progress;
 mod recap;
 mod request_ledger;
 mod retry;
+mod sidecar;
 mod suggest;
-pub use aux::AuxTasks;
 pub use background::SessionBackgrounds;
 pub use background::spawn_watcher as spawn_background_watcher;
 pub use background::{
@@ -19,6 +18,7 @@ pub use hosts::{ParkedAgents, context_report, release_agent, usage_report};
 pub use hub::TurnHub;
 pub use progress::ProgressReport;
 pub use recap::{RecapRecord, RecapSchedules};
+pub use sidecar::AuxTasks;
 mod tool_dispatch;
 mod turn_events;
 mod turn_persister;
@@ -5969,7 +5969,7 @@ mod tests {
         );
         let request_id = state.aux_tasks.start(
             "session",
-            super::aux::AuxKind::Suggestion,
+            super::sidecar::AuxKind::Suggestion,
             |_| std::future::pending(),
             &state.tokio_handle,
         );

@@ -256,6 +256,22 @@ async fn forged_closing_tags_do_not_escape_external_blocks() {
     );
 }
 
+/// The prompt of a fresh session whose launch directory is no repository:
+/// it has no clone, so no landing rule, and the usage of every core command
+/// shows no type name and no flag for a positional argument.
+#[tokio::test]
+async fn a_fresh_session_prompt_states_usage_without_type_names_and_no_landing_rule() {
+    let (_session, prefix) = Box::pin(fresh_session("", "")).await;
+    assert!(!prefix.contains("Land code with"), "{prefix}");
+    for type_name in ["AskUserArgs", "SubagentArgs", "positional-"] {
+        assert!(!prefix.contains(type_name), "`{type_name}`:\n{prefix}");
+    }
+    assert!(prefix.contains("<usage command=\"ask_user\">"), "{prefix}");
+    for name in ["aither-sed", "coreutils 0."] {
+        assert!(!prefix.contains(name), "`{name}`:\n{prefix}");
+    }
+}
+
 /// The system prefix of `session`'s first request.
 async fn system_prefix(session: &mut Session) -> String {
     let messages = session

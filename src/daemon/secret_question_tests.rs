@@ -60,7 +60,7 @@ impl Fixture {
     async fn ask(&self, session: &str, name: &str, scope: SecretScope) -> Result<String, String> {
         let args = AskUserArgs {
             question: None,
-            positional_question: None,
+            question_text: None,
             option: Vec::new(),
             multi_select: false,
             secret: None,

@@ -18,7 +18,7 @@ use waterkit_permission::{Permission, PermissionError, PermissionStatus};
 
 use super::proto::{AgentRequest, AgentResponse};
 use super::stream::OfferError;
-use super::{SessionDisplays, SessionStreams, screenshot};
+use super::{SessionDisplays, SessionStreams, launch, screenshot};
 
 /// Everything the agent holds across requests.
 struct AgentState {
@@ -279,6 +279,22 @@ async fn dispatch(request: AgentRequest, state: &AgentState) -> AgentResponse {
                 Err(e) => AgentResponse::Error {
                     error: e.to_string(),
                 },
+            }
+        }
+        AgentRequest::Launch {
+            session_id,
+            app,
+            items,
+        } => {
+            let display = state.displays.lock().await.get(&session_id);
+            let Some(display) = display else {
+                return AgentResponse::Error {
+                    error: "the session has no desktop".to_owned(),
+                };
+            };
+            match launch::launch(app, items, display.display_id()).await {
+                Ok(app) => AgentResponse::Launched { app },
+                Err(error) => AgentResponse::Error { error },
             }
         }
     }
