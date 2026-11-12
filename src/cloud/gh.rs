@@ -62,45 +62,60 @@ impl RemoteShell for CodespaceShell {
         input: Option<Vec<u8>>,
         deadline: Duration,
     ) -> Result<String, CloudError> {
-        let mut command = async_process::Command::from(self.command(script));
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let failed = |message: String| CloudError::Remote { step, message };
-        let mut child = command
-            .spawn()
-            .map_err(|error| failed(format!("cannot run gh: {error}")))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| failed("gh has no standard input".to_owned()))?;
-        let exchange = async {
-            let feed = async {
-                if let Some(bytes) = input {
-                    stdin.write_all(&bytes).await?;
-                }
-                stdin.close().await
-            };
-            let (sent, output) = futures_lite::future::zip(feed, child.output()).await;
-            let output = output.map_err(|error| failed(error.to_string()))?;
-            if !output.status.success() {
-                return Err(failed(error_tail(&output.stderr, output.status)));
-            }
-            sent.map_err(|error| failed(format!("the input was cut off: {error}")))?;
-            String::from_utf8(output.stdout)
-                .map_err(|error| failed(format!("the output is not text: {error}")))
-        };
-        futures_lite::future::or(exchange, async {
-            async_io::Timer::after(deadline).await;
-            Err(failed(format!(
-                "it did not finish within {}s",
-                deadline.as_secs()
-            )))
-        })
-        .await
+        run_command(self.command(script), step, input, deadline).await
     }
+}
+
+/// Runs `command` with `input` on its standard input and returns its
+/// standard output, within `deadline`.
+async fn run_command(
+    command: std::process::Command,
+    step: &'static str,
+    input: Option<Vec<u8>>,
+    deadline: Duration,
+) -> Result<String, CloudError> {
+    let mut command = async_process::Command::from(command);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let failed = |message: String| CloudError::Remote { step, message };
+    let mut child = command
+        .spawn()
+        .map_err(|error| failed(format!("cannot run gh: {error}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| failed("gh has no standard input".to_owned()))?;
+    let exchange = async {
+        let feed = async move {
+            if let Some(bytes) = input {
+                stdin.write_all(&bytes).await?;
+            }
+            // Closing a pipe only flushes it: the child sees the end of its
+            // input when the handle drops, so the handle must not outlive
+            // the write.
+            drop(stdin);
+            Ok(())
+        };
+        let (sent, output) = futures_lite::future::zip(feed, child.output()).await;
+        let output = output.map_err(|error| failed(error.to_string()))?;
+        if !output.status.success() {
+            return Err(failed(error_tail(&output.stderr, output.status)));
+        }
+        sent.map_err(|error: std::io::Error| failed(format!("the input was cut off: {error}")))?;
+        String::from_utf8(output.stdout)
+            .map_err(|error| failed(format!("the output is not text: {error}")))
+    };
+    futures_lite::future::or(exchange, async {
+        async_io::Timer::after(deadline).await;
+        Err(failed(format!(
+            "it did not finish within {}s",
+            deadline.as_secs()
+        )))
+    })
+    .await
 }
 
 /// The last lines of a failed command's error output.
@@ -212,6 +227,24 @@ mod tests {
             .find(|(name, _)| *name == "GH_TOKEN")
             .and_then(|(_, value)| value);
         assert_eq!(token, Some(std::ffi::OsStr::new("account-token")));
+    }
+
+    #[tokio::test]
+    async fn a_command_sees_the_end_of_its_input_once_it_is_written() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "cat"]);
+        let input = "日本語 한국어 中文".as_bytes().to_vec();
+
+        let output = run_command(
+            command,
+            "echo the input",
+            Some(input),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("cat ends when its input does");
+
+        assert_eq!(output, "日本語 한국어 中文");
     }
 
     #[test]
