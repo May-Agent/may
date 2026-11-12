@@ -1,6 +1,6 @@
 ---
 name: computer
-description: Read before driving the session's virtual desktop with the `computer` command: opening applications, clicking, typing and pressing keys, and what to do when the user takes control.
+description: Read before driving the session's virtual desktop with the `computer` command, to open applications, click, type and press keys, and for what to do when the user takes control.
 requires-command: computer
 ---
 
