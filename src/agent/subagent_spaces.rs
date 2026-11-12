@@ -364,7 +364,7 @@ mod tests {
             .subagent(aither_sandbox::SubagentGrant::new(), None, "worker")
             .await
             .expect("the space is prepared");
-        let space = child.working_dir().to_path_buf();
+        let space = child.working_dir().clone();
 
         let printed = CloneSandbox::new(child, std::time::Duration::from_secs(60))
             .run(
@@ -375,9 +375,9 @@ mod tests {
             .await
             .expect("mktemp and both writes succeed");
 
-        let temp = PathBuf::from(printed.trim());
-        assert!(temp.starts_with(&space), "{temp:?} is outside {space:?}");
-        assert!(temp.exists());
+        let made = PathBuf::from(printed.trim());
+        assert!(made.starts_with(&space), "{made:?} is outside {space:?}");
+        assert!(made.exists());
         assert!(space.join("home-file").exists());
         assert!(space.join(".cache/cache-file").exists());
     }
