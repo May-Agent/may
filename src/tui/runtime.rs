@@ -704,8 +704,7 @@ impl RuntimeDeps {
         let messages: Vec<_> = app
             .session_manager
             .current()
-            .map(|session| session.history.messages().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|session| session.history.messages().to_vec());
         app.init_session(&session_id, &messages).await;
         app.chat.push_notice(&format!(
             "Imported {imported_count} messages from {} session {}",

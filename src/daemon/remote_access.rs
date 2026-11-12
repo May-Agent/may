@@ -864,8 +864,7 @@ fn parse_tailnet_host(output: &str) -> Result<String, String> {
     }
     let host = status
         .self_node
-        .map(|node| node.dns_name.trim_end_matches('.').to_string())
-        .unwrap_or_default();
+        .map_or_default(|node| node.dns_name.trim_end_matches('.').to_string());
     if host.is_empty() {
         return Err("this machine has no MagicDNS name; enable MagicDNS for the tailnet".into());
     }

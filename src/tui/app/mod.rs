@@ -2011,8 +2011,7 @@ impl App {
         let messages = self
             .session_manager
             .current()
-            .map(|session| session.history.messages().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|session| session.history.messages().to_vec());
         self.render_history(&messages).await;
         self.scroll = usize::MAX;
     }
