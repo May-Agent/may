@@ -141,6 +141,7 @@ ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendere
 crossterm = "0.28"
 ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
+unicode-segmentation = { version = "1.13", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 ahash = "0.8"
 
