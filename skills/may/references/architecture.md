@@ -40,7 +40,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/skill.rs`: `SkillManager` (list, install from GitHub, register local). `src/bundle/mod.rs`: bundled skills embedded with `include_dir!` from `skills/` and written to `~/.may/skills`.
 - `aither-agent/src/specialized/task.rs`: `subagent` arguments; `aither-agent/subagents/*.toml`: the bundled definitions, written to `~/.may/subagents/`.
 - `src/memory.rs`: profile memory extraction; `templates/prompt/work.md`: the memory directory rule.
-- `src/agent/may.rs`: builds the agent (skills, compaction model, hooks, host load monitor); `templates/prompt/capabilities.md`: the command, skill and subagent catalog, and the usage of the core commands (`ask_user`, `subagent`, `tasks`) as their `--help` prints it (`CoreCommandUsage`, collected in `src/terminal_commands.rs`), so the agent need not run `--help` first. Other commands stay listed by name.
+- `src/agent/may.rs`: builds the agent (skills, compaction model, hooks, host load monitor); `templates/prompt/capabilities.md`: the command, skill and subagent catalog, and the usage of the core commands (`ask_user`, `withdraw_ask_user`, `subagent`, `explore`, `tasks`, and `agent` and `btw` in a session with agent messaging) as their `--help` prints it (`CoreCommandUsage`, collected in `src/terminal_commands.rs`), so the agent need not run `--help` first. Other commands stay listed by name.
 
 ## Repositories, PRs and CI
 

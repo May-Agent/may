@@ -2,9 +2,10 @@
 //! remote and direct listeners require an identity everywhere — config
 //! reads, chat sends, approval responses, the event stream, unmatched paths
 //! and the tunnel `Referer` fallback — and so does a non-loopback `--host`
-//! bind. A loopback bind admits only loopback `Host` and `Origin` headers;
-//! the unix socket admits its owner. The Tailscale identity accepts only a
-//! listed `Tailscale-User-Login`, never a Funnel request.
+//! bind — and refuse an identified request whose `Origin` is not the origin
+//! it was addressed to. A loopback bind admits only loopback `Host` and
+//! `Origin` headers; the unix socket admits its owner. The Tailscale identity
+//! accepts only a listed `Tailscale-User-Login`, never a Funnel request.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -443,6 +444,308 @@ async fn an_identified_tunnel_referer_request_still_reaches_the_tunnel() {
         StatusCode::OK,
         "the fallback proxies an identified request to the tunnel"
     );
+}
+
+/// The node's `MagicDNS` name, the `Host` a browser sends through `tailscale
+/// serve --https=443`.
+const SERVE_HOST: &str = "mac.tail1234.ts.net";
+/// The web UI's origin through `tailscale serve --https=443`.
+const SERVE_ORIGIN: &str = "https://mac.tail1234.ts.net";
+/// A direct bind's tailnet address, as a browser names it in `Host`.
+const DIRECT_HOST: &str = "100.64.0.10:8787";
+/// The web UI's origin on that direct bind.
+const DIRECT_ORIGIN: &str = "http://100.64.0.10:8787";
+
+/// An identified browser request as `tailscale serve` forwards it after
+/// terminating TLS: the browser's `Host` and `Origin` unchanged, the
+/// forwarding headers and the listed login added.
+fn serve_request(method: &str, uri: &str, host: &str, origin: Option<&str>) -> Request {
+    let mut req = browser_request(method, uri, host, origin);
+    let headers = req.headers_mut();
+    headers.insert(
+        "Tailscale-User-Login",
+        "owner@example.com".parse().expect("login header"),
+    );
+    headers.insert("X-Forwarded-Host", host.parse().expect("forwarded host"));
+    headers.insert(
+        "X-Forwarded-Proto",
+        "https".parse().expect("forwarded proto"),
+    );
+    req
+}
+
+/// An identified browser request on a direct bind: the login the
+/// connection's `WhoIs` resolved, and the browser's `Host` and `Origin`.
+fn direct_request(method: &str, uri: &str, host: &str, origin: Option<&str>) -> Request {
+    let mut req = browser_request(method, uri, host, origin);
+    req.extensions_mut()
+        .insert(TailnetLogin("owner@example.com".into()));
+    req
+}
+
+#[tokio::test]
+async fn an_identified_request_from_a_foreign_or_null_origin_gets_403_on_every_path() {
+    let state = state().await;
+    let referer = tunnel_referer(&state).await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let remote = remote_router(&state, source.clone());
+    let direct = direct_router(&state, &source);
+    let paths = [
+        ("a matched route", "POST", "/api/daemon/shutdown", None),
+        ("a matched route", "POST", "/api/sessions/delete-all", None),
+        ("a matched route", "GET", "/api/config", None),
+        ("an unmatched path", "GET", "/src/main.tsx", None),
+        (
+            "the tunnel fallback",
+            "GET",
+            "/src/main.tsx",
+            Some(referer.as_str()),
+        ),
+    ];
+    for origin in ["https://evil.example", "null"] {
+        for (case, method, uri, referer) in paths {
+            for (listener, router, req) in [
+                (
+                    "remote",
+                    &remote,
+                    serve_request(method, uri, SERVE_HOST, Some(origin)),
+                ),
+                (
+                    "direct",
+                    &direct,
+                    direct_request(method, uri, DIRECT_HOST, Some(origin)),
+                ),
+            ] {
+                let req = match referer {
+                    Some(referer) => with_referer(req, referer),
+                    None => req,
+                };
+                assert_eq!(
+                    status(router, req).await,
+                    StatusCode::FORBIDDEN,
+                    "{case} ({method} {uri}) on the {listener} listener must refuse Origin {origin}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn only_the_exact_addressed_origin_passes() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let remote = remote_router(&state, source.clone());
+    let direct = direct_router(&state, &source);
+    let remote_refused = [
+        (
+            "plain http on the served name",
+            "http://mac.tail1234.ts.net",
+        ),
+        ("another port", "https://mac.tail1234.ts.net:8443"),
+        ("another tailnet node", "https://other.tail1234.ts.net"),
+        (
+            "a name under the served one",
+            "https://mac.tail1234.ts.net.evil.example",
+        ),
+        ("a non-http Origin", "file://mac.tail1234.ts.net"),
+    ];
+    for (case, origin) in remote_refused {
+        assert_eq!(
+            status(
+                &remote,
+                serve_request("POST", "/api/daemon/shutdown", SERVE_HOST, Some(origin))
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "{case} is foreign to the remote listener"
+        );
+    }
+    let direct_refused = [
+        ("another port", "http://100.64.0.10:5173"),
+        ("another tailnet address", "http://100.64.0.11:8787"),
+        ("https on a plain-http bind", "https://100.64.0.10:8787"),
+    ];
+    for (case, origin) in direct_refused {
+        assert_eq!(
+            status(
+                &direct,
+                direct_request("POST", "/api/daemon/shutdown", DIRECT_HOST, Some(origin))
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "{case} is foreign to the direct listener"
+        );
+    }
+    // A direct peer reaches the bind without a proxy, so a forwarding header
+    // it sends is its own and does not change the addressed scheme.
+    let mut forged = direct_request(
+        "POST",
+        "/api/daemon/shutdown",
+        DIRECT_HOST,
+        Some("https://100.64.0.10:8787"),
+    );
+    forged.headers_mut().insert(
+        "X-Forwarded-Proto",
+        "https".parse().expect("forwarded proto"),
+    );
+    assert_eq!(
+        status(&direct, forged).await,
+        StatusCode::FORBIDDEN,
+        "the direct listener never reads X-Forwarded-Proto"
+    );
+    // With no authority there is no origin the request was addressed to.
+    let mut no_host = tailscale_request("POST", "/api/daemon/shutdown", "owner@example.com");
+    no_host
+        .headers_mut()
+        .insert("Origin", SERVE_ORIGIN.parse().expect("origin header"));
+    assert_eq!(
+        status(&remote, no_host).await,
+        StatusCode::FORBIDDEN,
+        "an Origin with no authority to match is foreign"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_origin_without_an_identity_still_gets_401() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let remote = remote_router(&state, source.clone());
+    let direct = direct_router(&state, &source);
+    let mut unidentified = serve_request(
+        "GET",
+        "/api/health",
+        SERVE_HOST,
+        Some("https://evil.example"),
+    );
+    unidentified.headers_mut().remove("Tailscale-User-Login");
+    assert_eq!(
+        status(&remote, unidentified).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status(
+            &direct,
+            browser_request(
+                "GET",
+                "/api/health",
+                DIRECT_HOST,
+                Some("https://evil.example")
+            )
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_served_web_ui_and_identified_clients_without_origin_keep_working() {
+    let state = state().await;
+    let referer = tunnel_referer(&state).await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let remote = remote_router(&state, source.clone());
+    let direct = direct_router(&state, &source);
+
+    let mut plain_serve = serve_request(
+        "GET",
+        "/api/health",
+        SERVE_HOST,
+        Some("http://mac.tail1234.ts.net"),
+    );
+    plain_serve.headers_mut().remove("X-Forwarded-Proto");
+    let admitted = [
+        (
+            "the web UI through tailscale serve",
+            &remote,
+            serve_request("GET", "/api/health", SERVE_HOST, Some(SERVE_ORIGIN)),
+        ),
+        (
+            "the web UI on another serve port",
+            &remote,
+            serve_request(
+                "GET",
+                "/api/health",
+                "mac.tail1234.ts.net:8443",
+                Some("https://mac.tail1234.ts.net:8443"),
+            ),
+        ),
+        ("the web UI through plain-http serve", &remote, plain_serve),
+        (
+            "a client without Origin through tailscale serve",
+            &remote,
+            serve_request("GET", "/api/health", SERVE_HOST, None),
+        ),
+        (
+            "a tunnel page through tailscale serve",
+            &remote,
+            with_referer(
+                serve_request("GET", "/src/main.tsx", SERVE_HOST, Some(SERVE_ORIGIN)),
+                &referer,
+            ),
+        ),
+        (
+            "the web UI on a direct bind",
+            &direct,
+            direct_request("GET", "/api/health", DIRECT_HOST, Some(DIRECT_ORIGIN)),
+        ),
+        (
+            "the web UI on a direct bind by MagicDNS name",
+            &direct,
+            direct_request(
+                "GET",
+                "/api/health",
+                "mac.tail1234.ts.net:8787",
+                Some("http://mac.tail1234.ts.net:8787"),
+            ),
+        ),
+        (
+            "the web UI on a direct IPv6 bind",
+            &direct,
+            direct_request(
+                "GET",
+                "/api/health",
+                "[fd7a:115c:a1e0::10]:8787",
+                Some("http://[fd7a:115c:a1e0::10]:8787"),
+            ),
+        ),
+        (
+            "a client without Origin on a direct bind",
+            &direct,
+            direct_request("GET", "/api/health", DIRECT_HOST, None),
+        ),
+        (
+            "a tunnel page on a direct bind",
+            &direct,
+            with_referer(
+                direct_request("GET", "/src/main.tsx", DIRECT_HOST, Some(DIRECT_ORIGIN)),
+                &referer,
+            ),
+        ),
+    ];
+    for (case, router, req) in admitted {
+        assert_eq!(
+            status(router, req).await,
+            StatusCode::OK,
+            "{case} is served"
+        );
+    }
+    for (listener, router, req) in [
+        (
+            "remote",
+            &remote,
+            serve_request("GET", "/no/such/path", SERVE_HOST, Some(SERVE_ORIGIN)),
+        ),
+        (
+            "direct",
+            &direct,
+            direct_request("GET", "/no/such/path", DIRECT_HOST, Some(DIRECT_ORIGIN)),
+        ),
+    ] {
+        assert_eq!(
+            status(router, req).await,
+            StatusCode::NOT_FOUND,
+            "a same-origin request to an unmatched path on the {listener} listener reaches the 404"
+        );
+    }
 }
 
 fn tcp_routers(state: &Arc<DaemonState>) -> TcpRouters {
