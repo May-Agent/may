@@ -377,24 +377,20 @@ async fn the_session_find_subcommand_runs_in_the_managed_bash() {
 }
 
 #[tokio::test]
-async fn sed_runs_only_in_the_forms_the_managed_sed_prints() {
+async fn sed_in_every_form_is_left_to_the_managed_sed() {
     for script in [
         "sed -n '2,3p' file",
-        "sed -n '$p' file",
-        "rg -n x | sed -n '1,5p'",
+        "sed -n '/start/,/end/p' file",
+        "sed -n '/^def foo/,/^def /p' file",
+        "sed -n '/start/,+3p' file",
+        "sed -E 's/(a)b/\\1/' file",
+        "rg -n x | sed '/x/d'",
+        "sed -i 's/a/b/' file",
     ] {
         assert_eq!(
             decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await,
             ScriptDecision::Pass,
-            "`{script}` prints a line range"
-        );
-    }
-    for script in ["sed 's/a/b/' file", "sed -i -n '2p' file"] {
-        let decision = decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await;
-        let text = refusal(&decision).unwrap_or_else(|| panic!("`{script}` is refused"));
-        assert!(
-            text.starts_with("Refused before running: `sed` in scripts only prints line ranges"),
-            "{text}"
+            "`{script}` reaches the managed sed, which refuses what writes"
         );
     }
 }

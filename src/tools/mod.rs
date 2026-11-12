@@ -43,7 +43,7 @@ const EMBEDDED_DISTRIBUTION_SHA256: &str =
 /// SHA-256 of `tool-artifacts.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const MAY_ARTIFACTS_SHA256: &str =
-    "c22543f797223e56211c736b4912de2bf4009705afd15b41b1a40d56d2b93df6";
+    "2249401c82bc1326c9aa59bba7526ad1674cf2d72b723388c6e8f5e1b1fd05ac";
 
 /// May's own host-program pins: `heel` at the version of the `heel` library
 /// May links, which refuses a binary of any other version, and the

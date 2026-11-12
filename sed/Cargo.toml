@@ -17,7 +17,6 @@ clap = { version = "4", default-features = false, features = ["std"] }
 # `--sandbox` refuses the `w`/`W`/`r`/`R`/`e` commands and the `s///w` and
 # `s///e` flags while the script compiles, before any file is opened.
 sed = { version = "0.3.0", default-features = false }
-thiserror = "2"
 
 [[bin]]
 name = "aither-sed"

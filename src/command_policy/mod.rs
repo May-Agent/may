@@ -5,14 +5,11 @@
 //! and so cannot be checked for that; a foreground `sleep`; a script that
 //! only repeats a read of files unchanged since; an `apply_patch` hunk that
 //! only changes whitespace where it carries no meaning; and, in the managed
-//! bash, the host `grep`, `awk` and
-//! `find` and the `sed` forms `may_sed::supports` does not accept. Each
-//! refusal names what to do instead. None of them approves a script that
+//! bash, the host `grep`, `awk` and `find`. Each refusal names what to do instead. None of them approves a script that
 //! leaves the sandbox: each [passes](ScriptDecision::Pass) one it has no
 //! objection to.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -777,12 +774,6 @@ struct HostCommandRefused<'a> {
     replacement: &'a str,
 }
 
-#[derive(Template)]
-#[template(path = "refused_sed.txt")]
-struct SedRefused<'a> {
-    unsupported: &'a may_sed::Unsupported,
-}
-
 /// Host programs a script's own shell does not run, each with what to use
 /// instead.
 const HOST_COMMANDS: [(&str, &str); 3] = [
@@ -791,9 +782,7 @@ const HOST_COMMANDS: [(&str, &str); 3] = [
     ("find", "`fd`"),
 ];
 
-/// Refuses a script whose own shell runs `grep`, `awk` or `find`, or `sed`
-/// in a form `may_sed::supports` does not accept (the line ranges); the
-/// allowed forms run the host `sed`.
+/// Refuses a script whose own shell runs `grep`, `awk` or `find`.
 ///
 /// The rule binds the script's own shell, the way shell functions would: a
 /// command it runs by name, through `time` or `eval` included. A program
@@ -825,14 +814,6 @@ fn host_command(script: &ShellScript) -> Option<ScriptDecision> {
         let name = command.argv().first()?.as_str();
         if !run_by_own_shell(script, command) {
             return None;
-        }
-        if name == "sed" {
-            let arguments = command.arguments().iter().map(OsString::from).collect();
-            return may_sed::supports(arguments).err().map(|unsupported| {
-                refuse(&SedRefused {
-                    unsupported: &unsupported,
-                })
-            });
         }
         HOST_COMMANDS
             .iter()
