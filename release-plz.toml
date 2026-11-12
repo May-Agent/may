@@ -6,7 +6,7 @@ git_release_enable = false
 name = "may-agent"
 git_tag_name = "v{{ version }}"
 
-# `tasks` has no release of its own: cargo-dist builds only `may`.
+# `tasks` ships inside `may` (the daemon links it to its own executable).
 [[package]]
 name = "may-tasks"
 release = false

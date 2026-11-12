@@ -19,5 +19,8 @@ install-updater = true
 # The release binaries are the builds that update from GitHub releases
 # (`src/update/mod.rs`) and embed the web UI.
 features = ["release-build", "ui"]
+# release-plz dispatches the release workflow with the tag it created
+# (`release-plz.yml`): a tag pushed with the workflow token starts no workflow.
+dispatch-releases = true
 # Steps every build job runs first: the toolchain pieces CI also installs.
 github-build-setup = "../build-setup.yml"

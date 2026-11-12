@@ -30,13 +30,21 @@ jobs:
       - uses: MarcoIeni/release-plz-action@v0.5
         id: release-plz
         env:
-          # The tag release-plz pushes starts the cargo-dist workflow
-          # (release.yml), and a push made with the workflow's own token
-          # starts no workflow: RELEASE_TOKEN is a token of a user or app
-          # that can push tags and open PRs, and the fallback only keeps
-          # the release PR working until it exists.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+      # A tag pushed with the workflow's token starts no workflow, but a
+      # workflow_dispatch it sends does: the cargo-dist workflow (release.yml,
+      # `dispatch-releases`) builds and publishes the release of the tag.
+      - name: Dispatch the release build
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          set -euo pipefail
+          tag=$(jq -r '.[] | select(.package_name == "may-agent") | .tag' <<< "${RELEASES}")
+          test -n "${tag}"
+          gh workflow run release.yml --ref "${tag}" -f tag="${tag}"
       # GitHub holds the pull request runs of a pull request the Actions bot
       # opened or pushed until they are approved, and the required
       # `CI result` reports on the pull request only from those runs.
