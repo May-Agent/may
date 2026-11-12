@@ -305,6 +305,9 @@ jobs:
       - clippy
       - test-ubuntu
       - test-macos
+      - container-image
+      - verify-tools
+      - container-acceptance
       - web-ui
     runs-on: ubuntu-latest
     timeout-minutes: 5
