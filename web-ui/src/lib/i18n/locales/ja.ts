@@ -132,6 +132,14 @@ export const ja: Messages = {
       empty: '利用可能なモデルがありません',
       searchPlaceholder: 'モデルを検索…',
     },
+    machinePicker: {
+      label: 'セッションの実行場所',
+      thisMachine: 'このマシン',
+      codespace: 'GitHub Codespace',
+      loading: 'マシンタイプを読み込み中…',
+      failed: 'マシンタイプを読み込めませんでした: {error}',
+      size: '{cpus} コア · {memory} GB',
+    },
     thinkingPicker: {
       label: '思考',
       none: 'オフ',
@@ -289,6 +297,18 @@ export const ja: Messages = {
     didConnect: 'ブラウザに接続しました',
     didRead: '{page} を読みました',
     didOther: 'ブラウザを使用しました',
+  },
+  cloudSession: {
+    creating: 'Codespace を作成しています…',
+    starting: 'Codespace を起動しています…',
+    checking: 'Codespace の May を確認しています…',
+    downloading: 'Codespace 用の May をダウンロードしています…',
+    installing: 'Codespace に May をインストールしています…',
+    cloning: 'Codespace にリポジトリをクローンしています…',
+    startingDaemon: 'Codespace で May を起動しています…',
+    connecting: 'Codespace に接続しています…',
+    failed: 'Codespace を起動できませんでした: {error}',
+    suspended: 'Codespace は停止中です。メッセージを送ると起動します。',
   },
   computer: {
     title: 'コンピュータ',

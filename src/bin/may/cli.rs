@@ -75,6 +75,8 @@ pub enum DaemonCommand {
     Stop,
     /// Stop the running daemon and start one of this build.
     Restart,
+    /// Start a daemon of this build unless one already runs.
+    Start,
 }
 
 /// Parsed `may exec` invocation.
@@ -214,6 +216,8 @@ enum DaemonAction {
     Stop,
     /// Stop the running daemon and start one of this build.
     Restart,
+    /// Start a daemon of this build unless one already runs.
+    Start,
 }
 
 #[derive(Debug, Args)]
@@ -386,6 +390,7 @@ impl From<Option<DaemonAction>> for DaemonCommand {
             Some(DaemonAction::Status) => Self::Status,
             Some(DaemonAction::Stop) => Self::Stop,
             Some(DaemonAction::Restart) => Self::Restart,
+            Some(DaemonAction::Start) => Self::Start,
         }
     }
 }
@@ -579,6 +584,7 @@ mod tests {
             (Some("status"), DaemonCommand::Status),
             (Some("stop"), DaemonCommand::Stop),
             (Some("restart"), DaemonCommand::Restart),
+            (Some("start"), DaemonCommand::Start),
         ] {
             let mut argv = vec!["may", "daemon"];
             argv.extend(word);

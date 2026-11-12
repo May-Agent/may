@@ -130,6 +130,14 @@ export const enUS = {
       empty: 'No models available',
       searchPlaceholder: 'Search models…',
     },
+    machinePicker: {
+      label: 'Where the session runs',
+      thisMachine: 'This machine',
+      codespace: 'GitHub Codespace',
+      loading: 'Loading machine types…',
+      failed: 'Couldn’t load the machine types: {error}',
+      size: '{cpus} cores · {memory} GB',
+    },
     thinkingPicker: {
       label: 'Thinking',
       none: 'Off',
@@ -287,6 +295,18 @@ export const enUS = {
     didConnect: 'Connected to the browser',
     didRead: 'Read {page}',
     didOther: 'Used the browser',
+  },
+  cloudSession: {
+    creating: 'Creating the codespace…',
+    starting: 'Starting the codespace…',
+    checking: 'Checking May on the codespace…',
+    downloading: 'Downloading May for the codespace…',
+    installing: 'Installing May on the codespace…',
+    cloning: 'Cloning the repository into the codespace…',
+    startingDaemon: 'Starting May on the codespace…',
+    connecting: 'Connecting to the codespace…',
+    failed: 'The codespace could not be brought up: {error}',
+    suspended: 'The codespace is suspended. Send a message to wake it.',
   },
   computer: {
     title: 'Computer',

@@ -395,8 +395,10 @@ async fn build_exec_shell(
         },
         futures_lite::future::try_zip(
             async {
+                // A one-shot run is never a cloud home: nothing is pushed to it.
+                let pushed = may_agent::cloud::access::PushedProviders::default();
                 resolve_provider_runtime(
-                    may_config,
+                    may_agent::agent::Providers::new(may_config, &pushed),
                     model,
                     0,
                     &may_agent::secrets::SecretRedactor::new(&context.may_dir),

@@ -6,6 +6,7 @@ import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment, AttachmentKind } from '@/lib/types';
 import { uploadAttachment } from '@/lib/api/artifacts';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { MachinePicker } from './MachinePicker';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
 
@@ -216,6 +217,7 @@ export function Composer({
             </Tooltip>
           )}
           <div className="mx-1 h-4 w-px bg-border" />
+          <MachinePicker sessionId={sessionId} disabled={disabled} />
           <ModelPicker
             sessionId={sessionId}
             currentModel={currentModel}

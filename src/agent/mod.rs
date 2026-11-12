@@ -62,6 +62,7 @@ mod runtime_context;
 #[cfg(test)]
 mod secret_redaction_tests;
 mod session_find;
+mod session_model;
 /// Session tool registration for the agent.
 pub mod session_tool;
 /// Authorization for the SSH servers `terminal` commands name.
@@ -101,13 +102,14 @@ pub use permission::{
 };
 pub(crate) use provider::reasoning_text_requested;
 pub use provider::{
-    ModelSlot, ProviderLlm, RedactedError, RedactedModel, ResolvedProviderRuntime,
+    ModelSlot, ProviderLlm, Providers, RedactedError, RedactedModel, ResolvedProviderRuntime,
     build_fast_provider_chain, provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{
     AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
     spawn_idle_worker, spawn_worker,
 };
+pub use session_model::{PushedModel, SessionModel};
 pub use subagent_tracker::{RunCard, RunUsage, SubagentRunSnapshot, SubagentTracker, TrackedRun};
 pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,

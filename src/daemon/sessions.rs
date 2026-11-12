@@ -463,21 +463,34 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
     }
 }
 
+/// Where a new session's name comes from.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SessionName<'a> {
+    /// The daemon's generator draws one.
+    Generate,
+    /// A client brings one the daemon issued it.
+    Issued(&'a str),
+    /// The daemon fronting this cloud home brings one its own generator
+    /// drew, so the session has the same name on both daemons.
+    Fronting(&'a str),
+}
+
 /// Creates the durable DB row and session directory layout for a profile.
 ///
 /// Shared by the regular create-session endpoint and notification callbacks,
 /// which open a fresh conversation in the originating profile.
 pub(super) async fn create_session_for_profile(
     state: &Arc<DaemonState>,
-    id: Option<&str>,
+    name: SessionName<'_>,
     profile_id: Option<&str>,
     model: &str,
 ) -> SkyResult<String> {
     let db = state.db();
     // Every session is named by the one generator: a name a client brings
-    // is one the daemon issued it and no session took yet.
-    let id = match id {
-        Some(id) => {
+    // is one the daemon issued it and no session took yet. A cloud home's
+    // sessions are named by the generator of the daemon fronting it.
+    let id = match name {
+        SessionName::Issued(id) => {
             if !db.session_name_unused(id).await.map_err(internal_error)? {
                 return Err(bad_request_error(
                     "session name was not issued by this daemon or is already taken",
@@ -485,7 +498,13 @@ pub(super) async fn create_session_for_profile(
             }
             id.to_string()
         }
-        None => db
+        SessionName::Fronting(id) => {
+            if db.get_session(id).await.map_err(internal_error)?.is_some() {
+                return Err(bad_request_error("session name is already taken"));
+            }
+            id.to_string()
+        }
+        SessionName::Generate => db
             .issue_session_name()
             .await
             .map_err(internal_error)?
@@ -535,10 +554,24 @@ pub(super) async fn issue_session_name(
 }
 
 pub(super) async fn create_session(
+    fronted: super::auth::Fronted,
     Json(req): Json<CreateSessionRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let requested_profile_id = req.profile_id.clone();
+    let name = match (req.id.as_deref(), fronted) {
+        (Some(id), super::auth::Fronted(true)) => SessionName::Fronting(id),
+        (Some(id), super::auth::Fronted(false)) => SessionName::Issued(id),
+        (None, _) => SessionName::Generate,
+    };
+    let cloud_account = match &req.cloud {
+        Some(_) => Some(cloud_account(&state, requested_profile_id.as_deref()).await?),
+        None => None,
+    };
+    let cloud_project = match (&req.cloud, req.repo.as_deref()) {
+        (Some(_), Some(spec)) => Some(cloud_repository(spec)?),
+        _ => None,
+    };
     let model = {
         let config = state.config_snapshot();
         req.model
@@ -550,18 +583,14 @@ pub(super) async fn create_session(
     let resolved_profile_id = requested_profile_id
         .clone()
         .or_else(|| Some(state.default_profile_id.clone()));
-    let id = create_session_for_profile(
-        &state,
-        req.id.as_deref(),
-        resolved_profile_id.as_deref(),
-        &model,
-    )
-    .await?;
+    let id =
+        create_session_for_profile(&state, name, resolved_profile_id.as_deref(), &model).await?;
+    // A cloud session works in its codespace's workspace, never here.
     if let Some(cwd) = req
         .cwd
         .as_deref()
         .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
+        .filter(|cwd| !cwd.is_empty() && req.cloud.is_none())
     {
         state
             .db()
@@ -581,14 +610,88 @@ pub(super) async fn create_session(
             .map_err(internal_error)?;
     }
 
-    persist_last_model(&state, &model)
-        .await
-        .map_err(internal_error)?;
+    let location = match (&req.cloud, &cloud_account) {
+        (Some(cloud), Some(account)) => {
+            let created = state
+                .cloud_sessions
+                .create(&id, account, cloud_project.as_ref(), &cloud.machine_type)
+                .await;
+            match created {
+                Ok(location) => Some(location),
+                Err(error) => {
+                    // No codespace serves it: the session is not kept.
+                    let _ = state.db().delete_session(&id).await;
+                    return Err(bad_request_error(error.to_string()));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // The model a user last chose is this machine's user's choice; a cloud
+    // home's sessions carry the choice made on the fronting daemon.
+    if !fronted.0 {
+        persist_last_model(&state, &model)
+            .await
+            .map_err(internal_error)?;
+    }
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
 
     let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
     session.repo = resolve_repo_binding(req.repo.as_deref()).ok().flatten();
+    session.location = location;
     Ok(Json(session))
+}
+
+/// The Codespaces account `profile_id` runs cloud sessions as.
+async fn cloud_account(
+    state: &Arc<DaemonState>,
+    profile_id: Option<&str>,
+) -> SkyResult<crate::cloud::CodespacesAccount> {
+    let profile_id = profile_id.unwrap_or(&state.default_profile_id);
+    state
+        .db()
+        .profile_cloud(profile_id)
+        .await
+        .map_err(internal_error)?
+        .codespaces
+        .ok_or_else(|| {
+            bad_request_error(
+                "this profile has no Codespaces account; set one up with /cloud first",
+            )
+        })
+}
+
+/// The GitHub repository a cloud session binds: a codespace is created
+/// from a GitHub repository, never a local checkout.
+fn cloud_repository(spec: &str) -> SkyResult<crate::workspace::GitHubRepository> {
+    let spec = spec.trim();
+    spec.strip_prefix("github:")
+        .unwrap_or(spec)
+        .parse()
+        .map_err(|_| {
+            bad_request_error(format!(
+                "a cloud session's repository is a GitHub repository (owner/repo), not {spec}"
+            ))
+        })
+}
+
+/// `POST /api/profiles/{id}/cloud/codespaces/catalog` — the machine types
+/// a cloud session of the profile with the repository may start on.
+pub(super) async fn cloud_catalog(
+    params: Params,
+    Json(req): Json<super::types::CloudCatalogRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::CloudCatalogResponse>> {
+    let profile_id = params.get("id").map_err(bad_request_error)?.to_string();
+    let account = cloud_account(&state, Some(&profile_id)).await?;
+    let project = req.repo.as_deref().map(cloud_repository).transpose()?;
+    let machines = state
+        .cloud_sessions
+        .catalog(&account, project.as_ref())
+        .await
+        .map_err(|error| bad_request_error(error.to_string()))?;
+    Ok(Json(super::types::CloudCatalogResponse { machines }))
 }
 
 /// Normalize a repo spec into a stored binding: `owner/repo` or a
@@ -663,6 +766,13 @@ pub(super) async fn delete_session(
     let secrets = crate::secrets::SecretStore::new(&state.may_dir);
     let session_id = id.clone();
     blocking::unblock(move || secrets.remove_session(&session_id))
+        .await
+        .map_err(internal_error)?;
+    // So is its codespace: a failed deletion keeps the session, so the
+    // delete can be retried instead of leaving the machine running.
+    state
+        .cloud_sessions
+        .delete(&id)
         .await
         .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;

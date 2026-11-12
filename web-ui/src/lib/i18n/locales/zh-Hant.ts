@@ -132,6 +132,14 @@ export const zhHant: Messages = {
       empty: '沒有可用的模型',
       searchPlaceholder: '搜尋模型…',
     },
+    machinePicker: {
+      label: '工作階段的執行位置',
+      thisMachine: '這台電腦',
+      codespace: 'GitHub Codespace',
+      loading: '正在載入機器類型…',
+      failed: '無法載入機器類型：{error}',
+      size: '{cpus} 核心 · {memory} GB',
+    },
     thinkingPicker: {
       label: '思考',
       none: '關閉',
@@ -289,6 +297,18 @@ export const zhHant: Messages = {
     didConnect: '已連接瀏覽器',
     didRead: '已閱讀 {page}',
     didOther: '已使用瀏覽器',
+  },
+  cloudSession: {
+    creating: '正在建立 Codespace…',
+    starting: '正在啟動 Codespace…',
+    checking: '正在檢查 Codespace 上的 May…',
+    downloading: '正在為 Codespace 下載 May…',
+    installing: '正在 Codespace 上安裝 May…',
+    cloning: '正在將儲存庫複製到 Codespace…',
+    startingDaemon: '正在 Codespace 上啟動 May…',
+    connecting: '正在連接 Codespace…',
+    failed: '無法啟動 Codespace：{error}',
+    suspended: 'Codespace 已暫停。傳送訊息即可喚醒。',
   },
   computer: {
     title: '电脑',

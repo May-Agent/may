@@ -323,6 +323,9 @@ pub struct MayAgentSessionInput<'a> {
     pub db: crate::db::ChatDb,
     /// Concrete model identifier selected for this request.
     pub model: &'a str,
+    /// The providers a fronting daemon pushed, laid over the configured
+    /// ones; empty off a cloud home.
+    pub pushed_providers: crate::cloud::access::PushedProviders,
     /// Reasoning effort override, if any.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Prompt-cache epoch of the agent this one replaces; 0 for a first build.
@@ -1240,6 +1243,7 @@ impl MayAgent {
             ask_user_broker,
             db,
             model,
+            pushed_providers,
             reasoning_effort,
             prompt_cache_epoch,
             profile_id,
@@ -1268,16 +1272,17 @@ impl MayAgent {
             limits,
             model_context_window,
         } = input;
+        let providers = super::Providers::new(may_config, &pushed_providers);
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
         let resolved_provider =
-            resolve_provider_runtime(may_config, &selector, provider_attempt, &redactor).await?;
+            resolve_provider_runtime(providers, &selector, provider_attempt, &redactor).await?;
         let provider_id = resolved_provider.provider_id;
         let llm = resolved_provider
             .llm
             .with_context_window(model_context_window);
         let request_parameters =
-            super::provider::session_request_parameters(may_config, &selector, reasoning_effort);
+            super::provider::session_request_parameters(providers, &selector, reasoning_effort);
 
         let ssh_servers = crate::profile::resolve_attached_ssh_servers(
             &db,
@@ -1292,22 +1297,22 @@ impl MayAgent {
         })?;
 
         let ask_models = super::provider::resolve_ask_tier_models(
-            may_config,
+            providers,
             &provider_id,
             selector.model_id(),
             &redactor,
         )
         .await?;
         let compaction_llm = super::provider::resolve_compaction_model(
-            may_config,
+            providers,
             &provider_id,
             selector.model_id(),
             &redactor,
         )
         .await?;
-        let cache_lifetime = may_config
-            .get_provider(&provider_id)
-            .map(|instance| instance.cache_lifetime)
+        let cache_lifetime = providers
+            .get(&provider_id)
+            .map(|provider| provider.instance.cache_lifetime)
             .ok_or_else(|| {
                 MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
             })?;
@@ -1917,7 +1922,7 @@ impl MayAgent {
 
 /// Returns None if title generation fails.
 pub async fn generate_session_title(
-    config: &MayConfig,
+    providers: super::Providers<'_>,
     user_message: &str,
     assistant_response: &str,
     redactor: &crate::secrets::SecretRedactor,
@@ -1926,17 +1931,19 @@ pub async fn generate_session_title(
     use aither_core::llm::{LLMRequest, Message};
     use futures_lite::StreamExt;
 
-    // Get a fast model
-    let selector = config
-        .default_model_for_tier(crate::config::ModelTier::Fast)
-        .or(config.last_model.as_ref())?;
+    // A fast model, else the model last chosen.
+    let selector = providers
+        .tier(crate::config::ModelTier::Fast)
+        .into_iter()
+        .next()
+        .or_else(|| providers.config().last_model.clone())?;
     let provider_id = selector.provider_id();
-    let provider = config.get_provider(provider_id)?;
+    let provider = providers.get(provider_id)?;
 
     // Build the cloud provider
     let llm = super::provider::build_cloud_provider_from_instance(
         provider_id,
-        provider,
+        &provider,
         selector.model_id(),
         redactor,
     )

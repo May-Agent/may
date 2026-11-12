@@ -3601,7 +3601,10 @@ async fn resolve_session_context(
     let cfg = state.config_snapshot();
     let current_model = resolve_default_model(&cfg, session_model)
         .ok_or(UiChatPreparationError::MissingModelConfiguration)?;
-    let provider_candidate_count = crate::agent::provider_candidate_count(&cfg, &current_model);
+    let provider_candidate_count = crate::agent::provider_candidate_count(
+        crate::agent::Providers::new(&cfg, &state.pushed_providers),
+        &current_model,
+    );
     if provider_candidate_count == 0 {
         return Err(UiChatPreparationError::NoProviderAvailable {
             model: current_model.clone(),
@@ -4212,7 +4215,7 @@ fn prepare_agent_for_request<'a>(
                 .await
                 .map_err(|error| UiChatPreparationError::BuildAgent(error.into()))?
         };
-        let build_key = agent_build_key(&config, &workspace_config, &ctx);
+        let build_key = agent_build_key(&config, &state.pushed_providers, &workspace_config, &ctx);
         // The session's idle agent continues the conversation when it was
         // built from the same inputs; a resumed turn exists only for what
         // that agent collected, so it takes the agent whatever changed.
@@ -4323,6 +4326,7 @@ fn build_session_agent<'a>(
                 ask_user_broker: brokers.ask_user,
                 db: state.db(),
                 model: &ctx.current_model,
+                pushed_providers: state.pushed_providers.clone(),
                 reasoning_effort: ctx.reasoning_effort,
                 profile_id: ctx.profile_id.clone(),
                 permission_approver: Some({
@@ -4424,12 +4428,14 @@ fn build_session_agent<'a>(
 }
 
 /// A fingerprint of everything `ctx`'s agent is built from, so a turn can
-/// tell whether the session's idle agent still fits: the configuration, the
+/// tell whether the session's idle agent still fits: the configuration and
+/// the providers a fronting daemon pushed, the
 /// model and its reasoning effort, the profile, its persona and memories,
 /// the plan state, where the session works and the workspace configuration
 /// (trust, workdirs) its grants, mounts, clone and PR contexts come from.
 fn agent_build_key(
     config: &crate::config::MayConfig,
+    pushed: &crate::cloud::access::PushedProviders,
     workspace: &crate::workspace::WorkspaceConfig,
     ctx: &SessionContext,
 ) -> u64 {
@@ -4439,6 +4445,9 @@ fn agent_build_key(
     serde_json::to_string(config)
         .unwrap_or_default()
         .hash(&mut hasher);
+    // The pushed providers' configurations, not their access tokens: the
+    // agent's models read a new token for each request.
+    pushed.fingerprint().hash(&mut hasher);
     toml::to_string(workspace)
         .expect("a parsed workspace configuration serializes")
         .hash(&mut hasher);

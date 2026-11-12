@@ -80,6 +80,9 @@ pub struct StartedDaemon {
     /// `WhoIs`-resolved login, for non-loopback TCP binds (`--host` and
     /// `[daemon] listen`), answering only requests addressed to the node.
     pub(crate) direct_router: Router,
+    /// This machine's cloud home record, when a fronting daemon bootstrapped
+    /// it: the remote listener binds its port.
+    pub(crate) cloud_home: Option<crate::cloud::home::CloudHome>,
     /// The webhook routes alone, for the public listener Tailscale Funnel
     /// targets. It holds no other route.
     pub(crate) webhook_router: Router,
@@ -218,26 +221,9 @@ pub async fn start(
         .with_runtime_service(runtime_service.clone())
         .with_secret_store(crate::secrets::SecretStore::new(&may_dir));
 
-    // Initialize memory processor with fast-tier provider chain
-    let memory_processor = match crate::agent::build_fast_provider_chain(
-        &config,
-        &crate::secrets::SecretRedactor::new(&may_dir),
-    )
-    .await
-    {
-        Ok(memory_providers) => {
-            tracing::info!("Profile memory processor enabled");
-            Some(crate::memory::MemoryProcessor::new(
-                db_for_archive.clone(),
-                memory_providers,
-            ))
-        }
-        Err(e) => {
-            tracing::debug!("Profile memory processor unavailable (no fast model): {e}");
-            None
-        }
-    };
-
+    // A cloud home's fronting daemon pushes its providers once this daemon
+    // serves; until then there are none.
+    let pushed_providers = crate::cloud::access::PushedProviders::default();
     // Initialize Web Push notification manager
     let notification_manager =
         crate::notification::NotificationManager::new(&may_dir, db_for_archive.clone())
@@ -286,6 +272,26 @@ pub async fn start(
 
     let live_limits = crate::agent::LiveLimits::of(&config);
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
+    // Each extraction resolves its models when it runs, so a model
+    // configured or pushed later is used.
+    let memory_processor = Some(crate::memory::MemoryProcessor::new(
+        db_for_archive.clone(),
+        crate::memory::MemoryModels::new(
+            config.clone(),
+            pushed_providers.clone(),
+            crate::secrets::SecretRedactor::new(&may_dir),
+        ),
+    ));
+    let cloud_sessions = Arc::new(
+        super::cloud_sessions::CloudSessions::load(
+            db_for_archive.clone(),
+            super::cloud_sessions::GitHubCloud,
+            config.clone(),
+            ui_event_bus.clone(),
+        )
+        .await
+        .context("failed to read the cloud sessions")?,
+    );
     let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
         config.clone(),
         crate::session::MayHomePaths::new(may_dir.clone()),
@@ -314,6 +320,8 @@ pub async fn start(
         browser_lifecycle_tx,
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
+        cloud_sessions,
+        pushed_providers,
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
             ui_event_bus.clone(),
@@ -382,13 +390,22 @@ pub async fn start(
     super::pr_checks::spawn(state.clone());
     super::auto_update::spawn(state.clone());
     // The tailscale-serve listener trusts Serve's identity header; a direct
-    // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
+    // non-loopback bind trusts only the peer's `WhoIs`-resolved login. On a
+    // cloud home it also admits the fronting daemon's bearer token.
+    let cloud_home = crate::cloud::home::CloudHome::load(&state.may_dir)
+        .context("failed to read the cloud home record")?;
+    let mut remote_sources: Vec<Box<dyn super::auth::IdentitySource>> =
+        vec![Box::new(state.remote_access_manager.tailscale_identity())];
+    if let Some(home) = &cloud_home {
+        remote_sources.push(Box::new(super::auth::FrontingTokenIdentitySource::new(
+            home.digest().context("the cloud home record is unusable")?,
+            home.owner.clone(),
+        )));
+    }
     let remote_router = build_router(
         state.clone(),
         mode,
-        super::auth::RequireIdentity::new(vec![Box::new(
-            state.remote_access_manager.tailscale_identity(),
-        )]),
+        super::auth::RequireIdentity::new(remote_sources),
     );
     let node_names =
         super::auth::NodeNamesCache::new(super::remote_access::TailscaleNodeNames(state.clone()));
@@ -414,6 +431,7 @@ pub async fn start(
         loopback_router,
         remote_router,
         direct_router,
+        cloud_home,
         webhook_router,
     })
 }
@@ -472,6 +490,8 @@ fn api_routes() -> Route {
             "/events".at(stream_events),
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
             "/session-names".post(super::sessions::issue_session_name),
+            "/cloud-home/providers/{id}".put(super::cloud_home::push_provider),
+            "/cloud-home/tiers".put(super::cloud_home::push_tiers),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
                 "".post(create_session),
@@ -551,6 +571,7 @@ fn api_routes() -> Route {
                 "/{id}/remotes".at(get_profile_remote_servers),
                 "/{id}/remotes".put(set_profile_remote_servers),
                 "/{id}/cloud/codespaces".put(set_profile_codespaces),
+                "/{id}/cloud/codespaces/catalog".post(super::sessions::cloud_catalog),
                 "/{id}/cloud/codespaces".delete(remove_profile_codespaces),
             ))),
         )),
@@ -690,10 +711,13 @@ pub(super) fn build_router(
     let artifact_pages = "/profile".route(artifact_page_routes());
     let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());
 
-    // Layers run outermost-first in registration order.
+    // Layers run outermost-first in registration order: the access policy,
+    // then the relay of cloud sessions to their codespace daemons.
+    let relay = super::cloud_sessions::CloudSessionRelay::new(state.cloud_sessions.clone());
     match mode {
         DaemonMode::Rest => Route::new((api, tunnel, artifact_pages))
             .layer(policy)
+            .layer(relay)
             .layer(fallback)
             .middleware(State(state))
             .build(),
@@ -707,13 +731,14 @@ pub(super) fn build_router(
                     EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
                 ))
                 .layer(policy)
+                .layer(relay)
                 .layer(fallback)
                 .middleware(State(state))
                 .build()
             }
             #[cfg(not(feature = "ui"))]
             {
-                let _ = api;
+                let _ = (api, relay);
                 panic!(
                     "`may ui` should fail before router construction when the `ui` feature is disabled"
                 );

@@ -245,6 +245,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.cloud_configured(result);
             Ok(None)
         }
+        AppEvent::CloudCatalog(result) => {
+            app.cloud_catalog_loaded(result);
+            Ok(None)
+        }
+        AppEvent::CloudSession(event) => {
+            app.cloud_session_step(&event);
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat

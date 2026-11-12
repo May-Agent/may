@@ -5,12 +5,17 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{Codespaces, CodespacesAccount, ENVIRONMENT_REPOSITORY};
+use super::{
+    CodespaceSource, Codespaces, CodespacesAccount, ENVIRONMENT_DEVCONTAINER,
+    ENVIRONMENT_REPOSITORY,
+};
 use crate::cloud::{
     CloudError, CloudMachine, CloudProvider, MachineId, MachineState, MachineType, NewMachine,
+    RunningWait, until_running,
 };
 use crate::issue::github::GitHubRest;
 use crate::pr::PrTokenSource;
@@ -25,6 +30,12 @@ const CODESPACE: &str = include_str!("fixtures/codespace.json");
 const REPOSITORY: &str = include_str!("fixtures/full_repository.json");
 /// `GET /user`, as documented.
 const USER: &str = include_str!("fixtures/user.json");
+/// `GET /repos/{owner}/{repo}/codespaces/devcontainers`, as documented.
+const DEVCONTAINERS: &str = include_str!("fixtures/codespace_devcontainers.json");
+/// A file of `GET /repos/{owner}/{repo}/contents/{path}`, as documented.
+const CONTENT_FILE: &str = include_str!("fixtures/content_file.json");
+/// `PUT /repos/{owner}/{repo}/contents/{path}`, as documented.
+const FILE_COMMIT: &str = include_str!("fixtures/file_commit.json");
 
 /// The documented examples' account and codespace.
 const LOGIN: &str = "octocat";
@@ -154,6 +165,15 @@ fn project() -> GitHubRepository {
     "octocat/Hello-World".parse().expect("repository")
 }
 
+/// The project as a source, without a devcontainer.
+fn project_source() -> CodespaceSource {
+    CodespaceSource {
+        repository: project(),
+        devcontainer_path: None,
+        clone: None,
+    }
+}
+
 fn standard_linux() -> MachineType {
     MachineType {
         name: "standardLinux".into(),
@@ -235,15 +255,86 @@ async fn the_catalog_is_the_repositorys_machine_list() {
     )])
     .await;
 
-    let catalog = api.provider().catalog(&project()).await.expect("catalog");
+    let catalog = api
+        .provider()
+        .catalog(&project_source())
+        .await
+        .expect("catalog");
 
     assert_eq!(catalog, [standard_linux(), premium_linux()]);
     api.assert_sent();
 }
 
+/// The documented devcontainer listing, cut to `paths`.
+fn devcontainers(paths: &[&str]) -> String {
+    let mut listing: Value = serde_json::from_str(DEVCONTAINERS).expect("listing fixture");
+    let kept: Vec<Value> = listing["devcontainers"]
+        .as_array()
+        .expect("devcontainers")
+        .iter()
+        .filter(|entry| paths.iter().any(|path| entry["path"] == *path))
+        .cloned()
+        .collect();
+    listing["total_count"] = json!(kept.len());
+    listing["devcontainers"] = Value::Array(kept);
+    listing.to_string()
+}
+
+/// The documented file of the contents API holding `text`, encoded as
+/// GitHub sends it: base64 in lines of 60.
+fn content_file(text: &str) -> String {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let lines: Vec<String> = encoded
+        .as_bytes()
+        .chunks(60)
+        .map(|line| String::from_utf8(line.to_vec()).expect("base64 is ASCII"))
+        .collect();
+    let mut file: Value = serde_json::from_str(CONTENT_FILE).expect("content fixture");
+    file["content"] = json!(lines.join("\n") + "\n");
+    file.to_string()
+}
+
+fn environment() -> GitHubRepository {
+    format!("{LOGIN}/{ENVIRONMENT_REPOSITORY}")
+        .parse()
+        .expect("repository")
+}
+
+/// The environment repository's devcontainer path, read and written.
+fn environment_devcontainer_path() -> String {
+    format!("/repos/{LOGIN}/{ENVIRONMENT_REPOSITORY}/contents/{ENVIRONMENT_DEVCONTAINER}")
+}
+
 #[tokio::test]
-async fn a_session_repository_is_the_source_as_it_is() {
-    let api = Recorded::serve(Vec::new()).await;
+async fn a_project_whose_devcontainer_has_an_ssh_server_is_the_source() {
+    let devcontainer = r#"{
+        // The project's own image, with the SSH server feature.
+        "image": "mcr.microsoft.com/devcontainers/rust:1",
+        "features": {
+            "ghcr.io/devcontainers/features/sshd:1": {},
+        },
+    }"#;
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            "/repos/octocat/Hello-World/codespaces/devcontainers",
+            ApiReply::json(
+                200,
+                devcontainers(&[
+                    ".devcontainer/foobar/devcontainer.json",
+                    ".devcontainer/devcontainer.json",
+                ]),
+            ),
+        ),
+        exchange(
+            "GET",
+            "/repos/octocat/Hello-World/contents/.devcontainer/devcontainer.json",
+            ApiReply::json(200, content_file(devcontainer)),
+        ),
+    ])
+    .await;
 
     let source = api
         .provider()
@@ -251,47 +342,162 @@ async fn a_session_repository_is_the_source_as_it_is() {
         .await
         .expect("source");
 
-    assert_eq!(source, project());
+    assert_eq!(
+        source,
+        CodespaceSource {
+            repository: project(),
+            devcontainer_path: Some(".devcontainer/devcontainer.json".into()),
+            clone: None,
+        }
+    );
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_project_without_a_devcontainer_gets_githubs_default_image_which_has_ssh() {
+    let api = Recorded::serve(vec![exchange(
+        "GET",
+        "/repos/octocat/Hello-World/codespaces/devcontainers",
+        ApiReply::json(200, devcontainers(&[])),
+    )])
+    .await;
+
+    let source = api
+        .provider()
+        .source(Some(&project()))
+        .await
+        .expect("source");
+
+    assert_eq!(
+        source,
+        CodespaceSource {
+            repository: project(),
+            devcontainer_path: None,
+            clone: None,
+        }
+    );
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_project_without_an_ssh_server_is_cloned_into_the_environment_repository() {
+    let devcontainer = r#"{ "image": "mcr.microsoft.com/devcontainers/rust:1" }"#;
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            "/repos/octocat/Hello-World/codespaces/devcontainers",
+            ApiReply::json(200, devcontainers(&[".devcontainer.json"])),
+        ),
+        exchange(
+            "GET",
+            "/repos/octocat/Hello-World/contents/.devcontainer.json",
+            ApiReply::json(200, content_file(devcontainer)),
+        ),
+        exchange(
+            "GET",
+            format!("/repos/{LOGIN}/{ENVIRONMENT_REPOSITORY}"),
+            ApiReply::json(200, repository(true)),
+        ),
+        exchange(
+            "GET",
+            environment_devcontainer_path(),
+            ApiReply::json(200, content_file(&super::environment_devcontainer())),
+        ),
+    ])
+    .await;
+
+    let source = api
+        .provider()
+        .source(Some(&project()))
+        .await
+        .expect("source");
+
+    assert_eq!(
+        source,
+        CodespaceSource {
+            repository: environment(),
+            devcontainer_path: Some(ENVIRONMENT_DEVCONTAINER.into()),
+            clone: Some(project()),
+        }
+    );
     api.assert_sent();
 }
 
 #[tokio::test]
 async fn a_session_without_a_repository_gets_a_private_environment_repository() {
-    let environment = format!("/repos/{LOGIN}/{ENVIRONMENT_REPOSITORY}");
+    let environment_path = format!("/repos/{LOGIN}/{ENVIRONMENT_REPOSITORY}");
     let api = Recorded::serve(vec![
-        exchange("GET", environment, not_found()),
+        exchange("GET", environment_path, not_found()),
         exchange("POST", "/user/repos", ApiReply::json(201, repository(true))),
+        exchange("GET", environment_devcontainer_path(), not_found()),
+        exchange(
+            "PUT",
+            environment_devcontainer_path(),
+            ApiReply::json(201, FILE_COMMIT),
+        ),
     ])
     .await;
 
     let source = api.provider().source(None).await.expect("source");
 
     assert_eq!(
-        source.to_string(),
-        format!("{LOGIN}/{ENVIRONMENT_REPOSITORY}")
+        source,
+        CodespaceSource {
+            repository: environment(),
+            devcontainer_path: Some(ENVIRONMENT_DEVCONTAINER.into()),
+            clone: None,
+        }
     );
     let created = api.body(1);
     assert_eq!(created["name"], ENVIRONMENT_REPOSITORY);
     assert_eq!(created["private"], true);
     assert_eq!(created["auto_init"], true);
+    let written = api.body(3);
+    assert_eq!(written.get("sha"), None);
+    let document = {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(written["content"].as_str().expect("content"))
+            .expect("base64");
+        serde_json::from_slice::<Value>(&bytes).expect("a devcontainer")
+    };
+    assert_eq!(
+        document["features"],
+        json!({"ghcr.io/devcontainers/features/sshd:1": {}})
+    );
+    assert_eq!(
+        document["postStartCommand"],
+        r#"test ! -x "$HOME/.may-cloud/bin/may" || "$HOME/.may-cloud/bin/may" daemon start"#
+    );
     api.assert_sent();
 }
 
 #[tokio::test]
-async fn an_existing_private_environment_repository_is_reused() {
-    let api = Recorded::serve(vec![exchange(
-        "GET",
-        format!("/repos/{LOGIN}/{ENVIRONMENT_REPOSITORY}"),
-        ApiReply::json(200, repository(true)),
-    )])
+async fn an_existing_private_environment_repository_is_reused_and_its_devcontainer_restored() {
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            format!("/repos/{LOGIN}/{ENVIRONMENT_REPOSITORY}"),
+            ApiReply::json(200, repository(true)),
+        ),
+        exchange(
+            "GET",
+            environment_devcontainer_path(),
+            ApiReply::json(200, content_file(r#"{ "image": "ubuntu" }"#)),
+        ),
+        exchange(
+            "PUT",
+            environment_devcontainer_path(),
+            ApiReply::json(200, FILE_COMMIT),
+        ),
+    ])
     .await;
 
     let source = api.provider().source(None).await.expect("source");
 
-    assert_eq!(
-        source.to_string(),
-        format!("{LOGIN}/{ENVIRONMENT_REPOSITORY}")
-    );
+    assert_eq!(source.repository, environment());
+    let content: Value = serde_json::from_str(CONTENT_FILE).expect("content fixture");
+    assert_eq!(api.body(2)["sha"], content["sha"]);
     api.assert_sent();
 }
 
@@ -361,7 +567,10 @@ async fn a_machine_is_created_started_stopped_resized_and_deleted() {
 
     let created = provider
         .create(
-            &project(),
+            &CodespaceSource {
+                devcontainer_path: Some(".devcontainer/devcontainer.json".into()),
+                ..project_source()
+            },
             &NewMachine {
                 machine_type: "standardLinux".into(),
                 display_name: "May session".into(),
@@ -401,7 +610,11 @@ async fn a_machine_is_created_started_stopped_resized_and_deleted() {
 
     assert_eq!(
         api.body(0),
-        json!({"machine": "standardLinux", "display_name": "May session"})
+        json!({
+            "machine": "standardLinux",
+            "display_name": "May session",
+            "devcontainer_path": ".devcontainer/devcontainer.json",
+        })
     );
     assert_eq!(api.body(4), json!({"machine": "premiumLinux"}));
     api.assert_sent();
@@ -459,7 +672,7 @@ async fn a_refusal_carries_githubs_message() {
     let error = api
         .provider()
         .create(
-            &project(),
+            &project_source(),
             &NewMachine {
                 machine_type: "standardLinux".into(),
                 display_name: "May session".into(),
@@ -471,6 +684,177 @@ async fn a_refusal_carries_githubs_message() {
     assert!(
         matches!(&error, CloudError::Refused { status: 403, message, .. }
             if message == "You must have a billing method to create a codespace"),
+        "{error:?}"
+    );
+    api.assert_sent();
+}
+
+/// A wait short enough for a test, long enough for a few polls.
+const TEST_WAIT: RunningWait = RunningWait {
+    deadline: Duration::from_secs(5),
+    first_poll: Duration::from_millis(1),
+    longest_poll: Duration::from_millis(4),
+};
+
+#[tokio::test]
+async fn a_suspended_machine_is_started_once_and_waited_on_until_it_runs() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "POST",
+            format!("{path}/start"),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        // The start is not visible yet: no second start is sent.
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Starting", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path,
+            ApiReply::json(200, codespace("Available", "standardLinux")),
+        ),
+    ])
+    .await;
+    let mut seen = Vec::new();
+
+    let running = until_running(
+        &api.provider(),
+        &MachineId::new(CODESPACE_NAME.into()),
+        TEST_WAIT,
+        |machine| seen.push(machine.state),
+    )
+    .await
+    .expect("running");
+
+    assert_eq!(running, machine(MachineState::Running, standard_linux()));
+    assert_eq!(
+        seen,
+        [
+            MachineState::Suspended,
+            MachineState::Suspended,
+            MachineState::Suspended,
+            MachineState::Provisioning,
+            MachineState::Running,
+        ]
+    );
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_machine_that_falls_back_to_suspended_is_started_again() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "POST",
+            format!("{path}/start"),
+            ApiReply::json(200, codespace("Starting", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Starting", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "POST",
+            format!("{path}/start"),
+            ApiReply::json(200, codespace("Available", "standardLinux")),
+        ),
+    ])
+    .await;
+
+    let running = until_running(
+        &api.provider(),
+        &MachineId::new(CODESPACE_NAME.into()),
+        TEST_WAIT,
+        |_| {},
+    )
+    .await
+    .expect("running");
+
+    assert_eq!(running, machine(MachineState::Running, standard_linux()));
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_machine_that_dies_or_vanishes_while_waited_on_is_gone() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Provisioning", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Failed", "standardLinux")),
+        ),
+        exchange("GET", path, not_found()),
+    ])
+    .await;
+    let provider = api.provider();
+    let id = MachineId::new(CODESPACE_NAME.into());
+
+    for _ in 0..2 {
+        let error = until_running(&provider, &id, TEST_WAIT, |_| {})
+            .await
+            .expect_err("gone");
+        assert!(
+            matches!(&error, CloudError::Gone(gone) if *gone == id),
+            "{error:?}"
+        );
+    }
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_machine_still_settling_at_the_deadline_is_not_running() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![exchange(
+        "GET",
+        path,
+        ApiReply::json(200, codespace("Rebuilding", "standardLinux")),
+    )])
+    .await;
+    let id = MachineId::new(CODESPACE_NAME.into());
+
+    let error = until_running(
+        &api.provider(),
+        &id,
+        RunningWait {
+            deadline: Duration::ZERO,
+            ..TEST_WAIT
+        },
+        |_| {},
+    )
+    .await
+    .expect_err("deadline");
+
+    assert!(
+        matches!(&error, CloudError::NotRunning { id: waited, state: MachineState::Provisioning, .. } if *waited == id),
         "{error:?}"
     );
     api.assert_sent();

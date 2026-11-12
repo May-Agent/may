@@ -15,8 +15,9 @@ use skyzen::{Request, StatusCode};
 
 use super::TcpRouters;
 use super::auth::{
-    DirectListener, LocalAddr, LoopbackOnly, NodeNames, NodeNamesCache, NodeNamesSource,
-    RequireIdentity, SocketOwner, TailnetLogin, TailscaleServeIdentitySource,
+    DirectListener, FrontingTokenIdentitySource, LocalAddr, LoopbackOnly, NodeNames,
+    NodeNamesCache, NodeNamesSource, RequireIdentity, SocketOwner, TailnetLogin,
+    TailscaleServeIdentitySource,
 };
 use super::remote_access::{parse_node_names, parse_whois_login, whois_login};
 use super::server::{DaemonMode, build_router};
@@ -1014,6 +1015,64 @@ async fn the_web_ui_the_tui_and_curl_keep_working() {
         StatusCode::OK,
         "the unix socket serves its owner"
     );
+}
+
+/// The token the fronting daemon installed, and the router of a cloud home
+/// that accepts it.
+fn cloud_home_router(state: &Arc<DaemonState>, token: &str) -> skyzen::routing::Router {
+    use sha2::Digest as _;
+
+    let digest: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
+    build_router(
+        state.clone(),
+        DaemonMode::Rest,
+        RequireIdentity::new(vec![
+            Box::new(tailscale_source(&[])),
+            Box::new(FrontingTokenIdentitySource::new(digest, "octocat".into())),
+        ]),
+    )
+}
+
+fn bearer_request(method: &str, uri: &str, authorization: &str) -> Request {
+    hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Host", "127.0.0.1:43123")
+        .header("Authorization", authorization)
+        .body(skyzen::Body::empty())
+        .expect("request builds")
+}
+
+#[tokio::test]
+async fn a_cloud_home_admits_only_the_fronting_daemons_token() {
+    let state = state().await;
+    let router = cloud_home_router(&state, "fronting-token");
+
+    for (method, path) in API_PATHS {
+        let admitted = status(
+            &router,
+            bearer_request(method, path, "Bearer fronting-token"),
+        )
+        .await;
+        assert_ne!(admitted, StatusCode::UNAUTHORIZED, "{method} {path}");
+        for refused in [
+            "Bearer other-token",
+            "fronting-token",
+            "Basic fronting-token",
+        ] {
+            assert_eq!(
+                status(&router, bearer_request(method, path, refused)).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with {refused}"
+            );
+        }
+        // Forwarded traffic lands on loopback: the address proves nothing.
+        assert_eq!(
+            status(&router, local_request(method, path)).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} without a token"
+        );
+    }
 }
 
 const STATUS_SELF: &str = include_str!("fixtures/status_self.json");

@@ -299,6 +299,9 @@ pub struct App {
     /// `/cloud`'s GitHub account input, while it is being typed; empty is
     /// the `gh` login's active account.
     pub cloud_login: Option<String>,
+    /// `/cloud`'s machine type picker for a new cloud session, once the
+    /// catalog arrived, with the selected row.
+    pub cloud_machines: Option<(Vec<crate::cloud::MachineType>, usize)>,
     /// Skill list for display
     pub skill_list: Vec<crate::skill::SkillInfo>,
     /// Selected skill index
@@ -727,6 +730,7 @@ impl App {
             ssh_add_name: String::new(),
             ssh_add_target: String::new(),
             cloud_login: None,
+            cloud_machines: None,
             skill_list: Vec::new(),
             skill_selected: 0,
             skill_scroll: 0,
@@ -851,6 +855,107 @@ impl App {
             let _ = tx.send(AppEvent::CloudConfigured(result)).await;
         })
         .detach();
+    }
+
+    /// List the machine types a new cloud session of the launch's
+    /// repository may start on; [`Self::cloud_catalog_loaded`] receives
+    /// them.
+    pub fn start_cloud_catalog(&mut self) {
+        #[derive(serde::Serialize)]
+        struct Catalog {
+            repo: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Listed {
+            machines: Vec<crate::cloud::MachineType>,
+        }
+        self.set_persistent_status("Listing the codespace machine types...");
+        let tx = self.event_tx.clone();
+        let (repo, cwd) = self.session_manager.launch_place();
+        let target = self
+            .session_manager
+            .current_profile_id()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "no profile is selected".to_owned())
+            .and_then(|id| {
+                self.session_manager
+                    .daemon_handle()
+                    .map(|client| (client, id))
+                    .map_err(|error| error.to_string())
+            });
+        spawn(async move {
+            let result = match target {
+                Ok((client, id)) => {
+                    let repo = blocking::unblock(move || {
+                        crate::session::cloud_repository(repo.as_deref(), cwd.as_deref())
+                    })
+                    .await;
+                    client
+                        .post::<_, Listed>(
+                            &format!("/api/profiles/{id}/cloud/codespaces/catalog"),
+                            &Catalog { repo },
+                        )
+                        .await
+                        .map(|listed| listed.machines)
+                        .map_err(|error| error.reason())
+                }
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(AppEvent::CloudCatalog(result)).await;
+        })
+        .detach();
+    }
+
+    /// Show the machine type picker the catalog fills.
+    pub fn cloud_catalog_loaded(&mut self, result: Result<Vec<crate::cloud::MachineType>, String>) {
+        self.clear_persistent_status();
+        match result {
+            Ok(machines) if machines.is_empty() => self
+                .chat
+                .push_error("GitHub offers no codespace machine types for this repository"),
+            Ok(machines) => self.cloud_machines = Some((machines, 0)),
+            Err(error) => self
+                .chat
+                .push_error(&format!("Listing codespace machines failed: {error}")),
+        }
+    }
+
+    /// Show a step of bringing the current cloud session's machine up: the
+    /// status line carries the wait until the machine serves the session.
+    pub fn cloud_session_step(&mut self, event: &crate::daemon::types::CloudSessionEvent) {
+        use crate::daemon::types::CloudSessionPhase;
+
+        if self
+            .session_manager
+            .current()
+            .is_none_or(|session| session.id.as_str() != event.session_id)
+        {
+            return;
+        }
+        let step = match event.phase {
+            CloudSessionPhase::Creating => "Creating the codespace...",
+            CloudSessionPhase::Starting => "Starting the codespace...",
+            CloudSessionPhase::Checking => "Checking May on the codespace...",
+            CloudSessionPhase::Downloading => "Downloading May for the codespace...",
+            CloudSessionPhase::Installing => "Installing May on the codespace...",
+            CloudSessionPhase::Cloning => "Cloning the repository into the codespace...",
+            CloudSessionPhase::StartingDaemon => "Starting May on the codespace...",
+            CloudSessionPhase::Connecting => "Connecting to the codespace...",
+            CloudSessionPhase::Ready => {
+                self.clear_persistent_status();
+                self.set_status("The codespace serves this session");
+                return;
+            }
+            CloudSessionPhase::Failed => {
+                self.clear_persistent_status();
+                self.chat.push_error(&format!(
+                    "The session's codespace could not be brought up: {}",
+                    event.error.as_deref().unwrap_or("no reason given")
+                ));
+                return;
+            }
+        };
+        self.set_persistent_status(step);
     }
 
     /// Show a `/cloud` change the daemon answered: the profile it returned
@@ -2735,10 +2840,7 @@ impl App {
             }
             AppMode::McpManage => Ok(super::reducer::manage::handle_mcp_key(self, code)),
             AppMode::SshManage => Ok(super::reducer::manage::handle_ssh_key(self, code)),
-            AppMode::CloudManage => {
-                super::reducer::manage::handle_cloud_key(self, code);
-                Ok(None)
-            }
+            AppMode::CloudManage => Ok(super::reducer::manage::handle_cloud_key(self, code)),
             AppMode::AskUser(_) => Ok(super::reducer::ask_user::handle_ask_user_key(self, code)),
             AppMode::SkillManage => Ok(super::reducer::manage::handle_skill_key(self, code)),
             AppMode::ProfileSelect => Ok(super::reducer::navigation::handle_profile_select_key(
@@ -4916,6 +5018,9 @@ pub enum SendAction {
     StopAgentAndQuit,
     /// User wants to create a new session.
     NewSession,
+    /// User wants a new session that runs entirely on a cloud machine of
+    /// this machine type.
+    NewCloudSession(String),
     /// User wants to load an existing session.
     LoadSession(SessionId),
     /// Send this message to the agent.

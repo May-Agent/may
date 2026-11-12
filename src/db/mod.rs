@@ -4,6 +4,7 @@
 
 mod cache_misses;
 mod ci;
+mod cloud_session;
 mod common;
 mod context_snapshot;
 mod daemon_exit;
@@ -44,6 +45,7 @@ use sql as db_sql;
 
 pub use cache_misses::PromptCacheRequest;
 pub use ci::{CiBaselineRow, CiFindingRow, CiJobRow, CiPrRunRow, CiStepRow, CiTestRow, NewCiJob};
+pub use cloud_session::CloudSessionRow;
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,

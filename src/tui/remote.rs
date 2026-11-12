@@ -273,13 +273,17 @@ pub async fn follow_profile_sessions(
 fn globals_query(session_id: &str) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query
-        .append_pair("topics", "sleep,user_notification,session_index")
+        .append_pair(
+            "topics",
+            "sleep,user_notification,session_index,cloud_session",
+        )
         .append_pair("sessionId", session_id);
     query.finish()
 }
 
 /// The session-wide topics the session stream does not carry: sleep
-/// status, notifications to the user and index coverage.
+/// status, notifications to the user, index coverage and the steps of
+/// bringing a cloud session's machine up.
 async fn follow_session_globals(
     client: DaemonClient,
     session_id: String,
@@ -321,6 +325,14 @@ async fn follow_session_globals(
                     if let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data)
                     {
                         let _ = app_events.send(AppEvent::IndexCoverage(snapshot)).await;
+                    }
+                }
+                "cloud_session" => {
+                    if let Ok(step) =
+                        serde_json::from_str::<crate::daemon::types::CloudSessionEvent>(&event.data)
+                        && step.session_id == session_id
+                    {
+                        let _ = app_events.send(AppEvent::CloudSession(step)).await;
                     }
                 }
                 _ => {}

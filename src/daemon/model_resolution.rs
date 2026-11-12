@@ -48,7 +48,7 @@ pub(super) async fn persist_last_model(
         config.last_model = Some(selector);
     });
 
-    updated.save().await?;
+    state.save_config(&updated).await?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(())
 }
@@ -66,7 +66,7 @@ pub(super) async fn persist_last_effort(
     let updated = state.update_config(|config| {
         config.last_effort = Some(effort.to_string());
     });
-    updated.save().await?;
+    state.save_config(&updated).await?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(())
 }

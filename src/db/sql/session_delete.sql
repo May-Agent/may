@@ -25,6 +25,7 @@ DELETE FROM message_tool_cards WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_transcript_entries WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_context_snapshots WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_repo_clones WHERE ? IS NULL OR session_id = ?;
+DELETE FROM cloud_sessions WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_intervals WHERE ? IS NULL OR session_id = ?;
 DELETE FROM ci_findings WHERE ? IS NULL OR session_id = ?;
 DELETE FROM pr_check_alerts WHERE ? IS NULL OR session_id = ?;

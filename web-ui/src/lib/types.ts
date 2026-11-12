@@ -19,7 +19,8 @@ export type ApiErrorCode =
   | 'github_unauthenticated'
   | 'cloud_account_unusable'
   | 'repo_declined'
-  | 'loop_stopped';
+  | 'loop_stopped'
+  | 'session_suspended';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =
@@ -287,6 +288,44 @@ export interface ApiSession {
   repo?: string | null;
   /** Cursor the session's event stream resumes from. */
   cursor?: string;
+  /** The cloud machine the session lives on; absent for the daemon's own. */
+  location?: SessionLocation;
+}
+
+/** One machine type of a cloud provider's catalog. */
+export interface MachineType {
+  /** The provider's name of the type, which a new session names. */
+  name: string;
+  displayName: string;
+  cpus: number;
+  memoryBytes: number;
+  storageBytes: number;
+}
+
+export interface SessionLocation {
+  provider: 'codespaces';
+  machine: string;
+  machineType: string;
+}
+
+export type CloudSessionPhase =
+  | 'creating'
+  | 'starting'
+  | 'checking'
+  | 'downloading'
+  | 'installing'
+  | 'cloning'
+  | 'starting_daemon'
+  | 'connecting'
+  | 'ready'
+  | 'failed';
+
+/** One step of bringing a cloud session's machine up. */
+export interface CloudSessionEvent {
+  sessionId: string;
+  phase: CloudSessionPhase;
+  machineState?: 'provisioning' | 'running' | 'suspended' | 'gone';
+  error?: string;
 }
 
 export interface ChatRequestPayload {
@@ -625,6 +664,7 @@ export type UiEvent =
   | { kind: 'config'; payload: UiConfigResponse }
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
   | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
+  | { kind: 'cloud_session'; payload: CloudSessionEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }

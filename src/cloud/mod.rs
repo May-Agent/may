@@ -10,9 +10,14 @@
 //! Which provider a profile uses, and as which account, is the profile's
 //! [`ProfileCloud`], set with `/cloud`.
 
+pub mod access;
+pub mod bootstrap;
 pub mod codespaces;
+pub mod gh;
+pub mod home;
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +116,75 @@ pub trait CloudProvider: Send + Sync {
     fn delete(&self, id: &MachineId) -> impl Future<Output = Result<(), CloudError>> + Send;
 }
 
+/// How [`until_running`] waits on a machine that is settling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningWait {
+    /// How long the machine may take to reach running.
+    pub deadline: Duration,
+    /// The wait before the first poll after a settling state.
+    pub first_poll: Duration,
+    /// The longest wait between polls; each wait doubles up to it.
+    pub longest_poll: Duration,
+}
+
+/// Brings machine `id` to running: a suspended machine is started, a
+/// settling one polled until it settles. `observe` sees every state the
+/// provider reports, for the caller's loading indicator.
+///
+/// A start is sent once per suspension: a machine still reported suspended
+/// right after its start is the start not yet visible, and is only started
+/// again once it was seen leaving suspension and fell back to it.
+///
+/// # Errors
+/// [`CloudError::Gone`] when the machine no longer exists or dies on the
+/// way; [`CloudError::NotRunning`] when the deadline passes first;
+/// otherwise the provider's failure.
+pub async fn until_running<P: CloudProvider>(
+    provider: &P,
+    id: &MachineId,
+    wait: RunningWait,
+    mut observe: impl FnMut(&CloudMachine),
+) -> Result<CloudMachine, CloudError> {
+    let began = Instant::now();
+    let mut poll = wait.first_poll;
+    let mut start_sent = false;
+    loop {
+        let mut machine = provider
+            .machine(id)
+            .await?
+            .ok_or_else(|| CloudError::Gone(id.clone()))?;
+        observe(&machine);
+        match machine.state {
+            MachineState::Running => return Ok(machine),
+            MachineState::Gone => return Err(CloudError::Gone(id.clone())),
+            MachineState::Suspended if !start_sent => {
+                machine = provider.start(id).await?;
+                start_sent = true;
+                observe(&machine);
+                if machine.state == MachineState::Running {
+                    return Ok(machine);
+                }
+            }
+            MachineState::Suspended => {}
+            MachineState::Provisioning => start_sent = false,
+        }
+        let waited = began.elapsed();
+        let Some(left) = wait
+            .deadline
+            .checked_sub(waited)
+            .filter(|left| !left.is_zero())
+        else {
+            return Err(CloudError::NotRunning {
+                id: id.clone(),
+                state: machine.state,
+                waited,
+            });
+        };
+        async_io::Timer::after(poll.min(left)).await;
+        poll = (poll * 2).min(wait.longest_poll);
+    }
+}
+
 /// The provider's identifier of a machine.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -137,7 +211,7 @@ impl fmt::Display for MachineId {
 }
 
 /// One machine type of a provider's catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineType {
     /// The provider's name of the type, which a create or resize names.
@@ -174,7 +248,7 @@ pub struct CloudMachine {
 }
 
 /// Where a machine is in its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineState {
     /// Being created, started, stopped or changed; it settles on its own.
@@ -223,6 +297,28 @@ pub enum CloudError {
     /// The machine no longer exists.
     #[error("cloud machine {0} no longer exists")]
     Gone(MachineId),
+    /// A command on the machine could not be run, failed, or outlived its
+    /// deadline.
+    #[error("could not {step} on the cloud machine: {message}")]
+    Remote {
+        /// What the command was for.
+        step: &'static str,
+        /// Why it failed: its error output, or the local failure.
+        message: String,
+    },
+    /// The build to install on the machine could not be found or fetched.
+    #[error("could not get May for the cloud machine: {0}")]
+    Install(String),
+    /// The machine did not reach running within the wait's deadline.
+    #[error("cloud machine {id} is still {state:?} after {}s", .waited.as_secs())]
+    NotRunning {
+        /// The machine.
+        id: MachineId,
+        /// Where it was when the deadline passed.
+        state: MachineState,
+        /// How long it was waited on.
+        waited: Duration,
+    },
     /// The GitHub account's `gh` token was not granted a scope the provider
     /// needs.
     #[error(

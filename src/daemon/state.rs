@@ -437,6 +437,12 @@ pub struct DaemonState {
     /// (display, stream, input) lives in that respawnable process.
     pub(crate) computer: Arc<crate::computer::ComputerAgent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
+    /// The cloud sessions this daemon fronts: their codespaces, hosts and
+    /// the steps of bringing them up.
+    pub(crate) cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
+    /// On a cloud home, the providers the fronting daemon pushed: kept
+    /// apart from `config`, so no configuration write carries them.
+    pub(crate) pushed_providers: crate::cloud::access::PushedProviders,
     /// Whether the user is asleep, for every session and client.
     pub(crate) sleep: Arc<crate::sleep::SleepState>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
@@ -560,6 +566,18 @@ impl DaemonState {
         let _ = update(&mut config);
         self.config.store(Arc::new(config.clone()));
         config
+    }
+
+    /// Writes `config` to this daemon's `config.toml`, in its own May
+    /// directory.
+    ///
+    /// # Errors
+    /// Fails when the configuration does not validate or the write fails.
+    pub(crate) async fn save_config(
+        &self,
+        config: &MayConfig,
+    ) -> Result<(), crate::config::ConfigError> {
+        config.save_to(&self.may_dir.join("config.toml")).await
     }
 
     pub(crate) fn browser_manager(&self) -> Option<Arc<crate::container::browser::BrowserManager>> {
@@ -1386,7 +1404,7 @@ impl DaemonState {
                 ui_event_bus.clone(),
                 db.clone(),
             )),
-            db,
+            db: db.clone(),
             github_api: crate::pr::PrContext::default_github_api(),
             default_profile_id: "test".to_string(),
             mcp_service: McpService::spawn(crate::mcp::McpManager::new(
@@ -1400,7 +1418,7 @@ impl DaemonState {
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
-            config,
+            config: config.clone(),
             live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
@@ -1412,6 +1430,16 @@ impl DaemonState {
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
             ),
+            cloud_sessions: std::sync::Arc::new(
+                super::cloud_sessions::CloudSessions::load(
+                    db.clone(),
+                    super::cloud_sessions::GitHubCloud,
+                    config.clone(),
+                    ui_event_bus.clone(),
+                )
+                .await?,
+            ),
+            pushed_providers: crate::cloud::access::PushedProviders::default(),
             notification_service,
             memory_processor: None,
             local_url_port_mapper: std::sync::Arc::new(

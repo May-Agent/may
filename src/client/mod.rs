@@ -77,6 +77,24 @@ pub enum DaemonClientError {
 }
 
 impl DaemonClientError {
+    /// Whether the daemon answered that the session's codespace is
+    /// suspended: nothing failed, and the session's next message starts it.
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        #[derive(serde::Deserialize)]
+        struct TypedError {
+            code: crate::daemon::types::ApiErrorCode,
+        }
+        matches!(
+            self,
+            Self::Status { status, message, .. }
+                if *status == hyper::StatusCode::SERVICE_UNAVAILABLE
+                    && serde_json::from_str::<TypedError>(message).is_ok_and(|typed| {
+                        typed.code == crate::daemon::types::ApiErrorCode::SessionSuspended
+                    })
+        )
+    }
+
     /// The daemon's own reason when it refused with a typed error body,
     /// else the error itself.
     #[must_use]

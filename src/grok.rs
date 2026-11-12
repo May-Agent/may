@@ -398,30 +398,59 @@ pub async fn fetch_account_email(access_token: &str) -> Option<String> {
 ///
 /// Order: the `XAI_OAUTH_TOKEN` environment override, then the stored
 /// credential — refreshing and persisting it when the access token is within
-/// 60 seconds of expiry.
+/// [`ACCESS_EXPIRY_MARGIN`] of expiry.
 ///
 /// # Errors
 ///
 /// Returns [`GrokAuthError`] on storage failures and when a needed token
 /// refresh fails.
 pub async fn get_access_token() -> Result<Option<String>, GrokAuthError> {
+    Ok(get_access().await?.map(|access| access.token))
+}
+
+/// How long before its expiry an access token is refreshed.
+pub const ACCESS_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+
+/// A usable `api.x.ai` bearer token and when it expires.
+#[derive(Debug, Clone)]
+pub struct GrokAccess {
+    /// The bearer token.
+    pub token: String,
+    /// When it expires, in seconds since the Unix epoch; `None` when the
+    /// token endpoint gave no expiry or the token came from the environment.
+    pub expires_at: Option<u64>,
+}
+
+/// [`get_access_token`]'s token with its expiry.
+///
+/// # Errors
+///
+/// Returns [`GrokAuthError`] on storage failures and when a needed token
+/// refresh fails.
+pub async fn get_access() -> Result<Option<GrokAccess>, GrokAuthError> {
     if let Ok(token) = std::env::var(OAUTH_TOKEN_ENV)
         && !token.trim().is_empty()
     {
-        return Ok(Some(token.trim().to_string()));
+        return Ok(Some(GrokAccess {
+            token: token.trim().to_string(),
+            expires_at: None,
+        }));
     }
 
     let Some(mut credentials) = load_credentials().await? else {
         return Ok(None);
     };
-    if credentials.is_expired(Duration::from_secs(60)) {
+    if credentials.is_expired(ACCESS_EXPIRY_MARGIN) {
         let endpoint = token_endpoint().await?;
         let email = credentials.email.take();
         credentials = refresh_tokens(&endpoint, &credentials.refresh_token).await?;
         credentials.email = email;
         save_credentials(&credentials).await?;
     }
-    Ok(Some(credentials.access_token))
+    Ok(Some(GrokAccess {
+        token: credentials.access_token,
+        expires_at: credentials.expires_at,
+    }))
 }
 
 #[cfg(test)]
