@@ -244,6 +244,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::agent::acp_subagent::{prepare_trial, run_trial};
 
     /// The fixture started as a program: the probe and trial sandboxes grant
     /// only the program they start, never a script its arguments name.
@@ -281,9 +282,10 @@ mod tests {
 
     /// The trial returns at its limit plus the time to kill the agent's tree
     /// and remove the scratch directory (measured at a few milliseconds). The
-    /// margin leaves room for a loaded test run and stays far below the
-    /// seconds a probe or sandbox start can take, which `connect` spends
-    /// before the trial and the limit does not cover.
+    /// margin leaves room for a loaded test run. It is measured from the start
+    /// of the handshake's timeout, so the scratch directory, host and sandbox
+    /// set up by `prepare_trial`, like the probe `connect` runs, are outside
+    /// both the limit and the margin.
     const TRIAL_MARGIN: Duration = Duration::from_millis(750);
 
     #[tokio::test(flavor = "multi_thread")]
@@ -300,16 +302,13 @@ mod tests {
             description: String::new(),
             grants: Vec::new(),
         };
+        let trial = prepare_trial("fake", &agent, crate::tools::test_heel().await)
+            .await
+            .expect("prepare the trial");
         let started = std::time::Instant::now();
-        let error = try_connection(
-            &tokio::runtime::Handle::current(),
-            "fake",
-            &agent,
-            limit,
-            crate::tools::test_heel().await,
-        )
-        .await
-        .expect_err("times out");
+        let error = run_trial(&tokio::runtime::Handle::current(), limit, trial)
+            .await
+            .expect_err("times out");
         let elapsed = started.elapsed();
         assert!(
             matches!(error, TrialError::TimedOut(l) if l == limit),
