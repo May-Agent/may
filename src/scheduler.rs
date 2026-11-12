@@ -1430,7 +1430,7 @@ impl TaskRuntime {
             slot: crate::ipc::ShellSlot::new(),
             ssh_servers: Vec::new(),
             ids: None,
-            spaces: None,
+            spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
             pool,
             connectivity: self.connectivity.clone(),
         }
