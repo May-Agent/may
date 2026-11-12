@@ -453,6 +453,39 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     None
 }
 
+/// `/cloud`: `s` sets up Codespaces (asking for the GitHub account), `d`
+/// removes it.
+pub fn handle_cloud_key(app: &mut App, code: KeyCode) {
+    match app.cloud_login.as_mut() {
+        None => match code {
+            KeyCode::Esc => app.mode = crate::tui::state::AppMode::Chat,
+            KeyCode::Char('s') => app.cloud_login = Some(String::new()),
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace
+                if app
+                    .current_profile()
+                    .is_some_and(|profile| profile.cloud.codespaces.is_some()) =>
+            {
+                app.start_codespaces_removal();
+            }
+            _ => {}
+        },
+        Some(login) => match code {
+            KeyCode::Esc => app.cloud_login = None,
+            KeyCode::Enter => {
+                let login = login.trim().to_owned();
+                app.cloud_login = None;
+                app.start_codespaces_setup((!login.is_empty()).then_some(login));
+            }
+            KeyCode::Backspace => {
+                login.pop();
+            }
+            // A GitHub login is letters, digits and hyphens.
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '-' => login.push(c),
+            _ => {}
+        },
+    }
+}
+
 pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match app.skill_add_mode {
         SkillAddMode::None => match code {

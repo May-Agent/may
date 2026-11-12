@@ -62,6 +62,8 @@ pub enum AppMode {
     McpManage,
     /// SSH server management overlay
     SshManage,
+    /// The profile's cloud machine setup (`/cloud`)
+    CloudManage,
     /// Ask user dialog
     AskUser(AskUserState),
     /// Skill management popup
@@ -122,6 +124,7 @@ impl AppMode {
             Self::RepoTrust(_) => "repo-trust",
             Self::McpManage => "mcp-manage",
             Self::SshManage => "ssh-manage",
+            Self::CloudManage => "cloud-manage",
             Self::AskUser(_) => "ask-user",
             Self::SkillManage => "skill-manage",
             Self::ProfileSelect => "profile-select",

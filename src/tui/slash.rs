@@ -38,6 +38,7 @@ pub enum SlashCommand {
     Connect,
     Mcp,
     Ssh,
+    Cloud,
     Skill,
     Permission,
     Config,
@@ -59,7 +60,7 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Help,
         Self::Session,
         Self::Archive,
@@ -89,6 +90,7 @@ impl SlashCommand {
         Self::Connect,
         Self::Mcp,
         Self::Ssh,
+        Self::Cloud,
         Self::Skill,
         Self::Permission,
         Self::Config,
@@ -182,6 +184,11 @@ impl SlashCommand {
             ),
             Self::Mcp => ("/mcp", "", "Manage MCP servers"),
             Self::Ssh => ("/ssh", "", "Manage preconfigured SSH servers"),
+            Self::Cloud => (
+                "/cloud",
+                "",
+                "Set up this profile's cloud machines (GitHub Codespaces)",
+            ),
             Self::Skill => ("/skill", "", "Manage installed skills"),
             Self::Permission => ("/permission", "", "Re-decide the launch directory's access"),
             Self::Config => ("/config", "", "Open configuration"),

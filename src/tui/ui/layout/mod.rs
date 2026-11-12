@@ -12,7 +12,7 @@ use self::pickers::{
     connect_picker_rows, render_connect_picker, render_file_picker_popup,
     render_profile_select_popup, render_resume_picker, render_session_popup,
 };
-use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
+use self::popups::{render_cloud_popup, render_mcp_popup, render_skill_popup, render_ssh_popup};
 
 use ratatui::{
     buffer::CellDiffOption,
@@ -365,6 +365,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         AppMode::McpManage | AppMode::SshManage | AppMode::SkillManage => {
             (pct(60).max(12), pct(70))
         }
+        AppMode::CloudManage => (rows(9), pct(70)),
         AppMode::ProfileSelect => (rows(app.profiles.len() + 2), pct(60)),
         AppMode::Rewind(state) => (rows(state.targets.len() * 2 + 4).min(18), pct(60)),
         AppMode::ResumePicker(state) => (
@@ -454,6 +455,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::EffortSelect => render_effort_select_popup(frame, sheet, app),
         AppMode::McpManage => render_mcp_popup(frame, sheet, app),
         AppMode::SshManage => render_ssh_popup(frame, sheet, app),
+        AppMode::CloudManage => render_cloud_popup(frame, sheet, app),
         AppMode::SkillManage => render_skill_popup(frame, sheet, app),
         AppMode::ProfileSelect => render_profile_select_popup(frame, sheet, app),
         AppMode::Rewind(state) => render_rewind_popup(frame, sheet, state, app.band_bg),
