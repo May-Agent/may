@@ -421,8 +421,8 @@ pub async fn start(
         loopback_router,
         remote_router,
         direct_router,
-        webhook_router,
         cloud_home,
+        webhook_router,
     })
 }
 

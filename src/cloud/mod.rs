@@ -10,7 +10,9 @@
 //! Which provider a profile uses, and as which account, is the profile's
 //! [`ProfileCloud`], set with `/cloud`.
 
+pub mod bootstrap;
 pub mod codespaces;
+pub mod gh;
 pub mod home;
 
 use std::fmt;
@@ -294,6 +296,18 @@ pub enum CloudError {
     /// The machine no longer exists.
     #[error("cloud machine {0} no longer exists")]
     Gone(MachineId),
+    /// A command on the machine could not be run, failed, or outlived its
+    /// deadline.
+    #[error("could not {step} on the cloud machine: {message}")]
+    Remote {
+        /// What the command was for.
+        step: &'static str,
+        /// Why it failed: its error output, or the local failure.
+        message: String,
+    },
+    /// The build to install on the machine could not be found or fetched.
+    #[error("could not get May for the cloud machine: {0}")]
+    Install(String),
     /// The machine did not reach running within the wait's deadline.
     #[error("cloud machine {id} is still {state:?} after {}s", .waited.as_secs())]
     NotRunning {

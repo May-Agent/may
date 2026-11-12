@@ -235,18 +235,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The `may` executable inside an artifact zip.
 pub(super) fn extract_executable(zip: &[u8]) -> Result<Vec<u8>, UpdateError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(zip))?;
-    let mut tarball = None;
-    for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
-        if entry.name()? == TARBALL {
-            let mut bytes = Vec::new();
-            entry.take(EXECUTABLE_LIMIT).read_to_end(&mut bytes)?;
-            tarball = Some(bytes);
-            break;
-        }
-    }
-    let tarball = tarball.ok_or(UpdateError::MissingMember(TARBALL))?;
+    let tarball = extract_tarball(zip)?;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(tarball.as_slice()));
     for entry in tar.entries()? {
         let entry = entry?;
@@ -257,6 +246,21 @@ pub(super) fn extract_executable(zip: &[u8]) -> Result<Vec<u8>, UpdateError> {
         }
     }
     Err(UpdateError::MissingMember(EXECUTABLE))
+}
+
+/// The `may-debug.tar.gz` inside an artifact zip, as CI packed it: the
+/// executable with its mode.
+pub(super) fn extract_tarball(zip: &[u8]) -> Result<Vec<u8>, UpdateError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip))?;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        if entry.name()? == TARBALL {
+            let mut bytes = Vec::new();
+            entry.take(EXECUTABLE_LIMIT).read_to_end(&mut bytes)?;
+            return Ok(bytes);
+        }
+    }
+    Err(UpdateError::MissingMember(TARBALL))
 }
 
 /// Replaces the executable at `target` with `bytes`: written beside it and

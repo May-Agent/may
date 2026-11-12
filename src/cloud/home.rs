@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 /// The record's file in the May home.
-const FILE: &str = "cloud-home.json";
+pub const FILE: &str = "cloud-home.json";
 
 /// The port a cloud home's remote listener binds and the fronting daemon
-/// forwards to. May chooses it: the default local listener is 8787, and
-/// the remote listener takes the next port so the two never collide.
+/// forwards to.
+///
+/// May chooses it: the default local listener is 8787, and the remote
+/// listener takes the next port so the two never collide.
 pub const REMOTE_PORT: u16 = 8788;
 
 /// Bytes of a fronting token: 256 bits, so it cannot be guessed.

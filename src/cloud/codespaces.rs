@@ -31,6 +31,46 @@ const SCOPES_HEADER: &str = "x-oauth-scopes";
 /// GitHub repository are created from.
 pub const ENVIRONMENT_REPOSITORY: &str = "may-environment";
 
+/// The devcontainer May keeps in the environment repository.
+pub const ENVIRONMENT_DEVCONTAINER: &str = ".devcontainer/devcontainer.json";
+
+/// Where a repository's devcontainer is found when no path is named, in
+/// the order the dev container specification looks.
+const DEFAULT_DEVCONTAINER_PATHS: [&str; 2] =
+    [".devcontainer/devcontainer.json", ".devcontainer.json"];
+
+/// The dev container feature that installs an SSH server, without its
+/// version tag.
+const SSHD_FEATURE: &str = "ghcr.io/devcontainers/features/sshd";
+
+/// The image of GitHub's default codespace, which ships an SSH server; a
+/// repository without a devcontainer gets it.
+const UNIVERSAL_IMAGE: &str = "mcr.microsoft.com/devcontainers/universal";
+
+/// The image of the environment repository's devcontainer.
+const ENVIRONMENT_IMAGE: &str = "mcr.microsoft.com/devcontainers/base:ubuntu";
+
+/// The SSH server feature the environment repository's devcontainer
+/// installs, at its major version.
+const ENVIRONMENT_SSHD_FEATURE: &str = "ghcr.io/devcontainers/features/sshd:1";
+
+/// The commit message of the environment devcontainer's writes.
+const ENVIRONMENT_COMMIT_MESSAGE: &str = "Boot May sessions";
+
+/// What a codespace is created from: a repository, the devcontainer in it
+/// to build, and the project to clone into it when the codespace is not
+/// created from the project itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodespaceSource {
+    /// The repository the codespace belongs to.
+    pub repository: GitHubRepository,
+    /// The devcontainer to build, when the repository has one.
+    pub devcontainer_path: Option<String>,
+    /// The session's repository, when its devcontainer has no SSH server
+    /// and the codespace is created from the environment repository.
+    pub clone: Option<GitHubRepository>,
+}
+
 /// The GitHub account a profile's codespaces belong to, as `/cloud` set it
 /// up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
@@ -169,25 +209,161 @@ impl<T: GitHubTokenSource> Codespaces<T> {
         if !found.private {
             return Err(CloudError::PublicSource(repository));
         }
+        self.write_environment_devcontainer(&repository).await?;
         Ok(repository)
+    }
+
+    /// Writes May's devcontainer into the environment repository unless it
+    /// is already there as May writes it: a changed one is a codespace that
+    /// boots without its SSH server or daemon.
+    async fn write_environment_devcontainer(
+        &self,
+        repository: &GitHubRepository,
+    ) -> Result<(), CloudError> {
+        let wanted = environment_devcontainer();
+        let url = self.url(&format!(
+            "/repos/{repository}/contents/{ENVIRONMENT_DEVCONTAINER}"
+        ));
+        let response = self.send(Method::GET, url.clone(), None).await?;
+        let sha = if response.status().as_u16() == 404 {
+            None
+        } else {
+            let file: GhContentFile = decode(succeeded(response).await?).await?;
+            if file.text()? == wanted {
+                return Ok(());
+            }
+            Some(file.sha)
+        };
+        let body = serde_json::to_value(PutContents {
+            message: ENVIRONMENT_COMMIT_MESSAGE,
+            content: base64_encode(wanted.as_bytes()),
+            sha,
+        })
+        .expect("a contents write always serializes");
+        succeeded(self.send(Method::PUT, url, Some(body)).await?)
+            .await
+            .map(drop)
+    }
+
+    /// The devcontainer a codespace of `project` builds by default, and its
+    /// text, or `None` when the project has none and GitHub's default
+    /// codespace image is used.
+    async fn project_devcontainer(
+        &self,
+        project: &GitHubRepository,
+    ) -> Result<Option<(String, String)>, CloudError> {
+        let url = self.url(&format!("/repos/{project}/codespaces/devcontainers"));
+        let listing: DevcontainerListing =
+            decode(succeeded(self.send(Method::GET, url, None).await?).await?).await?;
+        let Some(path) = DEFAULT_DEVCONTAINER_PATHS
+            .iter()
+            .find_map(|default| {
+                listing
+                    .devcontainers
+                    .iter()
+                    .find(|devcontainer| devcontainer.path == *default)
+            })
+            .or_else(|| listing.devcontainers.first())
+            .map(|devcontainer| devcontainer.path.clone())
+        else {
+            return Ok(None);
+        };
+        let url = self.url(&format!("/repos/{project}/contents/{path}"));
+        let file: GhContentFile =
+            decode(succeeded(self.send(Method::GET, url, None).await?).await?).await?;
+        Ok(Some((path, file.text()?)))
     }
 }
 
-impl<T: GitHubTokenSource> CloudProvider for Codespaces<T> {
-    type Source = GitHubRepository;
+/// Whether the devcontainer `text` gives its codespace an SSH server: the
+/// SSH server feature, or GitHub's default image, which ships one.
+///
+/// # Errors
+/// [`CloudError::Decode`] when `text` is not a devcontainer document.
+fn has_ssh_server(text: &str) -> Result<bool, CloudError> {
+    let devcontainer: DevcontainerSshProbe =
+        jsonc_parser::parse_to_serde_value(text, &jsonc_parser::ParseOptions::default()).map_err(
+            |error| CloudError::Decode {
+                provider: PROVIDER,
+                message: format!("the devcontainer is not readable: {error}"),
+            },
+        )?;
+    let feature = devcontainer.features.keys().any(|feature| {
+        feature
+            .strip_prefix(SSHD_FEATURE)
+            .is_some_and(|tag| tag.is_empty() || tag.starts_with(':'))
+    });
+    let image = devcontainer
+        .image
+        .is_some_and(|image| image.starts_with(UNIVERSAL_IMAGE));
+    Ok(feature || image)
+}
 
+/// The environment repository's devcontainer document: GitHub's base
+/// image with the SSH server feature, and a start command that starts the
+/// daemon once May is installed.
+fn environment_devcontainer() -> String {
+    use askama::Template as _;
+
+    let post_start = super::bootstrap::PostStart::default()
+        .render()
+        .expect("the post-start command always renders");
+    let document = EnvironmentDevcontainer {
+        name: "May",
+        image: ENVIRONMENT_IMAGE,
+        features: std::iter::once((ENVIRONMENT_SSHD_FEATURE, serde_json::json!({}))).collect(),
+        post_start_command: post_start.trim(),
+    };
+    let mut text =
+        serde_json::to_string_pretty(&document).expect("a devcontainer always serializes");
+    text.push('\n');
+    text
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+impl<T: GitHubTokenSource> CloudProvider for Codespaces<T> {
+    type Source = CodespaceSource;
+
+    /// The project itself when its devcontainer gives the codespace an SSH
+    /// server, which installing May and starting its daemon go through;
+    /// otherwise the environment repository, with the project to clone.
     async fn source(
         &self,
         project: Option<&GitHubRepository>,
-    ) -> Result<GitHubRepository, CloudError> {
-        match project {
-            Some(project) => Ok(project.clone()),
-            None => self.environment_repository().await,
+    ) -> Result<CodespaceSource, CloudError> {
+        let Some(project) = project else {
+            return Ok(CodespaceSource {
+                repository: self.environment_repository().await?,
+                devcontainer_path: Some(ENVIRONMENT_DEVCONTAINER.to_owned()),
+                clone: None,
+            });
+        };
+        let devcontainer = self.project_devcontainer(project).await?;
+        let reachable = match &devcontainer {
+            Some((_, text)) => has_ssh_server(text)?,
+            None => true,
+        };
+        if reachable {
+            return Ok(CodespaceSource {
+                repository: project.clone(),
+                devcontainer_path: devcontainer.map(|(path, _)| path),
+                clone: None,
+            });
         }
+        Ok(CodespaceSource {
+            repository: self.environment_repository().await?,
+            devcontainer_path: Some(ENVIRONMENT_DEVCONTAINER.to_owned()),
+            clone: Some(project.clone()),
+        })
     }
 
-    async fn catalog(&self, source: &GitHubRepository) -> Result<Vec<MachineType>, CloudError> {
-        let url = self.url(&format!("/repos/{source}/codespaces/machines"));
+    async fn catalog(&self, source: &CodespaceSource) -> Result<Vec<MachineType>, CloudError> {
+        let url = self.url(&format!("/repos/{}/codespaces/machines", source.repository));
         let listing: MachineListing =
             decode(succeeded(self.send(Method::GET, url, None).await?).await?).await?;
         Ok(listing.machines.into_iter().map(Into::into).collect())
@@ -195,15 +371,16 @@ impl<T: GitHubTokenSource> CloudProvider for Codespaces<T> {
 
     async fn create(
         &self,
-        source: &GitHubRepository,
+        source: &CodespaceSource,
         request: &NewMachine,
     ) -> Result<CloudMachine, CloudError> {
         let body = serde_json::to_value(CreateCodespace {
             machine: &request.machine_type,
             display_name: &request.display_name,
+            devcontainer_path: source.devcontainer_path.as_deref(),
         })
         .expect("a codespace request always serializes");
-        let url = self.url(&format!("/repos/{source}/codespaces"));
+        let url = self.url(&format!("/repos/{}/codespaces", source.repository));
         // 201 is a created codespace, 202 one GitHub is still creating;
         // both answer with the codespace.
         let codespace: Codespace =
@@ -318,6 +495,83 @@ struct CreateRepository<'a> {
 struct CreateCodespace<'a> {
     machine: &'a str,
     display_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devcontainer_path: Option<&'a str>,
+}
+
+/// `GET /repos/{owner}/{repo}/codespaces/devcontainers`, to the fields May
+/// reads.
+#[derive(Debug, Deserialize)]
+struct DevcontainerListing {
+    devcontainers: Vec<GhDevcontainer>,
+}
+
+/// One devcontainer of the listing.
+#[derive(Debug, Deserialize)]
+struct GhDevcontainer {
+    path: String,
+}
+
+/// A file of `GET /repos/{owner}/{repo}/contents/{path}` (`content-file`),
+/// to the fields May reads.
+#[derive(Debug, Deserialize)]
+struct GhContentFile {
+    sha: String,
+    encoding: String,
+    content: String,
+}
+
+impl GhContentFile {
+    /// The file's text: GitHub sends it base64-encoded, wrapped in lines.
+    fn text(&self) -> Result<String, CloudError> {
+        use base64::Engine as _;
+
+        let decode_error = |message: String| CloudError::Decode {
+            provider: PROVIDER,
+            message,
+        };
+        if self.encoding != "base64" {
+            return Err(decode_error(format!(
+                "a file in the {} encoding",
+                self.encoding
+            )));
+        }
+        let packed: String = self.content.split_ascii_whitespace().collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(packed)
+            .map_err(|error| decode_error(error.to_string()))?;
+        String::from_utf8(bytes).map_err(|error| decode_error(error.to_string()))
+    }
+}
+
+/// The body of `PUT /repos/{owner}/{repo}/contents/{path}`.
+#[derive(Debug, Serialize)]
+struct PutContents<'a> {
+    message: &'a str,
+    content: String,
+    /// The replaced file's blob, when one is replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha: Option<String>,
+}
+
+/// A devcontainer document, to the fields that tell whether it has an SSH
+/// server.
+#[derive(Debug, Deserialize)]
+struct DevcontainerSshProbe {
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    features: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// The environment repository's devcontainer document.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentDevcontainer<'a> {
+    name: &'a str,
+    image: &'a str,
+    features: std::collections::BTreeMap<&'a str, serde_json::Value>,
+    post_start_command: &'a str,
 }
 
 /// The body of `PATCH /user/codespaces/{codespace_name}`.

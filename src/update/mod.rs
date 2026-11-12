@@ -159,16 +159,18 @@ pub const fn built_from() -> Option<&'static str> {
     }
 }
 
-/// The debug `may` CI built for `platform` from the commit this binary was
-/// built from, downloaded with `token` and checked against GitHub's digest:
-/// the same build, for another machine. `progress` receives one line per
-/// step, for the caller's loading indicator.
+/// The debug `may` CI built for `platform` from this binary's commit.
+///
+/// It is the same build, for another machine, downloaded with `token`,
+/// checked against GitHub's digest and answered as the gzip tarball CI
+/// packs it in (`may` with its mode). `progress` receives one line per
+/// step.
 ///
 /// # Errors
 /// [`UpdateError::UnknownCommit`] for a build without its commit id,
 /// [`UpdateError::NoCommitBuild`] when CI has not built the commit;
 /// otherwise the download's failure.
-pub async fn this_build_for(
+pub async fn this_build_tarball_for(
     platform: CiPlatform,
     token: String,
     mut progress: impl FnMut(&str),
@@ -193,7 +195,7 @@ async fn this_commit_from(
         found.artifact.size_in_bytes / 1_000_000
     ));
     let zip = github.download(&found.artifact).await?;
-    blocking::unblock(move || ci::extract_executable(&zip)).await
+    blocking::unblock(move || ci::extract_tarball(&zip)).await
 }
 
 async fn update_dev(progress: &mut impl FnMut(&str)) -> Result<Outcome, UpdateError> {
