@@ -65,6 +65,57 @@ pub struct ComputerArgs {
     pub operands: Vec<String>,
 }
 
+/// The actions `computer` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Screenshot,
+    Observe,
+    Click,
+    DoubleClick,
+    RightClick,
+    Drag,
+    Scroll,
+    Type,
+    Key,
+    Launch,
+}
+
+impl Action {
+    /// Every action, in the order `usage` lists them.
+    const ALL: [Self; 10] = [
+        Self::Screenshot,
+        Self::Observe,
+        Self::Click,
+        Self::DoubleClick,
+        Self::RightClick,
+        Self::Drag,
+        Self::Scroll,
+        Self::Type,
+        Self::Key,
+        Self::Launch,
+    ];
+
+    /// The word that names the action on the command line.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::Observe => "observe",
+            Self::Click => "click",
+            Self::DoubleClick => "double-click",
+            Self::RightClick => "right-click",
+            Self::Drag => "drag",
+            Self::Scroll => "scroll",
+            Self::Type => "type",
+            Self::Key => "key",
+            Self::Launch => "launch",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == word)
+    }
+}
+
 /// A key press: the key code and the modifiers held (the wire bitmask).
 #[derive(Debug, PartialEq, Eq)]
 struct KeyPress {
@@ -183,13 +234,19 @@ impl Tool for ComputerTool {
 
 impl ComputerTool {
     async fn run(&self, action: &str, rest: &[String]) -> Result<ToolResult, String> {
-        match action {
-            "screenshot" | "observe" => self.capture(action == "observe").await,
-            "click" | "double-click" | "right-click" | "drag" | "scroll" | "type" | "key" => {
-                self.drive(action, rest).await
-            }
-            "launch" => self.launch(rest).await,
-            _ => Err(usage().to_owned()),
+        let Some(kind) = Action::parse(action) else {
+            return Err(usage().to_owned());
+        };
+        match kind {
+            Action::Screenshot | Action::Observe => self.capture(kind == Action::Observe).await,
+            Action::Click
+            | Action::DoubleClick
+            | Action::RightClick
+            | Action::Drag
+            | Action::Scroll
+            | Action::Type
+            | Action::Key => self.drive(action, rest).await,
+            Action::Launch => self.launch(rest).await,
         }
     }
 
@@ -486,6 +543,33 @@ mod tests {
             parsed(&["drag", "1", "2", "3", "4"]).1,
             strings(&["1", "2", "3", "4"])
         );
+    }
+
+    #[test]
+    fn every_action_the_skill_names_is_accepted() {
+        let skill = include_str!("../../skills/computer/SKILL.md");
+        let named: Vec<&str> = skill
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|span| span.strip_prefix("computer "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        assert!(named.len() >= 4, "{named:?}");
+        for word in named {
+            assert!(
+                Action::parse(word).is_some(),
+                "the skill names `computer {word}`, which the command does not accept"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_lists_every_action() {
+        for action in Action::ALL {
+            assert!(usage().contains(action.name()), "{}", action.name());
+        }
     }
 
     #[test]

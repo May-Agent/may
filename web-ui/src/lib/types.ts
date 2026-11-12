@@ -17,6 +17,7 @@ export type ApiErrorCode =
   | 'managed_podman_approval_required'
   | 'location_unavailable'
   | 'github_unauthenticated'
+  | 'cloud_account_unusable'
   | 'repo_declined'
   | 'loop_stopped';
 

@@ -445,7 +445,12 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .await
         .context("failed to bind the remote listener")?;
     let unix_listener = bind_unix(&paths.socket())?;
-    state.remote_access_manager.set_local_addr(
+    state.remote_access_manager.set_local_listener_addr(
+        tcp_listener
+            .local_addr()
+            .context("the daemon's local listener has no address")?,
+    );
+    state.remote_access_manager.set_remote_listener_addr(
         remote_listener
             .local_addr()
             .context("the daemon's remote listener has no address")?,

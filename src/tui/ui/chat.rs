@@ -15,9 +15,11 @@ use ratatui::{
 };
 
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::agent_event_adapter::COMPACT_TOOL;
+use super::super::grapheme::drawn_width;
 use super::super::queue::Attachment;
 use super::band;
 use super::chat_layout::{self, ChatLayout};
@@ -1616,7 +1618,7 @@ fn is_image_artifact(path: &str) -> bool {
 pub struct InputContext<'a> {
     /// Current input text.
     pub input: &'a str,
-    /// Cursor position (character index).
+    /// Cursor position: a byte offset of `input` on a grapheme boundary.
     pub cursor: usize,
     /// Pending attachments.
     pub attachments: &'a [Attachment],
@@ -3301,11 +3303,6 @@ fn greeting_line(text: &str) -> Line<'static> {
     ))
 }
 
-/// Convert a character index to a byte index in a string.
-fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
-}
-
 /// Style of the leading `!` while the composer is in bash mode.
 const BANG_PROMPT_STYLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
@@ -3315,53 +3312,84 @@ fn bash_mode(input: &str) -> bool {
     input.starts_with('!')
 }
 
-/// The composer's visible text: `/secret KEY VALUE` renders the value as
-/// `•`s so a secret never sits on screen; every other input shows
-/// verbatim. Masking is char-for-char so caret indexing stays aligned
-/// with `input`.
-fn composer_display(input: &str) -> Cow<'_, str> {
-    let Some(rest) = input.trim_start().strip_prefix("/secret") else {
-        return Cow::Borrowed(input);
-    };
+/// Byte offset in `input` where the value of a `/secret KEY VALUE` command
+/// begins; `None` for every other input.
+fn secret_value_start(input: &str) -> Option<usize> {
+    let rest = input.trim_start().strip_prefix("/secret")?;
     if !rest.starts_with(char::is_whitespace) {
-        return Cow::Borrowed(input);
+        return None;
     }
     let rest = rest.trim_start();
-    let Some(key_end) = rest.find(char::is_whitespace) else {
-        return Cow::Borrowed(input);
-    };
+    let key_end = rest.find(char::is_whitespace)?;
     let value = rest[key_end..].trim_start();
     if value.is_empty() {
-        return Cow::Borrowed(input);
+        return None;
     }
-    // `value` is a suffix of `input`, so the visible prefix ends where it
-    // begins.
-    let mut masked = String::with_capacity(input.len());
-    masked.push_str(&input[..input.len() - value.len()]);
-    masked.extend(
-        value
-            .chars()
-            .map(|c| if c.is_whitespace() { c } else { '•' }),
-    );
-    Cow::Owned(masked)
+    // `value` is a suffix of `input`.
+    Some(input.len() - value.len())
 }
 
-/// The input `Line` up to and including the caret marker: prompt,
-/// attachment chips and the text before the caret. The caret marker's
-/// cell is where the terminal cursor — and therefore IME composition —
-/// anchors.
-fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
+/// `text` with one `•` per non-whitespace grapheme, so a masked cursor
+/// still lands on a grapheme boundary of what is drawn.
+fn mask_graphemes(text: &str) -> String {
+    text.graphemes(true)
+        .map(|cluster| {
+            if cluster.chars().all(char::is_whitespace) {
+                cluster
+            } else {
+                "•"
+            }
+        })
+        .collect()
+}
+
+/// The part of the composer's visible text that is `text`, which sits at
+/// byte offset `base` of `input`: a `/secret` value renders as `•`s.
+fn composer_segment(text: &str, base: usize, secret_start: Option<usize>) -> Cow<'_, str> {
+    let Some(start) = secret_start else {
+        return Cow::Borrowed(text);
+    };
+    if base + text.len() <= start {
+        return Cow::Borrowed(text);
+    }
+    let visible = start.saturating_sub(base);
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..visible]);
+    out.push_str(&mask_graphemes(&text[visible..]));
+    Cow::Owned(out)
+}
+
+/// The composer's visible text: `/secret KEY VALUE` renders the value as
+/// one `•` per grapheme so a secret never sits on screen; every other
+/// input shows verbatim.
+fn composer_display(input: &str) -> Cow<'_, str> {
+    composer_segment(input, 0, secret_value_start(input))
+}
+
+/// The composer's visible text split at the caret (`cursor`, a byte offset
+/// of `input` on a grapheme boundary), each half masked like
+/// [`composer_display`].
+fn composer_display_split(input: &str, cursor: usize) -> (Cow<'_, str>, Cow<'_, str>) {
+    let secret_start = secret_value_start(input);
+    (
+        composer_segment(&input[..cursor], 0, secret_start),
+        composer_segment(&input[cursor..], cursor, secret_start),
+    )
+}
+
+/// The input line's leading spans: the bash-mode prompt and the attachment
+/// chips. Their width is what the typed text is offset by on the first row.
+fn input_prefix_spans(input: &str, attachments: &[Attachment]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let bash = bash_mode(ctx.input);
 
     // The composer has no `>` prompt marker: input starts flush left and
     // a leading `!` gets the bash-mode highlight instead of a prompt cell.
-    if bash {
+    if bash_mode(input) {
         spans.push(Span::styled("! ", BANG_PROMPT_STYLE));
     }
 
     // Render image attachments
-    for att in ctx.attachments {
+    for att in attachments {
         if matches!(att, Attachment::Image { .. }) {
             spans.push(Span::styled(
                 "[image] ",
@@ -3371,7 +3399,7 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     }
 
     // File references
-    for att in ctx.attachments {
+    for att in attachments {
         if let Attachment::FileReference { path } = att {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
             spans.push(Span::styled(
@@ -3382,7 +3410,7 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     }
 
     // Pasted text attachments
-    for att in ctx.attachments {
+    for att in attachments {
         if let Attachment::PastedText { content, .. } = att {
             let char_count = content.chars().count();
             spans.push(Span::styled(
@@ -3391,11 +3419,54 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
             ));
         }
     }
+    spans
+}
 
-    let display = composer_display(ctx.input);
-    let byte_idx = char_to_byte_index(&display, ctx.cursor);
+/// The byte offset of the cursor a click `column` cells into the input lands on.
+///
+/// `column` counts from the left edge of the input line's first row, the
+/// widths of the rows above the clicked one included. The result is the
+/// boundary before the grapheme the click hits, measured with the widths the
+/// renderer draws, and `input.len()` past the end.
+#[must_use]
+pub fn caret_at_column(input: &str, attachments: &[Attachment], column: usize) -> usize {
+    let prefix_width: usize = input_prefix_spans(input, attachments)
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let target = column.saturating_sub(prefix_width);
+    // The leading `!` of a bash-mode input is drawn as part of the prefix.
+    let first = usize::from(bash_mode(input));
+    let secret_start = secret_value_start(input);
+    let mut covered = 0usize;
+    for (offset, cluster) in input[first..].grapheme_indices(true) {
+        let at = first + offset;
+        let masked = secret_start.is_some_and(|start| at >= start)
+            && !cluster.chars().all(char::is_whitespace);
+        let width = if masked {
+            UnicodeWidthStr::width("•")
+        } else {
+            drawn_width(cluster)
+        };
+        if covered + width > target {
+            return at;
+        }
+        covered += width;
+    }
+    input.len()
+}
+
+/// The input `Line` up to and including the caret marker: prompt,
+/// attachment chips and the text before the caret. The caret marker's
+/// cell is where the terminal cursor — and therefore IME composition —
+/// anchors.
+fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
+    let mut spans = input_prefix_spans(ctx.input, ctx.attachments);
+    let bash = bash_mode(ctx.input);
+    let (before, _) = composer_display_split(ctx.input, ctx.cursor);
+    // The bash prompt already draws the leading `!`.
     let start = usize::from(bash);
-    spans.push(Span::raw(display[start..byte_idx.max(start)].to_string()));
+    spans.push(Span::raw(before.get(start..).unwrap_or("").to_string()));
     spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
     Line::from(spans)
 }
@@ -3452,16 +3523,18 @@ fn render_input_line(
         }
     }
 
-    // Input text with caret (convert char index to byte index). The real
+    // Input text with caret (a byte offset on a grapheme boundary). The real
     // terminal cursor marks the caret — the `│` stays only in the
     // scratch anchor used for cursor placement.
     let mut line = input_caret_line(ctx);
     line.spans.pop();
     let display = composer_display(ctx.input);
-    let byte_idx = char_to_byte_index(&display, ctx.cursor);
-    line.spans.push(Span::raw(
-        display[byte_idx.max(usize::from(bash_mode(&display)))..].to_string(),
-    ));
+    let (before, after) = composer_display_split(ctx.input, ctx.cursor);
+    // The bash prompt already draws the leading `!`, which sits before the
+    // caret unless the caret is at the very start.
+    let skipped = usize::from(bash_mode(&display)).saturating_sub(before.len());
+    line.spans
+        .push(Span::raw(after.get(skipped..).unwrap_or("").to_string()));
 
     // Ghost text trails the caret of an empty input.
     if display.is_empty()
@@ -7384,7 +7457,7 @@ mod tests {
                         view_height_out: None,
                         input_ctx: Some(InputContext {
                             input,
-                            cursor: input.chars().count(),
+                            cursor: input.len(),
                             attachments: &[],
                             suggestion: None,
                             greeting: None,

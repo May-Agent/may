@@ -19,8 +19,8 @@ use super::request_ledger::RequestLedger;
 use super::turn_persister::TurnPersister;
 use super::{
     ChatSink, PendingToolStream, SinkToolEvent, check_tasks_update, clear_terminal_runtime_state,
-    closes_reasoning_phase, emit_speed, enforce_issue_ownership, is_takeover_active_for_session,
-    log_first_agent_event, log_first_text_event, log_first_visible_tool_event, mark_run_running,
+    closes_reasoning_phase, emit_speed, enforce_issue_ownership, log_first_agent_event,
+    log_first_text_event, log_first_visible_tool_event, mark_run_running,
     normalize_tool_delta_for_sink, normalize_tool_start_for_sink, project_tool_summary_for_sink,
     record_request_log, record_tool_interval, segment_emitted_at, set_terminal_runtime_state,
 };
@@ -40,8 +40,6 @@ use crate::session::{
 pub(super) enum TurnStop {
     /// The run was cancelled, or its client went away; the reason is logged.
     Cancelled(&'static str),
-    /// A browser takeover paused the session.
-    TakeoverPaused,
     /// The agent reported an error event.
     Failed(aither_agent::AgentError),
     /// The turn's state could not be stored.
@@ -285,15 +283,14 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
         let at = timed.at;
         let event = timed.event;
         self.last_event_at = Some(at);
+        // A browser takeover reaches the turn as the cancellation
+        // `browser_takeover_start` issues; the run loop classifies that stop
+        // as a takeover pause once the stream ends, so no event polls for it.
         match self.event(at, event).await {
-            Ok(ControlFlow::Continue(())) => {}
-            Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),
-            Err(error) => return ControlFlow::Break(TurnStop::Persist(error)),
+            Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
+            Ok(ControlFlow::Break(stop)) => ControlFlow::Break(stop),
+            Err(error) => ControlFlow::Break(TurnStop::Persist(error)),
         }
-        if is_takeover_active_for_session(self.state, self.session_id).await {
-            return ControlFlow::Break(TurnStop::TakeoverPaused);
-        }
-        ControlFlow::Continue(())
     }
 
     /// Handles a fact about one of the session's jobs, which the agent read
