@@ -167,6 +167,9 @@ pub struct ProfileInfo {
     /// attached to this profile as auxiliary environments. Ordered by
     /// `profile_remote_servers.sort_order`.
     pub remote_attachments: Vec<String>,
+    /// The cloud provider accounts the profile's machines are created in,
+    /// set up with `/cloud`.
+    pub cloud: crate::cloud::ProfileCloud,
 }
 
 impl ProfileInfo {
@@ -178,6 +181,7 @@ impl ProfileInfo {
         m: profiles::Model,
         preferences: Option<ProfilePreferences>,
         remote_attachments: Vec<String>,
+        cloud: crate::cloud::ProfileCloud,
     ) -> Result<Self, crate::db::ChatDbError> {
         let environment = match m.environment.as_str() {
             "container" => ProfileEnvironment::Container {
@@ -202,6 +206,7 @@ impl ProfileInfo {
             pinned_limit: m.pinned_limit,
             sort_order: m.sort_order,
             remote_attachments,
+            cloud,
         })
     }
 }
@@ -426,9 +431,7 @@ pub async fn list_profiles(db: &ChatDb) -> Result<Vec<ProfileInfo>, crate::db::C
     let models = db.list_profiles().await?;
     let mut profiles = Vec::with_capacity(models.len());
     for model in models {
-        let preferences = db.load_profile_preferences(&model).await?;
-        let attachments = db.list_profile_remote_servers(&model.id).await?;
-        profiles.push(ProfileInfo::from_db_parts(model, preferences, attachments)?);
+        profiles.push(db.profile_info_from_model(model).await?);
     }
     Ok(profiles)
 }
@@ -457,8 +460,13 @@ mod tests {
 
     #[test]
     fn profile_info_wraps_environment_as_home_environment() {
-        let info = ProfileInfo::from_db_parts(make_profile_model("local"), None, Vec::new())
-            .expect("local profile should deserialize");
+        let info = ProfileInfo::from_db_parts(
+            make_profile_model("local"),
+            None,
+            Vec::new(),
+            crate::cloud::ProfileCloud::default(),
+        )
+        .expect("local profile should deserialize");
 
         assert!(matches!(info.environment, HomeEnvironment(_)));
         assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));

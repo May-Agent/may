@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::computer::proto::{
-    InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind, MouseInput,
+    InputMessage, KeyboardEventKind, KeyboardInput, LaunchedWindow, MouseButtonInput,
+    MouseEventKind, MouseInput,
 };
 use crate::computer::{
     ComputerAgent,
@@ -50,6 +52,8 @@ pub struct ComputerArgs {
     /// - `type TEXT`: type at the focused element
     /// - `key KEY` or `key MOD+MOD+KEY`: `Enter`, `Tab`, `ArrowLeft`, `F5`,
     ///   a letter or digit, `cmd+l`, `cmd+shift+4`
+    /// - `launch APP [URL ...]`: open an application on the desktop without
+    ///   taking the user's focus; APP is its name, bundle id or `.app` path
     ///
     /// Modifiers: `cmd` (`command`, `meta`), `ctrl` (`control`), `alt`
     /// (`option`), `shift`. `X`/`Y` are points on the desktop (its size is in
@@ -59,6 +63,57 @@ pub struct ComputerArgs {
     #[serde(default)]
     #[schemars(extend("x-positional" = true))]
     pub operands: Vec<String>,
+}
+
+/// The actions `computer` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Screenshot,
+    Observe,
+    Click,
+    DoubleClick,
+    RightClick,
+    Drag,
+    Scroll,
+    Type,
+    Key,
+    Launch,
+}
+
+impl Action {
+    /// Every action, in the order `usage` lists them.
+    const ALL: [Self; 10] = [
+        Self::Screenshot,
+        Self::Observe,
+        Self::Click,
+        Self::DoubleClick,
+        Self::RightClick,
+        Self::Drag,
+        Self::Scroll,
+        Self::Type,
+        Self::Key,
+        Self::Launch,
+    ];
+
+    /// The word that names the action on the command line.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::Observe => "observe",
+            Self::Click => "click",
+            Self::DoubleClick => "double-click",
+            Self::RightClick => "right-click",
+            Self::Drag => "drag",
+            Self::Scroll => "scroll",
+            Self::Type => "type",
+            Self::Key => "key",
+            Self::Launch => "launch",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == word)
+    }
 }
 
 /// A key press: the key code and the modifiers held (the wire bitmask).
@@ -179,12 +234,46 @@ impl Tool for ComputerTool {
 
 impl ComputerTool {
     async fn run(&self, action: &str, rest: &[String]) -> Result<ToolResult, String> {
-        match action {
-            "screenshot" | "observe" => self.capture(action == "observe").await,
-            "click" | "double-click" | "right-click" | "drag" | "scroll" | "type" | "key" => {
-                self.drive(action, rest).await
+        let Some(kind) = Action::parse(action) else {
+            return Err(usage().to_owned());
+        };
+        match kind {
+            Action::Screenshot | Action::Observe => self.capture(kind == Action::Observe).await,
+            Action::Click
+            | Action::DoubleClick
+            | Action::RightClick
+            | Action::Drag
+            | Action::Scroll
+            | Action::Type
+            | Action::Key => self.drive(action, rest).await,
+            Action::Launch => self.launch(rest).await,
+        }
+    }
+
+    async fn launch(&self, rest: &[String]) -> Result<ToolResult, String> {
+        let (app, items) = launch_operands(rest)?;
+        self.check_agent_owns_desktop().await?;
+        self.ensure_desktop().await?;
+        match self
+            .handles
+            .agent
+            .request(AgentRequest::Launch {
+                session_id: self.session_id.clone(),
+                app: app.clone(),
+                items: items.to_vec(),
+            })
+            .await?
+        {
+            AgentResponse::Launched { app } => LaunchedText {
+                bundle_id: &app.bundle_id,
+                pid: app.pid,
+                windows: &app.windows,
             }
-            _ => Err(usage().to_owned()),
+            .render()
+            .map(ToolResult::text)
+            .map_err(|e| e.to_string()),
+            AgentResponse::Error { error } => Err(error),
+            _ => Err("unexpected reply from computer-agent".to_owned()),
         }
     }
 
@@ -388,8 +477,24 @@ fn numbers(form: &str, rest: &[String]) -> Result<Vec<f64>, String> {
         .collect()
 }
 
+/// Splits `launch`'s operands into the application and what it opens.
+fn launch_operands(rest: &[String]) -> Result<(&String, &[String]), String> {
+    rest.split_first().ok_or_else(|| {
+        "expected `computer launch APP [URL ...]`: APP is an application's name, bundle id or .app path".to_owned()
+    })
+}
+
+/// What `computer launch` tells the model.
+#[derive(Template)]
+#[template(path = "computer_launched.txt", escape = "none")]
+struct LaunchedText<'a> {
+    bundle_id: &'a str,
+    pid: i32,
+    windows: &'a [LaunchedWindow],
+}
+
 const fn usage() -> &'static str {
-    "usage: computer <screenshot|observe|click X Y|double-click X Y|right-click X Y|drag X1 Y1 X2 Y2|scroll DX DY|type TEXT|key KEY|key MOD+KEY>"
+    "usage: computer <screenshot|observe|click X Y|double-click X Y|right-click X Y|drag X1 Y1 X2 Y2|scroll DX DY|type TEXT|key KEY|key MOD+KEY|launch APP [URL ...]>"
 }
 
 #[cfg(test)]
@@ -438,6 +543,71 @@ mod tests {
             parsed(&["drag", "1", "2", "3", "4"]).1,
             strings(&["1", "2", "3", "4"])
         );
+    }
+
+    #[test]
+    fn every_action_the_skill_names_is_accepted() {
+        let skill = include_str!("../../skills/computer/SKILL.md");
+        let named: Vec<&str> = skill
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|span| span.strip_prefix("computer "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        assert!(named.len() >= 4, "{named:?}");
+        for word in named {
+            assert!(
+                Action::parse(word).is_some(),
+                "the skill names `computer {word}`, which the command does not accept"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_lists_every_action() {
+        for action in Action::ALL {
+            assert!(usage().contains(action.name()), "{}", action.name());
+        }
+    }
+
+    #[test]
+    fn launch_takes_an_app_and_urls() {
+        assert_eq!(
+            parsed(&["launch", "Google Chrome", "https://example.com"]),
+            (
+                "launch".into(),
+                strings(&["Google Chrome", "https://example.com"])
+            )
+        );
+    }
+
+    #[test]
+    fn launch_without_an_app_names_the_form() {
+        let (action, operands) = parsed(&["launch"]);
+        assert_eq!(action, "launch");
+        let error = launch_operands(&operands).unwrap_err();
+        assert!(error.contains("`computer launch APP [URL ...]`"), "{error}");
+    }
+
+    #[test]
+    fn launched_text_reports_app_pid_and_windows() {
+        let text = LaunchedText {
+            bundle_id: "com.google.Chrome",
+            pid: 42,
+            windows: &[LaunchedWindow {
+                id: 7,
+                x: 10.0,
+                y: 20.0,
+                width: 800.0,
+                height: 600.0,
+            }],
+        }
+        .render()
+        .unwrap();
+        assert!(text.contains("com.google.Chrome (pid 42)"), "{text}");
+        assert!(text.contains("Window 7: 800x600 at (10, 20)"), "{text}");
     }
 
     #[test]

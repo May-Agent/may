@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
 use skyzen::utils::Json;
 
-use super::aux::AuxKind;
+use super::sidecar::AuxKind;
 use crate::daemon::state::DaemonState;
 use crate::session::MessageRole;
 
@@ -39,7 +39,7 @@ struct RecapOutput {
     next_action: Option<String>,
 }
 
-impl super::aux::AuxOutput for RecapOutput {
+impl super::sidecar::AuxOutput for RecapOutput {
     fn texts(&self) -> Vec<(&str, usize)> {
         let mut texts = vec![(self.summary.as_str(), SUMMARY_MAX_CHARS)];
         texts.extend(
@@ -237,7 +237,7 @@ fn recap_window<'a>(
 /// The recap instruction, written in the session's communication language
 /// when one is set.
 #[derive(Template)]
-#[template(path = "aux/recap.md", escape = "none")]
+#[template(path = "sidecar/recap.md", escape = "none")]
 struct RecapPrompt {
     language: Option<crate::harness::language::Language>,
 }
@@ -279,9 +279,9 @@ async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRec
         return None;
     }
     let turns = window.turns;
-    let languages = super::aux::languages(state, session_id).await.ok()?;
+    let languages = super::sidecar::languages(state, session_id).await.ok()?;
     let messages = recap_messages(&window.conversation, languages.communication());
-    super::aux::generate::<RecapOutput>(state, session_id, messages, GENERATION_TIMEOUT)
+    super::sidecar::generate::<RecapOutput>(state, session_id, messages, GENERATION_TIMEOUT)
         .await
         .ok()?
         .into_record(turns)
@@ -412,7 +412,7 @@ pub(super) fn arm(state: &Arc<DaemonState>, session_id: &str) {
     if !state.config.load().recap.auto {
         return;
     }
-    if let Some(warmth) = super::aux::warm_cache(state, session_id) {
+    if let Some(warmth) = super::sidecar::warm_cache(state, session_id) {
         state.recap_schedules.arm(state, session_id, warmth);
     }
 }
@@ -649,12 +649,14 @@ mod tests {
             .expect("release run");
     }
 
-    async fn recap_from(reply: &'static str) -> Result<RecapOutput, super::super::aux::AuxError> {
+    async fn recap_from(
+        reply: &'static str,
+    ) -> Result<RecapOutput, super::super::sidecar::AuxError> {
         let slot = crate::agent::ModelSlot::new(
-            super::super::aux::test_support::Replying(reply),
+            super::super::sidecar::test_support::Replying(reply),
             aither_core::llm::model::Parameters::default(),
         );
-        super::super::aux::generate_with::<_, RecapOutput>(
+        super::super::sidecar::generate_with::<_, RecapOutput>(
             &slot,
             recap_messages(&[(&MessageRole::User, "ship it")], None),
             GENERATION_TIMEOUT,
@@ -685,7 +687,7 @@ mod tests {
         );
         let error = recap_from(reply).await.expect_err("over the limit");
         assert!(
-            matches!(error, super::super::aux::AuxError::Output(_)),
+            matches!(error, super::super::sidecar::AuxError::Output(_)),
             "{error}"
         );
     }

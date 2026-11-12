@@ -13,9 +13,9 @@ name = "may"
 path = "src/bin/may/main.rs"
 
 [workspace]
-members = [".", "tasks"]
-# `cargo build` also builds the `tasks` binary that sits beside `may`.
-default-members = [".", "tasks"]
+members = [".", "tasks", "patch", "sed"]
+# `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
+default-members = [".", "tasks", "patch", "sed"]
 
 [features]
 default = []
@@ -33,7 +33,7 @@ aither-agent = { version = "0.30.0", features = ["mcp", "webfetch", "skills", "c
 aither-connectivity = { version = "0.30.0" }
 # The parser the harness applies `apply_patch` with; a call's reading uses it
 # to place each hunk in the file it edits.
-aither-patch = { version = "0.30.0" }
+may-patch = { path = "patch" }
 aither-sandbox = { version = "0.30.0", features = ["code-folding", "connectivity", "jobserver"] }
 aither-cloud = { version = "0.30.0" }
 aither-copilot = { version = "0.30.0" }
@@ -43,9 +43,9 @@ aither-mcp = { version = "0.30.0" }
 aither-browser = { version = "0.30.0" }
 # Exact token counts (`LanguageModel::count_text`) for the decode meter.
 aither-openai = { version = "0.30.0", default-features = false, features = ["tokenizer"] }
-# Decides which `sed` forms a script may run (`aither_sed::supports`); the host
+# Decides which `sed` forms a script may run (`may_sed::supports`); the host
 # `sed` runs them, and a script's other `sed` calls are refused.
-aither-sed = { version = "0.30.0", default-features = false }
+may-sed = { path = "sed" }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.
 aither-acp = { version = "0.30.0" }
@@ -141,6 +141,7 @@ ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendere
 crossterm = "0.28"
 ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
+unicode-segmentation = { version = "1.13", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 ahash = "0.8"
 
@@ -315,6 +316,17 @@ opt-level = 3
 [profile.dev.package.zip]
 opt-level = 3
 
+# Only used by `cargo build --profile artifact`, which builds the prebuilt
+# `apply_patch` and `aither-sed` executables (`.github/scripts/build-artifact.sh`);
+# panic stays `unwind` here so the profile works with the default build-std
+# crates, and the script passes the panic strategy through the build.
+[profile.artifact]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
 [profile.dev.package.tar]
 opt-level = 3
 
@@ -327,7 +339,6 @@ opt-level = 3
 aither-core = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-agent = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "main" }
-aither-patch = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "main" }
@@ -336,5 +347,4 @@ aither-models = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-browser = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
-aither-sed = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main" }

@@ -23,6 +23,8 @@ export interface ProfileInfo {
   /** SSH server names attached to this profile; reachable via the terminal
    *  tool with `location: <name>`. */
   remoteAttachments: string[];
+  /** Cloud provider accounts set up with `/cloud`. */
+  cloud: { codespaces: { login: string } | null };
   createdAt?: string;
   updatedAt?: string;
 }

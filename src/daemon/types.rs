@@ -35,6 +35,9 @@ pub enum ApiErrorCode {
     UnknownSshServer,
     /// The host has no usable GitHub login.
     GithubUnauthenticated,
+    /// The cloud provider account `/cloud` set up cannot create machines:
+    /// its login is missing, lacks a permission, or the provider refused it.
+    CloudAccountUnusable,
     /// The user declined, at the session's repository question, to work where
     /// the session starts. The turn did not run; nothing failed.
     RepoDeclined,

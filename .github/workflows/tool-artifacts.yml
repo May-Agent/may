@@ -1,0 +1,221 @@
+name: Tool Artifacts
+
+# Builds the prebuilt `apply_patch` (may-patch) and `aither-sed` (may-sed)
+# executables listed in .github/scripts/built-tools.json, and attaches them to
+# the `patch/v<version>` and `sed/v<version>` releases. release-plz creates
+# those tags with GITHUB_TOKEN, which starts no workflow, so release.yml calls
+# this one with the tags its run released.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The tag to build from; empty builds the triggering commit.
+        type: string
+        required: false
+        default: ''
+      tags:
+        description: JSON array of the release tags to attach the archives to.
+        type: string
+        required: false
+        default: '[]'
+  pull_request:
+    paths:
+      - patch/**
+      - sed/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/scripts/build-artifact.sh
+      - .github/scripts/built-tools.json
+      - .github/scripts/verify-sandbox.sh
+      - .github/workflows/tool-artifacts.yml
+  push:
+    branches: [main]
+    paths:
+      - patch/**
+      - sed/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/scripts/build-artifact.sh
+      - .github/scripts/built-tools.json
+      - .github/scripts/verify-sandbox.sh
+      - .github/workflows/tool-artifacts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  artifact:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            heel_os: linux
+            heel_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            heel_os: linux
+            heel_arch: aarch64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            heel_os: macos
+            heel_arch: aarch64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            heel_os: windows
+            heel_arch: x86_64
+            suffix: .exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            heel_os: windows
+            heel_arch: aarch64
+            suffix: .exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+          components: rust-src
+          targets: ${{ matrix.target }}
+      # Only main saves: a PR cache lives in a scope nothing else restores,
+      # and its size evicts main's under the cache limit.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: tool-artifacts-${{ matrix.target }}
+      # The tools .github/scripts/built-tools.json lists for this target, as a JSON array.
+      - name: Select the tools of this target
+        id: tools
+        run: |
+          echo "tools=$(jq -c --arg target "${{ matrix.target }}" '[.tools[] | select(.targets | index($target)) | .tool]' .github/scripts/built-tools.json)" >> "${GITHUB_OUTPUT}"
+      - name: Build rebuilt-std executables
+        timeout-minutes: 20
+        env:
+          ARTIFACT_ABORT: immediate
+          ARTIFACT_NIGHTLY: nightly-2026-10-01
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: .github/scripts/build-artifact.sh "${{ matrix.target }}" "${{ runner.temp }}/tool-artifacts"
+      - name: Verify the exact apply_patch artifact
+        timeout-minutes: 5
+        env:
+          APPLY_PATCH_TEST_BIN: ${{ runner.temp }}/tool-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}
+        run: cargo +stable test --locked -p may-patch --test e2e
+      - name: Verify the packaged aither-sed
+        if: contains(fromJSON(steps.tools.outputs.tools), 'aither-sed')
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          check="${RUNNER_TEMP}/aither-sed-check"
+          mkdir -p "${check}"
+          tar -xzf "${RUNNER_TEMP}"/tool-artifacts/aither-sed-*-"${{ matrix.target }}".tar.gz -C "${check}"
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "may-sed") | .version')"
+          [ "$("${check}/aither-sed" --version)" = "aither-sed ${version}" ]
+          [ "$(printf 'a\nb\nc\nd\n' | "${check}/aither-sed" -n '2,3p;$p')" = "$(printf 'b\nc\nd')" ]
+          status=0
+          "${check}/aither-sed" 's/a/b/' </dev/null 2>/dev/null || status=$?
+          [ "${status}" = 1 ]
+      # The heel executable the tool distribution pins for this runner
+      # (src/tools/host-programs.json), as HEEL_BIN.
+      - name: Install heel
+        run: |
+          set -euo pipefail
+          pin="$(jq -c --arg os "${{ matrix.heel_os }}" --arg arch "${{ matrix.heel_arch }}" \
+            '[.host_programs[] | select(.tool == "heel" and .target.os == $os and .target.arch == $arch)]
+             | if length == 1 then .[0] else error("expected one heel pin") end' \
+            src/tools/host-programs.json)"
+          executable="${RUNNER_TEMP}/heel-runtime/heel${{ matrix.suffix }}"
+          mkdir -p "${RUNNER_TEMP}/heel-runtime"
+          curl -fsSL "$(jq -r .url <<<"${pin}")" -o "${executable}"
+          echo "$(jq -r .sha256 <<<"${pin}")  ${executable}" | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -)
+          chmod +x "${executable}"
+          "${executable}" --version
+          echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"
+      - name: Verify Windows native sandbox launch
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & "$env:HEEL_BIN" run --network deny --keep-working-dir --working-dir "$env:RUNNER_TEMP" -- cmd.exe /D /S /C "echo native-sandbox-ready"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify sandbox file permissions
+        timeout-minutes: 5
+        run: bash .github/scripts/verify-sandbox.sh "${{ runner.temp }}/tool-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}"
+      - name: Verify archive checksum
+        working-directory: ${{ runner.temp }}/tool-artifacts
+        run: |
+          if [[ "${RUNNER_OS}" == Windows ]]; then
+            sha256sum -c ./*.sha256
+          else
+            shasum -a 256 -c ./*.sha256
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tools-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/tool-artifacts/*.tar.gz
+            ${{ runner.temp }}/tool-artifacts/*.sha256
+            ${{ runner.temp }}/tool-artifacts/*.json
+
+  # A `patch/v<version>` tag attaches the apply_patch archives, a
+  # `sed/v<version>` tag the aither-sed archives, to the release of that tag.
+  release:
+    name: Attach to the release
+    needs: artifact
+    if: inputs.tags != '' && inputs.tags != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAGS: ${{ inputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tools-*
+          path: artifacts
+          merge-multiple: true
+      - name: Check each tag's version and attach its archives
+        run: |
+          set -euo pipefail
+          for TAG in $(jq -r '.[]' <<<"${TAGS}"); do
+            crate="${TAG%%/*}"
+            version="${TAG#*/v}"
+            case "${crate}" in
+              patch) tool=apply_patch; package=may-patch ;;
+              sed) tool=aither-sed; package=may-sed ;;
+              *) echo "::error::${TAG} is not a patch/v or sed/v tag"; exit 1 ;;
+            esac
+            [ "$(cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r --arg package "${package}" '.packages[] | select(.name == $package) | .version')" = "${version}" ] \
+              || { echo "::error::${TAG} does not name the version of ${package}"; exit 1; }
+            # Every listed target has its archive and checksum.
+            for target in $(jq -r --arg tool "${tool}" '.tools[] | select(.tool == $tool) | .targets[]' .github/scripts/built-tools.json); do
+              for file in "${tool}-${version}-${target}.tar.gz" "${tool}-${version}-${target}.tar.gz.sha256"; do
+                [ -f "artifacts/${file}" ] || { echo "::error::missing ${file}"; exit 1; }
+              done
+            done
+            # release-plz creates the release with the tag; create it only if absent.
+            gh release view "${TAG}" >/dev/null 2>&1 \
+              || gh release create "${TAG}" --verify-tag --title "${TAG}" --notes ""
+            gh release upload "${TAG}" --clobber \
+              artifacts/"${tool}-${version}"-*.tar.gz artifacts/"${tool}-${version}"-*.tar.gz.sha256
+          done

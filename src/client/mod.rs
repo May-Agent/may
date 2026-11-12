@@ -76,6 +76,23 @@ pub enum DaemonClientError {
     Json(#[from] serde_json::Error),
 }
 
+impl DaemonClientError {
+    /// The daemon's own reason when it refused with a typed error body,
+    /// else the error itself.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        #[derive(serde::Deserialize)]
+        struct TypedError {
+            error: String,
+        }
+        match self {
+            Self::Status { message, .. } => serde_json::from_str::<TypedError>(message)
+                .map_or_else(|_| self.to_string(), |typed| typed.error),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Handle on the daemon's API. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
