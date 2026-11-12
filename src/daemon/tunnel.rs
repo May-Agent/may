@@ -337,16 +337,12 @@ fn rewrite_location(
         let origin = format!(
             "{}://{}",
             entry.url.scheme(),
-            entry
-                .url
-                .host_str()
-                .map(|host| {
-                    entry
-                        .url
-                        .port()
-                        .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
-                })
-                .unwrap_or_default()
+            entry.url.host_str().map_or_default(|host| {
+                entry
+                    .url
+                    .port()
+                    .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+            })
         );
         location
             .strip_prefix(origin.as_str())

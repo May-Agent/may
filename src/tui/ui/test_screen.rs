@@ -97,12 +97,8 @@ impl ScreenBackend {
             self.erase(col, y);
         }
         self.grid[y][x] = Slot::Lead(symbol, width);
-        for col in x + 1..x + width {
-            self.grid[y][col] = Slot::Cont;
-        }
-        for col in x..x + width {
-            self.backgrounds[y][col] = cell.bg;
-        }
+        self.grid[y][x + 1..x + width].fill(Slot::Cont);
+        self.backgrounds[y][x..x + width].fill(cell.bg);
     }
 
     /// Visible text of each row, trailing blanks trimmed.

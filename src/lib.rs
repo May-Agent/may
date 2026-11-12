@@ -263,8 +263,7 @@ mod test_support {
                             let (parts, body) = request.into_parts();
                             let body = http_body_util::BodyExt::collect(body)
                                 .await
-                                .map(http_body_util::Collected::to_bytes)
-                                .unwrap_or_default();
+                                .map_or_default(http_body_util::Collected::to_bytes);
                             let request = ApiRequest {
                                 method: parts.method.to_string(),
                                 path: parts

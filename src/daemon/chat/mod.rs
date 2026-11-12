@@ -4166,8 +4166,7 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
                     .load()
                     .provider
                     .get(provider_id)
-                    .map(|instance| instance.cache_lifetime)
-                    .unwrap_or_default()
+                    .map_or_default(|instance| instance.cache_lifetime)
             })
         },
         forks: state.agent_forks.clone(),

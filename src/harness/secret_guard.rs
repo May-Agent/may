@@ -239,10 +239,8 @@ impl SecretGuard {
     #[must_use]
     pub fn find(&self, text: &str) -> Vec<SecretFinding> {
         let registry = self.shared.registry.load();
-        let mut findings: Vec<SecretFinding> = registry
-            .matcher
-            .as_ref()
-            .map(|matcher| {
+        let mut findings: Vec<SecretFinding> =
+            registry.matcher.as_ref().map_or_default(|matcher| {
                 matcher
                     .find_iter(text)
                     .map(|hit| SecretFinding {
@@ -252,8 +250,7 @@ impl SecretGuard {
                         range: hit.range(),
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         // Registered findings never overlap one another; a shape is kept
         // only where nothing found before it lies.
         let mut taken: Vec<Range<usize>> = findings

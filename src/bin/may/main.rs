@@ -3142,8 +3142,7 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
                         health
                             .search_index
                             .last_error
-                            .map(|error| format!("; last error: {error}"))
-                            .unwrap_or_default()
+                            .map_or_default(|error| format!("; last error: {error}"))
                     );
                 }
                 Err(_) => println!("May daemon not running."),
