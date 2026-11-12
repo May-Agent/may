@@ -44,7 +44,7 @@ runs:
       run: |
         if [ "${RUNNER_OS}" = macOS ]; then
           sysctl hw.ncpu hw.memsize
-          (while sleep 15; do
+          (set +eo pipefail; while sleep 15; do
             echo "$(date -u +%T) pressure=$(sysctl -n kern.memorystatus_vm_pressure_level) $(sysctl -n vm.swapusage)"
             ps -Ao rss=,comm= | sort -rn | head -3 | awk '{printf "  %d MB %s\n", $1/1024, $2}'
           done) > "${RUNNER_TEMP}/memory.log" 2>&1 &
