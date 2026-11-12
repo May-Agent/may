@@ -30,7 +30,7 @@ on:
       - .github/scripts/verify-sandbox.sh
       - .github/workflows/tool-artifacts.yml
   push:
-    branches: [dev]
+    branches: [main]
     paths:
       - patch/**
       - sed/**
@@ -89,8 +89,11 @@ jobs:
           toolchain: nightly-2026-10-01
           components: rust-src
           targets: ${{ matrix.target }}
+      # Only main saves: a PR cache lives in a scope nothing else restores,
+      # and its size evicts main's under the cache limit.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: tool-artifacts-${{ matrix.target }}
       # The tools .github/scripts/built-tools.json lists for this target, as a JSON array.
       - name: Select the tools of this target

@@ -122,6 +122,15 @@ fn tokio_runtime() -> io::Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
+    // Under the name `tasks` (the daemon's `~/.may/bin/tasks` link) this
+    // executable is the `tasks` command.
+    if may_agent::daemon::lifecycle::invoked_as_tasks(std::env::args_os().next().as_deref()) {
+        return Ok(may_tasks::run(
+            std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        ));
+    }
     // The permission helper instances the computer agent launches run this
     // same executable; they do their work and exit before anything else.
     #[cfg(target_os = "macos")]
@@ -262,6 +271,7 @@ async fn async_main() -> anyhow::Result<()> {
             .await;
         }
         CliMode::Daemon(command) => return run_daemon_command(command).await,
+        CliMode::Update => return run_update().await,
         CliMode::ComputerAgent { may_dir, .. } => {
             #[cfg(target_os = "macos")]
             {
@@ -3045,6 +3055,34 @@ async fn open_web_ui() -> anyhow::Result<()> {
 }
 
 /// `may daemon [install|uninstall|status|stop]`.
+/// `may update`: replaces this binary on its channel, then restarts a
+/// running daemon onto the new one. The restart is the new binary's own
+/// `daemon restart`: this process is still the old build.
+async fn run_update() -> anyhow::Result<()> {
+    use may_agent::update::{Channel, Outcome, update};
+
+    match update(Channel::current(), |step| eprintln!("{step}")).await? {
+        Outcome::UpToDate => eprintln!("May is up to date."),
+        Outcome::Updated { executable, to } => {
+            eprintln!("Updated May to {to}.");
+            let paths = may_agent::daemon::DaemonPaths::user()?;
+            let running = may_agent::client::DaemonClient::new(paths.socket())
+                .health()
+                .await
+                .is_ok();
+            if running {
+                eprintln!("Restarting the May daemon…");
+                let status = async_process::Command::new(&executable)
+                    .args(["daemon", "restart"])
+                    .status()
+                    .await?;
+                anyhow::ensure!(status.success(), "the new May could not restart the daemon");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
     use may_agent::daemon::{DaemonOptions, DaemonPaths, lifecycle};
 
@@ -3072,6 +3110,12 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
             } else {
                 eprintln!("The May daemon is not running.");
             }
+            Ok(())
+        }
+        cli::DaemonCommand::Restart => {
+            lifecycle::stop(&paths).await?;
+            lifecycle::ensure_running(&paths, |step| eprintln!("{step}")).await?;
+            eprintln!("The May daemon runs this build.");
             Ok(())
         }
         cli::DaemonCommand::Status => {

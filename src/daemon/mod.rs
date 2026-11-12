@@ -17,6 +17,7 @@ mod attachments;
 mod auth;
 #[cfg(test)]
 mod auth_tests;
+mod auto_update;
 mod bootstrap;
 mod browser;
 mod chat;
@@ -405,6 +406,8 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     };
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
+    lifecycle::ensure_tasks_link(&paths)
+        .context("failed to link `tasks` to the daemon's executable")?;
 
     // Agents of relocated homes whose runs were killed before they could
     // retire them, swept before the daemon answers so a client never sees

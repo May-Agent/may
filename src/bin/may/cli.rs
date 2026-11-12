@@ -34,6 +34,8 @@ pub enum CliMode {
     OneShot(OneShotArgs),
     /// Print the completion script of a shell.
     Completion(Shell),
+    /// Replace this binary with the newest build and restart the daemon.
+    Update,
 }
 
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
@@ -71,6 +73,8 @@ pub enum DaemonCommand {
     Status,
     /// Stop the running daemon.
     Stop,
+    /// Stop the running daemon and start one of this build.
+    Restart,
 }
 
 /// Parsed `may exec` invocation.
@@ -177,6 +181,9 @@ enum Command {
         #[arg(long)]
         stderr: Option<PathBuf>,
     },
+    /// Update May: a release build to the latest GitHub release, a dev build
+    /// to the latest successful CI build of main.
+    Update,
     /// Print the completion script of a shell.
     Completion {
         /// The shell to complete for.
@@ -205,6 +212,8 @@ enum DaemonAction {
     Status,
     /// Stop the running daemon.
     Stop,
+    /// Stop the running daemon and start one of this build.
+    Restart,
 }
 
 #[derive(Debug, Args)]
@@ -376,6 +385,7 @@ impl From<Option<DaemonAction>> for DaemonCommand {
             Some(DaemonAction::Uninstall) => Self::Uninstall,
             Some(DaemonAction::Status) => Self::Status,
             Some(DaemonAction::Stop) => Self::Stop,
+            Some(DaemonAction::Restart) => Self::Restart,
         }
     }
 }
@@ -449,6 +459,7 @@ impl Cli {
                 }),
                 stderr,
             },
+            Some(Command::Update) => CliMode::Update,
             Some(Command::Completion { shell }) => CliMode::Completion(shell),
         })
     }
@@ -567,6 +578,7 @@ mod tests {
             (Some("uninstall"), DaemonCommand::Uninstall),
             (Some("status"), DaemonCommand::Status),
             (Some("stop"), DaemonCommand::Stop),
+            (Some("restart"), DaemonCommand::Restart),
         ] {
             let mut argv = vec!["may", "daemon"];
             argv.extend(word);
@@ -754,6 +766,11 @@ mod tests {
     }
 
     #[test]
+    fn update_is_a_subcommand() {
+        assert_eq!(parse(&["may", "update"]), CliMode::Update);
+    }
+
+    #[test]
     fn completion_names_the_shell() {
         assert_eq!(
             parse(&["may", "completion", "fish"]),
@@ -826,7 +843,6 @@ mod tests {
             &["may", "exec", "--mode", "root", "--session", "s", "ls"],
             &["may", "browser", "read"],
             &["may", "resume", "a", "b"],
-            &["may", "daemon", "restart"],
         ] {
             assert!(parse_cli_mode(argv).is_err(), "{argv:?}");
         }
