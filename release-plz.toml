@@ -9,11 +9,14 @@ git_release_enable = false
 
 # may is never on crates.io (`publish = false`), so release-plz reads its
 # latest version from its git tags; git-only mode also releases a package that
-# does not publish.
+# does not publish. Its aither dependencies build only through the workspace's
+# git `[patch]`, which cargo-semver-checks drops when it packages the crate, and
+# no outside crate uses its library, so its bump comes from commit markers alone.
 [[package]]
 name = "may-agent"
 git_only = true
 git_tag_name = "v{{ version }}"
+semver_check = false
 
 # `tasks` ships inside `may` (the daemon links it to its own executable).
 [[package]]
