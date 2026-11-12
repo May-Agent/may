@@ -99,6 +99,7 @@ fn emit_image_refs(heel_lib_version: &str) {
         workspace_dir.to_path_buf(),
     ];
     inputs.extend(image_ref::tasks_sources(Path::new(".")).expect("tasks crate must be readable"));
+    inputs.push(PathBuf::from(image_ref::PYTHON_SHIM_TEMPLATE));
     inputs.extend(
         image_ref::workspace_hash_inputs(workspace_dir)
             .expect("workspace context must be readable")
