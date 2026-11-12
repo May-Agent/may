@@ -15,6 +15,10 @@ use super::state::{AppMode, StatusNotice};
 ///
 /// Returns [`TuiError`](crate::tui::error::TuiError) when the underlying
 /// handler fails — e.g. a database write for a UI action errors.
+///
+/// # Panics
+///
+/// Panics if a compiled message template fails to render.
 pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendAction>> {
     match event {
         AppEvent::Key(code, modifiers) => {
@@ -483,8 +487,6 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::BashFinished(outcome) => {
-            use std::fmt::Write as _;
-
             let outcome = *outcome;
             let mut output = outcome.stdout.clone();
             if !outcome.stderr.is_empty() {
@@ -518,20 +520,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                     return Ok(None);
                 }
             };
-            let mut content = format!("! {masked_command}\n");
-            if let Some(error) = &outcome.error {
-                let _ = write!(content, "\n<error>{error}</error>");
-            } else {
-                if !outcome.stdout.is_empty() {
-                    let _ = write!(content, "\n<stdout>\n{}\n</stdout>", outcome.stdout);
-                }
-                if !outcome.stderr.is_empty() {
-                    let _ = write!(content, "\n<stderr>\n{}\n</stderr>", outcome.stderr);
-                }
-                if outcome.exit_code != 0 {
-                    let _ = write!(content, "\n<exit>{}</exit>", outcome.exit_code);
-                }
-            }
+            let content = askama::Template::render(&crate::bash::BashOutcomeMessage::new(
+                &masked_command,
+                &outcome,
+            ))
+            .expect("the bash outcome template renders");
             let msg = super::queue::PendingMessage {
                 content,
                 hidden_context_xml: None,

@@ -344,6 +344,14 @@ where
     )
 }
 
+/// A command's help: what it does, then its usage.
+#[derive(Template)]
+#[template(path = "command_help.txt", escape = "none")]
+struct CommandHelp<'a> {
+    description: &'a str,
+    usage: &'a str,
+}
+
 fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, Entry) {
     let name = definition.name().to_string();
     let description = definition.description().to_string();
@@ -353,7 +361,12 @@ fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, E
     let help = if description.is_empty() {
         usage
     } else {
-        format!("{description}\n\n{usage}")
+        CommandHelp {
+            description: &description,
+            usage: &usage,
+        }
+        .render()
+        .expect("the command help template renders")
     };
     (
         name,

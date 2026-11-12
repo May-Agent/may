@@ -3,51 +3,45 @@
 
 use std::collections::{HashMap, HashSet};
 
+use askama::Template;
 use serde_json::Value;
 
-fn push_help_line(help: &mut String, line: &str) {
-    help.push_str(line);
-    help.push('\n');
+/// The help a command prints, laid out by `schema_help.txt`.
+#[derive(Template)]
+#[template(path = "schema_help.txt", escape = "none")]
+struct SchemaHelp<'a> {
+    description: Option<&'a str>,
+    /// Set for a tagged enum.
+    subcommands: Option<Vec<SubcommandHelp<'a>>>,
+    /// Set for an object schema.
+    arguments: Option<ArgumentsHelp<'a>>,
 }
 
-fn render_positional_usage(name: &str, required: bool, variadic: bool) -> String {
-    let kebab = name.replace('_', "-");
-    let mut output = String::with_capacity(kebab.len() + 7);
-    if !required {
-        output.push('[');
-    }
-    output.push('<');
-    output.push_str(kebab.as_str());
-    output.push('>');
-    if variadic {
-        output.push_str("...");
-    }
-    if !required {
-        output.push(']');
-    }
-    output
+struct SubcommandHelp<'a> {
+    name: String,
+    description: Option<&'a str>,
 }
 
-fn render_repeatable_usage(name: &str) -> String {
-    let kebab = name.replace('_', "-");
-    let mut output = String::with_capacity(kebab.len() + 12);
-    output.push_str("--");
-    output.push_str(kebab.as_str());
-    output.push_str(" <value>...");
-    output
+struct ArgumentsHelp<'a> {
+    positionals: Vec<PositionalUsage>,
+    /// Required array fields that are not positional, as kebab-case flags.
+    repeatable: Vec<String>,
+    entries: Vec<ArgumentHelp<'a>>,
 }
 
-fn render_flag_prefix(flag: &str, short: Option<char>) -> String {
-    let mut output = String::with_capacity(flag.len() + 8);
-    output.push_str("  ");
-    if let Some(short) = short {
-        output.push('-');
-        output.push(short);
-        output.push_str(", ");
-    }
-    output.push_str("--");
-    output.push_str(flag);
-    output
+struct PositionalUsage {
+    name: String,
+    required: bool,
+    variadic: bool,
+}
+
+struct ArgumentHelp<'a> {
+    flag: String,
+    positional: bool,
+    array: bool,
+    required: bool,
+    short: Option<char>,
+    description: Option<&'a str>,
 }
 
 /// Converts CLI arguments to JSON using schema information.
@@ -882,43 +876,38 @@ fn parse_value(s: &str, expected_type: Option<&str>) -> Value {
 }
 
 /// Generates help text from a JSON schema.
+///
+/// # Panics
+///
+/// Panics if the compiled help template fails to render.
 #[must_use]
 pub fn schema_to_help(schema: &Value) -> String {
-    let mut help = String::new();
-
     // The schema's title is the argument struct's Rust type name, which is
     // no part of the command line; only the description is shown.
-    if let Some(desc) = schema.get("description").and_then(Value::as_str) {
-        help.push_str(desc);
-        help.push('\n');
-    }
-
-    help.push_str("\nUsage:\n");
+    let description = schema.get("description").and_then(Value::as_str);
+    let mut help = SchemaHelp {
+        description,
+        subcommands: None,
+        arguments: None,
+    };
 
     // Check for tagged enum (subcommands)
     if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
         && let Some(tag) = find_serde_tag(schema)
     {
-        help.push_str("  <subcommand> [options]\n\n");
-        help.push_str("Subcommands:\n");
-
-        for variant in variants {
-            if let Some(name) = get_variant_name(variant, &tag) {
-                help.push_str("  ");
-                help.push_str(name.as_str());
-                if let Some(desc) = variant.get("description").and_then(Value::as_str) {
-                    help.push_str(" - ");
-                    help.push_str(desc);
-                }
-                help.push('\n');
-            }
-        }
-        help.push_str("\nOptions:\n  -h, --help  Show help\n");
-        return help;
-    }
-
-    // Simple object
-    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        help.subcommands = Some(
+            variants
+                .iter()
+                .filter_map(|variant| {
+                    Some(SubcommandHelp {
+                        name: get_variant_name(variant, &tag)?,
+                        description: variant.get("description").and_then(Value::as_str),
+                    })
+                })
+                .collect(),
+        );
+    } else if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        // Simple object
         let required: Vec<&str> = schema
             .get("required")
             .and_then(Value::as_array)
@@ -928,82 +917,45 @@ pub fn schema_to_help(schema: &Value) -> String {
         // ones in brackets.
         let required_names: Vec<String> = required.iter().map(|n| (*n).to_string()).collect();
         let positional_names = positional_fields(schema, props, &required_names);
-        let positional: Vec<_> = positional_names
+        let positionals = positional_names
             .iter()
-            .map(|name| {
-                render_positional_usage(
-                    name,
-                    required.contains(&name.as_str()),
-                    is_array_field(schema, props, name),
-                )
+            .map(|name| PositionalUsage {
+                name: name.replace('_', "-"),
+                required: required.contains(&name.as_str()),
+                variadic: is_array_field(schema, props, name),
             })
             .collect();
         // Show required array fields that are not positional as repeatable
         // flags in usage
-        let repeatable: Vec<_> = required
+        let repeatable = required
             .iter()
             .filter(|n| {
                 is_array_field(schema, props, n) && !positional_names.iter().any(|p| p == **n)
             })
-            .map(|n| render_repeatable_usage(n))
+            .map(|n| n.replace('_', "-"))
             .collect();
 
-        let mut usage_parts = Vec::new();
-        if !positional.is_empty() {
-            usage_parts.push(positional.join(" "));
-        }
-        for r in &repeatable {
-            usage_parts.push(r.clone());
-        }
-        usage_parts.push("[options]".to_string());
-        let usage = usage_parts.join(" ");
-        help.push_str("  ");
-        push_help_line(&mut help, usage.as_str());
-
-        help.push_str("\nOptions:\n  -h, --help  Show help\n");
-        help.push_str("\nArguments:\n");
-
         let (_, field_to_short) = build_short_option_maps(props);
-
-        for (name, prop) in props {
-            let is_required = required.contains(&name.as_str());
-            let is_array = get_instance_type(prop, prop) == Some("array");
-            let flag = name.replace('_', "-");
-
-            if positional_names.iter().any(|positional| positional == name) {
+        let entries = props
+            .iter()
+            .map(|(name, prop)| ArgumentHelp {
+                flag: name.replace('_', "-"),
                 // A positional argument is given as a bare word, never as a flag.
-                help.push_str("  <");
-                help.push_str(flag.as_str());
-                help.push('>');
-                if is_array {
-                    help.push_str("...");
-                }
-                if is_required {
-                    help.push_str(" (required)");
-                }
-            } else {
-                let short = field_to_short.get(name).copied();
-                help.push_str(render_flag_prefix(flag.as_str(), short).as_str());
-                if is_array {
-                    help.push_str(" <value>  (repeatable");
-                    if is_required {
-                        help.push_str(", required");
-                    }
-                    help.push(')');
-                } else if is_required {
-                    help.push_str(" (required)");
-                }
-            }
-
-            if let Some(desc) = prop.get("description").and_then(Value::as_str) {
-                help.push_str("\n      ");
-                help.push_str(desc);
-            }
-            help.push('\n');
-        }
+                positional: positional_names.iter().any(|positional| positional == name),
+                array: get_instance_type(prop, prop) == Some("array"),
+                required: required.contains(&name.as_str()),
+                short: field_to_short.get(name).copied(),
+                description: prop.get("description").and_then(Value::as_str),
+            })
+            .collect();
+        help.arguments = Some(ArgumentsHelp {
+            positionals,
+            repeatable,
+            entries,
+        });
     }
 
-    help
+    help.render().expect("the schema help template renders")
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -1252,6 +1204,82 @@ mod tests {
         assert!(!help.contains("--prompt"), "{help}");
         assert!(help.contains("--body"), "{help}");
         assert!(help.contains("--verbose"), "{help}");
+    }
+
+    #[test]
+    fn help_text_is_laid_out_per_kind_of_argument() {
+        /// Does a thing.
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[allow(dead_code)]
+        struct Rich {
+            /// The first word.
+            prompt: String,
+            /// Files, as bare words.
+            #[schemars(extend("x-positional" = true))]
+            files: Vec<String>,
+            /// Tags.
+            tags: Vec<String>,
+            /// Labels.
+            labels: Vec<String>,
+            /// A body.
+            #[serde(default)]
+            body: Option<String>,
+            /// A switch.
+            #[serde(default)]
+            verbose: bool,
+        }
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(tag = "operation", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Op {
+            /// Adds a comment.
+            Comment {
+                number: u64,
+            },
+            Close {
+                number: u64,
+            },
+        }
+        let help = |schema| super::schema_to_help(&serde_json::to_value(schema).expect("a schema"));
+        assert_eq!(
+            help(schemars::schema_for!(Rich)),
+            "Does a thing.
+
+Usage:
+  <prompt> <files>... --tags <value>... --labels <value>... [options]
+
+Options:
+  -h, --help  Show help
+
+Arguments:
+  -b, --body
+      A body.
+  <files>... (required)
+      Files, as bare words.
+  -l, --labels <value>  (repeatable, required)
+      Labels.
+  <prompt> (required)
+      The first word.
+  -t, --tags <value>  (repeatable, required)
+      Tags.
+  -v, --verbose
+      A switch.
+"
+        );
+        assert_eq!(
+            help(schemars::schema_for!(Op)),
+            "
+Usage:
+  <subcommand> [options]
+
+Subcommands:
+  comment - Adds a comment.
+  close
+
+Options:
+  -h, --help  Show help
+"
+        );
     }
 
     #[test]

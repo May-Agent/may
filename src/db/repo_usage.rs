@@ -56,14 +56,7 @@ impl ChatDb {
             .await
         };
         self.db
-            .query(
-                "INSERT INTO repo_usage (worktree, last_used_at, use_count, owner_repo) \
-                 VALUES (?, ?, 1, ?) \
-                 ON CONFLICT(worktree) DO UPDATE SET \
-                 last_used_at = MAX(last_used_at, excluded.last_used_at), \
-                 use_count = use_count + 1, \
-                 owner_repo = COALESCE(excluded.owner_repo, owner_repo)",
-            )
+            .query(super::db_sql::REPO_USAGE_TOUCH)
             .bind(worktree.display().to_string())
             .bind(at)
             .bind(owner_repo)
@@ -79,10 +72,7 @@ impl ChatDb {
     pub async fn repo_usage_since(&self, since: i64) -> Result<Vec<RepoUsage>, ChatDbError> {
         Ok(self
             .db
-            .query(
-                "SELECT worktree, last_used_at, use_count, owner_repo FROM repo_usage \
-                 WHERE last_used_at >= ?",
-            )
+            .query(super::db_sql::REPO_USAGE_SINCE)
             .bind(since)
             .fetch_all::<RepoUsage>()
             .await?)

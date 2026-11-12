@@ -1,0 +1,11 @@
+! {{ command }}
+{% if let Some(error) = outcome.error %}
+<error>{{ error }}</error>
+{%- else %}{% if !outcome.stdout.is_empty() %}
+<stdout>
+{{ outcome.stdout }}
+</stdout>{% endif %}{% if !outcome.stderr.is_empty() %}
+<stderr>
+{{ outcome.stderr }}
+</stderr>{% endif %}{% if outcome.exit_code != 0 %}
+<exit>{{ outcome.exit_code }}</exit>{% endif %}{% endif %}

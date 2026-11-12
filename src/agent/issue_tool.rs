@@ -986,76 +986,59 @@ fn render_detail(
     marks: Option<&IssueMarks>,
     owner: Option<&IssueOwner>,
 ) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "#{} {}\nstate: {}",
-        detail.number,
-        detail.title,
-        render_state(detail.state)
-    );
-    if let Some(owner) = owner {
-        let _ = writeln!(
-            out,
-            "owner: agent \"{}\" (id {})",
-            owner.display_name(),
-            owner.session_id
-        );
-    }
-    if let Some(marks) = marks {
-        match &marks.created_in {
-            Some(session) => {
-                let _ = writeln!(out, "written by may: yes (session {session})");
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "written by may: no (not created by may on this machine)"
-                );
-            }
-        }
-    }
-    if !detail.labels.is_empty() {
-        let _ = writeln!(out, "labels: {}", detail.labels.join(", "));
-    }
-    if !detail.sub_issues.is_empty() {
-        let _ = writeln!(out, "sub-issues: {}", render_related(&detail.sub_issues));
-    }
-    if !detail.blocked_by.is_empty() {
-        let _ = writeln!(out, "blocked-by: {}", render_related(&detail.blocked_by));
-    }
-    let _ = writeln!(
-        out,
-        "created: {}\nupdated: {}",
-        detail.created_at, detail.updated_at
-    );
-    if !detail.body.trim().is_empty() {
-        out.push('\n');
-        out.push_str(detail.body.trim());
-        out.push('\n');
-    }
-    if !detail.comments.is_empty() {
-        let _ = writeln!(out, "\ncomments ({}):", detail.comments.len());
-        for comment in &detail.comments {
-            let author = comment
+    let comments: Vec<IssueCommentLine<'_>> = detail
+        .comments
+        .iter()
+        .map(|comment| IssueCommentLine {
+            created_at: &comment.created_at,
+            author: comment
                 .author
                 .as_deref()
-                .map_or_default(|author| format!(" {author}"));
-            let mark = marks.map_or("", |marks| {
+                .map_or_default(|author| format!(" {author}")),
+            mark: marks.map_or("", |marks| {
                 if marks.comment_ids.contains(&comment.id) {
                     " [written by may]"
                 } else {
                     " [not written by may]"
                 }
-            });
-            let _ = writeln!(
-                out,
-                "- [{}]{}{} {}",
-                comment.created_at, author, mark, comment.body
-            );
-        }
+            }),
+            body: &comment.body,
+        })
+        .collect();
+    IssueDetailText {
+        detail,
+        state: render_state(detail.state),
+        marks,
+        owner,
+        sub_issues: render_related(&detail.sub_issues),
+        blocked_by: render_related(&detail.blocked_by),
+        body: detail.body.trim(),
+        comments: &comments,
     }
-    out
+    .render()
+    .expect("the issue detail template renders")
+}
+
+/// What the model reads for one issue: its fields and comments.
+#[derive(Template)]
+#[template(path = "issue_detail.txt", escape = "none")]
+struct IssueDetailText<'a> {
+    detail: &'a IssueDetail,
+    state: &'static str,
+    marks: Option<&'a IssueMarks>,
+    owner: Option<&'a IssueOwner>,
+    sub_issues: String,
+    blocked_by: String,
+    body: &'a str,
+    comments: &'a [IssueCommentLine<'a>],
+}
+
+/// One comment of an issue, with its author and provenance marks.
+struct IssueCommentLine<'a> {
+    created_at: &'a str,
+    author: String,
+    mark: &'static str,
+    body: &'a str,
 }
 
 /// Shared checks of the subagent's `issue` tool, run against each backend.
@@ -1631,5 +1614,84 @@ mod tests {
             }
             other => panic!("unexpected args: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+    use crate::issue::{IssueComment, RelatedIssue};
+
+    #[test]
+    fn a_detail_reads_as_its_fields_then_its_comments() {
+        let detail = IssueDetail {
+            number: 7,
+            title: "Crash".to_string(),
+            body: "\n  It crashes.  \n".to_string(),
+            state: IssueState::Open,
+            labels: vec!["bug".to_string(), "area: cli".to_string()],
+            comments: vec![
+                IssueComment {
+                    id: 1,
+                    author: Some("lexoliu".to_string()),
+                    body: "first".to_string(),
+                    created_at: "2026-01-01".to_string(),
+                },
+                IssueComment {
+                    id: 2,
+                    author: None,
+                    body: "second".to_string(),
+                    created_at: "2026-01-02".to_string(),
+                },
+            ],
+            sub_issues: Vec::new(),
+            blocked_by: vec![RelatedIssue {
+                repository: None,
+                number: 3,
+                title: "Other".to_string(),
+                state: IssueState::Closed,
+            }],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+        let marks = IssueMarks {
+            created_in: Some("session-1".to_string()),
+            comment_ids: vec![2],
+        };
+        assert_eq!(
+            render_detail(&detail, Some(&marks), None),
+            "#7 Crash
+state: open
+written by may: yes (session session-1)
+labels: bug, area: cli
+blocked-by: #3 (closed)
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-02T00:00:00Z
+
+It crashes.
+
+comments (2):
+- [2026-01-01] lexoliu [not written by may] first
+- [2026-01-02] [written by may] second
+"
+        );
+        assert_eq!(
+            render_detail(
+                &IssueDetail {
+                    body: String::new(),
+                    labels: Vec::new(),
+                    comments: Vec::new(),
+                    blocked_by: Vec::new(),
+                    ..detail
+                },
+                None,
+                None
+            ),
+            "#7 Crash
+state: open
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-02T00:00:00Z
+"
+        );
     }
 }

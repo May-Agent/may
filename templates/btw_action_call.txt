@@ -1,0 +1,3 @@
+called {{ chip }}: {{ summary }}{% if let Some(tail) = output_tail %}
+output:
+{{ tail }}{% endif %}

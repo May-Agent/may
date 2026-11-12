@@ -1,0 +1,2 @@
+The database {{ path }} does not match the schema this build of May uses:{% for problem in problems %}
+- {{ problem }}{% endfor %}

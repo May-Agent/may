@@ -1,0 +1,32 @@
+#{{ detail.number }} {{ detail.title }}
+state: {{ state }}
+{% if let Some(owner) = owner -%}
+owner: agent "{{ owner.display_name() }}" (id {{ owner.session_id }})
+{% endif -%}
+{% if let Some(marks) = marks -%}
+{% if let Some(session) = marks.created_in -%}
+written by may: yes (session {{ session }})
+{% else -%}
+written by may: no (not created by may on this machine)
+{% endif -%}
+{% endif -%}
+{% if !detail.labels.is_empty() -%}
+labels: {{ detail.labels.join(", ") }}
+{% endif -%}
+{% if !detail.sub_issues.is_empty() -%}
+sub-issues: {{ sub_issues }}
+{% endif -%}
+{% if !detail.blocked_by.is_empty() -%}
+blocked-by: {{ blocked_by }}
+{% endif -%}
+created: {{ detail.created_at }}
+updated: {{ detail.updated_at }}
+{% if !body.is_empty() %}
+{{ body }}
+{% endif -%}
+{% if !comments.is_empty() %}
+comments ({{ comments.len() }}):
+{% for comment in comments -%}
+- [{{ comment.created_at }}]{{ comment.author }}{{ comment.mark }} {{ comment.body }}
+{% endfor -%}
+{% endif -%}

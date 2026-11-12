@@ -1856,6 +1856,14 @@ impl std::fmt::Display for ShellWord {
     }
 }
 
+/// The text the screening model reads: the title and body to be published.
+#[derive(Template)]
+#[template(path = "pr_screen_input.txt", escape = "none")]
+struct ScreenInput<'a> {
+    title: &'a str,
+    body: &'a str,
+}
+
 /// The body of a PR opened by `pr open`: its commit subjects and, for a
 /// GitHub-backed project, the issue it closes.
 #[derive(Template)]
@@ -1985,6 +1993,9 @@ fn github_owner_repo(url: &str) -> Option<String> {
 ///
 /// # Errors
 /// Returns the model's error as a string when the call fails.
+///
+/// # Panics
+/// Panics if the compiled screening template fails to render.
 pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
     llm: &LLM,
     title: &str,
@@ -1992,7 +2003,9 @@ pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
 ) -> Result<ScreenVerdict, String> {
     use aither_core::llm::{Event, oneshot};
     use futures_lite::StreamExt;
-    let input = format!("TITLE: {title}\n\n{body}");
+    let input = ScreenInput { title, body }
+        .render()
+        .expect("the screen input template renders");
     let mut stream = Box::pin(llm.respond(oneshot(SCREEN_PROMPT, &input)));
     let mut text = String::new();
     while let Some(event) = stream.next().await {

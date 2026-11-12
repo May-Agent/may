@@ -11,46 +11,7 @@ use std::process::ExitCode;
 /// artifact identity, so it stays a bare `apply_patch <semver>` line.
 const VERSION: &str = concat!("apply_patch ", env!("CARGO_PKG_VERSION"));
 
-const HELP: &str = "\
-apply_patch — apply a compact contextual patch to files
-
-Usage: apply_patch < PATCH
-
-Reads the patch from standard input and applies it relative to the current
-directory. Typical use is a quoted heredoc:
-
-  apply_patch <<'PATCH'
-  *** Begin Patch
-  *** Update File: src/main.rs
-  @@ fn main
-   let args = parse();
-  -run(args);
-  +run(&args);
-  *** Add File: notes/todo.txt
-  +first task
-  *** Update File: old/name.rs
-  *** Move to: new/name.rs
-  *** Delete File: stale.txt
-  *** End Patch
-  PATCH
-
-Format: one or more `Add File`, `Update File`, or `Delete File` sections
-between `*** Begin Patch` and `*** End Patch`. Inside an Update section,
-lines starting with a space are context, `-` removes, `+` inserts, `@@`
-anchors a hunk, `*** Move to:` renames, and `*** End of File` anchors a
-hunk at the tail of the file.
-
-Every hunk is validated before any file is written; a patch that fails to
-parse or match changes nothing. Matched context must be unambiguous.
-
-Options:
-  -h, --help     show this help and exit
-  -V, --version  print the version and exit
-
-Output: one summary line per file (`A` added, `M` modified, `D` deleted,
-`R` renamed). Exit status: 0 success, 1 patch or filesystem failure,
-2 bad arguments.
-";
+const HELP: &str = include_str!("../templates/help.txt");
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
