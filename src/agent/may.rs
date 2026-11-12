@@ -697,14 +697,14 @@ impl MayAgent {
             ids: Some(session_ids.allocator().clone()),
             // A subagent launched from inside a session clone works in a
             // child clone of it.
-            spaces: Some(super::subagent_spaces::SessionSubagentSpaces::new(
+            spaces: super::subagent_spaces::SessionSubagentSpaces::new(
                 crate::repo_clone::SessionRepos::new(
                     &config.sandbox_dir,
                     config.session_id.as_str(),
                     config.db.clone(),
                 )
                 .with_host(crate::host_git::HostGit::inherit()),
-            )),
+            ),
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),
         };

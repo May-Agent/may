@@ -11,6 +11,7 @@ mod python_shim;
 mod settings;
 mod tools;
 mod wording;
+mod writable_dirs;
 
 pub use approval::ServerApproval;
 pub use assembly::{ShellAssembly, ShellAssemblyError};
@@ -23,3 +24,4 @@ pub use settings::{
 };
 pub use tools::ShellToolkit;
 pub use wording::MayShellWording;
+pub use writable_dirs::WritableDirs;

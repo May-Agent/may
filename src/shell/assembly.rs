@@ -84,9 +84,8 @@ pub struct ShellAssembly<P> {
     /// The ids every name the model sees is leased from; a shell given none
     /// leases from its own.
     pub ids: Option<AnyIdAllocator>,
-    /// The spaces subagents work in; none for a shell that launches no
-    /// subagent.
-    pub spaces: Option<SessionSubagentSpaces>,
+    /// The spaces subagents launched from the shell work in.
+    pub spaces: SessionSubagentSpaces,
     /// The machine's job pool the commands draw from; none when the daemon
     /// runs no pool or the backend cannot reach it.
     pub pool: Option<JobConnection>,
@@ -148,12 +147,10 @@ where
             .build()
             .await?
             .with_approver(self.permissions)
-            .with_shell_sessions(sessions);
+            .with_shell_sessions(sessions)
+            .with_subagent_spaces(self.spaces);
         if let Some(ids) = self.ids {
             shell = shell.with_id_allocator(ids);
-        }
-        if let Some(spaces) = self.spaces {
-            shell = shell.with_subagent_spaces(spaces);
         }
         if let Some(pool) = self.pool {
             shell = shell.with_jobserver_pool(pool.pool, pool.fifo_dir)?;

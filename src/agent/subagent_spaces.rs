@@ -1,21 +1,25 @@
-//! The spaces subagent runs work in: a child clone of the repository the run
-//! was launched from.
+//! The spaces subagent runs work in: the writable directories its commands
+//! use and, from a session clone, a child clone of it.
 //!
 //! aither gives every subagent run a space of its own and has the terminal's
-//! [`SubagentSpaces`] fill it first. For a run launched from inside a session
-//! clone, May makes a child clone of that clone in the space, at the clone's
+//! [`SubagentSpaces`] fill it first. Every run gets the temporary, home,
+//! cache and config directories of [`WritableDirs`] inside its space, and
+//! its commands' environment points at them: the session's own are only
+//! readable to a subagent. For a run launched from inside a session clone,
+//! May also makes a child clone of that clone in the space, at the clone's
 //! current commit, and names it as the run's working copy: the run's work is
 //! `git diff base..head` of that copy, and reaches the session clone only
-//! when the main agent fetches and merges it. A run launched anywhere else
-//! gets an empty space. Spaces lie in the launcher's working directory, so
-//! they leave with the session, and the main agent can remove one once its
-//! work is merged.
+//! when the main agent fetches and merges it. A run launched anywhere else,
+//! or from a shell with no session clones, gets the directories alone. Spaces
+//! lie in the launcher's working directory, so they leave with the session,
+//! and the main agent can remove one once its work is merged.
 
 use std::path::{Path, PathBuf};
 
 use aither_sandbox::{PreparedSpace, RunSpace, SubagentSpaces};
 
 use crate::repo_clone::{RepoCloneError, SessionRepos};
+use crate::shell::WritableDirs;
 
 /// The name of the working copy in a run's space. A run launched from inside
 /// it, one level down, clones it in turn.
@@ -35,13 +39,18 @@ pub enum SubagentSpaceError {
     /// The session's clones could not be read, or the child clone failed.
     #[error(transparent)]
     Clone(#[from] RepoCloneError),
+    /// A writable directory of the space could not be created.
+    #[error("cannot create the run's writable directories: {0}")]
+    Directories(#[source] std::io::Error),
 }
 
-/// Prepares each subagent run's space of a session: a child clone of the
-/// session clone the run was launched from.
+/// Prepares each subagent run's space of a shell: the writable directories
+/// of its commands' environment and, from a session clone, a child clone of
+/// it.
 #[derive(Debug, Clone)]
 pub struct SessionSubagentSpaces {
-    repos: SessionRepos,
+    /// The session's clones; none for a shell that has none to clone from.
+    repos: Option<SessionRepos>,
 }
 
 impl SessionSubagentSpaces {
@@ -49,32 +58,39 @@ impl SessionSubagentSpaces {
     /// are made by `repos`' git.
     #[must_use]
     pub const fn new(repos: SessionRepos) -> Self {
-        Self { repos }
+        Self { repos: Some(repos) }
+    }
+
+    /// Spaces for a shell with no session clones: each holds the writable
+    /// directories alone.
+    #[must_use]
+    pub const fn without_clones() -> Self {
+        Self { repos: None }
     }
 
     /// The clone `run` was launched from inside, by its canonical path: a
-    /// clone the session registered, or the working copy of the launcher's
-    /// own space when the launcher is a subagent.
+    /// clone `repos` registered, or the working copy of the launcher's own
+    /// space when the launcher is a subagent.
     async fn launched_from(
-        &self,
+        repos: &SessionRepos,
         run: &RunSpace<'_>,
     ) -> Result<Option<PathBuf>, SubagentSpaceError> {
         let caller = resolve(run.caller).await?;
         let mut sources = Vec::new();
-        for record in self.repos.clones().await? {
-            match async_fs::canonicalize(self.repos.path(&record.dir)).await {
+        for record in repos.clones().await? {
+            match async_fs::canonicalize(repos.path(&record.dir)).await {
                 Ok(path) => sources.push(path),
                 // A clone removed behind the registry is none to launch from.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => {
                     return Err(SubagentSpaceError::Resolve {
-                        path: self.repos.path(&record.dir),
+                        path: repos.path(&record.dir),
                         source,
                     });
                 }
             }
         }
-        if run.launcher != resolve(self.repos.session_root()).await? {
+        if run.launcher != resolve(repos.session_root()).await? {
             sources.push(run.launcher.join(WORKING_COPY));
         }
         Ok(sources
@@ -87,12 +103,26 @@ impl SubagentSpaces for SessionSubagentSpaces {
     type Error = SubagentSpaceError;
 
     async fn prepare(&self, run: RunSpace<'_>) -> Result<PreparedSpace, Self::Error> {
-        let Some(source) = self.launched_from(&run).await? else {
-            return Ok(PreparedSpace::new());
+        let writable = WritableDirs::under(run.space);
+        writable
+            .create()
+            .await
+            .map_err(SubagentSpaceError::Directories)?;
+        let prepared = writable
+            .variables()
+            .into_iter()
+            .fold(PreparedSpace::new(), |prepared, (name, directory)| {
+                prepared.with_env_dir(name, directory)
+            });
+        let Some(repos) = &self.repos else {
+            return Ok(prepared);
+        };
+        let Some(source) = Self::launched_from(repos, &run).await? else {
+            return Ok(prepared);
         };
         let copy = run.space.join(WORKING_COPY);
-        self.repos.child_clone(&source, &copy).await?;
-        Ok(PreparedSpace::new().with_working_copy(copy))
+        repos.child_clone(&source, &copy).await?;
+        Ok(prepared.with_working_copy(copy))
     }
 }
 
@@ -110,7 +140,8 @@ mod tests {
     use super::*;
     use crate::db::ChatDb;
     use crate::host_git::HostGit;
-    use crate::repo_clone::test_sandbox::{arm_hostile_config, markers};
+    use crate::repo_clone::CloneSandbox;
+    use crate::repo_clone::test_sandbox::{TestTerminal, arm_hostile_config, markers};
 
     fn git(dir: &Path, args: &[&str]) -> String {
         HostGit::inherit().output(Some(dir), args).unwrap()
@@ -249,8 +280,106 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(prepared.working_copies(), &[] as &[PathBuf]);
-        assert_eq!(std::fs::read_dir(&space).unwrap().count(), 0);
+        assert_eq!(prepared, expected_env(&space));
+        assert!(!space.join(WORKING_COPY).exists());
+    }
+
+    /// What every prepared space records: the layout of [`WritableDirs`],
+    /// spelled out.
+    fn expected_env(space: &Path) -> PreparedSpace {
+        let tmp = space.join("tmp");
+        let cache = space.join(".cache");
+        PreparedSpace::new()
+            .with_env_dir("TMPDIR", &tmp)
+            .with_env_dir("TMP", &tmp)
+            .with_env_dir("TEMP", &tmp)
+            .with_env_dir("HOME", space)
+            .with_env_dir("XDG_CACHE_HOME", &cache)
+            .with_env_dir("XDG_CONFIG_HOME", space.join(".config"))
+            .with_env_dir("BUN_INSTALL_CACHE_DIR", cache.join("bun"))
+    }
+
+    fn assert_env_dirs_exist(space: &Path) {
+        for directory in ["tmp", ".cache", ".cache/bun", ".config"] {
+            assert!(space.join(directory).is_dir(), "{directory} is not made");
+        }
+    }
+
+    /// A run with a child clone also gets the writable directories, each
+    /// recorded inside the space and made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_with_a_clone_records_its_writable_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session::new(&tmp).await;
+        let space = Session::space(&session.root, "run-1");
+
+        let prepared = session
+            .spaces
+            .prepare(RunSpace {
+                space: &space,
+                launcher: &session.root,
+                caller: &session.clone,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared,
+            expected_env(&space).with_working_copy(space.join(WORKING_COPY))
+        );
+        assert_env_dirs_exist(&space);
+    }
+
+    /// A shell with no session clones still gives its runs the writable
+    /// directories, and no working copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_without_clones_records_its_writable_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let space = Session::space(&root, "run-1");
+
+        let prepared = SessionSubagentSpaces::without_clones()
+            .prepare(RunSpace {
+                space: &space,
+                launcher: &root,
+                caller: &root,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(prepared, expected_env(&space));
+        assert_env_dirs_exist(&space);
+        assert!(!space.join(WORKING_COPY).exists());
+    }
+
+    /// A native subagent's command writes a temporary file, its home and its
+    /// cache directory, all inside its space.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagents_command_writes_temp_home_and_cache_inside_its_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let terminal = TestTerminal::new(&root).await;
+        let child = terminal
+            .shell()
+            .subagent(aither_sandbox::SubagentGrant::new(), None, "worker")
+            .await
+            .expect("the space is prepared");
+        let space = child.working_dir().to_path_buf();
+
+        let printed = CloneSandbox::new(child, std::time::Duration::from_secs(60))
+            .run(
+                &space,
+                "file=$(mktemp) && touch \"$file\" \"$HOME/home-file\" \
+                 \"$XDG_CACHE_HOME/cache-file\" && printf '%s' \"$file\"",
+            )
+            .await
+            .expect("mktemp and both writes succeed");
+
+        let temp = PathBuf::from(printed.trim());
+        assert!(temp.starts_with(&space), "{temp:?} is outside {space:?}");
+        assert!(temp.exists());
+        assert!(space.join("home-file").exists());
+        assert!(space.join(".cache/cache-file").exists());
     }
 
     /// A subagent launched from inside its own working copy hands its

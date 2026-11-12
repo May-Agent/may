@@ -453,7 +453,7 @@ async fn build_exec_shell(
         slot: ShellSlot::new(),
         ssh_servers: ssh_server.into_iter().collect(),
         ids: Some(session_ids.allocator().clone()),
-        spaces: None,
+        spaces: may_agent::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
         pool,
         connectivity: None,
     }
