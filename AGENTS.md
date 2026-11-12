@@ -110,7 +110,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`tasks/`** - the `may-tasks` crate: the `tasks.md` parser, `edit.rs` and the `tasks` binary, the ordinary program (not an IPC command) that edits the file `MAY_TASKS` names; it links no `may-agent` code, and the container image tag hashes this directory and `Cargo.lock`. `may` runs the same command (`may_tasks::run`) when invoked under the name `tasks`: the daemon keeps `~/.may/bin/tasks` a symlink to its own executable (`lifecycle::ensure_tasks_link`) and puts `~/.may/bin` first on the `PATH` it gives sessions, so a release ships `tasks` inside `may`. The container image builds the `tasks` binary from this crate and carries it at `/usr/local/bin/tasks`; `cargo build` builds it, `cargo run --bin may` does not
 
-**`patch/`, `sed/`** - the `may-patch` crate (the `apply_patch` binary and the parser `command_reading` uses) and the `may-sed` crate (the `aither-sed` binary and `supports`, which `command_policy` uses). `.github/workflows/tool-artifacts.yml` builds their prebuilt binaries and attaches them to the `patch/v<version>` and `sed/v<version>` releases
+**`patch/`, `sed/`** - the `may-patch` crate (the `apply_patch` binary and the parser `command_reading` uses) and the `may-sed` crate (the `aither-sed` binary and `supports`, which `command_policy` uses). `.github/workflows/tool-artifacts.yml` builds their prebuilt binaries and attaches them to the `patch/v<version>` and `sed/v<version>` releases, which `src/tools/tool-artifacts.json` pins and the tool distribution downloads in place of aither's
 
 **`src/tasks_md/`** - re-exports `may-tasks` and holds `schema.rs`: `tasks.md` as an aither working document with the schema, the stop rule and the line limit
 

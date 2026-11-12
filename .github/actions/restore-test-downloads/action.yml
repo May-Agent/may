@@ -21,7 +21,7 @@ runs:
         # The manifests pin every baseline artifact, the interpreter uv
         # installs into a prepared runtime and heel, so their hash keys the
         # directory.
-        tools="$(cat src/tools/tool-distribution-*.json src/tools/host-programs.json | digest | cut -d' ' -f1)"
+        tools="$(cat src/tools/tool-distribution-*.json src/tools/tool-artifacts.json src/tools/host-programs.json | digest | cut -d' ' -f1)"
         root="${RUNNER_TEMP}/may-test-cache"
         mkdir -p "${root}"
         {

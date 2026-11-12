@@ -250,6 +250,7 @@ dispatch2 = { version = "0.3", default-features = false, features = ["std", "obj
 
 [build-dependencies]
 sha2 = "0.10"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # File locks, so the E2E tests that share host state stay serial across the
