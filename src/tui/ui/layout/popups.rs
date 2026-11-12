@@ -217,6 +217,9 @@ pub(super) fn render_cloud_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(hint("its token needs the codespace scope.")),
                 Line::from(""),
                 Line::from(vec![
+                    key("[n] "),
+                    label("New cloud session"),
+                    Span::raw("  "),
                     key("[s] "),
                     label("Set up"),
                     Span::raw("  "),
@@ -228,6 +231,29 @@ pub(super) fn render_cloud_popup(frame: &mut Frame, area: Rect, app: &App) {
                 ]),
             ],
         )
+    };
+    let machines_view = |(machines, selected): &(Vec<crate::cloud::MachineType>, usize)| {
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(label("The machine the new session runs entirely on:")),
+            Line::from(""),
+        ];
+        lines.extend(machines.iter().enumerate().map(|(index, machine)| {
+            let style = if index == *selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(
+                format!(" {} ({}) ", machine.display_name, machine.name),
+                style,
+            ))
+        }));
+        lines.push(Line::from(""));
+        lines.push(Line::from(hint(
+            "[Enter] Start the session  [↑/↓] Choose  [Esc] Back",
+        )));
+        (" New Cloud Session ", lines)
     };
     let login_view = |login: &String| {
         (
@@ -245,10 +271,11 @@ pub(super) fn render_cloud_popup(frame: &mut Frame, area: Rect, app: &App) {
             ],
         )
     };
-    let (title, content) = app
-        .cloud_login
-        .as_ref()
-        .map_or_else(account_view, login_view);
+    let (title, content) = match (&app.cloud_machines, &app.cloud_login) {
+        (Some(picker), _) => machines_view(picker),
+        (None, Some(login)) => login_view(login),
+        (None, None) => account_view(),
+    };
 
     let widget = Paragraph::new(content)
         .block(

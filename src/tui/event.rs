@@ -78,6 +78,13 @@ pub enum AppEvent {
     /// A `/cloud` change finished: the updated profile, or why it failed.
     CloudConfigured(Result<ProfileInfo, String>),
 
+    /// The machine types a cloud session may start on, or why they could
+    /// not be listed.
+    CloudCatalog(Result<Vec<crate::cloud::MachineType>, String>),
+
+    /// A step of bringing the current cloud session's machine up.
+    CloudSession(crate::daemon::types::CloudSessionEvent),
+
     /// The session's stored reasoning effort arrived from the daemon.
     EffortLoaded(Option<String>),
     /// A `/effort` update finished; Ok carries the applied token.
@@ -276,6 +283,8 @@ impl AppEvent {
             Self::ConfigSaved(_) => "config_saved",
             Self::SshProbed { .. } => "ssh_probed",
             Self::CloudConfigured(_) => "cloud_configured",
+            Self::CloudCatalog(_) => "cloud_catalog",
+            Self::CloudSession(_) => "cloud_session",
             Self::EffortLoaded(_) => "effort_loaded",
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",

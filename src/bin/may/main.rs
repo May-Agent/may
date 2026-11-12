@@ -1493,6 +1493,16 @@ where
                             runtime_deps.begin_new_session(app, worker).await?;
                         }
                     }
+                    Some(SendAction::NewCloudSession(machine_type)) => {
+                        held_turn = None;
+                        // The session works on its codespace, never in this
+                        // directory, so no launch trust gates it.
+                        runtime_deps.begin_new_session(app, worker).await?;
+                        app.session_manager.run_in_cloud(machine_type.clone())?;
+                        app.set_status(format!(
+                            "New cloud session on {machine_type}: its codespace is created with the first message"
+                        ));
+                    }
                     Some(SendAction::LoadSession(id)) => {
                         held_turn = None;
                         worker_build = Some(WorkerBuild {

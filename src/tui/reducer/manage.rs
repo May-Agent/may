@@ -454,17 +454,35 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
 }
 
 /// `/cloud`: `s` sets up Codespaces (asking for the GitHub account), `d`
-/// removes it.
-pub fn handle_cloud_key(app: &mut App, code: KeyCode) {
+/// removes it, `n` starts a new session entirely on a codespace of a
+/// machine type picked from the catalog.
+pub fn handle_cloud_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    if let Some((machines, selected)) = app.cloud_machines.as_mut() {
+        match code {
+            KeyCode::Esc => app.cloud_machines = None,
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(machines.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let machine_type = machines.get(*selected)?.name.clone();
+                app.cloud_machines = None;
+                app.mode = crate::tui::state::AppMode::Chat;
+                return Some(SendAction::NewCloudSession(machine_type));
+            }
+            _ => {}
+        }
+        return None;
+    }
+    let set_up = app
+        .current_profile()
+        .is_some_and(|profile| profile.cloud.codespaces.is_some());
     match app.cloud_login.as_mut() {
         None => match code {
             KeyCode::Esc => app.mode = crate::tui::state::AppMode::Chat,
             KeyCode::Char('s') => app.cloud_login = Some(String::new()),
-            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace
-                if app
-                    .current_profile()
-                    .is_some_and(|profile| profile.cloud.codespaces.is_some()) =>
-            {
+            KeyCode::Char('n') if set_up => app.start_cloud_catalog(),
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if set_up => {
                 app.start_codespaces_removal();
             }
             _ => {}
@@ -484,6 +502,7 @@ pub fn handle_cloud_key(app: &mut App, code: KeyCode) {
             _ => {}
         },
     }
+    None
 }
 
 pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
