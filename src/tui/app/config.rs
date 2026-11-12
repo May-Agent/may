@@ -163,8 +163,7 @@ impl App {
                         .models
                         .compaction_model
                         .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default();
+                        .map_or_default(ToString::to_string);
                     state.start_text_edit(&current);
                 }
                 _ => {}
@@ -193,8 +192,7 @@ impl App {
                             .config
                             .sandbox
                             .job_pool_size
-                            .map(|size| size.to_string())
-                            .unwrap_or_default();
+                            .map_or_default(|size| size.to_string());
                         state.start_text_edit(&current);
                     }
                     _ => {}

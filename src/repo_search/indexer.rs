@@ -219,8 +219,7 @@ impl IndexerStatus {
     pub fn snapshot(&self) -> IndexerSnapshot {
         self.inner
             .lock()
-            .map(|snapshot| snapshot.clone())
-            .unwrap_or_default()
+            .map_or_default(|snapshot| snapshot.clone())
     }
 }
 

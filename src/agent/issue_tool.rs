@@ -953,14 +953,13 @@ fn render_list(summaries: &[IssueSummary], owners: Option<&OwnerIndex>) -> Strin
         let owner = owners
             .filter(|_| summary.state == IssueState::Open)
             .and_then(|owners| owners.get(summary.number))
-            .map(|owner| {
+            .map_or_default(|owner| {
                 format!(
                     " (owner: {}, id {})",
                     owner.display_name(),
                     owner.session_id
                 )
-            })
-            .unwrap_or_default();
+            });
         let _ = writeln!(
             out,
             "#{}\t{}\t{}{}{}",
@@ -1041,8 +1040,7 @@ fn render_detail(
             let author = comment
                 .author
                 .as_deref()
-                .map(|author| format!(" {author}"))
-                .unwrap_or_default();
+                .map_or_default(|author| format!(" {author}"));
             let mark = marks.map_or("", |marks| {
                 if marks.comment_ids.contains(&comment.id) {
                     " [written by may]"
