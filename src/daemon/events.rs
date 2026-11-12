@@ -21,7 +21,7 @@ use super::types::{
     BrowserStatusEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
     NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
     RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeSnapshotItem,
-    SessionRuntimesEventPayload, SseHeartbeat,
+    SessionRuntimesEventPayload, SnapshotRuntime, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -598,8 +598,14 @@ async fn emit_session_runtimes_if_changed(
         Ok(runtimes) => runtimes
             .into_iter()
             .map(|(session_id, runtime)| SessionRuntimeSnapshotItem {
+                runtime: state
+                    .cloud_sessions
+                    .mirrored_runtime(&session_id)
+                    .map_or_else(
+                        || SnapshotRuntime::Local(Box::new(runtime.into())),
+                        SnapshotRuntime::Codespace,
+                    ),
                 session_id,
-                runtime: runtime.into(),
             })
             .collect::<Vec<_>>(),
         Err(error) => {

@@ -7,6 +7,9 @@ use crate::session::AttachmentKind;
 use crate::tui::{App, Attachment, PendingMessage};
 use crate::{ChatMessage, MayConfig, SessionId};
 
+/// Shown when a cloud session opens while its codespace is suspended.
+const SUSPENDED_NOTICE: &str = "This session's codespace is suspended. Send a message to wake it; its history appears once it is running.";
+
 /// Error type for TUI runtime operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiRuntimeError {
@@ -555,8 +558,12 @@ impl RuntimeDeps {
         let session_model = session.model.clone();
         let events_cursor = session.events_cursor.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
+        let suspended = session.suspended;
 
         app.init_session(&session_id, &messages).await;
+        if suspended {
+            app.chat.push_notice(SUSPENDED_NOTICE);
+        }
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;

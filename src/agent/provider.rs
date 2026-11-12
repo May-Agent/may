@@ -22,6 +22,7 @@ use aither_core::llm::{
 use futures_lite::{Stream, StreamExt as _};
 
 use super::may::MayAgentError;
+use super::session_model::{PushedModel, SessionModel};
 use crate::config::{
     MayConfig, ModelTier, NativeToolsConfig, ProviderApi, ProviderInstance, ProviderType,
 };
@@ -213,10 +214,10 @@ where
     }
 }
 
-/// The model every provider client is built as: a [`CloudProvider`] behind
+/// The model every provider client is built as: a [`SessionModel`] behind
 /// secret redaction. [`build_cloud_provider_from_instance`] is the only
 /// constructor, so no request leaves May without passing it.
-pub type ProviderLlm = RedactedModel<CloudProvider>;
+pub type ProviderLlm = RedactedModel<SessionModel>;
 
 /// A model and the [`Parameters`] of the requests sent to it. aither takes
 /// the parameters next to the model and adds the fields it owns on top.
@@ -665,6 +666,15 @@ pub(super) async fn build_cloud_provider_from_instance(
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
 
+    // On a cloud home an OAuth provider uses what the fronting daemon
+    // pushed, never a credential of this machine's own.
+    if let Some(access) = &instance.pushed_access {
+        return Ok(RedactedModel::new(
+            SessionModel::Pushed(PushedModel::new(access.clone(), base_url, model)),
+            redactor.clone(),
+        ));
+    }
+
     if provider_type.requires_api_key() && api_key.is_empty() {
         return Err(MayAgentError::MissingApiKey(err_api_key_required(id)));
     }
@@ -788,7 +798,7 @@ pub(super) async fn build_cloud_provider_from_instance(
         }
     };
 
-    Ok(RedactedModel::new(llm, redactor.clone()))
+    Ok(RedactedModel::new(llm.into(), redactor.clone()))
 }
 
 fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {

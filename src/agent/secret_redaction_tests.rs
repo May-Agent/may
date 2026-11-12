@@ -156,7 +156,8 @@ fn model(base_url: &str, redactor: SecretRedactor) -> ProviderLlm {
                 .no_retry()
                 .build()
                 .with_chat_completions_api(),
-        ),
+        )
+        .into(),
         redactor,
     )
 }

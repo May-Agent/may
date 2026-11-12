@@ -21,6 +21,7 @@ mod auto_update;
 mod bootstrap;
 mod browser;
 mod chat;
+mod cloud_home;
 mod cloud_sessions;
 mod computer;
 mod config;

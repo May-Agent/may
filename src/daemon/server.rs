@@ -289,6 +289,16 @@ pub async fn start(
 
     let live_limits = crate::agent::LiveLimits::of(&config);
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
+    let cloud_sessions = Arc::new(
+        super::cloud_sessions::CloudSessions::load(
+            db_for_archive.clone(),
+            super::cloud_sessions::GitHubCloud,
+            config.clone(),
+            ui_event_bus.clone(),
+        )
+        .await
+        .context("failed to read the cloud sessions")?,
+    );
     let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
         config.clone(),
         crate::session::MayHomePaths::new(may_dir.clone()),
@@ -317,14 +327,7 @@ pub async fn start(
         browser_lifecycle_tx,
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
-        cloud_sessions: Arc::new(
-            super::cloud_sessions::CloudSessions::load(
-                db_for_archive.clone(),
-                super::cloud_sessions::GitHubCloud,
-            )
-            .await
-            .context("failed to read the cloud sessions")?,
-        ),
+        cloud_sessions,
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
             ui_event_bus.clone(),
@@ -493,6 +496,7 @@ fn api_routes() -> Route {
             "/events".at(stream_events),
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
             "/session-names".post(super::sessions::issue_session_name),
+            "/cloud-home/providers/{id}".put(super::cloud_home::push_provider),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
                 "".post(create_session),

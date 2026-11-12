@@ -45,6 +45,9 @@ pub enum ApiErrorCode {
     /// alerted; the message says which loop. Nothing failed, and the session
     /// takes the next message.
     LoopStopped,
+    /// The cloud session's codespace is suspended; only a message starts
+    /// it. Nothing failed.
+    SessionSuspended,
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.
@@ -1495,7 +1498,19 @@ impl Default for SessionRuntimeResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
-    pub(crate) runtime: SessionRuntimeResponse,
+    #[schema(value_type = SessionRuntimeResponse)]
+    pub(crate) runtime: SnapshotRuntime,
+}
+
+/// A session's runtime in a snapshot: this daemon's own, or a cloud
+/// session's as its codespace daemon reports it, which has the same shape.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum SnapshotRuntime {
+    /// A session this daemon runs.
+    Local(Box<SessionRuntimeResponse>),
+    /// A cloud session, as its codespace daemon serialized it.
+    Codespace(serde_json::Value),
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]

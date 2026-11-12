@@ -1403,7 +1403,7 @@ impl DaemonState {
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
-            config,
+            config: config.clone(),
             live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
@@ -1419,6 +1419,8 @@ impl DaemonState {
                 super::cloud_sessions::CloudSessions::load(
                     db.clone(),
                     super::cloud_sessions::GitHubCloud,
+                    config.clone(),
+                    ui_event_bus.clone(),
                 )
                 .await?,
             ),

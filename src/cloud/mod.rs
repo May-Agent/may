@@ -10,6 +10,7 @@
 //! Which provider a profile uses, and as which account, is the profile's
 //! [`ProfileCloud`], set with `/cloud`.
 
+pub mod access;
 pub mod bootstrap;
 pub mod codespaces;
 pub mod gh;

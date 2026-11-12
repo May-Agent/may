@@ -116,6 +116,9 @@ pub struct Session {
     /// The machine type a new session runs entirely in the cloud on, until
     /// it is persisted; `None` for a session on the daemon's machine.
     pub cloud: Option<String>,
+    /// Whether the session's codespace was suspended when it was loaded:
+    /// its history arrives once a message starts the codespace.
+    pub suspended: bool,
 }
 
 /// The GitHub repository a cloud session of `repo` (a spec or a path) or,
@@ -704,6 +707,7 @@ impl SessionManager {
             cwd,
             events_cursor: None,
             cloud: None,
+            suspended: false,
         };
 
         self.current = Some(session);
@@ -839,9 +843,14 @@ impl SessionManager {
     /// which cannot happen given the immediately preceding assignment.
     pub async fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
         let daemon = self.daemon()?;
-        let api = daemon
+        let api = match daemon
             .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
-            .await?;
+            .await
+        {
+            Ok(api) => api,
+            Err(error) if error.is_suspended() => return Ok(self.suspended_session(id)),
+            Err(error) => return Err(error.into()),
+        };
 
         let title = Some(api.title.clone()).filter(|t| t != "New Chat");
         let model = Some(api.model.clone()).filter(|m| !m.is_empty());
@@ -853,9 +862,12 @@ impl SessionManager {
             .unwrap_or_else(|_| Timestamp::now());
         let created_at = updated_at;
 
-        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(
-            &daemon.get_transcript(id.as_str()).await?.entries,
-        );
+        let transcript = match daemon.get_transcript(id.as_str()).await {
+            Ok(transcript) => transcript,
+            Err(error) if error.is_suspended() => return Ok(self.suspended_session(id)),
+            Err(error) => return Err(error.into()),
+        };
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(&transcript.entries);
         let history = ChatHistory::default();
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
@@ -872,10 +884,33 @@ impl SessionManager {
             cwd: None,
             events_cursor: api.cursor,
             cloud: None,
+            suspended: false,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 
         Ok(self.current.as_ref().expect("just assigned"))
+    }
+
+    /// `id`, a cloud session whose codespace is suspended, as current: what
+    /// it holds is the codespace daemon's to tell once a message starts it.
+    fn suspended_session(&mut self, id: &SessionId) -> &Session {
+        let now = Timestamp::now();
+        self.current.insert(Session {
+            id: id.clone(),
+            title: None,
+            model: None,
+            profile_id: None,
+            history: ChatHistory::default(),
+            sandbox_dir: self.store.sandbox_dir(id.as_str(), None),
+            created_at: now,
+            updated_at: now,
+            persisted: true,
+            repo: None,
+            cwd: None,
+            events_cursor: None,
+            cloud: None,
+            suspended: true,
+        })
     }
 
     /// The profile a persisted session belongs to, read from the daemon
