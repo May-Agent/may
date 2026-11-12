@@ -259,18 +259,37 @@ fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -
 }
 
 #[test]
-fn the_work_section_names_the_issue_backend() {
-    let work = build_work(&crate::issue::IssueBackendInfo {
+fn the_pr_landing_rule_is_rendered_only_for_a_session_with_a_clone() {
+    let issues = crate::issue::IssueBackendInfo {
         name: "may",
         repository: None,
-    });
+    };
+    let with_clone = build_work(&issues, true);
+    assert!(
+        with_clone.contains("Land code with the `pr` command"),
+        "{with_clone}"
+    );
+    let direct = build_work(&issues, false);
+    assert!(!direct.contains("Land code with"), "{direct}");
+    assert!(!direct.contains("source checkout"), "{direct}");
+}
+
+#[test]
+fn the_work_section_names_the_issue_backend() {
+    let work = build_work(
+        &crate::issue::IssueBackendInfo {
+            name: "may",
+            repository: None,
+        },
+        false,
+    );
     assert!(work.contains("`issue` command (may backend)"), "{work}");
 
     let github = crate::issue::IssueBackendInfo {
         name: "github",
         repository: Some("May-Agent/may".to_string()),
     };
-    let work = build_work(&github);
+    let work = build_work(&github, false);
     assert!(work.contains("`issue` command (github backend)"), "{work}");
     assert!(!work.contains("May-Agent/may"), "{work}");
 
@@ -618,7 +637,7 @@ fn rendered_instructions(
             super::build_terminal(&AgentEnvironment::Local),
         )
         .with_instruction(tag::EFFICIENCY, build_efficiency(&[]))
-        .with_instruction(tag::WORK, build_work(&issues))
+        .with_instruction(tag::WORK, build_work(&issues, true))
         .with_instruction(
             tag::SESSION,
             super::build_session(
