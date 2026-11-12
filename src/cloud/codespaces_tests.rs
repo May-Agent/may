@@ -5,12 +5,14 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use super::{Codespaces, CodespacesAccount, ENVIRONMENT_REPOSITORY};
 use crate::cloud::{
     CloudError, CloudMachine, CloudProvider, MachineId, MachineState, MachineType, NewMachine,
+    RunningWait, until_running,
 };
 use crate::issue::github::GitHubRest;
 use crate::pr::PrTokenSource;
@@ -471,6 +473,177 @@ async fn a_refusal_carries_githubs_message() {
     assert!(
         matches!(&error, CloudError::Refused { status: 403, message, .. }
             if message == "You must have a billing method to create a codespace"),
+        "{error:?}"
+    );
+    api.assert_sent();
+}
+
+/// A wait short enough for a test, long enough for a few polls.
+const TEST_WAIT: RunningWait = RunningWait {
+    deadline: Duration::from_secs(5),
+    first_poll: Duration::from_millis(1),
+    longest_poll: Duration::from_millis(4),
+};
+
+#[tokio::test]
+async fn a_suspended_machine_is_started_once_and_waited_on_until_it_runs() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "POST",
+            format!("{path}/start"),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        // The start is not visible yet: no second start is sent.
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Starting", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path,
+            ApiReply::json(200, codespace("Available", "standardLinux")),
+        ),
+    ])
+    .await;
+    let mut seen = Vec::new();
+
+    let running = until_running(
+        &api.provider(),
+        &MachineId::new(CODESPACE_NAME.into()),
+        TEST_WAIT,
+        |machine| seen.push(machine.state),
+    )
+    .await
+    .expect("running");
+
+    assert_eq!(running, machine(MachineState::Running, standard_linux()));
+    assert_eq!(
+        seen,
+        [
+            MachineState::Suspended,
+            MachineState::Suspended,
+            MachineState::Suspended,
+            MachineState::Provisioning,
+            MachineState::Running,
+        ]
+    );
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_machine_that_falls_back_to_suspended_is_started_again() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "POST",
+            format!("{path}/start"),
+            ApiReply::json(200, codespace("Starting", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Starting", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Shutdown", "standardLinux")),
+        ),
+        exchange(
+            "POST",
+            format!("{path}/start"),
+            ApiReply::json(200, codespace("Available", "standardLinux")),
+        ),
+    ])
+    .await;
+
+    let running = until_running(
+        &api.provider(),
+        &MachineId::new(CODESPACE_NAME.into()),
+        TEST_WAIT,
+        |_| {},
+    )
+    .await
+    .expect("running");
+
+    assert_eq!(running, machine(MachineState::Running, standard_linux()));
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_machine_that_dies_or_vanishes_while_waited_on_is_gone() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Provisioning", "standardLinux")),
+        ),
+        exchange(
+            "GET",
+            path.clone(),
+            ApiReply::json(200, codespace("Failed", "standardLinux")),
+        ),
+        exchange("GET", path, not_found()),
+    ])
+    .await;
+    let provider = api.provider();
+    let id = MachineId::new(CODESPACE_NAME.into());
+
+    for _ in 0..2 {
+        let error = until_running(&provider, &id, TEST_WAIT, |_| {})
+            .await
+            .expect_err("gone");
+        assert!(
+            matches!(&error, CloudError::Gone(gone) if *gone == id),
+            "{error:?}"
+        );
+    }
+    api.assert_sent();
+}
+
+#[tokio::test]
+async fn a_machine_still_settling_at_the_deadline_is_not_running() {
+    let path = format!("/user/codespaces/{CODESPACE_NAME}");
+    let api = Recorded::serve(vec![exchange(
+        "GET",
+        path,
+        ApiReply::json(200, codespace("Rebuilding", "standardLinux")),
+    )])
+    .await;
+    let id = MachineId::new(CODESPACE_NAME.into());
+
+    let error = until_running(
+        &api.provider(),
+        &id,
+        RunningWait {
+            deadline: Duration::ZERO,
+            ..TEST_WAIT
+        },
+        |_| {},
+    )
+    .await
+    .expect_err("deadline");
+
+    assert!(
+        matches!(&error, CloudError::NotRunning { id: waited, state: MachineState::Provisioning, .. } if *waited == id),
         "{error:?}"
     );
     api.assert_sent();
