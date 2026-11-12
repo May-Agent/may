@@ -722,6 +722,29 @@ pub async fn try_connection(
     limit: std::time::Duration,
     heel: heel::HeelBinary,
 ) -> Result<(), TrialError> {
+    let trial = prepare_trial(name, agent, heel).await?;
+    run_trial(runtime, limit, trial).await
+}
+
+/// A trial session ready to run: its scratch directory, the host that knows
+/// only the candidate agent and the session to open.
+pub(crate) struct PreparedTrial {
+    scratch: tempfile::TempDir,
+    host: SandboxedHost,
+    spec: SessionSpec,
+}
+
+/// Builds the scratch directory, the trial host and its sandbox for `agent`;
+/// nothing is spawned yet.
+///
+/// # Errors
+/// Returns [`TrialError`] when the directory, the sandbox or the host cannot
+/// be prepared.
+pub(crate) async fn prepare_trial(
+    name: &str,
+    agent: &AcpAgentConfig,
+    heel: heel::HeelBinary,
+) -> Result<PreparedTrial, TrialError> {
     let scratch = blocking::unblock(tempfile::tempdir).await?;
     let work = scratch.path().join("work");
     async_fs::create_dir_all(&work).await?;
@@ -734,6 +757,29 @@ pub async fn try_connection(
     spec.model.clone_from(&agent.model);
     spec.mode.clone_from(&agent.mode);
     spec.permission = Some(PermissionPolicy::Deny);
+    Ok(PreparedTrial {
+        scratch,
+        host,
+        spec,
+    })
+}
+
+/// Opens the trial session and closes it, giving up after `limit` counted
+/// from the start of the handshake; the preparation's time is not part of it.
+/// The scratch directory is removed when this returns.
+///
+/// # Errors
+/// As [`try_connection`], except preparation failures.
+pub(crate) async fn run_trial(
+    runtime: &Handle,
+    limit: std::time::Duration,
+    trial: PreparedTrial,
+) -> Result<(), TrialError> {
+    let PreparedTrial {
+        scratch: _scratch,
+        host,
+        spec,
+    } = trial;
     // The timer is built inside the runtime's context. A handshake dropped at
     // the limit releases acpsub's last handle on the agent, which kills its
     // process tree.

@@ -58,7 +58,7 @@ may-sed = { path = "sed" }
 aither-acp = { version = "0.30.0" }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
-heel = { version = "0.10.0", default-features = false }
+heel = { version = "0.10.1", default-features = false }
 
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
 acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
@@ -252,6 +252,7 @@ dispatch2 = { version = "0.3", default-features = false, features = ["std", "obj
 
 [build-dependencies]
 sha2 = "0.10"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # File locks, so the E2E tests that share host state stay serial across the

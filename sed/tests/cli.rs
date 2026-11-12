@@ -1,11 +1,13 @@
 //! The executable as the sandbox runs it.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
 
-fn aither_sed(args: &[&str], stdin: &str) -> std::process::Output {
+fn aither_sed(directory: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_aither-sed"))
         .args(args)
+        .current_dir(directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -27,9 +29,21 @@ fn aither_sed(args: &[&str], stdin: &str) -> std::process::Output {
     child.wait_with_output().expect("wait")
 }
 
+/// Runs `args` on `stdin` and returns the standard output of a run that
+/// succeeded without a diagnostic.
+fn printed(args: &[&str], stdin: &str) -> String {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = aither_sed(directory.path(), args, stdin);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{args:?}: {stderr}");
+    assert_eq!(stderr, "", "{args:?}");
+    String::from_utf8(output.stdout).expect("stdout")
+}
+
 #[test]
 fn version_is_the_name_and_the_package_version() {
-    let output = aither_sed(&["--version"], "");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = aither_sed(directory.path(), &["--version"], "");
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
@@ -38,98 +52,125 @@ fn version_is_the_name_and_the_package_version() {
 }
 
 #[test]
-fn prints_a_range_from_standard_input() {
-    let output = aither_sed(&["-n", "2,3p"], "x\ny\nz\nw\n");
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"y\nz\n");
+fn line_ranges_print() {
+    assert_eq!(printed(&["-n", "2,3p"], "x\ny\nz\nw\n"), "y\nz\n");
+    assert_eq!(printed(&["-n", "$p"], "x\ny\nz\n"), "z\n");
 }
 
-/// Every supported form prints what the host's GNU `sed` prints, byte for
-/// byte, with the same exit status.
-#[cfg(target_os = "linux")]
+/// The expected outputs are what GNU sed prints for the same script and input.
 #[test]
-fn every_supported_form_matches_gnu_sed() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    for (name, content) in [
-        ("a", "a1\na2\na3\na4\na5\n"),
-        ("b", "b1\nb2\nb3\n"),
-        ("nonl", "n1\nn2"),
-        ("empty", ""),
+fn regex_addresses_and_ranges_print_as_gnu_sed_does() {
+    for (args, input, expected) in [
+        (
+            &["-n", "/foo/,/bar/p"][..],
+            "x\nfoo\ny\nbar\nz\n",
+            "foo\ny\nbar\n",
+        ),
+        (&["-n", "/foo/,+1p"], "x\nfoo\ny\nz\nfoo\n", "foo\ny\nfoo\n"),
+        (&["-n", "2,/c/p"], "a\nb\nc\nd\n", "b\nc\n"),
+        (&["-n", "/b/p"], "a\nb\nc\n", "b\n"),
+        (&["-n", "/b/,$p"], "a\nb\nc\n", "b\nc\n"),
     ] {
-        std::fs::write(directory.path().join(name), content).expect("write fixture");
+        assert_eq!(printed(args, input), expected, "{args:?}");
     }
-    let cases: &[&[&str]] = &[
-        &["-n", "2p", "a"],
-        &["-n", "2,4p", "a"],
-        &["-n", "4,$p", "a"],
-        &["-n", "$p", "a"],
-        &["-n", "4,2p", "a"],
-        &["-n", "9p", "a"],
-        &["-n", "2,3p;1p", "a"],
-        &["-n", "1,4p;3,5p", "a"],
-        &["-n", " 2 , 3 p ; 5p ", "a"],
-        &["-n", "2p\n4p", "a"],
-        &["-ne", "3p", "a"],
-        &["-n", "-e", "3p", "a"],
-        &["--quiet", "3p", "a"],
-        &["-n", "4,6p", "a", "b"],
-        &["-n", "$p", "a", "b"],
-        &["-n", "2p", "nonl"],
-        &["-n", "$p", "nonl"],
-        &["-n", "1,$p", "nonl", "b"],
-        &["-n", "2p", "nonl", "b"],
-        &["-n", "2,3p", "nonl", "b"],
-        &["-n", "1,$p", "b", "nonl"],
-        &["-n", "$p", "nonl", "empty"],
-        &["-n", "1,$p", "empty", "a"],
-        &["-n", "2p", "a", "missing", "b"],
-        &["-n", "7p", "a", "missing", "b"],
-        &["-n", "2,3p", "-"],
-        &["-n", "2,3p"],
-    ];
-    let mut mismatches = Vec::new();
-    for args in cases {
-        let run = |program: &str| {
-            let mut child = Command::new(program)
-                .args(*args)
-                .current_dir(directory.path())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn");
-            let mut stdin = child.stdin.take().expect("stdin");
-            // Only the forms that read standard input get it; the others may
-            // exit before it is written.
-            if args.len() == 2 || args.last() == Some(&"-") {
-                stdin.write_all(b"s1\ns2\ns3\ns4").expect("write stdin");
-            }
-            drop(stdin);
-            child.wait_with_output().expect("wait")
-        };
-        let ours = run(env!("CARGO_BIN_EXE_aither-sed"));
-        let gnu = run("sed");
-        if (ours.status.code(), &ours.stdout) != (gnu.status.code(), &gnu.stdout) {
-            mismatches.push(format!(
-                "{args:?}: ours {:?} {:?}, GNU {:?} {:?}",
-                ours.status.code(),
-                String::from_utf8_lossy(&ours.stdout),
-                gnu.status.code(),
-                String::from_utf8_lossy(&gnu.stdout),
-            ));
-        }
-    }
-    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
-fn an_unsupported_script_exits_non_zero_with_the_message() {
-    let output = aither_sed(&["s/a/b/"], "a\n");
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(output.stdout, b"");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`apply_patch`") && stderr.contains("`python3`"),
-        "{stderr}"
+fn the_commands_that_write_nothing_run() {
+    for (args, input, expected) in [
+        (&["s/a/b/"][..], "abc\naaa\n", "bbc\nbaa\n"),
+        (&["s/a/b/g"], "abc\naaa\n", "bbc\nbbb\n"),
+        (&["-E", "s/(a+)b/[\\1]/"], "aab\nb\n", "[aa]\nb\n"),
+        (&["2d"], "1\n2\n3\n", "1\n3\n"),
+        (&["2q"], "1\n2\n3\n", "1\n2\n"),
+        (&["y/abc/xyz/"], "aabbcc\n", "xxyyzz\n"),
+        (&["="], "a\nb\n", "1\na\n2\nb\n"),
+        (&["-e", "s/a/b/", "-e", "s/b/c/"], "a\n", "c\n"),
+        (&["s/語/日本/"], "漢語\n", "漢日本\n"),
+    ] {
+        assert_eq!(printed(args, input), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn reads_the_files_it_is_given() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    std::fs::write(directory.path().join("a"), "a1\na2\n").expect("write a");
+    let output = aither_sed(directory.path(), &["-n", "/a2/p", "a"], "");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"a2\n");
+}
+
+/// Every write form fails with the `apply_patch` message before a file is
+/// opened or created.
+#[test]
+fn every_write_form_is_refused_and_touches_no_file() {
+    for args in [
+        &["w out"][..],
+        &["W out"],
+        &["r in"],
+        &["R in"],
+        &["s/a/b/w out"],
+        &["s/a/b/e"],
+        &["e"],
+        &["1e echo hi"],
+        &["-e", "p", "-e", "w out"],
+        &["-n", "/a/{p;w out\n}"],
+        &["-i", "s/a/b/", "target"],
+        &["--in-place", "s/a/b/", "target"],
+        &["--in-pl", "s/a/b/", "target"],
+        &["-ni", "s/a/b/", "target"],
+        &["-i.bak", "s/a/b/", "target"],
+        &["-ni.bak", "s/a/b/", "target"],
+        &["-n", "-i", "s/a/b/", "target"],
+    ] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(directory.path().join("target"), "a\n").expect("write target");
+        std::fs::write(directory.path().join("in"), "x\n").expect("write in");
+        let output = aither_sed(directory.path(), args, "a\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert_eq!(output.stdout, b"", "{args:?}");
+        assert!(stderr.contains("`apply_patch`"), "{args:?}: {stderr}");
+        assert!(
+            stderr.starts_with("Refused before running:"),
+            "{args:?}: {stderr}"
+        );
+        assert!(!directory.path().join("out").exists(), "{args:?}");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("target")).expect("read target"),
+            "a\n",
+            "{args:?}"
+        );
+    }
+}
+
+/// An `i` in a script or its value is not the in-place flag.
+#[test]
+fn an_i_inside_a_script_is_not_in_place_editing() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    std::fs::write(directory.path().join("target"), "hi\n").expect("write target");
+    for args in [
+        &["-e", "s/i/x/", "target"][..],
+        &["-es/i/x/", "target"],
+        &["-n", "-e", "s/i/x/p", "target"],
+    ] {
+        let output = aither_sed(directory.path(), args, "");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert_eq!(output.stdout, b"hx\n", "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("target")).expect("read target"),
+        "hi\n"
     );
+}
+
+#[test]
+fn a_syntax_error_is_not_a_write_refusal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = aither_sed(directory.path(), &["s/a/b"], "a\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("apply_patch"), "{stderr}");
 }

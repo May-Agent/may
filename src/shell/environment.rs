@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use heel::{Access, Grant, ResolvedPath};
 
+use super::WritableDirs;
 use super::python_shim;
 use crate::tools::{PreparedTools, ToolRuntimeError, UV_PYTHON_PREFERENCE};
 
@@ -174,22 +175,11 @@ async fn environment(
     working_dir: &Path,
     tools: &PreparedTools<PathBuf>,
 ) -> Result<Vec<(String, String)>, SessionEnvironmentError> {
-    let session_tmp = working_dir.join("tmp");
-    let session_cache = working_dir.join(".cache");
-    let bun_cache = session_cache.join("bun");
-    let session_config = working_dir.join(".config");
-    let playwright_cache = session_cache.join("ms-playwright");
+    let writable = WritableDirs::under(working_dir);
+    let playwright_cache = writable.cache().join("ms-playwright");
     let python_path = working_dir.join("skills").join("python");
-    for directory in [
-        &session_tmp,
-        &session_cache,
-        &bun_cache,
-        &session_config,
-        &playwright_cache,
-    ] {
-        async_fs::create_dir_all(directory).await?;
-    }
-    let tmp = path_value("TMPDIR", &session_tmp)?;
+    writable.create().await?;
+    async_fs::create_dir_all(&playwright_cache).await?;
     let python = match std::env::var_os("PYTHONPATH") {
         None => python_path.into_os_string(),
         Some(existing) => std::env::join_paths(
@@ -216,30 +206,15 @@ async fn environment(
     .map_err(|error| std::io::Error::other(format!("session PATH: {error}")))?
     .into_string()
     .map_err(|_| ToolRuntimeError::InvalidCache(tools.bin_dir().clone()))?;
-    let mut env = vec![
-        ("PATH".to_string(), path),
-        ("TMPDIR".to_string(), tmp.clone()),
-        ("TMP".to_string(), tmp.clone()),
-        ("TEMP".to_string(), tmp),
-        ("HOME".to_string(), path_value("HOME", working_dir)?),
-        (
-            "XDG_CACHE_HOME".to_string(),
-            path_value("XDG_CACHE_HOME", &session_cache)?,
-        ),
-        (
-            "XDG_CONFIG_HOME".to_string(),
-            path_value("XDG_CONFIG_HOME", &session_config)?,
-        ),
-        (
-            "BUN_INSTALL_CACHE_DIR".to_string(),
-            path_value("BUN_INSTALL_CACHE_DIR", &bun_cache)?,
-        ),
-        (
-            "PLAYWRIGHT_BROWSERS_PATH".to_string(),
-            path_value("PLAYWRIGHT_BROWSERS_PATH", &playwright_cache)?,
-        ),
-        ("PYTHONPATH".to_string(), python),
-    ];
+    let mut env = vec![("PATH".to_string(), path)];
+    for (name, directory) in writable.variables() {
+        env.push((name.to_string(), path_value(name, &directory)?));
+    }
+    env.push((
+        "PLAYWRIGHT_BROWSERS_PATH".to_string(),
+        path_value("PLAYWRIGHT_BROWSERS_PATH", &playwright_cache)?,
+    ));
+    env.push(("PYTHONPATH".to_string(), python));
     // `uv` keeps its cache and the Pythons it installs for projects in one
     // directory shared by every session, not under the remapped HOME.
     if let Some(uv) = tools.uv_environment() {

@@ -4527,9 +4527,8 @@ const BASELINE_ACCEPTANCE_PASSED: &str = "baseline acceptance passed";
 /// The version the embedded distribution pins for `key` of `entries` on this
 /// host, the `uv` artifact or the managed Python.
 fn pinned_version(entries: &str, tool: Option<&str>) -> String {
-    let manifest: Value =
-        serde_json::from_str(include_str!("../src/tools/tool-distribution-0.24.0.json"))
-            .expect("the embedded distribution is JSON");
+    let manifest =
+        may_agent::tools::manifest::combined_manifest().expect("the embedded distribution is JSON");
     let target = ToolTarget::native().expect("test host should have a tool target");
     manifest[entries]
         .as_array()

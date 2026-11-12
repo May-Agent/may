@@ -20,7 +20,7 @@ use crate::config::RemoteAccessConfig;
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
 
-use super::auth::TailnetLogin;
+use super::auth::{NodeNames, NodeNamesSource, TailnetLogin};
 use super::error::{bad_request_error, internal_error};
 use super::state::DaemonState;
 use super::types::{
@@ -687,6 +687,8 @@ struct TailscaleNode {
     dns_name: String,
     #[serde(rename = "UserID", default)]
     user_id: u64,
+    #[serde(rename = "TailscaleIPs", default)]
+    tailscale_ips: Vec<IpAddr>,
 }
 
 /// `tailscale whois --json`: the node a tailnet address belongs to and the
@@ -759,6 +761,29 @@ pub(super) async fn resolve_tailnet_login(
 ) -> Option<TailnetLogin> {
     let binary = tailscale_binary(&state.config_snapshot().remote_access);
     whois_login(&binary, peer.to_canonical()).await
+}
+
+/// The node's tailnet addresses and `MagicDNS` name in `tailscale status
+/// --json` output (`Self.TailscaleIPs`, `Self.DNSName`).
+pub(super) fn parse_node_names(output: &str) -> Result<NodeNames, String> {
+    let status: TailscaleStatus = serde_json::from_str(output)
+        .map_err(|error| format!("unexpected `tailscale status` output: {error}"))?;
+    let node = status
+        .self_node
+        .ok_or_else(|| "`tailscale status` reports no Self node".to_string())?;
+    Ok(NodeNames::new(node.tailscale_ips, &node.dns_name))
+}
+
+/// Reads the direct listener's node names through the `tailscale` binary
+/// configured at the time of each read.
+pub(super) struct TailscaleNodeNames(pub(super) Arc<DaemonState>);
+
+impl NodeNamesSource for TailscaleNodeNames {
+    async fn read(&self) -> Result<NodeNames, String> {
+        let binary = tailscale_binary(&self.0.config_snapshot().remote_access);
+        let output = tailscale(&binary, vec!["status".into(), "--json".into()]).await?;
+        parse_node_names(&output)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

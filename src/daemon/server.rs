@@ -78,7 +78,7 @@ pub struct StartedDaemon {
     pub(crate) remote_router: Router,
     /// The same routes behind an identity layer accepting the peer's
     /// `WhoIs`-resolved login, for non-loopback TCP binds (`--host` and
-    /// `[daemon] listen`).
+    /// `[daemon] listen`), answering only requests addressed to the node.
     pub(crate) direct_router: Router,
     /// This machine's cloud home record, when a fronting daemon bootstrapped
     /// it: the remote listener binds its port.
@@ -410,15 +410,20 @@ pub async fn start(
         mode,
         super::auth::RequireIdentity::new(remote_sources),
     );
+    let node_names =
+        super::auth::NodeNamesCache::new(super::remote_access::TailscaleNodeNames(state.clone()));
     let direct_router = build_router(
         state.clone(),
         mode,
-        super::auth::RequireIdentity::new(vec![Box::new(
-            state
-                .remote_access_manager
-                .tailscale_identity()
-                .whois_source(),
-        )]),
+        super::auth::DirectListener::new(
+            node_names,
+            super::auth::RequireIdentity::new(vec![Box::new(
+                state
+                    .remote_access_manager
+                    .tailscale_identity()
+                    .whois_source(),
+            )]),
+        ),
     );
     let socket_router = build_router(state.clone(), mode, super::auth::SocketOwner);
     let loopback_router = build_router(state.clone(), mode, super::auth::LoopbackOnly);
