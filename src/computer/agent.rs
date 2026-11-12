@@ -16,9 +16,10 @@ use tokio::net::UnixListener;
 
 use waterkit_permission::{Permission, PermissionError, PermissionStatus};
 
+use super::input::InputError;
 use super::proto::{AgentRequest, AgentResponse};
 use super::stream::OfferError;
-use super::{SessionDisplays, SessionStreams, launch, screenshot};
+use super::{SessionDisplay, SessionDisplays, SessionStreams, launch, screenshot};
 
 /// Everything the agent holds across requests.
 struct AgentState {
@@ -268,11 +269,9 @@ async fn dispatch(request: AgentRequest, state: &AgentState) -> AgentResponse {
             session_id,
             message,
         } => {
-            let display = state.displays.lock().await.get(&session_id);
-            let Some(display) = display else {
-                return AgentResponse::Error {
-                    error: "the session has no desktop".to_owned(),
-                };
+            let display = match session_display(state, &session_id).await {
+                Ok(display) => display,
+                Err(response) => return response,
             };
             match display.post_input(message).await {
                 Ok(()) => AgentResponse::Ok,
@@ -286,17 +285,82 @@ async fn dispatch(request: AgentRequest, state: &AgentState) -> AgentResponse {
             app,
             items,
         } => {
-            let display = state.displays.lock().await.get(&session_id);
-            let Some(display) = display else {
-                return AgentResponse::Error {
-                    error: "the session has no desktop".to_owned(),
-                };
+            let display = match session_display(state, &session_id).await {
+                Ok(display) => display,
+                Err(response) => return response,
             };
             match launch::launch(app, items, display.display_id()).await {
                 Ok(app) => AgentResponse::Launched { app },
                 Err(error) => AgentResponse::Error { error },
             }
         }
+        AgentRequest::Elements { session_id } => {
+            let display = match session_display(state, &session_id).await {
+                Ok(display) => display,
+                Err(response) => return response,
+            };
+            match display.elements().await {
+                Ok(listing) => AgentResponse::Elements { listing },
+                Err(e) => AgentResponse::Error {
+                    error: e.to_string(),
+                },
+            }
+        }
+        AgentRequest::Press {
+            session_id,
+            element,
+        } => {
+            let display = match session_display(state, &session_id).await {
+                Ok(display) => display,
+                Err(response) => return response,
+            };
+            element_outcome(display.press(element).await)
+        }
+        AgentRequest::TypeInto {
+            session_id,
+            element,
+            text,
+        } => {
+            let display = match session_display(state, &session_id).await {
+                Ok(display) => display,
+                Err(response) => return response,
+            };
+            element_outcome(display.type_into(element, text).await)
+        }
+    }
+}
+
+/// The session's display, or the error answer when it has none.
+async fn session_display(
+    state: &AgentState,
+    session_id: &str,
+) -> Result<Arc<SessionDisplay>, AgentResponse> {
+    state
+        .displays
+        .lock()
+        .await
+        .get(session_id)
+        .ok_or_else(|| AgentResponse::Error {
+            error: "the session has no desktop".to_owned(),
+        })
+}
+
+/// The answer to an action on an element by reference: a reference that no
+/// longer names an element of the latest listing is told apart, so the
+/// agent lists again.
+fn element_outcome(result: Result<(), InputError>) -> AgentResponse {
+    match result {
+        Ok(()) => AgentResponse::Ok,
+        Err(InputError::Deliver(
+            error @ (waterkit_automation::Error::StaleElement { .. }
+            | waterkit_automation::Error::UnknownElement { .. }
+            | waterkit_automation::Error::ElementGone(_)),
+        )) => AgentResponse::StaleElement {
+            error: error.to_string(),
+        },
+        Err(error) => AgentResponse::Error {
+            error: error.to_string(),
+        },
     }
 }
 

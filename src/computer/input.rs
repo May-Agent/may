@@ -14,12 +14,13 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use waterkit_automation::{
-    Code, Input, KeyDown, KeyUp, Modifiers, MouseButton, MouseDown, MouseMove, MouseUp, Point,
-    Scroll, Text,
+    Code, ElementRef, Input, KeyDown, KeyUp, Modifiers, MouseButton, MouseDown, MouseMove, MouseUp,
+    Point, Scroll, Text,
 };
 
 use super::proto::{
-    InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind, MouseInput,
+    ElementListing, InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput,
+    MouseEventKind, MouseInput,
 };
 
 /// Why a wire message was not delivered.
@@ -62,37 +63,89 @@ enum KeyEvent {
     Text(Text),
 }
 
-/// A wire message for a display's input owner, with where to report how
-/// its delivery went, if anyone waits.
+/// Where a display's input owner reports how a posting went.
+pub type Reply<T> = async_channel::Sender<Result<T, InputError>>;
+
+/// Work for a display's input owner, with where to report how it went.
+///
+/// Element listings and the actions on their references go through the one
+/// owner too: a reference resolves only in the `Input` that listed it.
 #[derive(Debug)]
-pub struct Posting {
-    /// The message to deliver.
-    pub message: InputMessage,
-    /// Receives the delivery result; `None` logs a failure instead.
-    pub reply: Option<async_channel::Sender<Result<(), InputError>>>,
+pub enum Posting {
+    /// Deliver a wire message; `reply` of `None` logs a failure instead.
+    Message {
+        message: InputMessage,
+        reply: Option<Reply<()>>,
+    },
+    /// List the actionable elements on the display.
+    Elements { reply: Reply<ElementListing> },
+    /// Press a listed element.
+    Press {
+        element: ElementRef,
+        reply: Reply<()>,
+    },
+    /// Focus a listed element, then type `text` at it.
+    TypeInto {
+        element: ElementRef,
+        text: String,
+        reply: Reply<()>,
+    },
 }
 
 /// The one owner of a display's [`Input`], run on a thread of its own:
-/// delivers each posting in order and ends when every sender is gone.
+/// handles each posting in order and ends when every sender is gone.
 ///
 /// A post holds its thread until the target confirms the input arrived,
 /// serving that thread's run loop meanwhile, so it never runs on an
 /// executor thread.
 pub fn own(mut input: Input, postings: &async_channel::Receiver<Posting>) {
-    while let Ok(Posting { message, reply }) = postings.recv_blocking() {
-        let result = post(&mut input, message);
-        match reply {
-            Some(reply) => {
-                // The asker may have stopped waiting.
-                let _ = reply.send_blocking(result);
-            }
-            None => {
-                if let Err(error) = result {
-                    tracing::warn!(%error, "computer input not delivered");
+    while let Ok(posting) = postings.recv_blocking() {
+        match posting {
+            Posting::Message { message, reply } => {
+                let result = post(&mut input, message);
+                match reply {
+                    Some(reply) => answer(&reply, result),
+                    None => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "computer input not delivered");
+                        }
+                    }
                 }
             }
+            Posting::Elements { reply } => answer(&reply, elements(&mut input)),
+            Posting::Press { element, reply } => {
+                answer(&reply, input.press(element).map_err(InputError::from));
+            }
+            Posting::TypeInto {
+                element,
+                text,
+                reply,
+            } => answer(&reply, type_into(&mut input, element, &text)),
         }
     }
+}
+
+/// Sends `result` to whoever asked; the asker may have stopped waiting.
+fn answer<T>(reply: &Reply<T>, result: Result<T, InputError>) {
+    let _ = reply.send_blocking(result);
+}
+
+/// Lists the display's actionable elements, logging the reads that failed.
+fn elements(input: &mut Input) -> Result<ElementListing, InputError> {
+    let listed = input.elements()?;
+    for skipped in listed.skipped() {
+        tracing::debug!(%skipped, "computer element read skipped");
+    }
+    Ok(ElementListing::from(&listed))
+}
+
+/// Focuses `element` and types `text` through the same text path a typed
+/// wire message takes. Not `set_value`: web content can echo a written
+/// value its page never saw.
+fn type_into(input: &mut Input, element: ElementRef, text: &str) -> Result<(), InputError> {
+    input.focus(element)?;
+    input.post(Text::new(text))?;
+    Ok(())
 }
 
 /// Posts one wire message into the display `input` drives.
