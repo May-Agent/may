@@ -6,13 +6,6 @@
 //! opened. This crate adds the refusal of `-i`/`--in-place` and names
 //! `apply_patch` in every refusal. Everything else runs as uutils' `sed`.
 
-mod script;
-mod supports;
-
-/// The print-only `sed -n` check May's command policy uses until the managed
-/// shell's `sed` is this program.
-pub use supports::{Unsupported, supports};
-
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::PathBuf;

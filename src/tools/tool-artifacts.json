@@ -47,14 +47,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.0/apply_patch-0.1.0-aarch64-apple-darwin.tar.gz",
-      "sha256": "015a0c959894625c46c10ca931693cb211dc6377e9833c0388666329173eeb34",
-      "size": 39621,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.1/apply_patch-0.1.1-aarch64-apple-darwin.tar.gz",
+      "sha256": "456e1756f8747e12dd7b938164b73fecd411d891cca53b04e581f7ac84878b2a",
+      "size": 40910,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch"
@@ -62,14 +62,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "target": {
         "os": "windows",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.0/apply_patch-0.1.0-aarch64-pc-windows-msvc.tar.gz",
-      "sha256": "c17bad8a8bebf156273e6e1cc429bb7eca5e335f9ebddc66b52739e6ae9b87a7",
-      "size": 47207,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.1/apply_patch-0.1.1-aarch64-pc-windows-msvc.tar.gz",
+      "sha256": "cc3790eb5a4251b39dcdf38b72704e1a05541b041ce7820266cababe860ff0a8",
+      "size": 48377,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch.exe"
@@ -77,14 +77,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.0/apply_patch-0.1.0-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "9bf4785e494c3c537b351e281213868ab7967ecc3ba388cf7529ab380971af76",
-      "size": 57965,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.1/apply_patch-0.1.1-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "3f6665e816ab6311d9b76fdeba3f5003e447bfda5724c71e715dc702b873cf95",
+      "size": 59275,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch"
@@ -92,14 +92,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "target": {
         "os": "windows",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.0/apply_patch-0.1.0-x86_64-pc-windows-msvc.tar.gz",
-      "sha256": "2c74c2c746c4e4f28c18659b7915004147a6967fed550d866320e1be81774464",
-      "size": 48555,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.1/apply_patch-0.1.1-x86_64-pc-windows-msvc.tar.gz",
+      "sha256": "77e9bbea3dc477ad17951bdf66f5b1b870f2cbd691f8152a0fe892326506052c",
+      "size": 49703,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch.exe"
@@ -107,14 +107,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.0/apply_patch-0.1.0-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "8d4b1cceb1cae6fcf1c82a132d0eaf711939bfaab66b42e5ef97402df44fcdfe",
-      "size": 55672,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.1/apply_patch-0.1.1-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "a7525ed21d11808029fcc00d97b21bf24ba68b5113907cc231731dbbb02e98f2",
+      "size": 57239,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch"
@@ -122,14 +122,14 @@
     },
     {
       "tool": "aither-sed",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/sed/v0.1.0/aither-sed-0.1.0-aarch64-apple-darwin.tar.gz",
-      "sha256": "2be5e6217aaeafab7ea0547628acd781bdf076fee91a092a72455ba0b0718dba",
-      "size": 23078,
+      "url": "https://github.com/May-Agent/may/releases/download/sed/v0.2.0/aither-sed-0.2.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "bd74950c08377087df0b7df480e1c45bf72bba4aca5c7da6aa8c7cb1c3eb305c",
+      "size": 562824,
       "encoding": {
         "format": "tar_gzip",
         "executable": "aither-sed"
@@ -137,14 +137,14 @@
     },
     {
       "tool": "aither-sed",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/sed/v0.1.0/aither-sed-0.1.0-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "f997c101d4f12d27bc018d265a91269e74bdeb2ad51a73972d48cb0306ba1417",
-      "size": 37478,
+      "url": "https://github.com/May-Agent/may/releases/download/sed/v0.2.0/aither-sed-0.2.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "62a5a6d354066c65ecc8c7c83ed4a2c80eeb0686ccf42ea45e6c272a8fa9c53f",
+      "size": 650062,
       "encoding": {
         "format": "tar_gzip",
         "executable": "aither-sed"
@@ -152,14 +152,14 @@
     },
     {
       "tool": "aither-sed",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/may/releases/download/sed/v0.1.0/aither-sed-0.1.0-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "c228b84c79a20a210cc7e12bbaf2dec8445a7ee9033e74a413a21abf317737df",
-      "size": 35768,
+      "url": "https://github.com/May-Agent/may/releases/download/sed/v0.2.0/aither-sed-0.2.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "8e94c0482c36ad0da51ef8be6fc8acb08b128602b816b9077d4935465b0547f8",
+      "size": 698116,
       "encoding": {
         "format": "tar_gzip",
         "executable": "aither-sed"

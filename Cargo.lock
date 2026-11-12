@@ -5844,7 +5844,6 @@ dependencies = [
  "linkify",
  "lzma-rust2 0.24.0",
  "may-patch",
- "may-sed",
  "may-tasks",
  "mediax-codec",
  "mime",
@@ -5934,7 +5933,6 @@ dependencies = [
  "clap",
  "sed",
  "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]

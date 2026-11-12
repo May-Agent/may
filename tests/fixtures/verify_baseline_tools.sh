@@ -33,9 +33,14 @@ case $banner in
     *) echo "bash on PATH is not the running managed bash: $banner ($BASH_VERSION)" >&2; exit 1 ;;
 esac
 case $BASH_VERSION in 5.3.*) ;; *) echo "not bash 5.3: $BASH_VERSION" >&2; exit 1 ;; esac
-# The managed aither-sed prints line ranges and fails on anything else.
-[ "$(printf 'a\nb\nc\n' | aither-sed -n '2,3p')" = "$(printf 'b\nc')" ]
-if aither-sed 's/a/b/' /dev/null 2>/dev/null; then exit 1; fi
+# `sed` on PATH is the managed aither-sed: it runs every script that writes
+# no file and refuses the write forms.
+sed --version | rg -q '^aither-sed [0-9]'
+[ "$(printf 'a\nb\nc\n' | sed -n '2,3p')" = "$(printf 'b\nc')" ]
+[ "$(printf 'x\nstart\nb\nend\ny\n' | sed -n '/start/,/end/p')" = "$(printf 'start\nb\nend')" ]
+[ "$(printf 'a\n' | sed 's/a/b/')" = b ]
+if sed -i s/a/b/ /dev/null 2>/dev/null; then exit 1; fi
+if printf 'a\n' | sed 'w out.txt' 2>/dev/null; then exit 1; fi
 # Managed uutils tools win over the host's BSD or GNU ones, so GNU options
 # behave identically on macOS and Linux.
 date --version | rg -q 'uutils coreutils'

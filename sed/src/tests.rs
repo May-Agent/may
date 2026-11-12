@@ -1,69 +1,9 @@
 use std::ffi::OsString;
 
-use super::{in_place_requested, supports};
+use super::in_place_requested;
 
 fn args(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
-}
-
-#[test]
-fn supports_accepts_the_line_range_forms() {
-    for forms in [
-        &["-n", "2,3p", "a"][..],
-        &["-n", "$p"],
-        &["-n", "4,$p", "a"],
-        &["-n", "2,3p;1p", "a"],
-        &["-n", " 2 , 3 p ; 5p ", "a"],
-        &["-n", "2p\n4p", "a"],
-        &["-n", "4,2p", "a"],
-        &["-ne", "3p", "a"],
-        &["-n", "-e", "3p", "a"],
-        &["--quiet", "-e", "1p;4,$p", "a", "b"],
-        &["--version"],
-    ] {
-        assert!(supports(args(forms)).is_ok(), "{forms:?}");
-    }
-}
-
-#[test]
-fn supports_refuses_everything_else() {
-    for forms in [
-        &["-i", "2p", "a"][..],
-        &["-n", "-i", "2p", "a"],
-        &["-n", "-s", "2p", "a"],
-        &["-n", "-E", "2p", "a"],
-        &["-n", "--expression=2p", "a"],
-        &["-n", "--in-place", "2p", "a"],
-        &["-n", "--help"],
-        &["s/a/b/", "a"],
-        &["-n", "s/a/b/p", "a"],
-        &["-n", "/a2/p", "a"],
-        &["-n", "/a2/,/a4/p", "a"],
-        &["-n", "1d", "a"],
-        &["-n", "1!p", "a"],
-        &["-n", "2~2p", "a"],
-        &["-n", "0p", "a"],
-        &["-n", "0,3p", "a"],
-        &["-n", "1p;s/a/b/", "a"],
-        &["-n", "1,2,3p", "a"],
-        &["-n", "$,3p", "a"],
-        &["-n", "1pp", "a"],
-        &["-n", "1p p", "a"],
-        &["-n", "1 2p", "a"],
-        &["-n", "{1p}", "a"],
-        &["-n", "p", "a"],
-        &["-n", "1", "a"],
-        &["-n", "", "a"],
-        &["-n", ";", "a"],
-        &["-n"],
-        &[],
-        &["-n", "-e", "1p", "-e", "2p", "a"],
-        &["-n", "-e"],
-        &["2p", "a"],
-        &["--version", "a"],
-    ] {
-        assert!(supports(args(forms)).is_err(), "{forms:?}");
-    }
 }
 
 #[test]
