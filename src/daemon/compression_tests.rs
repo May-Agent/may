@@ -9,6 +9,7 @@ use flate2::read::GzDecoder;
 use hyper::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
 use skyzen::{Request, StatusCode};
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -46,7 +47,7 @@ async fn body_bytes(response: skyzen::Response) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_client_accepting_gzip_gets_the_same_json_compressed() {
-    let router = build_router(state().await, DaemonMode::Rest, None);
+    let router = build_router(state().await, DaemonMode::Rest, SocketOwner);
 
     let plain = router
         .go(get(LARGE_JSON, None))
@@ -80,7 +81,7 @@ async fn a_client_accepting_gzip_gets_the_same_json_compressed() {
 
 #[tokio::test]
 async fn a_client_without_accept_encoding_gets_plain_json() {
-    let router = build_router(state().await, DaemonMode::Rest, None);
+    let router = build_router(state().await, DaemonMode::Rest, SocketOwner);
     let response = router
         .go(get(LARGE_JSON, None))
         .await
@@ -93,7 +94,7 @@ async fn a_client_without_accept_encoding_gets_plain_json() {
 
 #[tokio::test]
 async fn the_event_stream_is_never_compressed() {
-    let router = build_router(state().await, DaemonMode::Rest, None);
+    let router = build_router(state().await, DaemonMode::Rest, SocketOwner);
     let response = router
         .go(get("/api/events", Some("gzip")))
         .await

@@ -153,7 +153,9 @@ pub enum MouseButtonInput {
 }
 
 /// Bits of the `modifiers` field of [`MouseInput`] and [`KeyboardInput`], in
-/// the web client's CDP order.
+/// the web client's CDP order. Only the macOS input path reads them; the web
+/// client sends them as numbers.
+#[cfg(target_os = "macos")]
 pub mod modifier_bits {
     /// Alt / Option.
     pub const ALT: u64 = 1;
