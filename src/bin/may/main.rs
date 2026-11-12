@@ -918,9 +918,11 @@ where
                 Err(TryRecvError::Closed) => {
                     app.clipboard_rx = None;
                     app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
-                    return Err(anyhow::anyhow!(
-                        "Clipboard task closed before sending a result"
-                    ));
+                    app.enqueue_clipboard_result(Err(may_agent::tui::error::TuiError::Clipboard(
+                        may_agent::tui::clipboard::ImageError::Clipboard(
+                            "clipboard task closed before sending a result".to_string(),
+                        ),
+                    )));
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -928,7 +930,7 @@ where
 
         let step_start = std::time::Instant::now();
         while let Some(paste) = app.dequeue_pending_paste() {
-            app.handle_pending_paste(paste).await?;
+            app.handle_pending_paste(paste).await;
         }
         phases.step("paste_results", step_start.elapsed());
 

@@ -1,18 +1,13 @@
-//! The `find` IPC command: rule-based search over session history.
+//! `session find`: rule-based search over session history.
 //!
 //! Filters narrow the `messages` table in SQL; the regex then runs over the
 //! remaining message text. It never touches the session search index, and
 //! never reads a thinking block.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
-use aither_core::llm::{Tool, ToolResult};
 use askama::Template;
 use regex::{Regex, RegexBuilder};
-use schemars::JsonSchema;
-use serde::Deserialize;
 use serde_json::Value;
 
 use super::session_tool::truncate_text;
@@ -25,105 +20,45 @@ const MAX_LINES: usize = 5;
 /// Characters shown per line.
 const LINE_WIDTH: usize = 240;
 
-/// Search session history with a regular expression, newest messages first.
+/// A `session find` request: a regular expression over session history,
+/// newest messages first, narrowed by filters.
 ///
 /// Matches user and assistant text; tool calls and their output only with
-/// `--tools`. Thinking is never searched. Read a hit in place with
-/// `session "messages <session>" --around <message id>`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct FindArgs {
+/// `tools`. Thinking is never searched.
+#[derive(Debug, Clone)]
+pub(super) struct FindRequest {
     /// Regular expression to look for.
     pub pattern: String,
-
     /// Only this session id.
-    #[serde(default)]
     pub session: Option<String>,
-
-    /// Only messages of this role (`user`, `assistant`, or `tool` with `--tools`).
-    #[serde(default)]
+    /// Only messages of this role (`user`, `assistant`, or `tool` with `tools`).
     pub role: Option<String>,
-
     /// Only messages at or after this timestamp (RFC 3339).
-    #[serde(default)]
     pub since: Option<String>,
-
     /// Only messages at or before this timestamp (RFC 3339).
-    #[serde(default)]
     pub until: Option<String>,
-
     /// Only sessions whose title contains this text, ignoring case.
-    #[serde(default)]
     pub title: Option<String>,
-
     /// Match the pattern ignoring case.
-    #[serde(default)]
     pub ignore_case: bool,
-
     /// Show this many neighbouring messages around each match.
-    #[serde(default)]
     pub context: Option<usize>,
-
     /// Report the number of matching messages per session instead of the matches.
-    #[serde(default)]
     pub count: bool,
-
     /// Also search tool calls and their output.
-    #[serde(default)]
     pub tools: bool,
-
-    /// Maximum matches shown. Default 20, at most 200.
-    #[serde(default = "default_limit")]
+    /// Maximum matches shown, at most 200.
     pub limit: usize,
-
     /// Skip this many matches first.
-    #[serde(default)]
     pub offset: usize,
 }
 
-const fn default_limit() -> usize {
-    20
-}
-
-/// `find` command: regex search over session history.
-#[derive(Debug, Clone)]
-pub struct FindTool {
-    may_dir: PathBuf,
-}
-
-impl FindTool {
-    /// Bind the command to the `~/.may` directory holding `history.db`.
-    #[must_use]
-    pub const fn new(may_dir: PathBuf) -> Self {
-        Self { may_dir }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
-enum FindError {
+pub(super) enum FindError {
     #[error("database error: {0}")]
     Database(#[from] ChatDbError),
     #[error("invalid pattern: {0}")]
     Pattern(#[from] regex::Error),
-}
-
-impl Tool for FindTool {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("find")
-    }
-
-    type Arguments = FindArgs;
-    type Res = ToolResult;
-
-    async fn call(
-        &self,
-        arguments: Self::Arguments,
-        _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
-        let db = ChatDb::open(&self.may_dir.join("history.db"))
-            .await
-            .map_err(FindError::from)?;
-        Ok(ToolResult::text(find(&db, arguments).await?))
-    }
 }
 
 struct Hit {
@@ -156,7 +91,7 @@ struct CountView {
     count: usize,
 }
 
-/// What the model reads for a `find`.
+/// What the model reads for a `session find`.
 #[derive(Template)]
 #[template(path = "find_matches.txt", escape = "none")]
 struct FindMatchesText {
@@ -165,7 +100,7 @@ struct FindMatchesText {
     has_more: bool,
 }
 
-/// What the model reads for a `find --count`.
+/// What the model reads for a `session find --count`.
 #[derive(Template)]
 #[template(path = "find_counts.txt", escape = "none")]
 struct FindCountsText {
@@ -173,7 +108,7 @@ struct FindCountsText {
     sessions: Vec<CountView>,
 }
 
-async fn find(db: &ChatDb, args: FindArgs) -> Result<String, FindError> {
+pub(super) async fn find(db: &ChatDb, args: FindRequest) -> Result<String, FindError> {
     let regex = RegexBuilder::new(&args.pattern)
         .case_insensitive(args.ignore_case)
         .build()?;
@@ -377,8 +312,8 @@ mod tests {
     use crate::session::MessageRole;
     use tempfile::tempdir;
 
-    fn args(pattern: &str) -> FindArgs {
-        FindArgs {
+    fn args(pattern: &str) -> FindRequest {
+        FindRequest {
             pattern: pattern.to_string(),
             session: None,
             role: None,

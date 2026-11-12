@@ -243,7 +243,9 @@ dispatch2 = { version = "0.3", default-features = false, features = ["std", "obj
 sha2 = "0.10"
 
 [dev-dependencies]
-serial_test = "3"
+# File locks, so the E2E tests that share host state stay serial across the
+# processes nextest runs them in.
+serial_test = { version = "3.5.0", default-features = false, features = ["async", "file_locks"] }
 # Builds the tar.xz artifacts the distribution tests extract.
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 # Checks that every model-facing id word is one o200k_base token.
