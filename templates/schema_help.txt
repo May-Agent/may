@@ -1,0 +1,19 @@
+{% if let Some(description) = description %}{{ description }}
+{% endif %}
+Usage:
+{% if let Some(subcommands) = subcommands %}  <subcommand> [options]
+
+Subcommands:
+{% for subcommand in subcommands %}  {{ subcommand.name }}{% if let Some(description) = subcommand.description %} - {{ description }}{% endif %}
+{% endfor %}
+Options:
+  -h, --help  Show help
+{% else %}{% if let Some(arguments) = arguments %}  {% for positional in arguments.positionals %}{% if !positional.required %}[{% endif %}<{{ positional.name }}>{% if positional.variadic %}...{% endif %}{% if !positional.required %}]{% endif %} {% endfor %}{% for flag in arguments.repeatable %}--{{ flag }} <value>... {% endfor %}[options]
+
+Options:
+  -h, --help  Show help
+
+Arguments:
+{% for argument in arguments.entries %}{% if argument.positional %}  <{{ argument.flag }}>{% if argument.array %}...{% endif %}{% if argument.required %} (required){% endif %}{% else %}  {% if let Some(short) = argument.short %}-{{ short }}, {% endif %}--{{ argument.flag }}{% if argument.array %} <value>  (repeatable{% if argument.required %}, required{% endif %}){% else if argument.required %} (required){% endif %}{% endif %}{% if let Some(description) = argument.description %}
+      {{ description }}{% endif %}
+{% endfor %}{% endif %}{% endif %}

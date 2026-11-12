@@ -6,7 +6,18 @@
 //! lines inside a hunk are empty context lines, and empty context lines at a
 //! hunk's edges are cosmetic and dropped.
 
+use askama::Template;
+
 use crate::error::PatchError;
+
+/// A patch body that lacks its envelope markers, wrapped in them.
+#[derive(Template)]
+#[template(path = "wrapped_patch.txt", escape = "none")]
+struct WrappedPatch<'a> {
+    begin: &'a str,
+    text: &'a str,
+    end: &'a str,
+}
 
 const BEGIN: &str = "*** Begin Patch";
 const END: &str = "*** End Patch";
@@ -96,11 +107,21 @@ impl Hunk {
 /// # Errors
 ///
 /// Returns [`PatchError`] when the text is not a well-formed patch.
+///
+/// # Panics
+///
+/// Panics if the compiled envelope template fails to render.
 pub fn parse(text: &str) -> Result<Vec<Action>, PatchError> {
     let text = unwrap_fence(text.trim());
     let wrapped;
     let text = if starts_with_directive(&text) && !text.contains(BEGIN) && !text.contains(END) {
-        wrapped = format!("{BEGIN}\n{text}\n{END}");
+        wrapped = WrappedPatch {
+            begin: BEGIN,
+            text: &text,
+            end: END,
+        }
+        .render()
+        .expect("the wrapped patch template renders");
         wrapped.as_str()
     } else {
         text.as_str()
@@ -241,6 +262,15 @@ fn parse_update(path: &str, lines: &[&str], index: &mut usize) -> Action {
 #[cfg(test)]
 mod tests {
     use super::{Action, HunkLine, parse};
+
+    #[test]
+    fn a_patch_without_markers_is_read_as_if_wrapped() {
+        let body = "*** Add File: a\n+x";
+        assert_eq!(
+            parse(body).unwrap(),
+            parse(&format!("*** Begin Patch\n{body}\n*** End Patch")).unwrap()
+        );
+    }
 
     #[test]
     fn splits_hunks_at_markers_and_keeps_anchors() {

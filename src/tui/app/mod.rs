@@ -1434,11 +1434,7 @@ impl App {
     }
 
     /// System prompt for `/btw`: answer once, no tools, no side effects.
-    const BTW_SYSTEM: &'static str = "This is a side question from the user. \
-        Answer it directly in a single response. You share the conversation \
-        context but are a separate, lightweight instance — the main agent is \
-        NOT interrupted and keeps working. You have NO tools available and \
-        there will be no follow-up turns: never promise to take any action.";
+    const BTW_SYSTEM: &'static str = include_str!("../../../templates/btw_system.txt");
 
     /// Chat elements the `/btw` request sees, oldest first. Bounded to the
     /// most recent entries so the overlay stays cheap on long sessions.
@@ -1447,6 +1443,8 @@ impl App {
     /// Build the `/btw` request: system contract, recent chat as context,
     /// then the question itself.
     fn btw_messages(&self, question: &str) -> Vec<crate::daemon::BtwMessage> {
+        use askama::Template as _;
+
         use super::ui::chat::{ChatElement, ToolDisplay};
 
         let mut messages = vec![btw_message("system", Self::BTW_SYSTEM)];
@@ -1469,38 +1467,25 @@ impl App {
                             command,
                             output,
                             ..
-                        } => {
-                            let lead = if description.is_empty() {
-                                "ran terminal command".to_string()
-                            } else {
-                                format!("ran terminal command ({description})")
-                            };
-                            let mut text = format!("{lead}:\n{command}");
-                            if let Some(info) = output
-                                && !info.output.is_empty()
-                            {
-                                let tail: String = info.output.chars().take(600).collect();
-                                text.push_str("\noutput:\n");
-                                text.push_str(&tail);
-                            }
-                            text
+                        } => BtwTerminalCall {
+                            description,
+                            command,
+                            output_tail: btw_output_tail(output.as_ref()),
                         }
+                        .render()
+                        .expect("the btw terminal call template renders"),
                         ToolDisplay::Action {
                             chip,
                             summary,
                             output,
                             ..
-                        } => {
-                            let mut text = format!("called {chip}: {summary}");
-                            if let Some(info) = output
-                                && !info.output.is_empty()
-                            {
-                                let tail: String = info.output.chars().take(600).collect();
-                                text.push_str("\noutput:\n");
-                                text.push_str(&tail);
-                            }
-                            text
+                        } => BtwActionCall {
+                            chip,
+                            summary,
+                            output_tail: btw_output_tail(output.as_ref()),
                         }
+                        .render()
+                        .expect("the btw action call template renders"),
                         ToolDisplay::Builtin { tool, detail, .. } => {
                             format!("hosted tool {tool}: {detail}")
                         }
@@ -5210,6 +5195,34 @@ pub enum SendAction {
         /// Secret value — never persisted to transcript or input history.
         value: String,
     },
+}
+
+/// How much of a tool call's output a `/btw` request carries, in characters.
+const BTW_OUTPUT_CHARS: usize = 600;
+
+/// A terminal call as the `/btw` request recounts it.
+#[derive(askama::Template)]
+#[template(path = "btw_terminal_call.txt", escape = "none")]
+struct BtwTerminalCall<'a> {
+    description: &'a str,
+    command: &'a str,
+    output_tail: Option<String>,
+}
+
+/// A labelled action call as the `/btw` request recounts it.
+#[derive(askama::Template)]
+#[template(path = "btw_action_call.txt", escape = "none")]
+struct BtwActionCall<'a> {
+    chip: &'a str,
+    summary: &'a str,
+    output_tail: Option<String>,
+}
+
+/// The leading part of a call's output, none when it printed nothing.
+fn btw_output_tail(output: Option<&super::ui::chat::TerminalCallInfo>) -> Option<String> {
+    output
+        .filter(|info| !info.output.is_empty())
+        .map(|info| info.output.chars().take(BTW_OUTPUT_CHARS).collect())
 }
 
 fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMessage {

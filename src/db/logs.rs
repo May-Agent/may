@@ -48,12 +48,7 @@ impl ChatDb {
         let elapsed_ms = to_i64_from_u64(params.elapsed_ms, "elapsed_ms")?;
 
         self.db
-            .query(
-                "INSERT INTO request_logs (session_id, timestamp, model, provider_id, \
-                 prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, \
-                 cache_write_tokens, context_window, elapsed_ms, ok, error, keep_warm) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
+            .query(super::db_sql::REQUEST_LOG_INSERT)
             .bind(params.session_id)
             .bind(params.timestamp)
             .bind(params.model)
@@ -124,10 +119,7 @@ impl ChatDb {
         let timestamp = jiff::Timestamp::now().to_string();
         let port = i32::from(params.port);
         self.db
-            .query(
-                "INSERT INTO network_access_logs (session_id, profile_id, source, mode, domain, \
-                 port, allowed, reason, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
+            .query(super::db_sql::NETWORK_ACCESS_LOG_INSERT)
             .bind(params.session_id)
             .bind(params.profile_id)
             .bind(params.source.as_str())

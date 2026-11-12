@@ -585,6 +585,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markdown_copies_as_html_with_raw_markup_escaped() {
+        assert_eq!(
+            markdown_to_basic_html("**bold** and *italic* <b>x</b> & \"q\"\n\n- one\n- two"),
+            "<p><strong>bold</strong> and <em>italic</em> &lt;b&gt;x&lt;/b&gt; &amp; \"q\"</p>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n"
+        );
+    }
+
+    #[test]
     fn image_url_detection_accepts_http_and_https_only() {
         assert!(is_image_url("https://example.com/view?page=photo.png").is_some());
         assert!(is_image_url("https://cdn.example.com/signed/blob").is_some());
@@ -703,45 +711,20 @@ impl TextManager {
 /// Convert basic markdown to simple HTML for rich clipboard copy.
 #[must_use]
 pub fn markdown_to_basic_html(markdown: &str) -> String {
-    // Keep this intentionally simple/safe for clipboard usage.
-    let escaped = markdown
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
+    use pulldown_cmark::{Event, Options, Parser, html};
 
-    let mut html = escaped.replace("\n\n", "</p><p>");
-    html = html.replace('\n', "<br />");
-    html = html.replace("**", "__BOLD_TOGGLE__");
-    html = html.replace('*', "__ITALIC_TOGGLE__");
-
-    // Toggle-style replacement: good enough for LLM markdown snippets.
+    // Raw HTML in the text is shown as text, never passed through.
+    let events = Parser::new_ext(
+        markdown,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
+    )
+    .map(|event| match event {
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        other => other,
+    });
     let mut out = String::new();
-    let mut bold = false;
-    let mut i = 0usize;
-    while let Some(pos) = html[i..].find("__BOLD_TOGGLE__") {
-        let abs = i + pos;
-        out.push_str(&html[i..abs]);
-        out.push_str(if bold { "</strong>" } else { "<strong>" });
-        bold = !bold;
-        i = abs + "__BOLD_TOGGLE__".len();
-    }
-    out.push_str(&html[i..]);
-
-    let html = out;
-    let mut out = String::new();
-    let mut italic = false;
-    let mut i = 0usize;
-    while let Some(pos) = html[i..].find("__ITALIC_TOGGLE__") {
-        let abs = i + pos;
-        out.push_str(&html[i..abs]);
-        out.push_str(if italic { "</em>" } else { "<em>" });
-        italic = !italic;
-        i = abs + "__ITALIC_TOGGLE__".len();
-    }
-    out.push_str(&html[i..]);
-
-    format!("<p>{out}</p>")
+    html::push_html(&mut out, events);
+    out
 }
 
 /// Try to write plain text into terminal clipboard via OSC52.

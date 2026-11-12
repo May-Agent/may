@@ -74,6 +74,22 @@ pub struct TaskScheduler {
     runtime: Arc<TaskRuntime>,
 }
 
+/// The error of a task script that exited non-zero, with what it printed.
+#[derive(Template)]
+#[template(path = "task_script_failure.txt", escape = "none")]
+struct TaskScriptFailure<'a> {
+    exit_code: i32,
+    output: &'a str,
+}
+
+/// A task script's stdout followed by its non-empty stderr.
+#[derive(Template)]
+#[template(path = "task_output_with_stderr.txt", escape = "none")]
+struct TaskOutputWithStderr<'a> {
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
 #[derive(Template)]
 #[template(path = "task_validate_script.sh", escape = "none")]
 struct TaskValidationScriptTemplate<'a> {
@@ -192,7 +208,9 @@ impl TaskOutcome {
 }
 
 fn task_script_failure(exit_code: i32, output: &str) -> String {
-    format!("task script failed with exit code {exit_code}\n{output}")
+    TaskScriptFailure { exit_code, output }
+        .render()
+        .expect("the task script failure template renders")
 }
 
 fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String {
@@ -1724,9 +1742,12 @@ fn parse_terminal_result(result: &ScriptResult, timeout: TaskTimeout) -> Result<
 
 fn combine_output(stdout: &str, stderr: Option<String>) -> String {
     match stderr {
-        Some(stderr_text) if !stderr_text.trim().is_empty() => {
-            format!("{stdout}\n--- stderr ---\n{stderr_text}")
+        Some(stderr_text) if !stderr_text.trim().is_empty() => TaskOutputWithStderr {
+            stdout,
+            stderr: &stderr_text,
         }
+        .render()
+        .expect("the task output template renders"),
         _ => stdout.to_string(),
     }
 }
@@ -2820,5 +2841,23 @@ mod tests {
                 "{unit}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::{combine_output, task_script_failure};
+
+    #[test]
+    fn script_output_names_its_stderr_and_failure() {
+        assert_eq!(
+            combine_output("out", Some("bad\n".to_string())),
+            "out\n--- stderr ---\nbad\n"
+        );
+        assert_eq!(combine_output("out", Some(" \n".to_string())), "out");
+        assert_eq!(
+            task_script_failure(3, "boom"),
+            "task script failed with exit code 3\nboom"
+        );
     }
 }

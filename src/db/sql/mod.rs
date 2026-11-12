@@ -21,3 +21,12 @@ pub fn statements(contents: &str) -> impl Iterator<Item = &str> {
         .map(str::trim)
         .filter(|part| !part.is_empty())
 }
+
+pub const CACHE_MISS_INSERT: &str = include_str!("cache_miss_insert.sql");
+pub const PROMPT_CACHE_ROUTE_UPSERT: &str = include_str!("prompt_cache_route_upsert.sql");
+pub const MESSAGE_SCAN: &str = include_str!("message_scan.sql");
+pub const REQUEST_LOG_INSERT: &str = include_str!("request_log_insert.sql");
+pub const NETWORK_ACCESS_LOG_INSERT: &str = include_str!("network_access_log_insert.sql");
+pub const REPO_USAGE_TOUCH: &str = include_str!("repo_usage_touch.sql");
+pub const REPO_USAGE_SINCE: &str = include_str!("repo_usage_since.sql");
+pub const INDEXED_MESSAGES: &str = include_str!("indexed_messages.sql");

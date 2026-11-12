@@ -29,6 +29,23 @@ pub struct BashOutcome {
     pub error: Option<String>,
 }
 
+/// The text the agent receives for a bash-mode run: the command as shown
+/// (`command`, secrets masked) and what it produced.
+#[derive(Debug, askama::Template)]
+#[template(path = "bash_outcome.txt", escape = "none")]
+pub struct BashOutcomeMessage<'a> {
+    command: &'a str,
+    outcome: &'a BashOutcome,
+}
+
+impl<'a> BashOutcomeMessage<'a> {
+    /// The agent's view of `outcome`, whose command was masked as `command`.
+    #[must_use]
+    pub const fn new(command: &'a str, outcome: &'a BashOutcome) -> Self {
+        Self { command, outcome }
+    }
+}
+
 /// Cap a captured output stream at `MAX` bytes on a char boundary.
 fn cap_stream(bytes: &[u8]) -> String {
     const MAX: usize = 64 * 1024;
@@ -87,5 +104,43 @@ pub fn run_bash_command(
                 error: None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use askama::Template as _;
+
+    use super::{BashOutcome, BashOutcomeMessage};
+
+    fn outcome(stdout: &str, stderr: &str, exit_code: i32, error: Option<&str>) -> BashOutcome {
+        BashOutcome {
+            call_id: String::new(),
+            command: "ls".to_string(),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code,
+            had_secret: false,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn message(outcome: &BashOutcome) -> String {
+        BashOutcomeMessage::new("ls", outcome)
+            .render()
+            .expect("renders")
+    }
+
+    #[test]
+    fn the_message_carries_each_stream_that_has_text() {
+        assert_eq!(message(&outcome("", "", 0, None)), "! ls\n");
+        assert_eq!(
+            message(&outcome("a\nb", "warn", 2, None)),
+            "! ls\n\n<stdout>\na\nb\n</stdout>\n<stderr>\nwarn\n</stderr>\n<exit>2</exit>"
+        );
+        assert_eq!(
+            message(&outcome("ignored", "", 1, Some("no shell"))),
+            "! ls\n\n<error>no shell</error>"
+        );
     }
 }

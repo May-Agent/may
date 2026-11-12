@@ -1,0 +1,5 @@
+{% if let Some(preference) = preference %}## User Preferences
+{{ preference }}{% endif %}{% if preference.is_some() && recency.is_some() %}
+
+{% endif %}{% if let Some(recency) = recency %}## Recent Context
+{{ recency }}{% endif %}

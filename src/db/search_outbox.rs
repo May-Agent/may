@@ -141,15 +141,8 @@ impl ChatDb {
         let ids = serde_json::to_string(ids).map_err(|error| {
             ChatDbError::Storage(super::db_custom_error("encode message ids: ", &error))
         })?;
-        Ok(query!(
-            self.db,
-            "SELECT m.id AS message_id, m.session_id, m.role, m.content, m.timestamp, \
-             s.title, s.model, s.profile_id, s.archived, s.preview, s.updated_at, s.message_count \
-             FROM messages m JOIN sessions s ON s.id = m.session_id \
-             WHERE m.id IN (SELECT value FROM json_each(?))",
-            ids
-        )
-        .fetch_all::<IndexedMessageRow>()
-        .await?)
+        Ok(query!(self.db, db_sql::INDEXED_MESSAGES, ids)
+            .fetch_all::<IndexedMessageRow>()
+            .await?)
     }
 }

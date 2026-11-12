@@ -177,26 +177,13 @@ impl fmt::Display for SchemaProblem {
 }
 
 /// Every problem found in one database, for the error that refuses it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, askama::Template)]
+#[template(path = "schema_problems.txt", escape = "none")]
 pub struct SchemaProblems {
     /// Database file that was checked.
     pub path: String,
     /// What differs, in table and column order.
     pub problems: Vec<SchemaProblem>,
-}
-
-impl fmt::Display for SchemaProblems {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "The database {} does not match the schema this build of May uses:",
-            self.path
-        )?;
-        for problem in &self.problems {
-            write!(f, "\n- {problem}")?;
-        }
-        Ok(())
-    }
 }
 
 type Columns = BTreeMap<(String, String), Declared>;

@@ -343,7 +343,8 @@ impl MemoryProcessor {
 }
 
 /// Profile memories to inject into agent context (read-only).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, askama::Template)]
+#[template(path = "profile_memories.txt", escape = "none")]
 pub struct ProfileMemories {
     /// Long-lived user preference memory, when present.
     pub preference: Option<String>,
@@ -384,18 +385,42 @@ impl ProfileMemories {
     }
 
     /// Format memories as context for agent injection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the compiled template fails to render.
     #[must_use]
     pub fn to_context_string(&self) -> String {
-        let mut parts = Vec::new();
+        askama::Template::render(self).expect("the profile memories template renders")
+    }
+}
 
-        if let Some(ref pref) = self.preference {
-            parts.push(format!("## User Preferences\n{pref}"));
-        }
+#[cfg(test)]
+mod context_tests {
+    use super::ProfileMemories;
 
-        if let Some(ref rec) = self.recency {
-            parts.push(format!("## Recent Context\n{rec}"));
-        }
-
-        parts.join("\n\n")
+    #[test]
+    fn context_lists_the_memories_that_exist() {
+        let both = ProfileMemories {
+            preference: Some("likes Rust".to_string()),
+            recency: Some("fixing #1159".to_string()),
+        };
+        assert_eq!(
+            both.to_context_string(),
+            "## User Preferences\nlikes Rust\n\n## Recent Context\nfixing #1159"
+        );
+        let recency = ProfileMemories {
+            preference: None,
+            recency: Some("fixing #1159".to_string()),
+        };
+        assert_eq!(
+            recency.to_context_string(),
+            "## Recent Context\nfixing #1159"
+        );
+        let none = ProfileMemories {
+            preference: None,
+            recency: None,
+        };
+        assert_eq!(none.to_context_string(), "");
     }
 }
