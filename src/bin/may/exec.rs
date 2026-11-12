@@ -492,6 +492,7 @@ where
             #[cfg(target_os = "macos")]
             computer: None,
             rules_import: None,
+            services: may_agent::SharedServices::new(&context.may_dir),
             llm,
             ask_flagship: None,
             ask_balanced: None,

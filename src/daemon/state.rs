@@ -459,8 +459,12 @@ pub struct DaemonState {
     pub(crate) search_index_wake: async_channel::Receiver<()>,
     /// Latest outcome of the search indexer.
     pub(crate) search_index_status: crate::repo_search::indexer::IndexerStatus,
-    /// The repo-search daemon handle worktree coverage is polled through.
-    pub(crate) repo_search: crate::repo_search::RepoSearch,
+    /// The compiled quota-reset matchers turns parse upstream errors with.
+    pub(crate) quota_patterns: crate::quota::QuotaPatterns,
+    /// The compiled secret shapes bash-mode output is masked with.
+    pub(crate) secret_patterns: crate::secrets::SecretPatterns,
+    /// The repo-search handle and PR land locks every session's agent shares.
+    pub(crate) services: crate::terminal_commands::SharedServices,
     /// Signalled by `POST /api/daemon/shutdown`.
     pub(crate) daemon_shutdown: Arc<tokio::sync::Notify>,
     /// Set once shutdown starts draining: new turns are refused so the
@@ -1430,7 +1434,9 @@ impl DaemonState {
             .await
             .expect("test jobserver starts"),
             may_dir: may_dir.to_path_buf(),
-            repo_search: crate::repo_search::RepoSearch::global(may_dir),
+            services: crate::terminal_commands::SharedServices::new(may_dir),
+            quota_patterns: crate::quota::QuotaPatterns::default(),
+            secret_patterns: crate::secrets::SecretPatterns::default(),
             search_index_wake_tx,
             search_index_wake,
             search_index_status: crate::repo_search::indexer::IndexerStatus::default(),

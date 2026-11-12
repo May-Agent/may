@@ -4,7 +4,7 @@
 //! line, colored with a dark syntect theme (the TUI assumes a dark
 //! terminal).
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use ratatui::prelude::*;
 use syntect::highlighting::{
@@ -12,17 +12,33 @@ use syntect::highlighting::{
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
-/// Bundled default syntaxes; loaded once, immutable afterwards.
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+/// The syntaxes and theme highlighting reads: loaded once when the TUI
+/// starts, immutable afterwards. Cloning shares them.
+#[derive(Debug, Clone)]
+pub struct Highlighting {
+    /// Bundled default syntaxes.
+    syntaxes: Arc<SyntaxSet>,
+    /// The dark theme's compiled selectors, built once.
+    highlighter: Arc<Highlighter<'static>>,
+}
 
-/// The dark theme shell commands are highlighted with.
-static THEME: LazyLock<Theme> = LazyLock::new(|| {
-    ThemeSet::load_defaults()
-        .themes
-        .get("base16-ocean.dark")
-        .expect("syntect's default themes include base16-ocean.dark")
-        .clone()
-});
+impl Default for Highlighting {
+    fn default() -> Self {
+        let theme = ThemeSet::load_defaults()
+            .themes
+            .get("base16-ocean.dark")
+            .expect("syntect's default themes include base16-ocean.dark")
+            .clone();
+        // syntect's `Highlighter` borrows its theme. The theme is loaded once
+        // per TUI and read until the process exits, so it is leaked rather
+        // than recompiled into selectors for every highlighted line.
+        let theme: &'static Theme = Box::leak(Box::new(theme));
+        Self {
+            syntaxes: Arc::new(SyntaxSet::load_defaults_newlines()),
+            highlighter: Arc::new(Highlighter::new(theme)),
+        }
+    }
+}
 
 /// Convert a syntect style to a ratatui style: foreground color and font
 /// modifiers; the theme's background is dropped so the chat surface shows
@@ -56,52 +72,63 @@ pub(super) struct LineHighlighter {
     highlight: HighlightState,
 }
 
-/// A highlighter for `language` — a fence token like `rust` or `rs`
-/// matched against syntax names and extensions; `None` when no syntax
-/// knows it.
-pub(super) fn highlighter(language: &str) -> Option<LineHighlighter> {
-    SYNTAXES.find_syntax_by_token(language).map(|syntax| {
-        let highlighter = Highlighter::new(&THEME);
-        let highlight = HighlightState::new(&highlighter, ScopeStack::new());
-        LineHighlighter {
-            highlighter: Arc::new(highlighter),
-            parse: ParseState::new(syntax),
-            highlight,
-        }
-    })
-}
+impl Highlighting {
+    /// A highlighter for `language` — a fence token like `rust` or `rs`
+    /// matched against syntax names and extensions; `None` when no syntax
+    /// knows it.
+    pub(super) fn highlighter(&self, language: &str) -> Option<LineHighlighter> {
+        self.syntaxes.find_syntax_by_token(language).map(|syntax| {
+            let highlight = HighlightState::new(&self.highlighter, ScopeStack::new());
+            LineHighlighter {
+                highlighter: self.highlighter.clone(),
+                parse: ParseState::new(syntax),
+                highlight,
+            }
+        })
+    }
 
-/// Highlight one source line, keeping parse state in `highlighter` so
-/// quotes, heredocs and open scopes carry across lines.
-pub(super) fn line_spans(highlighter: &mut LineHighlighter, line: &str) -> Vec<Span<'static>> {
-    let ops = highlighter
-        .parse
-        .parse_line(line, &SYNTAXES)
-        .expect("bundled syntaxes highlight without missing references");
-    HighlightIterator::new(
-        &mut highlighter.highlight,
-        &ops,
-        line,
-        &highlighter.highlighter,
-    )
-    .map(|(style, text)| Span::styled(text.to_string(), to_style(style)))
-    .collect()
-}
-
-/// Highlight `script` as bash, returning one span vector per source line.
-/// The script is highlighted as a unit so state (quotes, heredocs) carries
-/// across lines. An empty script yields no lines.
-pub(super) fn shell_spans(script: &str) -> Vec<Vec<Span<'static>>> {
-    let mut highlighter = highlighter("bash").expect("syntect's default syntaxes include bash");
-    script
-        .lines()
-        .map(|line| line_spans(&mut highlighter, line))
+    /// Highlight one source line, keeping parse state in `highlighter` so
+    /// quotes, heredocs and open scopes carry across lines.
+    pub(super) fn line_spans(
+        &self,
+        highlighter: &mut LineHighlighter,
+        line: &str,
+    ) -> Vec<Span<'static>> {
+        let ops = highlighter
+            .parse
+            .parse_line(line, &self.syntaxes)
+            .expect("bundled syntaxes highlight without missing references");
+        HighlightIterator::new(
+            &mut highlighter.highlight,
+            &ops,
+            line,
+            &highlighter.highlighter,
+        )
+        .map(|(style, text)| Span::styled(text.to_string(), to_style(style)))
         .collect()
+    }
+
+    /// Highlight `script` as bash, returning one span vector per source line.
+    /// The script is highlighted as a unit so state (quotes, heredocs) carries
+    /// across lines. An empty script yields no lines.
+    pub(super) fn shell_spans(&self, script: &str) -> Vec<Vec<Span<'static>>> {
+        let mut highlighter = self
+            .highlighter("bash")
+            .expect("syntect's default syntaxes include bash");
+        script
+            .lines()
+            .map(|line| self.line_spans(&mut highlighter, line))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shell_spans;
+    use super::Highlighting;
+
+    fn shell_spans(script: &str) -> Vec<Vec<ratatui::text::Span<'static>>> {
+        Highlighting::default().shell_spans(script)
+    }
 
     #[test]
     fn shell_spans_colors_a_command() {

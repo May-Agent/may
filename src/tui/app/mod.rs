@@ -395,6 +395,8 @@ pub struct App {
     /// Loaded secret values for bash-mode masking and env injection, or why
     /// they could not be read: bash mode then refuses to run.
     pub secrets: Result<crate::secrets::Secrets, crate::secrets::SecretError>,
+    /// The compiled secret shapes bash-mode masking recognizes.
+    pub secret_patterns: crate::secrets::SecretPatterns,
     /// Questions the agent asked that nobody answered yet, for the status bar.
     pub open_question_count: usize,
     /// The session's blocking state as the daemon last reported it on the
@@ -642,6 +644,7 @@ impl App {
         );
 
         Self {
+            secret_patterns: crate::secrets::SecretPatterns::default(),
             session_manager,
             worker_settings: crate::agent::AgentLiveSettings::of(&config),
             config,
@@ -1889,7 +1892,7 @@ impl App {
     /// finished turn folds into its "Worked for" row. The last turn folds
     /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
-        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(
+        self.chat = ChatStream::successor_of(&self.chat).with_tunnel_base(tunnel_base(
             &self.config,
             self.session_manager.current().map(|session| &session.id),
         ));
@@ -4004,7 +4007,7 @@ impl App {
         };
         self.input.clear();
         self.cursor = 0;
-        let (masked, had_secret) = secrets.mask(&command);
+        let (masked, had_secret) = secrets.mask(&self.secret_patterns, &command);
         self.history.push(format!("! {masked}"));
         self.history.save();
         if had_secret {

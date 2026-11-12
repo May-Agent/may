@@ -146,9 +146,9 @@ impl Entry {
         state: ElementState,
         width: u16,
         images_supported: bool,
-        tunnel_base: &str,
+        assets: &super::chat::ChatAssets,
     ) -> Self {
-        let laid = element_lines(elem, state, images_supported, tunnel_base, width);
+        let laid = element_lines(elem, state, images_supported, assets, width);
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;
         for line in &laid.lines {
@@ -224,14 +224,18 @@ impl Entry {
         state: ElementState,
         width: u16,
         images_supported: bool,
-        tunnel_base: &str,
+        assets: &super::chat::ChatAssets,
     ) -> Self {
         let (mut entry, mut stream) = previous
             .and_then(|mut entry| entry.stream.take().map(|stream| (entry, stream)))
             .unwrap_or_else(|| {
                 let stream = StreamingEntry {
                     reply,
-                    render: StreamingReply::new(images_supported, width),
+                    render: StreamingReply::new(
+                        images_supported,
+                        width,
+                        assets.highlighting.clone(),
+                    ),
                     settled: Settled::default(),
                     #[cfg(test)]
                     wrapped_lines: 0,
@@ -249,7 +253,7 @@ impl Entry {
         mirror.plain.truncate(settled.rows);
         mirror.runs.truncate(settled.link_runs);
 
-        let frame = stream.render.render(content, tunnel_base, width);
+        let frame = stream.render.render(content, assets, width);
         let fresh = &frame.settled[settled.lines..];
         #[cfg(test)]
         let wrapped = fresh.len() + frame.open.len();
@@ -470,7 +474,7 @@ impl ChatLayout {
                             state,
                             width,
                             images_supported,
-                            chat.tunnel_base(),
+                            chat.assets(),
                         )
                     },
                     |(reply, content)| {
@@ -489,7 +493,7 @@ impl ChatLayout {
                             state,
                             width,
                             images_supported,
-                            chat.tunnel_base(),
+                            chat.assets(),
                         )
                     },
                 )
@@ -992,7 +996,7 @@ fn main() { println!(\"안녕\"); }\n\
             ElementState::of(elem, None, false, 0),
             width,
             images_supported,
-            chat.tunnel_base(),
+            chat.assets(),
         );
         let entry = layout.entries.last().expect("the reply has an entry");
         assert!(

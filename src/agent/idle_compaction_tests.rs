@@ -352,6 +352,7 @@ impl SessionParts {
             connectivity: aither_connectivity::Connectivity::manual(true).0,
             rules_import: self.rules_import.clone(),
             limits: crate::agent::LiveLimits::of(&MayConfig::default()),
+            services: crate::terminal_commands::SharedServices::new(&self.dir.join(".may")),
             model_context_window: None,
         }
     }

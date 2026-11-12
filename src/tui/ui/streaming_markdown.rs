@@ -5,7 +5,7 @@
 //! [`IncrementalMarkdown`] renders a reply again after every append while
 //! parsing each of its complete lines once.
 
-use super::highlight::LineHighlighter;
+use super::highlight::{Highlighting, LineHighlighter};
 use super::wrap::wrap_line;
 use ratatui::prelude::*;
 use streamdown_parser::{InlineElement, InlineParser, ParseEvent, Parser};
@@ -17,6 +17,8 @@ pub const IMAGE_HEIGHT: usize = 8;
 /// Streaming markdown renderer with incremental parsing.
 #[derive(Debug)]
 pub struct StreamingMarkdown {
+    /// Syntaxes and theme code blocks are highlighted with.
+    highlighting: Highlighting,
     /// The incremental parser (maintains state between chunks)
     parser: Parser,
     /// Inline parser for block contents the block parser leaves raw
@@ -73,18 +75,14 @@ pub struct StreamingMarkdown {
     highlighted_lines: usize,
 }
 
-impl Default for StreamingMarkdown {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StreamingMarkdown {
-    /// Create a new streaming markdown renderer.
-    /// Uses default (no image support). For image support, use `with_image_support()`.
+    /// Create a new streaming markdown renderer, highlighting code with
+    /// `highlighting`. Uses default (no image support). For image support,
+    /// use `with_image_support()`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(highlighting: Highlighting) -> Self {
         Self {
+            highlighting,
             parser: Parser::new(),
             inline_parser: InlineParser::new(),
             content: String::new(),
@@ -146,10 +144,10 @@ impl StreamingMarkdown {
 
     /// Create a new streaming markdown renderer with explicit image support flag.
     #[must_use]
-    pub fn with_image_support(images_supported: bool) -> Self {
+    pub fn with_image_support(images_supported: bool, highlighting: Highlighting) -> Self {
         Self {
             images_supported,
-            ..Self::new()
+            ..Self::new(highlighting)
         }
     }
 
@@ -429,14 +427,16 @@ impl StreamingMarkdown {
             }
             ParseEvent::CodeBlockStart { language, .. } => {
                 self.end_inline_line();
-                self.code_highlighter = language.as_deref().and_then(super::highlight::highlighter);
+                self.code_highlighter = language
+                    .as_deref()
+                    .and_then(|language| self.highlighting.highlighter(language));
             }
             ParseEvent::CodeBlockLine(line) => {
                 self.end_inline_line();
                 let highlighted = self
                     .code_highlighter
                     .as_mut()
-                    .map(|highlighter| super::highlight::line_spans(highlighter, &line));
+                    .map(|highlighter| self.highlighting.line_spans(highlighter, &line));
                 #[cfg(test)]
                 {
                     self.highlighted_lines += usize::from(highlighted.is_some());
@@ -647,7 +647,12 @@ impl Resume {
     }
 
     /// A renderer, with nothing rendered yet, that continues from here.
-    fn renderer(&self, images_supported: bool, max_width: usize) -> StreamingMarkdown {
+    fn renderer(
+        &self,
+        images_supported: bool,
+        max_width: usize,
+        highlighting: &Highlighting,
+    ) -> StreamingMarkdown {
         let mut state = self.parser.state().clone();
         let reopen = self.code_fence_line.as_deref();
         if reopen.is_some() {
@@ -673,7 +678,8 @@ impl Resume {
             code_fence_line: self.code_fence_line.clone(),
             #[cfg(test)]
             parsed_lines: usize::from(replay.is_some()),
-            ..StreamingMarkdown::with_image_support(images_supported).with_width(max_width)
+            ..StreamingMarkdown::with_image_support(images_supported, highlighting.clone())
+                .with_width(max_width)
         }
     }
 }
@@ -698,6 +704,7 @@ impl Resume {
 /// whole text in one pass.
 #[derive(Debug)]
 pub struct IncrementalMarkdown {
+    highlighting: Highlighting,
     images_supported: bool,
     max_width: usize,
     /// Settled text after the last committed line.
@@ -734,8 +741,9 @@ impl IncrementalMarkdown {
     /// A renderer of an empty reply; tables are laid out to `max_width`
     /// display columns.
     #[must_use]
-    pub fn new(images_supported: bool, max_width: usize) -> Self {
+    pub fn new(images_supported: bool, max_width: usize, highlighting: Highlighting) -> Self {
         Self {
+            highlighting,
             images_supported,
             max_width,
             settled: String::new(),
@@ -759,7 +767,9 @@ impl IncrementalMarkdown {
         text.push_str(&self.settled);
         text.push_str(tail);
 
-        let mut renderer = self.resume.renderer(self.images_supported, self.max_width);
+        let mut renderer =
+            self.resume
+                .renderer(self.images_supported, self.max_width, &self.highlighting);
         let mut committing = true;
         let mut committed = 0;
         let mut start = 0;
@@ -1008,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_basic_rendering() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("# Hello\n\nWorld\n");
         let lines = md.lines();
         assert_ne!(lines, []);
@@ -1016,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_incremental_streaming() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("# Head");
         // Incomplete line - not parsed yet
         assert_eq!(md.lines(), []);
@@ -1041,7 +1051,7 @@ mod tests {
 
     #[test]
     fn test_image_rendering() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("![My Image](https://example.com/test.png)\n");
         let lines = md.lines();
         let text: String = lines
@@ -1055,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_horizontal_rule() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("Hello\n\n---\n\nWorld\n");
         md.flush();
         let lines = md.lines();
@@ -1091,7 +1101,7 @@ mod tests {
 
     #[test]
     fn test_list_item_inline_markdown() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("- **bold** and *italic* and `code` and [link](https://example.com)\n");
         let lines = md.lines();
         let text = flattened_text(lines);
@@ -1114,7 +1124,7 @@ mod tests {
 
     #[test]
     fn test_list_item_cjk_bold() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("- **SpaceX**：上季营收\n");
         let lines = md.lines();
         let text = flattened_text(lines);
@@ -1129,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_blockquote_inline_markdown() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("> **quoted** text\n");
         let lines = md.lines();
         let text = flattened_text(lines);
@@ -1147,7 +1157,7 @@ mod tests {
 
     #[test]
     fn test_table_inline_markdown() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("| **head** | plain |\n|---|---|\n| *it* | `c` |\n");
         md.flush();
         let lines = md.lines();
@@ -1166,7 +1176,7 @@ mod tests {
 
     #[test]
     fn test_table_columns_aligned() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("| aa | b |\n|---|---|\n| c | dddd |\n");
         md.flush();
         let lines = md.lines();
@@ -1179,7 +1189,7 @@ mod tests {
 
     #[test]
     fn test_table_cjk_columns_aligned() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("| 子 issue | 状态 |\n|---|---|\n| #18 登录 | ❌ 无 |\n");
         md.flush();
         let widths: Vec<usize> = md
@@ -1204,7 +1214,7 @@ mod tests {
     #[test]
     fn test_table_missing_trailing_pipes() {
         // GFM makes outer pipes optional; models drop the trailing one.
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("| a | b\n|---|---\n| c | d\n");
         md.flush();
         let text = flattened_text(md.lines());
@@ -1222,7 +1232,7 @@ mod tests {
     #[test]
     fn test_table_late_wide_row_realigns() {
         // A wider row streaming in later re-pads the rows already drawn.
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("| a | b |\n|---|---|\n| c | d |\n");
         md.push("| much longer | x |\n");
         md.flush();
@@ -1309,7 +1319,7 @@ mod tests {
     #[test]
     fn test_table_wraps_cells_to_width() {
         for width in [40, 56, 72] {
-            let mut md = StreamingMarkdown::new().with_width(width);
+            let mut md = StreamingMarkdown::new(Highlighting::default()).with_width(width);
             md.push(WIDE_TABLE);
             md.flush();
             let lines = md.lines().to_vec();
@@ -1331,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_table_wider_area_keeps_one_line_rows() {
-        let mut md = StreamingMarkdown::new().with_width(200);
+        let mut md = StreamingMarkdown::new(Highlighting::default()).with_width(200);
         md.push(WIDE_TABLE);
         md.flush();
         let lines: Vec<Line<'static>> = md
@@ -1352,7 +1362,7 @@ mod tests {
     fn test_streaming_table_relayouts_open_table() {
         // Each arriving row re-lays-out the whole open table to the width.
         let width = 48;
-        let mut md = StreamingMarkdown::new().with_width(width);
+        let mut md = StreamingMarkdown::new(Highlighting::default()).with_width(width);
         let mut lines_seen = 0;
         for (index, line) in WIDE_TABLE.split_inclusive('\n').enumerate() {
             md.push(line);
@@ -1373,7 +1383,7 @@ mod tests {
     #[test]
     fn test_table_pipe_line_below_is_not_absorbed() {
         // A pipe-less paragraph after a table ends it instead of joining.
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("| a |\n|---|\n| b |\ntext after\n");
         md.flush();
         let rows: Vec<String> = md
@@ -1387,7 +1397,7 @@ mod tests {
 
     #[test]
     fn test_heading_inline_markdown() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("## **Title** rest\n");
         let lines = md.lines();
         let text = flattened_text(lines);
@@ -1402,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_code_block_highlighted() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("```rust\nlet x = 1;\n```\n");
         md.flush();
         let lines = md.lines();
@@ -1422,7 +1432,7 @@ mod tests {
 
     #[test]
     fn test_code_block_unknown_language_plain() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("```notalang\nlet x = 1;\n```\n");
         md.flush();
         let code = &md.lines()[0];
@@ -1435,7 +1445,7 @@ mod tests {
         // A comment opened on one line stays open into the next: the
         // second line's code spans all carry the comment color, which
         // differs from the default white of an unhighlighted block.
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("```rust\n/* start\nend */\n```\n");
         md.flush();
         let lines = md.lines();
@@ -1450,7 +1460,7 @@ mod tests {
 
     #[test]
     fn test_block_inline_image_recorded() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("- ![diagram](https://example.com/diagram.png)\n");
         let images = md.images();
         assert_eq!(
@@ -1560,14 +1570,6 @@ plain 普通\n";
     /// Rendered lines and image positions.
     type Rendered = (Vec<Line<'static>>, Vec<(String, usize, String)>);
 
-    /// The render of `text` in one pass.
-    fn one_shot(text: &str, images_supported: bool) -> Rendered {
-        let mut md = StreamingMarkdown::with_image_support(images_supported).with_width(WIDTH);
-        md.push(text);
-        md.flush();
-        (md.lines().to_vec(), md.image_positions().to_vec())
-    }
-
     /// The whole render a frame describes.
     fn whole(frame: &MarkdownFrame<'_>) -> Rendered {
         let mut lines = frame.committed.to_vec();
@@ -1581,6 +1583,7 @@ plain 普通\n";
     /// text reaches it: every complete line settled, the unfinished line
     /// as the tail.
     struct Stream {
+        highlighting: Highlighting,
         markdown: IncrementalMarkdown,
         text: String,
         settled: usize,
@@ -1588,11 +1591,23 @@ plain 普通\n";
 
     impl Stream {
         fn new(images_supported: bool) -> Self {
+            let highlighting = Highlighting::default();
             Self {
-                markdown: IncrementalMarkdown::new(images_supported, WIDTH),
+                markdown: IncrementalMarkdown::new(images_supported, WIDTH, highlighting.clone()),
+                highlighting,
                 text: String::new(),
                 settled: 0,
             }
+        }
+
+        /// The render of the text so far in one pass.
+        fn one_shot(&self, images_supported: bool) -> Rendered {
+            let mut md =
+                StreamingMarkdown::with_image_support(images_supported, self.highlighting.clone())
+                    .with_width(WIDTH);
+            md.push(&self.text);
+            md.flush();
+            (md.lines().to_vec(), md.image_positions().to_vec())
         }
 
         /// Append `chunk` and render.
@@ -1609,7 +1624,7 @@ plain 普通\n";
 
     #[test]
     fn push_walks_lines_without_losing_the_tail() {
-        let mut md = StreamingMarkdown::new();
+        let mut md = StreamingMarkdown::new(Highlighting::default());
         md.push("a\nb\nc");
         assert_eq!(md.parsed_line_count, 2);
         assert_eq!(md.pending_line, "c");
@@ -1631,8 +1646,7 @@ plain 普通\n";
                 let mut shown = Vec::new();
                 for chunk in chunks(&reply, size) {
                     let (lines, images) = stream.push(chunk);
-                    let (expected_lines, expected_images) =
-                        one_shot(&stream.text, images_supported);
+                    let (expected_lines, expected_images) = stream.one_shot(images_supported);
                     assert_eq!(
                         lines,
                         expected_lines,
@@ -1678,7 +1692,7 @@ plain 普通\n";
                 let rendered = stream.push(chunk);
                 assert_eq!(
                     rendered,
-                    one_shot(&stream.text, false),
+                    stream.one_shot(false),
                     "render differs after {:?} (chunks of {size})",
                     stream.text
                 );
@@ -1728,7 +1742,7 @@ plain 普通\n";
             );
             // A one-pass render costs the whole text: compare a sample.
             if index % 97 == 0 || index + 1 == pieces.len() {
-                assert_eq!(rendered, one_shot(&stream.text, false));
+                assert_eq!(rendered, stream.one_shot(false));
             }
         }
         let parsed = stream.markdown.parsed_lines();

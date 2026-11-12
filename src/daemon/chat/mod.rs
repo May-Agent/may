@@ -50,7 +50,6 @@ use crate::agent::MayAgent;
 use crate::ask_user;
 use crate::db::RunFence;
 use crate::prompt_mentions;
-use crate::quota;
 use crate::session::{
     AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, FinishError,
     MayHomePaths, MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment,
@@ -1860,11 +1859,13 @@ pub(super) async fn run_bash(
     )
     .map_err(internal_error)?;
     let run_secrets = secrets.clone();
-    let outcome =
-        blocking::unblock(move || crate::bash::run_bash_command(&command, &cwd, &run_secrets))
-            .await;
+    let patterns = state.secret_patterns.clone();
+    let outcome = blocking::unblock(move || {
+        crate::bash::run_bash_command(&command, &cwd, &run_secrets, &patterns)
+    })
+    .await;
     // The transcript returned to the client never carries the raw secret.
-    let (masked_command, _) = secrets.mask(&outcome.command);
+    let (masked_command, _) = secrets.mask(&state.secret_patterns, &outcome.command);
     Ok(Json(crate::daemon::types::BashResponse {
         command: masked_command,
         stdout: outcome.stdout,
@@ -2529,7 +2530,11 @@ fn run_agent_loop_attempts<'a>(
                         .config_snapshot()
                         .preferences
                         .auto_continue_on_quota_reset
-                        .then(|| quota::reset_at(&err_msg, jiff::Timestamp::now()))
+                        .then(|| {
+                            state
+                                .quota_patterns
+                                .reset_at(&err_msg, jiff::Timestamp::now())
+                        })
                         .flatten()
                         .map(RetryWait::QuotaReset),
                 };
@@ -4371,6 +4376,7 @@ fn build_session_agent<'a>(
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
                 limits: state.live_limits.clone(),
+                services: state.services.clone(),
                 model_context_window,
             },
         )
