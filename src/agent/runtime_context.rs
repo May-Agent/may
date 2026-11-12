@@ -346,11 +346,15 @@ impl RuntimeSystemContext {
             }
         }
 
-        let Some(memories_dir) = self.memory_path.parent() else {
+        let Some(memories_dir) = self.memory_path.parent().map(Path::to_path_buf) else {
             return;
         };
-        let mut next = HashMap::new();
-        scan_memories_dir(memories_dir, memories_dir, &mut next);
+        let next = blocking::unblock(move || {
+            let mut next = HashMap::new();
+            scan_memories_dir(&memories_dir, &memories_dir, &mut next);
+            next
+        })
+        .await;
         let Some(snapshot) = self.memories_snapshot.replace(next.clone()) else {
             // First scan is a silent baseline: nothing counts as changed.
             return;

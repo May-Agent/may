@@ -2198,14 +2198,13 @@ fn run_agent_loop_attempts<'a>(
         // retry that resubmits the prompt rebuilds context only up to it,
         // so the rows the turn itself wrote are not fed back alongside the
         // resubmitted prompt.
-        let turn_boundary = crate::session::load_history_from_db(&state.db(), &req.session_id)
+        let turn_boundary = state
+            .db()
+            .max_message_id(&req.session_id)
             .await
-            .map_err(UiChatPreparationError::LoadHistory)?
-            .messages()
-            .iter()
-            .filter_map(|message| message.id)
-            .max()
-            .unwrap_or(0);
+            .map_err(|error| UiChatPreparationError::LoadHistory(error.into()))?
+            .map_or(Ok(0), i32::try_from)
+            .expect("message row ids are i32 columns");
         // Set once a retry follows tool activity: later attempts continue
         // the committed transcript with `resume` instead of resubmitting
         // the prompt.
@@ -2414,13 +2413,11 @@ fn run_agent_loop_attempts<'a>(
             } = turn;
             let mut terminal_error: Option<aither_agent::AgentError> = None;
             let mut cancellation_reason: Option<&'static str> = None;
-            let mut browser_takeover_paused = false;
             match stopped {
                 Ok(()) => {}
                 Err(turn_events::TurnStop::Cancelled(reason)) => {
                     cancellation_reason = Some(reason);
                 }
-                Err(turn_events::TurnStop::TakeoverPaused) => browser_takeover_paused = true,
                 Err(turn_events::TurnStop::Failed(error)) => terminal_error = Some(error),
                 Err(turn_events::TurnStop::Persist(error)) => return Err(error.into()),
             }
@@ -2432,13 +2429,11 @@ fn run_agent_loop_attempts<'a>(
 
             decode_meter.note_boundary();
 
-            // Browser takeover may have cancelled the stream before another agent
-            // event arrived, so classify the terminal state once more after the
-            // loop. This turns the immediate cancellation into a resumable
-            // takeover pause and preserves the post-takeover system alert.
-            if !browser_takeover_paused && is_takeover_active_for_session(state, &session_id).await
-            {
-                browser_takeover_paused = true;
+            // A browser takeover cancels the run when it starts, so the stop
+            // is classified once here: the cancellation becomes a resumable
+            // takeover pause that keeps the post-takeover system alert.
+            let browser_takeover_paused = is_takeover_active_for_session(state, &session_id).await;
+            if browser_takeover_paused {
                 cancellation_reason = None;
             }
 
@@ -6900,6 +6895,52 @@ mod tests {
             .await
             .expect("history");
         assert_eq!(user_rows(&history), vec!["hello".to_string()]);
+    }
+
+    /// A takeover that starts while the model streams ends the turn as a
+    /// takeover pause, not as a user cancellation: the start sets the owner
+    /// and then cancels the run, as `browser_takeover_start` does.
+    #[tokio::test]
+    async fn a_takeover_during_a_stream_pauses_the_turn() {
+        let thinking = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]
+            })
+            .to_string(),
+        );
+        let provider = stub_provider(vec![format!("stall:{thinking}")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let takeover = async {
+            last_body(&provider, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            state
+                .runtime_service
+                .set_browser_takeover_owner("session")
+                .await
+                .expect("takeover owner set");
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::User),
+                "the run is live"
+            );
+        };
+        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), takeover);
+        assert!(
+            matches!(result, Err(super::AgentLoopError::BrowserTakeoverPaused(_))),
+            "the cancellation is classified as a takeover pause: {result:?}"
+        );
+        assert!(
+            state
+                .runtime_service
+                .has_browser_takeover("session")
+                .await
+                .expect("takeover state loads"),
+            "the takeover is still active"
+        );
     }
 
     /// A stop after a tool call began keeps the message too.
