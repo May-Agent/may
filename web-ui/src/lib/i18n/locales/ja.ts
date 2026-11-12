@@ -290,6 +290,17 @@ export const ja: Messages = {
     didRead: '{page} を読みました',
     didOther: 'ブラウザを使用しました',
   },
+  cloudSession: {
+    creating: 'Codespace を作成しています…',
+    starting: 'Codespace を起動しています…',
+    checking: 'Codespace の May を確認しています…',
+    downloading: 'Codespace 用の May をダウンロードしています…',
+    installing: 'Codespace に May をインストールしています…',
+    cloning: 'Codespace にリポジトリをクローンしています…',
+    startingDaemon: 'Codespace で May を起動しています…',
+    connecting: 'Codespace に接続しています…',
+    failed: 'Codespace を起動できませんでした: {error}',
+  },
   computer: {
     title: 'コンピュータ',
     screenOf: '{name} のデスクトップ',

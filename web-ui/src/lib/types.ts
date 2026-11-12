@@ -287,6 +287,34 @@ export interface ApiSession {
   repo?: string | null;
   /** Cursor the session's event stream resumes from. */
   cursor?: string;
+  /** The cloud machine the session lives on; absent for the daemon's own. */
+  location?: SessionLocation;
+}
+
+export interface SessionLocation {
+  provider: 'codespaces';
+  machine: string;
+  machineType: string;
+}
+
+export type CloudSessionPhase =
+  | 'creating'
+  | 'starting'
+  | 'checking'
+  | 'downloading'
+  | 'installing'
+  | 'cloning'
+  | 'starting_daemon'
+  | 'connecting'
+  | 'ready'
+  | 'failed';
+
+/** One step of bringing a cloud session's machine up. */
+export interface CloudSessionEvent {
+  sessionId: string;
+  phase: CloudSessionPhase;
+  machineState?: 'provisioning' | 'running' | 'suspended' | 'gone';
+  error?: string;
 }
 
 export interface ChatRequestPayload {
@@ -625,6 +653,7 @@ export type UiEvent =
   | { kind: 'config'; payload: UiConfigResponse }
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
   | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
+  | { kind: 'cloud_session'; payload: CloudSessionEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }

@@ -288,6 +288,17 @@ export const enUS = {
     didRead: 'Read {page}',
     didOther: 'Used the browser',
   },
+  cloudSession: {
+    creating: 'Creating the codespace…',
+    starting: 'Starting the codespace…',
+    checking: 'Checking May on the codespace…',
+    downloading: 'Downloading May for the codespace…',
+    installing: 'Installing May on the codespace…',
+    cloning: 'Cloning the repository into the codespace…',
+    startingDaemon: 'Starting May on the codespace…',
+    connecting: 'Connecting to the codespace…',
+    failed: 'The codespace could not be brought up: {error}',
+  },
   computer: {
     title: 'Computer',
     screenOf: '{name}\'s desktop',

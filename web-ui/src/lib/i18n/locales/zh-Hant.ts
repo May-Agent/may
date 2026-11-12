@@ -290,6 +290,17 @@ export const zhHant: Messages = {
     didRead: '已閱讀 {page}',
     didOther: '已使用瀏覽器',
   },
+  cloudSession: {
+    creating: '正在建立 Codespace…',
+    starting: '正在啟動 Codespace…',
+    checking: '正在檢查 Codespace 上的 May…',
+    downloading: '正在為 Codespace 下載 May…',
+    installing: '正在 Codespace 上安裝 May…',
+    cloning: '正在將儲存庫複製到 Codespace…',
+    startingDaemon: '正在 Codespace 上啟動 May…',
+    connecting: '正在連接 Codespace…',
+    failed: '無法啟動 Codespace：{error}',
+  },
   computer: {
     title: '电脑',
     screenOf: '{name} 的桌面',

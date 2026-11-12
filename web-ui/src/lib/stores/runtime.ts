@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type {
   BrowserLifecycleEvent,
   BrowserStatusPayload,
+  CloudSessionEvent,
   NetworkAccessLogsResponse,
   ProfileSessions,
   RemoteAccessStatusResponse,
@@ -48,6 +49,8 @@ interface RuntimeState {
   activeProfileId: string | null;
   browser: BrowserStatusPayload | null;
   browserLifecycle: BrowserLifecycleSnapshot;
+  /** The last step of each cloud session's machine coming up. */
+  cloudSessions: Record<string, CloudSessionEvent>;
   runtimes: Record<string, SessionRuntimeSummary>;
   profileSessions: ProfileSessions | null;
   mailbox: NotificationMailboxEntry[];
@@ -70,6 +73,7 @@ const SUBSCRIBED_TOPICS = [
   'config',
   'browser_status',
   'browser_lifecycle',
+  'cloud_session',
   'profile_sessions',
   'session_runtimes',
   'remote_access',
@@ -160,6 +164,7 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   activeProfileId: null,
   browser: null,
   browserLifecycle: EMPTY_LIFECYCLE,
+  cloudSessions: {},
   runtimes: {},
   profileSessions: null,
   mailbox: [],
@@ -201,6 +206,13 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               if (event.kind === 'navigating' || event.kind === 'ready') {
                 useBrowserViewStore.getState().revealBrowserOnce();
               }
+              break;
+            }
+            case 'cloud_session': {
+              const step = evt.payload;
+              set((prev) => ({
+                cloudSessions: { ...prev.cloudSessions, [step.sessionId]: step },
+              }));
               break;
             }
             case 'profile_sessions': {
