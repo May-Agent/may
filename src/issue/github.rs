@@ -33,28 +33,54 @@ pub struct GhCliTokenSource;
 
 impl GitHubTokenSource for GhCliTokenSource {
     async fn token(&self) -> Result<String, IssueError> {
-        let output = blocking::unblock(|| {
-            std::process::Command::new("gh")
-                .arg("auth")
-                .arg("token")
-                .output()
-        })
+        gh_auth_token(None).await
+    }
+}
+
+/// Token source running `gh auth token --user <login>` on the host: one
+/// named account of the `gh` login, whichever account is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhAccountTokenSource {
+    login: String,
+}
+
+impl GhAccountTokenSource {
+    /// The `gh` account signed in as `login` on `github.com`.
+    #[must_use]
+    pub const fn new(login: String) -> Self {
+        Self { login }
+    }
+}
+
+impl GitHubTokenSource for GhAccountTokenSource {
+    async fn token(&self) -> Result<String, IssueError> {
+        gh_auth_token(Some(&self.login)).await
+    }
+}
+
+/// `gh auth token` for `github.com`, for `login` or the active account.
+async fn gh_auth_token(login: Option<&str>) -> Result<String, IssueError> {
+    let mut command = std::process::Command::new("gh");
+    command.args(["auth", "token", "--hostname", "github.com"]);
+    if let Some(login) = login {
+        command.arg("--user").arg(login);
+    }
+    let output = blocking::unblock(move || command.output())
         .await
         .map_err(|error| IssueError::GitHubAuth(format!("failed to run gh auth token: {error}")))?;
-        if !output.status.success() {
-            return Err(IssueError::GitHubAuth(format!(
-                "gh auth token failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if token.is_empty() {
-            return Err(IssueError::GitHubAuth(
-                "gh auth token returned an empty token".to_string(),
-            ));
-        }
-        Ok(token)
+    if !output.status.success() {
+        return Err(IssueError::GitHubAuth(format!(
+            "gh auth token failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(IssueError::GitHubAuth(
+            "gh auth token returned an empty token".to_string(),
+        ));
+    }
+    Ok(token)
 }
 
 /// Authenticated GitHub REST client shared by the issue and pull request
@@ -884,18 +910,11 @@ impl GhIssue {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
-
-    use hyper::body::Bytes;
-    use hyper::header::AUTHORIZATION;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper::{Request, Response};
-    use hyper_util::rt::TokioIo;
 
     use super::*;
     use crate::issue::{IssueKind, IssueListState};
+    use crate::test_support::ApiReply;
 
     #[derive(Debug, Clone)]
     struct StaticToken;
@@ -906,7 +925,7 @@ mod tests {
         }
     }
 
-    type Requests = Arc<Mutex<Vec<(String, String, String, String)>>>;
+    type Requests = crate::test_support::ApiRequests;
 
     /// Spin up a mock GitHub API on a loopback port. `handler` receives the
     /// request method, path and body and returns `(status, json_body)`.
@@ -928,69 +947,15 @@ mod tests {
         + Sync
         + 'static,
     ) -> (String, Requests) {
-        let handler = Arc::new(handler);
-        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
-        let requests_in = requests.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock api");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.expect("accept");
-                let requests = requests_in.clone();
-                let handler = handler.clone();
-                let service = service_fn(move |request: Request<hyper::body::Incoming>| {
-                    let requests = requests.clone();
-                    let handler = handler.clone();
-                    async move {
-                        let (parts, body) = request.into_parts();
-                        let auth = parts
-                            .headers
-                            .get(AUTHORIZATION)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or("")
-                            .to_string();
-                        let body = http_body_util::BodyExt::collect(body)
-                            .await
-                            .map(http_body_util::Collected::to_bytes)
-                            .unwrap_or_default();
-                        let body = String::from_utf8_lossy(&body).to_string();
-                        let path = parts
-                            .uri
-                            .path_and_query()
-                            .map_or("", |pq| pq.as_str())
-                            .to_string();
-                        let method = parts.method.to_string();
-                        requests.lock().expect("requests").push((
-                            method.clone(),
-                            path.clone(),
-                            auth,
-                            body.clone(),
-                        ));
-                        let (status, json, next) = handler(&method, &path, &body);
-                        let mut response = Response::builder()
-                            .status(status)
-                            .header("content-type", "application/json");
-                        if let Some(next) = next {
-                            response = response
-                                .header("link", format!("<http://{addr}{next}>; rel=\"next\""));
-                        }
-                        Ok::<_, Infallible>(
-                            response
-                                .body(http_body_util::Full::new(Bytes::from(json.to_string())))
-                                .expect("response"),
-                        )
-                    }
-                });
-                tokio::spawn(async move {
-                    let _ = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
-                });
+        crate::test_support::serve_api(move |request, base| {
+            let (status, json, next) = handler(&request.method, &request.path, &request.body);
+            let reply = ApiReply::json(status, json.to_string());
+            match next {
+                Some(next) => reply.header("link", format!("<{base}{next}>; rel=\"next\"")),
+                None => reply,
             }
-        });
-        (format!("http://{addr}"), requests)
+        })
+        .await
     }
 
     fn gh_issue_json(number: i64, title: &str, state: &str) -> serde_json::Value {
@@ -1045,7 +1010,7 @@ mod tests {
 
         let sent = requests.lock().expect("requests").clone();
         assert_eq!(sent.len(), reads, "refused writes sent no request");
-        assert!(sent.iter().all(|(method, ..)| method == "GET"));
+        assert!(sent.iter().all(|request| request.method == "GET"));
     }
 
     /// `--repo OWNER/REPO` reads another GitHub repository's issues while the
@@ -1132,10 +1097,10 @@ mod tests {
         let local = format!("{local:?}");
         assert!(local.contains("local only") && !local.contains("elsewhere"));
         let sent = requests.lock().expect("requests").clone();
-        assert!(sent.iter().all(|(method, ..)| method == "GET"));
+        assert!(sent.iter().all(|request| request.method == "GET"));
         assert!(
             sent.iter()
-                .all(|(_, path, ..)| path.starts_with("/repos/x/y/"))
+                .all(|request| request.path.starts_with("/repos/x/y/"))
         );
 
         let error = tool
@@ -1190,17 +1155,18 @@ mod tests {
             assert!(
                 requests
                     .iter()
-                    .all(|(_, _, auth, _)| auth == "Bearer test-token"),
+                    .all(|request| request.authorization == "Bearer test-token"),
                 "every request must carry the token: {requests:?}"
             );
             assert!(
                 requests
                     .iter()
-                    .all(|(_, _, _, body)| !body.contains("test-token")),
+                    .all(|request| !request.body.contains("test-token")),
                 "token must never appear in a request body"
             );
-            assert!(requests.iter().any(|(method, path, _, _)| {
-                method == "POST" && path == "/repos/o/r/issues/1/dependencies/blocked_by"
+            assert!(requests.iter().any(|request| {
+                request.method == "POST"
+                    && request.path == "/repos/o/r/issues/1/dependencies/blocked_by"
             }));
             drop(requests);
         }
@@ -1301,9 +1267,8 @@ mod tests {
 
         let sent = requests.lock().expect("requests").clone();
         assert!(
-            sent.iter()
-                .any(|(method, path, ..)| method == "DELETE"
-                    && path == "/repos/o/r/issues/1/sub_issue"),
+            sent.iter().any(|request| request.method == "DELETE"
+                && request.path == "/repos/o/r/issues/1/sub_issue"),
             "{sent:?}"
         );
     }
@@ -1343,7 +1308,7 @@ mod tests {
         let sent = requests.lock().expect("requests").clone();
         assert_eq!(sent.len(), 1);
         assert_eq!(
-            sent[0].1,
+            sent[0].path,
             "/repos/o/r/issues?state=open&per_page=10&labels=good+first+issue%2CC%2B%2B%2Ca%26b"
         );
     }
@@ -1411,7 +1376,7 @@ mod tests {
             .lock()
             .expect("requests")
             .iter()
-            .map(|(_, _, auth, _)| auth.clone())
+            .map(|request| request.authorization.clone())
             .collect();
         assert_eq!(
             auth,
@@ -1472,7 +1437,7 @@ mod tests {
             .lock()
             .expect("requests")
             .iter()
-            .map(|(_, path, ..)| path.clone())
+            .map(|request| request.path.clone())
             .collect();
         assert!(paths.contains(&"/comments-2".to_string()), "{paths:?}");
     }

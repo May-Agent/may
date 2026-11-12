@@ -296,6 +296,9 @@ pub struct App {
     pub ssh_add_name: String,
     /// SSH add target input (`user@host`)
     pub ssh_add_target: String,
+    /// `/cloud`'s GitHub account input, while it is being typed; empty is
+    /// the `gh` login's active account.
+    pub cloud_login: Option<String>,
     /// Skill list for display
     pub skill_list: Vec<crate::skill::SkillInfo>,
     /// Selected skill index
@@ -723,6 +726,7 @@ impl App {
             ssh_add_mode: SshAddMode::None,
             ssh_add_name: String::new(),
             ssh_add_target: String::new(),
+            cloud_login: None,
             skill_list: Vec::new(),
             skill_selected: 0,
             skill_scroll: 0,
@@ -790,6 +794,89 @@ impl App {
             let _ = tx.send(AppEvent::SshProbed { name, result }).await;
         })
         .detach();
+    }
+
+    /// The profile the TUI is on, as last loaded.
+    pub fn current_profile(&self) -> Option<&ProfileInfo> {
+        let id = self.session_manager.current_profile_id()?;
+        self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    /// Set up GitHub Codespaces for the current profile as `login`, or the
+    /// `gh` login's active account; [`Self::cloud_configured`] receives the
+    /// daemon's answer.
+    pub fn start_codespaces_setup(&mut self, login: Option<String>) {
+        #[derive(serde::Serialize)]
+        struct Setup {
+            login: Option<String>,
+        }
+        self.set_persistent_status("Checking the GitHub account for Codespaces...");
+        self.request_cloud_change(move |client, path| async move {
+            client.put::<_, ProfileInfo>(&path, &Setup { login }).await
+        });
+    }
+
+    /// Remove the current profile's Codespaces account.
+    pub fn start_codespaces_removal(&mut self) {
+        self.set_persistent_status("Removing the Codespaces account...");
+        self.request_cloud_change(|client, path| async move {
+            client.delete::<ProfileInfo>(&path).await
+        });
+    }
+
+    fn request_cloud_change<F, Fut>(&self, call: F)
+    where
+        F: FnOnce(crate::client::DaemonClient, String) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<ProfileInfo, crate::client::DaemonClientError>> + Send,
+    {
+        let tx = self.event_tx.clone();
+        let target = self
+            .session_manager
+            .current_profile_id()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "no profile is selected".to_owned())
+            .and_then(|id| {
+                self.session_manager
+                    .daemon_handle()
+                    .map(|client| (client, id))
+                    .map_err(|error| error.to_string())
+            });
+        spawn(async move {
+            let result = match target {
+                Ok((client, id)) => call(client, format!("/api/profiles/{id}/cloud/codespaces"))
+                    .await
+                    .map_err(|error| error.reason()),
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(AppEvent::CloudConfigured(result)).await;
+        })
+        .detach();
+    }
+
+    /// Show a `/cloud` change the daemon answered: the profile it returned
+    /// replaces the loaded one.
+    pub fn cloud_configured(&mut self, result: Result<ProfileInfo, String>) {
+        self.clear_persistent_status();
+        match result {
+            Ok(profile) => {
+                let message = profile.cloud.codespaces.as_ref().map_or_else(
+                    || "Codespaces account removed".to_owned(),
+                    |account| format!("Codespaces set up as {}", account.login),
+                );
+                match self
+                    .profiles
+                    .iter_mut()
+                    .find(|known| known.id == profile.id)
+                {
+                    Some(known) => *known = profile,
+                    None => self.profiles.push(profile),
+                }
+                self.set_status(message);
+            }
+            Err(error) => self
+                .chat
+                .push_error(&format!("Cloud setup failed: {error}")),
+        }
     }
 
     /// Add a probed SSH server to the config, or show why the probe failed.
@@ -2327,6 +2414,14 @@ impl App {
                 }
                 SshAddMode::None => {}
             },
+            AppMode::CloudManage => {
+                if let Some(login) = self.cloud_login.as_mut() {
+                    return Some(ActiveTextInput::Simple {
+                        input: login,
+                        filter: PasteFilter::Identifier,
+                    });
+                }
+            }
             AppMode::SkillManage => {
                 match self.skill_add_mode {
                     SkillAddMode::GitHubRepo => {
@@ -2641,6 +2736,10 @@ impl App {
             }
             AppMode::McpManage => Ok(super::reducer::manage::handle_mcp_key(self, code)),
             AppMode::SshManage => Ok(super::reducer::manage::handle_ssh_key(self, code)),
+            AppMode::CloudManage => {
+                super::reducer::manage::handle_cloud_key(self, code);
+                Ok(None)
+            }
             AppMode::AskUser(_) => Ok(super::reducer::ask_user::handle_ask_user_key(self, code)),
             AppMode::SkillManage => Ok(super::reducer::manage::handle_skill_key(self, code)),
             AppMode::ProfileSelect => Ok(super::reducer::navigation::handle_profile_select_key(
@@ -3677,6 +3776,11 @@ impl App {
             }
             SlashCommand::Ssh => {
                 self.mode = AppMode::SshManage;
+                None
+            }
+            SlashCommand::Cloud => {
+                self.cloud_login = None;
+                self.mode = AppMode::CloudManage;
                 None
             }
             SlashCommand::Permission => {

@@ -211,17 +211,19 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
     };
     let profile_environment = match (profile_model.clone(), profile_preferences.as_ref()) {
         (Some(model), Some(preferences)) => {
-            let attachments =
-                db.list_profile_remote_servers(&model.id)
-                    .await
-                    .map_err(|source| ExecError::LoadProfile {
-                        profile_id: profile_id
-                            .clone()
-                            .expect("profile id present when model exists"),
-                        source,
-                    })?;
+            let (attachments, cloud) = futures_lite::future::try_zip(
+                db.list_profile_remote_servers(&model.id),
+                db.profile_cloud(&model.id),
+            )
+            .await
+            .map_err(|source| ExecError::LoadProfile {
+                profile_id: profile_id
+                    .clone()
+                    .expect("profile id present when model exists"),
+                source,
+            })?;
             Some(
-                ProfileInfo::from_db_parts(model, preferences.clone(), attachments)
+                ProfileInfo::from_db_parts(model, preferences.clone(), attachments, cloud)
                     .map_err(|source| ExecError::InvalidProfile {
                         profile_id: profile_id
                             .clone()

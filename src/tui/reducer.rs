@@ -241,6 +241,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::CloudConfigured(result) => {
+            app.cloud_configured(result);
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat

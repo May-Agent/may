@@ -67,9 +67,72 @@ impl ChatDb {
         &self,
         profile: profiles::Model,
     ) -> Result<crate::profile::ProfileInfo, ChatDbError> {
-        let preferences = self.load_profile_preferences(&profile).await?;
-        let attachments = self.list_profile_remote_servers(&profile.id).await?;
-        crate::profile::ProfileInfo::from_db_parts(profile, preferences, attachments)
+        let (preferences, (attachments, cloud)) = futures_lite::future::try_zip(
+            self.load_profile_preferences(&profile),
+            futures_lite::future::try_zip(
+                self.list_profile_remote_servers(&profile.id),
+                self.profile_cloud(&profile.id),
+            ),
+        )
+        .await?;
+        crate::profile::ProfileInfo::from_db_parts(profile, preferences, attachments, cloud)
+    }
+
+    /// The cloud provider accounts `profile_id` uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
+    pub async fn profile_cloud(
+        &self,
+        profile_id: &str,
+    ) -> Result<crate::cloud::ProfileCloud, ChatDbError> {
+        let codespaces = query!(
+            self.db,
+            "SELECT login AS value FROM profile_codespaces_accounts WHERE profile_id = ?",
+            profile_id
+        )
+        .fetch_optional::<super::common::StringValueRow>()
+        .await?
+        .map(|row| crate::cloud::CodespacesAccount { login: row.value });
+        Ok(crate::cloud::ProfileCloud { codespaces })
+    }
+
+    /// Set, or with `None` remove, the GitHub account `profile_id`'s
+    /// codespaces belong to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the write fails.
+    pub async fn set_profile_codespaces_account(
+        &self,
+        profile_id: &str,
+        account: Option<&crate::cloud::CodespacesAccount>,
+    ) -> Result<(), ChatDbError> {
+        match account {
+            Some(account) => {
+                let now = jiff::Timestamp::now().to_string();
+                query!(
+                    self.db,
+                    "INSERT INTO profile_codespaces_accounts (profile_id, login, created_at) VALUES (?, ?, ?) ON CONFLICT(profile_id) DO UPDATE SET login = excluded.login",
+                    profile_id,
+                    account.login.as_str(),
+                    now.as_str()
+                )
+                .execute()
+                .await?;
+            }
+            None => {
+                query!(
+                    self.db,
+                    "DELETE FROM profile_codespaces_accounts WHERE profile_id = ?",
+                    profile_id
+                )
+                .execute()
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Return SSH server names attached to this profile, ordered by
@@ -376,6 +439,13 @@ impl ChatDb {
         query!(tx, "DELETE FROM folders WHERE profile_id = ?", id)
             .execute()
             .await?;
+        query!(
+            tx,
+            "DELETE FROM profile_codespaces_accounts WHERE profile_id = ?",
+            id
+        )
+        .execute()
+        .await?;
         query!(tx, "DELETE FROM profiles WHERE id = ?", id)
             .execute()
             .await?;
