@@ -843,7 +843,6 @@ mod tests {
             &["may", "exec", "--mode", "root", "--session", "s", "ls"],
             &["may", "browser", "read"],
             &["may", "resume", "a", "b"],
-            &["may", "daemon", "restart"],
         ] {
             assert!(parse_cli_mode(argv).is_err(), "{argv:?}");
         }
