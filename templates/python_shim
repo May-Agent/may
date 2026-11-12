@@ -1,16 +1,70 @@
 #!/bin/sh
-# `python3` and `python` of a terminal: the interpreter of the project
-# environment that holds the working directory, otherwise May's managed
-# `python3`.
+# `python3`, `python` and `uv` of a terminal.
 #
 # The project environment is `$UV_PROJECT_ENVIRONMENT` when set, else `.venv`,
 # looked up in the working directory and each parent up to the repository
 # root (the nearest directory holding a `.git`); outside a repository only
 # the working directory is looked at.
+#
+# `python3` and `python` run the interpreter of the project environment, else
+# that of the session environment (`~/.python-env`, `~` being the session
+# directory), which `uv venv` creates from May's managed `python3` the first
+# time it is needed.
+#
+# `uv` is the next `uv` on the PATH. Where no project environment is found,
+# `uv pip` and `uv run` get `VIRTUAL_ENV` set to the session environment;
+# it is never set for the whole session, because it takes precedence over a
+# project's `.venv`.
 
 name=${0##*/}
 own=$(cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 
+# The path of the next executable `$1` on the PATH after this directory.
+next() {
+    rest=$PATH
+    while [ -n "$rest" ]; do
+        case $rest in
+            *:*) entry=${rest%%:*}; rest=${rest#*:} ;;
+            *) entry=$rest; rest= ;;
+        esac
+        [ -n "$entry" ] || continue
+        resolved=$(cd -P -- "$entry" 2>/dev/null && pwd -P) || continue
+        [ "$resolved" = "$own" ] && continue
+        if [ -x "$resolved/$1" ] && [ ! -d "$resolved/$1" ]; then
+            printf '%s\n' "$resolved/$1"
+            return 0
+        fi
+    done
+    echo "$name: no $1 found on PATH" >&2
+    return 127
+}
+
+# Creates the session environment with the uv `$1` unless it exists.
+#
+# The environment is built in a directory of its own and published by
+# creating the symlink `$session` to it, which fails for all but one of the
+# commands racing to do it; the others delete their copy and use the winner's.
+# A creator that dies leaves only an unpublished directory.
+ensure_session_environment() {
+    session=${HOME:?"$name: HOME is not the session directory"}/.python-env
+    [ -x "$session/bin/python3" ] && return 0
+    managed=$(next python3) || return
+    built=$(mktemp -d "$HOME/.python-env.XXXXXX") || return
+    # The environment sees the interpreter's own packages, such as those a
+    # container image preinstalls into its system Python.
+    if ! (cd "$HOME" && "$1" venv --quiet --system-site-packages --python "$managed" "$built"); then
+        status=$?
+        rm -rf "$built"
+        return "$status"
+    fi
+    ln -sn "$built" "$session" 2>/dev/null || rm -rf "$built"
+    if [ ! -x "$session/bin/python3" ]; then
+        echo "$name: the session environment $session is not usable" >&2
+        return 1
+    fi
+}
+
+project=
 directory=$(pwd -P)
 while :; do
     case ${UV_PROJECT_ENVIRONMENT:-.venv} in
@@ -19,7 +73,8 @@ while :; do
     esac
     for candidate in "$environment/bin/$name" "$environment/bin/python3"; do
         if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
-            exec "$candidate" "$@"
+            project=$candidate
+            break 2
         fi
     done
     if [ -e "$directory/.git" ] || [ "$directory" = / ]; then
@@ -28,19 +83,30 @@ while :; do
     directory=$(dirname -- "$directory")
 done
 
-# The managed interpreter: the next `python3` on the PATH after this directory.
-rest=$PATH
-while [ -n "$rest" ]; do
-    case $rest in
-        *:*) entry=${rest%%:*}; rest=${rest#*:} ;;
-        *) entry=$rest; rest= ;;
-    esac
-    [ -n "$entry" ] || continue
-    resolved=$(cd -P -- "$entry" 2>/dev/null && pwd -P) || continue
-    [ "$resolved" = "$own" ] && continue
-    if [ -x "$resolved/python3" ] && [ ! -d "$resolved/python3" ]; then
-        exec "$resolved/python3" "$@"
+if [ "$name" = uv ]; then
+    uv=$(next uv) || exit
+    # Inside a project, or in an activated environment, `uv` decides.
+    if [ -n "$project" ] || [ -n "${VIRTUAL_ENV:-}" ]; then
+        exec "$uv" "$@"
     fi
-done
-echo "$name: no python3 found on PATH" >&2
-exit 127
+    needs=
+    for argument; do
+        case $argument in
+            -*) ;;
+            pip | run) needs=1; break ;;
+            *) break ;;
+        esac
+    done
+    [ -n "$needs" ] || exec "$uv" "$@"
+    ensure_session_environment "$uv" || exit
+    VIRTUAL_ENV=$session
+    export VIRTUAL_ENV
+    exec "$uv" "$@"
+fi
+
+if [ -n "$project" ]; then
+    exec "$project" "$@"
+fi
+uv=$(next uv) || exit
+ensure_session_environment "$uv" || exit
+exec "$session/bin/$name" "$@"
