@@ -17,6 +17,7 @@ use tokio::net::UnixListener;
 use waterkit_permission::{Permission, PermissionError, PermissionStatus};
 
 use super::input::InputError;
+use super::main_thread::MainThread;
 use super::proto::{AgentRequest, AgentResponse};
 use super::stream::OfferError;
 use super::{SessionDisplay, SessionDisplays, SessionStreams, launch, screenshot};
@@ -68,7 +69,8 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
         .map_err(|e| format!("stat {}: {e}", sock.display()))?
         .ino();
     let state = Arc::new(AgentState {
-        displays: async_lock::Mutex::new(SessionDisplays::default()),
+        // The helper's one handle to the main thread and its display host.
+        displays: async_lock::Mutex::new(SessionDisplays::new(MainThread::default())),
         streams: Mutex::new(SessionStreams::default()),
     });
     let mut watch = tokio::time::interval(watch_interval);

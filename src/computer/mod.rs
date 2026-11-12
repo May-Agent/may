@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 #[cfg(target_os = "macos")]
-use main_thread::MainThreadBound;
+use main_thread::{MainThread, MainThreadBound};
 #[cfg(target_os = "macos")]
 use waterkit_automation::{ElementRef, Input, VirtualDisplay, VirtualDisplayConfig};
 
@@ -95,19 +95,25 @@ impl SessionDisplay {
     /// # Errors
     /// Returns [`DisplayError`] when the size is empty or waterkit cannot
     /// bring the display up or drive it.
-    pub async fn create(name: String, size: (u32, u32), serial: u32) -> Result<Self, DisplayError> {
+    pub async fn create(
+        main_thread: &MainThread,
+        name: String,
+        size: (u32, u32),
+        serial: u32,
+    ) -> Result<Self, DisplayError> {
         let extent = |points: u32| {
             NonZeroU32::new(points).ok_or_else(|| DisplayError("the display has no area".into()))
         };
         let config = VirtualDisplayConfig::new(name, extent(size.0)?, extent(size.1)?, serial);
-        let (display, display_id) = main_thread::run(move |main| {
-            VirtualDisplay::new(&config, main).map(|display| {
-                let id = display.id();
-                (MainThreadBound::new(display, main), id)
+        let (display, display_id) = main_thread
+            .run(move |main, host| {
+                VirtualDisplay::new(&config, host).map(|display| {
+                    let id = display.id();
+                    (MainThreadBound::new(display, main), id)
+                })
             })
-        })
-        .await
-        .map_err(|e| DisplayError(e.to_string()))?;
+            .await
+            .map_err(|e| DisplayError(e.to_string()))?;
         let input = match Input::new(display_id) {
             Ok(input) => input,
             Err(e) => {
@@ -246,8 +252,10 @@ fn display_serial(session_id: &str) -> u32 {
 /// Entries drop — and so destroy their displays — when their session
 /// ends or the daemon stops.
 #[cfg(target_os = "macos")]
-#[derive(Default)]
 pub struct SessionDisplays {
+    /// The handle to the main thread and its one display host, which every
+    /// display here is created through.
+    main_thread: MainThread,
     displays: HashMap<String, Arc<SessionDisplay>>,
 }
 
@@ -256,12 +264,21 @@ impl std::fmt::Debug for SessionDisplays {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionDisplays")
             .field("displays", &self.displays.keys())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(target_os = "macos")]
 impl SessionDisplays {
+    /// No displays yet; they are created through `main_thread`.
+    #[must_use]
+    pub fn new(main_thread: MainThread) -> Self {
+        Self {
+            main_thread,
+            displays: HashMap::new(),
+        }
+    }
+
     /// The session's display, creating it on first ask.
     ///
     /// # Errors
@@ -273,6 +290,7 @@ impl SessionDisplays {
         let short = session_id.get(..8).unwrap_or(session_id);
         let display = Arc::new(
             SessionDisplay::create(
+                &self.main_thread,
                 format!("May {short}"),
                 (1920, 1200),
                 display_serial(session_id),
