@@ -138,6 +138,8 @@ pub mod tools;
 pub mod tui;
 /// Event bus publishing UI-facing state changes.
 pub mod ui_event_bus;
+/// Self-update from CI artifacts (dev builds) or GitHub releases.
+pub mod update;
 
 pub(crate) mod video;
 /// HTTP/SSE server backing the web UI.

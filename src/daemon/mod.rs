@@ -17,6 +17,7 @@ mod attachments;
 mod auth;
 #[cfg(test)]
 mod auth_tests;
+mod auto_update;
 mod bootstrap;
 mod browser;
 mod chat;

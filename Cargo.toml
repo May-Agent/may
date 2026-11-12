@@ -12,6 +12,10 @@ publish = false
 name = "may"
 path = "src/bin/may/main.rs"
 
+# `publish = false` hides the package from cargo-dist unless it says so.
+[package.metadata.dist]
+dist = true
+
 [workspace]
 members = [".", "tasks"]
 # `cargo build` also builds the `tasks` binary that sits beside `may`.
@@ -20,6 +24,9 @@ default-members = [".", "tasks"]
 [features]
 default = []
 ui = []
+# Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
+# release and updates from GitHub releases instead of CI artifacts.
+release-build = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
@@ -223,6 +230,7 @@ linkify = { version = "0.11.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 clap_complete = { version = "4.6.11", default-features = false }
+axoupdater = { version = "0.10.3", default-features = false, features = ["github_releases"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
@@ -320,6 +328,11 @@ opt-level = 3
 
 [profile.dev.package.lzma-rust2]
 opt-level = 3
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 # The aither redesign (May-Agent/aither#593) is released once, as a whole;
 # until then May follows aither's main branch.

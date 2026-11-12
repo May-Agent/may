@@ -99,6 +99,9 @@ pub enum ConfigError {
     /// Invalid `[ci]` config.
     #[error("invalid ci config: {0}")]
     InvalidCiConfig(String),
+    /// Invalid `[update]` config.
+    #[error("invalid update config: {0}")]
+    InvalidUpdateConfig(String),
     /// A provider instance already exists under the ID with a different type.
     #[error(
         "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
@@ -1348,6 +1351,9 @@ pub struct MayConfig {
     /// CI duration thresholds.
     #[serde(default)]
     pub ci: CiConfig,
+    /// Self-update of release builds.
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// Session list settings.
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -1542,6 +1548,45 @@ impl Default for CiConfig {
             max_job_minutes: 40,
             baseline_multiple: 2.0,
             pr_poll_seconds: 60,
+        }
+    }
+}
+
+/// `[update]` section: whether a release build updates itself.
+///
+/// Read by the daemon on every check, so a change applies without a restart.
+/// A dev build never updates on its own, whatever this says; it updates on
+/// `may update`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Whether a release build checks GitHub releases and installs a newer
+    /// one in the background.
+    pub auto: bool,
+    /// Hours between two automatic checks.
+    pub check_interval_hours: u64,
+}
+
+impl UpdateConfig {
+    /// Check the interval can elapse.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidUpdateConfig`] when the interval is zero.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.check_interval_hours == 0 {
+            return Err(ConfigError::InvalidUpdateConfig(
+                "update.check_interval_hours must be above 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            check_interval_hours: 6,
         }
     }
 }
@@ -2025,6 +2070,7 @@ impl Default for MayConfig {
             sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
             ci: CiConfig::default(),
+            update: UpdateConfig::default(),
             sessions: SessionsConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
@@ -2134,6 +2180,7 @@ impl MayConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.browser.validate()?;
         self.ci.validate()?;
+        self.update.validate()?;
         for (id, instance) in &self.provider {
             instance.validate(id)?;
         }
