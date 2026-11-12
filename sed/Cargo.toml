@@ -1,6 +1,6 @@
 [package]
 name = "may-sed"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 description = "The sed of sandboxed agent scripts: uutils sed that writes no file"

@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/May-Agent/may/compare/v0.1.0...v0.1.1) - 2026-11-12
+
+### Added
+
+- *(cloud)* push this machine's fast and balanced tiers to the cloud home
+- *(web-ui)* pick a codespace for a new chat and show a suspended session
+- *(cloud)* push the session's provider to its codespace and mirror its state
+- *(tools)* own the bash build and third-party pins
+- *(computer)* act on the desktop's elements by reference
+- *(web-ui)* show a cloud session's wait
+- *(tui)* start a session on a codespace
+- *(daemon)* front cloud sessions on their codespace
+- *(cloud)* bootstrap a codespace as a cloud home
+- *(daemon)* serve a fronting daemon on a cloud home
+- *(update)* find the CI build of a given commit
+- *(tools)* take apply_patch and sed from May's own releases
+- *(cloud)* bring a machine to running, starting a suspended one
+
+### Fixed
+
+- *(cloud)* delete a session's codespace with the session
+- *(ci)* pass clippy on Rust 1.100
+- *(tui)* keep text offsets on character boundaries
+- *(computer)* pick up waterkit's focus confirm for compound controls
+- *(computer)* say that keys are KeyboardEvent.code names in the help and the refusal
+- *(memory)* resolve extraction models when each extraction runs
+- *(cloud)* keep pushed providers off the codespace's disk and refresh them through a turn
+- *(computer)* keep the user's desktop on a Mac with no monitor
+- *(tools)* run May's sed in the managed shell
+- *(release)* build the Linux binaries on ubuntu-24.04
+- *(release)* skip semver-checks for may-agent
+- *(agent)* retry a rate limit reported mid-stream
+- *(patch)* show the lines around each place an ambiguous hunk matches
+- *(daemon)* answer a direct listener only when Host names the node
+
+### Other
+
+- Merge pull request #1172 from May-Agent/refactor/1159-templates
+- Merge pull request #1165 from May-Agent/refactor/1158-statics
+- render hand-built text through templates and include_str
+- Merge pull request #1164 from May-Agent/fix/1160-str-offsets
+- Merge remote-tracking branch 'origin/main' into refactor/1158-statics
+- Merge pull request #1169 from May-Agent/feat/1057-cloud-session
+- Merge pull request #1167 from May-Agent/ci/1166-cache-footprint
+- Merge pull request #1163 from May-Agent/fix/434-waterkit-focus
+- Merge remote-tracking branch 'origin/main' into feat/1057-cloud-session
+- Merge pull request #1162 from May-Agent/refactor/1161-pr-state
+- Merge remote-tracking branch 'origin/main' into ci/1166-cache-footprint
+- Merge remote-tracking branch 'origin/main' into refactor/1158-statics
+- Merge remote-tracking branch 'origin/main' into fix/1160-str-offsets
+- restore the test jobs' existing cache keys
+- keep one Rust cache per OS on main
+- move process-wide statics to their owners
+- *(pr)* type the session PR state
+- Merge pull request #1157 from May-Agent/fix/1156-key-names
+- Merge pull request #1154 from May-Agent/fix/1153-ci-gate
+- fail CI result when an acceptance or container image job fails
+- Merge pull request #1152 from May-Agent/fix/1098-shell-sed
+- Merge pull request #1151 from May-Agent/fix/1147-display-host
+- Merge remote-tracking branch 'origin/main' into fix/1098-shell-sed
+- Merge pull request #1148 from May-Agent/feat/1146-own-tool-pipeline
+- Merge pull request #1150 from May-Agent/fix/1029-dist-runners
+- Merge pull request #1143 from May-Agent/feat/1142-computer-elements
+- Merge pull request #1145 from May-Agent/fix/1144-release-semver-check
+- Merge remote-tracking branch 'origin/main' into feat/1057-cloud-session
+- Merge pull request #1130 from May-Agent/release-plz-2026-11-12T09-31-29Z
+- Merge pull request #1141 from May-Agent/fix/1140-aither-bump
+- Merge pull request #1139 from May-Agent/fix/1017-ambiguous-hunk-context
+- release
+- Merge pull request #1138 from May-Agent/ci/1137-scope
+- Merge pull request #1136 from May-Agent/fix/1108-direct-host-check
+- Merge pull request #1135 from May-Agent/feat/1015-distribution-switch
+- release configuration selects no CI job
+- Merge remote-tracking branch 'origin/main' into feat/1057-cloud-session
+
 ## [0.1.0](https://github.com/May-Agent/may/releases/tag/v0.1.0) - 2026-11-12
 
 ### Added
