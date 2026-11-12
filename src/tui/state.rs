@@ -699,11 +699,11 @@ pub enum ActiveTextInput<'a> {
         /// Byte offset of the cursor within the buffer.
         cursor: &'a mut usize,
     },
-    /// A settings field with a character-index cursor (insert at cursor)
+    /// A settings field whose cursor is a byte offset on a grapheme boundary
     Cursored {
         /// The buffer being edited.
         input: &'a mut String,
-        /// Cursor position within the buffer, in characters.
+        /// Byte offset of the cursor within the buffer.
         cursor: &'a mut usize,
     },
     /// Simple input (append at end) with character filter
@@ -720,7 +720,7 @@ pub enum ActiveTextInput<'a> {
 pub struct SelectionPoint {
     /// Line in the rendered viewport.
     pub line: usize,
-    /// Column in the rendered viewport.
+    /// Byte offset into the rendered line, on a char boundary.
     pub column: usize,
 }
 
@@ -750,23 +750,25 @@ impl TextSelection {
         }
     }
 
-    /// Word-shaped selection covering `point.column` in `text`: the maximal
-    /// run of same-class characters around it. `None` when the column lands
-    /// past the line's content.
+    /// Word-shaped selection covering the char at the byte offset
+    /// `point.column` in `text`: the maximal run of same-class characters
+    /// around it. `None` when the column lands past the line's content or off
+    /// a char boundary.
     #[must_use]
     pub fn word_at(text: &str, point: SelectionPoint) -> Option<Self> {
-        let chars: Vec<char> = text.chars().collect();
-        if point.column >= chars.len() {
-            return None;
-        }
-        let word = is_word_char(chars[point.column]);
-        let start = (0..point.column)
+        let before = text.get(..point.column)?;
+        let from_column = text.get(point.column..)?;
+        let word = is_word_char(from_column.chars().next()?);
+        let start = before
+            .char_indices()
             .rev()
-            .find(|&i| is_word_char(chars[i]) != word)
-            .map_or(0, |i| i + 1);
-        let end = (point.column + 1..chars.len())
-            .find(|&i| is_word_char(chars[i]) != word)
-            .unwrap_or(chars.len());
+            .find(|&(_, c)| is_word_char(c) != word)
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = from_column
+            .char_indices()
+            .skip(1)
+            .find(|&(_, c)| is_word_char(c) != word)
+            .map_or(text.len(), |(i, _)| point.column + i);
         Some(Self {
             anchor: SelectionPoint {
                 line: point.line,
@@ -989,7 +991,7 @@ pub enum ConfigEditMode {
     Text {
         /// Current text being edited.
         input: String,
-        /// Cursor position within `input`, in characters.
+        /// Byte offset of the cursor within `input`, on a grapheme boundary.
         cursor: usize,
     },
     /// Selecting from a list (provider type, model list)
@@ -1009,7 +1011,8 @@ pub enum ConfigEditMode {
         base_url: String,
         /// API key (optional)
         api_key: String,
-        /// Cursor position in the focused field
+        /// Byte offset of the cursor in the focused field, on a grapheme
+        /// boundary
         cursor: usize,
         /// Whether we're editing an existing provider
         editing_existing: bool,
@@ -1196,10 +1199,34 @@ mod tests {
     }
 
     #[test]
-    fn word_at_columns_are_char_indices_not_display_cells() {
-        // Wide chars take two cells but one char index each.
+    fn word_at_columns_are_byte_offsets_on_char_boundaries() {
+        // "你好" is six bytes; the word run after the space starts at byte 7.
+        let sel = TextSelection::word_at("你好 world", point(0, 8)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 7), point(0, 12)));
         let sel = TextSelection::word_at("你好 world", point(0, 3)).unwrap();
-        assert_eq!(sel.normalized(), (point(0, 3), point(0, 8)));
+        assert_eq!(sel.normalized(), (point(0, 0), point(0, 6)));
+        // Off a char boundary, there is no word.
+        assert!(TextSelection::word_at("你好 world", point(0, 1)).is_none());
+    }
+
+    #[test]
+    fn word_at_covers_japanese_korean_and_emoji_text() {
+        for (text, word) in [
+            ("こんにちは 世界", "こんにちは"),
+            ("안녕하세요 world", "안녕하세요"),
+        ] {
+            let sel = TextSelection::word_at(text, point(0, 3)).unwrap();
+            assert_eq!(
+                sel.normalized(),
+                (point(0, 0), point(0, word.len())),
+                "{text}"
+            );
+        }
+        // The thumbs-up with a skin tone (8 bytes) is not a word character:
+        // it forms one run with the spaces around it.
+        let text = "a 👍🏽 b";
+        let sel = TextSelection::word_at(text, point(0, 2)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 1), point(0, 1 + 1 + 8 + 1)));
     }
 
     #[test]

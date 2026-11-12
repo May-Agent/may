@@ -220,7 +220,9 @@ fn recap_window<'a>(
         if !matches!(role, MessageRole::User | MessageRole::Assistant) {
             continue;
         }
-        let size = content.chars().count();
+        // Counting stops one past the budget left, so the walk over all
+        // rows is bounded by the budget, not by the history's length.
+        let size = content.char_indices().take(remaining + 1).count();
         if size > remaining {
             break;
         }

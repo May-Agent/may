@@ -37,7 +37,7 @@ use super::queue::{Attachment, MessageQueue, PendingMessage};
 use super::slash::SlashCommand;
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
-use crate::pasted_text::LARGE_PASTE_THRESHOLD;
+use crate::pasted_text;
 
 /// User-facing message shown when a tool response cannot be sent to the session.
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
@@ -55,9 +55,12 @@ const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// screen before it clears itself.
 const STATUS_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Convert a character index to a byte index in a string.
-pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+/// Whether two selection columns (byte offsets into `line`) are at most one
+/// character apart, the tolerance of a double click.
+fn same_click_spot(line: &str, a: usize, b: usize) -> bool {
+    let (low, high) = (a.min(b), a.max(b));
+    line.get(low..high)
+        .is_some_and(|between| between.char_indices().nth(1).is_none())
 }
 
 /// Agent event from aither-agent.
@@ -2606,7 +2609,7 @@ impl App {
     pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
         // Special handling for Chat mode: large pastes become attachments
         if matches!(self.mode, AppMode::Chat)
-            && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
+            && (text.contains('\n') || pasted_text::is_large(&text))
         {
             self.set_status("Saving pasted text...");
             self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
@@ -2635,17 +2638,11 @@ impl App {
         // Get active text input and paste into it
         match self.active_text_input() {
             Some(ActiveTextInput::Composer { input, cursor }) => {
-                input.insert_str(*cursor, &text);
-                // The pasted text may join the cluster before or after it, so
-                // the cursor sits at the boundary at or after its end.
-                let end = *cursor + text.len();
-                *cursor = grapheme::next_boundary(input, grapheme::prev_boundary(input, end));
+                *cursor = grapheme::insert_str(input, *cursor, &text);
                 self.update_completion_state();
             }
             Some(ActiveTextInput::Cursored { input, cursor }) => {
-                let byte_idx = char_to_byte_index(input, *cursor);
-                input.insert_str(byte_idx, &text);
-                *cursor += text.chars().count();
+                *cursor = grapheme::insert_str(input, *cursor, &text);
             }
             Some(ActiveTextInput::Simple { input, filter }) => {
                 let filtered = filter.filter(&text);
@@ -3292,9 +3289,7 @@ impl App {
                 self.history.reset_navigation();
                 if self.cursor > 0 {
                     // Delete the grapheme before the cursor
-                    let start = grapheme::prev_boundary(&self.input, self.cursor);
-                    self.input.replace_range(start..self.cursor, "");
-                    self.cursor = start;
+                    self.cursor = grapheme::remove_before(&mut self.input, self.cursor);
                     self.update_completion_state();
                 } else if !self.attachments.is_empty() {
                     // Cursor at start and has attachments - delete last attachment
@@ -3304,8 +3299,7 @@ impl App {
             KeyCode::Delete => {
                 self.history.reset_navigation();
                 if self.cursor < self.input.len() {
-                    let end = grapheme::next_boundary(&self.input, self.cursor);
-                    self.input.replace_range(self.cursor..end, "");
+                    grapheme::remove_after(&mut self.input, self.cursor);
                     self.update_completion_state();
                 }
             }
@@ -3398,14 +3392,7 @@ impl App {
             KeyCode::Char(c) => {
                 // Reset history navigation when typing
                 self.history.reset_navigation();
-                self.input.insert(self.cursor, c);
-                // A combining mark, ZWJ or second regional indicator joins
-                // the cluster before it; the cursor sits after the cluster
-                // the new char ended up in.
-                self.cursor = grapheme::next_boundary(
-                    &self.input,
-                    grapheme::prev_boundary(&self.input, self.cursor + c.len_utf8()),
-                );
+                self.cursor = grapheme::insert_char(&mut self.input, self.cursor, c);
 
                 // Trigger or update completion
                 self.update_completion_state();
@@ -3580,7 +3567,10 @@ impl App {
                     self.last_click.is_some_and(|(at, last)| {
                         at.elapsed() <= DOUBLE_CLICK_WINDOW
                             && last.line == p.line
-                            && last.column.abs_diff(p.column) <= 1
+                            && self
+                                .chat_layout
+                                .plain_line(p.line)
+                                .is_some_and(|line| same_click_spot(line, last.column, p.column))
                     })
                 });
                 if double_click {
@@ -3697,22 +3687,21 @@ impl App {
 
         for line_idx in start.line..=end_line {
             let line = self.chat_layout.plain_line(line_idx).unwrap_or_default();
-            let char_count = line.chars().count();
+            // Selection columns are byte offsets on char boundaries of the
+            // line; a stale one is rounded down to a boundary.
             let from = if line_idx == start.line {
-                start.column.min(char_count)
+                line.floor_char_boundary(start.column)
             } else {
                 0
             };
             let to = if line_idx == end_line {
-                end.column.min(char_count)
+                line.floor_char_boundary(end.column)
             } else {
-                char_count
+                line.len()
             };
 
-            if from < to {
-                let from_b = char_to_byte_index(line, from);
-                let to_b = char_to_byte_index(line, to);
-                out.push_str(&line[from_b..to_b]);
+            if let Some(selected) = line.get(from..to) {
+                out.push_str(selected);
             }
 
             if line_idx != end_line {
@@ -4016,12 +4005,12 @@ impl App {
             // terminal paste; only large or multiline text needs an
             // attachment (and its file).
             if !matches!(self.mode, AppMode::Chat)
-                || (!text.contains('\n') && text.len() <= LARGE_PASTE_THRESHOLD)
+                || (!text.contains('\n') && !pasted_text::is_large(&text))
             {
                 self.handle_bracketed_paste(text);
                 return Ok(());
             }
-            let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
+            let saved_path = if pasted_text::is_large(&text) {
                 let manager = self
                     .text_manager
                     .as_mut()
@@ -5229,10 +5218,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 #[cfg(test)]
 mod tests {
-    use super::utf8_complete_len;
     use super::{
         App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction, TimedEvent,
     };
+    use super::{AppMode, ConfigEditMode, same_click_spot, utf8_complete_len};
     use crate::session::SessionManager;
     use crate::tui::ui::chat::ChatElement;
 
@@ -6955,5 +6944,199 @@ mod tests {
                 assert_eq!(app.cursor, expected, "{name}: click at column {column}");
             }
         }
+    }
+
+    /// Chinese, Japanese and Korean text and a thumbs-up with a skin tone
+    /// (two scalar values, one cluster).
+    const EDITED_TEXTS: [&str; 4] = ["你好世界", "こんにちは", "안녕하세요", "👍🏽"];
+
+    /// The Models section with its first tier's text field open and empty.
+    async fn config_text_edit(dir: &std::path::Path) -> App {
+        let (mut app, _id) = app_with_session(dir).await;
+        app.mode = AppMode::Config;
+        app.config_state.section = crate::tui::state::ConfigSection::Models;
+        app.config_state.selected = 0;
+        app.config_state.start_text_edit("");
+        app
+    }
+
+    fn edited(app: &App) -> (String, usize) {
+        let (input, cursor) = app.config_state.edit_text().expect("text edit");
+        (input.to_string(), cursor)
+    }
+
+    #[tokio::test]
+    async fn config_text_edit_types_moves_and_deletes_by_grapheme() {
+        use unicode_segmentation::UnicodeSegmentation as _;
+
+        for text in EDITED_TEXTS {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut app = config_text_edit(dir.path()).await;
+            for c in text.chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert_eq!(
+                edited(&app),
+                (text.to_string(), text.len()),
+                "{text}: typed"
+            );
+
+            let clusters: Vec<&str> = text.graphemes(true).collect();
+            let (first, last) = (clusters[0], clusters[clusters.len() - 1]);
+
+            press(&mut app, KeyCode::Left);
+            assert_eq!(edited(&app).1, text.len() - last.len(), "{text}: Left");
+            press(&mut app, KeyCode::Right);
+            assert_eq!(edited(&app).1, text.len(), "{text}: Right");
+            press(&mut app, KeyCode::Home);
+            assert_eq!(edited(&app).1, 0, "{text}: Home");
+            press(&mut app, KeyCode::Right);
+            assert_eq!(edited(&app).1, first.len(), "{text}: Right from Home");
+            press(&mut app, KeyCode::End);
+            assert_eq!(edited(&app).1, text.len(), "{text}: End");
+
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(
+                edited(&app),
+                (
+                    text[..text.len() - last.len()].to_string(),
+                    text.len() - last.len()
+                ),
+                "{text}: Backspace"
+            );
+            press(&mut app, KeyCode::Home);
+            press(&mut app, KeyCode::Delete);
+            let middle: String = clusters
+                .iter()
+                .skip(1)
+                .take(clusters.len().saturating_sub(2))
+                .copied()
+                .collect();
+            assert_eq!(edited(&app), (middle, 0), "{text}: Delete");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_text_edit_inserts_in_the_middle_of_cjk_text() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = config_text_edit(dir.path()).await;
+        for c in "你好世界".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('こ'));
+        press(&mut app, KeyCode::Char('한'));
+        assert_eq!(edited(&app), ("你好こ한世界".to_string(), 12));
+        assert!(app.handle_bracketed_paste("안녕".to_string()).is_none());
+        assert_eq!(edited(&app), ("你好こ한안녕世界".to_string(), 18));
+    }
+
+    #[tokio::test]
+    async fn config_text_edit_draws_the_text_and_puts_the_caret_after_it() {
+        for text in EDITED_TEXTS {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut app = config_text_edit(dir.path()).await;
+            for c in text.chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+                .expect("terminal");
+            let rows = draw_rows(&mut terminal, &mut app);
+            assert!(
+                rows.iter().any(|row| row.replace(' ', "").contains(text)),
+                "{text}: {rows:#?}"
+            );
+            let end = terminal.get_cursor_position().expect("cursor");
+
+            press(&mut app, KeyCode::Home);
+            draw_rows(&mut terminal, &mut app);
+            let home = terminal.get_cursor_position().expect("cursor");
+            assert_eq!(
+                usize::from(end.x - home.x),
+                unicode_width::UnicodeWidthStr::width(text),
+                "{text}: caret columns"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_provider_form_edits_each_field_by_grapheme() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.mode = AppMode::Config;
+        app.config_state.edit_mode = ConfigEditMode::CustomProvider {
+            focused_field: 0,
+            name: String::new(),
+            base_url: "https://例え.jp/안녕".to_string(),
+            api_key: "👍🏽あ".to_string(),
+            cursor: 0,
+            editing_existing: false,
+            original_name: None,
+        };
+        let state = |app: &App| match &app.config_state.edit_mode {
+            ConfigEditMode::CustomProvider {
+                name,
+                base_url,
+                api_key,
+                cursor,
+                focused_field,
+                ..
+            } => (
+                *focused_field,
+                name.clone(),
+                base_url.clone(),
+                api_key.clone(),
+                *cursor,
+            ),
+            other => panic!("unexpected mode {other:?}"),
+        };
+        for c in "你好".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(state(&app).1, "好");
+        assert_eq!(state(&app).4, 0);
+
+        // Moving to the API key puts the caret at its end, a byte offset.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        let (field, _, _, key, cursor) = state(&app);
+        assert_eq!((field, cursor), (2, key.len()));
+        press(&mut app, KeyCode::Left);
+        assert_eq!(state(&app).4, "👍🏽".len());
+        press(&mut app, KeyCode::Left);
+        assert_eq!(state(&app).4, 0);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(state(&app).3, "あ");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!((state(&app).3, state(&app).4), (String::new(), 0));
+
+        // The API key field is drawn masked: one star per grapheme.
+        for c in "👍🏽한".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).expect("terminal");
+        let rows = draw_rows(&mut terminal, &mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("**")),
+            "{:?} {rows:#?}",
+            state(&app)
+        );
+        assert!(rows.iter().all(|row| !row.contains('한')), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_double_click_spot_is_one_character_wide() {
+        let line = "你好 こんにちは";
+        assert!(same_click_spot(line, 3, 3));
+        assert!(same_click_spot(line, 0, 3));
+        assert!(same_click_spot(line, 3, 0));
+        assert!(!same_click_spot(line, 0, 6));
+        // Off a char boundary there is no spot.
+        assert!(!same_click_spot(line, 1, 3));
     }
 }

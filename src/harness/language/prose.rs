@@ -207,7 +207,7 @@ fn is_identifier(chunk: &str) -> bool {
         }
         previous = Some(c);
     }
-    core.chars().count() >= 2 && core.chars().all(char::is_uppercase)
+    core.char_indices().nth(1).is_some() && core.chars().all(char::is_uppercase)
 }
 
 /// A run of letters of one script family and the text between them.

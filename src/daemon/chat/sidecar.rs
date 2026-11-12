@@ -290,7 +290,7 @@ pub trait AuxOutput: JsonSchema + DeserializeOwned + 'static {
 /// Nothing is truncated: such an output is a failed generation.
 fn check<T: AuxOutput>(output: &T) -> Result<(), AuxError> {
     for (text, limit) in output.texts() {
-        if text.chars().count() > limit {
+        if text.char_indices().nth(limit).is_some() {
             return Err(AuxError::Output(format!(
                 "a field exceeds {limit} characters"
             )));

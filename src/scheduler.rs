@@ -1733,7 +1733,10 @@ fn combine_output(stdout: &str, stderr: Option<String>) -> String {
 
 fn truncate_output(output: &str) -> String {
     if output.len() > 10240 {
-        format!("{}...(truncated)", &output[..10240])
+        format!(
+            "{}...(truncated)",
+            &output[..output.floor_char_boundary(10240)]
+        )
     } else {
         output.to_string()
     }
@@ -2803,5 +2806,19 @@ mod tests {
             host.task_row("cron").await.next_fire_at.as_deref(),
             Some("2020-01-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn truncated_output_is_cut_on_a_char_boundary() {
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "👍🏽"] {
+            let output = unit.repeat(4000);
+            let truncated = super::truncate_output(&output);
+            let body = truncated.strip_suffix("...(truncated)").expect("cut");
+            assert!(output.starts_with(body), "{unit}");
+            assert!(
+                body.len() <= 10240 && 10240 - body.len() < unit.len(),
+                "{unit}"
+            );
+        }
     }
 }
