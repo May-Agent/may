@@ -55,6 +55,61 @@ fn off_boundary(text: &str, at: usize) -> usize {
     text.floor_char_boundary(at)
 }
 
+/// Inserts `c` at the grapheme boundary `at` and returns the cursor after it.
+///
+/// A combining mark, ZWJ or second regional indicator joins the cluster
+/// before it, so the cursor sits after the cluster the new char ended up in.
+pub fn insert_char(text: &mut String, at: usize, c: char) -> usize {
+    text.insert(at, c);
+    next_boundary(text, prev_boundary(text, at + c.len_utf8()))
+}
+
+/// Inserts `s` at the grapheme boundary `at` and returns the cursor at the
+/// boundary at or after its end: the text may join the cluster before or
+/// after it.
+pub fn insert_str(text: &mut String, at: usize, s: &str) -> usize {
+    text.insert_str(at, s);
+    next_boundary(text, prev_boundary(text, at + s.len()))
+}
+
+/// Deletes the grapheme before the boundary `at` and returns the cursor.
+pub fn remove_before(text: &mut String, at: usize) -> usize {
+    let start = prev_boundary(text, at);
+    text.replace_range(start..at, "");
+    start
+}
+
+/// Deletes the grapheme after the boundary `at`.
+pub fn remove_after(text: &mut String, at: usize) {
+    let end = next_boundary(text, at);
+    text.replace_range(at..end, "");
+}
+
+/// The longest prefix of `text`, cut between grapheme clusters, that the
+/// renderer draws in at most `max_cells` cells.
+#[must_use]
+pub fn prefix_within_width(text: &str, max_cells: usize) -> &str {
+    let mut used = 0;
+    for (at, cluster) in text.grapheme_indices(true) {
+        used += drawn_width(cluster);
+        if used > max_cells {
+            return &text[..at];
+        }
+    }
+    text
+}
+
+/// Terminal cells the renderer draws for `text` before the boundary `at`.
+#[must_use]
+pub fn width_before(text: &str, at: usize) -> usize {
+    let end = if text.is_char_boundary(at) {
+        at
+    } else {
+        off_boundary(text, at)
+    };
+    drawn_width(&text[..end])
+}
+
 /// Terminal cells the renderer draws for one grapheme cluster.
 #[must_use]
 pub fn drawn_width(cluster: &str) -> usize {
@@ -110,5 +165,79 @@ mod tests {
         assert_eq!(drawn_width(ACCENT), 1);
         assert_eq!(drawn_width("中"), 2);
         assert_eq!(drawn_width("a"), 1);
+    }
+
+    /// Chinese, Japanese and Korean text and a thumbs-up with a skin tone
+    /// (two scalar values, one cluster).
+    const TEXTS: [&str; 4] = ["你好世界", "こんにちは", "안녕하세요", "👍🏽"];
+
+    #[test]
+    fn typing_builds_the_text_with_the_cursor_at_its_end() {
+        for text in TEXTS {
+            let mut typed = String::new();
+            let mut cursor = 0;
+            for c in text.chars() {
+                cursor = insert_char(&mut typed, cursor, c);
+            }
+            assert_eq!((typed.as_str(), cursor), (text, text.len()), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_modifier_typed_after_its_base_joins_the_cluster() {
+        let mut typed = String::new();
+        let cursor = insert_char(&mut typed, 0, '\u{1F44D}');
+        assert_eq!(cursor, 4);
+        let cursor = insert_char(&mut typed, cursor, '\u{1F3FD}');
+        assert_eq!((typed.as_str(), cursor), ("👍🏽", 8));
+        assert_eq!(remove_before(&mut typed, cursor), 0);
+        assert_eq!(typed, "");
+    }
+
+    #[test]
+    fn removal_takes_one_cluster_on_either_side_of_the_cursor() {
+        for text in TEXTS {
+            let first = next_boundary(text, 0);
+            let mut deleted = text.to_string();
+            remove_after(&mut deleted, 0);
+            assert_eq!(deleted, text[first..], "{text}");
+
+            let last = prev_boundary(text, text.len());
+            let mut backspaced = text.to_string();
+            let cursor = remove_before(&mut backspaced, text.len());
+            assert_eq!(
+                (backspaced.as_str(), cursor),
+                (&text[..last], last),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_str_leaves_the_cursor_on_a_boundary() {
+        let mut text = "👍".to_string();
+        let cursor = insert_str(&mut text, 4, "\u{1F3FD}あ");
+        assert_eq!((text.as_str(), cursor), ("👍🏽あ", text.len()));
+    }
+
+    #[test]
+    fn width_before_is_the_cells_drawn_before_the_cursor() {
+        for text in TEXTS {
+            assert_eq!(width_before(text, 0), 0, "{text}");
+            assert_eq!(width_before(text, text.len()), drawn_width(text), "{text}");
+        }
+        assert_eq!(width_before("你好世界", 6), 4);
+        assert_eq!(width_before("a👍🏽b", 1 + 8), 3);
+    }
+
+    #[test]
+    fn prefix_within_width_cuts_between_clusters() {
+        assert_eq!(prefix_within_width("你好世界", 5), "你好");
+        assert_eq!(prefix_within_width("こんにちは", 4), "こん");
+        assert_eq!(prefix_within_width("안녕하세요", 1), "");
+        assert_eq!(prefix_within_width("a👍🏽b", 2), "a");
+        assert_eq!(prefix_within_width("a👍🏽b", 3), "a👍🏽");
+        assert_eq!(prefix_within_width("日本語abc", 100), "日本語abc");
+        assert_eq!(prefix_within_width("", 3), "");
     }
 }

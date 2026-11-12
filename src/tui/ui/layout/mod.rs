@@ -19,7 +19,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Clear, LineGauge, List, ListItem, Paragraph},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use super::band::panel;
 use super::wrap::WrappedParagraph;
@@ -34,11 +34,6 @@ use super::super::state::{
     RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
-
-/// Convert character index to byte index for safe string slicing.
-pub(super) fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
-}
 
 /// Render the main layout.
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -685,16 +680,16 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         let line = app.chat_layout.plain_line(line_idx).unwrap_or_default();
-        let char_count = line.chars().count();
+        // Selection columns are byte offsets on char boundaries of the line.
         let from = if line_idx == start_line {
-            start.column.min(char_count)
+            line.floor_char_boundary(start.column)
         } else {
             0
         };
         let to = if line_idx == end_line {
-            end.column.min(char_count)
+            line.floor_char_boundary(end.column)
         } else {
-            char_count
+            line.len()
         };
         if to <= from {
             continue;
@@ -718,11 +713,9 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-pub(super) fn display_width_prefix(text: &str, char_count: usize) -> usize {
-    text.chars()
-        .take(char_count)
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-        .sum()
+/// Cells the renderer draws for the text before the byte offset `at`.
+pub(super) fn display_width_prefix(text: &str, at: usize) -> usize {
+    crate::tui::grapheme::width_before(text, at)
 }
 
 /// The help sheet, rendered from the slash command table.
@@ -1082,8 +1075,9 @@ fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState, bg: O
 fn prompt_preview(content: &str) -> String {
     const MAX_CHARS: usize = 72;
     let first = content.lines().next().unwrap_or_default().trim();
-    if first.chars().count() > MAX_CHARS {
-        let mut preview: String = first.chars().take(MAX_CHARS - 1).collect();
+    if UnicodeWidthStr::width(first) > MAX_CHARS {
+        let mut preview =
+            crate::tui::grapheme::prefix_within_width(first, MAX_CHARS - 1).to_string();
         preview.push('…');
         preview
     } else {
@@ -3688,5 +3682,17 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn prompt_preview_cuts_mixed_cjk_text_to_one_row() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "x👍🏽"] {
+            let preview = super::prompt_preview(&unit.repeat(40));
+            assert!(preview.ends_with('…'), "{unit}");
+            assert!(preview.width() <= 72, "{unit}: {preview}");
+        }
+        assert_eq!(super::prompt_preview("  你好\n世界"), "你好");
     }
 }

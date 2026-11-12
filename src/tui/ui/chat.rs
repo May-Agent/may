@@ -19,7 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::agent_event_adapter::COMPACT_TOOL;
-use super::super::grapheme::drawn_width;
+use super::super::grapheme::{self, drawn_width};
 use super::super::queue::Attachment;
 use super::band;
 use super::chat_layout::{self, ChatLayout};
@@ -1862,10 +1862,10 @@ fn attachment_label(attachment: &Attachment) -> String {
             content,
             saved_path,
         } => {
-            let char_count = content.chars().count();
+            let size = content.len();
             saved_path.as_ref().map_or_else(
-                || format!("[pasted text: {char_count} chars]"),
-                |path| format!("[pasted text: {char_count} chars -> {}]", path.display()),
+                || format!("[pasted text: {size} bytes]"),
+                |path| format!("[pasted text: {size} bytes -> {}]", path.display()),
             )
         }
     }
@@ -2287,20 +2287,11 @@ fn collapsed_status_suffix(display: &ToolDisplay, open: bool) -> String {
     }
 }
 
-/// Clamp a visual column in `line` to `target_col`, counting wide characters.
+/// Byte offset in `line` of the last grapheme boundary whose preceding text
+/// is at most `target_col` cells wide, counting wide characters.
 #[must_use]
 pub fn clamp_column_by_width(line: &str, target_col: usize) -> usize {
-    let mut col = 0usize;
-    let mut out = 0usize;
-    for ch in line.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if col + w > target_col {
-            break;
-        }
-        col += w;
-        out += 1;
-    }
-    out
+    grapheme::prefix_within_width(line, target_col).len()
 }
 
 /// Safely clamp scroll value for u16 and content bounds.
@@ -3412,9 +3403,9 @@ fn input_prefix_spans(input: &str, attachments: &[Attachment]) -> Vec<Span<'stat
     // Pasted text attachments
     for att in attachments {
         if let Attachment::PastedText { content, .. } = att {
-            let char_count = content.chars().count();
+            let size = content.len();
             spans.push(Span::styled(
-                format!("[pasted: {char_count} chars] "),
+                format!("[pasted: {size} bytes] "),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -3583,17 +3574,12 @@ fn render_queue_lines(lines: &mut Vec<Line<'_>>, ctx: &QueueContext<'_>, width: 
     // Show up to 3 queued messages
     let max_width = width.saturating_sub(6) as usize;
     for msg in ctx.messages.iter().take(3) {
-        let preview: String = msg
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(max_width)
-            .collect();
-        let truncated = if msg.chars().count() > max_width || msg.lines().count() > 1 {
+        let first = msg.lines().next().unwrap_or("");
+        let preview = grapheme::prefix_within_width(first, max_width);
+        let truncated = if preview.len() < first.len() || msg.lines().nth(1).is_some() {
             format!("{preview}...")
         } else {
-            preview
+            preview.to_string()
         };
 
         lines.push(Line::from(vec![
@@ -4323,8 +4309,12 @@ fn card_summary(text: &str) -> String {
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default();
-    let mut summary: String = first.chars().take(CARD_SUMMARY_CHARS).collect();
-    if first.chars().nth(CARD_SUMMARY_CHARS).is_some() || text.lines().nth(1).is_some() {
+    let cut = first
+        .char_indices()
+        .nth(CARD_SUMMARY_CHARS)
+        .map(|(at, _)| at);
+    let mut summary = first[..cut.unwrap_or(first.len())].to_string();
+    if cut.is_some() || text.lines().nth(1).is_some() {
         summary.push('…');
     }
     summary
@@ -7915,5 +7905,43 @@ mod tests {
             ["  ✗ Compaction — failed: Nothing was started: the context is too small."]
         );
         assert_eq!(regions, 0);
+    }
+
+    #[test]
+    fn card_summary_cuts_mixed_cjk_text_on_a_character_boundary() {
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "a👍🏽"] {
+            let text = unit.repeat(super::CARD_SUMMARY_CHARS);
+            let summary = super::card_summary(&text);
+            let body = summary
+                .strip_suffix('…')
+                .expect("cut text ends in an ellipsis");
+            assert!(text.starts_with(body), "{unit}");
+            assert_eq!(body.chars().count(), super::CARD_SUMMARY_CHARS, "{unit}");
+        }
+        assert_eq!(super::card_summary("你好"), "你好");
+        assert_eq!(super::card_summary("你好\n世界"), "你好…");
+    }
+
+    #[test]
+    fn clamp_column_by_width_returns_a_byte_offset_on_a_boundary() {
+        // Each of these characters is two cells wide and three bytes long.
+        let line = "你好こん안녕";
+        for (cells, expected) in [
+            (0, 0),
+            (1, 0),
+            (2, 3),
+            (3, 3),
+            (4, 6),
+            (11, 15),
+            (12, 18),
+            (99, 18),
+        ] {
+            assert_eq!(
+                super::clamp_column_by_width(line, cells),
+                expected,
+                "{cells}"
+            );
+        }
+        assert_eq!(super::clamp_column_by_width("a👍🏽b", 3), 1 + 8);
     }
 }

@@ -256,7 +256,9 @@ fn section_span(content: &str, section: &str) -> Option<(usize, usize)> {
     let open = format!("<{section}>");
     let close = format!("</{section}>");
     let start = content.find(&open)?;
-    let end = content.find(&close).map(|index| index + close.len())?;
+    let end = content[start..]
+        .find(&close)
+        .map(|index| start + index + close.len())?;
     Some((start, end))
 }
 
@@ -546,5 +548,14 @@ mod tests {
         assert_eq!(report.compact_tokens, 100_000);
         assert_eq!(report.compact_start_tokens, 80_000);
         assert_eq!(report.phase, ContextWindowPhase::Compacting);
+    }
+
+    #[test]
+    fn a_closing_tag_before_the_opening_one_is_no_section() {
+        assert_eq!(section_span("</skills> 你好 <skills>", "skills"), None);
+        assert_eq!(
+            section_span("你好<skills>あ</skills>한", "skills"),
+            Some((6, 6 + "<skills>あ</skills>".len()))
+        );
     }
 }

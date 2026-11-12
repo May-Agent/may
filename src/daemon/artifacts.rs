@@ -1273,14 +1273,23 @@ fn normalized_artifact_diagnostics(diagnostics: Vec<String>) -> Result<Vec<Strin
                 return Err(bad_request_error("artifact diagnostic cannot be empty"));
             }
 
-            if diagnostic.chars().count() <= MAX_ARTIFACT_DIAGNOSTIC_CHARS {
+            if diagnostic
+                .char_indices()
+                .nth(MAX_ARTIFACT_DIAGNOSTIC_CHARS)
+                .is_none()
+            {
                 return Ok(diagnostic.to_string());
             }
 
+            // The suffix is ASCII, so its byte length is its character count.
             let retained_chars = MAX_ARTIFACT_DIAGNOSTIC_CHARS
-                .checked_sub(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX.chars().count())
+                .checked_sub(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX.len())
                 .expect("artifact diagnostic truncation suffix must fit the diagnostic limit");
-            let mut truncated = diagnostic.chars().take(retained_chars).collect::<String>();
+            let keep = diagnostic
+                .char_indices()
+                .nth(retained_chars)
+                .map_or(diagnostic.len(), |(at, _)| at);
+            let mut truncated = diagnostic[..keep].to_string();
             truncated.push_str(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX);
             Ok(truncated)
         })
@@ -2064,5 +2073,19 @@ mod tests {
             .expect("cached diagnostics should complete lock acquisition")
             .is_none()
         );
+    }
+
+    #[test]
+    fn bounds_cjk_diagnostics_on_a_character_boundary() {
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "a👍🏽"] {
+            let diagnostics = vec![unit.repeat(MAX_ARTIFACT_DIAGNOSTIC_CHARS)];
+            let normalized = normalized_artifact_diagnostics(diagnostics).expect("bounded");
+            assert_eq!(
+                normalized[0].chars().count(),
+                MAX_ARTIFACT_DIAGNOSTIC_CHARS,
+                "{unit}"
+            );
+            assert!(normalized[0].ends_with(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX));
+        }
     }
 }

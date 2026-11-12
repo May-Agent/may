@@ -394,57 +394,65 @@ pub(super) fn render_search_preview(
     search: &str,
 ) {
     let query = search.to_lowercase();
-    let query_char_count = query.chars().count();
-    let content_lower = summary.content_preview.to_lowercase();
-    let Some(pos) = content_lower.find(&query) else {
+    let preview = summary.content_preview.as_str();
+    let Some(found) = find_case_insensitive(preview, &query) else {
         return;
     };
 
-    let start = summary.content_preview[..pos]
+    let start = preview[..found.start]
         .char_indices()
         .rev()
         .nth(20)
         .map_or(0, |(i, _)| i);
-    let end = summary.content_preview[pos..]
+    let end = preview[found.end..]
         .char_indices()
-        .nth(query_char_count + 40)
-        .map_or(summary.content_preview.len(), |(i, _)| pos + i);
-
-    let snippet = summary.content_preview[start..end].replace('\n', " ");
-    let snippet_lower = snippet.to_lowercase();
+        .nth(40)
+        .map_or(preview.len(), |(i, _)| found.end + i);
 
     let prefix = if start > 0 { "..." } else { "" };
-    let suffix = if end < summary.content_preview.len() {
-        "..."
-    } else {
-        ""
-    };
+    let suffix = if end < preview.len() { "..." } else { "" };
 
-    if let Some(match_pos) = snippet_lower.find(&query) {
-        let match_end = match_pos + query.len();
-        let before_match = snippet[..match_pos].to_string();
-        let matched = snippet[match_pos..match_end.min(snippet.len())].to_string();
-        let after_match = snippet[match_end.min(snippet.len())..].to_string();
+    let one_line = |part: &str| part.replace('\n', " ");
+    let before_match = one_line(&preview[start..found.start]);
+    let matched = one_line(&preview[found.clone()]);
+    let after_match = one_line(&preview[found.end..end]);
 
-        lines.push(Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(before_match, Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                matched,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::styled(after_match, Style::default().fg(Color::DarkGray)),
-            Span::styled(suffix.to_string(), Style::default().fg(Color::DarkGray)),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("    {prefix}{snippet}{suffix}"),
-            Style::default().fg(Color::DarkGray),
-        )));
+    lines.push(Line::from(vec![
+        Span::styled("    ", Style::default()),
+        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(before_match, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            matched,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(after_match, Style::default().fg(Color::DarkGray)),
+        Span::styled(suffix.to_string(), Style::default().fg(Color::DarkGray)),
+    ]));
+}
+
+/// Byte range in `haystack` of its first stretch whose lowercase form is
+/// `query_lower`. Lowercasing can change a text's byte length, so the match
+/// is searched on `haystack` itself and its range is a pair of char
+/// boundaries of it.
+fn find_case_insensitive(haystack: &str, query_lower: &str) -> Option<std::ops::Range<usize>> {
+    if query_lower.is_empty() {
+        return Some(0..0);
     }
+    for (from, _) in haystack.char_indices() {
+        let mut lowered = String::new();
+        for (offset, c) in haystack[from..].char_indices() {
+            lowered.extend(c.to_lowercase());
+            if lowered == query_lower {
+                return Some(from..from + offset + c.len_utf8());
+            }
+            if !query_lower.starts_with(&lowered) {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// Render profile selection popup.
@@ -902,4 +910,28 @@ pub(super) fn render_connect_picker(
         ))),
         chunks[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_case_insensitive;
+
+    #[test]
+    fn the_match_range_is_on_char_boundaries_of_the_original_text() {
+        // Lowercasing `İ` changes its byte length, so a position found in the
+        // lowercased text would not index the original.
+        let text = "İİİ 你好世界 Hello こんにちは";
+        for (query, expected) in [
+            ("hello", "Hello"),
+            ("世界", "世界"),
+            ("こん", "こん"),
+            ("你", "你"),
+        ] {
+            let range = find_case_insensitive(text, query).expect(query);
+            assert_eq!(&text[range], expected, "{query}");
+        }
+        assert_eq!(find_case_insensitive(text, "안녕"), None);
+        assert_eq!(find_case_insensitive("안녕하세요", "하세"), Some(6..12));
+        assert_eq!(find_case_insensitive("abc", ""), Some(0..0));
+    }
 }

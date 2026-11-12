@@ -550,13 +550,13 @@ fn user_prompt_text(record: &Value) -> Option<String> {
     }
 }
 
-fn first_line_preview(text: &str) -> String {
+/// The first line of `text`, cut to 60 characters with `…` when it was cut.
+pub(super) fn first_line_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 60;
     let line = text.lines().next().unwrap_or(text).trim();
-    let truncated: String = line.chars().take(60).collect();
-    if line.chars().count() > 60 {
-        format!("{truncated}…")
-    } else {
-        truncated
+    match line.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
     }
 }
 
@@ -695,5 +695,18 @@ mod tests {
         let listed = list(root.path());
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "/compact");
+    }
+
+    #[test]
+    fn first_line_preview_cuts_mixed_cjk_text_on_a_boundary() {
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "a👍🏽"] {
+            let text = unit.repeat(60);
+            let preview = first_line_preview(&text);
+            let body = preview.strip_suffix('…').expect("cut");
+            assert_eq!(body.chars().count(), 60, "{unit}");
+            assert!(text.starts_with(body), "{unit}");
+        }
+        assert_eq!(first_line_preview("  你好\n世界"), "你好");
+        assert_eq!(first_line_preview(&"한".repeat(60)), "한".repeat(60));
     }
 }

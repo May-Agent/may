@@ -386,14 +386,7 @@ pub(super) fn derive_title(source: ForeignAgent, messages: &[ChatMessage]) -> St
         .iter()
         .find(|m| m.role == MessageRole::User && is_title_user_text(&m.content))
         .map_or("imported session", |m| m.content.as_str());
-    let line = first.lines().next().unwrap_or(first).trim();
-    let truncated: String = line.chars().take(60).collect();
-    let truncated = if line.chars().count() > 60 {
-        format!("{truncated}…")
-    } else {
-        truncated
-    };
-    format!("[{}] {truncated}", source.label())
+    format!("[{}] {}", source.label(), claude::first_line_preview(first))
 }
 
 /// User text that can title an imported session: skip compaction
