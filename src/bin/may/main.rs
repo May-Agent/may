@@ -122,6 +122,15 @@ fn tokio_runtime() -> io::Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
+    // Under the name `tasks` (the daemon's `~/.may/bin/tasks` link) this
+    // executable is the `tasks` command.
+    if may_agent::daemon::lifecycle::invoked_as_tasks(std::env::args_os().next().as_deref()) {
+        return Ok(may_tasks::run(
+            std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        ));
+    }
     // The permission helper instances the computer agent launches run this
     // same executable; they do their work and exit before anything else.
     #[cfg(target_os = "macos")]
