@@ -522,11 +522,6 @@ pub struct ProviderInstance {
     /// Default cache lifetime of the main conversation on this provider.
     #[serde(default, skip_serializing_if = "CacheLifetime::is_default")]
     pub cache_lifetime: CacheLifetime,
-    /// On a cloud home, the access token the fronting daemon pushed for this
-    /// OAuth provider. It lives only in memory: neither the configuration
-    /// file nor any API answer carries it.
-    #[serde(skip)]
-    pub pushed_access: Option<crate::cloud::access::AccessCell>,
 }
 
 const fn default_true() -> bool {
@@ -544,7 +539,6 @@ impl Default for ProviderInstance {
             display_name: None,
             enabled: true,
             cache_lifetime: CacheLifetime::default(),
-            pushed_access: None,
         }
     }
 }

@@ -317,6 +317,7 @@ impl SessionParts {
             sandbox_dir: self.dir.join("sandbox"),
             may_dir: self.dir.join(".may"),
             cwd,
+            pushed_providers: crate::cloud::access::PushedProviders::default(),
             session_id: self.session_id.clone(),
             workspace_request_broker: self.workspace_broker.clone(),
             agent_messaging: self.agent_messaging.clone(),

@@ -188,8 +188,8 @@ pub(super) async fn connect(
             .connect_acp_agent(request.name, agent)
             .expect("the name was checked above");
     });
-    updated
-        .save_to(&state.may_dir.join("config.toml"))
+    state
+        .save_config(&updated)
         .await
         .map_err(ConnectError::Save)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
@@ -231,10 +231,7 @@ pub(super) async fn disconnect_acp_agent(
     let updated = state.update_config(|config| {
         let _ = config.disconnect_acp_agent(name);
     });
-    updated
-        .save_to(&state.may_dir.join("config.toml"))
-        .await
-        .map_err(internal_error)?;
+    state.save_config(&updated).await.map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }

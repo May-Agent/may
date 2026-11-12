@@ -102,7 +102,7 @@ pub use permission::{
 };
 pub(crate) use provider::reasoning_text_requested;
 pub use provider::{
-    ModelSlot, ProviderLlm, RedactedError, RedactedModel, ResolvedProviderRuntime,
+    ModelSlot, ProviderLlm, Providers, RedactedError, RedactedModel, ResolvedProviderRuntime,
     build_fast_provider_chain, provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{

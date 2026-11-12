@@ -9,13 +9,14 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 use super::auth::Fronted;
 use super::error::bad_request_error;
 use super::state::DaemonState;
-use crate::cloud::access::{AccessCell, ProviderPush};
+use crate::cloud::access::ProviderPush;
 
 /// `PUT /api/cloud-home/providers/{id}`: the provider `id` as the fronting
 /// daemon pushed it. Only the fronting daemon's token is admitted: a request
-/// any other identity makes is refused. The configuration replaces the
-/// provider's in memory; an access token replaces the one in the cell the
-/// provider's models already read, so an idle agent keeps going on it.
+/// any other identity makes is refused. The provider goes to the daemon's
+/// pushed providers, never its configuration; an access token replaces the
+/// one in the cell the provider's models already read, so an idle agent
+/// keeps going on it.
 pub(super) async fn push_provider(
     params: Params,
     fronted: Fronted,
@@ -28,13 +29,9 @@ pub(super) async fn push_provider(
                 .set_status(StatusCode::FORBIDDEN),
         );
     }
-    let id = params.get("id").map_err(bad_request_error)?.to_owned();
-    let ProviderPush {
-        mut instance,
-        access,
-    } = push;
-    let provider_type = instance.resolve_type(&id);
-    if let Some(token) = &access
+    let id = params.get("id").map_err(bad_request_error)?;
+    let provider_type = push.instance.resolve_type(id);
+    if let Some(token) = &push.access
         && token.provider_type() != provider_type
     {
         return Err(bad_request_error(format!(
@@ -42,20 +39,6 @@ pub(super) async fn push_provider(
             token.provider_type()
         )));
     }
-    state.update_config(|config| {
-        let held = config
-            .provider
-            .get(&id)
-            .and_then(|current| current.pushed_access.clone());
-        instance.pushed_access = match (access, held) {
-            (Some(token), Some(cell)) => {
-                cell.replace(token);
-                Some(cell)
-            }
-            (Some(token), None) => Some(AccessCell::holding(token)),
-            (None, _) => None,
-        };
-        config.provider.insert(id, instance);
-    });
+    state.pushed_providers.push(id, push);
     Ok(StatusCode::NO_CONTENT)
 }

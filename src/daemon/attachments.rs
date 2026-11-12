@@ -638,7 +638,7 @@ async fn generate_pasted_text_filename(state: &DaemonState, text: &str) -> Strin
     let snippet: String = text.chars().take(600).collect();
 
     let generated = Box::pin(generate_session_title(
-        &config,
+        crate::agent::Providers::new(&config, &state.pushed_providers),
         &snippet,
         "",
         &crate::secrets::SecretRedactor::new(&state.may_dir),

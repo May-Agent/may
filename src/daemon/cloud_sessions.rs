@@ -18,7 +18,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -321,10 +321,17 @@ impl CloudBackend for GitHubCloud {
 }
 
 /// One request to a session's host.
-struct HostRequest {
-    /// Whether a suspended codespace is started for it: a message.
-    wake: bool,
-    reply: async_channel::Sender<Result<Endpoint, CloudSessionError>>,
+enum HostRequest {
+    /// A client's request needs the codespace daemon's endpoint.
+    Endpoint {
+        /// Whether a suspended codespace is started for it: a message.
+        wake: bool,
+        reply: async_channel::Sender<Result<Endpoint, CloudSessionError>>,
+    },
+    /// The codespace's session started or stopped running a turn.
+    Running(bool),
+    /// The access token pushed last is due to be replaced.
+    RefreshDue,
 }
 
 /// A cloud session's host: the actor owning the session's forward.
@@ -349,7 +356,7 @@ impl CloudHost {
     async fn endpoint(&self, wake: bool) -> Result<Endpoint, CloudSessionError> {
         let (reply, answer) = async_channel::bounded(1);
         self.requests
-            .send(HostRequest { wake, reply })
+            .send(HostRequest::Endpoint { wake, reply })
             .await
             .map_err(|_| CloudSessionError::Daemon("host has stopped".to_owned()))?;
         answer
@@ -435,19 +442,26 @@ impl<B: CloudBackend> CloudSessions<B> {
             row: row.clone(),
             requests,
         };
-        executor_core::spawn(run_host(
-            self.backend.clone(),
-            self.db.clone(),
-            self.config.clone(),
-            self.mirror.clone(),
-            row.clone(),
-            Publisher {
+        let actor = Host {
+            backend: self.backend.clone(),
+            db: self.db.clone(),
+            config: self.config.clone(),
+            mirror: self.mirror.clone(),
+            publisher: Publisher {
                 session_id: row.session_id.clone(),
                 events: self.events.clone(),
             },
-            inbox,
-        ))
-        .detach();
+            row: row.clone(),
+            // Weak: the host stops once nothing but itself could reach it.
+            own: host.requests.downgrade(),
+            forward: None,
+            follower: None,
+            suspended: false,
+            running: false,
+            refresh_at: None,
+            refresh_timer: None,
+        };
+        executor_core::spawn(actor.run(inbox)).detach();
         self.hosts.insert(row.session_id.clone(), host.clone());
         host
     }
@@ -597,65 +611,147 @@ impl Publisher {
     }
 }
 
-/// A session's host: answers each request with the endpoint, bringing the
-/// codespace up when the forward is gone. Once the codespace daemon serves
-/// the session, and before each message, it gets the session model's
-/// provider.
-async fn run_host<B: CloudBackend>(
+/// A session's host, the actor owning its forward. It answers each request
+/// with the endpoint, bringing the codespace up when the forward is gone.
+/// Once the codespace daemon serves the session, and before each message,
+/// it pushes the session model's provider; while the session runs a turn,
+/// it pushes a fresh access token before the one pushed last expires.
+struct Host<B: CloudBackend> {
     backend: Arc<B>,
     db: ChatDb,
     config: Arc<ArcSwap<MayConfig>>,
     mirror: Mirror,
-    row: Arc<CloudSessionRow>,
     publisher: Publisher,
-    inbox: async_channel::Receiver<HostRequest>,
-) {
-    let mut forward: Option<B::Forward> = None;
-    // Follows the codespace daemon's events while the forward stands; a new
-    // forward replaces it, dropping the old one.
-    let mut follower: Option<executor_core::AnyExecutorTask<()>> = None;
-    // Only a message starts a suspended codespace, so once it is seen
-    // suspended every other request is answered so without asking GitHub
-    // again, however often a client retries.
-    let mut suspended = false;
-    while let Ok(request) = inbox.recv().await {
-        if suspended && !request.wake {
-            let _ = request.reply.send(Err(CloudSessionError::Suspended)).await;
-            continue;
+    row: Arc<CloudSessionRow>,
+    /// This host's own requests, for its timer and its event follower.
+    own: async_channel::WeakSender<HostRequest>,
+    forward: Option<B::Forward>,
+    /// Follows the codespace daemon's events while the forward stands; a
+    /// new forward replaces it, dropping the old one.
+    follower: Option<executor_core::AnyExecutorTask<()>>,
+    /// Only a message starts a suspended codespace, so once it is seen
+    /// suspended every other request is answered so without asking GitHub
+    /// again, however often a client retries.
+    suspended: bool,
+    /// Whether the codespace's session runs a turn, as its events say.
+    running: bool,
+    /// When the access token pushed last is due to be replaced.
+    refresh_at: Option<SystemTime>,
+    /// Wakes the host at `refresh_at`; replaced by each push.
+    refresh_timer: Option<executor_core::AnyExecutorTask<()>>,
+}
+
+impl<B: CloudBackend> Host<B> {
+    async fn run(mut self, inbox: async_channel::Receiver<HostRequest>) {
+        while let Ok(request) = inbox.recv().await {
+            match request {
+                HostRequest::Endpoint { wake, reply } => {
+                    let answer = self.endpoint(wake).await;
+                    // The requester may have gone; the forward stays for
+                    // the next one.
+                    let _ = reply.send(answer).await;
+                }
+                HostRequest::Running(running) => {
+                    self.running = running;
+                    // A turn that starts after the token came due, without
+                    // a message (a background command's), gets a fresh one.
+                    if running && self.refresh_at.is_some_and(|at| SystemTime::now() >= at) {
+                        self.refresh().await;
+                    }
+                }
+                HostRequest::RefreshDue => {
+                    if self.running {
+                        self.refresh().await;
+                    }
+                }
+            }
         }
-        let mut answer = serve(&*backend, &db, &row, &publisher, &mut forward, request.wake).await;
-        suspended = matches!(answer, Err(CloudSessionError::Suspended));
-        if let Ok(served) = &answer
-            && served.fresh
-        {
-            let following = executor_core::spawn(
-                mirror
-                    .clone()
-                    .follow(served.endpoint.clone(), row.session_id.clone()),
-            );
-            // The previous forward's follower is cancelled as it drops.
-            drop(follower.replace(following));
+    }
+
+    async fn endpoint(&mut self, wake: bool) -> Result<Endpoint, CloudSessionError> {
+        if self.suspended && !wake {
+            return Err(CloudSessionError::Suspended);
         }
-        if let Ok(served) = &answer
-            && (request.wake || served.fresh)
-            && let Err(error) = push_provider(
-                &*backend,
-                &config.load_full(),
-                &row.session_id,
-                &served.endpoint,
-            )
-            .await
-        {
-            answer = Err(error);
-        }
-        let answer = answer.map(|served| served.endpoint);
+        let answer = serve(
+            &*self.backend,
+            &self.db,
+            &self.row,
+            &self.publisher,
+            &mut self.forward,
+            wake,
+        )
+        .await;
+        self.suspended = matches!(answer, Err(CloudSessionError::Suspended));
+        let answer = match answer {
+            Ok(served) => {
+                if served.fresh {
+                    let following = executor_core::spawn(self.mirror.clone().follow(
+                        served.endpoint.clone(),
+                        self.row.session_id.clone(),
+                        self.own.clone(),
+                    ));
+                    self.follower = Some(following);
+                }
+                if wake || served.fresh {
+                    self.push(&served.endpoint).await.map(|()| served.endpoint)
+                } else {
+                    Ok(served.endpoint)
+                }
+            }
+            Err(error) => Err(error),
+        };
         if let Err(error) = &answer
             && !matches!(error, CloudSessionError::Suspended)
         {
-            publisher.failed(error);
+            self.publisher.failed(error);
         }
-        // The requester may have gone; the forward stays for the next one.
-        let _ = request.reply.send(answer).await;
+        answer
+    }
+
+    /// Pushes the session model's provider and arms the timer for its
+    /// access token's replacement.
+    async fn push(&mut self, endpoint: &Endpoint) -> Result<(), CloudSessionError> {
+        let refresh_at = push_provider(
+            &*self.backend,
+            &self.config.load_full(),
+            &self.row.session_id,
+            endpoint,
+        )
+        .await?;
+        self.refresh_at = refresh_at;
+        self.refresh_timer = refresh_at.map(|at| {
+            let own = self.own.clone();
+            executor_core::spawn(async move {
+                // A time already past is due now.
+                let wait = at.duration_since(SystemTime::now()).unwrap_or_default();
+                async_io::Timer::after(wait).await;
+                if let Some(own) = own.upgrade() {
+                    let _ = own.send(HostRequest::RefreshDue).await;
+                }
+            })
+        });
+        Ok(())
+    }
+
+    /// Pushes a fresh access token over the standing forward; with none, a
+    /// suspended codespace is left as it is and gets one with its next
+    /// message.
+    async fn refresh(&mut self) {
+        let Some(open) = self.forward.as_mut() else {
+            return;
+        };
+        if open.exited().is_some() {
+            return;
+        }
+        let endpoint = Endpoint::new(open.local(), &self.row.token);
+        if let Err(error) = self.push(&endpoint).await {
+            tracing::warn!(
+                %error,
+                session_id = self.row.session_id,
+                "could not replace a cloud session's access token before it expires"
+            );
+            self.publisher.failed(&error);
+        }
     }
 }
 
@@ -729,13 +825,14 @@ async fn serve<B: CloudBackend>(
 /// Pushes the provider of `session_id`'s model, as the codespace daemon
 /// knows the model, from `config`: its configuration and, for an OAuth
 /// provider, an access token this machine refreshed. The refresh token is
-/// never part of it.
+/// never part of it. Answers when the pushed access token is due to be
+/// replaced; `None` for a token with no expiry or an API key provider.
 async fn push_provider<B: CloudBackend>(
     backend: &B,
     config: &MayConfig,
     session_id: &str,
     endpoint: &Endpoint,
-) -> Result<(), CloudSessionError> {
+) -> Result<Option<SystemTime>, CloudSessionError> {
     let path = crate::client::session_path(session_id, "");
     let (status, body) = endpoint.exchange(hyper::Method::GET, &path, None).await?;
     if !status.is_success() {
@@ -752,16 +849,14 @@ async fn push_provider<B: CloudBackend>(
             CloudSessionError::Provider(format!("model '{}': {error}", session.model))
         })?;
     let id = selector.provider_id();
-    let mut instance = config.get_provider(id).cloned().ok_or_else(|| {
+    let instance = config.get_provider(id).cloned().ok_or_else(|| {
         CloudSessionError::Provider(format!("'{id}' is not configured on this machine"))
     })?;
-    // This machine's own instances never hold a pushed token; a stale one
-    // would not be this machine's to forward.
-    instance.pushed_access = None;
     let access = backend
         .access(instance.resolve_type(id))
         .await
         .map_err(|error| CloudSessionError::Provider(error.to_string()))?;
+    let refresh_at = access.as_ref().and_then(AccessToken::refresh_at);
     let push = ProviderPush { instance, access };
     let (status, answer) = endpoint
         .exchange(
@@ -771,13 +866,25 @@ async fn push_provider<B: CloudBackend>(
         )
         .await?;
     if status.is_success() {
-        Ok(())
+        Ok(refresh_at)
     } else {
         Err(CloudSessionError::Daemon(format!(
             "refused the session's provider: {status} {}",
             String::from_utf8_lossy(&answer).trim()
         )))
     }
+}
+
+/// Whether a codespace daemon's session `runtime` has a turn in flight,
+/// waiting on the user included.
+fn runs(runtime: &serde_json::Value) -> bool {
+    runtime
+        .get("state")
+        .and_then(|state| {
+            serde_json::from_value::<crate::session::runtime::SessionRuntimeState>(state.clone())
+                .ok()
+        })
+        .is_some_and(|state| state != crate::session::runtime::SessionRuntimeState::Idle)
 }
 
 /// The model of a codespace daemon's session.
@@ -820,8 +927,14 @@ struct RemoteRuntime {
 impl Mirror {
     /// Follows `session_id`'s events on `endpoint` until the stream ends;
     /// its runtime is then no longer known.
-    async fn follow(self, endpoint: Endpoint, session_id: String) {
-        if let Err(error) = self.follow_events(&endpoint, &session_id).await {
+    /// Tells `host` each time the session starts or stops running a turn.
+    async fn follow(
+        self,
+        endpoint: Endpoint,
+        session_id: String,
+        host: async_channel::WeakSender<HostRequest>,
+    ) {
+        if let Err(error) = self.follow_events(&endpoint, &session_id, &host).await {
             tracing::debug!(%error, session_id, "stopped following a cloud session's events");
         }
         if self.runtimes.remove(&session_id).is_some() {
@@ -833,6 +946,7 @@ impl Mirror {
         &self,
         endpoint: &Endpoint,
         session_id: &str,
+        host: &async_channel::WeakSender<HostRequest>,
     ) -> Result<(), CloudSessionError> {
         let path = crate::client::session_path(session_id, "");
         let (status, body) = endpoint.exchange(hyper::Method::GET, &path, None).await?;
@@ -841,6 +955,7 @@ impl Mirror {
                 "answered {status} for the session"
             )));
         }
+        let mut running = false;
         let session: RemoteProfile = serde_json::from_slice(&body)
             .map_err(|error| CloudSessionError::Daemon(format!("answered no session: {error}")))?;
         let profile = session.profile_id.ok_or_else(|| {
@@ -872,7 +987,16 @@ impl Mirror {
             parser.push(&chunk);
             while let Some(event) = parser.next_event() {
                 match event.kind.as_str() {
-                    "session_runtimes" => self.runtime(session_id, &event.data),
+                    "session_runtimes" => {
+                        let now = self.runtime(session_id, &event.data);
+                        if now != running {
+                            running = now;
+                            let Some(host) = host.upgrade() else {
+                                return Ok(());
+                            };
+                            let _ = host.send(HostRequest::Running(running)).await;
+                        }
+                    }
                     "profile_sessions" => self.title(session_id, &event.data).await,
                     _ => {}
                 }
@@ -881,14 +1005,18 @@ impl Mirror {
         Ok(())
     }
 
-    /// Holds the runtime `data` reports for `session_id`; a session the
-    /// payload leaves out is idle, as this daemon's own row says.
-    fn runtime(&self, session_id: &str, data: &str) {
+    /// Holds the runtime `data` reports for `session_id`, and answers
+    /// whether the session runs a turn; a session the payload leaves out is
+    /// idle, as this daemon's own row says.
+    fn runtime(&self, session_id: &str, data: &str) -> bool {
         let runtimes: RemoteRuntimes = match serde_json::from_str(data) {
             Ok(runtimes) => runtimes,
             Err(error) => {
                 tracing::warn!(%error, session_id, "a codespace daemon sent unreadable runtimes");
-                return;
+                return self
+                    .runtimes
+                    .get(session_id)
+                    .is_some_and(|held| runs(&held));
             }
         };
         let runtime = runtimes
@@ -907,6 +1035,9 @@ impl Mirror {
         if changed {
             self.bus.publish(UiEventTopics::SESSION_RUNTIMES);
         }
+        self.runtimes
+            .get(session_id)
+            .is_some_and(|held| runs(&held))
     }
 
     /// Writes the title `data`, a `profile_sessions` payload, gives

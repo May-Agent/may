@@ -135,6 +135,7 @@ impl PushedModel {
             AccessToken::Copilot {
                 token,
                 api_endpoint,
+                ..
             } => Copilot::new(token.clone())
                 .with_base_url(api_endpoint.clone())
                 .with_model(&self.model)
@@ -163,7 +164,7 @@ impl PushedModel {
                 }
                 client.into()
             }
-            AccessToken::Grok { access_token } => {
+            AccessToken::Grok { access_token, .. } => {
                 let mut client = OpenAI::new(access_token).with_model(&self.model);
                 if let Some(url) = &self.base_url {
                     client = client.with_base_url(url);

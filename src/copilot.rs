@@ -126,9 +126,12 @@ fn is_session_valid(token: &SessionToken) -> bool {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
 
-    // Add 60 second buffer to avoid edge cases
-    token.expires_at > now + 60
+    token.expires_at > now.saturating_add(SESSION_EXPIRY_MARGIN.as_secs().cast_signed())
 }
+
+/// How long before its expiry a session token is replaced, to avoid edge
+/// cases at the boundary.
+pub const SESSION_EXPIRY_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Credentials for Copilot API calls.
 #[derive(Debug, Clone)]
@@ -137,6 +140,8 @@ pub struct CopilotCredentials {
     pub token: String,
     /// The API endpoint to use.
     pub api_endpoint: String,
+    /// When the session token expires, in seconds since the Unix epoch.
+    pub expires_at: i64,
     /// OAuth access token (for refreshing session tokens).
     pub oauth_token: String,
 }
@@ -172,6 +177,7 @@ pub async fn get_copilot_credentials() -> Result<Option<CopilotCredentials>, Cop
             return Ok(Some(CopilotCredentials {
                 token: session.token,
                 api_endpoint: session.api_endpoint,
+                expires_at: session.expires_at,
                 oauth_token: oauth_token.access_token.clone(),
             }));
         }
@@ -190,6 +196,7 @@ pub async fn get_copilot_credentials() -> Result<Option<CopilotCredentials>, Cop
     Ok(Some(CopilotCredentials {
         token: session.token,
         api_endpoint: session.api_endpoint,
+        expires_at: session.expires_at,
         oauth_token: oauth_token.access_token,
     }))
 }

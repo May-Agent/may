@@ -440,6 +440,9 @@ pub struct DaemonState {
     /// The cloud sessions this daemon fronts: their codespaces, hosts and
     /// the steps of bringing them up.
     pub(crate) cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
+    /// On a cloud home, the providers the fronting daemon pushed: kept
+    /// apart from `config`, so no configuration write carries them.
+    pub(crate) pushed_providers: crate::cloud::access::PushedProviders,
     /// Whether the user is asleep, for every session and client.
     pub(crate) sleep: Arc<crate::sleep::SleepState>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
@@ -563,6 +566,18 @@ impl DaemonState {
         let _ = update(&mut config);
         self.config.store(Arc::new(config.clone()));
         config
+    }
+
+    /// Writes `config` to this daemon's `config.toml`, in its own May
+    /// directory.
+    ///
+    /// # Errors
+    /// Fails when the configuration does not validate or the write fails.
+    pub(crate) async fn save_config(
+        &self,
+        config: &MayConfig,
+    ) -> Result<(), crate::config::ConfigError> {
+        config.save_to(&self.may_dir.join("config.toml")).await
     }
 
     pub(crate) fn browser_manager(&self) -> Option<Arc<crate::container::browser::BrowserManager>> {
@@ -1424,6 +1439,7 @@ impl DaemonState {
                 )
                 .await?,
             ),
+            pushed_providers: crate::cloud::access::PushedProviders::default(),
             notification_service,
             memory_processor: None,
             local_url_port_mapper: std::sync::Arc::new(

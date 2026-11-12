@@ -7,14 +7,18 @@
 //! an OAuth provider gets only a short-lived access token. The refresh
 //! token never leaves this machine; the fronting daemon refreshes it and
 //! pushes the new access token, so the two daemons never refresh the same
-//! token.
+//! token. While the codespace's session runs a turn, the fronting daemon
+//! also pushes a fresh token at [`AccessToken::refresh_at`], before the one
+//! pushed last expires.
 //!
-//! On the cloud home the access token lives in an [`AccessCell`] beside the
-//! provider's configuration, never in a file. Each push replaces the token
-//! in the cell its models already read, so the session's idle agent picks
-//! the new token up without being rebuilt.
+//! On the cloud home a pushed provider lives in [`PushedProviders`], apart
+//! from the configuration and never in a file; its access token is in an
+//! [`AccessCell`]. Each push replaces the token in the cell its models
+//! already read, so the session's idle agent picks the new token up without
+//! being rebuilt.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -32,6 +36,8 @@ pub enum AccessToken {
         token: String,
         /// The API endpoint the token is for.
         api_endpoint: String,
+        /// When the token expires, in seconds since the Unix epoch.
+        expires_at: i64,
     },
     /// A `ChatGPT` access token and the claims requests carry.
     Chatgpt {
@@ -50,6 +56,8 @@ pub enum AccessToken {
     Grok {
         /// The bearer token.
         access_token: String,
+        /// When the token expires, in seconds since the Unix epoch.
+        expires_at: Option<u64>,
     },
 }
 
@@ -77,6 +85,22 @@ impl AccessToken {
             residency: credentials.residency.clone(),
             expires_at: credentials.expires_at,
         }
+    }
+
+    /// When a fresh token must reach the codespace: this machine refreshes
+    /// a token that near its expiry — its provider's margin before it — so
+    /// the one pushed then is valid. `None` for a token with no expiry.
+    #[must_use]
+    pub fn refresh_at(&self) -> Option<SystemTime> {
+        let (expires_at, margin) = match self {
+            Self::Copilot { expires_at, .. } => (
+                u64::try_from(*expires_at).unwrap_or(0),
+                crate::copilot::SESSION_EXPIRY_MARGIN,
+            ),
+            Self::Chatgpt { expires_at, .. } => ((*expires_at)?, CHATGPT_EXPIRY_MARGIN),
+            Self::Grok { expires_at, .. } => ((*expires_at)?, crate::grok::ACCESS_EXPIRY_MARGIN),
+        };
+        (UNIX_EPOCH + Duration::from_secs(expires_at)).checked_sub(margin)
     }
 
     /// The provider type the token is for.
@@ -134,6 +158,78 @@ pub struct ProviderPush {
     pub access: Option<AccessToken>,
 }
 
+/// A provider as its models are built: its configuration and, when a
+/// fronting daemon pushed an OAuth provider, its access token.
+#[derive(Debug, Clone)]
+pub struct ResolvedProvider {
+    /// Its configuration, its API key included.
+    pub instance: ProviderInstance,
+    /// The pushed OAuth provider's access token; `None` for every other.
+    pub access: Option<AccessCell>,
+}
+
+/// The providers a fronting daemon pushed to this cloud home, by id.
+///
+/// They live only here, in memory, apart from the configuration, so no
+/// write of `config.toml` can carry them; provider resolution lays them over
+/// the configured ones. Clones share the providers.
+#[derive(Debug, Clone, Default)]
+pub struct PushedProviders(Arc<dashmap::DashMap<String, ResolvedProvider>>);
+
+impl PushedProviders {
+    /// Takes `push` as provider `id`. An access token replaces the one in
+    /// the cell the provider's models already read, so they use it from
+    /// their next request.
+    pub fn push(&self, id: &str, push: ProviderPush) {
+        let ProviderPush { instance, access } = push;
+        let held = self.0.get(id).and_then(|provider| provider.access.clone());
+        let access = match (access, held) {
+            (Some(token), Some(cell)) => {
+                cell.replace(token);
+                Some(cell)
+            }
+            (Some(token), None) => Some(AccessCell::holding(token)),
+            (None, _) => None,
+        };
+        self.0
+            .insert(id.to_owned(), ResolvedProvider { instance, access });
+    }
+
+    /// The pushed provider `id`.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<ResolvedProvider> {
+        self.0.get(id).map(|provider| provider.clone())
+    }
+
+    /// Every pushed provider, in id order.
+    #[must_use]
+    pub fn all(&self) -> Vec<(String, ResolvedProvider)> {
+        let mut all: Vec<_> = self
+            .0
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        all.sort_by(|left, right| left.0.cmp(&right.0));
+        all
+    }
+
+    /// What an agent built from these providers depends on: their
+    /// configurations, never their access tokens, which models read anew
+    /// for each request.
+    ///
+    /// # Panics
+    /// Never: a provider configuration always serializes.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let instances: Vec<_> = self
+            .all()
+            .into_iter()
+            .map(|(id, provider)| (id, provider.instance))
+            .collect();
+        serde_json::to_string(&instances).expect("provider configurations serialize")
+    }
+}
+
 /// Why this machine's credential of an OAuth provider is not available.
 #[derive(Debug, thiserror::Error)]
 pub enum AccessError {
@@ -153,7 +249,7 @@ pub enum AccessError {
 
 /// How long a `ChatGPT` access token must still be valid to be pushed: the
 /// margin the model listing refreshes it with.
-const CHATGPT_EXPIRY_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+const CHATGPT_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
 /// This machine's access token of a provider of type `provider_type`,
 /// refreshed here when it is about to expire; `None` for a provider that
@@ -171,6 +267,7 @@ pub async fn local_access(provider_type: ProviderType) -> Result<Option<AccessTo
             Ok(Some(AccessToken::Copilot {
                 token: credentials.token,
                 api_endpoint: credentials.api_endpoint,
+                expires_at: credentials.expires_at,
             }))
         }
         ProviderType::Chatgpt => {
@@ -186,10 +283,13 @@ pub async fn local_access(provider_type: ProviderType) -> Result<Option<AccessTo
             Ok(Some(AccessToken::of_codex(&credentials)))
         }
         ProviderType::Grok => {
-            let access_token = crate::grok::get_access_token()
+            let access = crate::grok::get_access()
                 .await?
                 .ok_or(AccessError::NotSignedIn("xAI Grok"))?;
-            Ok(Some(AccessToken::Grok { access_token }))
+            Ok(Some(AccessToken::Grok {
+                access_token: access.token,
+                expires_at: access.expires_at,
+            }))
         }
         ProviderType::Anthropic
         | ProviderType::OpenAI

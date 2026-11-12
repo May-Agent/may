@@ -221,9 +221,12 @@ pub async fn start(
         .with_runtime_service(runtime_service.clone())
         .with_secret_store(crate::secrets::SecretStore::new(&may_dir));
 
+    // A cloud home's fronting daemon pushes its providers once this daemon
+    // serves; until then there are none.
+    let pushed_providers = crate::cloud::access::PushedProviders::default();
     // Initialize memory processor with fast-tier provider chain
     let memory_processor = match crate::agent::build_fast_provider_chain(
-        &config,
+        crate::agent::Providers::new(&config, &pushed_providers),
         &crate::secrets::SecretRedactor::new(&may_dir),
     )
     .await
@@ -328,6 +331,7 @@ pub async fn start(
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
         cloud_sessions,
+        pushed_providers,
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
             ui_event_bus.clone(),

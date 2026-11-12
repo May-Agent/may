@@ -23,6 +23,7 @@ use futures_lite::{Stream, StreamExt as _};
 
 use super::may::MayAgentError;
 use super::session_model::{PushedModel, SessionModel};
+use crate::cloud::access::{PushedProviders, ResolvedProvider};
 use crate::config::{
     MayConfig, ModelTier, NativeToolsConfig, ProviderApi, ProviderInstance, ProviderType,
 };
@@ -47,29 +48,92 @@ pub(super) fn parse_model_selector(selector: &str) -> Result<ModelSelector, MayA
     })
 }
 
+/// The providers models resolve against.
+///
+/// The configured ones, with those a fronting daemon pushed to this cloud
+/// home laid over them. The pushed ones never enter the configuration, so
+/// nothing that saves it can carry them.
+#[derive(Debug, Clone, Copy)]
+pub struct Providers<'a> {
+    config: &'a MayConfig,
+    pushed: &'a PushedProviders,
+}
+
+impl<'a> Providers<'a> {
+    /// `config`'s providers, with `pushed` over them.
+    #[must_use]
+    pub const fn new(config: &'a MayConfig, pushed: &'a PushedProviders) -> Self {
+        Self { config, pushed }
+    }
+
+    /// The configuration the model selectors come from.
+    #[must_use]
+    pub const fn config(&self) -> &'a MayConfig {
+        self.config
+    }
+
+    /// Provider `id`: the pushed one when there is one, else the configured.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<ResolvedProvider> {
+        self.pushed.get(id).or_else(|| {
+            self.config
+                .get_provider(id)
+                .map(|instance| ResolvedProvider {
+                    instance: instance.clone(),
+                    access: None,
+                })
+        })
+    }
+
+    /// Every provider, in id order.
+    fn all(&self) -> Vec<(String, ResolvedProvider)> {
+        let mut all = self.pushed.all();
+        all.extend(
+            self.config
+                .provider
+                .iter()
+                .filter(|(id, _)| self.pushed.get(id).is_none())
+                .map(|(id, instance)| {
+                    (
+                        id.clone(),
+                        ResolvedProvider {
+                            instance: instance.clone(),
+                            access: None,
+                        },
+                    )
+                }),
+        );
+        all.sort_by(|left, right| left.0.cmp(&right.0));
+        all
+    }
+}
+
 fn resolve_model_selector(
-    may_config: &MayConfig,
+    providers: Providers<'_>,
     selector: &ModelSelector,
-) -> Result<ProviderInstance, MayAgentError> {
+) -> Result<ResolvedProvider, MayAgentError> {
     let provider_id = selector.provider_id();
-    let Some(provider_instance) = may_config.provider.get(provider_id).cloned() else {
+    let Some(provider) = providers.get(provider_id) else {
         return Err(MayAgentError::MissingApiKey(err_no_provider(
             selector.model_id(),
         )));
     };
-    if !provider_instance.is_valid(provider_id) {
+    if !provider.instance.is_valid(provider_id) {
         return Err(MayAgentError::MissingApiKey(err_no_provider(
             selector.model_id(),
         )));
     }
-    if !provider_instance.can_serve_model(provider_id, selector.model_id()) {
+    if !provider
+        .instance
+        .can_serve_model(provider_id, selector.model_id())
+    {
         return Err(MayAgentError::Llm(format!(
             "Provider '{provider_id}' cannot serve configured model '{}'",
             selector.model_id()
         )));
     }
 
-    Ok(provider_instance)
+    Ok(provider)
 }
 
 /// Why a [`RedactedModel`] request failed.
@@ -261,18 +325,18 @@ impl<M: LanguageModel> ModelSlot<M> {
 /// [`request_parameters_for`] for a session's `selector`, looking the provider
 /// instance up in `config`.
 pub(super) fn session_request_parameters(
-    config: &MayConfig,
+    providers: Providers<'_>,
     selector: &ModelSelector,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Parameters {
     let provider_id = selector.provider_id();
-    let provider_type = config
-        .provider
-        .get(provider_id)
-        .map(|instance| instance.resolve_type(provider_id));
+    let provider = providers.get(provider_id);
+    let provider_type = provider
+        .as_ref()
+        .map(|provider| provider.instance.resolve_type(provider_id));
     let mut parameters = request_parameters_for(
         provider_id,
-        config.provider.get(provider_id),
+        provider.as_ref().map(|provider| &provider.instance),
         selector.model_id(),
         reasoning_effort,
     );
@@ -364,34 +428,29 @@ pub(super) fn request_parameters_for(
 /// selector names first, then every configured generic proxy able to serve
 /// the model, ordered by provider id for a stable retry sequence.
 fn provider_candidates(
-    config: &MayConfig,
+    providers: Providers<'_>,
     selector: &ModelSelector,
-) -> Vec<(String, ProviderInstance)> {
-    let mut candidates: Vec<(String, ProviderInstance)> = resolve_model_selector(config, selector)
-        .map(|instance| (selector.provider_id().to_string(), instance))
-        .into_iter()
-        .collect();
-    let mut proxies = config
-        .provider
-        .iter()
-        .filter(|(id, instance)| {
-            id.as_str() != selector.provider_id()
-                && instance.is_valid(id)
-                && instance.is_generic_model_proxy(id)
-                && instance.can_serve_model(id, selector.model_id())
-        })
-        .map(|(id, instance)| (id.clone(), instance.clone()))
-        .collect::<Vec<_>>();
-    proxies.sort_by(|left, right| left.0.cmp(&right.0));
-    candidates.extend(proxies);
+) -> Vec<(String, ResolvedProvider)> {
+    let mut candidates: Vec<(String, ResolvedProvider)> =
+        resolve_model_selector(providers, selector)
+            .map(|provider| (selector.provider_id().to_string(), provider))
+            .into_iter()
+            .collect();
+    candidates.extend(providers.all().into_iter().filter(|(id, provider)| {
+        id.as_str() != selector.provider_id()
+            && provider.instance.is_valid(id)
+            && provider.instance.is_generic_model_proxy(id)
+            && provider.instance.can_serve_model(id, selector.model_id())
+    }));
     candidates
 }
 
 /// Number of runnable provider candidates for `selector`.
 #[must_use]
-pub fn provider_candidate_count(config: &MayConfig, selector: &str) -> usize {
-    parse_model_selector(selector)
-        .map_or(0, |selector| provider_candidates(config, &selector).len())
+pub fn provider_candidate_count(providers: Providers<'_>, selector: &str) -> usize {
+    parse_model_selector(selector).map_or(0, |selector| {
+        provider_candidates(providers, &selector).len()
+    })
 }
 
 /// The concrete runtime produced by [`resolve_provider_runtime`].
@@ -403,7 +462,7 @@ pub struct ResolvedProviderRuntime {
     pub llm: ProviderLlm,
 }
 
-/// Resolve a model selector against `may_config` into a usable provider
+/// Resolve a model selector against `providers` into a usable provider
 /// runtime, trying fallback candidates in order.
 ///
 /// # Errors
@@ -411,24 +470,20 @@ pub struct ResolvedProviderRuntime {
 /// Returns [`MayAgentError`] when no configured provider can serve the
 /// selector or all candidates fail.
 pub async fn resolve_provider_runtime(
-    may_config: &MayConfig,
+    providers: Providers<'_>,
     selector: &ModelSelector,
     provider_attempt: usize,
     redactor: &SecretRedactor,
 ) -> Result<ResolvedProviderRuntime, MayAgentError> {
-    let candidates = provider_candidates(may_config, selector);
-    let Some((provider_id, provider_instance)) = candidates.get(provider_attempt) else {
+    let candidates = provider_candidates(providers, selector);
+    let Some((provider_id, provider)) = candidates.get(provider_attempt) else {
         return Err(MayAgentError::MissingApiKey(err_no_provider(
             selector.model_id(),
         )));
     };
-    let llm = build_cloud_provider_from_instance(
-        provider_id,
-        provider_instance,
-        selector.model_id(),
-        redactor,
-    )
-    .await?;
+    let llm =
+        build_cloud_provider_from_instance(provider_id, provider, selector.model_id(), redactor)
+            .await?;
 
     Ok(ResolvedProviderRuntime {
         provider_id: provider_id.clone(),
@@ -460,28 +515,28 @@ pub struct AskTierModels {
 /// Returns [`MayAgentError`] when a configured tier selector references a
 /// provider missing from `config` or its model fails to build.
 pub async fn resolve_ask_tier_models(
-    config: &MayConfig,
+    providers: Providers<'_>,
     session_provider_id: &str,
     session_model_id: &str,
     redactor: &SecretRedactor,
 ) -> Result<AskTierModels, MayAgentError> {
     let (flagship, balanced, fast) = futures_util::future::try_join3(
         resolve_ask_tier_model(
-            config,
+            providers,
             ModelTier::Advanced,
             session_provider_id,
             session_model_id,
             redactor,
         ),
         resolve_ask_tier_model(
-            config,
+            providers,
             ModelTier::Balanced,
             session_provider_id,
             session_model_id,
             redactor,
         ),
         resolve_ask_tier_model(
-            config,
+            providers,
             ModelTier::Fast,
             session_provider_id,
             session_model_id,
@@ -501,27 +556,27 @@ pub async fn resolve_ask_tier_models(
 /// tier: nothing is configured for it, or it resolves to the session's own
 /// model.
 async fn resolve_ask_tier_model(
-    config: &MayConfig,
+    providers: Providers<'_>,
     tier: ModelTier,
     session_provider_id: &str,
     session_model_id: &str,
     redactor: &SecretRedactor,
 ) -> Result<Option<ModelSlot<ProviderLlm>>, MayAgentError> {
-    let Some(selector) = config.default_model_for_tier(tier) else {
+    let Some(selector) = providers.config().default_model_for_tier(tier) else {
         return Ok(None);
     };
     let provider_id = selector.provider_id();
     if provider_id == session_provider_id && selector.model_id() == session_model_id {
         return Ok(None);
     }
-    let Some(instance) = config.get_provider(provider_id) else {
+    let Some(provider) = providers.get(provider_id) else {
         return Err(MayAgentError::MissingApiKey(format!(
             "ask {tier:?} tier model '{selector}' references provider '{provider_id}', \
              which is not configured"
         )));
     };
     let llm =
-        build_cloud_provider_from_instance(provider_id, instance, selector.model_id(), redactor)
+        build_cloud_provider_from_instance(provider_id, &provider, selector.model_id(), redactor)
             .await
             .map_err(|error| {
                 MayAgentError::Llm(format!(
@@ -530,7 +585,12 @@ async fn resolve_ask_tier_model(
             })?;
     Ok(Some(ModelSlot::new(
         llm,
-        request_parameters_for(provider_id, Some(instance), selector.model_id(), None),
+        request_parameters_for(
+            provider_id,
+            Some(&provider.instance),
+            selector.model_id(),
+            None,
+        ),
     )))
 }
 
@@ -543,26 +603,26 @@ async fn resolve_ask_tier_model(
 /// Returns [`MayAgentError`] when the selector references a provider missing
 /// from `config` or its model fails to build.
 pub async fn resolve_compaction_model(
-    config: &MayConfig,
+    providers: Providers<'_>,
     session_provider_id: &str,
     session_model_id: &str,
     redactor: &SecretRedactor,
 ) -> Result<Option<ModelSlot<ProviderLlm>>, MayAgentError> {
-    let Some(selector) = config.models.compaction_model.as_ref() else {
+    let Some(selector) = providers.config().models.compaction_model.as_ref() else {
         return Ok(None);
     };
     let provider_id = selector.provider_id();
     if provider_id == session_provider_id && selector.model_id() == session_model_id {
         return Ok(None);
     }
-    let Some(instance) = config.get_provider(provider_id) else {
+    let Some(provider) = providers.get(provider_id) else {
         return Err(MayAgentError::MissingApiKey(format!(
             "compaction model '{selector}' references provider '{provider_id}', \
              which is not configured"
         )));
     };
     let llm =
-        build_cloud_provider_from_instance(provider_id, instance, selector.model_id(), redactor)
+        build_cloud_provider_from_instance(provider_id, &provider, selector.model_id(), redactor)
             .await
             .map_err(|error| {
                 MayAgentError::Llm(format!(
@@ -571,7 +631,12 @@ pub async fn resolve_compaction_model(
             })?;
     Ok(Some(ModelSlot::new(
         llm,
-        request_parameters_for(provider_id, Some(instance), selector.model_id(), None),
+        request_parameters_for(
+            provider_id,
+            Some(&provider.instance),
+            selector.model_id(),
+            None,
+        ),
     )))
 }
 
@@ -589,9 +654,10 @@ pub async fn resolve_compaction_model(
 /// in the provider map — config validation is expected to reject that
 /// earlier.
 pub async fn build_fast_provider_chain(
-    config: &MayConfig,
+    providers: Providers<'_>,
     redactor: &SecretRedactor,
 ) -> Result<Vec<crate::memory::MemoryExtractionProvider>, MayAgentError> {
+    let config = providers.config();
     let mut selectors = Vec::new();
     let mut seen = HashSet::new();
     for tier in [
@@ -617,13 +683,13 @@ pub async fn build_fast_provider_chain(
 
     for selector in selectors {
         let provider_id = selector.provider_id().to_string();
-        let Some(instance) = config.get_provider(&provider_id) else {
+        let Some(provider) = providers.get(&provider_id) else {
             panic!("configured model selector referenced unknown provider '{provider_id}'");
         };
 
         match build_cloud_provider_from_instance(
             &provider_id,
-            instance,
+            &provider,
             selector.model_id(),
             redactor,
         )
@@ -654,21 +720,22 @@ pub async fn build_fast_provider_chain(
     Ok(built)
 }
 
-/// Build a `CloudProvider` from a `ProviderInstance` directly, behind the
+/// Build a `CloudProvider` from a resolved provider directly, behind the
 /// secret redaction of `redactor`.
 pub(super) async fn build_cloud_provider_from_instance(
     id: &str,
-    instance: &ProviderInstance,
+    provider: &ResolvedProvider,
     model: &str,
     redactor: &SecretRedactor,
 ) -> Result<ProviderLlm, MayAgentError> {
+    let instance = &provider.instance;
     let provider_type = instance.resolve_type(id);
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
 
     // On a cloud home an OAuth provider uses what the fronting daemon
     // pushed, never a credential of this machine's own.
-    if let Some(access) = &instance.pushed_access {
+    if let Some(access) = &provider.access {
         return Ok(RedactedModel::new(
             SessionModel::Pushed(PushedModel::new(access.clone(), base_url, model)),
             redactor.clone(),
@@ -958,7 +1025,11 @@ mod tests {
         config.provider.insert("google".to_string(), instance);
 
         let selector = parse_model_selector("google::gemini-3-flash-preview").unwrap();
-        let parameters = session_request_parameters(&config, &selector, None);
+        let parameters = session_request_parameters(
+            Providers::new(&config, &PushedProviders::default()),
+            &selector,
+            None,
+        );
         assert!(parameters.websearch);
         assert!(aither_models::lookup(selector.model_id()).is_some());
     }
@@ -989,7 +1060,7 @@ mod tests {
             .add_model(ModelTier::Balanced, "gemini-3-flash-preview", "google");
 
         let models = resolve_ask_tier_models(
-            &config,
+            Providers::new(&config, &PushedProviders::default()),
             "google",
             "gemini-3-flash-preview",
             &SecretRedactor::new(std::path::Path::new("/nonexistent")),
@@ -1024,7 +1095,7 @@ mod tests {
             .add_model(ModelTier::Fast, "some-model", "ghost");
 
         let error = resolve_ask_tier_models(
-            &config,
+            Providers::new(&config, &PushedProviders::default()),
             "google",
             "gemini-3-flash-preview",
             &SecretRedactor::new(std::path::Path::new("/nonexistent")),

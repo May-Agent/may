@@ -71,7 +71,7 @@ async fn process_task(state: Arc<DaemonState>, task: TitleGenerationTask) {
 
     let config = (*state.config_snapshot()).clone();
     let Some(generated_title) = Box::pin(generate_session_title(
-        &config,
+        crate::agent::Providers::new(&config, &state.pushed_providers),
         &task.user_message,
         &task.assistant_response,
         &crate::secrets::SecretRedactor::new(&state.may_dir),

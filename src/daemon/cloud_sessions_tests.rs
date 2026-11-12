@@ -43,6 +43,9 @@ const PROVIDER: &str = "chatgpt";
 /// The refresh token of this machine's `ChatGPT` sign-in, which never
 /// leaves it.
 const REFRESH_TOKEN: &str = "refresh-token-that-stays-here";
+/// An API key a fronting daemon pushes, which no file on the codespace may
+/// hold.
+const API_KEY: &str = "sk-ant-api03-鍵-キー-키";
 
 /// A codespace daemon of this build: its remote listener on loopback,
 /// admitting only the fronting token, and the directory it keeps its files
@@ -187,6 +190,8 @@ struct TestCloud {
     forward_ended: Arc<AtomicBool>,
     /// This machine's `ChatGPT` sign-in, refresh token included.
     chatgpt: Arc<Mutex<CodexCredentials>>,
+    /// This machine's GitHub Copilot session token, as it is refreshed.
+    copilot: Arc<Mutex<Option<AccessToken>>>,
 }
 
 impl TestCloud {
@@ -197,6 +202,7 @@ impl TestCloud {
             shell: RecordedShell::default(),
             forward_ended: Arc::default(),
             chatgpt: Arc::new(Mutex::new(signed_in("access-1"))),
+            copilot: Arc::default(),
         }
     }
 }
@@ -209,7 +215,13 @@ fn signed_in(access: &str) -> CodexCredentials {
         id_token: None,
         account_id: Some("account-日本語-한국어-中文".into()),
         residency: None,
-        expires_at: Some(4_102_444_800),
+        // A day from now: valid through any test, and due long after.
+        expires_at: Some(
+            (std::time::SystemTime::now() + Duration::from_hours(24))
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_secs(),
+        ),
         earliest_refresh_at: None,
     }
 }
@@ -255,21 +267,37 @@ impl CloudBackend for TestCloud {
         &self,
         provider_type: ProviderType,
     ) -> impl Future<Output = Result<Option<AccessToken>, AccessError>> + Send {
-        let credentials = self.chatgpt.lock().expect("sign-in");
-        std::future::ready(Ok(
-            (provider_type == ProviderType::Chatgpt).then(|| AccessToken::of_codex(&credentials))
-        ))
+        let access = match provider_type {
+            ProviderType::Chatgpt => Some(AccessToken::of_codex(
+                &self.chatgpt.lock().expect("sign-in"),
+            )),
+            ProviderType::Copilot => self.copilot.lock().expect("sign-in").clone(),
+            _ => None,
+        };
+        std::future::ready(Ok(access))
     }
 }
 
-/// The fronting side: its database holding the session and its record.
+/// The fronting side: its database holding the session, on `ChatGPT`, and
+/// its record.
 async fn fronting(backend: TestCloud) -> Arc<CloudSessions<TestCloud>> {
+    fronting_on(backend, PROVIDER, ProviderType::Chatgpt).await
+}
+
+/// The fronting side with the session's model on provider `provider` of
+/// type `provider_type`.
+async fn fronting_on(
+    backend: TestCloud,
+    provider: &str,
+    provider_type: ProviderType,
+) -> Arc<CloudSessions<TestCloud>> {
+    let model = ModelSelector::new(provider, "gpt-5").to_string();
     let dir = tempfile::tempdir().expect("temp dir");
     let db = ChatDb::open(&dir.path().join("history.db"))
         .await
         .expect("database");
     std::mem::forget(dir);
-    db.create_session_in_profile(SESSION, Some("日本語 한국어 中文"), Some(&model()), None)
+    db.create_session_in_profile(SESSION, Some("日本語 한국어 中文"), Some(&model), None)
         .await
         .expect("session");
     db.insert_cloud_session(&CloudSessionRow {
@@ -284,10 +312,9 @@ async fn fronting(backend: TestCloud) -> Arc<CloudSessions<TestCloud>> {
     .await
     .expect("record");
     let mut config = MayConfig::default();
-    config.provider.insert(
-        PROVIDER.into(),
-        ProviderInstance::new(ProviderType::Chatgpt),
-    );
+    config
+        .provider
+        .insert(provider.into(), ProviderInstance::new(provider_type));
     Arc::new(
         CloudSessions::load(
             db,
@@ -453,12 +480,10 @@ async fn the_relay_carries_the_fronting_token_and_streams_the_answer() {
 /// The access token the codespace daemon's `chatgpt` provider holds.
 fn pushed(remote: &DaemonState) -> crate::cloud::access::AccessCell {
     remote
-        .config_snapshot()
-        .provider
+        .pushed_providers
         .get(PROVIDER)
         .expect("the pushed provider")
-        .pushed_access
-        .clone()
+        .access
         .expect("an access token")
 }
 
@@ -492,6 +517,7 @@ async fn the_codespace_gets_an_access_token_and_never_the_refresh_token() {
     let (daemon, remote, remote_home) = codespace_daemon().await;
     let backend = TestCloud::new(&github, daemon);
     let chatgpt = backend.chatgpt.clone();
+    let first = AccessToken::of_codex(&chatgpt.lock().expect("sign-in"));
     let sessions = fronting(backend).await;
     let host = sessions.host(SESSION).expect("a cloud session");
     github.reads_as(&["Available"]);
@@ -499,45 +525,88 @@ async fn the_codespace_gets_an_access_token_and_never_the_refresh_token() {
     // Bootstrap pushes the session model's provider with its access token.
     host.endpoint(true).await.expect("served");
     let cell = pushed(&remote);
-    assert_eq!(
-        *cell.current(),
-        AccessToken::of_codex(&signed_in("access-1"))
-    );
+    assert_eq!(*cell.current(), first);
 
     // This machine refreshed: the next message pushes the new access token
     // into the cell the codespace's models already read.
-    *chatgpt.lock().expect("sign-in") = signed_in("access-2");
+    let refreshed = signed_in("access-2");
+    *chatgpt.lock().expect("sign-in") = refreshed.clone();
     host.endpoint(true).await.expect("served");
-    assert_eq!(
-        *cell.current(),
-        AccessToken::of_codex(&signed_in("access-2"))
-    );
+    assert_eq!(*cell.current(), AccessToken::of_codex(&refreshed));
 
     // A read pushes nothing.
     *chatgpt.lock().expect("sign-in") = signed_in("access-3");
     host.endpoint(false).await.expect("served");
-    assert_eq!(
-        *cell.current(),
-        AccessToken::of_codex(&signed_in("access-2"))
-    );
+    assert_eq!(*cell.current(), AccessToken::of_codex(&refreshed));
 
-    // The refresh token reached nothing the codespace daemon keeps: not its
+    // An API key provider goes with its key, as the fronting daemon pushes
+    // a session on one.
+    let mut keyed = ProviderInstance::new(ProviderType::Anthropic);
+    keyed.api_key = Some(API_KEY.into());
+    let fronted = Endpoint::new(daemon, TOKEN);
+    let (status, _) = fronted
+        .exchange(
+            hyper::Method::PUT,
+            "/api/cloud-home/providers/anthropic",
+            Some(
+                serde_json::to_vec(&crate::cloud::access::ProviderPush {
+                    instance: keyed,
+                    access: None,
+                })
+                .expect("push"),
+            ),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(status, skyzen::StatusCode::NO_CONTENT);
+
+    // Preference updates through the codespace daemon's API write its
+    // `config.toml`.
+    let (status, _) = fronted
+        .exchange(
+            hyper::Method::PUT,
+            "/api/config/job-pool",
+            Some(json!({"size": 3}).to_string().into_bytes()),
+        )
+        .await
+        .expect("answered");
+    assert!(status.is_success(), "{status}");
+    let (status, _) = fronted
+        .exchange(
+            hyper::Method::POST,
+            "/api/config/last-model",
+            Some(
+                json!({"model": ModelSelector::new("anthropic", "claude-sonnet-4-5").to_string()})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        )
+        .await
+        .expect("answered");
+    assert!(status.is_success(), "{status}");
+    let saved = remote_home.join("config.toml");
+    assert!(saved.is_file(), "the preferences were saved");
+
+    // No credential reached anything the codespace daemon keeps: not its
     // configuration as served or saved, and no file it wrote.
     let config = serde_json::to_string(&*remote.config_snapshot()).expect("config");
-    assert!(!config.contains(REFRESH_TOKEN), "{config}");
-    assert!(!config.contains("access-2"), "{config}");
-    assert_eq!(
-        files_holding(&remote_home, REFRESH_TOKEN),
-        Vec::<std::path::PathBuf>::new()
-    );
+    for secret in [REFRESH_TOKEN, API_KEY, "access-1", "access-2"] {
+        assert!(!config.contains(secret), "{secret} in {config}");
+        assert_eq!(
+            files_holding(&remote_home, secret),
+            Vec::<std::path::PathBuf>::new(),
+            "{secret} on disk"
+        );
+    }
 }
 
 #[tokio::test]
 async fn only_the_fronting_daemon_pushes_a_provider() {
     let (daemon, remote, _) = codespace_daemon().await;
+    let forged = AccessToken::of_codex(&signed_in("forged"));
     let push = serde_json::to_vec(&crate::cloud::access::ProviderPush {
         instance: ProviderInstance::new(ProviderType::Chatgpt),
-        access: Some(AccessToken::of_codex(&signed_in("forged"))),
+        access: Some(forged.clone()),
     })
     .expect("push");
     let path = format!("/api/cloud-home/providers/{PROVIDER}");
@@ -584,9 +653,103 @@ async fn only_the_fronting_daemon_pushes_a_provider() {
         .await
         .expect("answered");
     assert_eq!(status, skyzen::StatusCode::NO_CONTENT);
-    assert_eq!(
-        *pushed(&remote).current(),
-        AccessToken::of_codex(&signed_in("forged"))
+    assert_eq!(*pushed(&remote).current(), forged);
+}
+
+/// A GitHub Copilot session token for `api_endpoint` that expires `life`
+/// from now.
+fn copilot_token(token: &str, api_endpoint: &str, life: Duration) -> AccessToken {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch");
+    AccessToken::Copilot {
+        token: token.into(),
+        api_endpoint: api_endpoint.into(),
+        expires_at: i64::try_from((now + life).as_secs()).expect("in range"),
+    }
+}
+
+#[tokio::test]
+async fn a_token_expiring_during_a_turn_is_replaced_before_the_next_request() {
+    use aither_core::LanguageModel as _;
+    use futures_lite::StreamExt as _;
+
+    let (copilot_api, requests) =
+        serve_api(|_, _| ApiReply::json(500, r#"{"message":"recorded"}"#)).await;
+    let github = RecordedGitHub::serve().await;
+    let (daemon, remote, _) = codespace_daemon().await;
+    let backend = TestCloud::new(&github, daemon);
+    let copilot = backend.copilot.clone();
+    // Copilot's margin is 60 s, so this token is due to be replaced in one.
+    *copilot.lock().expect("sign-in") = Some(copilot_token(
+        "copilot-1",
+        &copilot_api,
+        crate::copilot::SESSION_EXPIRY_MARGIN + Duration::from_secs(1),
+    ));
+    let sessions = fronting_on(backend, "copilot", ProviderType::Copilot).await;
+    github.reads_as(&["Available"]);
+    sessions
+        .host(SESSION)
+        .expect("a cloud session")
+        .endpoint(true)
+        .await
+        .expect("served");
+
+    // The codespace's session runs a turn on the token pushed at bootstrap.
+    let config = remote.config_snapshot();
+    let turn = crate::agent::resolve_provider_runtime(
+        crate::agent::Providers::new(&config, &remote.pushed_providers),
+        &ModelSelector::new("copilot", "gpt-5"),
+        0,
+        &crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
+    )
+    .await
+    .expect("the session's model");
+    remote
+        .runtime_service
+        .set_state(
+            SESSION,
+            crate::session::runtime::SessionRuntimeState::Running,
+        )
+        .await
+        .expect("running");
+
+    // This machine refreshes the token as it comes due, and the fronting
+    // daemon pushes the new one with no message in between.
+    *copilot.lock().expect("sign-in") = Some(copilot_token(
+        "copilot-2",
+        &copilot_api,
+        Duration::from_secs(3600),
+    ));
+    let cell = remote
+        .pushed_providers
+        .get("copilot")
+        .expect("the pushed provider")
+        .access
+        .expect("an access token");
+    eventually("the re-push of the refreshed token", || {
+        let current = cell.current();
+        async move { matches!(&*current, AccessToken::Copilot { token, .. } if token == "copilot-2") }
+    })
+    .await;
+
+    // The turn's next model request carries it.
+    let mut events = std::pin::pin!(turn.llm.respond(aither_core::llm::LLMRequest::new(vec![
+        aither_core::llm::Message::user("東京 · 서울 · 北京"),
+    ])));
+    while events.next().await.is_some() {}
+    let authorizations: Vec<String> = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .map(|request| request.authorization.clone())
+        .collect();
+    assert!(!authorizations.is_empty(), "the request reached Copilot");
+    assert!(
+        authorizations
+            .iter()
+            .all(|authorization| authorization == "Bearer copilot-2"),
+        "{authorizations:?}"
     );
 }
 
