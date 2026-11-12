@@ -274,7 +274,7 @@ fn issue_row(issue: &IssueBrief, width: usize) -> Line<'static> {
 /// all passed. `merging` overrides with green; no rollup read yet shows
 /// the neutral open dot.
 fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
-    if pr.state == "merging" {
+    if pr.state == crate::db::PrState::Merging {
         return ("●", Style::default().fg(Color::Green));
     }
     match &pr.checks {
@@ -561,7 +561,7 @@ fn build_body(app: &App, width: usize) -> Body {
     let live_prs: Vec<_> = state
         .prs
         .iter()
-        .filter(|pr| matches!(pr.state.as_str(), "open" | "checks_pending" | "merging"))
+        .filter(|pr| pr.state.is_in_flight())
         .collect();
     if !live_prs.is_empty() {
         body.gap();
@@ -668,6 +668,7 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
 mod tests {
     use super::{pr_icon, truncate, wrap_hanging};
     use crate::client::{WirePr, WirePrCheck, WirePrChecks};
+    use crate::db::PrState;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -737,11 +738,11 @@ mod tests {
         assert_eq!(truncate("终端渲染逻辑", 7), "终端渲…");
     }
 
-    fn wire_pr(state: &str, checks: Option<WirePrChecks>) -> WirePr {
+    fn wire_pr(state: PrState, checks: Option<WirePrChecks>) -> WirePr {
         WirePr {
             number: 1,
             title: "title".to_string(),
-            state: state.to_string(),
+            state,
             backend: "github".to_string(),
             external_number: Some(1),
             issue_number: None,
@@ -782,7 +783,7 @@ mod tests {
         use crate::tui::sidebar::SidebarState;
 
         let mut pr = wire_pr(
-            "open",
+            PrState::Open,
             Some(WirePrChecks {
                 items: vec![
                     check(
@@ -849,15 +850,18 @@ mod tests {
         use ratatui::style::Color;
 
         // No rollup read yet: the neutral open dot.
-        assert_eq!(pr_icon(&wire_pr("open", None)).0, "●");
+        assert_eq!(pr_icon(&wire_pr(PrState::Open, None)).0, "●");
         // Merging overrides whatever the checks say.
-        assert_eq!(pr_icon(&wire_pr("merging", Some(rollup(2, 0, 0)))).0, "●");
+        assert_eq!(
+            pr_icon(&wire_pr(PrState::Merging, Some(rollup(2, 0, 0)))).0,
+            "●"
+        );
         // Failure beats pending; pending beats all-passed.
-        let (icon, style) = pr_icon(&wire_pr("open", Some(rollup(1, 0, 1))));
+        let (icon, style) = pr_icon(&wire_pr(PrState::Open, Some(rollup(1, 0, 1))));
         assert_eq!((icon, style.fg), ("●", Some(Color::Red)));
-        let (icon, style) = pr_icon(&wire_pr("open", Some(rollup(1, 3, 0))));
+        let (icon, style) = pr_icon(&wire_pr(PrState::Open, Some(rollup(1, 3, 0))));
         assert_eq!((icon, style.fg), ("●", Some(Color::Yellow)));
-        let (icon, style) = pr_icon(&wire_pr("open", Some(rollup(0, 4, 0))));
+        let (icon, style) = pr_icon(&wire_pr(PrState::Open, Some(rollup(0, 4, 0))));
         assert_eq!((icon, style.fg), ("✓", Some(Color::Green)));
     }
 }

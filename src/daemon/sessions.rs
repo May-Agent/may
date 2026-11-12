@@ -645,10 +645,7 @@ pub(super) async fn delete_session(
     // them `orphaned` so a later session knows to `pr adopt` before merge.
     if let Ok(prs) = db.list_session_prs(&id).await {
         for pr in prs {
-            if matches!(
-                pr.state.as_str(),
-                "open" | "checks_pending" | "failed" | "rejected" | "merging"
-            ) {
+            if pr.state.is_live() {
                 let _ = db
                     .add_pr_event(
                         pr.id,
@@ -713,7 +710,7 @@ pub(super) async fn delete_all_sessions(
     let db = state.db();
     state.tunnels.remove_all();
     // Every live PR outlives its session — mark them `orphaned` first.
-    if let Ok(prs) = db.list_prs(None, Some("open")).await {
+    if let Ok(prs) = db.list_prs(None, crate::db::PrFilter::Open).await {
         for pr in prs {
             let _ = db
                 .add_pr_event(

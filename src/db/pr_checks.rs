@@ -129,10 +129,13 @@ impl ChatDb {
     pub async fn live_github_prs(&self) -> Result<Vec<super::pr::PrRow>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT * FROM prs WHERE backend = 'github' AND external_number IS NOT NULL AND state IN ('open', 'checks_pending', 'merging')"
+            "SELECT * FROM prs WHERE backend = 'github' AND external_number IS NOT NULL"
         )
         .fetch_all::<super::pr::PrRow>()
-        .await?)
+        .await?
+        .into_iter()
+        .filter(|row| row.state.is_in_flight())
+        .collect())
     }
 }
 

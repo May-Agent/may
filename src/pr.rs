@@ -21,7 +21,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use askama::Template;
 
-use crate::db::ChatDb;
+use crate::db::{ChatDb, PrFilter, PrState};
 use crate::host_git::HostGit;
 use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
@@ -527,7 +527,7 @@ impl PrStore {
             self.pin(&resolved, pr.number, &head_sha).await?;
         }
         let pr = db
-            .update_pr(pr.id, "open", Some(&head_sha), None, None)
+            .update_pr(pr.id, PrState::Open, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "opened", Some(&format!("base {base_sha}")))
             .await;
@@ -569,11 +569,8 @@ impl PrStore {
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
             )));
         }
-        match pr.state.as_str() {
-            "merged" | "closed" => {
-                return Err(PrError::State(format!("PR #{number} is {}", pr.state)));
-            }
-            _ => {}
+        if pr.state.is_terminal() {
+            return Err(PrError::State(format!("PR #{number} is {}", pr.state)));
         }
         // Merging deletes the clone: work it holds outside a commit would
         // go with it, so it refuses and names the files.
@@ -589,7 +586,7 @@ impl PrStore {
             ))
         })?;
         self.db()?
-            .update_pr(pr.id, "checks_pending", Some(&head_sha), None, None)
+            .update_pr(pr.id, PrState::ChecksPending, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "checks_pending", None).await;
         if pr.backend == "github" {
@@ -601,7 +598,7 @@ impl PrStore {
             && let Err(err) = self.check_pinned(&resolved, &pr, &head_sha, &cmd).await
         {
             self.db()?
-                .update_pr(pr.id, "failed", Some(&head_sha), None, None)
+                .update_pr(pr.id, PrState::Failed, Some(&head_sha), None, None)
                 .await?;
             self.event(&pr, "check_failed", Some(&err)).await;
             return Err(PrError::CheckFailed(err));
@@ -625,7 +622,7 @@ impl PrStore {
                 self.db()?
                     .update_pr(
                         pr.id,
-                        "merged",
+                        PrState::Merged,
                         Some(&head_sha),
                         Some(&merge_sha),
                         Some(&now),
@@ -650,7 +647,7 @@ impl PrStore {
             }
             Err(reason) => {
                 self.db()?
-                    .update_pr(pr.id, "rejected", Some(&head_sha), None, None)
+                    .update_pr(pr.id, PrState::Rejected, Some(&head_sha), None, None)
                     .await?;
                 self.event(&pr, "rejected", Some(&reason)).await;
                 self.task_event(
@@ -680,7 +677,7 @@ impl PrStore {
         }
         // A terminal PR is refused before anything leaves the machine; the
         // transition below re-checks atomically.
-        if matches!(pr.state.as_str(), "merged" | "closed") {
+        if pr.state.is_terminal() {
             return Err(PrError::State(format!(
                 "PR #{number} is already {}",
                 pr.state
@@ -758,7 +755,7 @@ impl PrStore {
             self.pin(&resolved, pr.number, &head_sha).await?;
         }
         self.db()?
-            .update_pr(pr.id, "open", Some(&head_sha), None, None)
+            .update_pr(pr.id, PrState::Open, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "updated", Some(&head_sha)).await;
         Ok(format!("PR #{number} now holds {head_sha}"))
@@ -792,7 +789,7 @@ impl PrStore {
     ///
     /// # Errors
     /// Fails on database errors.
-    pub async fn list(&self, repo: Option<&str>, state: Option<&str>) -> Result<String, PrError> {
+    pub async fn list(&self, repo: Option<&str>, filter: PrFilter) -> Result<String, PrError> {
         let key = if let Some(name) = repo {
             let resolved = self.resolve(Some(name)).await?;
             Some(resolved.record.repo_key)
@@ -804,7 +801,7 @@ impl PrStore {
                 None
             }
         };
-        let rows = self.db()?.list_prs(key.as_deref(), state).await?;
+        let rows = self.db()?.list_prs(key.as_deref(), filter).await?;
         if rows.is_empty() {
             return Ok("no PRs".to_string());
         }
@@ -875,7 +872,7 @@ impl PrStore {
         // snapshot, best-effort, skipped for the may backend and for
         // states GitHub no longer reports checks on.
         if pr.backend == "github"
-            && matches!(pr.state.as_str(), "open" | "checks_pending" | "merging")
+            && pr.state.is_in_flight()
             && let (Some(owner_repo), Some(external)) = (
                 github_owner_repo(&resolved.record.source),
                 pr.external_number,
@@ -1113,7 +1110,13 @@ impl PrStore {
         match outcome {
             merge_watch::Outcome::Merged => {
                 self.db()?
-                    .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
+                    .update_pr(
+                        pr.id,
+                        PrState::Merged,
+                        Some(head_sha),
+                        None,
+                        Some(now.as_str()),
+                    )
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
                 self.record_queue_wait(pr).await;
@@ -1143,7 +1146,7 @@ impl PrStore {
                 match stopped {
                     merge_watch::Stopped::Closed => {
                         self.db()?
-                            .update_pr(pr.id, "closed", Some(head_sha), None, None)
+                            .update_pr(pr.id, PrState::Closed, Some(head_sha), None, None)
                             .await?;
                         self.event(pr, "closed", Some(&report)).await;
                         self.task_event(
@@ -1154,14 +1157,14 @@ impl PrStore {
                     }
                     merge_watch::Stopped::CheckFailed(_) => {
                         self.db()?
-                            .update_pr(pr.id, "failed", Some(head_sha), None, None)
+                            .update_pr(pr.id, PrState::Failed, Some(head_sha), None, None)
                             .await?;
                         self.event(pr, "check_failed", Some(&report)).await;
                         Err(PrError::CheckFailed(report))
                     }
                     merge_watch::Stopped::Removed(_) => {
                         self.db()?
-                            .update_pr(pr.id, "failed", Some(head_sha), None, None)
+                            .update_pr(pr.id, PrState::Failed, Some(head_sha), None, None)
                             .await?;
                         self.event(pr, "removed_from_queue", Some(&report)).await;
                         Err(PrError::State(report))
@@ -2058,6 +2061,7 @@ mod tests {
         github_owner_repo, host_git, push_pinned,
     };
     use crate::commit_signing::test_user::TestUser;
+    use crate::db::{PrFilter, PrState};
     use crate::repo_clone::test_sandbox::{TestTerminal, arm_hostile_config, markers};
     use crate::repo_clone::{CloneSandbox, SessionRepos};
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
@@ -2187,7 +2191,7 @@ mod tests {
 
         /// A store whose only clone is a GitHub remote clone of `o/r`, with
         /// a GitHub-backed PR #1 (upstream #7) in `state`, and its API at `base`.
-        async fn github_store(&self, id: &str, base: &str, state: &str) -> PrStore {
+        async fn github_store(&self, id: &str, base: &str, state: PrState) -> PrStore {
             let url = "https://github.com/o/r.git";
             self.db
                 .insert_repo_clone(
@@ -2218,7 +2222,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if state != "open" {
+            if state != PrState::Open {
                 self.db
                     .update_pr(pr.id, state, None, None, None)
                     .await
@@ -2249,7 +2253,7 @@ mod tests {
             )
         }
 
-        async fn pr_state(&self) -> String {
+        async fn pr_state(&self) -> PrState {
             self.db
                 .get_pr("https://github.com/o/r.git", 1)
                 .await
@@ -2619,7 +2623,7 @@ mod tests {
     async fn closing_a_github_pr_patches_upstream_then_records_closed() {
         let fx = Fixture::new().await;
         let (base, requests) = mock_api(200).await;
-        let store = fx.github_store("s1", &base, "open").await;
+        let store = fx.github_store("s1", &base, PrState::Open).await;
         store.close(1, None).await.unwrap();
         let seen = requests.lock().unwrap().clone();
         assert_eq!(
@@ -2631,28 +2635,28 @@ mod tests {
                 "{\"state\":\"closed\"}".to_string(),
             )]
         );
-        assert_eq!(fx.pr_state().await, "closed");
+        assert_eq!(fx.pr_state().await, PrState::Closed);
     }
 
     #[tokio::test]
     async fn a_failed_upstream_close_leaves_the_row_unchanged() {
         let fx = Fixture::new().await;
         let (base, requests) = mock_api(422).await;
-        let store = fx.github_store("s1", &base, "open").await;
+        let store = fx.github_store("s1", &base, PrState::Open).await;
         let err = store.close(1, None).await.unwrap_err();
         assert!(err.to_string().contains("422"), "{err}");
         assert_eq!(requests.lock().unwrap().len(), 1);
-        assert_eq!(fx.pr_state().await, "open");
+        assert_eq!(fx.pr_state().await, PrState::Open);
     }
 
     #[tokio::test]
     async fn a_merged_or_closed_github_pr_cannot_be_closed_again() {
-        for state in ["merged", "closed"] {
+        for state in [PrState::Merged, PrState::Closed] {
             let fx = Fixture::new().await;
             let (base, requests) = mock_api(200).await;
             let store = fx.github_store("s1", &base, state).await;
             let err = store.close(1, None).await.unwrap_err();
-            assert!(err.to_string().contains(state), "{err}");
+            assert!(err.to_string().contains(state.as_str()), "{err}");
             assert!(requests.lock().unwrap().is_empty());
             assert_eq!(fx.pr_state().await, state);
         }
@@ -2667,13 +2671,13 @@ mod tests {
         let key = fx.repo_key.to_str().unwrap();
         let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
         fx.db
-            .update_pr(pr.id, "merged", None, None, None)
+            .update_pr(pr.id, PrState::Merged, None, None, None)
             .await
             .unwrap();
         let err = store.close(1, None).await.unwrap_err();
         assert!(err.to_string().contains("merged"), "{err}");
         let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
-        assert_eq!(pr.state, "merged");
+        assert_eq!(pr.state, PrState::Merged);
         // The transition itself refuses too, not just `close`.
         assert!(matches!(
             fx.db.close_pr(pr.id).await,
@@ -3351,7 +3355,13 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("no signature"), "{error}");
-        assert!(store.list(None, None).await.unwrap().contains("no PRs"));
+        assert!(
+            store
+                .list(None, PrFilter::All)
+                .await
+                .unwrap()
+                .contains("no PRs")
+        );
         assert!(!fx.checkout.join("signed.txt").exists());
     }
 
@@ -3613,7 +3623,10 @@ mod tests {
         assert!(!fx.checkout.join("work.txt").exists(), "nothing landed");
         assert!(clone.join("notes.txt").exists(), "nothing was deleted");
         let key = fx.repo_key.to_str().unwrap();
-        assert_eq!(fx.db.get_pr(key, 1).await.unwrap().unwrap().state, "open");
+        assert_eq!(
+            fx.db.get_pr(key, 1).await.unwrap().unwrap().state,
+            PrState::Open
+        );
 
         git(Some(&clone), &["checkout", "--", "work.txt"]).unwrap();
         std::fs::remove_file(clone.join("notes.txt")).unwrap();
@@ -3644,7 +3657,7 @@ mod tests {
         ] {
             let fx = Fixture::new().await;
             let (base, requests) = mock_api(status).await;
-            let store = fx.github_store("s1", &base, "merged").await;
+            let store = fx.github_store("s1", &base, PrState::Merged).await;
 
             assert_eq!(store.delete_remote_branch("o/r", "may/s").await, expected);
             assert_eq!(
