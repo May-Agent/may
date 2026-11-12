@@ -5,6 +5,8 @@
 
 use std::io;
 
+use askama::Template;
+
 /// Failure while reading, validating, or writing a patch.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -33,17 +35,14 @@ pub enum PatchError {
     },
 
     /// A hunk's context and deleted lines match in more than one place.
-    #[error(
-        "Ambiguous patch: in {path}: hunk {hunk} matches at file lines {}; add surrounding context or an `@@ anchor` line to select one",
-        join_lines(starts)
-    )]
+    #[error("{}", AmbiguousMessage::new(.path, .hunk, .matches))]
     Ambiguous {
         /// The patch-relative path of the file being updated.
         path: String,
         /// The 1-based number of the ambiguous hunk within that file's update.
         hunk: usize,
-        /// The 1-based file lines where the hunk's old side starts.
-        starts: Vec<usize>,
+        /// Each place the hunk's old side matches, with the lines around it.
+        matches: Vec<Excerpt>,
     },
 
     /// A `Delete File` directive's content lines differ from the file.
@@ -77,10 +76,48 @@ pub enum PatchError {
     },
 }
 
-fn join_lines(lines: &[usize]) -> String {
-    lines
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
+/// One place a hunk matches: the matched lines and their neighbours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Excerpt {
+    /// The 1-based number of the first matched line.
+    pub first: usize,
+    /// The 1-based number of the last matched line.
+    pub last: usize,
+    /// Consecutive file lines, the matched region and the lines around it.
+    pub lines: Vec<ExcerptLine>,
+}
+
+/// A file line shown in an [`Excerpt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcerptLine {
+    /// The 1-based file line number.
+    pub number: usize,
+    /// The line's text.
+    pub text: String,
+    /// Whether the line is part of the matched region.
+    pub matched: bool,
+}
+
+impl ExcerptLine {
+    const fn marker(&self) -> char {
+        if self.matched { '>' } else { ' ' }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "ambiguous.txt")]
+struct AmbiguousMessage<'a> {
+    path: &'a str,
+    hunk: usize,
+    matches: &'a [Excerpt],
+}
+
+impl<'a> AmbiguousMessage<'a> {
+    const fn new(path: &'a str, hunk: &usize, matches: &'a [Excerpt]) -> Self {
+        Self {
+            path,
+            hunk: *hunk,
+            matches,
+        }
+    }
 }
