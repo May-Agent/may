@@ -437,6 +437,9 @@ pub struct DaemonState {
     /// (display, stream, input) lives in that respawnable process.
     pub(crate) computer: Arc<crate::computer::ComputerAgent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
+    /// The cloud sessions this daemon fronts: their codespaces, hosts and
+    /// the steps of bringing them up.
+    pub(crate) cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
     /// Whether the user is asleep, for every session and client.
     pub(crate) sleep: Arc<crate::sleep::SleepState>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
@@ -1386,7 +1389,7 @@ impl DaemonState {
                 ui_event_bus.clone(),
                 db.clone(),
             )),
-            db,
+            db: db.clone(),
             github_api: crate::pr::PrContext::default_github_api(),
             default_profile_id: "test".to_string(),
             mcp_service: McpService::spawn(crate::mcp::McpManager::new(
@@ -1411,6 +1414,13 @@ impl DaemonState {
             computer: std::sync::Arc::new(crate::computer::ComputerAgent::detached()),
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
+            ),
+            cloud_sessions: std::sync::Arc::new(
+                super::cloud_sessions::CloudSessions::load(
+                    db.clone(),
+                    super::cloud_sessions::GitHubCloud,
+                )
+                .await?,
             ),
             notification_service,
             memory_processor: None,

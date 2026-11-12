@@ -35,6 +35,8 @@ pub enum UiEventTopic {
     Sleep = 1 << 19,
     /// A popup waits on the user; attached terminals raise a notification.
     UserNotification = 1 << 20,
+    /// A step of bringing a cloud session's machine up.
+    CloudSession = 1 << 21,
 }
 
 impl UiEventTopic {
@@ -59,6 +61,7 @@ impl UiEventTopic {
             Self::SessionIndex => "session_index",
             Self::Sleep => "sleep",
             Self::UserNotification => "user_notification",
+            Self::CloudSession => "cloud_session",
         }
     }
 }
@@ -81,6 +84,7 @@ impl FromStr for UiEventTopic {
             "session_index" => Ok(Self::SessionIndex),
             "sleep" => Ok(Self::Sleep),
             "user_notification" => Ok(Self::UserNotification),
+            "cloud_session" => Ok(Self::CloudSession),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -119,6 +123,8 @@ impl UiEventTopics {
     pub const SLEEP: Self = Self(UiEventTopic::Sleep.bit());
     /// `user_notification` topic bit.
     pub const USER_NOTIFICATION: Self = Self(UiEventTopic::UserNotification.bit());
+    /// `cloud_session` topic bit.
+    pub const CLOUD_SESSION: Self = Self(UiEventTopic::CloudSession.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -132,7 +138,8 @@ impl UiEventTopics {
             | Self::REMOTE_ACCESS.0
             | Self::BROWSER_LIFECYCLE.0
             | Self::SESSION_INDEX.0
-            | Self::SLEEP.0,
+            | Self::SLEEP.0
+            | Self::CLOUD_SESSION.0,
     );
 
     /// Whether no topics are set.

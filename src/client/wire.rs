@@ -503,6 +503,10 @@ pub struct CreateSessionRequest {
     /// Repository to bind: `owner/repo`, a local path, or none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// The cloud machine the session runs entirely on; none for this
+    /// machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<crate::daemon::types::CloudSessionRequest>,
 }
 
 /// `PUT /api/sessions/{id}` request body.
@@ -679,6 +683,9 @@ pub struct WireSession {
     /// `GET /api/sessions/{id}` only.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// The cloud machine the session lives on; none for the daemon's own.
+    #[serde(default)]
+    pub location: Option<crate::daemon::types::SessionLocation>,
 }
 
 /// One session PR over the wire, mirroring the daemon's `ApiPr`.

@@ -113,6 +113,32 @@ pub struct Session {
     /// Cursor `GET /api/sessions/{id}` reported at load, for the session
     /// events stream to continue from. `None` for a new session.
     pub events_cursor: Option<String>,
+    /// The machine type a new session runs entirely in the cloud on, until
+    /// it is persisted; `None` for a session on the daemon's machine.
+    pub cloud: Option<String>,
+}
+
+/// The GitHub repository a cloud session of `repo` (a spec or a path) or,
+/// without one, of the checkout at `cwd` is created from: a codespace
+/// needs a GitHub repository, never a local checkout. Runs `git`.
+#[must_use]
+pub fn cloud_repository(repo: Option<&str>, cwd: Option<&Path>) -> Option<String> {
+    let github_of = |path: &Path| match crate::trust::repo_kind(path) {
+        crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+        crate::trust::RepoKind::Git => None,
+    };
+    match repo {
+        Some(spec) if Path::new(spec).is_dir() => github_of(Path::new(spec)),
+        Some(spec) => spec
+            .strip_prefix("github:")
+            .unwrap_or(spec)
+            .parse::<crate::workspace::GitHubRepository>()
+            .ok()
+            .map(|repository| repository.to_string()),
+        None => cwd.and_then(|cwd| {
+            crate::repo_search::worktree_root(cwd).and_then(|root| github_of(&root))
+        }),
+    }
 }
 
 /// How a client starts its sessions.
@@ -677,11 +703,38 @@ impl SessionManager {
             repo,
             cwd,
             events_cursor: None,
+            cloud: None,
         };
 
         self.current = Some(session);
         // SAFETY: We just set `self.current` to `Some` above.
         Ok(self.current.as_ref().expect("just assigned"))
+    }
+
+    /// Makes the current session, not yet persisted, run entirely on a
+    /// cloud machine of `machine_type`; persisting it creates the machine.
+    ///
+    /// # Errors
+    /// [`SessionError::NoActiveSession`] when no session is active or the
+    /// current one is already persisted: a session's home environment is
+    /// chosen when it starts.
+    pub fn run_in_cloud(&mut self, machine_type: String) -> Result<(), SessionError> {
+        let session = self
+            .current
+            .as_mut()
+            .filter(|session| !session.persisted)
+            .ok_or(SessionError::NoActiveSession)?;
+        session.cloud = Some(machine_type);
+        Ok(())
+    }
+
+    /// The repository spec and directory the current session starts with,
+    /// which pick a cloud session's repository.
+    #[must_use]
+    pub fn launch_place(&self) -> (Option<String>, Option<PathBuf>) {
+        self.current.as_ref().map_or((None, None), |session| {
+            (session.repo.clone(), session.cwd.clone())
+        })
     }
 
     /// Ensure current session is persisted to disk and database.
@@ -705,8 +758,19 @@ impl SessionManager {
         if !already_persisted {
             // The session works where this client runs, not where the
             // daemon happened to be started; a repo-less chat or a GitHub
-            // start works in neither.
+            // start works in neither. A cloud session works in its
+            // codespace, created from the checkout's GitHub repository.
             // The daemon creates the session's row and directory layout.
+            let repo = self.current.as_ref().and_then(|s| s.repo.clone());
+            let cloud = self.current.as_ref().and_then(|s| s.cloud.clone());
+            let repo = match &cloud {
+                Some(_) => {
+                    let cwd = cwd.clone();
+                    blocking::unblock(move || cloud_repository(repo.as_deref(), cwd.as_deref()))
+                        .await
+                }
+                None => repo,
+            };
             let _: crate::client::WireSession = self
                 .daemon()?
                 .post(
@@ -716,7 +780,10 @@ impl SessionManager {
                         model: model.clone(),
                         profile_id: profile_id.clone(),
                         cwd: cwd.map(|cwd| cwd.display().to_string()),
-                        repo: self.current.as_ref().and_then(|s| s.repo.clone()),
+                        repo,
+                        cloud: cloud.map(|machine_type| {
+                            crate::daemon::types::CloudSessionRequest { machine_type }
+                        }),
                     },
                 )
                 .await?;
@@ -804,6 +871,7 @@ impl SessionManager {
             repo: None,
             cwd: None,
             events_cursor: api.cursor,
+            cloud: None,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 

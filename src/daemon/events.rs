@@ -93,6 +93,10 @@ pub(super) async fn stream_events(
     // Popups waiting on the user are transients too: one event per popup.
     let mut notification_rx = state.notification_service.subscribe_user_notifications();
     let notification_subscribed = subscribed_topics.contains(UiEventTopics::USER_NOTIFICATION);
+    // Each step of bringing a cloud session's machine up, for the wait's
+    // loading indicator.
+    let mut cloud_rx = state.cloud_sessions.subscribe();
+    let cloud_subscribed = subscribed_topics.contains(UiEventTopics::CLOUD_SESSION);
     let index_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_INDEX);
     let cwd = query
         .cwd
@@ -175,6 +179,19 @@ pub(super) async fn stream_events(
                             &mut signatures,
                         ).await {
                             break;
+                        }
+                    }
+                    cloud = cloud_rx.recv(), if cloud_subscribed => {
+                        match cloud {
+                            Ok(event) => {
+                                if !send_event(&sender, "cloud_session", &event).await {
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "cloud session stream lagged; dropping events");
+                            }
+                            Err(RecvError::Closed) => {}
                         }
                     }
                     lifecycle = lifecycle_rx.recv(), if lifecycle_subscribed => {

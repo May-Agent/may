@@ -317,6 +317,14 @@ pub async fn start(
         browser_lifecycle_tx,
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
+        cloud_sessions: Arc::new(
+            super::cloud_sessions::CloudSessions::load(
+                db_for_archive.clone(),
+                super::cloud_sessions::GitHubCloud,
+            )
+            .await
+            .context("failed to read the cloud sessions")?,
+        ),
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
             ui_event_bus.clone(),
@@ -559,6 +567,7 @@ fn api_routes() -> Route {
                 "/{id}/remotes".at(get_profile_remote_servers),
                 "/{id}/remotes".put(set_profile_remote_servers),
                 "/{id}/cloud/codespaces".put(set_profile_codespaces),
+                "/{id}/cloud/codespaces/catalog".post(super::sessions::cloud_catalog),
                 "/{id}/cloud/codespaces".delete(remove_profile_codespaces),
             ))),
         )),
@@ -698,10 +707,13 @@ pub(super) fn build_router(
     let artifact_pages = "/profile".route(artifact_page_routes());
     let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());
 
-    // Layers run outermost-first in registration order.
+    // Layers run outermost-first in registration order: the access policy,
+    // then the relay of cloud sessions to their codespace daemons.
+    let relay = super::cloud_sessions::CloudSessionRelay::new(state.cloud_sessions.clone());
     match mode {
         DaemonMode::Rest => Route::new((api, tunnel, artifact_pages))
             .layer(policy)
+            .layer(relay)
             .layer(fallback)
             .middleware(State(state))
             .build(),
@@ -715,13 +727,14 @@ pub(super) fn build_router(
                     EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
                 ))
                 .layer(policy)
+                .layer(relay)
                 .layer(fallback)
                 .middleware(State(state))
                 .build()
             }
             #[cfg(not(feature = "ui"))]
             {
-                let _ = api;
+                let _ = (api, relay);
                 panic!(
                     "`may ui` should fail before router construction when the `ui` feature is disabled"
                 );

@@ -885,6 +885,9 @@ pub struct ApiSession {
     /// `/api/sessions/{id}/events`, read before the session itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cursor: Option<String>,
+    /// The cloud machine the session lives on; absent for this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) location: Option<SessionLocation>,
 }
 
 impl ApiSession {
@@ -909,6 +912,7 @@ impl ApiSession {
             runtime: summary.runtime.clone().into(),
             repo: summary.repo.clone(),
             cursor: None,
+            location: None,
         }
     }
 
@@ -925,6 +929,7 @@ impl ApiSession {
             runtime: crate::session::SessionRuntimeSummary::default().into(),
             repo: None,
             cursor: None,
+            location: None,
         }
     }
 }
@@ -954,6 +959,116 @@ pub struct CreateSessionRequest {
     /// repo-less chat.
     #[serde(default)]
     pub(crate) repo: Option<String>,
+    /// Runs the session entirely on a cloud machine of the profile's
+    /// provider, on the machine type named; absent for a session on this
+    /// machine.
+    #[serde(default)]
+    pub(crate) cloud: Option<CloudSessionRequest>,
+}
+
+/// The cloud machine a new session runs on.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSessionRequest {
+    /// The catalog's machine type name.
+    pub machine_type: String,
+}
+
+/// Where a session's home environment is, when it is not this machine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLocation {
+    /// The cloud provider.
+    pub provider: CloudProviderName,
+    /// The provider's name of the machine.
+    pub machine: String,
+    /// The machine type it was created on.
+    pub machine_type: String,
+}
+
+/// A cloud provider, as the API names it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, skyzen::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudProviderName {
+    /// GitHub Codespaces.
+    Codespaces,
+}
+
+/// `POST /api/profiles/{id}/cloud/codespaces/catalog` request body.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCatalogRequest {
+    /// The repository the session binds, `owner/repo`; absent for none.
+    #[serde(default)]
+    pub(crate) repo: Option<String>,
+}
+
+/// The machine types a cloud session may start on.
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCatalogResponse {
+    /// The provider's catalog for the repository's codespaces.
+    pub machines: Vec<crate::cloud::MachineType>,
+}
+
+/// One step of bringing a cloud session's machine to serve it, pushed as
+/// the `cloud_session` event kind for the clients' loading indicator.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSessionEvent {
+    /// The session.
+    pub session_id: String,
+    /// What is happening.
+    pub phase: CloudSessionPhase,
+    /// The machine's state as the provider reported it, while it settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_state: Option<crate::cloud::MachineState>,
+    /// Why it failed, for [`CloudSessionPhase::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The steps of bringing a cloud session's machine to serve it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSessionPhase {
+    /// The machine is being created.
+    Creating,
+    /// The machine is starting or settling.
+    Starting,
+    /// Checking which May the machine has.
+    Checking,
+    /// Downloading the May the machine needs.
+    Downloading,
+    /// Installing May on the machine.
+    Installing,
+    /// Cloning the session's repository onto the machine.
+    Cloning,
+    /// Starting the machine's May daemon.
+    StartingDaemon,
+    /// Connecting to the machine's May daemon.
+    Connecting,
+    /// The machine serves the session.
+    Ready,
+    /// Bringing the machine up failed.
+    Failed,
+}
+
+impl From<crate::cloud::bootstrap::BootstrapStep> for CloudSessionPhase {
+    fn from(step: crate::cloud::bootstrap::BootstrapStep) -> Self {
+        use crate::cloud::bootstrap::BootstrapStep;
+        match step {
+            BootstrapStep::Checking => Self::Checking,
+            BootstrapStep::Downloading => Self::Downloading,
+            BootstrapStep::Installing => Self::Installing,
+            BootstrapStep::Cloning => Self::Cloning,
+            BootstrapStep::StartingDaemon => Self::StartingDaemon,
+        }
+    }
 }
 
 /// Request to truncate a session's history at a stored row.

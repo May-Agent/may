@@ -210,7 +210,7 @@ impl fmt::Display for MachineId {
 }
 
 /// One machine type of a provider's catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineType {
     /// The provider's name of the type, which a create or resize names.
@@ -247,7 +247,7 @@ pub struct CloudMachine {
 }
 
 /// Where a machine is in its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineState {
     /// Being created, started, stopped or changed; it settles on its own.

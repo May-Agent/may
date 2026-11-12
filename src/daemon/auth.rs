@@ -402,3 +402,23 @@ impl IdentitySource for FrontingTokenIdentitySource {
         Scheme::Http
     }
 }
+
+/// Whether the request was relayed by the daemon fronting this cloud home:
+/// its identity came from [`FrontingTokenIdentitySource`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fronted(pub bool);
+
+impl skyzen::extract::Extractor for Fronted {
+    type Error = std::convert::Infallible;
+
+    fn extract(
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
+        std::future::ready(Ok(Self(
+            request
+                .extensions()
+                .get::<Identity>()
+                .is_some_and(|identity| identity.source == IdentitySourceKind::FrontingDaemon),
+        )))
+    }
+}
