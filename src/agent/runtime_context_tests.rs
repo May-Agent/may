@@ -259,18 +259,63 @@ fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -
 }
 
 #[test]
-fn the_work_section_names_the_issue_backend() {
-    let work = build_work(&crate::issue::IssueBackendInfo {
+fn the_computer_skill_is_listed_only_where_computer_is_registered() {
+    let dir = tempdir().expect("temp dir should be created");
+    let skill_dir = dir.path().join("computer");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        include_str!("../../skills/computer/SKILL.md"),
+    )
+    .expect("write skill");
+    let render = |commands: &[(String, String)]| {
+        tokio_test::block_on(build_capabilities(
+            commands,
+            &[],
+            &Parameters::default(),
+            dir.path(),
+        ))
+        .expect("capabilities render")
+    };
+
+    let with = render(&[("computer".to_string(), "the desktop".to_string())]);
+    assert!(with.contains("`skills/computer/SKILL.md`"), "{with}");
+    let without = render(&[("browser".to_string(), "pages".to_string())]);
+    assert!(!without.contains("skills/computer/SKILL.md"), "{without}");
+}
+
+#[test]
+fn the_pr_landing_rule_is_rendered_only_for_a_session_with_a_clone() {
+    let issues = crate::issue::IssueBackendInfo {
         name: "may",
         repository: None,
-    });
+    };
+    let with_clone = build_work(&issues, true);
+    assert!(
+        with_clone.contains("Land code with the `pr` command"),
+        "{with_clone}"
+    );
+    let direct = build_work(&issues, false);
+    assert!(!direct.contains("Land code with"), "{direct}");
+    assert!(!direct.contains("source checkout"), "{direct}");
+}
+
+#[test]
+fn the_work_section_names_the_issue_backend() {
+    let work = build_work(
+        &crate::issue::IssueBackendInfo {
+            name: "may",
+            repository: None,
+        },
+        false,
+    );
     assert!(work.contains("`issue` command (may backend)"), "{work}");
 
     let github = crate::issue::IssueBackendInfo {
         name: "github",
         repository: Some("May-Agent/may".to_string()),
     };
-    let work = build_work(&github);
+    let work = build_work(&github, false);
     assert!(work.contains("`issue` command (github backend)"), "{work}");
     assert!(!work.contains("May-Agent/may"), "{work}");
 
@@ -618,7 +663,7 @@ fn rendered_instructions(
             super::build_terminal(&AgentEnvironment::Local),
         )
         .with_instruction(tag::EFFICIENCY, build_efficiency(&[]))
-        .with_instruction(tag::WORK, build_work(&issues))
+        .with_instruction(tag::WORK, build_work(&issues, true))
         .with_instruction(
             tag::SESSION,
             super::build_session(

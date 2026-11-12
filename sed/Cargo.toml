@@ -1,0 +1,25 @@
+[package]
+name = "may-sed"
+version = "0.1.0"
+edition = "2024"
+authors = ["Lexo Liu <me@lexo.cool>"]
+description = "The read-only sed that prints line ranges in sandboxed agent scripts"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+readme = "README.md"
+keywords = ["sed", "sandbox", "agent", "tooling"]
+categories = ["command-line-utilities"]
+publish = false
+
+[dependencies]
+thiserror = "2"
+
+[[bin]]
+name = "aither-sed"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -153,8 +153,12 @@ enum RemoteAccessCommand {
 pub struct RemoteAccessManager {
     command_tx: mpsc::Sender<RemoteAccessCommand>,
     status_rx: watch::Receiver<RemoteAccessStatusResponse>,
-    /// The daemon's remote TCP address, once it listens.
-    local_addr: watch::Sender<Option<SocketAddr>>,
+    /// The remote listener's address, once it listens: the address
+    /// `tailscale serve` forwards to.
+    remote_listener_addr: watch::Sender<Option<SocketAddr>>,
+    /// The address the local listener is bound to, once it listens: the
+    /// address links meant for this machine name.
+    local_listener_addr: watch::Sender<Option<SocketAddr>>,
     /// The router of the public Funnel listener, once built.
     webhook_router: watch::Sender<Option<Arc<skyzen::routing::Router>>>,
     /// Accepts `Tailscale-User-Login` identities the tailnet is allowed to use;
@@ -173,14 +177,15 @@ impl RemoteAccessManager {
     pub(crate) fn new(ui_event_bus: UiEventBus) -> Self {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
-        let (local_addr, local_addr_rx) = watch::channel(None);
+        let (remote_listener_addr, remote_listener_addr_rx) = watch::channel(None);
+        let (local_listener_addr, _) = watch::channel(None);
         let (webhook_router, webhook_router_rx) = watch::channel(None);
         let tailscale_identity =
             super::auth::TailscaleServeIdentitySource::new(std::collections::HashSet::default());
         tokio::spawn(run_remote_access_actor(
             command_rx,
             status_tx,
-            local_addr_rx,
+            remote_listener_addr_rx,
             webhook_router_rx,
             ui_event_bus,
             tailscale_identity.clone(),
@@ -188,7 +193,8 @@ impl RemoteAccessManager {
         Self {
             command_tx,
             status_rx,
-            local_addr,
+            remote_listener_addr,
+            local_listener_addr,
             webhook_router,
             tailscale_identity,
         }
@@ -205,15 +211,20 @@ impl RemoteAccessManager {
         self.tailscale_identity.clone()
     }
 
-    /// Records the TCP address the daemon serves on; remote access forwards
-    /// to its port on loopback.
-    pub(crate) fn set_local_addr(&self, addr: SocketAddr) {
-        self.local_addr.send_replace(Some(addr));
+    /// Records the remote listener's address; remote access forwards to its
+    /// port on loopback.
+    pub(crate) fn set_remote_listener_addr(&self, addr: SocketAddr) {
+        self.remote_listener_addr.send_replace(Some(addr));
     }
 
-    /// The daemon's TCP address, once it listens.
-    pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
-        *self.local_addr.borrow()
+    /// Records the address the local listener is actually bound to.
+    pub(crate) fn set_local_listener_addr(&self, addr: SocketAddr) {
+        self.local_listener_addr.send_replace(Some(addr));
+    }
+
+    /// The local listener's bound address, once it listens.
+    pub(crate) fn local_listener_addr(&self) -> Option<SocketAddr> {
+        *self.local_listener_addr.borrow()
     }
 
     pub(crate) fn snapshot(&self) -> RemoteAccessStatusResponse {
@@ -315,7 +326,7 @@ async fn has_local_profile(db: &ChatDb) -> Result<bool, crate::db::ChatDbError> 
 async fn run_remote_access_actor(
     mut command_rx: mpsc::Receiver<RemoteAccessCommand>,
     status_tx: watch::Sender<RemoteAccessStatusResponse>,
-    local_addr: watch::Receiver<Option<SocketAddr>>,
+    remote_listener_addr: watch::Receiver<Option<SocketAddr>>,
     webhook_router: watch::Receiver<Option<Arc<skyzen::routing::Router>>>,
     ui_event_bus: UiEventBus,
     tailscale_identity: super::auth::TailscaleServeIdentitySource,
@@ -330,7 +341,7 @@ async fn run_remote_access_actor(
                 let Some(command) = command else { break };
                 match command {
                     RemoteAccessCommand::Sync { config, has_local_profile, response } => {
-                        let addr = *local_addr.borrow();
+                        let addr = *remote_listener_addr.borrow();
                         runtime.status.accepted =
                             Some(refresh_allow_list(&tailscale_identity, &config).await);
                         let router = webhook_router.borrow().clone();
@@ -538,7 +549,7 @@ async fn sync_runtime(
     runtime: &mut RemoteAccessRuntime,
     config: RemoteAccessConfig,
     has_local_profile: bool,
-    local_addr: Option<SocketAddr>,
+    remote_listener_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
     runtime.status.enabled = config.enabled;
     if !config.enabled {
@@ -547,7 +558,7 @@ async fn sync_runtime(
         return Ok(());
     }
 
-    let spec = serve_spec(&config, has_local_profile, local_addr)?;
+    let spec = serve_spec(&config, has_local_profile, remote_listener_addr)?;
     if runtime.serving.as_ref() == Some(&spec) && check_serving(&spec).await.is_ok() {
         runtime.status.state = RemoteAccessState::Running;
         runtime.status.last_error = None;
@@ -598,7 +609,7 @@ async fn stop_runtime(runtime: &mut RemoteAccessRuntime) -> Result<(), String> {
 fn serve_spec(
     config: &RemoteAccessConfig,
     has_local_profile: bool,
-    local_addr: Option<SocketAddr>,
+    remote_listener_addr: Option<SocketAddr>,
 ) -> Result<ServeSpec, String> {
     if has_local_profile && !config.allow_local_environment {
         return Err(
@@ -606,7 +617,7 @@ fn serve_spec(
                 .to_string(),
         );
     }
-    let port = local_addr
+    let port = remote_listener_addr
         .map(|addr| addr.port())
         .ok_or_else(|| "the May daemon is not listening on TCP yet".to_string())?;
     Ok(ServeSpec {

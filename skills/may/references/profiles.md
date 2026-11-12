@@ -9,6 +9,7 @@ A profile groups sessions and sets where their agents run. Three exist from the 
 - Persona: free text added to the system prompt for sessions in that profile.
 - Location awareness: whether the user's inferred city is given to the agent.
 - Attached SSH servers, chosen from `ssh_servers` in the config; the agent reaches them through the terminal's `location`. A name no longer configured is skipped with a warning.
+- The cloud provider account its cloud machines are created in: the GitHub account for Codespaces, set up with `/cloud` (see `slash-commands.md`). Deleting the profile removes it.
 - A pinned limit (10 by default) on pinned sessions plus folders.
 - Per-profile files under `~/.may/profiles/<id>/`: `workspace.toml` (approved directories and repository trust), memories, skills and the session directories.
 

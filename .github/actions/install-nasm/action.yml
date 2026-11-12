@@ -2,8 +2,8 @@ name: Install nasm
 description: Put the pinned nasm on PATH, restored from the Actions cache and downloaded from an Ubuntu mirror only on a miss, never through apt.
 inputs:
   save:
-    description: Whether a cache miss saves the download. Only dev saves caches, as in the Rust caches.
-    default: ${{ github.ref == 'refs/heads/dev' }}
+    description: Whether a cache miss saves the download. Only main saves caches, as in the Rust caches.
+    default: ${{ github.ref == 'refs/heads/main' }}
 runs:
   using: composite
   steps:

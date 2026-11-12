@@ -456,7 +456,7 @@ pub async fn btw_inner(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let side = super::aux::side_context(state, session_id)
+    let side = super::sidecar::side_context(state, session_id)
         .await
         .map_err(internal_error)?;
     let llm = if let Some(side) = side {
