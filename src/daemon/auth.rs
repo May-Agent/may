@@ -187,7 +187,9 @@ fn has_addressed_origin_or_none(request: &Request, scheme: Scheme) -> bool {
     };
     let Some(addressed) = request_authority(request).and_then(|authority| {
         let host = url::Host::parse(authority.host()).ok()?;
-        let port = authority.port_u16().unwrap_or(scheme.default_port());
+        let port = authority
+            .port_u16()
+            .unwrap_or_else(|| scheme.default_port());
         Some(url::Origin::Tuple(scheme.name().to_owned(), host, port))
     }) else {
         return false;

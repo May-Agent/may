@@ -446,7 +446,7 @@ async fn an_identified_tunnel_referer_request_still_reaches_the_tunnel() {
     );
 }
 
-/// The node's MagicDNS name, the `Host` a browser sends through `tailscale
+/// The node's `MagicDNS` name, the `Host` a browser sends through `tailscale
 /// serve --https=443`.
 const SERVE_HOST: &str = "mac.tail1234.ts.net";
 /// The web UI's origin through `tailscale serve --https=443`.
