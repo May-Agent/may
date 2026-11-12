@@ -202,5 +202,23 @@ mod tests {
         assert!(text.contains("at most 120 minutes"), "{text}");
         assert!(text.contains("up to 10 seconds"), "{text}");
         assert!(text.contains("`terminal_read`"), "{text}");
+        assert!(
+            text.contains("A foreground command reads end of file on stdin"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Only a job started with `background: true` has a stdin"),
+            "{text}"
+        );
+        assert!(!text.contains("(stdin)"), "{text}");
+    }
+
+    #[test]
+    fn the_input_description_limits_input_to_background_jobs() {
+        let budgets = ShellBudgets::of(&ShellSettings::default());
+        let settings = shell_tool_settings(&budgets);
+        let text = &settings.input.description;
+        assert!(text.contains("started with `background: true`"), "{text}");
+        assert!(text.contains("reads end of file"), "{text}");
     }
 }
