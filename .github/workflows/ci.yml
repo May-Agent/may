@@ -191,10 +191,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Restores the `test` job's cache of the same OS and saves none of its
+      # own (see the `test` action).
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: ci-verify-tools
+          save-if: false
+          shared-key: ${{ runner.os == 'macOS' && 'test-macos' || 'test-ubuntu' }}
       # See the `test` action.
       - name: Drop restored test scratch
         shell: bash
@@ -243,10 +245,12 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Restores the Linux `test` job's cache and saves none of its own (see
+      # the `test` action).
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: ci-container-acceptance
+          save-if: false
+          shared-key: test-ubuntu
       - name: Drop restored test scratch
         run: |
           chmod -R u+w target/tmp 2>/dev/null || true

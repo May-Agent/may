@@ -19,7 +19,10 @@ runs:
       run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
     - uses: dtolnay/rust-toolchain@stable
     # Only main saves; a PR or merge-group cache lives in a scope nothing else
-    # restores, and its size evicts main's under the cache limit.
+    # restores, and its size evicts main's under the cache limit. Keyed by the
+    # job id (`test-ubuntu`, `test-macos`), it is the one Rust cache per OS that
+    # `verify-tools` and `container-acceptance` restore too, so main's caches
+    # fit under the limit together.
     - uses: Swatinem/rust-cache@v2
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
