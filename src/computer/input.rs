@@ -30,7 +30,10 @@ pub enum InputError {
     #[error("keyboard input without a code or text")]
     NoKey,
     /// The code is not a W3C `KeyboardEvent.code` value.
-    #[error("unknown key code {0:?}")]
+    #[error(
+        "unknown key {0:?}: a key is named by its W3C KeyboardEvent.code value, such as \
+         ArrowRight, Backspace, Delete, Escape, Home, PageDown, KeyA or Digit1"
+    )]
     UnknownCode(String),
     /// The modifier bitmap has bits beyond Alt, Ctrl, Meta and Shift.
     #[error("unknown modifier bits {0:#x}")]
@@ -359,10 +362,14 @@ mod tests {
 
     #[test]
     fn unmappable_keyboard_input_is_an_error() {
-        assert!(matches!(
-            keyboard(r#"{"type":"keyboard","eventType":"keyDown","code":"Nonsense"}"#),
-            Err(InputError::UnknownCode(_))
-        ));
+        let refused = keyboard(r#"{"type":"keyboard","eventType":"keyDown","code":"right"}"#)
+            .expect_err("`right` is not a KeyboardEvent.code value");
+        assert!(matches!(refused, InputError::UnknownCode(_)));
+        assert_eq!(
+            refused.to_string(),
+            "unknown key \"right\": a key is named by its W3C KeyboardEvent.code value, such as \
+             ArrowRight, Backspace, Delete, Escape, Home, PageDown, KeyA or Digit1"
+        );
         assert!(matches!(
             keyboard(r#"{"type":"keyboard","eventType":"keyDown"}"#),
             Err(InputError::NoKey)

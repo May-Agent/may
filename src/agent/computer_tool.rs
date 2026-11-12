@@ -55,8 +55,11 @@ pub struct ComputerArgs {
     /// - `scroll DX DY`: pixel deltas at the pointer
     /// - `type REF TEXT`: focus the element REF names, then type TEXT
     /// - `type TEXT`: type at the focused element
-    /// - `key KEY` or `key MOD+MOD+KEY`: `Enter`, `Tab`, `ArrowLeft`, `F5`,
-    ///   a letter or digit, `cmd+l`, `cmd+shift+4`
+    /// - `key KEY` or `key MOD+MOD+KEY`: KEY is a W3C `KeyboardEvent.code`
+    ///   name, exactly as written there (`Enter`, `Tab`, `Escape`,
+    ///   `Backspace`, `Delete`, `ArrowLeft`/`ArrowRight`/`ArrowUp`/`ArrowDown`,
+    ///   `Home`, `End`, `PageUp`, `PageDown`, `F5`), or a single letter or
+    ///   digit; `cmd+l`, `cmd+shift+4`
     /// - `launch APP [URL ...]`: open an application on the desktop without
     ///   taking the user's focus; APP is its name, bundle id or `.app` path
     ///
