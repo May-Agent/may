@@ -15,9 +15,10 @@ mod manifest;
 
 /// The manifest files the workspace image's tag hashes, through
 /// `manifest::combined_manifest_bytes`.
-const TOOL_DISTRIBUTION_MANIFESTS: [&str; 2] = [
-    "src/tools/tool-distribution-0.24.0.json",
+const TOOL_DISTRIBUTION_MANIFESTS: [&str; 3] = [
+    "src/tools/third-party-tools.json",
     "src/tools/tool-artifacts.json",
+    "src/tools/host-programs.json",
 ];
 
 fn main() {

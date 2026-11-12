@@ -50,9 +50,6 @@ aither-mcp = { version = "0.30.0" }
 aither-browser = { version = "0.30.0" }
 # Exact token counts (`LanguageModel::count_text`) for the decode meter.
 aither-openai = { version = "0.30.0", default-features = false, features = ["tokenizer"] }
-# Decides which `sed` forms a script may run (`may_sed::supports`); the host
-# `sed` runs them, and a script's other `sed` calls are refused.
-may-sed = { path = "sed" }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.
 aither-acp = { version = "0.30.0" }

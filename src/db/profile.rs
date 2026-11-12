@@ -529,7 +529,7 @@ impl ChatDb {
             };
 
             if def.slug == crate::profile::BUILD_PROFILE_SLUG {
-                fallback_id = Some(ensured.id.clone());
+                fallback_id = Some(ensured.id);
             }
         }
 

@@ -31,8 +31,9 @@ pub enum ManagedTool {
     Xargs,
     /// Fast file finder.
     Fd,
-    /// `aither-sed`, the `sed` of terminal scripts, which only prints line
-    /// ranges. Its manifest id is its executable's name, as
+    /// `aither-sed`, the `sed` of terminal scripts, which refuses every form
+    /// that writes a file or runs a command, reached as `sed` through
+    /// [`ManagedTool::aliases`]. Its manifest id is its executable's name, as
     /// `patch/built-tools.json` names it.
     #[serde(rename = "aither-sed")]
     Sed,
@@ -194,13 +195,23 @@ impl ManagedTool {
     }
 
     /// Commands exposed as relative symlinks `bin/<alias> -> <command>` to
-    /// this tool's executable; empty for every tool but `coreutils`.
+    /// this tool's executable; empty for every tool but `coreutils` and
+    /// `aither-sed`, whose `sed` alias puts May's sed ahead of the host's
+    /// on the managed `PATH`.
     #[must_use]
     pub const fn aliases(self) -> &'static [&'static str] {
         match self {
             Self::Coreutils => COREUTILS_ALIASES,
+            Self::Sed => &["sed"],
             _ => &[],
         }
+    }
+
+    /// Whether the executable reports its aliases in `--list`, which the
+    /// preparation checks it provides every one of: a multicall binary does,
+    /// a program with one alias of its own name does not.
+    const fn lists_aliases(self) -> bool {
+        matches!(self, Self::Coreutils)
     }
 
     pub(crate) fn executable_name(self, target: &ToolTarget) -> String {
@@ -769,7 +780,7 @@ impl ToolBundle {
             if !binary.tool.aliases().is_empty() {
                 // A foreign target's executable cannot run here; an image
                 // build for one stages the aliases unchecked.
-                if self.target == ToolTarget::native()? {
+                if binary.tool.lists_aliases() && self.target == ToolTarget::native()? {
                     ensure_aliases_provided(binary.tool, &path)?;
                 }
                 for alias in binary.tool.aliases() {
@@ -2102,8 +2113,23 @@ printf '%s\n' 'uv @VERSION@'
         }
         for excluded in ["grep", "sed", "awk", "find", "xargs", "fd", "[", "stdbuf"] {
             assert!(!COREUTILS_ALIASES.contains(&excluded), "{excluded}");
+        }
+        for excluded in ["grep", "awk", "find", "xargs", "fd", "[", "stdbuf"] {
             assert!(!alias_path(&prepared, excluded).is_symlink(), "{excluded}");
         }
+    }
+
+    /// `sed` leads the managed `PATH` as a link to `aither-sed`, so the host's
+    /// `sed` never runs in a script.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sed_is_a_relative_link_to_aither_sed() {
+        let cache = unlocking_tempdir();
+        let prepared = bundle().prepare_local(cache.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read_link(alias_path(&prepared, "sed")).unwrap(),
+            Path::new("aither-sed")
+        );
     }
 
     #[cfg(unix)]

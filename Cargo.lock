@@ -672,7 +672,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -2492,7 +2492,7 @@ dependencies = [
  "openssl-sys",
  "schannel",
  "socket2 0.6.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2508,7 +2508,7 @@ dependencies = [
  "openssl-sys",
  "pkg-config",
  "vcpkg",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2817,7 +2817,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3135,7 +3135,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5854,7 +5854,6 @@ dependencies = [
  "linkify",
  "lzma-rust2 0.24.0",
  "may-patch",
- "may-sed",
  "may-tasks",
  "mediax-codec",
  "mime",
@@ -5929,7 +5928,7 @@ dependencies = [
 
 [[package]]
 name = "may-patch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "askama 0.16.1",
  "tempfile",
@@ -5938,13 +5937,12 @@ dependencies = [
 
 [[package]]
 name = "may-sed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "askama 0.16.1",
  "clap",
  "sed",
  "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -6537,7 +6535,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8055,7 +8053,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -8094,9 +8092,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8895,7 +8893,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8954,7 +8952,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9196,7 +9194,7 @@ checksum = "609c5606d9d357b26e4ee1a7a01beac396628d0fa01ebbade2a09cefb88e65af"
 dependencies = [
  "fastrand",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10415,7 +10413,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10473,7 +10471,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11619,7 +11617,7 @@ dependencies = [
 [[package]]
 name = "waterkit-automation"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d424ac82f73ed6a1e60461f05110102736a1c236"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#ed47dc161f49a3f09b6d75b095fed4f608f2aaf8"
 dependencies = [
  "block2",
  "dispatch2",
@@ -11633,6 +11631,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-core-services",
  "objc2-foundation",
+ "objc2-io-kit",
  "thiserror 2.0.21",
  "tracing",
  "waterkit-core",
@@ -11641,7 +11640,7 @@ dependencies = [
 [[package]]
 name = "waterkit-build"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d424ac82f73ed6a1e60461f05110102736a1c236"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#ed47dc161f49a3f09b6d75b095fed4f608f2aaf8"
 dependencies = [
  "futures-channel",
  "jni",
@@ -11652,7 +11651,7 @@ dependencies = [
 [[package]]
 name = "waterkit-core"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d424ac82f73ed6a1e60461f05110102736a1c236"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#ed47dc161f49a3f09b6d75b095fed4f608f2aaf8"
 dependencies = [
  "dispatch2",
  "executor-core",
@@ -11668,7 +11667,7 @@ dependencies = [
 [[package]]
 name = "waterkit-permission"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d424ac82f73ed6a1e60461f05110102736a1c236"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#ed47dc161f49a3f09b6d75b095fed4f608f2aaf8"
 dependencies = [
  "async-channel",
  "async-io",
@@ -11706,7 +11705,7 @@ dependencies = [
 [[package]]
 name = "waterkit-screen"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d424ac82f73ed6a1e60461f05110102736a1c236"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#ed47dc161f49a3f09b6d75b095fed4f608f2aaf8"
 dependencies = [
  "async-channel",
  "block2",
@@ -12131,7 +12130,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

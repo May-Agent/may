@@ -741,7 +741,7 @@ pub fn build_session(
 #[template(path = "prompt/terminal.md", escape = "none")]
 struct TerminalTemplate {
     /// Whether scripts run in the managed bash, which May's command policy
-    /// confines to `rg`, `fd` and line-range `sed`.
+    /// confines to `rg`, `fd` and a `sed` that writes no file.
     managed_bash: bool,
 }
 

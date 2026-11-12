@@ -126,8 +126,7 @@ impl SubagentTracker {
                 let counters = self
                     .usage
                     .get(&info.id)
-                    .map(|usage| Arc::clone(&usage.counters))
-                    .unwrap_or_default();
+                    .map_or_default(|usage| Arc::clone(&usage.counters));
                 SubagentRunSnapshot {
                     run_id: info.id,
                     agent: info.name,

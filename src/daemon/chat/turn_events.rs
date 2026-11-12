@@ -211,8 +211,7 @@ pub(super) fn provider_cache_lifetime(
         .load()
         .provider
         .get(provider_id)
-        .map(|instance| instance.cache_lifetime)
-        .unwrap_or_default()
+        .map_or_default(|instance| instance.cache_lifetime)
 }
 
 /// The prompt-cache block size `provider_id` publishes, `None` where it

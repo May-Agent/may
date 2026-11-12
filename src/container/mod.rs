@@ -106,15 +106,14 @@ pub(crate) fn select_ipc_gateway(
         .network_settings
         .as_ref()
         .and_then(|settings| settings.networks.as_ref())
-        .map(|networks| {
+        .map_or_default(|networks| {
             networks
                 .values()
                 .filter_map(|endpoint| endpoint.gateway.as_deref())
                 .filter(|gateway| !gateway.trim().is_empty())
                 .map(str::to_string)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     gateways.sort_unstable();
     gateways.dedup();
     match gateways.as_slice() {

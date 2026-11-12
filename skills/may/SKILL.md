@@ -15,7 +15,7 @@ What the user sees and sets. Read the file for the area a question touches.
 - `references/configuration.md`: `~/.may/config.toml` settings, providers and setting up a model.
 - `references/clients.md`: the `may` command line, the TUI and the web UI.
 - `references/profiles.md`: profiles, pinning, folders and archiving.
-- `references/tools-and-runtimes.md`: the managed bash, the tools and Python May provides, PATH order and uv.
+- `references/tools-and-runtimes.md`: the managed bash, the tools and Python May provides, PATH order and uv, and the session desktop (`computer`).
 - `references/sleep.md`: `/sleep`, waking and the health reminder.
 - `references/remote-access.md`: Tailscale remote access, allowed logins and Funnel.
 
