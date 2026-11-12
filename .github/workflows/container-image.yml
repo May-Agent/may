@@ -1,22 +1,11 @@
 name: Container image
 
 # CI calls this workflow ahead of the tests that pull its image, for every
-# pull request, merge group and dev push that selects the tests, so the only
-# standalone trigger left is a push to main. The caller's concurrency group
-# cancels a superseded pull request run, called jobs included.
+# pull request, merge group and main push that selects the tests. The caller's
+# concurrency group cancels a superseded pull request run, called jobs
+# included.
 on:
   workflow_call:
-  push:
-    branches: [main]
-    paths:
-      - 'container/**'
-      - 'src/tools/*.json'
-      - 'src/container/image_ref.rs'
-      - 'tasks/**'
-      - 'build.rs'
-      - 'Cargo.lock'
-      - 'examples/container_image.rs'
-      - '.github/workflows/container-image.yml'
 
 permissions:
   contents: read
@@ -42,9 +31,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - id: refs
         run: cargo run --locked --example container_image --timings -- refs >> "$GITHUB_OUTPUT"
       - name: Upload cargo timings
@@ -166,9 +153,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: steps.exists.outputs.exists != 'true' && runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: Stage the workspace context
         if: steps.exists.outputs.exists != 'true'
         run: cargo run --locked --example container_image --timings -- stage ${{ matrix.arch }} ./container/workspace

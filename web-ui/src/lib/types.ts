@@ -17,7 +17,8 @@ export type ApiErrorCode =
   | 'managed_podman_approval_required'
   | 'location_unavailable'
   | 'github_unauthenticated'
-  | 'repo_declined';
+  | 'repo_declined'
+  | 'loop_stopped';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =

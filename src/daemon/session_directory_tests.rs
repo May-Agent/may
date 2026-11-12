@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use skyzen::{Request, StatusCode};
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::sessions::resolve_repo_binding;
 use super::state::DaemonState;
@@ -25,7 +26,7 @@ impl Host {
                 .await
                 .expect("daemon state"),
         );
-        let router = build_router(state.clone(), DaemonMode::Rest, None);
+        let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
         Self {
             _home: home,
             state,

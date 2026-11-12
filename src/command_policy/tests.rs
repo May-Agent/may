@@ -364,6 +364,19 @@ async fn the_scripts_own_shell_runs_no_host_grep_awk_or_find() {
 }
 
 #[tokio::test]
+async fn the_session_find_subcommand_runs_in_the_managed_bash() {
+    for script in [
+        "session find canary",
+        "session \"find canary\" --ignore-case --context 2",
+        "session \"find deploy\" --count | rg alpha",
+        "echo $(session \"find canary\" --session-id alpha)",
+    ] {
+        let decision = decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await;
+        assert_eq!(decision, ScriptDecision::Pass, "`{script}` runs");
+    }
+}
+
+#[tokio::test]
 async fn sed_runs_only_in_the_forms_the_managed_sed_prints() {
     for script in [
         "sed -n '2,3p' file",

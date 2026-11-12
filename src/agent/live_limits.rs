@@ -1,6 +1,7 @@
 //! Limits every agent of the daemon shares and a saved config change moves
 //! while they run.
 
+use super::LoopLimits;
 use crate::config::MayConfig;
 use crate::harness::disk::DiskThresholds;
 use crate::shell::ShellBudgets;
@@ -15,6 +16,7 @@ pub struct LiveLimits {
     disk: DiskThresholds,
     tasks_lines: LineLimit,
     shell: ShellBudgets,
+    loops: LoopLimits,
 }
 
 impl LiveLimits {
@@ -25,6 +27,7 @@ impl LiveLimits {
             disk: DiskThresholds::default(),
             tasks_lines: LineLimit::default(),
             shell: ShellBudgets::of(&config.shell),
+            loops: LoopLimits::default(),
         };
         limits.apply(config);
         limits
@@ -40,6 +43,13 @@ impl LiveLimits {
         );
         self.tasks_lines.set(config.tasks.line_limit);
         self.shell.apply(&config.shell);
+        self.loops.set(config.loop_detection);
+    }
+
+    /// The thresholds every agent's loop detection counts to.
+    #[must_use]
+    pub fn loops(&self) -> LoopLimits {
+        self.loops.clone()
     }
 
     /// The time bounds and output budgets every shell is built with.
@@ -114,6 +124,42 @@ mod tests {
         config.tasks.line_limit = 90;
         limits.apply(&config);
         assert_eq!(built_with.get(), 90);
+    }
+
+    #[test]
+    fn a_config_change_moves_the_loop_thresholds_agents_were_built_with() {
+        let mut config = MayConfig::default();
+        let limits = LiveLimits::of(&config);
+        let built_with = limits.loops();
+        assert_eq!(
+            built_with.get(),
+            crate::config::LoopDetectionSettings::default()
+        );
+
+        config.loop_detection =
+            toml::from_str("cycle_alert = 3\ncycle_end = 4\nfailure_alert = 6\nfailure_end = 7\n")
+                .expect("the section parses");
+        limits.apply(&config);
+        assert_eq!(
+            built_with.get(),
+            crate::config::LoopDetectionSettings {
+                cycle_alert: 3,
+                cycle_end: 4,
+                failure_alert: 6,
+                failure_end: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn the_loop_detection_section_keeps_the_defaults_it_does_not_set() {
+        let config: MayConfig =
+            toml::from_str("[loop_detection]\ncycle_end = 20\n").expect("the settings parse");
+        let defaults = crate::config::LoopDetectionSettings::default();
+        assert_eq!(config.loop_detection.cycle_end, 20);
+        assert_eq!(config.loop_detection.cycle_alert, defaults.cycle_alert);
+        assert_eq!(config.loop_detection.failure_alert, defaults.failure_alert);
+        assert_eq!(config.loop_detection.failure_end, defaults.failure_end);
     }
 
     #[test]

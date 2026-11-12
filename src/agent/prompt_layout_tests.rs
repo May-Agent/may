@@ -271,3 +271,69 @@ async fn a_fresh_session_prompt_states_usage_without_type_names_and_no_landing_r
         assert!(!prefix.contains(name), "`{name}`:\n{prefix}");
     }
 }
+
+/// The system prefix of `session`'s first request.
+async fn system_prefix(session: &mut Session) -> String {
+    let messages = session
+        .agent
+        .preview_request_messages("Say hello.", [])
+        .await
+        .expect("the request previews");
+    messages
+        .first()
+        .expect("a system message")
+        .content()
+        .to_string()
+}
+
+#[tokio::test]
+async fn messaging_commands_carry_their_usage_only_in_a_session_with_agent_messaging() {
+    crate::test_support::install_global_executor();
+    let may_dir = tempfile::tempdir().expect("may dir");
+    let db = crate::db::ChatDb::open(&may_dir.path().join("history.db"))
+        .await
+        .expect("history.db opens");
+    let runtime_service = std::sync::Arc::new(crate::session::SessionRuntimeService::new(
+        db,
+        crate::ui_event_bus::UiEventBus::new(),
+        crate::session::MayHomePaths::new(may_dir.path().join("home")),
+    ));
+    let messaging = crate::agent_link::AgentMessaging {
+        directory: crate::agent_link::AgentDirectory::new(
+            runtime_service.clone(),
+            may_dir.path().to_path_buf(),
+            |_| {},
+        ),
+        runtime_service,
+        cache_lifetime: crate::agent_link::CacheLifetimes::new(|_| {
+            crate::cache_lifetime::CacheLifetime::default()
+        }),
+        forks: crate::agent_link::ForkHosts::default(),
+    };
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+
+    let mut with = Box::pin(Session::start_with_messaging(&config, messaging)).await;
+    let prefix = system_prefix(&mut with).await;
+    for command in ["agent", "btw", "subagent", "explore", "tasks"] {
+        assert!(
+            prefix.contains(&format!("<usage command=\"{command}\">")),
+            "`{command}` carries its usage:\n{prefix}"
+        );
+    }
+
+    let mut without = Box::pin(Session::start_with_runtime(&config)).await;
+    let prefix = system_prefix(&mut without).await;
+    for command in ["agent", "btw"] {
+        assert!(
+            !prefix.contains(&format!("<usage command=\"{command}\">")),
+            "`{command}` has no usage without agent messaging:\n{prefix}"
+        );
+    }
+    for command in ["subagent", "explore", "tasks"] {
+        assert!(
+            prefix.contains(&format!("<usage command=\"{command}\">")),
+            "`{command}` carries its usage:\n{prefix}"
+        );
+    }
+}

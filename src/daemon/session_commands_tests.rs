@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use skyzen::StatusCode;
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -88,7 +89,7 @@ async fn a_patch_applies_every_field_and_notifies_the_list_once() {
     let state = state().await;
     seed(&state).await;
     let mut events = state.ui_event_bus.subscribe();
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let (status, body) = call(
         &router,
@@ -125,7 +126,7 @@ async fn a_patch_applies_every_field_and_notifies_the_list_once() {
 async fn an_invalid_patch_changes_nothing() {
     let state = state().await;
     seed(&state).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let (status, _) = call(
         &router,
@@ -149,7 +150,7 @@ async fn an_invalid_patch_changes_nothing() {
 async fn a_queued_turn_appears_in_the_queue_and_deletes_by_id() {
     let state = state().await;
     seed(&state).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let (status, runtime) = call(
         &router,
@@ -236,7 +237,7 @@ async fn a_queued_turn_appears_in_the_queue_and_deletes_by_id() {
 async fn each_interaction_kind_reaches_its_approver() {
     let state = state().await;
     seed(&state).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     for kind in ["permission", "workspace"] {
         let (status, _) = call(
@@ -277,7 +278,7 @@ async fn each_interaction_kind_reaches_its_approver() {
 async fn the_actions_route_dispatches_and_rejects_unknown_names() {
     let state = state().await;
     seed(&state).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let (status, _) = call(
         &router,

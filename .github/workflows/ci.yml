@@ -2,11 +2,11 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev, main]
+    branches: [main, dev]
   merge_group:
-    branches: [dev]
+    branches: [main, dev]
   push:
-    branches: [dev]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,13 +17,10 @@ permissions:
 
 jobs:
   # Selects the jobs the change reads (.github/scripts/ci-scope.sh holds the
-  # path rules). The ruleset requires `fmt`, `clippy`, `web-ui`,
-  # `test (ubuntu-latest)` and `test (macos-latest)`; a job skipped by its
-  # job-level `if` reports success under its own name, which is why the test
-  # job exists once per runner with a literal name: a skipped matrix job
-  # reports the unexpanded `test (${{ matrix.os }})` and leaves the required
-  # names pending. Should this job itself fail, the others run, so a broken
-  # scope never skips coverage.
+  # path rules). The ruleset requires one check, `CI result`, which needs
+  # `fmt`, `clippy`, `web-ui` and both test jobs and passes when each of them
+  # succeeded or was skipped by its job-level `if`. Should this job itself
+  # fail, the others run, so a broken scope never skips coverage.
   scope:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -39,8 +36,8 @@ jobs:
         with:
           fetch-depth: 0
       # A pull request measures from the merge base with its base branch; a
-      # merge group from the dev commit it is built on; a push from the commit
-      # dev pointed at before. A push with no previous commit (all zeros) has no
+      # merge group from the main commit it is built on; a push from the commit
+      # main pointed at before. A push with no previous commit (all zeros) has no
       # base, so it selects everything.
       - id: scope
         env:
@@ -114,11 +111,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Only dev saves: a PR or merge-group cache lives in a scope nothing
-      # else restores, and its size evicts dev's under the cache limit.
+      # Only main saves: a PR or merge-group cache lives in a scope nothing
+      # else restores, and its size evicts main's under the cache limit.
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The `ui` feature's build script builds and embeds web-ui with bun.
       - uses: ./.github/actions/install-bun
       - name: bun install
@@ -127,9 +124,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: cargo clippy (default features)
         run: cargo clippy --locked --all-targets --timings -- -D warnings
       - name: cargo clippy (ui)
@@ -198,7 +193,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-verify-tools
       # See the `test` action.
       - name: Drop restored test scratch
@@ -211,9 +206,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: Run the baseline tools acceptance script
         run: >
           cargo test --locked --timings --test terminal_first_e2e
@@ -225,7 +218,7 @@ jobs:
         with:
           name: cargo-timings-verify-tools-${{ matrix.os }}
           path: target/cargo-timings/
-      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/dev'
+      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.downloads.outputs.tools-path }}
@@ -252,7 +245,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-container-acceptance
       - name: Drop restored test scratch
         run: |
@@ -263,9 +256,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: Run the container acceptance test
         run: >
           cargo test --locked --timings --test terminal_first_e2e
@@ -277,7 +268,7 @@ jobs:
         with:
           name: cargo-timings-container-acceptance
           path: target/cargo-timings/
-      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/dev'
+      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.downloads.outputs.tools-path }}
@@ -303,3 +294,28 @@ jobs:
       - name: bun test
         working-directory: web-ui
         run: bun test
+
+  result:
+    # The one required check on `main`: green when every job it needs
+    # succeeded or was skipped by the scope.
+    name: CI result
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - test-ubuntu
+      - test-macos
+      - web-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" = failure ] || [ "$result" = cancelled ]; then
+              echo "::error::a needed job ended $result"
+              exit 1
+            fi
+          done
