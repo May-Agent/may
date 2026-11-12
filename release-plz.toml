@@ -1,0 +1,12 @@
+[workspace]
+# cargo-dist creates the GitHub release from the tag, with the binaries.
+git_release_enable = false
+
+[[package]]
+name = "may-agent"
+git_tag_name = "v{{ version }}"
+
+# `tasks` has no release of its own: cargo-dist builds only `may`.
+[[package]]
+name = "may-tasks"
+release = false
