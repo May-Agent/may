@@ -196,7 +196,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: false
-          shared-key: ci-test
+          shared-key: ${{ runner.os == 'macOS' && 'test-macos' || 'test-ubuntu' }}
       # See the `test` action.
       - name: Drop restored test scratch
         shell: bash
@@ -250,7 +250,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: false
-          shared-key: ci-test
+          shared-key: test-ubuntu
       - name: Drop restored test scratch
         run: |
           chmod -R u+w target/tmp 2>/dev/null || true
