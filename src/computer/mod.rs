@@ -35,7 +35,7 @@ use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use main_thread::MainThreadBound;
 #[cfg(target_os = "macos")]
-use waterkit_automation::{Input, VirtualDisplay, VirtualDisplayConfig};
+use waterkit_automation::{ElementRef, Input, VirtualDisplay, VirtualDisplayConfig};
 
 #[cfg(target_os = "macos")]
 pub use stream::SessionStream;
@@ -153,12 +153,59 @@ impl SessionDisplay {
     /// Returns [`input::InputError`] when the message cannot be mapped or
     /// delivered.
     pub async fn post_input(&self, message: proto::InputMessage) -> Result<(), input::InputError> {
+        self.ask(|reply| input::Posting::Message {
+            message,
+            reply: Some(reply),
+        })
+        .await
+    }
+
+    /// Lists the actionable elements on the display; the previous
+    /// listing's references stop resolving.
+    ///
+    /// # Errors
+    /// Returns [`input::InputError`] when waterkit cannot list them.
+    pub async fn elements(&self) -> Result<proto::ElementListing, input::InputError> {
+        self.ask(|reply| input::Posting::Elements { reply }).await
+    }
+
+    /// Presses the element `element` names.
+    ///
+    /// # Errors
+    /// Returns [`input::InputError`] when the reference does not resolve or
+    /// the press is not delivered.
+    pub async fn press(&self, element: ElementRef) -> Result<(), input::InputError> {
+        self.ask(|reply| input::Posting::Press { element, reply })
+            .await
+    }
+
+    /// Focuses the element `element` names, then types `text` at it.
+    ///
+    /// # Errors
+    /// Returns [`input::InputError`] when the reference does not resolve,
+    /// the element takes no focus or the text is not delivered.
+    pub async fn type_into(
+        &self,
+        element: ElementRef,
+        text: String,
+    ) -> Result<(), input::InputError> {
+        self.ask(|reply| input::Posting::TypeInto {
+            element,
+            text,
+            reply,
+        })
+        .await
+    }
+
+    /// Hands the owner the posting `make` builds around its reply channel
+    /// and waits for the answer.
+    async fn ask<T>(
+        &self,
+        make: impl FnOnce(input::Reply<T>) -> input::Posting,
+    ) -> Result<T, input::InputError> {
         let (reply, answer) = async_channel::bounded(1);
         self.posts
-            .send(input::Posting {
-                message,
-                reply: Some(reply),
-            })
+            .send(make(reply))
             .await
             .map_err(|_| input::InputError::OwnerGone)?;
         answer
@@ -172,7 +219,7 @@ impl SessionDisplay {
     pub async fn queue_input(&self, message: proto::InputMessage) {
         if self
             .posts
-            .send(input::Posting {
+            .send(input::Posting::Message {
                 message,
                 reply: None,
             })

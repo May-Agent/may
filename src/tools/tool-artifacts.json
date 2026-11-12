@@ -1,6 +1,51 @@
 {
   "artifacts": [
     {
+      "tool": "bash",
+      "version": "5.3.20",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-aarch64-apple-darwin.tar.gz",
+      "sha256": "07b49e55b50199b44fda9a15e5ed426746273abb588cba020557cb52834d476c",
+      "size": 519355,
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "bash"
+      }
+    },
+    {
+      "tool": "bash",
+      "version": "5.3.20",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "0cfa24664dbdfd7398961882ad30c339a9d60f0ed89155e222eea817d2c8fff4",
+      "size": 791333,
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "bash"
+      }
+    },
+    {
+      "tool": "bash",
+      "version": "5.3.20",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "f0daed3763a8ab69c11fe05ad105e989171fb5a5ccaf8715092338ce8ecdb043",
+      "size": 788216,
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "bash"
+      }
+    },
+    {
       "tool": "apply_patch",
       "version": "0.1.1",
       "target": {
