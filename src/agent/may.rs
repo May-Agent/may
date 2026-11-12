@@ -841,6 +841,7 @@ impl MayAgent {
                 tracing::warn!(%error, "failed to create session repo clone");
             }
         }
+        let works_in_clone = !repo_clones.is_empty();
         if let Some(repo_clones) =
             build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
         {
@@ -996,7 +997,10 @@ impl MayAgent {
             )
             .with_instruction(
                 tag::WORK,
-                build_work(&crate::issue::IssueStore::info(&issue_store)),
+                build_work(
+                    &crate::issue::IssueStore::info(&issue_store),
+                    works_in_clone,
+                ),
             )
             .with_instruction(
                 tag::SESSION,

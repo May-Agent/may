@@ -57,7 +57,7 @@ pub(super) async fn state_with_idle_agent_on(
 async fn suggestion_is_skipped_for_a_cold_cache() {
     let dir = tempfile::tempdir().expect("dir");
     let (state, _clock, _session) = state_with_idle_agent(dir.path(), false).await;
-    assert!(super::aux::warm_cache(&state, SESSION).is_none());
+    assert!(super::sidecar::warm_cache(&state, SESSION).is_none());
 
     super::suggest::maybe_suggest(&state, SESSION);
     assert!(
@@ -124,7 +124,7 @@ async fn disabling_auto_recap_drops_timers_and_automatic_generations_only() {
     state.update_config(|config| config.recap.auto = true);
     let auto = state.aux_tasks.start(
         SESSION,
-        super::aux::AuxKind::AutoRecap,
+        super::sidecar::AuxKind::AutoRecap,
         |_| std::future::pending(),
         &handle,
     );
@@ -133,7 +133,7 @@ async fn disabling_auto_recap_drops_timers_and_automatic_generations_only() {
     assert!(!state.aux_tasks.is_current(SESSION, auto));
     let manual = state.aux_tasks.start(
         SESSION,
-        super::aux::AuxKind::ManualRecap,
+        super::sidecar::AuxKind::ManualRecap,
         |_| std::future::pending(),
         &handle,
     );
@@ -164,7 +164,7 @@ async fn a_config_change_event_applies_the_settings_to_the_running_daemon() {
 async fn recap_idle_deadline_skips_a_cache_that_went_cold() {
     let dir = tempfile::tempdir().expect("dir");
     let (state, clock, _session) = state_with_idle_agent(dir.path(), true).await;
-    let warmth = super::aux::warm_cache(&state, SESSION).expect("warm after a turn");
+    let warmth = super::sidecar::warm_cache(&state, SESSION).expect("warm after a turn");
     let idle = Duration::from_mins(30);
 
     // The deadline passes inside the cache lifetime: the recap may run.
@@ -253,7 +253,7 @@ async fn aux_generations_leave_the_conversation_and_the_next_request_untouched()
     );
 
     // The recap runs to its stored card.
-    super::recap::request_recap(&state, SESSION, super::aux::AuxKind::ManualRecap);
+    super::recap::request_recap(&state, SESSION, super::sidecar::AuxKind::ManualRecap);
     wait_until(async || {
         state.db().get_messages(SESSION).await.expect("rows").len() > stored_before
     })
@@ -382,7 +382,7 @@ async fn side_requests_carry_the_session_agents_prompt_cache_key() {
     wait_until(async || !state.aux_tasks.is_current(SESSION, 0)).await;
     assert_eq!(cache_key_of(&stub, SUGGESTION_PROMPT).await, expected);
 
-    super::recap::request_recap(&state, SESSION, super::aux::AuxKind::ManualRecap);
+    super::recap::request_recap(&state, SESSION, super::sidecar::AuxKind::ManualRecap);
     wait_until(async || state.db().get_messages(SESSION).await.expect("rows").len() > 1).await;
     assert_eq!(cache_key_of(&stub, RECAP_PROMPT).await, expected);
 
@@ -418,7 +418,7 @@ async fn a_recap_card_survives_reopening_the_database() {
         )
         .await
         .expect("append");
-    super::recap::request_recap(&state, SESSION, super::aux::AuxKind::AutoRecap);
+    super::recap::request_recap(&state, SESSION, super::sidecar::AuxKind::AutoRecap);
     wait_until(async || state.db().get_messages(SESSION).await.expect("rows").len() == 2).await;
 
     // A new connection to the same file: nothing is held in memory.

@@ -862,7 +862,8 @@ mod tests {
             .await
             .unwrap();
         let tools = image.verify(&image_transport(&out)).await.unwrap();
-        assert!(tools.catalog().render().unwrap().contains("python3 3.13.1"));
+        // The catalog names the command; its version was checked by `verify`.
+        assert!(tools.catalog().render().unwrap().contains("\n- python3\n"));
         // An interpreter reporting another version is a version mismatch.
         let link = std::fs::read_link(staged.join("bin/python3")).unwrap();
         let interpreter = staged.join("bin").join(&link);

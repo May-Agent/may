@@ -1,5 +1,10 @@
+# Only the fields in release-plz's own schema belong here: it rejects the file
+# outright on an unknown key rather than ignoring it, and the release job is the
+# one place where that is not discovered until a release is being cut. Check a
+# change with `release-plz generate-schema`.
+
 [workspace]
-# cargo-dist creates the GitHub release from the tag, with the binaries.
+# cargo-dist creates may's GitHub release from the tag, with the binaries.
 git_release_enable = false
 
 [[package]]
@@ -10,3 +15,19 @@ git_tag_name = "v{{ version }}"
 [[package]]
 name = "may-tasks"
 release = false
+
+# may-patch and may-sed ship as prebuilt executables attached to their GitHub
+# release (.github/workflows/tool-artifacts.yml), never to crates.io, so
+# release-plz reads their latest version from git tags instead of the registry.
+
+[[package]]
+name = "may-patch"
+git_only = true
+git_tag_name = "patch/v{{ version }}"
+git_release_enable = true
+
+[[package]]
+name = "may-sed"
+git_only = true
+git_tag_name = "sed/v{{ version }}"
+git_release_enable = true

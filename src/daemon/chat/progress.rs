@@ -41,7 +41,7 @@ pub struct ProgressReport {
     pub waiting_on_user: Vec<String>,
 }
 
-impl super::aux::AuxOutput for ProgressReport {
+impl super::sidecar::AuxOutput for ProgressReport {
     fn texts(&self) -> Vec<(&str, usize)> {
         [
             &self.waiting_to_land,
@@ -59,7 +59,7 @@ impl super::aux::AuxOutput for ProgressReport {
 /// The progress instruction, written in the session's communication
 /// language when one is set.
 #[derive(Template)]
-#[template(path = "aux/progress.md", escape = "none")]
+#[template(path = "sidecar/progress.md", escape = "none")]
 struct ProgressPrompt {
     language: Option<crate::harness::language::Language>,
 }
@@ -78,9 +78,9 @@ fn progress_messages(
 }
 
 /// Rejects a report that finished more items than it counted.
-fn validated(report: ProgressReport) -> Result<ProgressReport, super::aux::AuxError> {
+fn validated(report: ProgressReport) -> Result<ProgressReport, super::sidecar::AuxError> {
     if report.done > report.total {
-        return Err(super::aux::AuxError::Output(format!(
+        return Err(super::sidecar::AuxError::Output(format!(
             "{} items done of {} in all",
             report.done, report.total
         )));
@@ -99,12 +99,12 @@ pub async fn progress_inner(
 
 /// Generates the remaining-work report of `session_id`.
 async fn report(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<ProgressReport> {
-    if let Some(side) = super::aux::side_context(state, session_id)
+    if let Some(side) = super::sidecar::side_context(state, session_id)
         .await
         .map_err(internal_error)?
     {
         let messages = progress_messages(side.messages, side.languages.communication());
-        return super::aux::generate_with::<_, ProgressReport>(
+        return super::sidecar::generate_with::<_, ProgressReport>(
             &side.model,
             messages,
             GENERATION_TIMEOUT,
@@ -113,14 +113,14 @@ async fn report(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Progres
         .and_then(validated)
         .map_err(internal_error_message);
     }
-    let context = super::aux::context_messages(state, session_id)
+    let context = super::sidecar::context_messages(state, session_id)
         .await
         .map_err(internal_error)?;
-    let languages = super::aux::languages(state, session_id)
+    let languages = super::sidecar::languages(state, session_id)
         .await
         .map_err(internal_error)?;
     let messages = progress_messages(context, languages.communication());
-    super::aux::generate::<ProgressReport>(state, session_id, messages, GENERATION_TIMEOUT)
+    super::sidecar::generate::<ProgressReport>(state, session_id, messages, GENERATION_TIMEOUT)
         .await
         .and_then(validated)
         .map_err(internal_error_message)
