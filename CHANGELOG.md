@@ -1,0 +1,913 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/May-Agent/may/releases/tag/v0.1.0) - 2026-11-12
+
+### Added
+
+- serve the tasks command from the may binary
+- *(cloud)* Codespaces provider and /cloud setup
+- self-update from CI artifacts and GitHub releases
+- *(sed)* run every script on uutils sed in its sandbox mode
+- *(skills)* computer-use guidance as a bundled skill
+- *(computer)* launch applications onto the session desktop
+- build and release the sed and apply_patch programs from May
+- state the Python rule by whether a .venv exists, not by project
+- give each session a Python environment outside a project
+- *(agent)* carry the control commands' usage in every session's prompt
+- *(agent)* detect a looping agent, alert it once, then end the turn
+- *(shell)* resolve python3 to the project environment
+- parse may's command line with clap
+- *(shell)* keep the blank lines of a file read
+- *(agent)* compact on request after the turn and warn before the window fills
+- *(prompt)* steer fixes to formatters, lint autofix and subagents
+- *(policy)* refuse an apply_patch hunk that only changes whitespace
+- *(subagent)* run subagents on aither's subagent primitives
+- *(shell)* assemble the session shell and approve through Approver
+- *(ipc)* serve May's commands to scripts through an IpcProvider
+- *(shell)* [**breaking**] word the shell's texts, tools and budgets in May
+- *(webfetch)* tell the model to pipe a page into ask when only part of it is needed
+- *(new-repo)* fetch canonical license texts and check licenses in CI
+- require uv for Python dependencies and environments
+- keep a session's prompt cache warm while a background command outlives it
+- *(web-ui)* render tasks, subagent and ask_user calls as cards
+- render tasks, subagent and ask_user calls as cards
+- *(ssh)* /ssh add probes the server's OS and the prompt shows it
+- find, rule-based search over session history, and ranged session messages
+- build sessions with SSH servers with the shared jobserver pool
+- *(sandbox)* ACP terminal commands run the managed tools first
+- *(tui)* the context meter follows compaction events
+- *(tui)* the context meter shows Compacting, then Compacted
+- heel is managed through aither's distribution
+- define exit behaviour for clients and an unexpected daemon exit
+- [**breaking**] session names are global, every other id leases from its session's pool
+- *(web)* show in-flight PRs and their checks in the inspector
+- *(tui)* expand a sidebar PR row into its checks
+- *(pr)* alert the agent on PR check changes and list failed checks in pr show
+- model-facing ids are one-token words from one namespace
+- *(tasks)* answering a question clears its BLOCKING marks and the question lists the rows it blocks
+- *(prompt)* carry the core commands' usage in the system prompt
+- *(tui)* scroll, fold and expand the sidebar ([#914](https://github.com/May-Agent/may/pull/914))
+- *(tui)* welcome header with logo, version and working directory ([#916](https://github.com/May-Agent/may/pull/916))
+- *(tasks)* tasks command edits the session tasks.md as title and detail rows
+- *(tui)* draw popups, panels and the sidebar as filled blocks ([#911](https://github.com/May-Agent/may/pull/911))
+- *(db)* record the repository of each used checkout
+- *(tui)* start a session on a repository from inside the TUI with /new
+- *(repo)* bind the session as soon as its repository trust is set
+- *(daemon)* count streamed text with the model's own vocabulary
+- *(agent)* move the disk thresholds with the config
+- consolidate session state changes, turns, queue and interactions ([#901](https://github.com/May-Agent/may/pull/901))
+- web folds the transcript into ApiMessages; history GET and rewind index removed ([#895](https://github.com/May-Agent/may/pull/895))
+- web UI loads the transcript; sessions no longer embed messages ([#895](https://github.com/May-Agent/may/pull/895))
+- *(tui)* load sessions from the transcript and rewind by entry id ([#894](https://github.com/May-Agent/may/pull/894))
+- *(daemon)* one transcript entry shape with cursor pagination ([#893](https://github.com/May-Agent/may/pull/893))
+- attachments are links to the session's files, not base64 ([#890](https://github.com/May-Agent/may/pull/890))
+- web UI on the session event stream; session topics leave /api/events ([#887](https://github.com/May-Agent/may/pull/887))
+- *(tui)* follow a session on its own event stream ([#886](https://github.com/May-Agent/may/pull/886))
+- *(daemon)* per-session event stream after a cursor ([#884](https://github.com/May-Agent/may/pull/884))
+- *(daemon)* compress /api responses by Accept-Encoding ([#879](https://github.com/May-Agent/may/pull/879))
+- *(tui)* input band through the status line, with room around the chat
+- *(web-ui)* group sessions by project with a new chat per project
+- *(tui)* repo-less and direct repository starts, sessions grouped by project
+- gate a session's first turn on the checkout preflight
+- bind sessions to a repository and sync checkouts after a merge
+- *(agent)* judge disk pressure on the session sandbox's volume
+- warn the user about an abnormally long CI job in both clients
+- add the ci-optimise skill and document the ci command and [ci] settings
+- record CI job, step and test durations and alert on abnormally long jobs
+- *(jobserver)* draw ACP agent commands and may exec from the shared pool
+- add the explore command, a read-only explore subagent on the fast model
+- share one jobserver token pool across every local terminal
+- [**breaking**] notify the user of every popup that waits on them, remove notify
+- greet the new year with fireworks on Dec 31 and Jan 1
+- *(tui)* effort slider panel that applies on Enter and cancels on Esc
+- add the new-repo built-in skill
+- ask another agent a read-only btw question from a fork of its context
+- ask /progress from the idle agent's full context
+- add /progress to report the remaining work with a progress bar
+- show an edit's reading after a history reload or a late attach
+- carry the daemon's reading to the TUI and keep edit diffs when folded
+- read terminal calls before they run
+- list running and recent sessions, archive idle ones
+- choose reasoning effort with a slider over the model's levels
+- pick the GitHub repository for a new chat from a searchable list
+- *(agent)* run subagents in a child clone of the session clone
+- *(web-ui)* accept /sleep and /sleep off, show the sleep state
+- add /sleep, a global asleep state agents are told about
+- *(issue)* ask before the agent publishes on external repositories or files features
+- import Claude Code and Codex rules and skills
+- *(agent)* load global rules from ~/.may/AGENTS.md
+- *(agent)* record issue, PR, question and subagent changes for tasks.md
+- *(agent)* read tasks.md issues and PRs through the session's backends
+- *(repo)* clone any trusted repository into the session and resolve pr by clone
+- *(chat)* show a translated reply with its original reachable
+- *(issue)* read any project's issues with --repo
+- *(usage)* record every prompt-cache miss with its cause
+- *(issue)* one owner per open issue
+- *(usage)* split the wall clock into API, waiting on the user, tools and idle
+- *(agent)* one system prompt section per concern, external content last ([#504](https://github.com/May-Agent/may/pull/504))
+- *(issue)* move to aither 0.17 and answer a sandboxed gh with a pointer to issue
+- *(agent)* agent-driven compaction with a configurable warning distance
+- *(context)* compact asynchronously at min(80%, 400k) with a 5k safe buffer
+- *(issue)* record who made every issue change and refuse sandboxed gh
+- *(subagent)* require a subcommand with a fixed model and workspace access
+- move to aither 0.15.0
+- *(session)* per-session yolo mode that grants every approval request
+- *(daemon)* expose webhook tasks to the internet through Tailscale Funnel
+- *(ask-user)* masked secret input in the web UI
+- *(ask-user)* masked secret input in the TUI
+- *(ask-user)* secret questions stored through the secret store
+- *(tui)* open URLs and file paths in the chat as terminal hyperlinks
+- *(task)* let a task's run prompt the session that created it
+
+### Fixed
+
+- *(computer)* pin waterkit with the focus guard and the press geometry fix
+- *(release)* release may from its git tags
+- *(ci)* save Rust caches only on main
+- *(skills)* keep the computer skill's description valid YAML
+- *(subagent)* give a native subagent's commands temp, home and cache directories in its space
+- *(shell)* say that only a background job takes input
+- *(daemon)* build a tunnel's local URL from the local listener
+- *(tui)* move the composer cursor by grapheme cluster
+- *(ci)* drop the shims a restored test tool cache carries
+- *(daemon)* refuse identified requests from a foreign Origin on remote listeners
+- *(tui)* keep running when a paste cannot be applied
+- *(computer)* gate the modifier bits to macOS, their only reader
+- name ask_user's positional argument question-text in its usage
+- *(computer)* take the action's operands as separate arguments and key combinations
+- *(agent)* move the history regex search to session find
+- *(agent)* keep the ask_user usage in a one-shot run's prompt
+- *(ci)* run the tests through nextest
+- *(agent)* state only the rules that hold in the session's prompt
+- *(ci)* install nasm from a pinned cached package instead of apt
+- *(ipc)* bind piped stdin before the option terminator
+- *(tui)* keep a dialog a run waits on through the global shortcuts
+- *(ci)* fall back to a mirror outside ubuntu.com DNS
+- *(ci)* install apt packages without the runner's Azure mirror
+- take aither's fix for a claimed job read as pending
+- *(daemon)* box the runtime summary of a live run's resume
+- *(issue)* release the token lock once the token is stored
+- *(transcript)* read only the rows a page returns
+- *(acp)* run a connected agent in its run's subagent space
+- *(ipc)* satisfy clippy in the unknown-option error and the test tool
+- *(daemon)* box the runtime summary a queued resume carries
+- *(container)* take managed Podman from the pinned tool distribution
+- *(pr)* merge only the checked commit and publish only on an explicit screen pass
+- *(issue)* encode the label filter, page past pull requests, cache the gh token
+- *(session)* retry a failed run settle and always end the hub turn
+- *(secrets)* fail instead of running unredacted when stored secrets cannot be read
+- *(tasks)* keep an every-day weekday field as written
+- *(ipc)* return the unknown-option error as a value
+- *(daemon)* serve session files with nosniff and a policy that runs no script
+- *(ipc)* take help only from -h or --help in option position
+- *(daemon)* make TcpRouters::router_for a const fn
+- *(policy)* shorten two doc summaries and give each read pair its own state
+- *(tasks)* read a 5-field cron weekday in crontab numbering
+- *(policy)* refuse a re-read or a whitespace patch only when it does nothing new
+- *(scheduler)* report an out-of-range time instead of panicking in next_fire
+- follow repo-search and aither main; pin repo-search 0.0.14
+- *(daemon)* put each listener's access policy outside its whole router
+- *(scheduler)* store each time task's next fire and claim it in the write that starts the run
+- *(shell)* keep the python shims beside the managed tools, out of sandbox reach
+- replace a git shim whose content differs from the build's template
+- *(test)* finish the resume test's command only after the run is released
+- *(db)* report only schema differences that can fail a statement
+- *(db)* name the schema mismatch without advising to discard the database
+- *(db)* refuse a database whose tables differ from the schema
+- *(test)* install the global executor in every test that reaches it
+- *(daemon)* treat a bootout of a service launchd no longer holds as done
+- *(agent)* announce a changed command table as a diff instead of rewriting the prompt
+- send the reasoning end before the event that closes it, and give a subagent its own tasks inbox
+- *(usage)* credit a provider that reports no cache writes with whole cache blocks
+- *(webfetch)* satisfy fmt and redundant_pub_crate
+- *(daemon)* bring StreamExt into scope for the owner heartbeat
+- *(daemon)* keep the remaining workers and SSE streams running through a panic
+- *(daemon)* stop a one-shot run's turn when its client disconnects
+- *(cache)* record each consecutive miss when the provider reports no writes
+- *(daemon)* catch a panic at the boundary of the operation that raised it
+- *(web-ui)* report invalid terminal arguments from the daemon's tool summary
+- render tool calls with malformed arguments instead of panicking
+- *(transcript)* serve a stored terminal call with its command reading
+- settle subagent cards a stopped daemon left running as interrupted
+- *(models)* label the abilities aither-core 0.27 added
+- *(daemon)* a failed sweep of stale on-demand jobs fails the start
+- *(daemon)* give each May home its own on-demand launchd job
+- *(tui)* probe SSH servers off the event loop
+- *(repo-search)* the daemon-start sweep waits for swept agents to leave launchd
+- *(sandbox)* use map_or_else for the managed tools lookup
+- *(sandbox)* clear clippy warnings in the managed tools wiring
+- settle a finished turn's persisted state before reporting done
+- *(repo-search)* wait for a retired relocated home's agents to leave launchd
+- *(deps)* pin heel 0.9.3, whose version check retries a freshly written binary
+- a failed queued turn reports its error to the dispatcher's caller
+- *(deps)* pin repo-search v0.0.13, whose launch fails at once on a socket path over the platform limit
+- restore the interrupted turn's input into a rebuilt agent
+- show the SSH server a command runs on
+- recover interrupted scheduled-task runs at daemon startup
+- *(web-ui)* stop a turn with DELETE, the route the daemon serves
+- *(web-ui)* the PR check clock sets its time only from timer callbacks
+- may exec leases a session's ids from the daemon's pool
+- *(prompt)* run a sandbox-blocked step in unsafe mode instead of asking first
+- drop migration and retired-format compatibility code
+- *(jobserver)* container commands draw from the machine-wide pool
+- *(ci)* authenticate managed tool downloads
+- *(tui)* draw inline code without a background ([#919](https://github.com/May-Agent/may/pull/919))
+- *(tui)* fold turns without a result into one Worked for row
+- *(tui)* give a user message its own top padding row ([#911](https://github.com/May-Agent/may/pull/911))
+- *(pr)* report a gone checkout and stop a timed-out pull with everything it started
+- keep GitHub for a current checkout, carry submodules and nested repositories, and ask when offline
+- show declining the repository question as the user's choice
+- *(agent)* fail when the session's repository binding cannot be read
+- *(pr)* kill a timed-out post-merge pull and bound their concurrency
+- *(session)* send the daemon the canonical path of a launch repository
+- *(daemon)* accept the stored local form as a repository spec
+- *(issue)* keep the May issues of one GitHub repository under one key
+- *(issue)* resolve a session's issue store from its repository binding
+- *(pr)* compare the checkout's dirty files with the PR's own work
+- *(agent)* mark the agent interrupted when the user stops a run
+- *(tasks)* hold every agent's tasks.md to the line limit
+- update aither to 0.24 and heel to 0.9.1 so approved unsafe commands run unconfined
+- one-shot runs and the effort picker patch the session ([#901](https://github.com/May-Agent/may/pull/901))
+- fix the interactions call sites in the tui runtime
+- move the remaining callers to the #901 routes
+- *(tui)* detach the effort PUT task so the pick actually reaches the daemon
+- *(tui)* draw a blank row above a user message as its padding ([#873](https://github.com/May-Agent/may/pull/873))
+- *(tui)* clamp the band's painted rows to the window ([#871](https://github.com/May-Agent/may/pull/871))
+- *(tui)* show file link targets as paths and open links on modified Enter
+- *(tui)* track the latest request's usage on the status bar
+- *(build)* install pinned web-ui deps before bundling
+- *(prompt)* tell the agent grep, awk and find fail only where the policy refuses them
+- *(agent)* drop the no-op home_volume call
+- *(terminal)* refuse May's scripts through command policies
+- satisfy clippy in the CI duration recorder
+- answer /btw and /progress from a read-only fork while a turn runs
+- move a deleted profile's sessions to the default profile and refuse deleting the default
+- list the slash commands the TUI handles in help and completion from one table
+- watch a queued GitHub PR until it lands, fails a required check or leaves the merge queue
+- render hosted search and fetch as one unfoldable row
+- show a compaction as a one-line status row and mark a refused one failed
+- resolve a model's context window in the daemon
+- expand a thought in a Worked for group and show a single-item turn as its own row
+- version the persisted sleep state
+- tell agents how the user's sleep ended
+- state the tasks.md sections in the prompt and drop checkbox plans
+- prepare the repo-search binary before taking the retirement lock
+- refuse agent messages to a recipient whose prompt cache is cold
+- *(daemon)* log a failed issue lookup and a failed pr command at WARN
+- write sleep.json through tempfile's atomic persist
+- clear shown prompt suggestions when the user sleeps or suggestions are disabled
+- write sleep.json atomically and persist the last reminder time
+- *(web-ui)* find the withdrawn message with findLastIndex
+- *(web-ui)* find the withdrawn message without ES2023 array methods
+- let a takeover pause before any reply carry no assistant message
+- name streamed messages by the ids they are stored under
+- keep a withdrawn turn's hidden context and markers consistent
+- *(tui)* keep a reply-only turn's reply outside the Worked for fold
+- withdraw a turn stopped before any tool call or response text
+- *(computer)* take waterkit's socket-reported permission requests
+- record a sleep only once it lasted an hour, and remind only on a habit
+- effort popover follows the theme's popover colours
+- close stub provider connections explicitly in tests
+- render thinking text as Markdown in the TUI and web UI
+- store a reply's thinking with its assistant message
+- start the on-demand daemon in the macOS GUI session
+- *(computer)* send a press to the window WindowServer hit-tests
+- resolve a --repo path through the project's issue backend
+- *(computer)* take waterkit's confirmed cross-process input
+- *(tasks)* read tasks.md through aither's TasksFile and ship its rows
+- *(computer)* own each display's input on a thread of its own
+- *(computer)* keep serving the main run loop through stray stops
+- drop a retried response's broken attempt from the turn and the UIs
+- run the sandbox on heel 0.9.0
+- deliver /sleep to a busy session as a pending message
+- *(tui)* wrap every TUI paragraph with the width-safe wrapper
+- *(agent)* record answers for tasks.md and read its items without guessing
+- *(tui)* wrap chat rows so no glyph crosses the column edge
+- *(prompt)* run a user-authorized step the sandbox blocks in unsafe mode
+- *(tui)* lay markdown tables out to the chat width
+- *(tui)* report interaction failures in the chat instead of ending the TUI
+- *(tui)* close the permission dialog once its request resolves
+- *(daemon)* wait for launchd to drop the service before bootstrapping
+- *(tui)* probe the terminal's graphics support with a bounded read on the caller's thread
+- *(computer)* send the helper's diagnostics to its --stderr log
+- *(tui)* an attaching client shows a running turn's prompt once and times it from the turn's start
+- *(tui)* size and count the native tools /context reports from their definitions
+- *(tui)* show a job's elapsed time only while it runs
+- *(tui)* keep a failed turn's error outside the folded Worked for row
+- *(computer)* raise the direct-capture consent through the async screenshot
+- *(session)* leave a session's sandbox layout to the daemon when the TUI loads it
+- *(tui)* head a finished expanded thought as Thought for, not Thinking
+- *(tui)* drop unbound Ctrl/Alt/Super characters instead of typing them
+- *(daemon)* answer a secret the keychain refuses with its error
+- *(usage)* count cached tokens once in the hit rate and cost
+- *(pr)* refuse to merge a dirty clone and delete a merged PR's may/* branch
+- *(tui)* replay stored tool calls when a session's chat is rebuilt
+- *(computer)* capture displays through waterkit's DisplayStream
+- *(skill)* drop skill-local subagents; slide briefs become references
+- *(agent_link)* say a delivered message is not the user's and how to answer it
+- *(session)* commit a hidden-context queue entry with the run that delivers it
+- *(trust)* gate the session's own profile at launch and after a profile switch
+- *(trust)* open the /permission sheet on the persisted trust level
+- *(tui)* settle a turn only once the daemon has stored it
+- *(computer)* raise the direct screen-capture consent with the permission request
+- *(computer)* require and request direct screen-capture consent
+- *(aux)* send side requests under the session's prompt cache key
+- *(computer)* request grants from a LaunchServices-launched instance
+- *(computer)* read and request grants in a fresh probe process
+- *(acp)* bound the connect trial's handshake
+- *(daemon)* sweep stale repo-search agents before the daemon answers
+- *(repo-search)* sweep stale relocated-home agents at daemon start
+- *(daemon)* read a finished job's undelivered completion as resuming
+- *(deps)* pin repo-search v0.0.12, which stops a server that cannot own its port
+- *(acp)* let the configured agent command read the script it names
+- *(acp)* close the sandbox's escape routes and drop a deleted session's ACP state
+- *(pr)* screen the PR body and template the commit-subject query
+- *(pr)* title a PR from its commits and link its GitHub issue
+- *(test)* keep the host load test under the compaction floor
+- *(daemon)* close a turn subscription two turns behind
+- *(repo-search)* make the non-macOS retire stub const
+- *(daemon)* deliver every turn frame to a client that falls behind
+- *(pr)* fetch the remote's state into the staging repo before pushing
+- *(daemon)* retire repo-search agents only after every launch ends
+- *(daemon)* boot out a relocated home's repo-search agents on stop
+- *(pr)* sign sandbox commits only when the user signs
+- *(pr)* sign sandbox commits as the user through the harness
+- *(test)* read a turn's request, not a late compaction request
+- *(oneshot)* follow the session while background work will resume it
+- *(pr)* run clone git and checks in the session sandbox
+- *(oneshot)* end a run only when its turn ends
+- *(daemon)* bind the socket at the home's own spelling
+- *(config)* resolve the home directory before deriving the May directory
+- *(acp)* give sandboxed ACP agents their toolchains, host PATH and own state
+- *(acp)* run ACP agents and their terminal commands in the session sandbox
+- *(issue)* point a refused gh at pr as well, and fail fast if its text cannot render
+- *(trust)* derive a project's GitHub repository from its origin
+- *(trust)* clone kind, PR backend and screening follow the project's trust level
+- *(aux)* generate recaps and suggestions through structured output
+- *(db)* queue history.db writes on one connection
+- *(search)* one clone key per checkout, pass the daemon's freshness line through
+- *(recap)* name full-width brackets and dash asides, keep each detail in its own sentence
+- *(search)* search the session's clone and report indexing in progress
+- *(pr)* push each GitHub PR to a branch of its own
+- *(container)* keep a container's hostname within one DNS label
+- *(computer)* tests never launch the helper, and a helper exits when its socket is gone
+- *(issue)* keep an updated_at tie whole in a local sync page
+- *(workspace)* report a project entry whose path no longer resolves
+- *(db)* drop the unused legacy pending tables on open
+- *(pr)* close the upstream pull request first and refuse closing a terminal one
+- *(db)* delete every row a session owns in one transaction
+- *(issue)* follow GitHub pagination for issue lists and the index sync
+- *(tui)* refresh sidebar issues when an issue changes
+- *(context)* render repository clone paths as the container sees them
+- *(issue)* filter labels in the query, update fields atomically, bump updated_at on comment
+- *(issue)* remove sub-issues through GitHub's sub_issue endpoint
+- *(agent)* hand aither the session's request parameters
+- *(daemon)* a workspace.toml change retires the session's idle agent
+- *(session)* resolve a session's directory from its row, not the daemon's
+- *(trust)* key projects by repository identity and persist only trust's fields
+- *(pr)* a PR owns its commit under a durable ref
+- *(clone)* keep the clone registry in host state
+- *(clone)* copy objects instead of hardlinking them
+- *(recap)* write recaps as plain prose in the session's communication language
+- *(daemon)* close the public webhook listener before Funnel off returns
+- *(session)* save the checkpoint's own boundary as the restore watermark
+- *(subagent)* run the advanced slot on the session model so a fork resolves
+- *(daemon)* default the webhook body cap to the largest payload GitHub delivers
+- *(daemon)* cap webhook delivery bodies and refuse larger ones with 413
+- *(daemon)* wait on background jobs of a parked agent only after its run released the session
+- *(container)* bound only the runtime probe by the short Docker timeout
+- *(daemon)* point the Funnel proxy at the webhook mount and keep funnel tests off the host keychain
+- *(suggest)* build prompt suggestions from the agent's effective context
+- *(ask-user)* give the description examples in forms the parser accepts
+- *(task)* remove an inline task's working directory with the task
+- *(task)* run inline local tasks in a working directory of their own
+- *(ask-user)* report why an answer was not stored
+- *(session)* keep a session run releasable when its handler is dropped
+- *(tasks)* authenticate webhook tasks with a random token and an optional signature
+- *(secrets)* box the redacted response stream
+- *(secrets)* redact stored secret values from model requests and tool results
+- *(config)* apply [suggestions] and [recap] to a running daemon
+- *(chat)* publish an aux result only under the lock that orders cancellation
+- *(chat)* run the suggestion and recap lifecycle for every turn
+- *(recap)* refuse /recap while a turn runs
+- *(tui)* draw code blocks without a quote bar or background
+- *(recap)* summarise the newest part of a session
+- *(chat)* keep a resumed turn's agent across same-provider retries
+
+### Other
+
+- Merge pull request #1132 from May-Agent/fix/1029-release-git-only
+- Merge pull request #1134 from May-Agent/fix/1133-waterkit-bump
+- Merge pull request #1131 from May-Agent/fix/1098-uutils-sed
+- Merge remote-tracking branch 'origin/main' into fix/1098-uutils-sed
+- Merge pull request #1129 from May-Agent/fix/1076-subagent-dirs
+- Merge pull request #1128 from May-Agent/fix/1118-acp-trial-margin
+- Merge remote-tracking branch 'origin/main' into fix/1076-subagent-dirs
+- Merge remote-tracking branch 'origin/main' into fix/1118-acp-trial-margin
+- Merge pull request #1126 from May-Agent/feat/1029-self-update
+- Merge pull request #1121 from May-Agent/release-plz-2026-11-12T06-02-34Z
+- Merge pull request #1127 from May-Agent/fix/1073-stdin-wording
+- *(cli)* daemon restart is a valid command now
+- Merge pull request #1124 from May-Agent/fix/1123-cache-save
+- Merge pull request #1122 from May-Agent/fix/1061-tunnel-local-url
+- Merge pull request #1125 from May-Agent/feat/1055-codespaces
+- Merge remote-tracking branch 'origin/main' into fix/1073-stdin-wording
+- Merge pull request #1119 from May-Agent/feat/821-computer-skill
+- Merge remote-tracking branch 'origin/main' into feat/1029-self-update
+- dispatch the cargo-dist release from release-plz
+- release binaries with cargo-dist, tagged by release-plz
+- Merge remote-tracking branch 'origin/main' into fix/1061-tunnel-local-url
+- Merge pull request #1120 from May-Agent/fix/1043-turn-per-token-work
+- Merge remote-tracking branch 'origin/main' into feat/821-computer-skill
+- release v0.1.0
+- Merge remote-tracking branch 'origin/main' into fix/1043-turn-per-token-work
+- Merge remote-tracking branch 'origin/main' into feat/821-computer-skill
+- Merge pull request #1115 from May-Agent/fix/1048-grapheme-cursor
+- Merge pull request #1104 from May-Agent/feat/1015-own-sed-patch
+- Merge pull request #1092 from May-Agent/fix/1039-prompt-rules
+- *(subagent)* settle clippy's similar_names and implicit_clone findings
+- move to heel 0.10.1 and aither main
+- Merge pull request #1117 from May-Agent/ci/1105-drop-dev
+- Merge remote-tracking branch 'origin/main' into fix/1076-subagent-dirs
+- Merge remote-tracking branch 'origin/main' into fix/1073-stdin-wording
+- Merge remote-tracking branch 'origin/main' into fix/1061-tunnel-local-url
+- Merge remote-tracking branch 'origin/main' into fix/1043-turn-per-token-work
+- Merge pull request #1111 from May-Agent/fix/818-computer-launch
+- Merge remote-tracking branch 'origin/main' into fix/1118-acp-trial-margin
+- *(acp)* time a silent agent's trial from the handshake's timeout
+- Merge remote-tracking branch 'origin/main' into fix/1048-grapheme-cursor
+- Merge remote-tracking branch 'origin/main' into feat/1015-own-sed-patch
+- Merge remote-tracking branch 'origin/main' into fix/1039-prompt-rules
+- *(daemon)* stop reading the database for every streamed event
+- Merge pull request #1114 from May-Agent/chore/746-heel-0.10
+- Merge pull request #1113 from May-Agent/fix/ci-shim-cache
+- run and save caches on main only
+- move to heel 0.10.0 and aither main
+- Merge remote-tracking branch 'origin/dev' into fix/1039-prompt-rules
+- Merge remote-tracking branch 'origin/dev' into feat/1015-own-sed-patch
+- Merge remote-tracking branch 'origin/dev' into fix/818-computer-launch
+- Merge remote-tracking branch 'origin/dev' into feat/1100-session-python
+- Merge pull request #1109 from May-Agent/fix/1058-origin-check
+- *(daemon)* settle clippy's or_fun_call and doc_markdown findings
+- Merge pull request #1096 from May-Agent/feat/1095-messaging-usage
+- Merge pull request #1090 from May-Agent/fix/1072-stdin-terminator
+- Merge pull request #1091 from May-Agent/fix/1087-nasm
+- Merge pull request #1099 from May-Agent/fix/1097-session-find
+- Merge pull request #1093 from May-Agent/fix/1089-nextest
+- *(e2e)* match catalog entries by their unversioned line
+- Merge pull request #1068 from May-Agent/fix/1044-run-settle-storage
+- Merge pull request #1103 from May-Agent/fix/817-computer-args2
+- Merge pull request #1106 from May-Agent/ci/1105-main-trunk
+- Merge pull request #1107 from May-Agent/fix/1047-paste-failure
+- Merge remote-tracking branch 'origin/dev' into feat/1015-own-sed-patch
+- preview the prompt through a mutable session
+- *(daemon)* rename the aux module and templates to sidecar
+- keep the serial E2E tests serial across nextest's processes
+- keep the fake uv in a fixture and the racing threads collected
+- keep dev pull requests and merge groups running until dev is retired
+- make main the single trunk
+- Merge pull request #1060 from May-Agent/fix/1033-access-policy
+- Merge pull request #1085 from May-Agent/fix/1046-pending-dialog
+- *(daemon)* serve the transcript paging tests through the socket policy
+- *(daemon)* serve the attachment tests through the socket policy
+- Merge remote-tracking branch 'origin/dev' into fix/1033-access-policy
+- Merge pull request #1082 from May-Agent/feat/1052-loop-detection
+- Merge pull request #1062 from May-Agent/fix/pin-repo-search-0.0.14
+- *(agent)* satisfy clippy in the loop watch and its settings
+- Merge remote-tracking branch 'origin/dev' into fix/pin-repo-search-0.0.14
+- *(agent)* build the broken-index test's hooks with the loop watch
+- Merge remote-tracking branch 'origin/dev' into feat/1052-loop-detection
+- Merge remote-tracking branch 'origin/dev' into fix/1044-run-settle-storage
+- Merge pull request #1074 from May-Agent/fix/1041-acp-grants
+- Merge pull request #1065 from May-Agent/fix/1038-help-flag
+- Merge pull request #1066 from May-Agent/fix/1034-session-file-headers
+- Merge pull request #1077 from May-Agent/fix/1045-tui-streaming-parse
+- Merge pull request #1069 from May-Agent/fix/1050-github-issue-list
+- Merge pull request #1075 from May-Agent/fix/1049-transcript-pages
+- Merge pull request #1081 from May-Agent/fix/apt-mirror
+- Merge pull request #1067 from May-Agent/fix/1051-secrets-index
+- Merge pull request #1071 from May-Agent/fix/1040-podman-pin
+- Merge pull request #1079 from May-Agent/fix/1078-job-removed-event
+- *(ipc)* give the command that reads stdin an empty one
+- *(daemon)* take the killed job's completion before expecting its removal
+- Merge pull request #1070 from May-Agent/fix/1042-pr-merge-head
+- *(daemon)* a resume carries its runtime and an optional lease
+- *(tui)* parse and wrap only the new lines of a streaming reply
+- *(secrets)* corrupt the index with text that does not parse
+- Merge pull request #1064 from May-Agent/fix/1036-cron-weekday
+- Merge pull request #1063 from May-Agent/fix/1037-policy-refusals
+- *(secrets)* compare empty results with assert_eq
+- Merge pull request #1031 from May-Agent/fix/1014-project-python
+- python3 resolves through the shim; the acceptance script checks a project .venv
+- Merge pull request #1028 from May-Agent/feat/1027-clap
+- Merge pull request #1020 from May-Agent/feat/1005-aither-redesign
+- import PathBuf only where the macOS-only helper uses it
+- keep every run's debug may as an artifact
+- give host git an identity, gate the macOS-only helper, match jq's version line
+- Merge remote-tracking branch 'origin/dev' into feat/1005-aither-redesign
+- select the acceptance jobs whenever the tests run
+- run the tool and container acceptance checks when what they read changes
+- accept the baseline tools and a container command through may exec
+- follow aither's dev branch until the redesign is released
+- *(deps)* follow aither's branch head and heel 0.9.5
+- *(deps)* follow the aither bridge-leaves head
+- Merge pull request #1010 from May-Agent/fix/1009-test-executor
+- *(tests)* satisfy clippy in the ported environment tests
+- *(skill)* state the shell settings, the compact tool's turn end, the command-table announcement and the one-shot stderr lines
+- *(ipc)* a panicking command fails its own call and the session continues
+- Merge pull request #1008 from May-Agent/feat/1007-whitespace-patch
+- *(shell)* port the host toolchain, credential and committing-worktree git tests
+- *(runaway)* place container and remote jobs through aither's test-util
+- *(test)* install the global executor through the one fixture
+- *(acp)* a named file outside the grants stays unreadable and unwritable
+- keep the dev debug may artifact for 90 days
+- satisfy clippy and port the end-to-end target to the redesigned wire
+- port the test targets to the redesigned aither API
+- *(wire)* carry aither's TimedEvent on the session event stream
+- build exec, scheduler and clone test shells from ShellAssembly
+- *(agent)* run on aither's redesigned loop and shell
+- move to zip 9 and keep the xz encoder for the distribution tests
+- follow the aither branch head and drop the test-heel feature
+- format
+- *(agent)* read compaction phases from aither's compaction events
+- *(agent)* build the main agent on the shell assembly and aither's builder
+- *(shell)* run scheduled tasks, ACP agents and job views on the shell assembly
+- *(agent)* move the leaf modules onto the redesigned aither API
+- *(commands)* register subagent and explore as shell-bound commands
+- *(subagent)* move the tracker, explore, ACP agents and btw onto the new module
+- *(commands)* register the shared commands on May's registry
+- *(harness)* own the loop helpers aither no longer ships
+- *(tools)* prepare SSH servers lazily and route containers by HostRoute
+- *(command_policy)* [**breaking**] May's script rules are aither ScriptPolicies
+- *(tools)* [**breaking**] prepare the programs every backend takes
+- *(tasks)* [**breaking**] own the work reference parser
+- *(deps)* build against the unreleased aither redesign
+- *(usage)* expect the block-rounded credit in the expired-cache e2e
+- *(usage)* keep a route's inferred cache block on its route row
+- Merge pull request #1001 from May-Agent/feat/984-webfetch-ask
+- *(prompt)* order the system prompt from most shared to least shared
+- Merge pull request #999 from May-Agent/fix/986-oneshot-cancel
+- Merge remote-tracking branch 'origin/dev' into fix/986-oneshot-cancel
+- Merge pull request #998 from May-Agent/fix/987-consecutive-misses
+- Merge pull request #997 from May-Agent/build/aither-0.30
+- *(cache)* an expired cache loses the whole prompt a write-less provider cached
+- *(agent)* give test agents a fixed clock
+- *(keep-warm)* wait on the logged refreshes, not the requests the stub received
+- move onto aither 0.30 and heel 0.9.4
+- Merge pull request #994 from May-Agent/feat/new-repo-license
+- Merge pull request #992 from May-Agent/feat/983-uv
+- Merge pull request #968 from May-Agent/feat/933-may-tasks
+- state when .chars() is costly and when bytes are equivalent
+- Merge remote-tracking branch 'origin/dev' into fix/981-malformed-tool-args
+- give the valid terminal arguments every field TerminalArgs requires
+- move may-tasks onto aither-agent 0.29
+- Merge pull request #980 from May-Agent/fix/976-readings-reload
+- borrow the parsed arguments when projecting tool summary fields
+- Merge remote-tracking branch 'origin/dev' into feat/933-may-tasks
+- Merge remote-tracking branch 'origin/dev' into fix/976-readings-reload
+- Merge pull request #982 from May-Agent/feat/969-cache-keep-warm
+- Merge remote-tracking branch 'origin/dev' into feat/933-may-tasks
+- Merge remote-tracking branch 'origin/dev' into feat/969-cache-keep-warm
+- mark keep-warm requests with a request_logs column
+- *(tasks)* take aither-agent 0.28 like the rest of the workspace
+- Merge remote-tracking branch 'origin/dev' into feat/922-command-cards
+- Merge remote-tracking branch 'origin/dev' into feat/933-may-tasks
+- *(deps)* aither 0.29
+- Merge pull request #972 from May-Agent/feat/955-compaction-meter
+- Merge pull request #971 from May-Agent/feat/152-find
+- Merge pull request #973 from May-Agent/feat/907-ssh-followups
+- Merge pull request #967 from May-Agent/feat/157-managed-shell
+- Merge remote-tracking branch 'origin/dev' into feat/955-compaction-meter
+- give the SSH job-pool test's server its platform
+- Merge remote-tracking branch 'origin/dev' into feat/907-ssh-followups
+- Merge remote-tracking branch 'origin/dev' into feat/955-compaction-meter
+- Merge remote-tracking branch 'origin/dev' into feat/933-may-tasks
+- Merge pull request #970 from May-Agent/feat/842-one-token-ids
+- the credential read test creates ~/.ssh when the runner has none
+- run the exec lease test in the default mode with a bound that outlasts the lease sweep
+- *(deps)* aither-acp 0.28 with acpsub on aither 0.28
+- Merge remote-tracking branch 'origin/dev' into feat/933-may-tasks
+- describe the may-tasks crate where the tasks command now lives
+- split the tasks.md parser and tasks command into the may-tasks crate
+- Merge remote-tracking branch 'origin/dev' into feat/842-one-token-ids
+- Merge remote-tracking branch 'origin/dev' into fix/960-repo-search-0.0.13
+- Merge remote-tracking branch 'origin/dev' into fix/962-done-before-release
+- Merge pull request #958 from May-Agent/chore/aither-0.27
+- give the ACP trial timeout test its heel
+- Merge remote-tracking branch 'origin/dev' into chore/aither-0.27
+- Merge remote-tracking branch 'origin/dev' into fix/952-task-run-recovery
+- give the task-run recovery test its home paths
+- Merge remote-tracking branch 'origin/dev' into fix/952-task-run-recovery
+- Merge remote-tracking branch 'origin/dev' into chore/aither-0.27
+- Merge pull request #956 from May-Agent/fix/950-exit-behaviour
+- *(deps)* depend on aither 0.27
+- Merge pull request #935 from May-Agent/feat/913-core-commands
+- Merge remote-tracking branch 'origin/dev' into fix/950-exit-behaviour
+- Merge remote-tracking branch 'origin/dev' into feat/913-core-commands
+- Merge pull request #943 from May-Agent/fix/no-migrations
+- Merge pull request #946 from May-Agent/feat/915-pr-ci
+- run the container tests after their image is built
+- Merge remote-tracking branch 'origin/dev' into fix/no-migrations
+- Merge remote-tracking branch 'origin/dev' into chore/aither-acp-0.26
+- Merge remote-tracking branch 'origin/dev' into feat/924-blocking-marks
+- *(tui)* a blocked row with only its BLOCKING line has nothing to expand
+- Merge remote-tracking branch 'origin/dev' into feat/924-blocking-marks
+- *(pr)* store the check rollup as a typed column
+- *(acp)* bound a timed-out trial by its limit, not the probe before it
+- *(deps)* bump aither-acp to 0.26
+- Merge remote-tracking branch 'origin/dev' into feat/785-command-reading
+- Merge remote-tracking branch 'origin/dev' into feat/137-remote-pools
+- build the workspace image when the tasks sources change
+- Merge pull request #932 from May-Agent/feat/914-sidebar-scroll
+- Merge pull request #934 from May-Agent/feat/137-pool-setting
+- *(session)* the runtime service takes its May home at construction
+- Merge remote-tracking branch 'origin/dev' into feat/914-sidebar-scroll
+- *(deps)* bump aither to 0.26
+- cover the job pool size setting and document it in the product reference
+- Merge remote-tracking branch 'origin/dev' into feat/914-sidebar-scroll
+- Merge remote-tracking branch 'origin/dev' into feat/785-command-reading
+- *(tui)* fit dev's new tests to the reading field and the panel background
+- Merge remote-tracking branch 'origin/dev' into feat/785-command-reading
+- Merge pull request #931 from May-Agent/feat/916-welcome-header
+- Merge pull request #929 from May-Agent/feat/912-tasks-command
+- *(e2e)* task rows carry a title and detail
+- Merge pull request #849 from May-Agent/feat/137-jobserver-acp-exec
+- Merge pull request #928 from May-Agent/fix/823-compact-row
+- Merge origin/dev into feat/785-command-reading
+- Merge remote-tracking branch 'origin/dev' into feat/912-tasks-command
+- Merge pull request #927 from May-Agent/fix/917-stacked-worked-for
+- Merge remote-tracking branch 'origin/dev' into fix/823-compact-row
+- Merge pull request #925 from May-Agent/fix/911-block-design
+- Merge remote-tracking branch 'origin/dev' into fix/917-stacked-worked-for
+- Merge remote-tracking branch 'origin/dev' into fix/stray-cells
+- Merge remote-tracking branch 'origin/dev' into fix/911-block-design
+- *(tui)* split the panel doc comment's summary line ([#911](https://github.com/May-Agent/may/pull/911))
+- Merge pull request #918 from May-Agent/feat/325-repo-sessions
+- Merge origin/chore/764-aither-0.22 into feat/137-jobserver-acp-exec
+- keep the dev push's debug may as an artifact
+- *(e2e)* look for the tasks_document tag May's template renders
+- give the repo gate fixtures a git author
+- *(trust)* share the project entry construction between the trust persisters
+- Merge origin/dev into chore/764-aither-0.22
+- Merge remote-tracking branch 'origin/dev' into feat/325-repo-sessions
+- describe where the subagent definitions live
+- *(deps)* [**breaking**] depend on aither 0.25.0
+- report cargo build timings and upload them per job
+- *(agents)* run may outside the test harness under a temporary HOME
+- Merge pull request #905 from May-Agent/fix/882-unsafe-host-access
+- stopping a turn is DELETE /turns/current ([#901](https://github.com/May-Agent/may/pull/901))
+- bash and rewind tests use the /actions routes ([#901](https://github.com/May-Agent/may/pull/901))
+- session-command routes, sweep dead handlers and stale callers ([#901](https://github.com/May-Agent/may/pull/901))
+- e2e reads the transcript instead of embedded messages ([#895](https://github.com/May-Agent/may/pull/895))
+- keep transcript conversion lint-clean ([#894](https://github.com/May-Agent/may/pull/894))
+- Merge pull request #891 from May-Agent/feat/887-web-session-events
+- the turn reader skips other session frames ([#887](https://github.com/May-Agent/may/pull/887))
+- a foreign-epoch cursor's reset precedes frames queued at subscribe ([#887](https://github.com/May-Agent/may/pull/887))
+- a stale cursor is one the session-event hub cannot continue ([#887](https://github.com/May-Agent/may/pull/887))
+- follow sessions on /api/sessions/{id}/events in the e2e tests ([#887](https://github.com/May-Agent/may/pull/887))
+- show the live check rollup on sidebar PR rows and in pr show
+- Merge pull request #885 from May-Agent/feat/884-session-events
+- *(tui)* assert the padding row's text with assert_eq ([#873](https://github.com/May-Agent/may/pull/873))
+- note that \n in issue/ask_user text is literal, pass real newlines
+- sidebar issue/PR rows show GitHub-style state icons
+- give sidebar issues GitHub-style state icons (open=●, closed=✓); PR rows show ● too
+- Merge pull request #868 from May-Agent/may/literally-notably-animated-godwit-42064a3f3bc2
+- TUI composer has no prompt, user messages share the band shade, images show placeholders
+- Merge pull request #867 from May-Agent/may/obscenely-dumbly-manageable-tamandua-87938068bef2
+- fmt
+- fetch and render markdown/artifact images folded into WorkedFor, and paint a placeholder on image cache misses
+- run typed /btw and /progress as commands, not messages
+- fix clippy warnings in dump_frame_json test
+- drop the composer '>' prompt and give user messages the band background
+- list command_policy, tasks_md and agent notices in the module map
+- describe aither-sed as the check for allowed sed forms
+- *(tui)* one inset for the band's horizontal padding
+- describe the TUI input band in the clients reference
+- repo-scoped sessions in the product reference
+- *(deps)* [**breaking**] depend on aither 0.23.0
+- Merge pull request #850 from May-Agent/feat/815-ci-durations
+- Merge origin/dev into feat/137-jobserver-acp-exec
+- Merge remote-tracking branch 'origin/dev' into chore/764-aither-0.22
+- Merge pull request #848 from May-Agent/fix/810-side-requests
+- Merge pull request #838 from May-Agent/feat/829-new-year
+- Merge pull request #846 from May-Agent/fix/844-delete-profile
+- Merge remote-tracking branch 'origin/dev' into fix/810-side-requests
+- prove a side request sees the context a running turn added
+- Merge pull request #845 from May-Agent/fix/843-help-commands
+- Merge remote-tracking branch 'origin/dev' into feat/141-explore
+- Merge remote-tracking branch 'origin/dev' into feat/829-new-year
+- Merge pull request #840 from May-Agent/feat/137-jobserver
+- Merge pull request #839 from May-Agent/feat/828-prompt-notifications
+- Merge pull request #836 from May-Agent/fix/805-agent-btw
+- update aither to 0.22.0
+- Merge remote-tracking branch 'origin/dev' into feat/828-prompt-notifications
+- Merge pull request #834 from May-Agent/feat/820-product-docs
+- Merge origin/dev into chore/764-aither-0.22
+- Merge pull request #833 from May-Agent/fix/825-context-window
+- Merge remote-tracking branch 'origin/dev' into fix/805-agent-btw
+- Merge pull request #831 from May-Agent/fix/826-searched-row
+- Merge pull request #832 from May-Agent/feat/827-effort-slider
+- Merge pull request #830 from May-Agent/fix/824-worked-for-single
+- Merge remote-tracking branch 'origin/dev' into fix/805-agent-btw
+- drop source citations from the product reference and name the compact tool
+- Merge remote-tracking branch 'origin/dev' into feat/129-event-driven-tasks-merge
+- add the product reference to the may skill
+- Merge remote-tracking branch 'origin/dev' into feat/129-event-driven-tasks-merge
+- keep condition-specific prompt guidance in built-in skills
+- Merge pull request #796 from May-Agent/fix/793-retract-aborted
+- Merge pull request #811 from May-Agent/feat/803-progress
+- Merge remote-tracking branch 'origin/dev' into fix/793-retract-aborted
+- Merge pull request #808 from May-Agent/fix/804-cold-send
+- Merge pull request #801 from May-Agent/fix/787-sleep-suggestion
+- Merge origin/dev into fix/741
+- update aither to 0.22.0
+- *(web-ui)* target ES2025 on TypeScript 6.0
+- Merge pull request #797 from May-Agent/fix/769-stable-message-ids
+- Merge remote-tracking branch 'origin/dev' into feat/129-event-driven-tasks-merge
+- Merge pull request #786 from May-Agent/feat/711-session-list-archive
+- Merge pull request #782 from May-Agent/fix/sleep-reminder-history
+- run each job only when the change reads something it does
+- keep product behaviour out of aither
+- Merge pull request #776 from May-Agent/feat/773-effort-slider
+- a push to dev builds instead of retesting the merged tree
+- save the rust cache only on dev
+- a night runs noon to noon
+- report a closed stub request channel
+- *(subagent)* keep the tasks.md probe fixture in the tasks format
+- *(rules-import)* mark the tasks.md row that waits on the import question
+- name the command behind each search in AGENTS.md
+- reformat the tests rustfmt reflows
+- Merge remote-tracking branch 'origin/dev' into fix/671-computer-waterkit
+- Merge remote-tracking branch 'origin/dev' into feat/129-event-driven-tasks
+- *(deps)* depend on aither 0.21.0
+- Merge pull request #734 from May-Agent/feat/727-global-rules
+- Merge remote-tracking branch 'origin/dev' into fix/671-computer-waterkit
+- Merge origin/dev into feat/727-global-rules
+- Merge pull request #732 from May-Agent/fix/296-table-wrap
+- Merge pull request #736 from May-Agent/feat/730-issue-approval
+- create the e2e issue with its kind
+- *(computer)* give each display's input a single owner task
+- *(computer)* take permissions, virtual displays and input from waterkit
+- Merge pull request #747 from May-Agent/feat/sleep-mode
+- Merge pull request #710 from May-Agent/fix/709-helper-stderr
+- Merge pull request #737 from May-Agent/fix/735-isolated-git-tests
+- Merge pull request #722 from May-Agent/fix/712-install-bootout
+- Merge pull request #729 from May-Agent/fix/unsafe-escalation
+- Merge remote-tracking branch 'origin/dev' into feat/sleep-mode
+- Merge remote-tracking branch 'origin/dev' into feat/129-event-driven-tasks
+- *(deps)* depend on aither 0.20.0
+- Merge remote-tracking branch 'origin/dev' into fix/709-helper-stderr
+- Merge remote-tracking branch 'origin/dev' into feat/730-issue-approval
+- adapt to aither 0.20
+- Merge remote-tracking branch 'origin/dev' into feat/129-event-driven-tasks
+- Merge pull request #726 from May-Agent/fix/714-nonfatal-tui-errors
+- Merge pull request #689 from May-Agent/fix/686-skill-local-subagents
+- Merge pull request #681 from May-Agent/fix/678-gate-profile
+- Merge remote-tracking branch 'origin/dev' into fix/714-nonfatal-tui-errors
+- Merge remote-tracking branch 'origin/dev' into fix/697-ctrl-keys
+- *(e2e)* hold the compaction probe answer until the run asks again
+- Merge pull request #715 from May-Agent/fix/695-error-fold
+- Merge remote-tracking branch 'origin/dev' into fix/678-gate-profile
+- Merge pull request #684 from May-Agent/fix/682-commit-hidden-entries
+- Merge pull request #740 from May-Agent/fix/670-capture-waterkit
+- take waterkit-screen from waterkit's dev branch
+- Merge remote-tracking branch 'origin/dev' into fix/670-capture-waterkit
+- Merge pull request #731 from May-Agent/fix/723-stray-bars
+- Merge pull request #720 from May-Agent/fix/698-thought-header
+- stop merge-group runs the queue has superseded
+- *(git)* run fixture git on an isolated configuration
+- Merge pull request #724 from May-Agent/docs/one-shot-alerts
+- *(tui)* wrap table cells with the shared wrapper
+- Merge branch 'fix/723-stray-bars' into fix/296-table-wrap
+- Merge pull request #725 from May-Agent/fix/permission-popup
+- Merge pull request #690 from May-Agent/fix/683-reload-tool-runs
+- Merge pull request #716 from May-Agent/fix/699-attach-dup
+- Merge pull request #675 from May-Agent/feat/issue-any-repo
+- Merge pull request #706 from May-Agent/fix/703-load-session-layout
+- Merge remote-tracking branch 'origin/dev' into fix/697-ctrl-keys
+- *(agents)* a recurring condition is a new alert event
+- Merge remote-tracking branch 'origin/dev' into fix/699-attach-dup
+- Merge pull request #692 from May-Agent/feat/318-session-clones
+- *(agents)* the home environment is where the agent works, transcripts aside
+- *(agents)* define the home environment that pressure handling protects
+- Merge remote-tracking branch 'origin/dev' into fix/670-capture-waterkit
+- Merge pull request #687 from May-Agent/feat/149-language-display
+- *(skills)* describe per-repository clones, repo clone and merge cleanup
+- *(computer)* forward and time captures with runtime-neutral primitives
+- Merge pull request #676 from May-Agent/fix/rewind-after-effort
+- Merge pull request #679 from May-Agent/fix/trust-profile
+- Merge pull request #497 from May-Agent/fix/496-helper-signing
+- Merge remote-tracking branch 'origin/dev' into fix/496-helper-signing
+- Revert "fix(computer): require and request direct screen-capture consent"
+- *(acp)* check a killed sandboxed agent's exit status is collected
+- *(acp)* drop the trial executor; a timed-out handshake already ends its agent
+- *(acp)* check a scratch-sandbox agent's exit status is collected
+- Merge remote-tracking branch 'origin/dev' into fix/656-sweep-dead-home-agents
+- *(repo-search)* document the off-macOS sweep stubs' errors
+- follow acpsub dev, which reports a failed process wait
+- Merge remote-tracking branch 'origin/dev' into fix/569-acp-sandbox
+- Merge remote-tracking branch 'origin/dev' into fix/654-pin-repo-search
+- Merge remote-tracking branch 'origin/dev' into fix/569-acp-sandbox
+- Merge remote-tracking branch 'origin/dev' into fix/569-acp-sandbox
+- Merge pull request #614 from May-Agent/fix/594-claim-busy
+- follow acpsub dev now that client file access can be turned off
+- Merge pull request #657 from May-Agent/feat/632-cache-miss
+- move to aither 0.19 and acpsub's sandboxed-host-fs branch
+- *(deps)* move to aither 0.19 and acpsub on 0.19
+- *(agent)* run the session lookup tests on a Tokio runtime
+- Merge remote-tracking branch 'origin/dev' into fix/594-claim-busy
+- Merge remote-tracking branch 'origin/dev' into fix/569-acp-sandbox
+- Merge pull request #651 from May-Agent/feat/644-live-content
+- *(tui)* index nested click regions directly
+- expand members inside an expanded 'Worked for' group
+- take acpsub on aither 0.18 and drop aither 0.17
+- Merge origin/dev into fix/647-oneshot-resync
+- cover live MCP commands, AGENTS.md and memory
+- [**breaking**] move to aither 0.18
+- Merge pull request #648 from May-Agent/fix/626-launchd-leak
+- Merge pull request #645 from May-Agent/feat/506-issue-owner
+- Merge remote-tracking branch 'origin/dev' into fix/639-signed-commits
+- Merge pull request #641 from May-Agent/ci/640-cache-downloads
+- link bunx beside the pinned bun
+- restore pinned downloads from the Actions cache
+- Merge pull request #627 from May-Agent/fix/625-symlink-home
+- *(e2e)* keep the harness's temp home alive under a named guard
+- *(e2e)* spell the harness home by its real path
+- Merge remote-tracking branch 'origin/dev' into fix/625-symlink-home
+- Merge remote-tracking branch 'origin/dev' into fix/569-acp-sandbox
+- Merge pull request #620 from May-Agent/feat/154-issue-provenance
+- Merge pull request #623 from May-Agent/feat/504-prompt
+- *(e2e)* expect the environment section's new wording
+- *(agent)* gate the scripted compaction reply on a served turn request
+- *(aux)* cover suggestions, recap cards and history isolation end to end
+- Merge remote-tracking branch 'origin/dev' into feat/154-issue-provenance
+- Merge pull request #619 from May-Agent/fix/578-trust-backend
+- Merge remote-tracking branch 'origin/dev' into feat/154-issue-provenance
+- *(issue)* state when the shared command registry can panic
+- *(issue)* an issue and comment written outside may are marked as such
+- *(daemon)* bound the gate-pattern command by the test's own waits ([#617](https://github.com/May-Agent/may/pull/617))
+- Merge remote-tracking branch 'origin/dev' into feat/154-issue-provenance
+- Merge pull request #615 from May-Agent/feat/127-compact-tool
+- Merge pull request #613 from May-Agent/fix/583-search-clone
+- *(agent)* leave the compact rule to the tool's own description
+- Merge remote-tracking branch 'origin/dev' into fix/518-recap-prose
+- Merge remote-tracking branch 'origin/dev' into fix/518-recap-prose
+- *(pr)* make the simulated squash merge a distinct commit
+- Merge origin/dev into feat/128-async-compaction
+- Merge origin/dev into fix/518-recap-prose
+- Merge pull request #598 from May-Agent/fix/572-pr-close
+- Merge pull request #602 from May-Agent/fix/517-request-params
+- Merge pull request #599 from May-Agent/fix/581-missing-project-path
+- *(daemon)* require the signature refusal body to recognise our webhook router
+- Merge remote-tracking branch 'origin/dev' into fix/572-pr-close
+- *(daemon)* prove the funnel listener closed by its own router, not by a refused port
+- *(deps)* move to aither 0.16.0
+- *(github)* share one REST client between the issue and PR backends
+- Merge pull request #596 from May-Agent/fix/574-github-pagination
+- Merge remote-tracking branch 'origin/dev' into fix/517-request-params
+- Merge pull request #587 from May-Agent/fix/579-trust-persist
+- Merge pull request #592 from May-Agent/fix/570-container-clone-paths
+- *(daemon)* persist trust through the config-reloading persist
+- Merge pull request #593 from May-Agent/fix/582-sidebar-refresh
+- *(context)* build the container test client without a Docker socket
+- *(daemon)* build repo-clone test state without the removed cwd argument
+- *(daemon)* set the trust test session cwd on its row
+- Merge remote-tracking branch 'origin/dev' into fix/571-durable-pr-commits
+- Merge remote-tracking branch 'origin/dev' into fix/580-trust-live
+- Merge remote-tracking branch 'origin/fix/566-clone-registry' into fix/571-durable-pr-commits
+- Merge remote-tracking branch 'origin/dev' into fix/571-durable-pr-commits
+- *(trust)* lay the repo tool test out as a real session
+- Merge remote-tracking branch 'origin/dev' into fix/566-clone-registry
+- install the heel runtime Cargo.lock pins
+- Merge remote-tracking branch 'origin/dev' into feat/143-aither-015-subagent-subcommands
+- take aither-acp 0.15.0 now that acpsub is on aither 0.15
+- *(subagent)* a subagent's terminal has no subagent command
+- *(tui)* cover links in user messages and the hovered-link paint
+- Merge remote-tracking branch 'origin/dev' into feat/519-tui-links
+- Merge pull request #557 from May-Agent/fix/551-webhook-body-cap
+- Merge pull request #556 from May-Agent/fix/549-resume-after-release
+- *(daemon)* gate the background job of the release regression test on the test itself
+- Merge pull request #555 from May-Agent/feat/528-session-yolo
+- Merge pull request #544 from May-Agent/fix/514-live-aux-settings
+- *(e2e)* include the server log when a subagent probe never finishes its resumed turn
+- serve the fixture tool scripts from askama templates and use them in scheduler and idle-compaction tests
+- *(daemon)* prepare the test daemon's tools from a file-backed fixture distribution
+- *(chat)* bound the network-hold wait so a hang fails fast
+- *(chat)* wait for the network hold by event, not a 60 s bound
+- Merge remote-tracking branch 'origin/dev' into HEAD
+- Merge pull request #541 from May-Agent/feat/522-ask-user-secrets
+- Merge pull request #538 from May-Agent/fix/511-idle-lifecycle
+- *(task)* build webhook triggers with the signed-webhook fields
+- Merge remote-tracking branch 'origin/dev' into feat/529-task-wake-session
+- Merge pull request #534 from May-Agent/fix/516-run-cancel-safety
+- Merge pull request #533 from May-Agent/fix/525-webhook-auth
+- *(skill)* describe clones, PRs and CI in the may skill
+- add a bundled may skill and bring AGENTS.md architecture in line with the source
+- clear read-only files from the restored test scratch
