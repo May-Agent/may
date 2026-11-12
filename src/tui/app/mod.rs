@@ -31,6 +31,7 @@ use super::completion::{Completion, CompletionMode};
 use super::error::{AppResult, TuiError};
 use super::event::{AppEvent, EventSender};
 use super::file_diff::FileDiffHandle;
+use super::grapheme;
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
 use super::slash::SlashCommand;
@@ -118,10 +119,9 @@ pub struct App {
     pub worker_settings: crate::agent::AgentLiveSettings,
     /// Current input text
     pub input: String,
-    /// Input cursor position (character index, not byte index)
+    /// Input cursor position: a byte offset into `input` that always sits
+    /// on a grapheme cluster boundary.
     pub cursor: usize,
-    /// Cached character count for input (avoids O(n) .`chars().count()`)
-    pub input_char_count: usize,
     /// The daemon's suggested next prompt, drawn as ghost text while the
     /// input is empty; `Tab` lifts it into the draft.
     pub prompt_suggestion: Option<PromptSuggestion>,
@@ -644,7 +644,6 @@ impl App {
             config,
             input: String::new(),
             cursor: 0,
-            input_char_count: 0,
             prompt_suggestion: None,
             attachments: Vec::new(),
             chat: ChatStream::new().with_tunnel_base(tunnel_base),
@@ -1944,7 +1943,6 @@ impl App {
         // Reset per-session UI state so /new starts from a clean screen in inline viewport mode.
         self.input.clear();
         self.cursor = 0;
-        self.input_char_count = 0;
         self.attachments.clear();
         self.completion.cancel();
         self.queue = MessageQueue::new();
@@ -2240,7 +2238,7 @@ impl App {
         match &self.mode {
             AppMode::Chat => {
                 // Chat has special handling for large pastes (attachments)
-                return Some(ActiveTextInput::Cursored {
+                return Some(ActiveTextInput::Composer {
                     input: &mut self.input,
                     cursor: &mut self.cursor,
                 });
@@ -2437,16 +2435,18 @@ impl App {
 
         // Get active text input and paste into it
         match self.active_text_input() {
+            Some(ActiveTextInput::Composer { input, cursor }) => {
+                input.insert_str(*cursor, &text);
+                // The pasted text may join the cluster before or after it, so
+                // the cursor sits at the boundary at or after its end.
+                let end = *cursor + text.len();
+                *cursor = grapheme::next_boundary(input, grapheme::prev_boundary(input, end));
+                self.update_completion_state();
+            }
             Some(ActiveTextInput::Cursored { input, cursor }) => {
                 let byte_idx = char_to_byte_index(input, *cursor);
                 input.insert_str(byte_idx, &text);
                 *cursor += text.chars().count();
-
-                // Update input_char_count if this is the main chat input
-                if matches!(self.mode, AppMode::Chat) {
-                    self.input_char_count = self.input.chars().count();
-                    self.update_completion_state();
-                }
             }
             Some(ActiveTextInput::Simple { input, filter }) => {
                 let filtered = filter.filter(&text);
@@ -2505,7 +2505,6 @@ impl App {
                     self.quit_pending = true;
                     self.input.clear();
                     self.cursor = 0;
-                    self.input_char_count = 0;
                     self.attachments.clear();
                     self.completion.cancel();
                     self.set_status("^C Press Ctrl+C again to exit");
@@ -3056,7 +3055,6 @@ impl App {
                         if mode == CompletionMode::Slash {
                             self.input.clear();
                             self.cursor = 0;
-                            self.input_char_count = 0;
                             let command = SlashCommand::from_name(&cmd)
                                 .expect("completion lists only table commands");
                             return self.execute_slash_command(command);
@@ -3093,11 +3091,10 @@ impl App {
             KeyCode::Backspace => {
                 self.history.reset_navigation();
                 if self.cursor > 0 {
-                    // Delete character before cursor
-                    self.cursor -= 1;
-                    let byte_idx = char_to_byte_index(&self.input, self.cursor);
-                    self.input.remove(byte_idx);
-                    self.input_char_count -= 1;
+                    // Delete the grapheme before the cursor
+                    let start = grapheme::prev_boundary(&self.input, self.cursor);
+                    self.input.replace_range(start..self.cursor, "");
+                    self.cursor = start;
                     self.update_completion_state();
                 } else if !self.attachments.is_empty() {
                     // Cursor at start and has attachments - delete last attachment
@@ -3106,26 +3103,24 @@ impl App {
             }
             KeyCode::Delete => {
                 self.history.reset_navigation();
-                if self.cursor < self.input_char_count {
-                    let byte_idx = char_to_byte_index(&self.input, self.cursor);
-                    self.input.remove(byte_idx);
-                    self.input_char_count -= 1;
+                if self.cursor < self.input.len() {
+                    let end = grapheme::next_boundary(&self.input, self.cursor);
+                    self.input.replace_range(self.cursor..end, "");
                     self.update_completion_state();
                 }
             }
             KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = grapheme::prev_boundary(&self.input, self.cursor);
             }
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.input_char_count);
+                self.cursor = grapheme::next_boundary(&self.input, self.cursor);
             }
             KeyCode::Up => {
                 if self.completion.has_matches() {
                     self.completion.prev();
                 } else if let Some(entry) = self.history.prev(&self.input) {
                     self.input = entry.to_string();
-                    self.input_char_count = self.input.chars().count();
-                    self.cursor = self.input_char_count;
+                    self.cursor = self.input.len();
                 }
             }
             KeyCode::Down => {
@@ -3133,8 +3128,7 @@ impl App {
                     self.completion.next();
                 } else if let Some(entry) = self.history.next_entry() {
                     self.input = entry.to_string();
-                    self.input_char_count = self.input.chars().count();
-                    self.cursor = self.input_char_count;
+                    self.cursor = self.input.len();
                 } else if self.background.is_some() {
                     // ↓ past the newest history entry opens the background
                     // jobs/subagents panel (status bar hint: `N shells ↓`).
@@ -3155,7 +3149,7 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::End => {
-                self.cursor = self.input_char_count;
+                self.cursor = self.input.len();
             }
             KeyCode::Esc => {
                 if self.prompt_suggestion.is_some() {
@@ -3177,7 +3171,6 @@ impl App {
                     if !self.input.is_empty() {
                         self.input.clear();
                         self.cursor = 0;
-                        self.input_char_count = 0;
                     }
                 }
             }
@@ -3189,9 +3182,8 @@ impl App {
                     return None;
                 }
                 if let Some(suggestion) = self.own_visible_suggestion().map(str::to_owned) {
-                    self.input_char_count = suggestion.chars().count();
+                    self.cursor = suggestion.len();
                     self.input = suggestion;
-                    self.cursor = self.input_char_count;
                     self.prompt_suggestion = None;
                     return None;
                 }
@@ -3206,10 +3198,14 @@ impl App {
             KeyCode::Char(c) => {
                 // Reset history navigation when typing
                 self.history.reset_navigation();
-                let byte_idx = char_to_byte_index(&self.input, self.cursor);
-                self.input.insert(byte_idx, c);
-                self.cursor += 1;
-                self.input_char_count += 1;
+                self.input.insert(self.cursor, c);
+                // A combining mark, ZWJ or second regional indicator joins
+                // the cluster before it; the cursor sits after the cluster
+                // the new char ended up in.
+                self.cursor = grapheme::next_boundary(
+                    &self.input,
+                    grapheme::prev_boundary(&self.input, self.cursor + c.len_utf8()),
+                );
 
                 // Trigger or update completion
                 self.update_completion_state();
@@ -3367,13 +3363,16 @@ impl App {
                     && let Some((start, rows)) = self.chat_layout.input_span()
                     && (start..start + rows).contains(&p.line)
                 {
-                    let mut cursor = 0usize;
+                    // Cells from the input line's left edge to the click: the
+                    // rows above (as drawn) plus the column in the clicked row.
+                    let mut column = usize::from(mouse.column.saturating_sub(self.chat_area.x));
                     for row in start..p.line {
                         if let Some(text) = self.chat_layout.plain_line(row) {
-                            cursor += text.chars().count();
+                            column += unicode_width::UnicodeWidthStr::width(text);
                         }
                     }
-                    self.cursor = (cursor + p.column).min(self.input_char_count);
+                    self.cursor =
+                        super::ui::chat::caret_at_column(&self.input, &self.attachments, column);
                     self.selection = None;
                     return Ok(None);
                 }
@@ -3659,8 +3658,7 @@ impl App {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
                 self.input = format!("{} ", command.name());
-                self.input_char_count = self.input.chars().count();
-                self.cursor = self.input_char_count;
+                self.cursor = self.input.len();
                 None
             }
             SlashCommand::Quit => self.request_quit(),
@@ -3889,7 +3887,6 @@ impl App {
         if command.is_empty() {
             self.input.clear();
             self.cursor = 0;
-            self.input_char_count = 0;
             return None;
         }
         // Without the stored secrets nothing can be masked: the command is
@@ -3903,8 +3900,6 @@ impl App {
         };
         self.input.clear();
         self.cursor = 0;
-        self.input_char_count = 0;
-
         let (masked, had_secret) = secrets.mask(&command);
         self.history.push(format!("! {masked}"));
         self.history.save();
@@ -3942,7 +3937,6 @@ impl App {
     fn submit_secret(&mut self) -> Option<SendAction> {
         let line = std::mem::take(&mut self.input);
         self.cursor = 0;
-        self.input_char_count = 0;
         let rest = line.trim_start()["/secret".len()..].trim();
         let Some((key, value)) = rest.split_once(char::is_whitespace) else {
             self.chat
@@ -3973,8 +3967,6 @@ impl App {
         let content = std::mem::take(&mut self.input);
         let attachments = std::mem::take(&mut self.attachments);
         self.cursor = 0;
-        self.input_char_count = 0;
-
         let trimmed = content.trim();
         if trimmed == SlashCommand::Context.name() && attachments.is_empty() {
             return Some(SendAction::ContextReport);
@@ -4114,8 +4106,7 @@ impl App {
             if self.rewind_notice.is_none() {
                 self.rewind_notice = self.sent_hidden_context.take();
             }
-            self.input_char_count = content.chars().count();
-            self.cursor = self.input_char_count;
+            self.cursor = content.len();
             self.input = content;
             self.attachments = attachments.unwrap_or_default();
         }
@@ -5731,7 +5722,7 @@ mod tests {
         let action = press(&mut app, KeyCode::Tab);
         assert!(action.is_none(), "accepting never submits");
         assert_eq!(app.input, "run the tests");
-        assert_eq!(app.cursor, app.input_char_count);
+        assert_eq!(app.cursor, app.input.len());
         assert!(app.prompt_suggestion.is_none(), "consumed");
         press(&mut app, KeyCode::Char('!'));
         assert_eq!(app.input, "run the tests!", "the lifted text is editable");
@@ -6455,7 +6446,6 @@ mod tests {
         app.chat.push_user("hello", Vec::new(), 0);
         app.input = "draft".to_string();
         app.cursor = 5;
-        app.input_char_count = 5;
         set_date(&mut app, "2026-12-31T12:00:00", "America/New_York");
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
@@ -6616,5 +6606,146 @@ mod tests {
         })
         .expect("background event");
         assert!(matches!(app.request_quit(), Some(SendAction::Quit)));
+    }
+
+    /// What the composer must treat as one character: a ZWJ family emoji, a
+    /// flag (two regional indicators), a letter with a combining accent and
+    /// one character each of Chinese, Japanese and Korean, with the cells the
+    /// renderer draws for it.
+    const COMPOSER_CLUSTERS: [(&str, &str, usize); 6] = [
+        (
+            "zwj family",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            2,
+        ),
+        ("flag", "\u{1F1E8}\u{1F1E6}", 2),
+        ("combining accent", "e\u{0301}", 1),
+        ("chinese", "中", 2),
+        ("japanese", "あ", 2),
+        ("korean", "한", 2),
+    ];
+
+    async fn composer_with(dir: &std::path::Path, text: &str, cursor: usize) -> App {
+        let (mut app, _id) = app_with_session(dir).await;
+        app.input = text.to_string();
+        app.cursor = cursor;
+        app
+    }
+
+    #[tokio::test]
+    async fn left_and_right_move_one_grapheme() {
+        for (name, cluster, _) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let text = format!("a{cluster}b");
+            let mut app = composer_with(dir.path(), &text, 0).await;
+            let stops = [0, 1, 1 + cluster.len(), text.len()];
+            for stop in &stops[1..] {
+                press(&mut app, KeyCode::Right);
+                assert_eq!(app.cursor, *stop, "{name}: Right");
+            }
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.cursor, text.len(), "{name}: Right at the end");
+            for stop in stops[..3].iter().rev() {
+                press(&mut app, KeyCode::Left);
+                assert_eq!(app.cursor, *stop, "{name}: Left");
+            }
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.cursor, 0, "{name}: Left at the start");
+        }
+    }
+
+    #[tokio::test]
+    async fn backspace_and_delete_remove_one_whole_grapheme() {
+        for (name, cluster, _) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let text = format!("a{cluster}b");
+            let mut app = composer_with(dir.path(), &text, 1 + cluster.len()).await;
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(
+                (app.input.as_str(), app.cursor),
+                ("ab", 1),
+                "{name}: Backspace"
+            );
+
+            let mut app = composer_with(dir.path(), &text, 1).await;
+            press(&mut app, KeyCode::Delete);
+            assert_eq!(
+                (app.input.as_str(), app.cursor),
+                ("ab", 1),
+                "{name}: Delete"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_clusters_are_one_backspace() {
+        for (name, cluster, _) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _id) = app_with_session(dir.path()).await;
+            for c in cluster.chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert_eq!(app.cursor, cluster.len(), "{name}: cursor after typing");
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!((app.input.as_str(), app.cursor), ("", 0), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pasting_keeps_the_cursor_on_a_boundary() {
+        let dir = tempfile::tempdir().expect("dir");
+        let flag = "\u{1F1E8}\u{1F1E6}";
+        let mut app = composer_with(dir.path(), "ab", 1).await;
+        assert!(app.handle_bracketed_paste(flag.to_string()).is_none());
+        assert_eq!(app.input, format!("a{flag}b"));
+        assert_eq!(app.cursor, 1 + flag.len());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!((app.input.as_str(), app.cursor), ("ab", 1));
+    }
+
+    /// Click the input row `column` cells into the drawn text.
+    fn click_input(
+        app: &mut App,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        column: u16,
+    ) {
+        draw_rows(terminal, app);
+        let (row, _) = app.chat_layout.input_span().expect("input row");
+        let area = app.chat_area;
+        let screen_row = area.y
+            + u16::try_from(row + app.chat_layout.top_padding() - app.effective_scroll())
+                .expect("row");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x + column,
+            row: screen_row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("mouse");
+    }
+
+    #[tokio::test]
+    async fn clicking_places_the_caret_on_the_grapheme_under_the_pointer() {
+        for (name, cluster, width) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let text = format!("a{cluster}b");
+            let mut app = composer_with(dir.path(), &text, 0).await;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+                .expect("terminal");
+            let width = u16::try_from(width).expect("width");
+            // (column clicked, cursor expected)
+            let cases = [
+                (0, 0),
+                (1, 1),
+                (1 + width - 1, 1),
+                (1 + width, 1 + cluster.len()),
+                (2 + width, text.len()),
+                (40, text.len()),
+            ];
+            for (column, expected) in cases {
+                click_input(&mut app, &mut terminal, column);
+                assert_eq!(app.cursor, expected, "{name}: click at column {column}");
+            }
+        }
     }
 }
