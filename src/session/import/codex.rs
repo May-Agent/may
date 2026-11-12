@@ -83,13 +83,12 @@ pub(super) fn parse(path: &Path) -> Result<ImportedTranscript, ImportError> {
                 // replacement list as the base for what follows.
                 items = record["payload"]["replacement_history"]
                     .as_array()
-                    .map(|list| {
+                    .map_or_default(|list| {
                         list.iter()
                             .cloned()
                             .map(|item| (timestamp.clone(), item))
                             .collect()
-                    })
-                    .unwrap_or_default();
+                    });
             }
             Some("response_item") => {
                 items.push((timestamp, record["payload"].clone()));
@@ -179,7 +178,7 @@ pub(super) fn parse(path: &Path) -> Result<ImportedTranscript, ImportError> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let output = item.get("output").map(output_text).unwrap_or_default();
+                let output = item.get("output").map_or_default(output_text);
                 turn.results.push((call_id, ToolResult::text(output), ts));
             }
             _ => {}

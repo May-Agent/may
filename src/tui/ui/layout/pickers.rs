@@ -30,8 +30,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
     // Build title with profile name
     let profile_label = app
         .current_profile_name()
-        .map(|n| format!(" [{n}]"))
-        .unwrap_or_default();
+        .map_or_default(|n| format!(" [{n}]"));
     let heading = match app.session_view {
         SessionView::Recent => "Sessions",
         SessionView::Archive => "Archived sessions",
@@ -699,9 +698,9 @@ pub(super) fn render_resume_picker(
                 Style::default().fg(Color::White)
             };
             let meta_style = Style::default().fg(Color::DarkGray);
-            let cwd = session.cwd.as_deref().map(display_cwd).unwrap_or_default();
+            let cwd = session.cwd.as_deref().map_or_default(display_cwd);
             let id_short: String = session.id.chars().take(8).collect();
-            let age = session.modified.map(relative_age).unwrap_or_default();
+            let age = session.modified.map_or_default(relative_age);
             lines.push(Line::from(vec![
                 Span::styled(
                     prefix,

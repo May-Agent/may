@@ -380,8 +380,7 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
             .models
             .compaction_model
             .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
+            .map_or_default(ToString::to_string),
     ];
 
     let mut items: Vec<ListItem> = tier_names

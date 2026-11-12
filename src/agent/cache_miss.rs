@@ -61,7 +61,7 @@ impl CacheObservation {
         self.cache_write_tokens.map_or_else(
             || {
                 let whole_blocks =
-                    block.map_or(0, |block| self.prompt_tokens / block.get() * block.get());
+                    block.map_or(0, |block| self.prompt_tokens / block * block.get());
                 whole_blocks.max(self.cache_read_tokens)
             },
             |written| self.cache_read_tokens + written,

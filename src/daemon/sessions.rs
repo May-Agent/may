@@ -157,10 +157,9 @@ pub(super) async fn linked_issue_briefs(
     paths: &crate::session::SessionPaths,
 ) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
     let content = paths.tasks_content().await.map_err(internal_error)?;
-    let numbers = content
-        .as_deref()
-        .map(|content| crate::tui::sidebar::linked_issues(&crate::task_rows::task_rows(content)))
-        .unwrap_or_default();
+    let numbers = content.as_deref().map_or_default(|content| {
+        crate::tui::sidebar::linked_issues(&crate::task_rows::task_rows(content))
+    });
     let mut briefs = issue_briefs(state, session_id, numbers).await?;
     // A failed lookup says nothing new; the client keeps what it shows.
     briefs.retain(|brief| brief.title.is_some());

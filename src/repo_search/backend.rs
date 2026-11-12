@@ -191,8 +191,7 @@ pub mod testing {
                 .lock()
                 .expect("collections lock")
                 .get(collection)
-                .map(|docs| docs.keys().cloned().collect())
-                .unwrap_or_default()
+                .map_or_default(|docs| docs.keys().cloned().collect())
         }
     }
 
