@@ -1,7 +1,7 @@
 use crate::harness::working_document::WorkTracker;
 
 use super::*;
-use crate::db::RepoCloneRow;
+use crate::db::{PrState, RepoCloneRow};
 use crate::issue::{IssueRelationKind, MayIssueStore};
 
 async fn tracker(dir: &std::path::Path) -> (MayWorkTracker, MayIssueStore, ChatDb) {
@@ -165,9 +165,15 @@ async fn a_pr_reads_its_state_from_its_record() {
         tracker.status(&reference).await.expect("open").state,
         WorkState::Open
     );
-    db.update_pr(pr.id, "merged", Some("head"), Some("merge"), Some("now"))
-        .await
-        .expect("merge");
+    db.update_pr(
+        pr.id,
+        PrState::Merged,
+        Some("head"),
+        Some("merge"),
+        Some("now"),
+    )
+    .await
+    .expect("merge");
     let item = tracker.item(&reference).await.expect("merged");
     assert_eq!(item.state, WorkState::Merged);
     assert_eq!(item.title, "land search");
@@ -175,14 +181,6 @@ async fn a_pr_reads_its_state_from_its_record() {
         tracker.item(&WorkRef::pull_request(77)).await,
         Err(WorkTrackerError::NotFound(WorkRef::pull_request(77)))
     );
-
-    db.update_pr(pr.id, "abandoned", None, None, None)
-        .await
-        .expect("state");
-    assert!(matches!(
-        tracker.status(&reference).await,
-        Err(WorkTrackerError::Unavailable { .. })
-    ));
 }
 
 /// A qualified PR reads in the session's clone of that repository, names

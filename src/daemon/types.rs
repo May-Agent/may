@@ -469,8 +469,8 @@ pub struct ApiPr {
     pub(crate) number: i64,
     /// PR title.
     pub(crate) title: String,
-    /// `open`, `checks_pending`, `failed`, `rejected`, `merging`, `merged`, `closed`.
-    pub(crate) state: String,
+    /// Where the PR stands.
+    pub(crate) state: crate::db::PrState,
     /// `may` or `github`.
     pub(crate) backend: String,
     /// External PR number, when the backend created one.

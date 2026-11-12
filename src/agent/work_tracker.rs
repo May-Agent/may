@@ -8,7 +8,7 @@ use crate::harness::working_document::{
     RelatedWork, WorkComment, WorkItem, WorkKind, WorkRef, WorkState, WorkStatus, WorkTrackerError,
 };
 
-use crate::db::{ChatDb, PrRow};
+use crate::db::{ChatDb, PrRow, PrState};
 use crate::issue::{
     IssueDetail, IssueError, IssueState, IssueStatus, IssueStore, RelatedIssue, ResolvedIssueStore,
 };
@@ -189,7 +189,7 @@ impl crate::harness::working_document::WorkTracker for MayWorkTracker {
                 Ok(WorkItem {
                     reference: reference.clone(),
                     title: row.title,
-                    state: pr_state(reference, &row.state)?,
+                    state: pr_state(row.state),
                     body: row.body,
                     comments: Vec::new(),
                     sub_issues: Vec::new(),
@@ -206,7 +206,7 @@ impl crate::harness::working_document::WorkTracker for MayWorkTracker {
                 let row = self.pull_request(reference).await?;
                 Ok(WorkStatus {
                     reference: reference.clone(),
-                    state: pr_state(reference, &row.state)?,
+                    state: pr_state(row.state),
                     blocked_by: Vec::new(),
                 })
             }
@@ -247,17 +247,16 @@ const fn issue_state(state: IssueState) -> WorkState {
     }
 }
 
-/// A PR record's state; one this tracker does not know is an error, never
-/// taken for open.
-fn pr_state(reference: &WorkRef, state: &str) -> Result<WorkState, WorkTrackerError> {
+/// A PR record's state as a tracker state: every live state is open.
+const fn pr_state(state: PrState) -> WorkState {
     match state {
-        "open" | "checks_pending" | "failed" | "rejected" | "merging" => Ok(WorkState::Open),
-        "merged" => Ok(WorkState::Merged),
-        "closed" => Ok(WorkState::Closed),
-        other => Err(unavailable(
-            reference,
-            &format!("its PR record has the unknown state {other}"),
-        )),
+        PrState::Merged => WorkState::Merged,
+        PrState::Closed => WorkState::Closed,
+        PrState::Open
+        | PrState::ChecksPending
+        | PrState::Failed
+        | PrState::Rejected
+        | PrState::Merging => WorkState::Open,
     }
 }
 

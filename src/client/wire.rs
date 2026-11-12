@@ -690,7 +690,7 @@ pub struct WirePr {
     /// PR title.
     pub title: String,
     /// Lifecycle state.
-    pub state: String,
+    pub state: crate::db::PrState,
     /// `may` or `github`.
     pub backend: String,
     /// External PR number, when the backend created one.

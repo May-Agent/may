@@ -58,7 +58,7 @@ pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessag
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, NamedAskUserQuestion, PendingAskUserQuestion};
-pub use pr::{PrEventRow, PrRow};
+pub use pr::{PrEventRow, PrFilter, PrRow, PrState};
 pub use pr_checks::PrCheckState;
 pub use repo_clone::RepoCloneRow;
 pub use repo_usage::RepoUsage;
