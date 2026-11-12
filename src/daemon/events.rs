@@ -388,6 +388,7 @@ async fn index_coverage(
 ) -> Result<Option<crate::client::IndexCoverage>, String> {
     let status = async {
         let client = state
+            .services
             .repo_search
             .client()
             .await

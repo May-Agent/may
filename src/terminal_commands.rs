@@ -143,6 +143,29 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened: it alone gets `global-rules`.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// Handles every session of the host shares.
+    pub services: SharedServices,
+}
+
+/// Handles the host owns once and every session's commands share: cloning
+/// shares them.
+#[derive(Debug, Clone)]
+pub struct SharedServices {
+    /// The repo-search daemon handle.
+    pub repo_search: RepoSearch,
+    /// The per-repository locks serializing `pr` lands.
+    pub land_locks: crate::pr::LandLocks,
+}
+
+impl SharedServices {
+    /// Fresh handles over the May home `may_dir`.
+    #[must_use]
+    pub fn new(may_dir: &std::path::Path) -> Self {
+        Self {
+            repo_search: RepoSearch::new(may_dir),
+            land_locks: crate::pr::LandLocks::default(),
+        }
+    }
 }
 
 /// A core command and the usage its `--help` prints.
@@ -236,7 +259,7 @@ where
             config.session_id.clone(),
             Some(SearchIndexer::new(
                 config.db.clone(),
-                RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+                RepoSearchCollections::new(config.services.repo_search.clone()),
             )),
         ),
     );
@@ -244,7 +267,7 @@ where
         builder,
         &mut descriptions,
         CodeSearchTool::new(
-            RepoSearch::global(&config.may_dir),
+            config.services.repo_search.clone(),
             config.cwd.clone(),
             Some(config.db.clone()),
             Some(crate::repo_clone::SessionRepos::new(
@@ -257,7 +280,7 @@ where
     );
     let issue_search = IssueSearch::new(
         config.db.clone(),
-        RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+        RepoSearchCollections::new(config.services.repo_search.clone()),
     );
     let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
     let issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
@@ -340,6 +363,7 @@ where
         screen: Some(screen),
         signing,
         github_api: crate::pr::PrContext::default_github_api(),
+        land_locks: config.services.land_locks.clone(),
         task_events: Some(config.task_events.clone()),
         publish: config.publish_gate.clone(),
         ci: config.ask_user.as_ref().map(|runtime| crate::pr::CiWatch {
@@ -809,6 +833,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -904,6 +929,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -972,6 +998,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1034,6 +1061,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1091,6 +1119,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1261,6 +1290,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1389,6 +1419,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1448,6 +1479,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1511,6 +1543,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,

@@ -521,7 +521,7 @@ impl Secrets {
     /// assignments on secret-named variables, well-known token formats).
     /// Returns the masked text and whether anything was redacted.
     #[must_use]
-    pub fn mask(&self, text: &str) -> (String, bool) {
+    pub fn mask(&self, patterns: &SecretPatterns, text: &str) -> (String, bool) {
         let mut masked = text.to_string();
         // Longest-first so overlapping values (prefix of another) redact cleanly.
         let mut values: Vec<&str> = self
@@ -535,10 +535,10 @@ impl Secrets {
         for value in values {
             masked = masked.replace(value, "***");
         }
-        for pattern in literal_patterns() {
+        for pattern in &patterns.literal {
             masked = pattern.replace_all(&masked, "${name}***").into_owned();
         }
-        for pattern in token_patterns() {
+        for pattern in &patterns.token {
             masked = pattern.replace_all(&masked, "***").into_owned();
         }
         let changed = masked != text;
@@ -546,36 +546,40 @@ impl Secrets {
     }
 }
 
-/// `SECRET_NAMED=value` style assignments — mask the value side.
-fn literal_patterns() -> &'static [regex::Regex] {
-    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        // FOO_KEY=..., API_TOKEN: ..., --password value, etc. Value must
-        // be >= 8 chars to keep ordinary config text untouched.
-        vec![regex::Regex::new(
-            r#"(?i)(?P<name>[a-z_]*(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key)[a-z0-9_]*[=:]\s*["']?)[^\s"']{8,}"#,
-        )
-        .expect("secret literal pattern compiles")]
-    })
+/// The compiled shapes [`Secrets::mask`] recognizes without a stored value.
+/// Built once by the host (the daemon, the TUI) and passed to every mask;
+/// cloning shares the compiled programs.
+#[derive(Debug, Clone)]
+pub struct SecretPatterns {
+    /// `SECRET_NAMED=value` style assignments — mask the value side.
+    literal: Vec<regex::Regex>,
+    /// Well-known secret token shapes masked wholesale.
+    token: Vec<regex::Regex>,
 }
 
-/// Well-known secret token shapes masked wholesale.
-fn token_patterns() -> &'static [regex::Regex] {
-    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        [
-            r"sk-(?:ant-|live-|test-)?[A-Za-z0-9_-]{16,}",
-            r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}",
-            r"github_pat_[A-Za-z0-9_]{20,}",
-            r"xox[baprs]-[A-Za-z0-9-]{10,}",
-            r"AKIA[0-9A-Z]{16}",
-            r"AIza[0-9A-Za-z_-]{30,}",
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*-----END [A-Z ]*PRIVATE KEY-----",
-        ]
-        .iter()
-        .map(|pattern| regex::Regex::new(pattern).expect("secret token pattern compiles"))
-        .collect()
-    })
+impl Default for SecretPatterns {
+    fn default() -> Self {
+        Self {
+            // FOO_KEY=..., API_TOKEN: ..., --password value, etc. Value must
+            // be >= 8 chars to keep ordinary config text untouched.
+            literal: vec![regex::Regex::new(
+                r#"(?i)(?P<name>[a-z_]*(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key)[a-z0-9_]*[=:]\s*["']?)[^\s"']{8,}"#,
+            )
+            .expect("secret literal pattern compiles")],
+            token: [
+                r"sk-(?:ant-|live-|test-)?[A-Za-z0-9_-]{16,}",
+                r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}",
+                r"github_pat_[A-Za-z0-9_]{20,}",
+                r"xox[baprs]-[A-Za-z0-9-]{10,}",
+                r"AKIA[0-9A-Z]{16}",
+                r"AIza[0-9A-Za-z_-]{30,}",
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*-----END [A-Z ]*PRIVATE KEY-----",
+            ]
+            .iter()
+            .map(|pattern| regex::Regex::new(pattern).expect("secret token pattern compiles"))
+            .collect(),
+        }
+    }
 }
 
 /// Shortest stored value that is masked or redacted: shorter values would
@@ -923,23 +927,25 @@ mod tests {
             entries: vec![("MY_TOKEN".to_string(), "supersecretvalue".to_string())],
             extra_values: Vec::new(),
         };
-        let (masked, hit) = secrets.mask("echo supersecretvalue && echo hi");
+        let patterns = SecretPatterns::default();
+        let (masked, hit) = secrets.mask(&patterns, "echo supersecretvalue && echo hi");
         assert!(hit);
         assert_eq!(masked, "echo *** && echo hi");
-        let (_, hit) = secrets.mask("nothing here");
+        let (_, hit) = secrets.mask(&patterns, "nothing here");
         assert!(!hit);
     }
 
     #[test]
     fn mask_catches_token_shapes_and_assignments() {
         let secrets = Secrets::empty();
-        let (masked, hit) = secrets.mask("curl -H 'key: ghp_abcdefghijklmnopqrst'");
+        let patterns = SecretPatterns::default();
+        let (masked, hit) = secrets.mask(&patterns, "curl -H 'key: ghp_abcdefghijklmnopqrst'");
         assert!(hit);
         assert!(!masked.contains("ghp_"));
-        let (masked, hit) = secrets.mask("export MY_SECRET=hunter2hunter2");
+        let (masked, hit) = secrets.mask(&patterns, "export MY_SECRET=hunter2hunter2");
         assert!(hit);
         assert_eq!(masked, "export MY_SECRET=***");
-        let (_, hit) = secrets.mask("set name=lexo debug=1");
+        let (_, hit) = secrets.mask(&patterns, "set name=lexo debug=1");
         assert!(!hit);
     }
 

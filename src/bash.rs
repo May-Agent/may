@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::secrets::Secrets;
+use crate::secrets::{SecretPatterns, Secrets};
 
 /// Masked result of a bash-mode command, ready for display and the agent.
 #[derive(Debug, serde::Serialize)]
@@ -47,8 +47,13 @@ fn cap_stream(bytes: &[u8]) -> String {
 /// keychain secrets injected as environment variables. Output is masked
 /// before it returns.
 #[must_use]
-pub fn run_bash_command(command: &str, cwd: &Path, secrets: &Secrets) -> BashOutcome {
-    let (_, command_secret) = secrets.mask(command);
+pub fn run_bash_command(
+    command: &str,
+    cwd: &Path,
+    secrets: &Secrets,
+    patterns: &SecretPatterns,
+) -> BashOutcome {
+    let (_, command_secret) = secrets.mask(patterns, command);
     let spawn = || {
         std::process::Command::new("bash")
             .arg("-c")
@@ -68,8 +73,8 @@ pub fn run_bash_command(command: &str, cwd: &Path, secrets: &Secrets) -> BashOut
             error: Some(format!("failed to run bash: {error}")),
         },
         Ok(output) => {
-            let (stdout, out_secret) = secrets.mask(&cap_stream(&output.stdout));
-            let (stderr, err_secret) = secrets.mask(&cap_stream(&output.stderr));
+            let (stdout, out_secret) = secrets.mask(patterns, &cap_stream(&output.stdout));
+            let (stderr, err_secret) = secrets.mask(patterns, &cap_stream(&output.stderr));
             // `had_secret` tracks output only — a command-side hit already
             // warned at submit time.
             BashOutcome {

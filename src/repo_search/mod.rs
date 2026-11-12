@@ -97,14 +97,6 @@ impl RepoSearch {
         }
     }
 
-    /// The process-wide handle; `may_dir` is fixed for a process, so the
-    /// first caller's value is the one kept.
-    #[must_use]
-    pub fn global(may_dir: &Path) -> Self {
-        static GLOBAL: std::sync::OnceLock<RepoSearch> = std::sync::OnceLock::new();
-        GLOBAL.get_or_init(|| Self::new(may_dir)).clone()
-    }
-
     async fn prepared(&self) -> Result<&Prepared, RepoSearchError> {
         self.inner
             .prepared

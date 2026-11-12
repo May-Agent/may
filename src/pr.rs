@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use askama::Template;
 
@@ -104,6 +104,8 @@ pub struct PrContext {
     pub signing: crate::commit_signing::CommitSigning,
     /// GitHub REST client the GitHub backend's direct calls go through.
     pub github_api: GitHubRest<PrTokenSource>,
+    /// The per-repository land locks every session of the daemon shares.
+    pub land_locks: LandLocks,
     /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
     /// rejected or closes.
     pub task_events: Option<crate::harness::working_document::WorkEvents>,
@@ -243,14 +245,20 @@ impl merge_watch::ChecksObserver for CiObserver<'_> {
 }
 
 /// Serialized per-repo merge: one in-flight land per repository.
-static LAND_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+///
+/// Cloning shares the locks, so the daemon hands one set to every session and
+/// a land in one session excludes a land of the same repository in another.
+#[derive(Clone, Debug, Default)]
+pub struct LandLocks(Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>);
 
-fn land_lock(repo_key: &str) -> Arc<Mutex<()>> {
-    let mut locks = LAND_LOCKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    locks.entry(repo_key.to_string()).or_default().clone()
+impl LandLocks {
+    fn get(&self, repo_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.entry(repo_key.to_string()).or_default().clone()
+    }
 }
 
 /// The resolved clone a `pr` operates on.
@@ -604,7 +612,7 @@ impl PrStore {
             return Err(PrError::CheckFailed(err));
         }
         // Serialized land: one in-flight merge per repository.
-        let lock = land_lock(&resolved.record.repo_key);
+        let lock = self.context.land_locks.get(&resolved.record.repo_key);
         self.event(&pr, "merging", None).await;
         let result = blocking::unblock({
             let checkout = resolved.record.source.clone();
@@ -1064,7 +1072,7 @@ impl PrStore {
         let external = pr
             .external_number
             .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
-        let lock = land_lock(&resolved.record.repo_key);
+        let lock = self.context.land_locks.get(&resolved.record.repo_key);
         let github = merge_watch::GithubPr {
             api: &self.context.github_api,
             owner_repo: &owner_repo,
@@ -2056,7 +2064,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchState, GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch,
+        BranchState, GitHubRest, LandLocks, PrContext, PrStore, PrTokenSource, git, github_branch,
         github_owner_repo, host_git, push_pinned,
     };
     use crate::commit_signing::test_user::TestUser;
@@ -2179,6 +2187,7 @@ mod tests {
                     screen: None,
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -2244,6 +2253,7 @@ mod tests {
                         PrTokenSource::Fixed("test-token".to_string()),
                         base,
                     ),
+                    land_locks: LandLocks::default(),
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -2703,6 +2713,7 @@ mod tests {
                 screen,
                 signing: fx.signing(id),
                 github_api,
+                land_locks: LandLocks::default(),
                 task_events: None,
                 ci: None,
                 publish: None,
@@ -2954,6 +2965,7 @@ mod tests {
                 screen: None,
                 signing: fx.signing(id),
                 github_api: PrContext::default_github_api(),
+                land_locks: LandLocks::default(),
                 task_events: None,
                 ci: None,
                 publish: None,

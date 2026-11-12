@@ -169,7 +169,8 @@ pub use session::{
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
 pub use terminal_commands::{
-    SharedTerminalCommandConfig, TerminalCommandsError, register_shared_terminal_commands,
+    SharedServices, SharedTerminalCommandConfig, TerminalCommandsError,
+    register_shared_terminal_commands,
 };
 pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};

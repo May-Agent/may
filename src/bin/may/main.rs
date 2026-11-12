@@ -885,6 +885,7 @@ where
 
         tracing::info!("=== LOOP START ===");
         let mut phases = may_agent::tui::perf::LoopPhases::default();
+        let jank_threshold = may_agent::tui::perf::jank_threshold();
 
         // First draw: updates content_height/view_height for accurate overflow calculation.
         if needs_draw {
@@ -2298,9 +2299,12 @@ where
                     }) => {
                         let tx = events.sender();
                         let cwd = app.cwd.clone();
+                        let patterns = app.secret_patterns.clone();
                         spawn(async move {
                             let mut outcome = blocking::unblock(move || {
-                                may_agent::bash::run_bash_command(&command, &cwd, &secrets)
+                                may_agent::bash::run_bash_command(
+                                    &command, &cwd, &secrets, &patterns,
+                                )
                             })
                             .await;
                             outcome.call_id = call_id;
@@ -2341,6 +2345,7 @@ where
         // Report a stall whenever one busy iteration exceeded the jank
         // threshold; the log carries the render breakdown for repro.
         may_agent::tui::perf::report(
+            jank_threshold,
             &phases,
             &app.frame_stats,
             app.scroll,

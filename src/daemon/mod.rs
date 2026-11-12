@@ -105,9 +105,9 @@ use anyhow::Context as _;
 use skyzen::routing::Router;
 
 use crate::config::MayConfig;
+use crate::repo_search::RepoSearchCollections;
 use crate::repo_search::auto_index::AutoIndexer;
 use crate::repo_search::indexer::{IndexerStatus, SearchIndexer};
-use crate::repo_search::{RepoSearch, RepoSearchCollections};
 use crate::ui_event_bus::UiEventTopics;
 
 /// How long a shutdown waits for running turns before exiting anyway.
@@ -516,7 +516,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         }
     });
 
-    let repo_search = RepoSearch::global(paths.root());
+    let repo_search = state.services.repo_search.clone();
     let indexer = SearchIndexer::new(
         state.db.clone(),
         RepoSearchCollections::new(repo_search.clone()),

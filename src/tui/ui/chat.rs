@@ -476,7 +476,7 @@ struct CompactionRecoveryNotice<'a> {
 }
 
 /// The chat stream containing all elements.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ChatStream {
     elements: Vec<ChatElement>,
     /// Revision of each element, parallel to `elements`. Every mutation of
@@ -498,86 +498,147 @@ pub struct ChatStream {
     /// The elements from it on are the response in flight, which a retry
     /// discards.
     response_floor: usize,
-    /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
-    tunnel_base: String,
+    /// What rendering the stream's elements reads besides the elements.
+    assets: ChatAssets,
+    /// Numbers the revisions of this stream's elements.
+    clock: RevisionClock,
     /// The reply streaming text was last appended to: an identity unique
     /// across every stream of the process, under which a layout cache keeps
     /// what it rendered of the reply, and the revision the append left.
     streaming_reply: Option<(u64, u64)>,
 }
 
-/// The `<tunnel id="…"/>` control tag.
-fn tunnel_tag() -> &'static regex::Regex {
-    static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    TAG.get_or_init(|| {
-        regex::Regex::new(r#"<tunnel\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*/>"#)
-            .expect("tunnel tag pattern must compile")
-    })
+/// What rendering reads besides the elements: the `<tunnel id="…"/>` control
+/// tag and the daemon URL it renders as, and the syntax highlighting. Built
+/// once when the TUI starts; cloning shares the compiled data.
+#[derive(Debug, Clone)]
+pub(super) struct ChatAssets {
+    /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
+    base: String,
+    /// Matches one `<tunnel id="…"/>` tag.
+    tag: regex::Regex,
+    /// Syntaxes and theme of code blocks and commands.
+    pub(super) highlighting: super::highlight::Highlighting,
 }
 
-/// Renders `<tunnel id="…"/>` control tags as daemon URLs so the terminal
-/// shows a link instead of the raw marker.
-fn resolve_tunnel_tags<'a>(content: &'a str, tunnel_base: &str) -> std::borrow::Cow<'a, str> {
-    tunnel_tag().replace_all(content, |captures: &regex::Captures<'_>| {
-        format!("{tunnel_base}/{}/", &captures[1])
-    })
+impl Default for ChatAssets {
+    fn default() -> Self {
+        Self {
+            highlighting: super::highlight::Highlighting::default(),
+            base: format!("http://localhost:{}/tunnel", crate::daemon::DEFAULT_PORT),
+            tag: regex::Regex::new(r#"<tunnel\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*/>"#)
+                .expect("tunnel tag pattern must compile"),
+        }
+    }
 }
 
-/// Whether appended text can no longer change the tunnel tags of `content`.
-///
-/// It holds when every `<tunnel` opening lies inside a tag found in
-/// `content` or meets a `>` before any quote: a tag holds a `>` only
-/// inside its quoted id, so such an opening is no tag whatever follows.
-fn tunnel_tags_settled(content: &str) -> bool {
-    let tags: Vec<std::ops::Range<usize>> = tunnel_tag()
-        .find_iter(content)
-        .map(|tag| tag.range())
-        .collect();
-    content.match_indices("<tunnel").all(|(start, _)| {
-        tags.iter().any(|tag| tag.contains(&start))
-            || content[start..]
-                .find(['>', '"', '\''])
-                .is_some_and(|at| content[start + at..].starts_with('>'))
-    })
+impl ChatAssets {
+    /// Renders `<tunnel id="…"/>` control tags as daemon URLs so the terminal
+    /// shows a link instead of the raw marker.
+    fn resolve<'a>(&self, content: &'a str) -> std::borrow::Cow<'a, str> {
+        self.tag
+            .replace_all(content, |captures: &regex::Captures<'_>| {
+                format!("{}/{}/", self.base, &captures[1])
+            })
+    }
+
+    /// Whether appended text can no longer change the tunnel tags of `content`.
+    ///
+    /// It holds when every `<tunnel` opening lies inside a tag found in
+    /// `content` or meets a `>` before any quote: a tag holds a `>` only
+    /// inside its quoted id, so such an opening is no tag whatever follows.
+    fn settled(&self, content: &str) -> bool {
+        let tags: Vec<std::ops::Range<usize>> =
+            self.tag.find_iter(content).map(|tag| tag.range()).collect();
+        content.match_indices("<tunnel").all(|(start, _)| {
+            tags.iter().any(|tag| tag.contains(&start))
+                || content[start..]
+                    .find(['>', '"', '\''])
+                    .is_some_and(|at| content[start + at..].starts_with('>'))
+        })
+    }
+}
+
+/// Numbers element revisions. A layout cache outlives the stream it was
+/// filled from, so every stream an app creates shares one clock: a revision
+/// is then unique across them and a cached entry never matches another
+/// stream's element.
+#[derive(Debug, Clone, Default)]
+struct RevisionClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl RevisionClock {
+    fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+impl Default for ChatStream {
+    fn default() -> Self {
+        Self::with_assets(ChatAssets::default())
+    }
 }
 
 impl ChatStream {
     /// Create a new empty chat stream.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An empty stream rendering with `assets`, so a stream built after
+    /// another reuses what the first loaded.
+    fn with_assets(assets: ChatAssets) -> Self {
         Self {
-            tunnel_base: format!("http://localhost:{}/tunnel", crate::daemon::DEFAULT_PORT),
-            ..Self::default()
+            elements: Vec::new(),
+            revisions: Vec::new(),
+            next_thinking_id: 0,
+            next_worked_id: 0,
+            next_translation_id: 0,
+            fold_cursor: 0,
+            response_floor: 0,
+            assets,
+            clock: RevisionClock::default(),
+            streaming_reply: None,
+        }
+    }
+
+    /// An empty stream that renders as `previous` does and numbers its
+    /// revisions on the same clock: a layout cache that outlives `previous`
+    /// never matches the new stream's elements with the old ones.
+    #[must_use]
+    pub fn successor_of(previous: &Self) -> Self {
+        Self {
+            clock: previous.clock.clone(),
+            ..Self::with_assets(previous.assets.clone())
         }
     }
 
     /// Sets the daemon base URL `<tunnel id>` tags render against.
     #[must_use]
     pub fn with_tunnel_base(mut self, tunnel_base: String) -> Self {
-        self.tunnel_base = tunnel_base;
+        self.assets.base = tunnel_base;
         self
     }
 
-    /// The base URL `<tunnel id>` tags resolve against.
-    pub(super) fn tunnel_base(&self) -> &str {
-        &self.tunnel_base
+    /// What this stream renders its elements with.
+    pub(super) const fn assets(&self) -> &ChatAssets {
+        &self.assets
     }
 
-    fn next_revision() -> u64 {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        NEXT.fetch_add(1, Ordering::Relaxed)
+    fn next_revision(&self) -> u64 {
+        self.clock.next()
     }
 
     /// Append `element` with a fresh revision.
     fn push_element(&mut self, element: ChatElement) {
-        let revision = Self::next_revision();
+        let revision = self.next_revision();
         self.elements.push(element);
         self.revisions.push(revision);
     }
 
     /// Mark the element at `index` changed.
     fn touch(&mut self, index: usize) {
-        let revision = Self::next_revision();
+        let revision = self.next_revision();
         if let Some(slot) = self.revisions.get_mut(index) {
             *slot = revision;
         }
@@ -1018,7 +1079,7 @@ impl ChatStream {
                     expanded: false,
                 },
             );
-            self.revisions.insert(at, Self::next_revision());
+            self.revisions.insert(at, self.next_revision());
             at += 1;
         }
         for (element, revision) in errors {
@@ -1041,7 +1102,7 @@ impl ChatStream {
             streaming: true,
             translation: None,
         });
-        self.streaming_reply = Some((Self::next_revision(), self.revision_of_last()));
+        self.streaming_reply = Some((self.next_revision(), self.revision_of_last()));
     }
 
     /// Identity of the reply in the last element, when the last change to
@@ -1094,7 +1155,9 @@ impl ChatStream {
             content.push_str(chunk);
             // When anything else changed the last element since text was
             // last appended to it, the reply streams under a new identity.
-            let reply = self.streaming_reply().unwrap_or_else(Self::next_revision);
+            let reply = self
+                .streaming_reply()
+                .unwrap_or_else(|| self.next_revision());
             self.touch_last();
             self.streaming_reply = Some((reply, self.revision_of_last()));
         } else {
@@ -2568,7 +2631,7 @@ fn finish_reply(
 /// reply's display text (control tags replaced) settles at the
 /// reply's last line break once no `<artifact` or `<tunnel` opening
 /// before it can still become a tag ([`replace_artifact_tags`],
-/// [`tunnel_tags_settled`]): no tag then spans the break, so both passes
+/// [`ChatAssets::settled`]): no tag then spans the break, so both passes
 /// give the same text run over the whole reply as over its two sides. An
 /// opening still waiting for its end keeps the text from its line on
 /// unsettled. Settled text goes to the markdown renderer as final, the
@@ -2599,10 +2662,14 @@ pub(super) struct ReplyFrame<'a> {
 
 impl StreamingReply {
     /// A reply with no text yet, laid out at `width` columns.
-    pub(super) fn new(images_supported: bool, width: u16) -> Self {
+    pub(super) fn new(
+        images_supported: bool,
+        width: u16,
+        highlighting: super::highlight::Highlighting,
+    ) -> Self {
         Self {
             settled: 0,
-            markdown: IncrementalMarkdown::new(images_supported, usize::from(width)),
+            markdown: IncrementalMarkdown::new(images_supported, usize::from(width), highlighting),
         }
     }
 
@@ -2612,22 +2679,22 @@ impl StreamingReply {
     pub(super) fn render(
         &mut self,
         content: &str,
-        tunnel_base: &str,
+        assets: &ChatAssets,
         width: u16,
     ) -> ReplyFrame<'_> {
         let pending = &content[self.settled..];
         let cut = pending.rfind('\n').map_or(0, |at| at + 1);
         let (head, tail) = pending.split_at(cut);
         let (head_text, closed) = replace_artifact_tags(head);
-        let head_is_final = closed && tunnel_tags_settled(&head_text);
+        let head_is_final = closed && assets.settled(&head_text);
         let (settled_text, open_source) = if head_is_final {
             self.settled += cut;
-            (resolve_tunnel_tags(&head_text, tunnel_base), tail)
+            (assets.resolve(&head_text), tail)
         } else {
             (Cow::Borrowed(""), pending)
         };
         let open_text = artifact_tag_text(open_source);
-        let open_text = resolve_tunnel_tags(&open_text, tunnel_base);
+        let open_text = assets.resolve(&open_text);
         let frame = self.markdown.render(&settled_text, &open_text);
 
         let committed = frame.committed;
@@ -2663,7 +2730,7 @@ pub(super) fn element_lines(
     elem: &ChatElement,
     state: ElementState,
     images_supported: bool,
-    tunnel_base: &str,
+    assets: &ChatAssets,
     width: u16,
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2729,9 +2796,13 @@ pub(super) fn element_lines(
                 markdown::ImageSupport::Disabled
             };
             let display = artifact_tag_text(content);
-            let content = resolve_tunnel_tags(&display, tunnel_base);
-            let md_result =
-                markdown::render_markdown_with_positions(&content, image_mode, usize::from(width));
+            let content = assets.resolve(&display);
+            let md_result = markdown::render_markdown_with_positions(
+                &content,
+                image_mode,
+                usize::from(width),
+                assets.highlighting.clone(),
+            );
             let reserved = reserved_end(&md_result.image_positions);
             let mut md_lines = md_result.lines;
             finish_reply(&mut md_lines, 0, reserved, *streaming, width);
@@ -2755,6 +2826,7 @@ pub(super) fn element_lines(
                 &mut images,
                 state.open,
                 state.spinner_frame,
+                &assets.highlighting,
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
             if display.expandable() {
@@ -2918,6 +2990,7 @@ pub(super) fn element_lines(
                     body,
                     markdown::ImageSupport::Disabled,
                     usize::from(width),
+                    assets.highlighting.clone(),
                 )
                 .lines;
                 while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
@@ -2958,8 +3031,7 @@ pub(super) fn element_lines(
                     // `state` describes the group row itself.
                     let inner_state =
                         ElementState::of(inner, None, state.hide_todos, state.spinner_frame);
-                    let sub =
-                        element_lines(inner, inner_state, images_supported, tunnel_base, width);
+                    let sub = element_lines(inner, inner_state, images_supported, assets, width);
                     let offset = lines.len();
                     lines.extend(sub.lines);
                     regions.extend(
@@ -3919,12 +3991,13 @@ fn status_icon(status: &ToolStatus, spinner_frame: usize, unsafe_exec: bool) -> 
 
 /// A tool call's styled headline: expand marker + status icon +
 /// chip/description + collapsed status suffix.
-fn tool_header_line(
-    display: &ToolDisplay,
+fn tool_header_line<'a>(
+    display: &'a ToolDisplay,
     selection_style: Style,
     open: bool,
     spinner_frame: usize,
-) -> Line<'_> {
+    highlighting: &super::highlight::Highlighting,
+) -> Line<'a> {
     let marker = if !display.expandable() {
         "  "
     } else if open {
@@ -3974,7 +4047,8 @@ fn tool_header_line(
                 ));
                 spans.push(Span::styled("$ ", dim.patch(selection_style)));
                 spans.extend(
-                    super::highlight::shell_spans(command.lines().next().unwrap_or_default())
+                    highlighting
+                        .shell_spans(command.lines().next().unwrap_or_default())
                         .into_iter()
                         .flatten()
                         .map(|span| Span::styled(span.content, span.style.patch(selection_style))),
@@ -4108,10 +4182,12 @@ fn render_tool_inline<'a>(
         image_positions,
         open,
         0,
+        &super::highlight::Highlighting::default(),
     );
 }
 
 /// Inline rows of a tool call whose body is `open`.
+#[allow(clippy::too_many_arguments)]
 fn render_tool_inline_at<'a>(
     lines: &mut Vec<Line<'a>>,
     display: &'a ToolDisplay,
@@ -4120,6 +4196,7 @@ fn render_tool_inline_at<'a>(
     image_positions: &mut Vec<(String, usize, String)>,
     open: bool,
     spinner_frame: usize,
+    highlighting: &super::highlight::Highlighting,
 ) {
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
@@ -4133,6 +4210,7 @@ fn render_tool_inline_at<'a>(
         selection_style,
         open,
         spinner_frame,
+        highlighting,
     ));
     // A call that ran one of May's commands shows what the command did, open
     // or folded; only a subagent's full result waits for the expansion.
@@ -4177,7 +4255,7 @@ fn render_tool_inline_at<'a>(
             let mut command_rows = if recognised.is_some() {
                 Vec::new()
             } else {
-                super::highlight::shell_spans(command)
+                highlighting.shell_spans(command)
             }
             .into_iter();
             if let Some(reading) = recognised {
@@ -5861,7 +5939,7 @@ mod tests {
                     elem,
                     super::ElementState::of(elem, None, false, 0),
                     true,
-                    "http://localhost:8787/tunnel",
+                    chat.assets(),
                     inner,
                 )
                 .lines,
@@ -6662,7 +6740,7 @@ mod tests {
             elem,
             super::ElementState::of(elem, None, false, 0),
             false,
-            "",
+            chat.assets(),
             80,
         )
         .lines;
@@ -7290,7 +7368,7 @@ mod tests {
             elem,
             super::ElementState::of(elem, None, false, 0),
             false,
-            "",
+            chat.assets(),
             80,
         )
         .lines;

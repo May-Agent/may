@@ -302,6 +302,8 @@ pub struct MayAgentConfig {
     pub rules_import: Option<crate::rules_import::RulesImport>,
     /// The daemon's live limits, shared by every agent it builds.
     pub limits: super::LiveLimits,
+    /// The repo-search handle and PR land locks the daemon shares.
+    pub services: crate::terminal_commands::SharedServices,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -380,6 +382,8 @@ pub struct MayAgentSessionInput<'a> {
     pub rules_import: Option<crate::rules_import::RulesImport>,
     /// The daemon's live limits, shared by every agent it builds.
     pub limits: super::LiveLimits,
+    /// The repo-search handle and PR land locks the daemon shares.
+    pub services: crate::terminal_commands::SharedServices,
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
@@ -973,6 +977,7 @@ impl MayAgent {
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
+                services: config.services.clone(),
             },
         ))
         .await?;
@@ -1270,6 +1275,7 @@ impl MayAgent {
             connectivity,
             rules_import,
             limits,
+            services,
             model_context_window,
         } = input;
         let providers = super::Providers::new(may_config, &pushed_providers);
@@ -1377,6 +1383,7 @@ impl MayAgent {
             db,
             rules_import,
             limits,
+            services,
         })
     }
 

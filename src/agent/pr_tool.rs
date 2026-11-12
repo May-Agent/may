@@ -259,7 +259,7 @@ mod tests {
     use aither_core::llm::ToolContext;
 
     use super::{CommandRole, PrArgs, PrFilter, PrStore, PrTool, Tool};
-    use crate::pr::PrContext;
+    use crate::pr::{LandLocks, PrContext};
     use crate::repo_clone::test_sandbox::TestTerminal;
 
     fn text(result: &aither_core::llm::ToolResult) -> String {
@@ -291,6 +291,7 @@ mod tests {
                         "s1",
                     ),
                     github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -398,6 +399,7 @@ mod tests {
                     screen: None,
                     signing: user.signing(&tmp.join("may-home"), "s1"),
                     github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
                     task_events: None,
                     ci: None,
                     publish: None,

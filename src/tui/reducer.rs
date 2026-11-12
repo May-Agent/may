@@ -520,7 +520,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // When the stored secrets cannot be read the transcript cannot be
             // masked, so nothing is sent to the agent.
             let masked_command = match &app.secrets {
-                Ok(secrets) => secrets.mask(&outcome.command).0,
+                Ok(secrets) => secrets.mask(&app.secret_patterns, &outcome.command).0,
                 Err(error) => {
                     app.chat.push_error(&error.to_string());
                     return Ok(None);
