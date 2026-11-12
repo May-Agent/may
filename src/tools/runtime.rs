@@ -1331,6 +1331,15 @@ impl ToolInfo {
         }
     }
 
+    /// The name a script runs this entry under: the managed `aither-sed`
+    /// is the shell's `sed`.
+    const fn listed_name(&self) -> &'static str {
+        match self.source {
+            CatalogCommand::Tool(ManagedTool::Sed) => "sed",
+            CatalogCommand::Tool(_) | CatalogCommand::Python => self.command,
+        }
+    }
+
     fn python(python: &PythonRuntime) -> Self {
         Self {
             source: CatalogCommand::Python,
@@ -2782,10 +2791,17 @@ printf '%s\n' 'uv @VERSION@'
         let first = catalog.render().unwrap();
         assert_eq!(first, catalog.render().unwrap());
         for command in native_tools() {
-            assert!(first.contains(command.command()), "{command:?}");
+            let listed = if *command == ManagedTool::Sed {
+                "sed"
+            } else {
+                command.command()
+            };
+            assert!(first.contains(&format!("- {listed}\n")), "{command:?}");
         }
+        assert!(!first.contains("aither-sed"), "{first}");
         if ToolTarget::native().unwrap().provides_python() {
-            assert!(first.contains(&format!("python3 {FIXTURE_PYTHON_VERSION}")));
+            assert!(first.contains("- python3\n"));
+            assert!(!first.contains(FIXTURE_PYTHON_VERSION));
             assert!(first.contains("`.python-version`"));
         }
         assert!(first.contains("ast-grep run"));

@@ -179,7 +179,7 @@ async fn an_answer_to_a_question_that_blocks_nothing_edits_nothing() {
 fn which_database() -> AskUserArgs {
     AskUserArgs {
         question: Some("Which database?".to_string()),
-        positional_question: None,
+        question_text: None,
         option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
         multi_select: false,
         secret: None,
@@ -191,7 +191,7 @@ fn which_database() -> AskUserArgs {
 fn two_questions() -> AskUserArgs {
     AskUserArgs {
         question: None,
-        positional_question: None,
+        question_text: None,
         option: Vec::new(),
         multi_select: false,
         secret: None,
