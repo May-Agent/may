@@ -213,6 +213,15 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               set((prev) => ({
                 cloudSessions: { ...prev.cloudSessions, [step.sessionId]: step },
               }));
+              // A suspended session read nothing; once its codespace serves
+              // it again, its history and state are there to read.
+              if (
+                step.phase === 'ready' &&
+                useSessionsStore.getState().suspended[step.sessionId] &&
+                useSessionsStore.getState().active?.id === step.sessionId
+              ) {
+                void useSessionsStore.getState().refreshActive(step.sessionId);
+              }
               break;
             }
             case 'profile_sessions': {

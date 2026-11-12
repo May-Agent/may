@@ -68,6 +68,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   const { profileId } = useParams();
   const isDraft = isDraftSessionId(sessionId);
+  const draftMachine = useSessionsStore((s) => s.drafts[sessionId]?.machineType ?? null);
+  const [creatingCloud, setCreatingCloud] = useState(false);
 
   useEffect(() => {
     open(sessionId);
@@ -143,6 +145,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     let sid = sessionId;
     if (isDraft) {
       let created;
+      // Creating a codespace takes a while; the banner says so meanwhile.
+      setCreatingCloud(draftMachine !== null);
       try {
         created = await useSessionsStore.getState().materialize(sessionId);
       } catch (err) {
@@ -150,6 +154,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           description: err instanceof Error ? err.message : String(err),
         });
         return;
+      } finally {
+        setCreatingCloud(false);
       }
       sid = created.id;
       const pid = profileId ?? created.profileId;
@@ -250,7 +256,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <YoloToggle sessionId={active.id} yolo={active.runtime?.yolo ?? false} />
       )}
       <BrowserTakeoverBanner session={active} />
-      <CloudSessionBanner sessionId={active.id} />
+      <CloudSessionBanner sessionId={active.id} creating={creatingCloud} />
       {asleep && (
         <div className="text-muted-foreground flex items-center gap-2 px-4 py-1 text-xs sm:px-6">
           <Moon className="size-3.5" aria-hidden />

@@ -29,6 +29,8 @@ export function createSession(payload?: {
   profileId?: string | null;
   model?: string;
   repo?: string;
+  /** Runs the session entirely on a codespace of this machine type. */
+  cloud?: { machineType: string };
 }): Promise<ApiSession> {
   return apiPost<ApiSession>('/sessions', payload ?? {});
 }

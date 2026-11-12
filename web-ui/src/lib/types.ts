@@ -19,7 +19,8 @@ export type ApiErrorCode =
   | 'github_unauthenticated'
   | 'cloud_account_unusable'
   | 'repo_declined'
-  | 'loop_stopped';
+  | 'loop_stopped'
+  | 'session_suspended';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =
@@ -289,6 +290,16 @@ export interface ApiSession {
   cursor?: string;
   /** The cloud machine the session lives on; absent for the daemon's own. */
   location?: SessionLocation;
+}
+
+/** One machine type of a cloud provider's catalog. */
+export interface MachineType {
+  /** The provider's name of the type, which a new session names. */
+  name: string;
+  displayName: string;
+  cpus: number;
+  memoryBytes: number;
+  storageBytes: number;
 }
 
 export interface SessionLocation {

@@ -1,6 +1,7 @@
 import { apiDelete, apiGet, apiPost, apiPut } from './client';
 import type {
   CreateProfileRequest,
+  MachineType,
   ProfilePreferences,
   UpdateProfileRequest,
 } from '../types';
@@ -47,6 +48,18 @@ export function deleteProfile(id: string): Promise<void> {
 
 export function setLastModel(model: string): Promise<void> {
   return apiPost<void>('/config/last-model', { model });
+}
+
+/** The machine types a cloud session of the profile on `repo` may start on. */
+export async function getCloudCatalog(
+  profileId: string,
+  repo: string | null,
+): Promise<MachineType[]> {
+  const resp = await apiPost<{ machines: MachineType[] }>(
+    `/profiles/${encodeURIComponent(profileId)}/cloud/codespaces/catalog`,
+    { repo },
+  );
+  return resp.machines;
 }
 
 export function getProfileRemoteAttachments(profileId: string): Promise<string[]> {

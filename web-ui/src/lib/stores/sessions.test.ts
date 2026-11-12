@@ -37,6 +37,7 @@ function reset() {
     order: [],
     active: null,
     drafts: {},
+    suspended: {},
     messages: {},
     loading: false,
     error: null,
@@ -128,6 +129,23 @@ describe('draft sessions', () => {
     expect(calls.bodies[1]).toContain('"planState":"draft"');
   });
 
+  test('a draft on a codespace asks for that machine type', async () => {
+    const draft = await useSessionsStore.getState().createNew('p1');
+    useSessionsStore.getState().setDraftMachine(draft.id, 'standardLinux32gb');
+    expect(calls.urls).toEqual([]);
+
+    await useSessionsStore.getState().materialize(draft.id);
+
+    expect(JSON.parse(calls.bodies[0] ?? '{}').cloud).toEqual({ machineType: 'standardLinux32gb' });
+  });
+
+  test('a draft on this machine asks for no codespace', async () => {
+    const draft = await useSessionsStore.getState().createNew('p1');
+    await useSessionsStore.getState().materialize(draft.id);
+
+    expect(JSON.parse(calls.bodies[0] ?? '{}').cloud).toBeUndefined();
+  });
+
   test('remove drops a draft without a delete request', async () => {
     const draft = await useSessionsStore.getState().createNew('p1');
     await useSessionsStore.getState().remove(draft.id);
@@ -135,6 +153,49 @@ describe('draft sessions', () => {
     expect(useSessionsStore.getState().drafts[draft.id]).toBeUndefined();
     expect(useSessionsStore.getState().active).toBeNull();
     expect(calls.urls).toEqual([]);
+  });
+});
+
+describe('a suspended cloud session', () => {
+  beforeEach(() => {
+    reset();
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            code: 'session_suspended',
+            error: "the session's codespace is suspended",
+          }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    ) as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test('opens as waiting for a message, not as an error', async () => {
+    useSessionsStore.setState({
+      index: {
+        'quiet-otter': {
+          id: 'quiet-otter',
+          title: '日本語 한국어 中文',
+          lastModified: '2026-01-01T00:00:00Z',
+          preview: '',
+          profileId: 'p1',
+        },
+      },
+    });
+
+    await useSessionsStore.getState().open('quiet-otter');
+
+    const state = useSessionsStore.getState();
+    expect(state.error).toBeNull();
+    expect(state.suspended['quiet-otter']).toBe(true);
+    expect(state.active?.id).toBe('quiet-otter');
+    expect(state.active?.title).toBe('日本語 한국어 中文');
   });
 });
 
