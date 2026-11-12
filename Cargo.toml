@@ -51,7 +51,7 @@ aither-sed = { version = "0.30.0", default-features = false }
 aither-acp = { version = "0.30.0" }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
-heel = { version = "0.9.5", default-features = false }
+heel = { version = "0.10.0", default-features = false }
 
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
 acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
@@ -243,7 +243,9 @@ dispatch2 = { version = "0.3", default-features = false, features = ["std", "obj
 sha2 = "0.10"
 
 [dev-dependencies]
-serial_test = "3"
+# File locks, so the E2E tests that share host state stay serial across the
+# processes nextest runs them in.
+serial_test = { version = "3.5.0", default-features = false, features = ["async", "file_locks"] }
 # Builds the tar.xz artifacts the distribution tests extract.
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 # Checks that every model-facing id word is one o200k_base token.

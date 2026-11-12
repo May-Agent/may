@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-attachments",
  "aither-connectivity",
@@ -202,7 +202,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "askama 0.16.1",
@@ -228,7 +228,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -246,7 +246,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -263,7 +263,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -287,7 +287,7 @@ dependencies = [
 [[package]]
 name = "aither-connectivity"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -332,7 +332,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -361,7 +361,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -372,7 +372,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -395,7 +395,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "arc-swap",
@@ -419,7 +419,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "serde",
@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "aither-patch"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -460,7 +460,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -510,7 +510,7 @@ dependencies = [
 [[package]]
 name = "aither-sed"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -518,7 +518,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -530,7 +530,7 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.30.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#4283c043d382098b5a0cb2875300059e759f7bc1"
+source = "git+https://github.com/May-Agent/aither?branch=main#3570fea5a45c4c377c6e11b295d01695b8044eee"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -3347,6 +3347,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fslock"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3999,9 +4009,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.5"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddad4d8fba11b64ecaf2265fdf4b0330da314c92ac5c249d4ffe33afa3e9d0bf"
+checksum = "92b21e0932552edec5f468d427e6209474117e0add549585bdddc5f9051250e3"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -4014,7 +4024,7 @@ dependencies = [
  "errno",
  "executor-core",
  "futures-lite",
- "http 1.5.0",
+ "heel-shim",
  "http-body-util",
  "humantime",
  "hyper",
@@ -4030,8 +4040,6 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "shell-escape",
  "smol",
  "smol-hyper",
  "thiserror 2.0.21",
@@ -4041,6 +4049,25 @@ dependencies = [
  "tracing-subscriber",
  "which 7.0.3",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "heel-shim"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "793cb8255a73dec683141deccacb11fa0f83d768e10736caf3cb7c8dbfbdeac9"
+dependencies = [
+ "blocking",
+ "clap",
+ "futures-lite",
+ "http 1.5.0",
+ "humantime",
+ "interprocess",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4422,7 +4449,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -8933,9 +8960,9 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
 dependencies = [
+ "fslock",
  "futures-executor",
  "futures-util",
- "log",
  "once_cell",
  "parking_lot",
  "serial_test_derive",

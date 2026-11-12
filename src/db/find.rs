@@ -1,4 +1,4 @@
-//! Message scans behind `find` and ranged `session messages`.
+//! Message scans behind `session find` and ranged `session messages`.
 //!
 //! The filters run in SQL against the `messages` and `sessions` indexes; the
 //! caller applies its pattern to the rows a scan returns. Only the text

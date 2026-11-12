@@ -644,7 +644,7 @@ async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
     let resumed = bounded("the resume", resume_from(&winner)).await;
 
     assert!(
-        matches!(resumed, super::chat::WaitingTurnResume::RunLive(_)),
+        resumed.dispatch.is_none(),
         "a live run's lease blocks the resume"
     );
     assert_eq!(
@@ -699,9 +699,8 @@ async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_
 
     let resumed = bounded("the resume", resume_from(&winner)).await;
 
-    let super::chat::WaitingTurnResume::Dispatch { guard, runtime } = resumed else {
-        panic!("a session without a live run must be resumed");
-    };
+    let super::chat::WaitingTurnResume { runtime, dispatch } = resumed;
+    let guard = dispatch.expect("a session without a live run must be resumed");
     assert!(runtime.has_pending_messages(), "the reminder is queued");
     assert!(
         winner.runs().is_held("session"),
