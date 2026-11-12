@@ -883,6 +883,12 @@ pub async fn build_capabilities(
             MayAgentError::Sandbox(format!("failed to load skill prompt metadata: {error}"))
         })?
         .into_iter()
+        .filter(|skill| {
+            skill
+                .requires_command
+                .as_deref()
+                .is_none_or(|required| commands.iter().any(|(name, _)| name == required))
+        })
         .map(|skill| CatalogSkill {
             dir_name: skill.dir_name,
             name: skill.name,

@@ -259,6 +259,32 @@ fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -
 }
 
 #[test]
+fn the_computer_skill_is_listed_only_where_computer_is_registered() {
+    let dir = tempdir().expect("temp dir should be created");
+    let skill_dir = dir.path().join("computer");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        include_str!("../../skills/computer/SKILL.md"),
+    )
+    .expect("write skill");
+    let render = |commands: &[(String, String)]| {
+        tokio_test::block_on(build_capabilities(
+            commands,
+            &[],
+            &Parameters::default(),
+            dir.path(),
+        ))
+        .expect("capabilities render")
+    };
+
+    let with = render(&[("computer".to_string(), "the desktop".to_string())]);
+    assert!(with.contains("`skills/computer/SKILL.md`"), "{with}");
+    let without = render(&[("browser".to_string(), "pages".to_string())]);
+    assert!(!without.contains("skills/computer/SKILL.md"), "{without}");
+}
+
+#[test]
 fn the_work_section_names_the_issue_backend() {
     let work = build_work(&crate::issue::IssueBackendInfo {
         name: "may",
