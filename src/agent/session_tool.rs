@@ -7,6 +7,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::session_find::{FindError, FindRequest, find};
 use crate::db::{ChatDb, IndexedMessageRow};
 use crate::repo_search::indexer::{
     IndexerError, SESSIONS_COLLECTION, SearchIndexer, parse_message_doc_id,
@@ -27,18 +28,30 @@ pub enum SessionOutputMode {
 }
 
 /// Search May sessions by what was discussed, or inspect, read and list them.
+///
+/// `session "find <regex>"` is rule-based search over session history, newest
+/// first, not the ranked index: `--session-id`, `--role`, `--since`, `--until`
+/// and `--title-contains` filter in SQLite, then the regex runs over message
+/// text. `--ignore-case` matches ignoring case, `--context N` shows N
+/// neighbouring messages per match, `--count` reports matching messages per
+/// session, `--tools` also searches tool calls and their output, `--limit`
+/// (default 20, at most 200) and `--offset` page the matches. Thinking is
+/// never searched. A hit names its session and message id; read it in place
+/// with `session "messages <session>" --around <message id>`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionArgs {
     /// Optional command-form input. Supported:
     /// - `session <id> search <prompt>`
     /// - `session search <prompt>`
+    /// - `session find <regex>`
     /// - `session inspect <id>`
     /// - `session messages <id>`
     /// - `session list`
     #[serde(default)]
     pub command: Option<String>,
 
-    /// What to find, described in natural language.
+    /// What to find, described in natural language; with `find`, the regular
+    /// expression after it.
     pub query: String,
 
     /// Output mode: `sessions` (aggregated) or `messages`.
@@ -105,6 +118,19 @@ pub struct SessionArgs {
     /// Include archived sessions. Default false.
     #[serde(default)]
     pub include_archived: bool,
+
+    /// With `find`: match the pattern ignoring case.
+    #[serde(default)]
+    pub ignore_case: bool,
+
+    /// With `find`: report the number of matching messages per session
+    /// instead of the matches.
+    #[serde(default)]
+    pub count: bool,
+
+    /// With `find`: also search tool calls and their output.
+    #[serde(default)]
+    pub tools: bool,
 }
 
 const fn default_output_mode() -> SessionOutputMode {
@@ -133,6 +159,10 @@ enum SessionToolError {
         #[source]
         source: shell_words::ParseError,
     },
+    #[error(transparent)]
+    Find(#[from] FindError),
+    #[error("invalid session command: missing regular expression after 'find'")]
+    MissingFindPattern,
     #[error("session search is unavailable: {0}")]
     Index(#[from] IndexerError),
     #[error("session search is unavailable: {0}")]
@@ -169,9 +199,30 @@ struct SearchDefaults {
 #[derive(Debug, Clone)]
 enum SessionExecutionPlan {
     Search(SessionArgs),
+    Find(FindRequest),
     Inspect(SessionInspectRequest),
     Messages(SessionMessagesRequest),
     List(SessionListRequest),
+}
+
+impl FindRequest {
+    /// `session find <pattern>` with the filters `args` carries.
+    fn new(pattern: String, args: &SessionArgs) -> Self {
+        Self {
+            pattern,
+            session: args.session_id.clone(),
+            role: args.role.clone(),
+            since: args.since.clone(),
+            until: args.until.clone(),
+            title: args.title_contains.clone(),
+            ignore_case: args.ignore_case,
+            context: args.context,
+            count: args.count,
+            tools: args.tools,
+            limit: args.limit,
+            offset: args.offset,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +360,10 @@ async fn execute_plan(
         SessionExecutionPlan::Search(args) => {
             let index = index.ok_or(SessionToolError::NoIndex)?;
             execute_search(index, &current_session_id, args).await
+        }
+        SessionExecutionPlan::Find(request) => {
+            let db = ChatDb::open(&db_path).await?;
+            Ok(ToolResult::text(find(&db, request).await?))
         }
         SessionExecutionPlan::Inspect(request) => execute_inspect(db_path, request).await,
         SessionExecutionPlan::Messages(request) => execute_messages(db_path, request).await,
@@ -735,6 +790,15 @@ fn plan_from_tokens(
     }
 
     match first {
+        "find" => {
+            let pattern = tokens[1..].join(" ");
+            if pattern.is_empty() {
+                return Err(SessionToolError::MissingFindPattern);
+            }
+            Ok(Some(SessionExecutionPlan::Find(FindRequest::new(
+                pattern, args,
+            ))))
+        }
         "search" => {
             let prompt = tokens
                 .iter()
@@ -791,6 +855,16 @@ fn plan_from_raw_query(
     let trimmed = args.query.trim();
     if trimmed.is_empty() {
         return None;
+    }
+
+    // The regular expression is everything after `find`, spacing kept.
+    if let Some(("find", pattern)) = trimmed.split_once(char::is_whitespace)
+        && !pattern.trim().is_empty()
+    {
+        return Some(SessionExecutionPlan::Find(FindRequest::new(
+            pattern.trim().to_string(),
+            args,
+        )));
     }
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -1056,7 +1130,103 @@ mod tests {
             include_content: false,
             include_current: false,
             include_archived: false,
+            ignore_case: false,
+            count: false,
+            tools: false,
         }
+    }
+
+    fn defaults() -> SearchDefaults {
+        SearchDefaults {
+            current_session_id: "current".to_string(),
+        }
+    }
+
+    #[test]
+    fn find_is_a_session_subcommand_that_carries_every_filter() {
+        let mut args = base_args();
+        args.session_id = Some("alpha".to_string());
+        args.role = Some("user".to_string());
+        args.since = Some("2026-01-01T00:00:00Z".to_string());
+        args.until = Some("2026-02-01T00:00:00Z".to_string());
+        args.title_contains = Some("deploy".to_string());
+        args.ignore_case = true;
+        args.context = Some(2);
+        args.count = true;
+        args.tools = true;
+        args.limit = 5;
+        args.offset = 7;
+
+        // The raw query keeps the regular expression's own spacing.
+        let mut raw = args.clone();
+        raw.query = "find  roll   out ".to_string();
+        let Some(SessionExecutionPlan::Find(request)) = plan_from_raw_query(&raw, &defaults())
+        else {
+            panic!("expected find plan");
+        };
+        assert_eq!(request.pattern, "roll   out");
+        assert_eq!(request.session.as_deref(), Some("alpha"));
+        assert_eq!(request.role.as_deref(), Some("user"));
+        assert_eq!(request.since.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(request.until.as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(request.title.as_deref(), Some("deploy"));
+        assert!(request.ignore_case && request.count && request.tools);
+        assert_eq!(request.context, Some(2));
+        assert_eq!((request.limit, request.offset), (5, 7));
+
+        // The command form tokenises shell words and rejoins the pattern.
+        let tokens = split_command_form_tokens("session find \"canary\" live", "session")
+            .expect("command form should parse");
+        let Some(SessionExecutionPlan::Find(request)) =
+            plan_from_tokens(&tokens, &args, &defaults()).expect("plan should parse")
+        else {
+            panic!("expected find plan");
+        };
+        assert_eq!(request.pattern, "canary live");
+    }
+
+    #[test]
+    fn find_without_a_pattern_is_refused() {
+        let tokens = vec!["find".to_string()];
+        let error =
+            plan_from_tokens(&tokens, &base_args(), &defaults()).expect_err("find needs a pattern");
+        assert!(error.to_string().contains("after 'find'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn session_find_searches_history_through_the_session_tool_path() {
+        use crate::db::MessageMeta;
+        use crate::session::MessageRole;
+
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("alpha", Some("Deploy plan"), Some("m"))
+            .await
+            .expect("session");
+        db.append_message(
+            "alpha",
+            MessageRole::User,
+            "roll out the canary",
+            Some("2026-01-01T10:00:00Z"),
+            MessageMeta::default(),
+        )
+        .await
+        .expect("append");
+
+        let mut args = base_args();
+        args.query = "find CANARY".to_string();
+        args.ignore_case = true;
+        let plan = build_execution_plan(args, SessionCommandInput::RawQuery, &defaults())
+            .expect("find plan");
+        let text = execute_plan(db_path, None, "current".to_string(), plan)
+            .await
+            .expect("find runs without a search index")
+            .as_text()
+            .expect("text")
+            .to_string();
+        assert!(text.contains("Showing 1 matching message(s)"), "{text}");
+        assert!(text.contains("> roll out the canary"), "{text}");
     }
 
     #[test]

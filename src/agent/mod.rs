@@ -23,8 +23,6 @@ mod context_dump;
 mod context_report;
 mod environment;
 pub(crate) mod explore_tool;
-/// The `find` command: regex search over session history.
-pub mod find_tool;
 mod hooks;
 #[cfg(test)]
 mod host_load_tests;
@@ -63,6 +61,7 @@ pub mod runner;
 mod runtime_context;
 #[cfg(test)]
 mod secret_redaction_tests;
+mod session_find;
 /// Session tool registration for the agent.
 pub mod session_tool;
 /// Authorization for the SSH servers `terminal` commands name.
