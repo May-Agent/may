@@ -1,0 +1,1 @@
+{% if ambiguous %}"{{ name }}" matches several installed applications{% else %}No installed application is named "{{ name }}"{% endif %}.{% if !suggestions.is_empty() %} Closest names: {{ suggestions.join(", ") }}. Launch one of them by that name, or by its bundle id.{% endif %}
