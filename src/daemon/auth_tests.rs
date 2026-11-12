@@ -380,11 +380,20 @@ async fn upstream() -> SocketAddr {
 /// served under it.
 async fn tunnel_referer(state: &Arc<DaemonState>) -> String {
     state
+        .remote_access_manager
+        .set_local_listener_addr(LOCAL_HOST.parse().expect("local listener address"));
+    let tunnel = open_tunnel(state).await;
+    format!("http://{LOCAL_HOST}{}", tunnel.path)
+}
+
+/// Opens a tunnel of session `s` to [`upstream`].
+async fn open_tunnel(state: &Arc<DaemonState>) -> crate::agent::tunnel_tool::TunnelResult {
+    state
         .db()
         .create_session("s", None, None)
         .await
         .expect("session");
-    let tunnel = super::tunnel::handle_tunnel_request(
+    super::tunnel::handle_tunnel_request(
         state,
         TunnelRequest {
             session_id: "s".to_string(),
@@ -392,8 +401,34 @@ async fn tunnel_referer(state: &Arc<DaemonState>) -> String {
         },
     )
     .await
-    .expect("tunnel registers");
-    format!("http://{LOCAL_HOST}{}", tunnel.path)
+    .expect("tunnel registers")
+}
+
+#[tokio::test]
+async fn a_tunnels_local_url_is_served_by_the_local_listener_on_its_bound_port() {
+    let state = state().await;
+    // A listener bound to port 0, as the daemon's may be: the URL must carry
+    // the port it actually got, not a configured one.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the local listener");
+    let bound = listener.local_addr().expect("local listener address");
+    state.remote_access_manager.set_local_listener_addr(bound);
+    let tunnel = open_tunnel(&state).await;
+    assert_eq!(
+        tunnel.local_url,
+        format!("http://127.0.0.1:{}{}", bound.port(), tunnel.path)
+    );
+    let uri: hyper::Uri = tunnel.local_url.parse().expect("local url parses");
+    let host = uri
+        .authority()
+        .expect("local url has an authority")
+        .as_str();
+    let path = uri.path();
+    let router = local_router(&state);
+    assert_eq!(
+        status(&router, browser_request("GET", path, host, None)).await,
+        StatusCode::OK,
+        "the local URL needs no identity on the local listener"
+    );
 }
 
 fn with_referer(mut request: Request, referer: &str) -> Request {
