@@ -5,10 +5,6 @@ use std::path::{Path, PathBuf};
 use may_agent::container::image_ref;
 use may_agent::container::stage::stage_workspace_context;
 
-/// Byte for byte the manifest `embedded_distribution` loads; it is one of the
-/// workspace reference's hash inputs.
-const TOOL_DISTRIBUTION: &[u8] = include_bytes!("../src/tools/tool-distribution-0.24.0.json");
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -26,10 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Prints `base=<ref>` and `workspace=<ref>` for `$GITHUB_OUTPUT`.
 fn refs() -> Result<(), Box<dyn std::error::Error>> {
     let base = image_ref::base_image_ref(Path::new("container/base"))?;
+    // The manifest `embedded_distribution` loads, one of the reference's hash inputs.
+    let distribution = may_agent::tools::manifest::combined_manifest_bytes()?;
     let workspace = image_ref::workspace_image_ref(
         Path::new("container/workspace"),
         &base,
-        TOOL_DISTRIBUTION,
+        &distribution,
         Path::new("."),
         env!("MAY_HEEL_LIB_VERSION"),
     )?;

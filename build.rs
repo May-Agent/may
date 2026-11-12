@@ -8,8 +8,17 @@ use std::process::Command;
 #[path = "src/container/image_ref.rs"]
 mod image_ref;
 
-/// The pinned tool-distribution manifest the workspace image stages.
-const TOOL_DISTRIBUTION_MANIFEST: &str = "src/tools/tool-distribution-0.24.0.json";
+/// The same combined manifest `embedded_distribution` loads; a build script
+/// cannot call the crate it builds, so it includes the module that holds it.
+#[path = "src/tools/manifest.rs"]
+mod manifest;
+
+/// The manifest files the workspace image's tag hashes, through
+/// `manifest::combined_manifest_bytes`.
+const TOOL_DISTRIBUTION_MANIFESTS: [&str; 2] = [
+    "src/tools/tool-distribution-0.24.0.json",
+    "src/tools/tool-artifacts.json",
+];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
@@ -80,8 +89,8 @@ fn emit_heel_lib_version() -> String {
 fn emit_image_refs(heel_lib_version: &str) {
     let base_dir = Path::new("container/base");
     let workspace_dir = Path::new("container/workspace");
-    let manifest =
-        fs::read(TOOL_DISTRIBUTION_MANIFEST).expect("tool distribution manifest must be readable");
+    let manifest = manifest::combined_manifest_bytes()
+        .expect("tool distribution manifests must be valid JSON");
     let base_ref = image_ref::base_image_ref(base_dir).expect("base context must be readable");
     let workspace_ref = image_ref::workspace_image_ref(
         workspace_dir,
@@ -94,10 +103,11 @@ fn emit_image_refs(heel_lib_version: &str) {
     println!("cargo:rustc-env=MAY_BASE_IMAGE={base_ref}");
     println!("cargo:rustc-env=MAY_WORKSPACE_IMAGE={workspace_ref}");
 
-    let mut inputs = vec![
-        PathBuf::from(TOOL_DISTRIBUTION_MANIFEST),
-        workspace_dir.to_path_buf(),
-    ];
+    let mut inputs: Vec<PathBuf> = TOOL_DISTRIBUTION_MANIFESTS
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    inputs.push(workspace_dir.to_path_buf());
     inputs.extend(image_ref::tasks_sources(Path::new(".")).expect("tasks crate must be readable"));
     inputs.push(PathBuf::from(image_ref::PYTHON_SHIM_TEMPLATE));
     inputs.extend(

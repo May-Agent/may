@@ -110,7 +110,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`tasks/`** - the `may-tasks` crate: the `tasks.md` parser, `edit.rs` and the `tasks` binary, the ordinary program (not an IPC command) that edits the file `MAY_TASKS` names; it links no `may-agent` code, and the container image tag hashes this directory and `Cargo.lock`. It is installed beside `may`, the daemon puts that directory first on its `PATH`, and the container image carries it at `/usr/local/bin/tasks`. `cargo run --bin may` does not build it: `cargo build` does
 
-**`patch/`, `sed/`** - the `may-patch` crate (the `apply_patch` binary and the parser `command_reading` uses) and the `may-sed` crate (the `aither-sed` binary and `supports`, which `command_policy` uses). `.github/workflows/tool-artifacts.yml` builds their prebuilt binaries and attaches them to the `patch/v<version>` and `sed/v<version>` releases
+**`patch/`, `sed/`** - the `may-patch` crate (the `apply_patch` binary and the parser `command_reading` uses) and the `may-sed` crate (the `aither-sed` binary and `supports`, which `command_policy` uses). `.github/workflows/tool-artifacts.yml` builds their prebuilt binaries and attaches them to the `patch/v<version>` and `sed/v<version>` releases, which `src/tools/tool-artifacts.json` pins and the tool distribution downloads in place of aither's
 
 **`src/tasks_md/`** - re-exports `may-tasks` and holds `schema.rs`: `tasks.md` as an aither working document with the schema, the stop rule and the line limit
 
