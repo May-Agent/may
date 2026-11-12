@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/May-Agent/may/compare/v0.1.0...v0.1.1) - 2026-11-12
+
+### Added
+
+- *(tools)* own the bash build and third-party pins
+- *(computer)* act on the desktop's elements by reference
+- *(tools)* take apply_patch and sed from May's own releases
+
+### Fixed
+
+- *(release)* build the Linux binaries on ubuntu-24.04
+- *(release)* skip semver-checks for may-agent
+- *(agent)* retry a rate limit reported mid-stream
+- *(patch)* show the lines around each place an ambiguous hunk matches
+- *(daemon)* answer a direct listener only when Host names the node
+
+### Other
+
+- Merge pull request #1148 from May-Agent/feat/1146-own-tool-pipeline
+- Merge pull request #1150 from May-Agent/fix/1029-dist-runners
+- Merge pull request #1143 from May-Agent/feat/1142-computer-elements
+- Merge pull request #1145 from May-Agent/fix/1144-release-semver-check
+- Merge pull request #1130 from May-Agent/release-plz-2026-11-12T09-31-29Z
+- Merge pull request #1141 from May-Agent/fix/1140-aither-bump
+- Merge pull request #1139 from May-Agent/fix/1017-ambiguous-hunk-context
+- release
+- Merge pull request #1138 from May-Agent/ci/1137-scope
+- Merge pull request #1136 from May-Agent/fix/1108-direct-host-check
+- Merge pull request #1135 from May-Agent/feat/1015-distribution-switch
+- release configuration selects no CI job
+
 ## [0.1.0](https://github.com/May-Agent/may/releases/tag/v0.1.0) - 2026-11-12
 
 ### Added
