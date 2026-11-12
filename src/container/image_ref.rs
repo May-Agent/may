@@ -19,9 +19,14 @@ pub const WORKSPACE_IMAGE_REPOSITORY: &str = "ghcr.io/may-agent/may-workspace";
 
 /// Top-level context entries CI generates for the workspace build. Their
 /// content is identified by the hash's other inputs (the pinned tool
-/// distribution, the `tasks` sources and the heel library version), so
-/// staging rewrites must not move the reference.
-const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "tasks", "tools"];
+/// distribution, the `tasks` sources, the Python shim template and the heel
+/// library version), so staging rewrites must not move the reference.
+const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "python_shim", "tasks", "tools"];
+
+/// The `python3`, `python` and `uv` shim template, relative to the
+/// repository. The workspace image carries it as those three commands, so a
+/// change to it moves the workspace reference.
+pub const PYTHON_SHIM_TEMPLATE: &str = "templates/python_shim";
 
 /// The directory, relative to the repository, of the `tasks` crate.
 ///
@@ -66,9 +71,10 @@ pub fn base_image_ref(context_dir: &Path) -> io::Result<String> {
 /// The `<repository>:<content tag>` reference of the workspace image.
 ///
 /// Named by the base reference it layers on, the `context_dir` files minus
-/// the generated `heel`/`tools`/`tasks` entries, the tool distribution
-/// manifest bytes, the sources the `tasks` binary is built from and the heel
-/// library version pinning the staged binary.
+/// the generated `heel`/`tools`/`tasks`/`python_shim` entries, the tool
+/// distribution manifest bytes, the sources the `tasks` binary is built from,
+/// the Python shim template and the heel library version pinning the staged
+/// binary.
 ///
 /// # Errors
 /// Returns an IO error when the context cannot be read.
@@ -94,6 +100,8 @@ pub fn workspace_image_ref(
     for relative in tasks_sources(repository)? {
         feed_file(&mut hasher, repository, &relative)?;
     }
+    feed(&mut hasher, b"python-shim");
+    feed_file(&mut hasher, repository, Path::new(PYTHON_SHIM_TEMPLATE))?;
     feed(&mut hasher, b"heel-lib-version");
     feed(&mut hasher, heel_lib_version.as_bytes());
     Ok(format!(
@@ -214,6 +222,8 @@ mod tests {
         )
         .unwrap();
         fs::write(repository.path().join("Cargo.lock"), "source").unwrap();
+        fs::create_dir_all(repository.path().join("templates")).unwrap();
+        fs::write(repository.path().join(PYTHON_SHIM_TEMPLATE), "shim").unwrap();
         let fixture = || {
             workspace_image_ref(
                 context.path(),
@@ -249,6 +259,12 @@ mod tests {
             fs::write(&source, "source").unwrap();
             assert_eq!(fixture(), before);
         }
+        // So is the Python shim template the image installs.
+        let shim = repository.path().join(PYTHON_SHIM_TEMPLATE);
+        fs::write(&shim, "edited").unwrap();
+        assert_ne!(fixture(), before);
+        fs::write(&shim, "shim").unwrap();
+        assert_eq!(fixture(), before);
         // A file added to the crate is an input too.
         let added = repository.path().join("tasks").join("templates");
         fs::create_dir_all(&added).unwrap();
@@ -265,6 +281,7 @@ mod tests {
         fs::create_dir_all(context.path().join("tools").join("key")).unwrap();
         fs::write(context.path().join("heel"), "binary").unwrap();
         fs::write(context.path().join("tasks"), "binary").unwrap();
+        fs::write(context.path().join("python_shim"), "staged").unwrap();
         fs::write(context.path().join("tools").join("key").join("rg"), "tool").unwrap();
         assert_eq!(fixture(), before);
         assert_eq!(
@@ -321,5 +338,29 @@ mod tests {
             "target tables are not scanned"
         );
         assert!(manifest.get("workspace").is_none());
+    }
+
+    /// The workspace image installs the staged shim as the three commands in
+    /// a directory that leads its `PATH`, ahead of the base image's
+    /// `/root/.local/bin/uv` and `/usr/bin/python3` the shim then finds.
+    #[test]
+    fn the_workspace_image_installs_the_python_shim_first_on_the_path() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dockerfile = fs::read_to_string(repository.join("container/workspace/Dockerfile"))
+            .expect("workspace Dockerfile");
+        for command in ["python3", "python", "uv"] {
+            assert!(
+                dockerfile.contains(&format!(
+                    "COPY --chmod=0755 python_shim /opt/may/shims/{command}\n"
+                )),
+                "{command} is not installed from the staged shim"
+            );
+        }
+        assert!(dockerfile.contains("ENV PATH=\"/opt/may/shims:${PATH}\"\n"));
+        assert!(
+            GENERATED_WORKSPACE_ENTRIES.contains(&"python_shim"),
+            "the staged shim must not move the tag by its staging"
+        );
+        assert!(repository.join(PYTHON_SHIM_TEMPLATE).is_file());
     }
 }

@@ -10,6 +10,7 @@ use futures_util::TryStreamExt as _;
 use http_body_util::BodyDataStream;
 use skyzen::{Request, StatusCode};
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::session_events::{SessionChange, diff, format_cursor, parse_cursor};
 use super::state::DaemonState;
@@ -142,7 +143,7 @@ fn publish_turn_frame(state: &DaemonState, session_id: &str, data: &str) {
 async fn a_change_between_the_cursor_read_and_subscribing_arrives_exactly_once() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let cursor = cursor_of(&router, SESSION).await;
     state
@@ -178,7 +179,7 @@ async fn a_change_between_the_cursor_read_and_subscribing_arrives_exactly_once()
 async fn a_stream_without_after_replays_nothing_of_the_turn_in_progress() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     state.turn_hub.begin_turn(SESSION);
     publish_turn_frame(&state, SESSION, r#"{"seq":1}"#);
@@ -206,7 +207,7 @@ async fn a_stream_without_after_replays_nothing_of_the_turn_in_progress() {
 async fn a_cursor_read_mid_turn_replays_the_turn_from_its_first_frame() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     state.turn_hub.begin_turn(SESSION);
     publish_turn_frame(&state, SESSION, r#"{"seq":1}"#);
@@ -243,7 +244,7 @@ async fn a_cursor_read_mid_turn_replays_the_turn_from_its_first_frame() {
 async fn a_cursor_from_another_epoch_gets_a_reset_then_live_events() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let mut stream = Stream::open(
         &router,
@@ -265,7 +266,7 @@ async fn a_cursor_from_another_epoch_gets_a_reset_then_live_events() {
 async fn a_foreign_epoch_cursors_reset_is_the_first_event_even_with_frames_queued() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     // A frame buffered right at subscribe time still lands after `reset`.
     publish_turn_frame(&state, SESSION, r#"{"seq":"queued"}"#);
@@ -286,7 +287,7 @@ async fn a_foreign_epoch_cursors_reset_is_the_first_event_even_with_frames_queue
 async fn the_same_runtime_value_publishes_once_to_every_subscriber() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let mut first = Stream::open(&router, &format!("/api/sessions/{SESSION}/events")).await;
     let mut second = Stream::open(&router, &format!("/api/sessions/{SESSION}/events")).await;
@@ -338,7 +339,7 @@ async fn take_completion(terminal: &crate::repo_clone::test_sandbox::TestTermina
 async fn a_job_added_then_removed_upserts_then_removes() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let mut stream = Stream::open(&router, &format!("/api/sessions/{SESSION}/events")).await;
 
@@ -416,7 +417,7 @@ async fn the_issues_route_answers_the_list_the_stream_reports() {
         crate::session::SessionStore::new(crate::session::MayHomePaths::new(state.may_dir.clone()))
             .sandbox_dir(SESSION, None);
     std::fs::create_dir_all(&sandbox).expect("session sandbox dir");
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let response = router
         .go(request("GET", &format!("/api/sessions/{SESSION}/issues")))
@@ -435,7 +436,7 @@ async fn the_issues_route_answers_the_list_the_stream_reports() {
 #[tokio::test]
 async fn a_removed_session_topic_is_rejected_on_the_shared_stream() {
     let state = state().await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let error = router
         .go(request("GET", "/api/events?topics=session_turn"))
         .await
@@ -472,7 +473,7 @@ async fn run_until_cancelled(
 async fn a_one_shot_client_that_disconnects_mid_turn_stops_the_turn() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let run = run_until_cancelled(&state).await;
     let stream = Stream::open(
@@ -506,7 +507,7 @@ async fn a_one_shot_client_that_disconnects_mid_turn_stops_the_turn() {
 async fn an_ordinary_client_that_disconnects_leaves_the_turn_running() {
     let state = state().await;
     session(&state, SESSION).await;
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
 
     let run = run_until_cancelled(&state).await;
     let stream = Stream::open(&router, &format!("/api/sessions/{SESSION}/events")).await;

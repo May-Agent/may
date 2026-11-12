@@ -887,11 +887,8 @@ fn parse_value(s: &str, expected_type: Option<&str>) -> Value {
 pub fn schema_to_help(schema: &Value) -> String {
     let mut help = String::new();
 
-    // Title and description
-    if let Some(title) = schema.get("title").and_then(Value::as_str) {
-        help.push_str(title);
-        help.push('\n');
-    }
+    // The schema's title is the argument struct's Rust type name, which is
+    // no part of the command line; only the description is shown.
     if let Some(desc) = schema.get("description").and_then(Value::as_str) {
         help.push_str(desc);
         help.push('\n');
@@ -975,16 +972,29 @@ pub fn schema_to_help(schema: &Value) -> String {
             let is_array = get_instance_type(prop, prop) == Some("array");
             let flag = name.replace('_', "-");
 
-            let short = field_to_short.get(name).copied();
-            help.push_str(render_flag_prefix(flag.as_str(), short).as_str());
-            if is_array {
-                help.push_str(" <value>  (repeatable");
-                if is_required {
-                    help.push_str(", required");
+            if positional_names.iter().any(|positional| positional == name) {
+                // A positional argument is given as a bare word, never as a flag.
+                help.push_str("  <");
+                help.push_str(flag.as_str());
+                help.push('>');
+                if is_array {
+                    help.push_str("...");
                 }
-                help.push(')');
-            } else if is_required {
-                help.push_str(" (required)");
+                if is_required {
+                    help.push_str(" (required)");
+                }
+            } else {
+                let short = field_to_short.get(name).copied();
+                help.push_str(render_flag_prefix(flag.as_str(), short).as_str());
+                if is_array {
+                    help.push_str(" <value>  (repeatable");
+                    if is_required {
+                        help.push_str(", required");
+                    }
+                    help.push(')');
+                } else if is_required {
+                    help.push_str(" (required)");
+                }
             }
 
             if let Some(desc) = prop.get("description").and_then(Value::as_str) {
@@ -1040,6 +1050,14 @@ pub fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> V
         }));
     }
 
+    // Bound fields are options, so they belong before the option terminator;
+    // everything from the terminator on is positional.
+    let terminator = cli_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(cli_args.len());
+    let positionals = cli_args.split_off(terminator);
+
     // Options already spelled out in the verbatim argv keep their value; a
     // same-named bound field would only come from piped stdin.
     let declared: HashSet<String> = cli_args
@@ -1064,6 +1082,7 @@ pub fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> V
             .expect("flatten_args_to_cli keys must resolve back into the map");
         flatten_named_arg_to_cli(&mut cli_args, key, value);
     }
+    cli_args.extend(positionals);
     cli_args
 }
 
@@ -1109,7 +1128,70 @@ mod tests {
     use serde::Deserialize;
     use serde_json::Value;
 
-    use super::requests_help;
+    use super::{flatten_args_to_cli, requests_help};
+
+    fn bound(argv: &[&str], input: &str) -> std::collections::HashMap<String, Value> {
+        std::collections::HashMap::from([
+            ("args".to_string(), serde_json::json!(argv)),
+            ("input".to_string(), Value::String(input.to_string())),
+        ])
+    }
+
+    #[test]
+    fn piped_stdin_is_bound_before_the_option_terminator() {
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--", "word"], "x")),
+            words(&["--input", "x", "--", "word"])
+        );
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--verbose"], "x")),
+            words(&["--verbose", "--input", "x"])
+        );
+    }
+
+    #[test]
+    fn a_literal_option_after_the_terminator_is_not_declared() {
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--", "--input"], "x")),
+            words(&["--input", "x", "--", "--input"])
+        );
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct Piped {
+        /// The first word.
+        prompt: String,
+        /// Piped stdin.
+        #[serde(default)]
+        input: Option<String>,
+    }
+
+    /// What the command receives once the rebuilt line is parsed.
+    fn parsed(argv: &[&str], input: &str) -> Value {
+        let schema = serde_json::to_value(schemars::schema_for!(Piped)).expect("a schema");
+        super::cli_to_json(&schema, &flatten_args_to_cli(&bound(argv, input))).expect("parses")
+    }
+
+    #[test]
+    fn piped_stdin_reaches_its_field_through_the_terminator() {
+        assert_eq!(
+            parsed(&["--", "word"], "x"),
+            serde_json::json!({ "prompt": "word", "input": "x" })
+        );
+        assert_eq!(
+            parsed(&["--", "--input"], "x"),
+            serde_json::json!({ "prompt": "--input", "input": "x" })
+        );
+    }
+
+    #[test]
+    fn an_option_before_the_terminator_still_wins_over_stdin() {
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--input", "a", "--", "word"], "x")),
+            words(&["--input", "a", "--", "word"])
+        );
+    }
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[allow(dead_code)]
@@ -1161,6 +1243,18 @@ mod tests {
         assert!(help_in(&["--help"]));
         assert!(help_in(&["--verbose", "-h"]));
         assert!(!help_in(&["--verbose"]));
+    }
+
+    #[test]
+    fn usage_shows_no_type_name_and_no_flag_for_a_positional() {
+        let schema = serde_json::to_value(schemars::schema_for!(Args)).expect("a schema");
+        let help = super::schema_to_help(&schema);
+        assert!(!help.contains("Args"), "{help}");
+        assert!(help.contains("  <prompt> [options]"), "{help}");
+        assert!(help.contains("  <prompt> (required)"), "{help}");
+        assert!(!help.contains("--prompt"), "{help}");
+        assert!(help.contains("--body"), "{help}");
+        assert!(help.contains("--verbose"), "{help}");
     }
 
     #[test]

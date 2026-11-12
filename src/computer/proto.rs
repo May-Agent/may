@@ -42,6 +42,34 @@ pub enum AgentRequest {
         session_id: String,
         message: InputMessage,
     },
+    /// Launch an application in the background onto the session's display
+    /// and open `items` (URLs, or file paths) in it.
+    Launch {
+        session_id: String,
+        /// An application name, a bundle id or an `.app` path.
+        app: String,
+        items: Vec<String>,
+    },
+}
+
+/// An application launched onto the session's display.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaunchedApp {
+    pub bundle_id: String,
+    pub pid: i32,
+    /// The windows the launch opened and placed on the display.
+    pub windows: Vec<LaunchedWindow>,
+}
+
+/// A window the launch placed, in the session display's own points: the
+/// space `click X Y` takes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaunchedWindow {
+    pub id: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// What the agent answers.
@@ -72,6 +100,8 @@ pub enum AgentResponse {
     OfferRefused { error: String },
     /// Boolean-bearing replies (`stream_running`, `takeover_active`).
     Flag { value: bool },
+    /// `launch` result.
+    Launched { app: LaunchedApp },
 }
 
 // ── Wire input messages (the same shape the browser input uses) ────────────────
@@ -120,6 +150,21 @@ pub enum MouseButtonInput {
     Left,
     Right,
     Middle,
+}
+
+/// Bits of the `modifiers` field of [`MouseInput`] and [`KeyboardInput`], in
+/// the web client's CDP order. Only the macOS input path reads them; the web
+/// client sends them as numbers.
+#[cfg(target_os = "macos")]
+pub mod modifier_bits {
+    /// Alt / Option.
+    pub const ALT: u64 = 1;
+    /// Control.
+    pub const CTRL: u64 = 2;
+    /// Meta / Command.
+    pub const META: u64 = 4;
+    /// Shift.
+    pub const SHIFT: u64 = 8;
 }
 
 #[derive(Debug, Deserialize, Serialize)]

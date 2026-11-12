@@ -35,6 +35,37 @@ pub enum AcquireError {
     Storage(#[from] ChatDbError),
 }
 
+/// Why [`SessionRunGuard::finish`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum FinishError {
+    /// The end of the run could not be recorded; a background task keeps
+    /// retrying it, see [`SessionRunGuard`].
+    #[error("failed to record the end of the session run: {0}")]
+    Settle(#[source] ChatDbError),
+    /// The run was recorded as ended, but looking for follow-up work or
+    /// taking the session again failed.
+    #[error("the session run ended but follow-up work could not be dispatched: {0}")]
+    FollowUp(#[source] ChatDbError),
+}
+
+/// Delays between attempts to record the end of a run whose settle failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleRetry {
+    /// Delay before the first retry; each further one doubles it.
+    pub initial: std::time::Duration,
+    /// Longest delay between two attempts.
+    pub max: std::time::Duration,
+}
+
+impl Default for SettleRetry {
+    fn default() -> Self {
+        Self {
+            initial: std::time::Duration::from_secs(1),
+            max: std::time::Duration::from_mins(1),
+        }
+    }
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -84,6 +115,7 @@ pub struct SessionRuns {
     db: ChatDb,
     ui_event_bus: UiEventBus,
     spawner: Spawner,
+    settle_retry: SettleRetry,
     live: Arc<Mutex<HashMap<String, LiveRun>>>,
 }
 
@@ -101,7 +133,47 @@ impl SessionRuns {
             db,
             ui_event_bus,
             spawner: global_spawner(),
+            settle_retry: SettleRetry::default(),
             live: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Retry a failed settle on `settle_retry`'s delays instead of the
+    /// defaults.
+    #[must_use]
+    pub const fn with_settle_retry(mut self, settle_retry: SettleRetry) -> Self {
+        self.settle_retry = settle_retry;
+        self
+    }
+
+    /// Record the end of the run `fence` names until storage accepts it, then
+    /// publish the runtime change. The finish is fenced and idempotent, and
+    /// a run that no longer holds the row (restart recovery or a later run
+    /// owns it) counts as recorded. Attempts wait `settle_retry.initial`,
+    /// doubling up to `settle_retry.max`.
+    async fn finish_until_recorded(self, fence: RunFence) {
+        let mut delay = self.settle_retry.initial;
+        loop {
+            async_io::Timer::after(delay).await;
+            match self.db.finish_session_run(&fence).await {
+                Ok(_) => {
+                    tracing::info!(
+                        session_id = %fence.session_id,
+                        "recorded the end of a session run after a storage failure"
+                    );
+                    self.publish_runtime_change(&fence.session_id);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %fence.session_id,
+                        %error,
+                        ?delay,
+                        "retrying to record the end of a session run"
+                    );
+                    delay = (delay * 2).min(self.settle_retry.max);
+                }
+            }
         }
     }
 
@@ -343,14 +415,27 @@ impl SessionRunGuard {
     async fn settle(&mut self, outcome: RunOutcome) -> Result<bool, ChatDbError> {
         // `settled` is set only once the finish returned, so a settle
         // dropped at the await falls through to `Drop`, which repeats the
-        // fenced, idempotent finish. A storage error leaves the session to
-        // restart recovery.
+        // fenced, idempotent finish. The run leaves the registry first and
+        // whatever the finish does: it has ended, so it must not block a new
+        // acquire in memory. After a storage error the row keeps naming the
+        // run until the background retry lands, so a new acquire in that
+        // window gets `Busy` from the conditional claim, which is the truth
+        // of the row.
         self.runs.unregister(&self.fence);
         let held = match self.runs.db.finish_session_run(&self.fence).await {
             Ok(held) => held,
             Err(error) => {
+                tracing::error!(
+                    session_id = %self.fence.session_id,
+                    ?outcome,
+                    %error,
+                    "failed to record the end of a session run; retrying in the background"
+                );
                 self.settled = true;
                 self.released_tx = None;
+                let runs = self.runs.clone();
+                let fence = self.fence.clone();
+                (self.runs.spawner)(Box::pin(runs.finish_until_recorded(fence)));
                 return Err(error);
             }
         };
@@ -375,10 +460,13 @@ impl SessionRunGuard {
     /// Only a [`RunOutcome::Completed`] run continues.
     ///
     /// # Errors
-    /// Returns [`ChatDbError`] on storage failure; the session is then left
-    /// to restart recovery.
-    pub async fn finish(mut self, outcome: RunOutcome) -> Result<Option<Self>, ChatDbError> {
-        let held = self.settle(outcome).await?;
+    /// Returns [`FinishError::Settle`] when the end of the run could not be
+    /// recorded: the run has left the registry and a background task retries
+    /// the write, and until it lands the row still names the run, so an
+    /// acquire gets `Busy`. Returns [`FinishError::FollowUp`] when the run
+    /// was recorded as ended and only the follow-up lookup failed.
+    pub async fn finish(mut self, outcome: RunOutcome) -> Result<Option<Self>, FinishError> {
+        let held = self.settle(outcome).await.map_err(FinishError::Settle)?;
         if outcome != RunOutcome::Completed || !held {
             return Ok(None);
         }
@@ -389,7 +477,8 @@ impl SessionRunGuard {
         let runtime = runs
             .db
             .get_session_runtime(&session_id)
-            .await?
+            .await
+            .map_err(FinishError::FollowUp)?
             .unwrap_or_default();
         if !runtime.can_dispatch_follow_up() {
             return Ok(None);
@@ -397,7 +486,7 @@ impl SessionRunGuard {
         match runs.acquire(&session_id).await {
             Ok(next) => Ok(Some(next)),
             Err(AcquireError::Busy(_)) => Ok(None),
-            Err(AcquireError::Storage(error)) => Err(error),
+            Err(AcquireError::Storage(error)) => Err(FinishError::FollowUp(error)),
         }
     }
 
@@ -405,7 +494,8 @@ impl SessionRunGuard {
     /// an entrypoint whose own loop dispatches pending work.
     ///
     /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
+    /// Returns [`ChatDbError`] when the end of the run could not be recorded;
+    /// see [`FinishError::Settle`].
     pub async fn finish_idle(mut self, outcome: RunOutcome) -> Result<(), ChatDbError> {
         self.settle(outcome).await?;
         Ok(())

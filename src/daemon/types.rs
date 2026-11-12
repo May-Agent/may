@@ -38,6 +38,10 @@ pub enum ApiErrorCode {
     /// The user declined, at the session's repository question, to work where
     /// the session starts. The turn did not run; nothing failed.
     RepoDeclined,
+    /// The daemon ended the turn because the agent kept looping after it was
+    /// alerted; the message says which loop. Nothing failed, and the session
+    /// takes the next message.
+    LoopStopped,
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.

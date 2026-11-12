@@ -21,7 +21,14 @@ pub enum StageContextError {
     /// The built `tasks` binary could not be copied into the context.
     #[error("staging the tasks binary failed: {0}")]
     Tasks(#[source] std::io::Error),
+    /// The Python shim could not be written into the context.
+    #[error("staging the python shim failed: {0}")]
+    PythonShim(#[source] std::io::Error),
 }
+
+/// The shim the image installs as `python3`, `python` and `uv`: the template
+/// a host session installs, so both behave the same.
+const PYTHON_SHIM: &str = include_str!("../../templates/python_shim");
 
 /// Stages the workspace context's generated entries for a Linux architecture.
 ///
@@ -29,7 +36,8 @@ pub enum StageContextError {
 /// layout the image's runtime tool verification expects), the distribution's
 /// Linux `heel` binary at `<context>/heel`, pinned at the `heel` library
 /// version this binary links, and `tasks_binary`, the `tasks` command built
-/// for the same architecture, at `<context>/tasks`.
+/// for the same architecture, at `<context>/tasks`, and the Python shim
+/// template at `<context>/python_shim`.
 ///
 /// `scratch` receives the transient tool artifact cache; it is safe to
 /// discard after staging.
@@ -76,6 +84,10 @@ pub async fn stage_workspace_context(
     async_fs::copy(tasks_binary, context.join("tasks"))
         .await
         .map_err(StageContextError::Tasks)?;
+
+    async_fs::write(context.join("python_shim"), PYTHON_SHIM)
+        .await
+        .map_err(StageContextError::PythonShim)?;
 
     Ok(staged)
 }

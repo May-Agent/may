@@ -23,6 +23,7 @@ use super::context_dump::ContextDump;
 use super::hooks::MayHooks;
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::job_events::{BackgroundWake, JobFact, JobReport, JobReports};
+use super::loop_watch::{LoopPattern, LoopWatch};
 use super::permission::PermissionApprover;
 use super::provider::{ModelSlot, ProviderLlm, resolve_provider_runtime};
 use super::runtime_context::{
@@ -426,6 +427,8 @@ pub struct MayAgent {
     language_guard: LanguageGuard,
     /// Set when the `compact` tool ended a turn for a compaction.
     compaction_requested: Arc<AtomicBool>,
+    /// The loop detection of the agent's runs.
+    loops: LoopWatch,
     /// Hands the window's measure to the `compact` valve and the warning.
     watch: RunWatch,
     /// Where the calls whose exchanges a compaction keeps are reported.
@@ -705,25 +708,22 @@ impl MayAgent {
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),
         };
-        // Connected ACP agents start in the sandbox this session's own
-        // commands run in; a container session has no host sandbox to give
-        // them, so it offers none.
         let sandbox = assembly.sandbox().await?;
+        // A connected ACP agent starts in the sandbox of its run's subagent
+        // shell, derived from this session's; a container session has no
+        // host sandbox to give it, so it offers none.
         let acp = match config.acp.as_ref() {
             Some(hosts) if !is_container => Some(
-                hosts
-                    .agents(
-                        config.session_id.as_str(),
-                        super::acp_sandbox::SessionSandbox::for_session(
-                            sandbox.clone(),
-                            config.permission_approver.clone(),
-                            config
-                                .job_server
-                                .broker()
-                                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
-                        ),
-                    )
-                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                hosts.agents(
+                    config.session_id.as_str(),
+                    super::acp_sandbox::SessionServices::new(
+                        config.permission_approver.clone(),
+                        config
+                            .job_server
+                            .broker()
+                            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                    ),
+                ),
             ),
             Some(_) => {
                 tracing::warn!(
@@ -841,6 +841,7 @@ impl MayAgent {
                 tracing::warn!(%error, "failed to create session repo clone");
             }
         }
+        let works_in_clone = !repo_clones.is_empty();
         if let Some(repo_clones) =
             build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
         {
@@ -996,7 +997,10 @@ impl MayAgent {
             )
             .with_instruction(
                 tag::WORK,
-                build_work(&crate::issue::IssueStore::info(&issue_store)),
+                build_work(
+                    &crate::issue::IssueStore::info(&issue_store),
+                    works_in_clone,
+                ),
             )
             .with_instruction(
                 tag::SESSION,
@@ -1028,15 +1032,17 @@ impl MayAgent {
 
         let valve = Arc::new(CompactSignal::default());
         let compaction_requested = Arc::new(AtomicBool::new(false));
-        let hooks = MayHooks::new(
-            hook_runtime.clone(),
-            &config.session_id,
-            SecretRedactor::for_session(&config.may_dir, config.session_id.as_str()),
-            refused_reads,
-            shell.jobs(),
-            valve.clone(),
-            compaction_requested.clone(),
-        );
+        let loops = LoopWatch::new(config.limits.loops());
+        let hooks = MayHooks {
+            runtime: hook_runtime.clone(),
+            session_id: config.session_id.clone(),
+            redactor: SecretRedactor::for_session(&config.may_dir, config.session_id.as_str()),
+            refused: refused_reads,
+            jobs: shell.jobs(),
+            valve: valve.clone(),
+            compaction: compaction_requested.clone(),
+            loops: loops.clone(),
+        };
         let effective_max_iterations = if config.max_iterations == 0 {
             usize::MAX
         } else {
@@ -1103,6 +1109,7 @@ impl MayAgent {
             .fork_source(shared_terminal_commands.fork_source.clone())
             .subagents(subagent_tracker.runs().clone())
             .context_source(PreCompactionAlert::new(gauge.clone()))
+            .context_source(loops.alerts())
             .context_source(conditions)
             .context_source(events)
             .context_source(JobReports::new(shell.jobs().events(), job_facts_tx.clone()));
@@ -1190,6 +1197,7 @@ impl MayAgent {
             btw_llm,
             language_guard,
             compaction_requested,
+            loops,
             watch,
             kept_exchanges,
             kept_calls: Vec::new(),
@@ -1374,6 +1382,7 @@ impl MayAgent {
         attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
+        self.loops.begin_run();
         MayRun::new(self.inner.run(prompt, attachments), self.watch.clone())
     }
 
@@ -1399,7 +1408,15 @@ impl MayAgent {
     /// [`Self::run`].
     pub fn resume(&mut self) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
+        self.loops.begin_run();
         MayRun::new(self.inner.resume(), self.watch.clone())
+    }
+
+    /// The loop that made the last run end, once: the turn runner tells the
+    /// session's clients why the turn ended.
+    #[must_use]
+    pub(crate) fn take_loop_stop(&self) -> Option<LoopPattern> {
+        self.loops.take_stop()
     }
 
     /// Waits, between runs, for a fact about the session's jobs that the

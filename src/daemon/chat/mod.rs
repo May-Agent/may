@@ -52,9 +52,9 @@ use crate::db::RunFence;
 use crate::prompt_mentions;
 use crate::quota;
 use crate::session::{
-    AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths,
-    MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment, RunOutcome,
-    SessionId, SessionPaths, SessionRunGuard, SessionRuntimeState, SessionStore,
+    AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, FinishError,
+    MayHomePaths, MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment,
+    RunOutcome, SessionId, SessionPaths, SessionRunGuard, SessionRuntimeState, SessionStore,
     TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
@@ -1199,7 +1199,7 @@ enum FollowUpError {
     #[error("follow-up run failed: {0}")]
     Turn(ChatCollectError),
     #[error("failed to release session run after follow-up dispatch: {0}")]
-    Release(crate::db::ChatDbError),
+    Release(crate::session::FinishError),
 }
 
 /// [`dispatch_follow_ups`] for a spawned task, which has no caller to
@@ -1433,17 +1433,15 @@ fn resume_waiting_turn_reminder(
 }
 
 /// How a resume after a decision was scheduled.
-pub(super) enum WaitingTurnResume {
-    /// The run is gone: this process took the session's lease and queued the
-    /// resume reminder, and the guard dispatches it.
-    Dispatch {
-        guard: SessionRunGuard,
-        runtime: crate::session::SessionRuntimeSummary,
-    },
-    /// A live run (possibly in another process) holds the lease. It was or
-    /// will be answered through its own prompt, so nothing was written: no
+pub(super) struct WaitingTurnResume {
+    /// The session's runtime state after the attempt.
+    pub(super) runtime: crate::session::SessionRuntimeSummary,
+    /// The session's lease when its run was gone: this process took it and
+    /// queued the resume reminder, and the guard dispatches it. `None` while
+    /// a live run (possibly in another process) holds the lease: it was or
+    /// will be answered through its own prompt, so nothing was written, no
     /// state change and no reminder that would reach the model after it.
-    RunLive(crate::session::SessionRuntimeSummary),
+    pub(super) dispatch: Option<SessionRunGuard>,
 }
 
 /// Take the lease of a session whose run is gone and queue the reminder for
@@ -1471,7 +1469,10 @@ pub(super) async fn queue_waiting_turn_resume(
             return runtime_service
                 .get(session_id)
                 .await
-                .map(WaitingTurnResume::RunLive)
+                .map(|runtime| WaitingTurnResume {
+                    runtime,
+                    dispatch: None,
+                })
                 .map_err(ScheduleWaitingTurnError::Lease);
         }
         Err(AcquireError::Storage(error)) => return Err(ScheduleWaitingTurnError::Lease(error)),
@@ -1484,7 +1485,10 @@ pub(super) async fn queue_waiting_turn_resume(
         )
         .await
     {
-        Ok(runtime) => Ok(WaitingTurnResume::Dispatch { guard, runtime }),
+        Ok(runtime) => Ok(WaitingTurnResume {
+            runtime,
+            dispatch: Some(guard),
+        }),
         Err(error) => {
             finish_failed_run(guard).await;
             Err(ScheduleWaitingTurnError::Enqueue(error))
@@ -1498,15 +1502,13 @@ pub(super) async fn schedule_waiting_turn_resume(
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
 ) -> Result<crate::session::SessionRuntimeSummary, ScheduleWaitingTurnError> {
-    match queue_waiting_turn_resume(&state.runtime_service, session_id, request_kind, resolution)
-        .await?
-    {
-        WaitingTurnResume::Dispatch { guard, runtime } => {
-            spawn_continued_run(state.clone(), guard);
-            Ok(runtime)
-        }
-        WaitingTurnResume::RunLive(runtime) => Ok(runtime),
+    let resume =
+        queue_waiting_turn_resume(&state.runtime_service, session_id, request_kind, resolution)
+            .await?;
+    if let Some(guard) = resume.dispatch {
+        spawn_continued_run(state.clone(), guard);
     }
+    Ok(resume.runtime)
 }
 
 async fn schedule_browser_takeover_resume(
@@ -2743,6 +2745,15 @@ fn run_agent_loop_attempts<'a>(
                 record_request_log(state, entry).await;
             }
 
+            // A turn the loop detection ended tells its clients why, on the
+            // path that reports why any turn stopped; the turn itself is
+            // complete and stored, and the session takes the next message.
+            if let Some(pattern) = agent.take_loop_stop() {
+                let _ = sink
+                    .on_error(ApiErrorCode::LoopStopped, &pattern.stop_notice(), false)
+                    .await;
+            }
+
             // Post-completion hooks
             schedule_profile_memory_processing(state, profile_id.as_deref()).await;
             title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
@@ -2904,6 +2915,9 @@ async fn run_published_turn(
     let response_session_id = req.session_id.clone();
     // Every arm releases the session and records the release before
     // announcing the end of the turn.
+    // A follow-up lookup that failed after the run was recorded as ended: the
+    // turn still ends as it ran, and the error is returned for logging.
+    let mut follow_up_error = None;
     match result {
         Ok(result) => {
             let done_event = done_event_from_run_result(
@@ -2916,7 +2930,16 @@ async fn run_published_turn(
             // a client that sends its next message on `done` is never refused
             // as a concurrent run. Finishing continues the session under a
             // new guard only when there is pending work to dispatch.
-            let continued = guard.finish(RunOutcome::Completed).await?;
+            let continued = match guard.finish(RunOutcome::Completed).await {
+                Ok(continued) => continued,
+                Err(FinishError::Settle(error)) => {
+                    return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+                }
+                Err(FinishError::FollowUp(error)) => {
+                    follow_up_error = Some(error);
+                    None
+                }
+            };
             record_release(&state, resuming).await;
             sink.finish_with("done", &done_event, crate::client::RunEnd::Completed);
             if let Some(continued) = continued {
@@ -2932,7 +2955,16 @@ async fn run_published_turn(
                 response_session_id.clone(),
                 *result,
             );
-            let continued = guard.finish(RunOutcome::Completed).await?;
+            let continued = match guard.finish(RunOutcome::Completed).await {
+                Ok(continued) => continued,
+                Err(FinishError::Settle(error)) => {
+                    return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+                }
+                Err(FinishError::FollowUp(error)) => {
+                    follow_up_error = Some(error);
+                    None
+                }
+            };
             record_release(&state, resuming).await;
             sink.finish_with("paused", &paused_event, crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
@@ -2941,17 +2973,39 @@ async fn run_published_turn(
         }
         // Errors are already published through on_error in run_agent_loop.
         Err(AgentLoopError::Cancelled(_)) => {
-            guard.finish_idle(RunOutcome::Cancelled).await?;
+            if let Err(error) = guard.finish_idle(RunOutcome::Cancelled).await {
+                return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+            }
             record_release(&state, resuming).await;
             sink.finish(crate::client::RunEnd::Cancelled);
         }
         Err(_) => {
-            guard.finish_idle(RunOutcome::Failed).await?;
+            if let Err(error) = guard.finish_idle(RunOutcome::Failed).await {
+                return end_unsettled_turn(&state, &mut sink, resuming, error).await;
+            }
             record_release(&state, resuming).await;
             sink.finish(crate::client::RunEnd::Failed);
         }
     }
-    Ok(())
+    follow_up_error.map_or(Ok(()), Err)
+}
+
+/// Ends a turn whose run could not be settled in storage. The guard already
+/// released the session in memory and retries the write in the background,
+/// so the release is recorded and clients hear the storage error and the
+/// turn's `end` as they would for any failed turn; the error goes back to
+/// the caller, which logs it.
+async fn end_unsettled_turn(
+    state: &DaemonState,
+    sink: &mut HubSink,
+    resuming: Option<background::ResumePending>,
+    error: crate::db::ChatDbError,
+) -> Result<(), crate::db::ChatDbError> {
+    sink.on_error(ApiErrorCode::InternalError, &error.to_string(), false)
+        .await;
+    record_release(state, resuming).await;
+    sink.finish(crate::client::RunEnd::Failed);
+    Err(error)
 }
 
 /// A run just released its session: the background wake it served, if any,
@@ -6425,6 +6479,149 @@ mod tests {
         assert_eq!(done.user_message_id.as_deref(), Some(rest_user.id.as_str()));
         assert_eq!(done.message_ids, rest_assistants);
         assert_eq!(done.assistant.id, rest_assistants[0]);
+    }
+
+    /// The `session_turn` events of `frames`, as `(event, data)`.
+    fn turn_events(
+        frames: &[std::sync::Arc<super::hub::TurnFrame>],
+    ) -> Vec<(String, serde_json::Value)> {
+        frames
+            .iter()
+            .filter(|frame| frame.kind == "session_turn")
+            .map(|frame| {
+                let frame: serde_json::Value =
+                    serde_json::from_str(&frame.data).expect("a turn frame is JSON");
+                (
+                    frame["event"]
+                        .as_str()
+                        .expect("the frame names its event")
+                        .to_string(),
+                    frame["data"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// An agent that repeats one call is alerted once at the alert threshold
+    /// and its turn ended at the end threshold: every client of the session
+    /// hears why, the turn is stored as complete, and the session takes the
+    /// next message. The thresholds are lowered live, after the daemon
+    /// started, as a saved config change does.
+    #[tokio::test]
+    async fn a_looping_turn_is_alerted_once_ended_and_the_next_message_runs() {
+        const ALERT: &str = "Retrying the same way cannot work";
+        const NOTICE: &str = "The turn was ended because the agent was looping: it made the same call 4 times in a row. Send a message to continue.";
+        let arguments = serde_json::json!({
+            "script": "echo looping",
+            "description": "repeats one command",
+            "timeout": 10
+        })
+        .to_string();
+        let mut script: Vec<String> = (1..=4)
+            .map(|call| sse_tool_call(&format!("call_{call}"), "terminal", &arguments))
+            .collect();
+        script.push(sse_text("I stopped repeating it."));
+        let provider = stub_provider(script).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut config = (*state.config_snapshot()).clone();
+        config.loop_detection = crate::config::LoopDetectionSettings {
+            cycle_alert: 2,
+            cycle_end: 4,
+            failure_alert: 2,
+            failure_end: 4,
+        };
+        state.live_limits.apply(&config);
+
+        let request = |content: &str| ChatRequest {
+            session_id: "session".to_string(),
+            content: content.to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let clients = state.turn_hub.subscribe_live("session");
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        super::run_published_turn(
+            state.clone(),
+            request("run it"),
+            guard,
+            TurnKind::Prompt,
+            None,
+        )
+        .await
+        .expect("the looping turn settles");
+
+        // The prompt, then one request after each of the first three calls;
+        // the fourth call ends the turn before another request.
+        let bodies = [
+            last_body(&provider, 1).await,
+            last_body(&provider, 1).await,
+            last_body(&provider, 1).await,
+            last_body(&provider, 1).await,
+        ];
+        let alerts: Vec<usize> = bodies
+            .iter()
+            .map(|body| body.matches(ALERT).count())
+            .collect();
+        assert_eq!(
+            alerts,
+            [0, 0, 1, 1],
+            "the alert comes with the request after the second call, once, and stays"
+        );
+
+        let events = turn_events(&clients.take_unread().expect("the subscription is open"));
+        let stop = events
+            .iter()
+            .position(|(event, _)| event == "error")
+            .expect("the clients hear why the turn ended");
+        assert_eq!(events[stop].1["code"], "loop_stopped");
+        assert_eq!(events[stop].1["message"], NOTICE);
+        assert_eq!(events[stop].1["retryable"], false);
+        let (last, end) = events.last().expect("the turn ended");
+        assert_eq!(last, "end");
+        assert_eq!(
+            end["outcome"], "completed",
+            "the turn is complete, not failed"
+        );
+        assert!(
+            events.iter().any(|(event, _)| event == "done"),
+            "the turn's messages are announced: {events:?}"
+        );
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("the session takes the next message");
+        super::run_published_turn(
+            state.clone(),
+            request("go on"),
+            guard,
+            TurnKind::Prompt,
+            None,
+        )
+        .await
+        .expect("the next turn settles");
+        assert_eq!(
+            stored_assistant_texts(&state)
+                .await
+                .last()
+                .map(String::as_str),
+            Some("I stopped repeating it.")
+        );
+        let events = turn_events(&clients.take_unread().expect("the subscription is open"));
+        assert!(
+            !events.iter().any(|(event, _)| event == "error"),
+            "the next turn runs as usual: {events:?}"
+        );
     }
 
     /// A takeover can pause a turn before it stored any reply: the `paused`
