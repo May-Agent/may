@@ -33,34 +33,26 @@ pub(crate) use fixture::{fixture_distribution, test_heel, test_tool_cache};
 pub mod manifest;
 use manifest::combined_manifest;
 #[cfg(test)]
-use manifest::{BASELINE as EMBEDDED_DISTRIBUTION, MAY_ARTIFACTS};
+use manifest::{HOST_PROGRAMS, MAY_ARTIFACTS, THIRD_PARTY_TOOLS};
 
-/// SHA-256 of the `patch-v0.24.0` `tool-distribution-0.24.0.json` release asset.
+/// SHA-256 of `third-party-tools.json`, so an accidental edit fails a test.
 #[cfg(test)]
-const EMBEDDED_DISTRIBUTION_SHA256: &str =
-    "965d2f13f3098268d34e251dfd04ca3ab5af7a79c55fcc81a0b07e8155a026ef";
+const THIRD_PARTY_TOOLS_SHA256: &str =
+    "2c8092f520fb3e8d5d7bcd30151e4755c1bd3cdc05d143fb162a61397ccac795";
 
 /// SHA-256 of `tool-artifacts.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const MAY_ARTIFACTS_SHA256: &str =
-    "c22543f797223e56211c736b4912de2bf4009705afd15b41b1a40d56d2b93df6";
+    "44d15fd2849f1cf19b8997679f4d6e386c58cb4baee5909afeac17115a6448c3";
 
-/// May's own host-program pins: `heel` at the version of the `heel` library
-/// May links, which refuses a binary of any other version, and the
-/// repo-search daemon release whose version matches the `repo-search-client`
-/// crate May links, since the daemon refuses a handshake from any other
-/// client version.
-const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
     "3377752efbdf34537d47c97d4474c2204df07cc7e735380ba631e28265b513fe";
 
-/// Loads the distribution: aither's embedded, hash-pinned baseline tools.
-///
-/// `apply_patch` and `aither-sed` come from May's own `patch/v<version>` and
-/// `sed/v<version>` releases (`tool-artifacts.json`) instead of the
-/// baseline's, and May's own host programs replace the baseline's.
+/// Loads the distribution: May's embedded, hash-pinned tools, assembled from
+/// `third-party-tools.json`, `tool-artifacts.json` (`bash`, `apply_patch` and
+/// `aither-sed`) and `host-programs.json`.
 ///
 /// Artifacts are downloaded on first use and verified against the manifest's
 /// SHA-256 digests before anything executes them.
@@ -68,10 +60,7 @@ const HOST_PROGRAMS_SHA256: &str =
 /// # Errors
 /// Fails when an embedded manifest does not validate.
 pub fn embedded_distribution() -> Result<ToolDistribution, ToolRuntimeError> {
-    let mut manifest = combined_manifest()?;
-    let host_programs: serde_json::Value = serde_json::from_slice(HOST_PROGRAMS)?;
-    manifest["host_programs"] = host_programs["host_programs"].clone();
-    ToolDistribution::from_json(&serde_json::to_vec(&manifest)?).map(authenticated)
+    ToolDistribution::from_json(&serde_json::to_vec(&combined_manifest()?)?).map(authenticated)
 }
 
 /// Downloads GitHub release artifacts with the `GITHUB_TOKEN` environment
@@ -107,9 +96,17 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        EMBEDDED_DISTRIBUTION, EMBEDDED_DISTRIBUTION_SHA256, HOST_PROGRAMS, HOST_PROGRAMS_SHA256,
-        MAY_ARTIFACTS, MAY_ARTIFACTS_SHA256, embedded_distribution,
+        HOST_PROGRAMS, HOST_PROGRAMS_SHA256, MAY_ARTIFACTS, MAY_ARTIFACTS_SHA256,
+        THIRD_PARTY_TOOLS, THIRD_PARTY_TOOLS_SHA256, embedded_distribution,
     };
+
+    #[test]
+    fn third_party_tools_match_their_pin() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(THIRD_PARTY_TOOLS)),
+            THIRD_PARTY_TOOLS_SHA256
+        );
+    }
 
     #[test]
     fn may_artifacts_match_their_pin() {
@@ -166,14 +163,6 @@ mod tests {
             targets.sort();
             assert_eq!(targets, expected, "{tool}");
         }
-    }
-
-    #[test]
-    fn embedded_distribution_matches_the_published_release_asset() {
-        assert_eq!(
-            format!("{:x}", Sha256::digest(EMBEDDED_DISTRIBUTION)),
-            EMBEDDED_DISTRIBUTION_SHA256
-        );
     }
 
     #[test]
