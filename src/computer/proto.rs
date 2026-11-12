@@ -2,6 +2,8 @@
 //! `computer-agent.sock` unix socket. One request per connection.
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use waterkit_automation::{Element, ElementRef, Elements};
 
 use crate::config::StreamCodec;
 
@@ -50,6 +52,118 @@ pub enum AgentRequest {
         app: String,
         items: Vec<String>,
     },
+    /// List the actionable elements of the windows on the session's display;
+    /// the references of the previous listing stop resolving.
+    #[cfg(target_os = "macos")]
+    Elements { session_id: String },
+    /// Press the element `element` names.
+    #[cfg(target_os = "macos")]
+    Press {
+        session_id: String,
+        #[serde(with = "element_ref")]
+        element: ElementRef,
+    },
+    /// Give the element `element` names keyboard focus, then type `text`.
+    #[cfg(target_os = "macos")]
+    TypeInto {
+        session_id: String,
+        #[serde(with = "element_ref")]
+        element: ElementRef,
+        text: String,
+    },
+}
+
+/// An [`ElementRef`] on the wire: its text form.
+#[cfg(target_os = "macos")]
+mod element_ref {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+    use waterkit_automation::ElementRef;
+
+    pub fn serialize<S: Serializer>(
+        element: &ElementRef,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(element)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ElementRef, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+/// The actionable elements on a session's display, front window first.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ElementListing {
+    pub elements: Vec<ListedElement>,
+    /// The listing left out the rest of an application or of the display.
+    pub truncated: bool,
+    /// How many reads of single elements failed, each leaving its element
+    /// out or read as empty.
+    pub skipped: usize,
+}
+
+/// One element of an [`ElementListing`], as its application reported it.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListedElement {
+    #[serde(with = "element_ref")]
+    pub reference: ElementRef,
+    /// The Accessibility role, such as `AXButton`.
+    pub role: String,
+    /// The Accessibility subrole, such as `AXSecureTextField`.
+    pub subrole: Option<String>,
+    pub title: Option<String>,
+    pub label: Option<String>,
+    pub value: Option<String>,
+    pub placeholder: Option<String>,
+    pub enabled: bool,
+    /// The centre of its frame in the display's points, when it reports one.
+    pub center: Option<ElementPoint>,
+}
+
+/// A point on the session display, in the space `click X Y` takes.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ElementPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[cfg(target_os = "macos")]
+impl From<&Elements> for ElementListing {
+    fn from(listed: &Elements) -> Self {
+        Self {
+            elements: listed.elements().iter().map(ListedElement::from).collect(),
+            truncated: listed.truncated(),
+            skipped: listed.skipped().len(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<&Element> for ListedElement {
+    fn from(element: &Element) -> Self {
+        Self {
+            reference: element.reference(),
+            role: element.role().to_owned(),
+            subrole: element.subrole().map(str::to_owned),
+            title: element.title().map(str::to_owned),
+            label: element.label().map(str::to_owned),
+            value: element.value().map(str::to_owned),
+            placeholder: element.placeholder().map(str::to_owned),
+            enabled: element.enabled(),
+            center: element.frame().map(|frame| {
+                let center = frame.center();
+                ElementPoint {
+                    x: center.x(),
+                    y: center.y(),
+                }
+            }),
+        }
+    }
 }
 
 /// An application launched onto the session's display.
@@ -102,6 +216,12 @@ pub enum AgentResponse {
     Flag { value: bool },
     /// `launch` result.
     Launched { app: LaunchedApp },
+    /// `elements` result.
+    #[cfg(target_os = "macos")]
+    Elements { listing: ElementListing },
+    /// An element request refused because its reference no longer names an
+    /// element of the latest listing; `error` is human-readable.
+    StaleElement { error: String },
 }
 
 // ── Wire input messages (the same shape the browser input uses) ────────────────

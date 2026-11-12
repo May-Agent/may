@@ -10,9 +10,11 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use waterkit_automation::ElementRef;
+
 use crate::computer::proto::{
-    InputMessage, KeyboardEventKind, KeyboardInput, LaunchedWindow, MouseButtonInput,
-    MouseEventKind, MouseInput,
+    ElementListing, ElementPoint, InputMessage, KeyboardEventKind, KeyboardInput, LaunchedWindow,
+    ListedElement, MouseButtonInput, MouseEventKind, MouseInput,
 };
 use crate::computer::{
     ComputerAgent,
@@ -44,11 +46,14 @@ impl std::fmt::Debug for ComputerHandles {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ComputerArgs {
     /// Usage, one line per action:
-    /// - `observe`: the screen plus a description
+    /// - `observe`: the screen, its size and the actionable elements, each
+    ///   with a reference such as `0a3f91c2:12`, valid until the next observe
     /// - `screenshot`: just the screen image
+    /// - `click REF`: press the element a reference from `observe` names
     /// - `click X Y`, `double-click X Y`, `right-click X Y`
     /// - `drag X1 Y1 X2 Y2`: press at the start, release at the end
     /// - `scroll DX DY`: pixel deltas at the pointer
+    /// - `type REF TEXT`: focus the element REF names, then type TEXT
     /// - `type TEXT`: type at the focused element
     /// - `key KEY` or `key MOD+MOD+KEY`: `Enter`, `Tab`, `ArrowLeft`, `F5`,
     ///   a letter or digit, `cmd+l`, `cmd+shift+4`
@@ -168,6 +173,35 @@ fn key_code(key: &str) -> String {
     }
 }
 
+/// An action aimed at an element by its reference.
+#[derive(Debug, PartialEq, Eq)]
+enum ElementAction {
+    /// `click REF`.
+    Press(ElementRef),
+    /// `type REF TEXT`.
+    TypeInto(ElementRef, String),
+}
+
+/// The element form of `click` and `type`: `click REF` (one operand), and
+/// `type REF TEXT` (a first operand in a reference's text form). `None` is
+/// the coordinate or focused-element form.
+fn element_action(kind: Action, rest: &[String]) -> Result<Option<ElementAction>, String> {
+    match (kind, rest) {
+        (Action::Click, [reference]) => reference
+            .parse()
+            .map(|element| Some(ElementAction::Press(element)))
+            .map_err(|e| format!("expected `computer click REF` or `computer click X Y`: {e}")),
+        (Action::Type, [first, text @ ..]) => match first.parse() {
+            Ok(_) if text.is_empty() => {
+                Err("`computer type REF TEXT` needs the text to type".to_owned())
+            }
+            Ok(element) => Ok(Some(ElementAction::TypeInto(element, text.join(" ")))),
+            Err(_) => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
 impl ComputerTool {
     /// Bind the tool to its session.
     #[must_use]
@@ -179,8 +213,9 @@ impl ComputerTool {
     }
 
     /// The session's display, creating it on first use — provisioning is
-    /// the point: an agent asking for its desktop gets one.
-    async fn ensure_desktop(&self) -> Result<(), String> {
+    /// the point: an agent asking for its desktop gets one. Answers its
+    /// size in points.
+    async fn ensure_desktop(&self) -> Result<(u32, u32), String> {
         match self
             .handles
             .agent
@@ -189,7 +224,7 @@ impl ComputerTool {
             })
             .await?
         {
-            AgentResponse::Display { .. } => Ok(()),
+            AgentResponse::Display { width, height, .. } => Ok((width, height)),
             AgentResponse::Error { error } => Err(error),
             _ => Err("unexpected reply from computer-agent".to_owned()),
         }
@@ -237,8 +272,12 @@ impl ComputerTool {
         let Some(kind) = Action::parse(action) else {
             return Err(usage().to_owned());
         };
+        if let Some(element_action) = element_action(kind, rest)? {
+            return self.act_on_element(element_action).await;
+        }
         match kind {
-            Action::Screenshot | Action::Observe => self.capture(kind == Action::Observe).await,
+            Action::Screenshot => self.screenshot().await,
+            Action::Observe => self.observe().await,
             Action::Click
             | Action::DoubleClick
             | Action::RightClick
@@ -277,9 +316,29 @@ impl ComputerTool {
         }
     }
 
-    async fn capture(&self, with_text: bool) -> Result<ToolResult, String> {
+    async fn screenshot(&self) -> Result<ToolResult, String> {
         self.ensure_desktop().await?;
-        let png = match self
+        Ok(ToolResult::image(self.png().await?, "image/png"))
+    }
+
+    /// The screen, its size and its actionable elements. The screenshot and
+    /// the listing are taken together.
+    async fn observe(&self) -> Result<ToolResult, String> {
+        let (width, height) = self.ensure_desktop().await?;
+        let (png, listing) = futures_lite::future::zip(self.png(), self.elements()).await;
+        let (png, listing) = (png?, listing?);
+        let text = ObservedText::new(width, height, &listing)
+            .render()
+            .map_err(|e| e.to_string())?;
+        Ok(ToolResult::parts(vec![
+            ToolResultPart::text(text),
+            ToolResultPart::image(png, "image/png"),
+        ]))
+    }
+
+    /// The display's current screen as PNG.
+    async fn png(&self) -> Result<Vec<u8>, String> {
+        match self
             .handles
             .agent
             .request(AgentRequest::Screenshot {
@@ -287,17 +346,57 @@ impl ComputerTool {
             })
             .await?
         {
-            AgentResponse::Png { data } => data,
-            AgentResponse::Error { error } => return Err(error),
-            _ => return Err("unexpected reply from computer-agent".to_owned()),
+            AgentResponse::Png { data } => Ok(data),
+            AgentResponse::Error { error } => Err(error),
+            _ => Err("unexpected reply from computer-agent".to_owned()),
+        }
+    }
+
+    /// A fresh element listing; the previous one's references stop
+    /// resolving.
+    async fn elements(&self) -> Result<ElementListing, String> {
+        match self
+            .handles
+            .agent
+            .request(AgentRequest::Elements {
+                session_id: self.session_id.clone(),
+            })
+            .await?
+        {
+            AgentResponse::Elements { listing } => Ok(listing),
+            AgentResponse::Error { error } => Err(error),
+            _ => Err("unexpected reply from computer-agent".to_owned()),
+        }
+    }
+
+    async fn act_on_element(&self, action: ElementAction) -> Result<ToolResult, String> {
+        self.check_agent_owns_desktop().await?;
+        self.ensure_desktop().await?;
+        let session_id = self.session_id.clone();
+        let (request, done) = match action {
+            ElementAction::Press(element) => (
+                AgentRequest::Press {
+                    session_id,
+                    element,
+                },
+                "done: click",
+            ),
+            ElementAction::TypeInto(element, text) => (
+                AgentRequest::TypeInto {
+                    session_id,
+                    element,
+                    text,
+                },
+                "done: type",
+            ),
         };
-        if with_text {
-            Ok(ToolResult::parts(vec![
-                ToolResultPart::text("The attached image is the session desktop's current screen."),
-                ToolResultPart::image(png, "image/png"),
-            ]))
-        } else {
-            Ok(ToolResult::image(png, "image/png"))
+        match self.handles.agent.request(request).await? {
+            AgentResponse::Ok => Ok(ToolResult::text(done)),
+            AgentResponse::StaleElement { error } => Err(StaleElementText { error: &error }
+                .render()
+                .map_err(|e| e.to_string())?),
+            AgentResponse::Error { error } => Err(error),
+            _ => Err("unexpected reply from computer-agent".to_owned()),
         }
     }
 
@@ -493,8 +592,87 @@ struct LaunchedText<'a> {
     windows: &'a [LaunchedWindow],
 }
 
+/// What `computer observe` tells the model beside the screenshot.
+#[derive(Template)]
+#[template(path = "computer_observed.txt", escape = "none")]
+struct ObservedText<'a> {
+    width: u32,
+    height: u32,
+    elements: Vec<ElementLine<'a>>,
+    truncated: bool,
+    skipped: usize,
+}
+
+impl<'a> ObservedText<'a> {
+    fn new(width: u32, height: u32, listing: &'a ElementListing) -> Self {
+        Self {
+            width,
+            height,
+            elements: listing.elements.iter().map(ElementLine::new).collect(),
+            truncated: listing.truncated,
+            skipped: listing.skipped,
+        }
+    }
+}
+
+/// One element's line of the observe listing.
+struct ElementLine<'a> {
+    reference: ElementRef,
+    /// The subrole when it has one, which is the more specific (a secure or
+    /// search field), else the role; without the `AX` prefix.
+    role: &'a str,
+    /// Its assistive label, else its title.
+    name: Option<Quoted<'a>>,
+    value: Option<Quoted<'a>>,
+    placeholder: Option<Quoted<'a>>,
+    center: Option<ElementPoint>,
+    enabled: bool,
+}
+
+impl<'a> ElementLine<'a> {
+    fn new(element: &'a ListedElement) -> Self {
+        let role = element.subrole.as_deref().unwrap_or(&element.role);
+        let text = |text: &'a Option<String>| text.as_deref().filter(|text| !text.is_empty());
+        Self {
+            reference: element.reference,
+            role: role.strip_prefix("AX").unwrap_or(role),
+            name: text(&element.label)
+                .or_else(|| text(&element.title))
+                .map(Quoted),
+            value: text(&element.value).map(Quoted),
+            placeholder: text(&element.placeholder).map(Quoted),
+            center: element.center,
+            enabled: element.enabled,
+        }
+    }
+}
+
+/// How many characters of an element's text the listing shows: the model
+/// reads it every turn, and a name or value past this is cut with `…`.
+const QUOTED_CHARS: usize = 80;
+
+/// An element's text in quotes, escaped, cut at [`QUOTED_CHARS`].
+struct Quoted<'a>(&'a str);
+
+impl std::fmt::Display for Quoted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (shown, cut) = match self.0.char_indices().nth(QUOTED_CHARS) {
+            Some((at, _)) => (self.0.split_at(at).0, "…"),
+            None => (self.0, ""),
+        };
+        write!(f, "\"{}{cut}\"", shown.escape_debug())
+    }
+}
+
+/// What a refused action on a stale or unknown reference tells the model.
+#[derive(Template)]
+#[template(path = "computer_stale_element.txt", escape = "none")]
+struct StaleElementText<'a> {
+    error: &'a str,
+}
+
 const fn usage() -> &'static str {
-    "usage: computer <screenshot|observe|click X Y|double-click X Y|right-click X Y|drag X1 Y1 X2 Y2|scroll DX DY|type TEXT|key KEY|key MOD+KEY|launch APP [URL ...]>"
+    "usage: computer <screenshot|observe|click REF|click X Y|double-click X Y|right-click X Y|drag X1 Y1 X2 Y2|scroll DX DY|type REF TEXT|type TEXT|key KEY|key MOD+KEY|launch APP [URL ...]>"
 }
 
 #[cfg(test)]
@@ -608,6 +786,204 @@ mod tests {
         .unwrap();
         assert!(text.contains("com.google.Chrome (pid 42)"), "{text}");
         assert!(text.contains("Window 7: 800x600 at (10, 20)"), "{text}");
+    }
+
+    fn reference(text: &str) -> ElementRef {
+        text.parse().unwrap()
+    }
+
+    fn act(words: &[&str]) -> Result<Option<ElementAction>, String> {
+        let (action, operands) = parsed(words);
+        element_action(Action::parse(&action).unwrap(), &operands)
+    }
+
+    #[test]
+    fn click_takes_a_reference_or_coordinates() {
+        assert_eq!(
+            act(&["click", "0a3f91c2:12"]),
+            Ok(Some(ElementAction::Press(reference("0a3f91c2:12"))))
+        );
+        assert_eq!(act(&["click", "10", "20"]), Ok(None));
+        let error = act(&["click", "10"]).unwrap_err();
+        assert!(error.contains("`computer click REF`"), "{error}");
+        assert!(error.contains("`computer click X Y`"), "{error}");
+        assert!(error.contains("not an element reference"), "{error}");
+    }
+
+    #[test]
+    fn type_takes_a_reference_before_its_text() {
+        assert_eq!(
+            act(&["type", "0a3f91c2:3", "山田", "太郎"]),
+            Ok(Some(ElementAction::TypeInto(
+                reference("0a3f91c2:3"),
+                "山田 太郎".to_owned()
+            )))
+        );
+        assert_eq!(
+            act(&["type", "0000ffff:0", "こんにちは 안녕하세요"]),
+            Ok(Some(ElementAction::TypeInto(
+                reference("0000ffff:0"),
+                "こんにちは 안녕하세요".to_owned()
+            )))
+        );
+        assert_eq!(act(&["type", "你好", "世界"]), Ok(None));
+        assert_eq!(act(&["type", "12:30"]), Ok(None));
+        let error = act(&["type", "0a3f91c2:3"]).unwrap_err();
+        assert!(error.contains("`computer type REF TEXT`"), "{error}");
+    }
+
+    #[test]
+    fn other_actions_have_no_element_form() {
+        assert_eq!(act(&["double-click", "0a3f91c2:1"]), Ok(None));
+        assert_eq!(act(&["observe"]), Ok(None));
+    }
+
+    fn listed(
+        text: &str,
+        role: &str,
+        subrole: Option<&str>,
+        texts: [Option<&str>; 4],
+        center: Option<(f64, f64)>,
+        enabled: bool,
+    ) -> ListedElement {
+        let [title, label, value, placeholder] = texts.map(|t| t.map(str::to_owned));
+        ListedElement {
+            reference: reference(text),
+            role: role.to_owned(),
+            subrole: subrole.map(str::to_owned),
+            title,
+            label,
+            value,
+            placeholder,
+            enabled,
+            center: center.map(|(x, y)| ElementPoint { x, y }),
+        }
+    }
+
+    #[test]
+    fn observe_lists_each_element_on_one_line() {
+        let listing = ElementListing {
+            elements: vec![
+                listed(
+                    "0a3f91c2:0",
+                    "AXTextField",
+                    None,
+                    [None, Some("名前 / 이름"), Some("山田太郎"), None],
+                    Some((640.4, 311.6)),
+                    true,
+                ),
+                listed(
+                    "0a3f91c2:1",
+                    "AXTextField",
+                    Some("AXSecureTextField"),
+                    [Some("パスワード"), Some(""), Some(""), Some("8文字以上")],
+                    Some((640.0, 360.0)),
+                    true,
+                ),
+                listed(
+                    "0a3f91c2:2",
+                    "AXButton",
+                    None,
+                    [Some("送信"), None, None, None],
+                    Some((700.0, 420.0)),
+                    false,
+                ),
+                listed(
+                    "0a3f91c2:3",
+                    "AXLink",
+                    None,
+                    [Some("帮助"), None, None, None],
+                    None,
+                    true,
+                ),
+            ],
+            truncated: false,
+            skipped: 0,
+        };
+        let text = ObservedText::new(1920, 1200, &listing).render().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "The attached image is the session desktop's current screen, 1920x1200 points."
+        );
+        assert_eq!(
+            &lines[2..],
+            [
+                r#"0a3f91c2:0 TextField "名前 / 이름" = "山田太郎" at (640, 312)"#,
+                r#"0a3f91c2:1 SecureTextField "パスワード" empty, hint "8文字以上" at (640, 360)"#,
+                r#"0a3f91c2:2 Button "送信" at (700, 420), disabled"#,
+                r#"0a3f91c2:3 Link "帮助" with no position"#,
+            ]
+        );
+        assert!(!text.contains("incomplete"), "{text}");
+    }
+
+    #[test]
+    fn an_incomplete_listing_is_noted_in_one_line() {
+        let mut listing = ElementListing {
+            elements: Vec::new(),
+            truncated: true,
+            skipped: 2,
+        };
+        let text = ObservedText::new(800, 600, &listing).render().unwrap();
+        assert!(
+            text.contains("No actionable elements were listed"),
+            "{text}"
+        );
+        assert_eq!(text.lines().filter(|l| l.contains("incomplete")).count(), 1);
+        assert!(text.contains("and 2 element reads failed"), "{text}");
+
+        listing.truncated = false;
+        let text = ObservedText::new(800, 600, &listing).render().unwrap();
+        assert!(!text.contains("incomplete"), "{text}");
+        assert!(text.contains("2 element reads failed, so the listing may leave elements out"));
+
+        listing.skipped = 0;
+        let text = ObservedText::new(800, 600, &listing).render().unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+    }
+
+    #[test]
+    fn element_text_is_escaped_and_cut() {
+        assert_eq!(
+            Quoted("一行\n二行 \"引用\"").to_string(),
+            r#""一行\n二行 \"引用\"""#
+        );
+        let long = "あ".repeat(QUOTED_CHARS + 5);
+        let shown = Quoted(&long).to_string();
+        assert_eq!(shown, format!("\"{}…\"", "あ".repeat(QUOTED_CHARS)));
+        let exact = "한".repeat(QUOTED_CHARS);
+        assert_eq!(Quoted(&exact).to_string(), format!("\"{exact}\""));
+    }
+
+    #[test]
+    fn a_stale_reference_is_told_to_observe_again() {
+        let text = StaleElementText {
+            error: "element 0a3f91c2:12 no longer exists in its application",
+        }
+        .render()
+        .unwrap();
+        assert!(
+            text.contains("element 0a3f91c2:12 no longer exists"),
+            "{text}"
+        );
+        assert!(text.contains("Run `computer observe` again"), "{text}");
+    }
+
+    #[test]
+    fn element_requests_carry_the_reference_text_form() {
+        let request = AgentRequest::TypeInto {
+            session_id: "s".to_owned(),
+            element: reference("0a3f91c2:12"),
+            text: "東京".to_owned(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(wire.contains(r#""element":"0a3f91c2:12""#), "{wire}");
+        let AgentRequest::TypeInto { element, text, .. } = serde_json::from_str(&wire).unwrap()
+        else {
+            panic!("expected type_into: {wire}");
+        };
+        assert_eq!((element, text.as_str()), (reference("0a3f91c2:12"), "東京"));
     }
 
     #[test]
