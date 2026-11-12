@@ -837,6 +837,127 @@ async fn memory_extraction_on_a_cloud_home_uses_the_pushed_provider() {
     }
 }
 
+#[tokio::test]
+async fn a_cloud_home_runs_titles_and_memory_on_the_pushed_fast_tier() {
+    let (copilot_api, requests) =
+        serve_api(|_, _| ApiReply::json(500, r#"{"message":"recorded"}"#)).await;
+    let github = RecordedGitHub::serve().await;
+    let (daemon, remote, _) = codespace_daemon().await;
+    let backend = TestCloud::new(&github, daemon);
+    *backend.copilot.lock().expect("sign-in") = Some(copilot_token(
+        "copilot-fast",
+        &copilot_api,
+        Duration::from_hours(1),
+    ));
+    // The session runs on ChatGPT; this machine's fast tier is on Copilot.
+    let sessions = fronting(backend).await;
+    let fast_on = |model: &str| {
+        let mut config = (*sessions.config.load_full()).clone();
+        config.provider.insert(
+            "copilot".into(),
+            ProviderInstance::new(ProviderType::Copilot),
+        );
+        config.models.fast = vec![ModelSelector::new("copilot", model)];
+        sessions.config.store(Arc::new(config));
+    };
+    fast_on("gpt-5-mini");
+    github.reads_as(&["Available"]);
+    sessions
+        .host(SESSION)
+        .expect("a cloud session")
+        .endpoint(true)
+        .await
+        .expect("served");
+
+    // The codespace keeps its default configuration.
+    let config = remote.config_snapshot();
+    assert!(config.provider.is_empty() && !config.models.has_any_models());
+    let redactor = crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent"));
+    let title = || {
+        let config = remote.config_snapshot();
+        let pushed = remote.pushed_providers.clone();
+        let redactor = redactor.clone();
+        async move {
+            crate::agent::generate_session_title(
+                crate::agent::Providers::new(&config, &pushed),
+                "東京の天気は？ 서울 날씨는? 北京天气如何？",
+                "晴れ · 맑음 · 晴",
+                &redactor,
+            )
+            .await
+        }
+    };
+    // Every request sent since the last look: its bearer and body.
+    let sent = || -> Vec<(String, String)> {
+        requests
+            .lock()
+            .expect("requests")
+            .drain(..)
+            .map(|request| (request.authorization, request.body))
+            .collect()
+    };
+    let on = |sent: &[(String, String)], model: &str| {
+        let model = format!("\"{model}\"");
+        !sent.is_empty()
+            && sent
+                .iter()
+                .all(|(bearer, body)| bearer == "Bearer copilot-fast" && body.contains(&model))
+    };
+
+    // Titles run on the pushed fast model; the recording API refuses it.
+    assert_eq!(title().await, None);
+    let titled = sent();
+    assert!(on(&titled, "gpt-5-mini"), "{titled:?}");
+
+    // So does memory extraction.
+    let db = remote.db();
+    for (role, content) in [
+        (
+            crate::session::MessageRole::User,
+            "東京の天気は？ 서울 날씨는? 北京天气如何？",
+        ),
+        (crate::session::MessageRole::Assistant, "晴れ · 맑음 · 晴"),
+    ] {
+        db.append_message(
+            SESSION,
+            role,
+            content,
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("message");
+    }
+    let profile = db
+        .get_session(SESSION)
+        .await
+        .expect("read")
+        .and_then(|session| session.profile_id)
+        .expect("the session's profile");
+    let models = crate::memory::MemoryModels::new(
+        remote.config.clone(),
+        remote.pushed_providers.clone(),
+        redactor.clone(),
+    );
+    let _ = crate::memory::MemoryProcessor::refresh_profile(&db, &models, &profile).await;
+    let extracted = sent();
+    assert!(on(&extracted, "gpt-5-mini"), "{extracted:?}");
+
+    // This machine's fast tier changes: the daemon announces it, the tiers
+    // are pushed again, and the next request runs on the new model.
+    fast_on("gpt-5-nano");
+    sessions.mirror.bus.publish(UiEventTopics::CONFIG);
+    let pushed = remote.pushed_providers.clone();
+    eventually("the changed tiers reaching the codespace", || {
+        let fast = pushed.tiers().fast.clone();
+        async move { fast == [ModelSelector::new("copilot", "gpt-5-nano")] }
+    })
+    .await;
+    assert_eq!(title().await, None);
+    let retitled = sent();
+    assert!(on(&retitled, "gpt-5-nano"), "{retitled:?}");
+}
+
 /// Waits up to five seconds for `check` to hold.
 async fn eventually<F: Future<Output = bool>>(what: &str, check: impl Fn() -> F) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

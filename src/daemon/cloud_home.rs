@@ -9,7 +9,7 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 use super::auth::Fronted;
 use super::error::bad_request_error;
 use super::state::DaemonState;
-use crate::cloud::access::ProviderPush;
+use crate::cloud::access::{ProviderPush, PushedTiers};
 
 /// `PUT /api/cloud-home/providers/{id}`: the provider `id` as the fronting
 /// daemon pushed it. Only the fronting daemon's token is admitted: a request
@@ -40,5 +40,23 @@ pub(super) async fn push_provider(
         )));
     }
     state.pushed_providers.push(id, push);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /api/cloud-home/tiers`: the fronting daemon's fast and balanced
+/// model tiers, which this daemon's background work runs on while its own
+/// configuration names none. Only the fronting daemon's token is admitted.
+pub(super) async fn push_tiers(
+    fronted: Fronted,
+    State(state): State<Arc<DaemonState>>,
+    Json(tiers): Json<PushedTiers>,
+) -> SkyResult<StatusCode> {
+    if !fronted.0 {
+        return Err(SkyError::msg(
+            "only the daemon fronting this cloud home pushes its model tiers",
+        )
+        .set_status(StatusCode::FORBIDDEN));
+    }
+    state.pushed_providers.set_tiers(tiers);
     Ok(StatusCode::NO_CONTENT)
 }

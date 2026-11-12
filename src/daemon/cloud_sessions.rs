@@ -31,7 +31,7 @@ use skyzen::{BodyError, Error, Request, Response, StatusCode};
 use tokio::sync::broadcast;
 
 use super::types::{CloudProviderName, CloudSessionEvent, CloudSessionPhase, SessionLocation};
-use crate::cloud::access::{AccessError, AccessToken, ProviderPush, local_access};
+use crate::cloud::access::{AccessError, AccessToken, ProviderPush, PushedTiers, local_access};
 use crate::cloud::bootstrap::{Bootstrap, MayBuild, RemoteShell};
 use crate::cloud::codespaces::{CodespaceSource, Codespaces, CodespacesAccount};
 use crate::cloud::gh::{CodespaceShell, PortForward};
@@ -44,6 +44,7 @@ use crate::config::{MayConfig, ProviderType};
 use crate::db::{ChatDb, CloudSessionRow};
 use crate::issue::GitHubTokenSource as _;
 use crate::issue::github::GhAccountTokenSource;
+use crate::model_selector::ModelSelector;
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::workspace::GitHubRepository;
 
@@ -332,6 +333,8 @@ enum HostRequest {
     Running(bool),
     /// The access token pushed last is due to be replaced.
     RefreshDue,
+    /// This machine's fast or balanced model tiers changed.
+    TiersChanged,
 }
 
 /// A cloud session's host: the actor owning the session's forward.
@@ -373,7 +376,7 @@ pub struct CloudSessions<B: CloudBackend = GitHubCloud> {
     /// This daemon's live configuration, whose providers are pushed.
     config: Arc<ArcSwap<MayConfig>>,
     mirror: Mirror,
-    hosts: DashMap<String, CloudHost>,
+    hosts: Arc<DashMap<String, CloudHost>>,
     events: broadcast::Sender<CloudSessionEvent>,
 }
 
@@ -398,6 +401,14 @@ impl<B: CloudBackend> CloudSessions<B> {
         bus: UiEventBus,
     ) -> Result<Self, crate::db::ChatDbError> {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let hosts: Arc<DashMap<String, CloudHost>> = Arc::default();
+        // Holds the hosts weakly, so it ends once these sessions are gone.
+        executor_core::spawn(follow_tiers(
+            bus.subscribe(),
+            config.clone(),
+            Arc::downgrade(&hosts),
+        ))
+        .detach();
         let sessions = Self {
             backend: Arc::new(backend),
             db: db.clone(),
@@ -407,7 +418,7 @@ impl<B: CloudBackend> CloudSessions<B> {
                 bus,
                 runtimes: Arc::default(),
             },
-            hosts: DashMap::new(),
+            hosts,
             events,
         };
         for row in db.list_cloud_sessions().await? {
@@ -664,6 +675,8 @@ impl<B: CloudBackend> Host<B> {
                         self.refresh().await;
                     }
                 }
+                // Without a forward the next message pushes the new tiers.
+                HostRequest::TiersChanged => self.refresh().await,
             }
         }
     }
@@ -733,9 +746,9 @@ impl<B: CloudBackend> Host<B> {
         Ok(())
     }
 
-    /// Pushes a fresh access token over the standing forward; with none, a
-    /// suspended codespace is left as it is and gets one with its next
-    /// message.
+    /// Pushes again — fresh access tokens, the current tiers — over the
+    /// standing forward; with none, a suspended codespace is left as it is
+    /// and gets them with its next message.
     async fn refresh(&mut self) {
         let Some(open) = self.forward.as_mut() else {
             return;
@@ -748,7 +761,7 @@ impl<B: CloudBackend> Host<B> {
             tracing::warn!(
                 %error,
                 session_id = self.row.session_id,
-                "could not replace a cloud session's access token before it expires"
+                "could not push a cloud session's providers again"
             );
             self.publisher.failed(&error);
         }
@@ -822,11 +835,14 @@ async fn serve<B: CloudBackend>(
     })
 }
 
-/// Pushes the provider of `session_id`'s model, as the codespace daemon
-/// knows the model, from `config`: its configuration and, for an OAuth
-/// provider, an access token this machine refreshed. The refresh token is
-/// never part of it. Answers when the pushed access token is due to be
-/// replaced; `None` for a token with no expiry or an API key provider.
+/// Pushes, from `config`, the provider of `session_id`'s model as the
+/// codespace daemon knows the model, every provider the fast and balanced
+/// tiers name, and the tiers themselves. Each provider goes with its
+/// configuration and, for an OAuth provider, an access token this machine
+/// refreshed; the refresh token is never part of it. A tier's provider that
+/// cannot be pushed is left out, so the session's own provider is the only
+/// one whose failure fails the push. Answers when the earliest pushed
+/// access token is due to be replaced; `None` when none expires.
 async fn push_provider<B: CloudBackend>(
     backend: &B,
     config: &MayConfig,
@@ -848,7 +864,60 @@ async fn push_provider<B: CloudBackend>(
         .map_err(|error| {
             CloudSessionError::Provider(format!("model '{}': {error}", session.model))
         })?;
-    let id = selector.provider_id();
+    let session_provider = selector.provider_id();
+    let tiers = PushedTiers::of(config);
+    let mut tier_providers: Vec<&str> = Vec::new();
+    for id in tiers.all().map(ModelSelector::provider_id) {
+        if id != session_provider && !tier_providers.contains(&id) {
+            tier_providers.push(id);
+        }
+    }
+    // A handful of providers at most, pushed together.
+    let (own, others) = futures_lite::future::zip(
+        push_one(backend, config, endpoint, session_provider),
+        futures_util::future::join_all(
+            tier_providers
+                .iter()
+                .map(|id| push_one(backend, config, endpoint, id)),
+        ),
+    )
+    .await;
+    let mut refresh_at = own?;
+    for (id, pushed) in tier_providers.iter().zip(others) {
+        match pushed {
+            Ok(due) => refresh_at = earliest(refresh_at, due),
+            Err(error) => tracing::warn!(
+                %error,
+                provider_id = id,
+                session_id,
+                "a model tier's provider is not pushed to the cloud session"
+            ),
+        }
+    }
+    let (status, answer) = endpoint
+        .exchange(
+            hyper::Method::PUT,
+            "/api/cloud-home/tiers",
+            Some(serde_json::to_vec(&tiers).expect("model tiers always serialize")),
+        )
+        .await?;
+    if !status.is_success() {
+        return Err(CloudSessionError::Daemon(format!(
+            "refused the model tiers: {status} {}",
+            String::from_utf8_lossy(&answer).trim()
+        )));
+    }
+    Ok(refresh_at)
+}
+
+/// Pushes provider `id` from `config`, answering when its access token is
+/// due to be replaced.
+async fn push_one<B: CloudBackend>(
+    backend: &B,
+    config: &MayConfig,
+    endpoint: &Endpoint,
+    id: &str,
+) -> Result<Option<SystemTime>, CloudSessionError> {
     let instance = config.get_provider(id).cloned().ok_or_else(|| {
         CloudSessionError::Provider(format!("'{id}' is not configured on this machine"))
     })?;
@@ -869,9 +938,17 @@ async fn push_provider<B: CloudBackend>(
         Ok(refresh_at)
     } else {
         Err(CloudSessionError::Daemon(format!(
-            "refused the session's provider: {status} {}",
+            "refused provider '{id}': {status} {}",
             String::from_utf8_lossy(&answer).trim()
         )))
+    }
+}
+
+/// The earlier of two due times; `None` only when neither is due.
+fn earliest(left: Option<SystemTime>, right: Option<SystemTime>) -> Option<SystemTime> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
     }
 }
 
@@ -891,6 +968,39 @@ fn runs(runtime: &serde_json::Value) -> bool {
 #[derive(serde::Deserialize)]
 struct RemoteModel {
     model: String,
+}
+
+/// Sends every host [`HostRequest::TiersChanged`] when a `config`
+/// announcement on `topics` comes with a change to this machine's fast or
+/// balanced model tiers, until the hosts are gone.
+async fn follow_tiers(
+    mut topics: broadcast::Receiver<UiEventTopics>,
+    config: Arc<ArcSwap<MayConfig>>,
+    hosts: std::sync::Weak<DashMap<String, CloudHost>>,
+) {
+    let mut pushed = PushedTiers::of(&config.load());
+    loop {
+        match topics.recv().await {
+            Ok(changed) if !changed.contains(UiEventTopics::CONFIG) => continue,
+            // A missed announcement may have been a change.
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+        let now = PushedTiers::of(&config.load());
+        if now == pushed {
+            continue;
+        }
+        pushed = now;
+        let Some(hosts) = hosts.upgrade() else {
+            return;
+        };
+        // Collected first: no map guard is held across a send.
+        let requests: Vec<_> = hosts.iter().map(|host| host.requests.clone()).collect();
+        drop(hosts);
+        for request in requests {
+            let _ = request.send(HostRequest::TiersChanged).await;
+        }
+    }
 }
 
 /// What the codespace daemons' own `/api/events` say of their sessions

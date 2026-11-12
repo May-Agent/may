@@ -11,6 +11,11 @@
 //! also pushes a fresh token at [`AccessToken::refresh_at`], before the one
 //! pushed last expires.
 //!
+//! With the providers go the fronting daemon's fast and balanced model
+//! tiers ([`PushedTiers`]) and every provider they name, so the cloud home's
+//! background work — titles, memory extraction — runs on the models chosen
+//! on this machine; a change to those tiers here is pushed again.
+//!
 //! On the cloud home a pushed provider lives in [`PushedProviders`], apart
 //! from the configuration and never in a file; its access token is in an
 //! [`AccessCell`]. Each push replaces the token in the cell its models
@@ -23,7 +28,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ProviderInstance, ProviderType};
+use crate::config::{MayConfig, ModelTier, ProviderInstance, ProviderType};
+use crate::model_selector::ModelSelector;
 
 /// A short-lived access token of an OAuth provider, without what refreshes
 /// it.
@@ -158,6 +164,45 @@ pub struct ProviderPush {
     pub access: Option<AccessToken>,
 }
 
+/// The body of `PUT /api/cloud-home/tiers`: the fronting daemon's fast and
+/// balanced model tiers, in priority order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PushedTiers {
+    /// The fast tier.
+    #[schema(value_type = Vec<String>)]
+    pub fast: Vec<ModelSelector>,
+    /// The balanced tier.
+    #[schema(value_type = Vec<String>)]
+    pub balanced: Vec<ModelSelector>,
+}
+
+impl PushedTiers {
+    /// `config`'s fast and balanced tiers.
+    #[must_use]
+    pub fn of(config: &MayConfig) -> Self {
+        Self {
+            fast: config.models.fast.clone(),
+            balanced: config.models.balanced.clone(),
+        }
+    }
+
+    /// The models of `tier`; none for a tier that is not pushed.
+    #[must_use]
+    pub fn models(&self, tier: ModelTier) -> &[ModelSelector] {
+        match tier {
+            ModelTier::Fast => &self.fast,
+            ModelTier::Balanced => &self.balanced,
+            ModelTier::Advanced | ModelTier::ImageGeneration => &[],
+        }
+    }
+
+    /// Every model of both tiers, fast first.
+    pub fn all(&self) -> impl Iterator<Item = &ModelSelector> {
+        self.fast.iter().chain(&self.balanced)
+    }
+}
+
 /// A provider as its models are built: its configuration and, when a
 /// fronting daemon pushed an OAuth provider, its access token.
 #[derive(Debug, Clone)]
@@ -168,13 +213,17 @@ pub struct ResolvedProvider {
     pub access: Option<AccessCell>,
 }
 
-/// The providers a fronting daemon pushed to this cloud home, by id.
+/// The providers a fronting daemon pushed to this cloud home, by id, and
+/// its model tiers.
 ///
 /// They live only here, in memory, apart from the configuration, so no
 /// write of `config.toml` can carry them; provider resolution lays them over
-/// the configured ones. Clones share the providers.
+/// the configured ones. Clones share them.
 #[derive(Debug, Clone, Default)]
-pub struct PushedProviders(Arc<dashmap::DashMap<String, ResolvedProvider>>);
+pub struct PushedProviders {
+    providers: Arc<dashmap::DashMap<String, ResolvedProvider>>,
+    tiers: Arc<ArcSwap<PushedTiers>>,
+}
 
 impl PushedProviders {
     /// Takes `push` as provider `id`. An access token replaces the one in
@@ -182,7 +231,10 @@ impl PushedProviders {
     /// their next request.
     pub fn push(&self, id: &str, push: ProviderPush) {
         let ProviderPush { instance, access } = push;
-        let held = self.0.get(id).and_then(|provider| provider.access.clone());
+        let held = self
+            .providers
+            .get(id)
+            .and_then(|provider| provider.access.clone());
         let access = match (access, held) {
             (Some(token), Some(cell)) => {
                 cell.replace(token);
@@ -191,21 +243,21 @@ impl PushedProviders {
             (Some(token), None) => Some(AccessCell::holding(token)),
             (None, _) => None,
         };
-        self.0
+        self.providers
             .insert(id.to_owned(), ResolvedProvider { instance, access });
     }
 
     /// The pushed provider `id`.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<ResolvedProvider> {
-        self.0.get(id).map(|provider| provider.clone())
+        self.providers.get(id).map(|provider| provider.clone())
     }
 
     /// Every pushed provider, in id order.
     #[must_use]
     pub fn all(&self) -> Vec<(String, ResolvedProvider)> {
         let mut all: Vec<_> = self
-            .0
+            .providers
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
@@ -213,9 +265,20 @@ impl PushedProviders {
         all
     }
 
+    /// Takes `tiers` as the fronting daemon's model tiers.
+    pub fn set_tiers(&self, tiers: PushedTiers) {
+        self.tiers.store(Arc::new(tiers));
+    }
+
+    /// The model tiers pushed last; empty before any push.
+    #[must_use]
+    pub fn tiers(&self) -> Arc<PushedTiers> {
+        self.tiers.load_full()
+    }
+
     /// What an agent built from these providers depends on: their
-    /// configurations, never their access tokens, which models read anew
-    /// for each request.
+    /// configurations and the tiers, never their access tokens, which
+    /// models read anew for each request.
     ///
     /// # Panics
     /// Never: a provider configuration always serializes.
@@ -226,7 +289,8 @@ impl PushedProviders {
             .into_iter()
             .map(|(id, provider)| (id, provider.instance))
             .collect();
-        serde_json::to_string(&instances).expect("provider configurations serialize")
+        serde_json::to_string(&(instances, &*self.tiers()))
+            .expect("provider configurations serialize")
     }
 }
 

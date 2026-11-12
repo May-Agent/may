@@ -491,6 +491,7 @@ fn api_routes() -> Route {
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
             "/session-names".post(super::sessions::issue_session_name),
             "/cloud-home/providers/{id}".put(super::cloud_home::push_provider),
+            "/cloud-home/tiers".put(super::cloud_home::push_tiers),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
                 "".post(create_session),

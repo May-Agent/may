@@ -1931,12 +1931,12 @@ pub async fn generate_session_title(
     use aither_core::llm::{LLMRequest, Message};
     use futures_lite::StreamExt;
 
-    let config = providers.config();
-
-    // Get a fast model
-    let selector = config
-        .default_model_for_tier(crate::config::ModelTier::Fast)
-        .or(config.last_model.as_ref())?;
+    // A fast model, else the model last chosen.
+    let selector = providers
+        .tier(crate::config::ModelTier::Fast)
+        .into_iter()
+        .next()
+        .or_else(|| providers.config().last_model.clone())?;
     let provider_id = selector.provider_id();
     let provider = providers.get(provider_id)?;
 

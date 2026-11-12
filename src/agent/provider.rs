@@ -72,6 +72,18 @@ impl<'a> Providers<'a> {
         self.config
     }
 
+    /// The models of `tier`, in priority order: the configured ones, or,
+    /// when the configuration has none, those a fronting daemon pushed.
+    #[must_use]
+    pub fn tier(&self, tier: ModelTier) -> Vec<ModelSelector> {
+        let configured = self.config.models.models_for_tier(tier);
+        if configured.is_empty() {
+            self.pushed.tiers().models(tier).to_vec()
+        } else {
+            configured.to_vec()
+        }
+    }
+
     /// Provider `id`: the pushed one when there is one, else the configured.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<ResolvedProvider> {
@@ -562,7 +574,7 @@ async fn resolve_ask_tier_model(
     session_model_id: &str,
     redactor: &SecretRedactor,
 ) -> Result<Option<ModelSlot<ProviderLlm>>, MayAgentError> {
-    let Some(selector) = providers.config().default_model_for_tier(tier) else {
+    let Some(selector) = providers.tier(tier).into_iter().next() else {
         return Ok(None);
     };
     let provider_id = selector.provider_id();
@@ -651,16 +663,12 @@ pub async fn build_fast_provider_chain(
     providers: Providers<'_>,
     redactor: &SecretRedactor,
 ) -> Result<Vec<crate::memory::MemoryExtractionProvider>, MayAgentError> {
-    let config = providers.config();
     let mut selectors = Vec::new();
     let mut seen = HashSet::new();
-    for tier in [
-        crate::config::ModelTier::Fast,
-        crate::config::ModelTier::Balanced,
-    ] {
-        for selector in config.models.models_for_tier(tier) {
+    for tier in [ModelTier::Fast, ModelTier::Balanced] {
+        for selector in providers.tier(tier) {
             if seen.insert(selector.clone()) {
-                selectors.push(selector.clone());
+                selectors.push(selector);
             }
         }
     }
