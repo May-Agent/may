@@ -3,14 +3,23 @@
 //! Maintains preference and recency memories for each profile by running
 //! conversations through a fast LLM. Processing happens asynchronously
 //! in a periodic background worker to avoid blocking the main chat flow.
+//! Each extraction resolves its models when it runs, from the live
+//! configuration and, on a cloud home, the providers its fronting daemon
+//! pushed.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use arc_swap::ArcSwap;
 
 use aither_core::LanguageModel;
 use aither_core::llm::{LLMRequest, Message};
 use futures_lite::StreamExt;
 
+use crate::cloud::access::PushedProviders;
+use crate::config::MayConfig;
 use crate::db::ChatDb;
+use crate::secrets::SecretRedactor;
 
 const PREFERENCE_PROMPT: &str = include_str!("../templates/preference_extraction_prompt.txt");
 const RECENCY_PROMPT: &str = include_str!("../templates/recency_extraction_prompt.txt");
@@ -37,15 +46,53 @@ pub struct MemoryProcessor {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum MemoryProcessingError {
+pub(crate) enum MemoryProcessingError {
     #[error("database error: {0}")]
     Database(#[from] crate::db::ChatDbError),
-    #[error("no memory extraction providers configured")]
-    NoProviders,
+    #[error("no memory extraction model is available: {0}")]
+    NoModel(#[source] crate::agent::MayAgentError),
     #[error("all memory extraction providers failed: {details}")]
     AllProvidersFailed { details: String },
     #[error("memory extraction LLM error: {0}")]
     Llm(#[from] crate::agent::RedactedError<aither_cloud::CloudError>),
+}
+
+/// Where memory extraction finds its models when it runs: the live
+/// configuration's fast and balanced tiers, resolved through the providers
+/// it configures and those a fronting daemon pushed.
+#[derive(Debug, Clone)]
+pub struct MemoryModels {
+    config: Arc<ArcSwap<MayConfig>>,
+    pushed: PushedProviders,
+    redactor: SecretRedactor,
+}
+
+impl MemoryModels {
+    /// Models resolved from `config` and `pushed`, their errors redacted
+    /// by `redactor`.
+    #[must_use]
+    pub const fn new(
+        config: Arc<ArcSwap<MayConfig>>,
+        pushed: PushedProviders,
+        redactor: SecretRedactor,
+    ) -> Self {
+        Self {
+            config,
+            pushed,
+            redactor,
+        }
+    }
+
+    /// The candidates an extraction tries now, in order.
+    async fn chain(&self) -> Result<Vec<MemoryExtractionProvider>, MemoryProcessingError> {
+        let config = self.config.load_full();
+        crate::agent::build_fast_provider_chain(
+            crate::agent::Providers::new(&config, &self.pushed),
+            &self.redactor,
+        )
+        .await
+        .map_err(MemoryProcessingError::NoModel)
+    }
 }
 
 /// A provider candidate for memory extraction, tried in order.
@@ -65,10 +112,10 @@ impl MemoryProcessor {
     /// `llm` should be a fast model provider (e.g., Claude Haiku, GPT-4o-mini).
     /// Spawns a periodic background task that processes dirty profiles.
     #[must_use]
-    pub fn new(db: ChatDb, providers: Vec<MemoryExtractionProvider>) -> Self {
+    pub fn new(db: ChatDb, models: MemoryModels) -> Self {
         let worker_db = db.clone();
         tokio::spawn(async move {
-            Box::pin(Self::worker(worker_db, providers)).await;
+            Box::pin(Self::worker(worker_db, models)).await;
         });
 
         Self { db }
@@ -81,7 +128,7 @@ impl MemoryProcessor {
         }
     }
 
-    async fn worker(db: ChatDb, providers: Vec<MemoryExtractionProvider>) {
+    async fn worker(db: ChatDb, models: MemoryModels) {
         let mut ticker = tokio::time::interval(MEMORY_JOB_SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -109,31 +156,7 @@ impl MemoryProcessor {
             };
 
             for job in dirty_jobs {
-                let conversation = match Self::build_profile_conversation(&db, &job.profile_id)
-                    .await
-                {
-                    Ok(conversation) => conversation,
-                    Err(error) => {
-                        tracing::warn!(profile_id = %job.profile_id, error = %error, "failed to build profile conversation for memory");
-                        continue;
-                    }
-                };
-
-                if conversation.is_empty() {
-                    let _ = db
-                        .mark_profile_memory_job_processed(&job.profile_id, &job.updated_at)
-                        .await;
-                    continue;
-                }
-
-                match Box::pin(Self::process_request(
-                    &db,
-                    &providers,
-                    &job.profile_id,
-                    &conversation,
-                ))
-                .await
-                {
+                match Box::pin(Self::refresh_profile(&db, &models, &job.profile_id)).await {
                     Ok(()) => {
                         if let Err(error) = db
                             .mark_profile_memory_job_processed(&job.profile_id, &job.updated_at)
@@ -148,6 +171,28 @@ impl MemoryProcessor {
                 }
             }
         }
+    }
+
+    /// Extracts `profile_id`'s memories from its recent conversation, on
+    /// the models `models` resolves now; a profile with no conversation
+    /// has nothing to extract.
+    pub(crate) async fn refresh_profile(
+        db: &ChatDb,
+        models: &MemoryModels,
+        profile_id: &str,
+    ) -> Result<(), MemoryProcessingError> {
+        let conversation = Self::build_profile_conversation(db, profile_id).await?;
+        if conversation.is_empty() {
+            return Ok(());
+        }
+        let providers = models.chain().await?;
+        Box::pin(Self::process_request(
+            db,
+            &providers,
+            profile_id,
+            &conversation,
+        ))
+        .await
     }
 
     async fn build_profile_conversation(
@@ -200,10 +245,6 @@ impl MemoryProcessor {
         profile_id: &str,
         conversation: &str,
     ) -> Result<(), MemoryProcessingError> {
-        if providers.is_empty() {
-            return Err(MemoryProcessingError::NoProviders);
-        }
-
         // Extract preference memory
         let current_preference = db
             .get_profile_memory(profile_id, "preference")

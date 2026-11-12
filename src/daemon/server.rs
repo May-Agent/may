@@ -224,26 +224,6 @@ pub async fn start(
     // A cloud home's fronting daemon pushes its providers once this daemon
     // serves; until then there are none.
     let pushed_providers = crate::cloud::access::PushedProviders::default();
-    // Initialize memory processor with fast-tier provider chain
-    let memory_processor = match crate::agent::build_fast_provider_chain(
-        crate::agent::Providers::new(&config, &pushed_providers),
-        &crate::secrets::SecretRedactor::new(&may_dir),
-    )
-    .await
-    {
-        Ok(memory_providers) => {
-            tracing::info!("Profile memory processor enabled");
-            Some(crate::memory::MemoryProcessor::new(
-                db_for_archive.clone(),
-                memory_providers,
-            ))
-        }
-        Err(e) => {
-            tracing::debug!("Profile memory processor unavailable (no fast model): {e}");
-            None
-        }
-    };
-
     // Initialize Web Push notification manager
     let notification_manager =
         crate::notification::NotificationManager::new(&may_dir, db_for_archive.clone())
@@ -292,6 +272,16 @@ pub async fn start(
 
     let live_limits = crate::agent::LiveLimits::of(&config);
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
+    // Each extraction resolves its models when it runs, so a model
+    // configured or pushed later is used.
+    let memory_processor = Some(crate::memory::MemoryProcessor::new(
+        db_for_archive.clone(),
+        crate::memory::MemoryModels::new(
+            config.clone(),
+            pushed_providers.clone(),
+            crate::secrets::SecretRedactor::new(&may_dir),
+        ),
+    ));
     let cloud_sessions = Arc::new(
         super::cloud_sessions::CloudSessions::load(
             db_for_archive.clone(),

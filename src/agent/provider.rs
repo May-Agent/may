@@ -644,15 +644,9 @@ pub async fn resolve_compaction_model(
 ///
 /// # Errors
 ///
-/// Returns [`MayAgentError`] when a configured selector cannot be resolved
-/// into a provider, and [`MayAgentError::MissingApiKey`] when a candidate
-/// provider is not authenticated.
-///
-/// # Panics
-///
-/// Panics when a configured model selector references a provider that is not
-/// in the provider map — config validation is expected to reject that
-/// earlier.
+/// Returns [`MayAgentError`] when no candidate can be built: none is
+/// configured, none names a provider `providers` holds (on a cloud home,
+/// one not pushed yet), or none is authenticated.
 pub async fn build_fast_provider_chain(
     providers: Providers<'_>,
     redactor: &SecretRedactor,
@@ -684,7 +678,15 @@ pub async fn build_fast_provider_chain(
     for selector in selectors {
         let provider_id = selector.provider_id().to_string();
         let Some(provider) = providers.get(&provider_id) else {
-            panic!("configured model selector referenced unknown provider '{provider_id}'");
+            tracing::warn!(
+                provider_id = %provider_id,
+                model = selector.model_id(),
+                "memory extraction model names a provider that is not available"
+            );
+            last_error = Some(MayAgentError::MissingApiKey(err_no_provider(
+                selector.model_id(),
+            )));
+            continue;
         };
 
         match build_cloud_provider_from_instance(

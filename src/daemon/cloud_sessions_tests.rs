@@ -753,6 +753,90 @@ async fn a_token_expiring_during_a_turn_is_replaced_before_the_next_request() {
     );
 }
 
+#[tokio::test]
+async fn memory_extraction_on_a_cloud_home_uses_the_pushed_provider() {
+    let (copilot_api, requests) =
+        serve_api(|_, _| ApiReply::json(500, r#"{"message":"recorded"}"#)).await;
+    let (daemon, remote, _) = codespace_daemon().await;
+    // The codespace's fast tier names Copilot, which only a push provides.
+    remote.update_config(|config| {
+        config.models.fast = vec![ModelSelector::new("copilot", "gpt-5-mini")];
+    });
+    assert!(remote.config_snapshot().provider.is_empty());
+    let db = remote.db();
+    db.create_session_in_profile(
+        SESSION,
+        Some("日本語 한국어 中文"),
+        Some(&ModelSelector::new("copilot", "gpt-5").to_string()),
+        Some(&remote.default_profile_id),
+    )
+    .await
+    .expect("session");
+    for (role, content) in [
+        (
+            crate::session::MessageRole::User,
+            "東京の天気は？ 서울 날씨는? 北京天气如何？",
+        ),
+        (crate::session::MessageRole::Assistant, "晴れ · 맑음 · 晴"),
+    ] {
+        db.append_message(
+            SESSION,
+            role,
+            content,
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("message");
+    }
+    let models = crate::memory::MemoryModels::new(
+        remote.config.clone(),
+        remote.pushed_providers.clone(),
+        crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
+    );
+    let extract = || {
+        crate::memory::MemoryProcessor::refresh_profile(&db, &models, &remote.default_profile_id)
+    };
+    let sent = || -> Vec<String> {
+        requests
+            .lock()
+            .expect("requests")
+            .drain(..)
+            .map(|request| request.authorization)
+            .collect()
+    };
+
+    // Before the push there is no model to extract with.
+    assert!(extract().await.is_err());
+    assert_eq!(sent(), Vec::<String>::new());
+
+    // The fronting daemon pushes Copilot; extraction uses its token, and
+    // after a re-push the current one.
+    let fronted = Endpoint::new(daemon, TOKEN);
+    for token in ["copilot-pushed", "copilot-repushed"] {
+        let push = crate::cloud::access::ProviderPush {
+            instance: ProviderInstance::new(ProviderType::Copilot),
+            access: Some(copilot_token(token, &copilot_api, Duration::from_hours(1))),
+        };
+        let (status, _) = fronted
+            .exchange(
+                hyper::Method::PUT,
+                "/api/cloud-home/providers/copilot",
+                Some(serde_json::to_vec(&push).expect("push")),
+            )
+            .await
+            .expect("answered");
+        assert_eq!(status, skyzen::StatusCode::NO_CONTENT);
+        // The recording API refuses every request, so the extraction fails
+        // after sending.
+        let _ = extract().await;
+        let sent = sent();
+        assert!(!sent.is_empty(), "the extraction reached Copilot");
+        let bearer = format!("Bearer {token}");
+        assert!(sent.iter().all(|sent| *sent == bearer), "{sent:?}");
+    }
+}
+
 /// Waits up to five seconds for `check` to hold.
 async fn eventually<F: Future<Output = bool>>(what: &str, check: impl Fn() -> F) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
