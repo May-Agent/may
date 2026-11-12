@@ -455,6 +455,79 @@ pub(super) async fn set_profile_remote_servers(
     json_ok_response(&super::types::API_OK)
 }
 
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetCodespacesAccountRequest {
+    /// The `gh` account the profile's codespaces belong to; absent for the
+    /// `gh` login's active account.
+    #[serde(default)]
+    pub login: Option<String>,
+}
+
+/// `/cloud` setting up Codespaces: the account is saved once GitHub confirms
+/// its token can manage codespaces.
+pub(super) async fn set_profile_codespaces(
+    params: Params,
+    Json(req): Json<SetCodespacesAccountRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    use crate::cloud::Codespaces;
+    use crate::issue::github::{GhAccountTokenSource, GhCliTokenSource, GitHubRest};
+
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let model = db
+        .get_profile(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Profile not found"))?;
+
+    let verified = match req.login {
+        Some(login) => Codespaces::verify(&GitHubRest::new(GhAccountTokenSource::new(login))).await,
+        None => Codespaces::verify(&GitHubRest::new(GhCliTokenSource)).await,
+    };
+    let account = match verified {
+        Ok(account) => account,
+        Err(error) => {
+            return Ok(typed_error_response(
+                skyzen::StatusCode::BAD_REQUEST,
+                ApiErrorCode::CloudAccountUnusable,
+                error.to_string(),
+            ));
+        }
+    };
+    db.set_profile_codespaces_account(&id, Some(&account))
+        .await
+        .map_err(internal_error)?;
+    json_ok_response(
+        &db.profile_info_from_model(model)
+            .await
+            .map_err(map_profile_error)?,
+    )
+}
+
+/// `/cloud` removing the profile's Codespaces account.
+pub(super) async fn remove_profile_codespaces(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ProfileInfo>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let model = db
+        .get_profile(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Profile not found"))?;
+    db.set_profile_codespaces_account(&id, None)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(
+        db.profile_info_from_model(model)
+            .await
+            .map_err(map_profile_error)?,
+    ))
+}
+
 pub(super) async fn get_profile_sessions(
     params: Params,
     Query(query): Query<ProfileSessionsQuery>,

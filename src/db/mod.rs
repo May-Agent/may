@@ -695,6 +695,61 @@ mod tests {
         );
     }
 
+    /// The turn boundary is the largest stored row id of the session, as the
+    /// full history load it replaced took it: 0 when nothing is stored, and
+    /// never another session's rows.
+    #[tokio::test]
+    async fn max_message_id_matches_the_largest_history_row_id() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        db.create_session("session-a", Some("A"), Some("test-model"))
+            .await
+            .expect("first session should be created");
+        db.create_session("session-b", Some("B"), Some("test-model"))
+            .await
+            .expect("second session should be created");
+        assert_eq!(
+            db.max_message_id("session-a")
+                .await
+                .expect("empty session boundary"),
+            None
+        );
+
+        for (session, text) in [
+            ("session-a", "one"),
+            ("session-b", "other"),
+            ("session-a", "two"),
+            ("session-b", "other two"),
+        ] {
+            db.append_message(
+                session,
+                crate::session::MessageRole::User,
+                text,
+                None,
+                crate::db::MessageMeta::default(),
+            )
+            .await
+            .expect("message should append");
+        }
+
+        let from_history = db
+            .get_messages("session-a")
+            .await
+            .expect("history should load")
+            .iter()
+            .map(|message| i64::from(message.id))
+            .max();
+        assert!(from_history.is_some());
+        assert_eq!(
+            db.max_message_id("session-a")
+                .await
+                .expect("boundary should load"),
+            from_history
+        );
+    }
+
     #[tokio::test]
     async fn browser_takeover_state_persists_and_is_consumable() {
         let dir = tempdir().expect("temp dir should be created");

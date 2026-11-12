@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
     println!("cargo:rerun-if-changed=Cargo.lock");
 
+    emit_git_sha();
     let heel_lib_version = emit_heel_lib_version();
     emit_image_refs(&heel_lib_version);
     watch_web_ui_inputs();
@@ -61,6 +62,27 @@ fn main() {
         Path::new("web-ui/dist/index.html").exists(),
         "web-ui build did not produce dist/index.html"
     );
+}
+
+/// The commit the binary is built from, which a dev build compares with the
+/// CI run it would update to; empty outside a git checkout. Git moves `HEAD`
+/// and its reflog on every commit and checkout, so those are what rebuild it.
+fn emit_git_sha() {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    for name in ["HEAD", "logs/HEAD"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_default();
+    println!("cargo:rustc-env=MAY_GIT_SHA={sha}");
 }
 
 /// The version of the `heel` library `Cargo.lock` pins, which the

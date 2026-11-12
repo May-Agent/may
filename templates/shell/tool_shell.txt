@@ -16,6 +16,8 @@ Large outputs are automatically saved to file to manage context. When this happe
 
 Each call starts a fresh shell; only a successful `cd` carries over to the next call. `timeout` is required: it is the job's maximum runtime in seconds — the job and its process tree are killed when it passes — and it may be at most {{ timeout_cap_minutes }} minutes.
 
-By default the call waits in the foreground for up to {{ foreground_secs }} seconds. A command still running then **promotes to a background task**: the call returns the task id and the output captured so far, and the job keeps running under its `timeout` bound. Manage it with `{{ read }}` (incremental output), `{{ input }}` (stdin) and `{{ kill }}`. Set `background: true` to detach immediately instead of waiting.
+By default the call waits in the foreground for up to {{ foreground_secs }} seconds. A command still running then **promotes to a background task**: the call returns the task id and the output captured so far, and the job keeps running under its `timeout` bound. Manage it with `{{ read }}` (incremental output) and `{{ kill }}`. Set `background: true` to detach immediately instead of waiting.
+
+A foreground command reads end of file on stdin. Only a job started with `background: true` has a stdin: send it input with `{{ input }}`.
 
 `interpreter` is `shell` by default; `python` runs `script` as Python source, without a shell wrapper.

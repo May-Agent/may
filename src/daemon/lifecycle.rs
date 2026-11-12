@@ -98,14 +98,52 @@ struct LaunchdPlist<'a> {
     environment: &'a [(String, String)],
 }
 
+/// The name `tasks` is invoked under: the daemon's link to its own
+/// executable, which then runs the `tasks` command instead of May.
+const TASKS_COMMAND: &str = "tasks";
+
+/// Whether a process started as `argv0` is the `tasks` command.
+#[must_use]
+pub fn invoked_as_tasks(argv0: Option<&std::ffi::OsStr>) -> bool {
+    argv0.is_some_and(|name| {
+        Path::new(name).file_name() == Some(std::ffi::OsStr::new(TASKS_COMMAND))
+    })
+}
+
+/// `~/.may/bin`, the directory leading the `PATH` of every sandboxed
+/// command.
+fn bin_dir(paths: &DaemonPaths) -> PathBuf {
+    paths.root().join("bin")
+}
+
+/// Keeps `~/.may/bin/tasks` a symlink to this executable, so every build
+/// serves the `tasks` command from itself: created when missing and
+/// replaced when it points elsewhere.
+///
+/// # Errors
+/// Fails when the directory or the link cannot be written.
+pub fn ensure_tasks_link(paths: &DaemonPaths) -> std::io::Result<()> {
+    let directory = bin_dir(paths);
+    std::fs::create_dir_all(&directory)?;
+    let link = directory.join(TASKS_COMMAND);
+    let target = current_exe()?;
+    match std::fs::read_link(&link) {
+        Ok(current) if current == target => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Pointing elsewhere, or not a symlink at all.
+        Ok(_) | Err(_) => std::fs::remove_file(&link)?,
+    }
+    std::os::unix::fs::symlink(&target, &link)
+}
+
 /// The calling process's environment as text. A launchd job starts with
 /// launchd's default environment, so the daemon is given the client's.
 ///
-/// Its `PATH` leads with the directory of this executable, so the `tasks`
-/// binary installed beside `may` is on the `PATH` of every sandboxed command.
-fn environment() -> Result<Vec<(String, String)>, LifecycleError> {
+/// Its `PATH` leads with [`bin_dir`], so `tasks` is on the `PATH` of every
+/// sandboxed command.
+fn environment(paths: &DaemonPaths) -> Result<Vec<(String, String)>, LifecycleError> {
     let mut environment = text_environment(std::env::vars_os())?;
-    let path = path_with_executable_dir()?;
+    let path = path_with_bin_dir(paths)?;
     match environment.iter_mut().find(|(name, _)| name == "PATH") {
         Some((_, value)) => *value = path,
         None => environment.push(("PATH".to_string(), path)),
@@ -113,16 +151,11 @@ fn environment() -> Result<Vec<(String, String)>, LifecycleError> {
     Ok(environment)
 }
 
-/// The calling process's `PATH` led by the directory of its executable.
-fn path_with_executable_dir() -> Result<String, LifecycleError> {
-    let executable = current_exe()?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| std::io::Error::other("the executable has no directory"))?
-        .to_path_buf();
+/// The calling process's `PATH` led by [`bin_dir`].
+fn path_with_bin_dir(paths: &DaemonPaths) -> Result<String, LifecycleError> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let joined =
-        std::env::join_paths(std::iter::once(directory).chain(std::env::split_paths(&path)))
+        std::env::join_paths(std::iter::once(bin_dir(paths)).chain(std::env::split_paths(&path)))
             .map_err(std::io::Error::other)?;
     joined
         .into_string()
@@ -274,7 +307,7 @@ pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
             program: &program,
             log: &paths.log().display().to_string(),
             keep_alive: true,
-            environment: &environment()?,
+            environment: &environment(paths)?,
         }
         .render()?;
         let domain = format!("gui/{}", uid().await?);
@@ -349,7 +382,7 @@ fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
     let mut command = std::process::Command::new(current_exe()?);
     command
         .arg("daemon")
-        .env("PATH", path_with_executable_dir()?)
+        .env("PATH", path_with_bin_dir(paths)?)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -547,7 +580,7 @@ async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
             &label,
             &current_exe()?.display().to_string(),
             &log.display().to_string(),
-            &environment()?,
+            &environment(paths)?,
         )?,
     )?;
     // A job left from an earlier start of this home (a stopped or replaced
@@ -751,9 +784,9 @@ mod launchd_job_tests {
 
     use super::{
         LifecycleError, ON_DEMAND_LABEL, current_exe, environment, job_exit, on_demand_label,
-        on_demand_plist, path_with_executable_dir, require_gui_domain, text_environment,
-        write_private,
+        on_demand_plist, path_with_bin_dir, require_gui_domain, text_environment, write_private,
     };
+    use crate::daemon::DaemonPaths;
 
     #[test]
     fn the_on_demand_plist_is_not_kept_alive() {
@@ -780,15 +813,14 @@ mod launchd_job_tests {
     }
 
     #[test]
-    fn the_daemon_path_leads_with_the_executable_directory() {
-        let executable = current_exe().expect("the test binary has a path");
-        let directory = executable.parent().expect("the binary has a directory");
-        let path = path_with_executable_dir().expect("the path is text");
+    fn the_daemon_path_leads_with_the_may_bin_directory() {
+        let paths = DaemonPaths::new(std::path::PathBuf::from("/home/.may"));
+        let path = path_with_bin_dir(&paths).expect("the path is text");
         assert_eq!(
             std::env::split_paths(&path).next().as_deref(),
-            Some(directory)
+            Some(std::path::Path::new("/home/.may/bin"))
         );
-        let environment = environment().expect("the environment is text");
+        let environment = environment(&paths).expect("the environment is text");
         assert_eq!(
             environment
                 .iter()
@@ -796,6 +828,42 @@ mod launchd_job_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn the_tasks_link_points_at_this_executable_and_is_repaired() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths::new(home.path().to_path_buf());
+        let link = home.path().join("bin").join("tasks");
+        let executable = current_exe().expect("the test binary has a path");
+
+        super::ensure_tasks_link(&paths).expect("the link is created");
+        assert_eq!(std::fs::read_link(&link).expect("a symlink"), executable);
+
+        std::fs::remove_file(&link).expect("removed");
+        std::os::unix::fs::symlink("/elsewhere", &link).expect("a stale link");
+        super::ensure_tasks_link(&paths).expect("the link is repaired");
+        assert_eq!(std::fs::read_link(&link).expect("a symlink"), executable);
+
+        std::fs::remove_file(&link).expect("removed");
+        std::fs::write(&link, b"a file").expect("a regular file");
+        super::ensure_tasks_link(&paths).expect("the file is replaced");
+        assert_eq!(std::fs::read_link(&link).expect("a symlink"), executable);
+    }
+
+    #[test]
+    fn only_the_name_tasks_runs_the_tasks_command() {
+        use std::ffi::OsStr;
+
+        for (argv0, expected) in [
+            ("/home/.may/bin/tasks", true),
+            ("tasks", true),
+            ("/usr/local/bin/may", false),
+            ("/home/.may/bin/tasks-old", false),
+        ] {
+            assert_eq!(super::invoked_as_tasks(Some(OsStr::new(argv0))), expected);
+        }
+        assert!(!super::invoked_as_tasks(None));
     }
 
     #[test]

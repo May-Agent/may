@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.34.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# The installer writes the install receipt `may update` reads (axoupdater)
+# only when it installs the updater too
+install-updater = true
+# The release binaries are the builds that update from GitHub releases
+# (`src/update/mod.rs`) and embed the web UI.
+features = ["release-build", "ui"]
+# release-plz dispatches the release workflow with the tag it created
+# (`release-plz.yml`): a tag pushed with the workflow token starts no workflow.
+dispatch-releases = true
+# Steps every build job runs first: the toolchain pieces CI also installs.
+github-build-setup = "../build-setup.yml"

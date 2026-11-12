@@ -185,6 +185,80 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Render the `/cloud` popup: the profile's Codespaces account.
+pub(super) fn render_cloud_popup(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let key = |key: &'static str| Span::styled(key, Style::default().fg(Color::Cyan));
+    let label = |text: &'static str| Span::styled(text, Style::default().fg(Color::White));
+    let hint = |text: &'static str| Span::styled(text, Style::default().fg(Color::DarkGray));
+
+    let account_view = || {
+        let account = app
+            .current_profile()
+            .and_then(|profile| profile.cloud.codespaces.as_ref());
+        let state = account.map_or_else(
+            || Span::styled("not set up", Style::default().fg(Color::DarkGray)),
+            |account| {
+                Span::styled(
+                    format!("set up as {}", account.login),
+                    Style::default().fg(Color::Green),
+                )
+            },
+        );
+        (
+            " Cloud Machines ",
+            vec![
+                Line::from(""),
+                Line::from(vec![label("GitHub Codespaces: "), state]),
+                Line::from(""),
+                Line::from(hint(
+                    "Codespaces are created as a GitHub account of your gh login;",
+                )),
+                Line::from(hint("its token needs the codespace scope.")),
+                Line::from(""),
+                Line::from(vec![
+                    key("[s] "),
+                    label("Set up"),
+                    Span::raw("  "),
+                    key("[d] "),
+                    label("Remove"),
+                    Span::raw("  "),
+                    key("[Esc] "),
+                    label("Close"),
+                ]),
+            ],
+        )
+    };
+    let login_view = |login: &String| {
+        (
+            " Set Up GitHub Codespaces ",
+            vec![
+                Line::from(""),
+                Line::from(label("GitHub account (empty for gh's active account):")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {login}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(hint("[Enter] Set up  [Esc] Back")),
+            ],
+        )
+    };
+    let (title, content) = app
+        .cloud_login
+        .as_ref()
+        .map_or_else(account_view, login_view);
+
+    let widget = Paragraph::new(content)
+        .block(
+            panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+    frame.render_widget(widget, area);
+}
+
 /// Render SSH server management popup.
 pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;

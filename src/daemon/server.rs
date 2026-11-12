@@ -380,6 +380,7 @@ pub async fn start(
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
     super::pr_checks::spawn(state.clone());
+    super::auto_update::spawn(state.clone());
     // The tailscale-serve listener trusts Serve's identity header; a direct
     // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
     let remote_router = build_router(
@@ -437,8 +438,8 @@ fn api_routes() -> Route {
     };
     use super::profiles::{
         create_folder, create_profile, delete_folder, delete_profile, get_profile_remote_servers,
-        get_profile_sessions, list_profiles, set_profile_remote_servers, update_folder,
-        update_profile,
+        get_profile_sessions, list_profiles, remove_profile_codespaces, set_profile_codespaces,
+        set_profile_remote_servers, update_folder, update_profile,
     };
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
@@ -544,6 +545,8 @@ fn api_routes() -> Route {
                 "/{id}/folders".post(create_folder),
                 "/{id}/remotes".at(get_profile_remote_servers),
                 "/{id}/remotes".put(set_profile_remote_servers),
+                "/{id}/cloud/codespaces".put(set_profile_codespaces),
+                "/{id}/cloud/codespaces".delete(remove_profile_codespaces),
             ))),
         )),
         Route::new((

@@ -208,6 +208,7 @@ impl ShellWording for MayShellWording {
                     | CallRefusal::EmptyTaskId
                     | CallRefusal::UnknownTask { .. }
                     | CallRefusal::ZeroMaxBytes
+                    | CallRefusal::NoStdin { .. }
             ),
             "the shell refused a call May has no wording for: {refusal:?}"
         );
@@ -343,6 +344,17 @@ mod tests {
         });
         assert!(text.contains("'amber-forest-thunder-pearl' produced no new output"));
         assert!(text.contains("`monitor`"));
+    }
+
+    #[test]
+    fn input_to_a_foreground_task_is_refused_through_the_template() {
+        let text = MayShellWording.call_refused(&CallRefusal::NoStdin {
+            task_id: "amber-forest-thunder-pearl".into(),
+        });
+        assert_eq!(
+            text,
+            "task amber-forest-thunder-pearl takes no input: it started in the foreground, where stdin reads end of file; only a job started with background: true has a stdin to write to"
+        );
     }
 
     #[test]

@@ -243,6 +243,12 @@ pub async fn handle_tunnel_request(
             "container sessions may only tunnel loopback endpoints (localhost/127.x)".to_string(),
         );
     }
+    // Links meant for this machine name the address the local listener is
+    // bound to, which answers without an identity.
+    let local_listener = state
+        .remote_access_manager
+        .local_listener_addr()
+        .ok_or_else(|| "the May daemon is not listening on TCP yet".to_string())?;
     let lease = state
         .db()
         .session_ids(&request.session_id)
@@ -262,10 +268,7 @@ pub async fn handle_tunnel_request(
         .await;
     let path = format!("{}/", key.prefix());
     let id = key.id;
-    let local_url = state.remote_access_manager.local_addr().map_or_else(
-        || format!("http://127.0.0.1:{}{path}", super::server::DEFAULT_PORT),
-        |addr| format!("http://{addr}{path}"),
-    );
+    let local_url = format!("http://{local_listener}{path}");
     Ok(TunnelResult {
         id,
         url: url.into(),

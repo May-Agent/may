@@ -17,6 +17,7 @@ mod attachments;
 mod auth;
 #[cfg(test)]
 mod auth_tests;
+mod auto_update;
 mod bootstrap;
 mod browser;
 mod chat;
@@ -405,6 +406,8 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     };
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
+    lifecycle::ensure_tasks_link(&paths)
+        .context("failed to link `tasks` to the daemon's executable")?;
 
     // Agents of relocated homes whose runs were killed before they could
     // retire them, swept before the daemon answers so a client never sees
@@ -445,7 +448,12 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .await
         .context("failed to bind the remote listener")?;
     let unix_listener = bind_unix(&paths.socket())?;
-    state.remote_access_manager.set_local_addr(
+    state.remote_access_manager.set_local_listener_addr(
+        tcp_listener
+            .local_addr()
+            .context("the daemon's local listener has no address")?,
+    );
+    state.remote_access_manager.set_remote_listener_addr(
         remote_listener
             .local_addr()
             .context("the daemon's remote listener has no address")?,
