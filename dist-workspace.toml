@@ -24,3 +24,9 @@ features = ["release-build", "ui"]
 dispatch-releases = true
 # Steps every build job runs first: the toolchain pieces CI also installs.
 github-build-setup = "../build-setup.yml"
+# The Linux builds run where CI tests them: onnxruntime's prebuilt static
+# library (ort-sys) and the pinned nasm package both need glibc 2.38, which
+# dist's default ubuntu-22.04 runners (glibc 2.35) lack.
+[dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
