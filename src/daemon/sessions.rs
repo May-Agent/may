@@ -772,6 +772,13 @@ pub(super) async fn delete_session(
     blocking::unblock(move || secrets.remove_session(&session_id))
         .await
         .map_err(internal_error)?;
+    // So is its codespace: a failed deletion keeps the session, so the
+    // delete can be retried instead of leaving the machine running.
+    state
+        .cloud_sessions
+        .delete(&id)
+        .await
+        .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     // After the eviction, whose dropped agent sessions start closing: the

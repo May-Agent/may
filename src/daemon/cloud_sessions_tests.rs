@@ -102,13 +102,16 @@ struct RecordedGitHub {
     base: String,
     reads: Arc<Mutex<VecDeque<&'static str>>>,
     starts: Arc<Mutex<usize>>,
+    deletes: Arc<Mutex<usize>>,
 }
 
 impl RecordedGitHub {
     async fn serve() -> Self {
         let reads: Arc<Mutex<VecDeque<&'static str>>> = Arc::default();
         let starts: Arc<Mutex<usize>> = Arc::default();
-        let (served_reads, served_starts) = (reads.clone(), starts.clone());
+        let deletes: Arc<Mutex<usize>> = Arc::default();
+        let (served_reads, served_starts, served_deletes) =
+            (reads.clone(), starts.clone(), deletes.clone());
         let codespace_path = format!("/user/codespaces/{CODESPACE_NAME}");
         let start_path = format!("{codespace_path}/start");
         let (base, _) = serve_api(move |request, _| {
@@ -123,6 +126,9 @@ impl RecordedGitHub {
             } else if request.method == "POST" && request.path == start_path {
                 *served_starts.lock().expect("starts") += 1;
                 ApiReply::json(200, codespace("Starting"))
+            } else if request.method == "DELETE" && request.path == codespace_path {
+                *served_deletes.lock().expect("deletes") += 1;
+                ApiReply::json(202, "{}")
             } else {
                 ApiReply::json(500, r#"{"message":"off the script"}"#)
             }
@@ -132,7 +138,12 @@ impl RecordedGitHub {
             base,
             reads,
             starts,
+            deletes,
         }
+    }
+
+    fn deletes(&self) -> usize {
+        *self.deletes.lock().expect("deletes")
     }
 
     fn reads_as(&self, states: &[&'static str]) {
@@ -423,6 +434,26 @@ async fn a_cloud_session_is_served_through_suspension_and_resumption() {
     assert_eq!(
         phases(&drain(&mut events)).last(),
         Some(&CloudSessionPhase::Ready)
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_cloud_session_deletes_its_codespace_and_record() {
+    let github = RecordedGitHub::serve().await;
+    let (daemon, _remote, _) = codespace_daemon().await;
+    let sessions = fronting(TestCloud::new(&github, daemon)).await;
+
+    sessions.delete(SESSION).await.expect("deleted");
+
+    assert_eq!(github.deletes(), 1);
+    assert!(sessions.host(SESSION).is_none());
+    assert!(
+        sessions
+            .db
+            .cloud_session(SESSION)
+            .await
+            .expect("read")
+            .is_none()
     );
 }
 
