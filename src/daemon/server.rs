@@ -1,0 +1,1153 @@
+//! The daemon's API server: state construction, background workers, and
+//! the REST/SSE router every client (TUI, oneshot, web UI) talks to.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, anyhow};
+#[cfg(feature = "ui")]
+use skyzen::EmbeddedStaticDir;
+use skyzen::Result as SkyResult;
+use skyzen::middleware::CompressionMiddleware;
+use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::utils::{Json, State};
+
+use crate::config::MayConfig;
+use crate::mcp::McpManager;
+use crate::models::fetch_all_models;
+use aither_models::lookup as lookup_model_info;
+
+use super::error::internal_error;
+use super::state::{AskUserApprover, DaemonState, WorkspaceApprover, tool_dispatch_channels};
+use super::types::{
+    ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
+    RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
+};
+
+/// Applies the configured remote access, once the daemon listens on TCP.
+///
+/// # Errors
+/// Fails when the profiles cannot be read.
+pub async fn sync_remote_access(state: &DaemonState) -> anyhow::Result<()> {
+    super::remote_access::sync_remote_access_from_state(state)
+        .await
+        .context("failed to sync remote access state")
+}
+
+#[cfg(feature = "ui")]
+static WEB_UI_DIST: include_dir::Dir<'static> =
+    skyzen::embed_dir!("$CARGO_MANIFEST_DIR/web-ui/dist");
+
+/// HTTP server mode selected by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonMode {
+    /// Serve the REST API plus the embedded web UI.
+    Ui,
+    /// Serve the REST API only.
+    Rest,
+}
+
+impl DaemonMode {
+    #[cfg(not(feature = "ui"))]
+    fn ensure_supported(self) -> anyhow::Result<()> {
+        match self {
+            Self::Rest => Ok(()),
+            Self::Ui => Err(anyhow!(
+                "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+            )),
+        }
+    }
+}
+
+/// TCP port the daemon serves the API and web UI on by default.
+pub const DEFAULT_PORT: u16 = 8787;
+
+/// A started server: shared state with its background work running, and
+/// the router that serves it.
+pub struct StartedDaemon {
+    /// Shared server state.
+    pub(crate) state: Arc<DaemonState>,
+    /// Router serving the API (and the web UI when embedded) on the unix
+    /// socket, whose file mode is its access control.
+    pub(crate) socket_router: Router,
+    /// The same routes for loopback TCP binds, admitting only loopback
+    /// `Host` and `Origin` headers.
+    pub(crate) loopback_router: Router,
+    /// The same routes behind the identity layer, for the remote listener
+    /// `tailscale serve` targets.
+    pub(crate) remote_router: Router,
+    /// The same routes behind an identity layer accepting the peer's
+    /// `WhoIs`-resolved login, for non-loopback TCP binds (`--host` and
+    /// `[daemon] listen`).
+    pub(crate) direct_router: Router,
+    /// The webhook routes alone, for the public listener Tailscale Funnel
+    /// targets. It holds no other route.
+    pub(crate) webhook_router: Router,
+}
+
+/// Builds the server state, starts its background work (scheduler, title
+/// worker, tool dispatchers, auto-archive, container auto-stop, remote
+/// access) and returns the router to serve.
+///
+/// After an unexpected exit of the previous daemon, it ends every process
+/// the exited one left in its process session, and the sessions it
+/// interrupted are told (see [`super::chat::restart_interrupted_sessions`]).
+///
+/// # Errors
+/// Fails when configuration, persistence or a required service cannot be
+/// initialized.
+pub async fn start(
+    mode: DaemonMode,
+    process_session: super::process_session::ProcessSession,
+) -> anyhow::Result<StartedDaemon> {
+    #[cfg(not(feature = "ui"))]
+    mode.ensure_supported()?;
+
+    let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
+
+    let mcp_manager = McpManager::load()
+        .await
+        .context("failed to load MCP config")?;
+    // Note: MCP connection is deferred until the service is spawned.
+    // The McpService handles connection internally, avoiding startup blocking.
+
+    let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
+
+    // Starting the monitor waits for the OS's first reachability report, so it
+    // runs alongside loading the config.
+    let (connectivity, config) = futures_lite::future::zip(
+        blocking::unblock(aither_connectivity::Connectivity::start),
+        MayConfig::load(),
+    )
+    .await;
+    let connectivity = connectivity.context("failed to start the connectivity monitor")?;
+    let config = config.context("Failed to load config")?;
+    let tool_distribution = Arc::new(
+        crate::tools::embedded_distribution().context("embedded tool distribution is invalid")?,
+    );
+
+    // Try to detect a container runtime (OrbStack/Docker/Podman)
+    let container_manager = match crate::container::ContainerRuntime::detect().await {
+        Ok(runtime) => {
+            tracing::info!(kind = %runtime.kind, "Container runtime detected");
+            Some(Arc::new(
+                crate::container::lifecycle::ContainerManager::new(
+                    Arc::new(runtime),
+                    may_dir.clone(),
+                ),
+            ))
+        }
+        Err(e) => {
+            tracing::debug!("No container runtime available: {e}");
+            None
+        }
+    };
+
+    // Capacity must be high enough that a slow SSE client cannot block the
+    // browser actor's hot path; lifecycle events are small and high-volume
+    // during Chrome boot / page navigations.
+    let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
+
+    // Initialize the May-managed browser runtime only when the feature is
+    // enabled; provisioning is deferred to the first browser start.
+    let browser_manager = if config.browser.enabled {
+        tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
+        match crate::container::browser::BrowserManager::new(
+            config.browser.clone(),
+            may_dir.clone(),
+            crate::container::browser::BrowserLifecyclePublisher::new(browser_lifecycle_tx.clone()),
+            config.stream.codec,
+        ) {
+            Ok(manager) => Some(Arc::new(manager)),
+            Err(error) => {
+                tracing::error!("Failed to initialize browser manager: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (_session_store, db_for_archive, default_profile_id) =
+        crate::session::initialize_session_persistence(&may_dir).await?;
+    let previous_daemon = db_for_archive
+        .record_daemon_start(process_session.id())
+        .await
+        .context("failed to record the daemon's start")?;
+    if let crate::db::PreviousDaemon::Exited {
+        process_session: exited,
+    } = previous_daemon
+    {
+        let killed = blocking::unblock(move || super::process_session::end_exited_session(exited))
+            .await
+            .context("failed to end the processes of the daemon that exited unexpectedly")?;
+        tracing::warn!(
+            killed,
+            "the previous daemon exited unexpectedly; ended the processes it left"
+        );
+    }
+    let (title_generation_queue, title_generation_rx) =
+        crate::daemon::state::TitleGenerationQueue::new();
+    let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
+    let (session_change_tx, session_change_rx) = async_channel::unbounded();
+    ui_event_bus.set_session_changes(session_change_tx.clone());
+    // Request handlers acquire runs from outside the tokio runtime, so the
+    // lease tasks are spawned on its handle.
+    let lease_handle = tokio::runtime::Handle::current();
+    let runtime_service = Arc::new(
+        crate::session::SessionRuntimeService::new(
+            db_for_archive.clone(),
+            ui_event_bus.clone(),
+            crate::session::MayHomePaths::new(may_dir.clone()),
+        )
+        .with_spawner(Arc::new(move |task| {
+            lease_handle.spawn(task);
+        })),
+    );
+    recover_persisted_runs_after_restart(&runtime_service, &db_for_archive, previous_daemon)
+        .await?;
+    let remote_access_manager = Arc::new(super::remote_access::RemoteAccessManager::new(
+        ui_event_bus.clone(),
+    ));
+    let permission_approver =
+        crate::agent::PermissionApprover::new().with_runtime_service(runtime_service.clone());
+    let workspace_approver = WorkspaceApprover::new()
+        .with_runtime_service(runtime_service.clone())
+        .with_may_dir(may_dir.clone());
+    let ask_user_approver = AskUserApprover::new()
+        .with_runtime_service(runtime_service.clone())
+        .with_secret_store(crate::secrets::SecretStore::new(&may_dir));
+
+    // Initialize memory processor with fast-tier provider chain
+    let memory_processor = match crate::agent::build_fast_provider_chain(
+        &config,
+        &crate::secrets::SecretRedactor::new(&may_dir),
+    )
+    .await
+    {
+        Ok(memory_providers) => {
+            tracing::info!("Profile memory processor enabled");
+            Some(crate::memory::MemoryProcessor::new(
+                db_for_archive.clone(),
+                memory_providers,
+            ))
+        }
+        Err(e) => {
+            tracing::debug!("Profile memory processor unavailable (no fast model): {e}");
+            None
+        }
+    };
+
+    // Initialize Web Push notification manager
+    let notification_manager =
+        crate::notification::NotificationManager::new(&may_dir, db_for_archive.clone())
+            .await
+            .map_err(|e| anyhow!("failed to initialize web push notifications: {e}"))?;
+    let notification_manager = Arc::new(notification_manager);
+    tracing::info!("Web Push notifications enabled");
+    let notification_service = Arc::new(crate::notification::NotificationService::new(
+        db_for_archive.clone(),
+        notification_manager.clone(),
+        ui_event_bus.clone(),
+    ));
+    notification_service
+        .redeliver_pending()
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let job_server = crate::jobserver::JobServer::start(&may_dir, config.sandbox.job_pool_size())
+        .await
+        .context("failed to create the jobserver pool")?;
+    // Prompts that task runs store for their sessions; dispatched once the
+    // daemon state exists.
+    let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
+    let mut task_runtime = crate::scheduler::TaskRuntime::load(
+        db_for_archive.clone(),
+        may_dir.clone(),
+        tool_distribution.clone(),
+    )
+    .await
+    .context("failed to load task runtime state")?
+    .with_notifier(notification_service.clone())
+    .with_ui_event_bus(ui_event_bus.clone())
+    .with_network_policy(&config.preferences.network_policy)
+    .map_err(|error| anyhow!(error))?
+    .with_connectivity(connectivity.clone())
+    .with_job_server(job_server.clone())
+    .with_session_prompts(crate::task_wake::SessionPrompts::new(
+        runtime_service.clone(),
+        task_wake_tx,
+    ));
+    if let Some(ref manager) = container_manager {
+        task_runtime = task_runtime.with_container_manager(manager.clone());
+    }
+    let task_runtime = Arc::new(task_runtime);
+    let container_prepare = super::state::ContainerPrepareTracker::new(ui_event_bus.clone());
+    let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
+
+    let live_limits = crate::agent::LiveLimits::of(&config);
+    let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
+    let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
+        config.clone(),
+        crate::session::MayHomePaths::new(may_dir.clone()),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let state = Arc::new(DaemonState {
+        acp_host,
+        tokio_handle: tokio::runtime::Handle::current(),
+        db: db_for_archive.clone(),
+        github_api: crate::pr::PrContext::default_github_api(),
+        default_profile_id,
+        mcp_service: super::state::McpService::spawn(mcp_manager),
+        permission_approver,
+        workspace_approver,
+        ask_user_approver,
+        tool_dispatchers,
+        fetched_models_cache: super::state::RefreshableCache::new(Duration::from_secs(20)),
+        config: config.clone(),
+        live_limits,
+        ui_event_bus: ui_event_bus.clone(),
+        container_prepare,
+        container_manager,
+        browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
+        browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
+        browser_lifecycle_tx,
+        computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
+        remote_access_manager,
+        sleep: Arc::new(crate::sleep::SleepState::load(
+            &may_dir,
+            ui_event_bus.clone(),
+            db_for_archive.clone(),
+        )),
+        notification_service: notification_service.clone(),
+        memory_processor,
+        local_url_port_mapper: Arc::new(super::local_url_mapper::LocalUrlPortMapper::new()),
+        title_generation_queue,
+        location_provider: crate::location::LocationProvider::new(),
+        runtime_service,
+        task_runtime: task_runtime.clone(),
+        tool_distribution,
+        tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
+        job_server,
+        repo_search: crate::repo_search::RepoSearch::global(&may_dir),
+        may_dir,
+        search_index_wake_tx,
+        search_index_wake,
+        search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
+        daemon_shutdown: Arc::new(tokio::sync::Notify::new()),
+        draining: std::sync::atomic::AtomicBool::new(false),
+        build_id: crate::daemon::current_build_id()
+            .context("failed to identify the running build")?,
+        turn_hub: Arc::new(super::chat::TurnHub::default()),
+        parked_agents: super::chat::ParkedAgents::default(),
+        agent_forks: crate::agent_link::ForkHosts::default(),
+        aux_tasks: super::chat::AuxTasks::default(),
+        recap_schedules: super::chat::RecapSchedules::default(),
+        session_background: super::chat::SessionBackgrounds::default(),
+        pr_checks: super::pr_checks::PrChecksCache::default(),
+        tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
+        connectivity,
+        session_events_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            }),
+        session_change_tx,
+        session_change_rx,
+        session_publisher_once: std::sync::Once::new(),
+    });
+
+    state.ensure_session_publisher();
+
+    super::chat::restart_interrupted_sessions(&state)
+        .await
+        .context("failed to restart the sessions an unexpected exit interrupted")?;
+    super::chat::resume_pending_follow_up_runs(state.clone())
+        .await
+        .context("failed to resume persisted pending session runs")?;
+
+    // Spawn background tasks
+    super::archive::spawn(state.clone());
+    if let Some(ref cm) = state.container_manager {
+        let _auto_stop = cm.spawn_auto_stop_task();
+    }
+    super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
+    super::title_generation::spawn_worker(state.clone(), title_generation_rx);
+    super::user_wait::spawn_notifier(&state);
+    super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
+    super::chat::spawn_task_wake_dispatcher(state.clone(), task_wake_rx);
+    let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
+    let _scheduler = scheduler.spawn();
+    super::artifacts::spawn_artifact_watcher(&state);
+    super::pr_checks::spawn(state.clone());
+    // The tailscale-serve listener trusts Serve's identity header; a direct
+    // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
+    let remote_router = build_router(
+        state.clone(),
+        mode,
+        super::auth::RequireIdentity::new(vec![Box::new(
+            state.remote_access_manager.tailscale_identity(),
+        )]),
+    );
+    let direct_router = build_router(
+        state.clone(),
+        mode,
+        super::auth::RequireIdentity::new(vec![Box::new(
+            state
+                .remote_access_manager
+                .tailscale_identity()
+                .whois_source(),
+        )]),
+    );
+    let socket_router = build_router(state.clone(), mode, super::auth::SocketOwner);
+    let loopback_router = build_router(state.clone(), mode, super::auth::LoopbackOnly);
+    let webhook_router = build_webhook_router(state.clone());
+    Ok(StartedDaemon {
+        state,
+        socket_router,
+        loopback_router,
+        remote_router,
+        direct_router,
+        webhook_router,
+    })
+}
+
+fn api_routes() -> Route {
+    use super::artifacts::{
+        get_artifact_preview, get_artifact_runtime_bridge, get_artifact_runtime_preview,
+        get_output_preview, get_session_runtime, get_slidev_static_asset, list_session_artifacts,
+        map_container_local_url, prepare_slidev_preview, report_artifact_diagnostics,
+    };
+    use super::bootstrap::get_bootstrap;
+    use super::browser::{
+        browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
+        browser_takeover_start, browser_takeover_stop,
+    };
+
+    use super::config::{
+        add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
+        copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
+        list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server, save_full_config,
+        save_memory, set_job_pool, set_last_model,
+    };
+    use super::events::stream_events;
+    use super::notifications::{
+        get_vapid_key, list_network_access_logs, list_notification_mailbox, subscribe,
+        test_notification, unsubscribe,
+    };
+    use super::profiles::{
+        create_folder, create_profile, delete_folder, delete_profile, get_profile_remote_servers,
+        get_profile_sessions, list_profiles, set_profile_remote_servers, update_folder,
+        update_profile,
+    };
+    use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
+    use super::sessions::{
+        append_session_history, create_session, delete_all_sessions, delete_session, get_session,
+        get_session_context_debug, get_session_prs, get_session_queue, get_session_tasks,
+        list_sessions, lookup_issues, patch_session, remove_queue_entry, save_session_tasks,
+    };
+    use super::sleep::{end_sleep, get_sleep, start_sleep};
+    use super::tasks::{
+        approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
+        run_task, update_task,
+    };
+
+    Route::new((
+        Route::new((
+            "/health".at(health),
+            "/daemon/shutdown".post(shutdown_daemon),
+            "/artifact-runtime.js".at(get_artifact_runtime_bridge),
+            "/bootstrap".at(get_bootstrap),
+            "/models".route(Route::new((
+                "".at(models),
+                "/by-provider".at(models_by_provider),
+            ))),
+            "/github/repos".at(super::github_repos::list_github_repos),
+            "/events".at(stream_events),
+            "/logs".route(Route::new(("/requests".at(get_request_logs),))),
+            "/session-names".post(super::sessions::issue_session_name),
+            "/sessions".route(Route::new((
+                "".at(list_sessions),
+                "".post(create_session),
+                "/delete-all".post(delete_all_sessions),
+                "/{id}".route(Route::new((
+                    Route::new((
+                        "".at(get_session),
+                        "".patch(patch_session),
+                        "".delete(delete_session),
+                        "/events".at(super::session_events::stream_session_events),
+                        "/history".post(append_session_history),
+                        "/attachments".post(super::attachments::post_attachment),
+                        "/files/{*path}".at(super::attachments::get_session_file),
+                        "/transcript".at(super::transcript::get_transcript),
+                        "/queue".at(get_session_queue),
+                        "/queue/{entryId}".delete(remove_queue_entry),
+                        "/turns".post(super::chat::post_turn),
+                        "/turns/current".delete(super::chat::delete_current_turn),
+                        "/actions/{name}".post(super::chat::post_session_action),
+                        "/issues/lookup".post(lookup_issues),
+                    )),
+                    Route::new((
+                        "/tasks".at(get_session_tasks),
+                        "/prs".at(get_session_prs),
+                        "/repo-clones".at(super::sessions::get_session_repo_clones),
+                        "/tasks".put(save_session_tasks),
+                        "/runtime".at(get_session_runtime),
+                        "/context-debug".at(get_session_context_debug),
+                        "/artifacts".at(list_session_artifacts),
+                        "/artifacts/preview".at(get_artifact_preview),
+                        "/artifacts/slidev/preview".at(prepare_slidev_preview),
+                        "/artifacts/slidev-static/{buildKey}/{*path}".at(get_slidev_static_asset),
+                        "/outputs/preview".at(get_output_preview),
+                        "/artifacts/local-url-map".post(map_container_local_url),
+                    )),
+                    Route::new(("/computer".route(Route::new((
+                        "/status".at(super::computer::computer_status),
+                        "/start".post(super::computer::computer_start),
+                        "/stop".post(super::computer::computer_stop),
+                        "/offer".post(super::computer::computer_offer),
+                        "/takeover/start".post(super::computer::computer_takeover_start),
+                        "/takeover/stop".post(super::computer::computer_takeover_stop),
+                    ))),)),
+                    Route::new((
+                        "/context-report".at(super::chat::context_report),
+                        "/usage".at(super::chat::usage_report),
+                        "/agent".delete(super::chat::release_agent),
+                    )),
+                    Route::new((
+                        "/background".at(super::chat::get_background),
+                        "/issues".at(super::session_events::get_session_issues),
+                        "/jobs/read".at(super::chat::read_job),
+                        "/jobs/{pid}".at(super::chat::get_job),
+                        "/jobs/{pid}/kill".post(super::chat::kill_job),
+                        "/subagents".delete(super::chat::cancel_subagents),
+                        "/subagents/{runId}".delete(super::chat::cancel_subagent),
+                    )),
+                    Route::new((
+                        "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
+                        "/artifacts/diagnostics".post(report_artifact_diagnostics),
+                    )),
+                    Route::new((
+                        "/ids".post(super::session_ids::lease_session_id),
+                        "/ids/{word}".delete(super::session_ids::release_session_id),
+                        "/ids/{word}/keep".post(super::session_ids::keep_session_id),
+                        "/stored-ids/{word}".delete(super::session_ids::release_stored_session_id),
+                    )),
+                ))),
+            ))),
+            "/profiles".route(Route::new((
+                "".at(list_profiles),
+                "".post(create_profile),
+                "/{id}".put(update_profile),
+                "/{id}".delete(delete_profile),
+                "/{id}/sessions".at(get_profile_sessions),
+                "/{id}/folders".post(create_folder),
+                "/{id}/remotes".at(get_profile_remote_servers),
+                "/{id}/remotes".put(set_profile_remote_servers),
+            ))),
+        )),
+        Route::new((
+            "/folders".route(Route::new((
+                "/{id}".put(update_folder),
+                "/{id}".delete(delete_folder),
+            ))),
+            "/interactions".route(Route::new((
+                "/{id}".post(super::interaction::respond_interaction),
+            ))),
+            "/config".route(Route::new((
+                "".at(get_ui_config),
+                "/full".post(save_full_config),
+                "/last-model".post(set_last_model),
+                "/job-pool".put(set_job_pool),
+            ))),
+        )),
+        Route::new((
+            "/memory".route(Route::new(("".at(get_memory), "".post(save_memory)))),
+            "/ssh".route(Route::new((
+                "".post(add_ssh_server),
+                "/{name}".delete(remove_ssh_server),
+            ))),
+            "/acp-agents".route(Route::new((
+                "".at(super::acp_agents::list_acp_agents),
+                "".post(super::acp_agents::connect_acp_agent),
+                "/{name}".delete(super::acp_agents::disconnect_acp_agent),
+            ))),
+            "/mcp".route(Route::new((
+                "".at(list_mcp_servers),
+                "".post(add_mcp_server),
+                "/{name}".delete(remove_mcp_server),
+                "/{name}/reconnect".post(reconnect_mcp_server),
+            ))),
+            "/skills".route(Route::new((
+                "".at(list_skills),
+                "/install".post(install_skill),
+                "/{dir}".delete(delete_skill),
+            ))),
+            "/rules/import".post(super::rules_import::import_rules),
+            "/tasks".route(Route::new((
+                "".at(list_tasks),
+                "".post(create_task),
+                "/webhook/{token}".post(invoke_webhook_task),
+                "/{id}".at(get_task),
+                "/{id}".put(update_task),
+                "/{id}".delete(delete_task),
+                "/{id}/approve".post(approve_task),
+                "/{id}/run".post(run_task),
+            ))),
+            "/copilot".route(Route::new((
+                "/status".at(copilot_status),
+                "/start".post(copilot_start),
+                "/stream".at(copilot_stream),
+                "/logout".post(copilot_logout),
+            ))),
+            "/tunnels".route(Route::new((
+                "".post(super::tunnel::register_tunnel),
+                "/{session}/{id}".at(super::tunnel::get_tunnel),
+            ))),
+            "/browser".route(Route::new((
+                "/status".at(browser_status),
+                "/start".post(browser_start),
+                "/stop".post(browser_stop),
+                "/offer".post(browser_offer),
+                "/viewport".post(browser_resize_viewport),
+                "/takeover/start".post(browser_takeover_start),
+                "/takeover/stop".post(browser_takeover_stop),
+            ))),
+            "/sleep".route(Route::new((
+                "".at(get_sleep),
+                "".post(start_sleep),
+                "".delete(end_sleep),
+            ))),
+            "/remote-access".route(Route::new((
+                "/status".at(get_remote_access_status),
+                "/start".post(start_remote_access),
+                "/stop".post(stop_remote_access),
+            ))),
+            "/push".route(Route::new((
+                "/vapid-key".at(get_vapid_key),
+                "/subscribe".post(subscribe),
+                "/unsubscribe".post(unsubscribe),
+                "/test".post(test_notification),
+            ))),
+            "/notifications".route(Route::new((
+                "/mailbox".at(list_notification_mailbox),
+                "/network-access".at(list_network_access_logs),
+            ))),
+        )),
+    ))
+}
+
+fn tunnel_routes() -> Route {
+    Route::new((
+        "/tunnel/{session}/{id}".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{session}/{id}/".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{session}/{id}/{*path}".any(super::tunnel::tunnel_proxy),
+    ))
+}
+
+/// User-facing artifact pages: `/profile/{profileId}/session/{sessionId}/artifacts`
+/// browses a session's artifact directory with rendered previews for
+/// browsers and raw bytes for everything else.
+fn artifact_page_routes() -> Route {
+    use super::artifact_pages::serve_artifact;
+    Route::new((
+        "/{profileId}/session/{sessionId}/artifacts".at(serve_artifact),
+        "/{profileId}/session/{sessionId}/artifacts/{*path}".at(serve_artifact),
+    ))
+}
+
+/// The router of the public Funnel listener: the webhook delivery route and
+/// nothing else, so no other route is reachable through it. Authentication
+/// is the delivery's own token and signature.
+pub(super) fn build_webhook_router(state: Arc<DaemonState>) -> Router {
+    use super::tasks::invoke_webhook_task;
+    let api = "/api".route(Route::new((
+        "/tasks".route(Route::new(("/webhook/{token}".post(invoke_webhook_task),))),
+    )));
+    Route::new((api,)).middleware(State(state)).build()
+}
+
+/// The daemon's routes behind `policy`, the listener's access policy (see
+/// [`super::auth`]). It is the outermost layer, so it decides before any
+/// route, 404 or the tunnel `Referer` fallback runs.
+pub(super) fn build_router(
+    state: Arc<DaemonState>,
+    mode: DaemonMode,
+    policy: impl skyzen::middleware::Middleware,
+) -> Router {
+    let api = "/api"
+        .route(api_routes())
+        .with(CompressionMiddleware::new());
+    let tunnel = tunnel_routes();
+    let artifact_pages = "/profile".route(artifact_page_routes());
+    let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());
+
+    // Layers run outermost-first in registration order.
+    match mode {
+        DaemonMode::Rest => Route::new((api, tunnel, artifact_pages))
+            .layer(policy)
+            .layer(fallback)
+            .middleware(State(state))
+            .build(),
+        DaemonMode::Ui => {
+            #[cfg(feature = "ui")]
+            {
+                Route::new((
+                    api,
+                    tunnel,
+                    artifact_pages,
+                    EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
+                ))
+                .layer(policy)
+                .layer(fallback)
+                .middleware(State(state))
+                .build()
+            }
+            #[cfg(not(feature = "ui"))]
+            {
+                let _ = api;
+                panic!(
+                    "`may ui` should fail before router construction when the `ui` feature is disabled"
+                );
+            }
+        }
+    }
+}
+
+// ── System / Meta handlers ────────────────────────────────
+
+async fn health(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::DaemonHealth>> {
+    Ok(Json(super::types::DaemonHealth {
+        ok: true,
+        pid: std::process::id(),
+        build: state.build_id.clone(),
+        search_index: state.search_index_status.snapshot(),
+    }))
+}
+
+async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ApiHealth>> {
+    state
+        .draining
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state.daemon_shutdown.notify_one();
+    Ok(Json(super::types::API_OK))
+}
+
+async fn get_request_logs(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<RequestLogsResponse>> {
+    let logs = state
+        .db()
+        .list_request_logs(300)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(RequestLogEntry::from)
+        .collect::<Vec<_>>();
+    let cache_summary = state
+        .db()
+        .assistant_cache_usage_summary()
+        .await
+        .map(RequestLogCacheSummary::from)
+        .map_err(internal_error)?;
+    Ok(Json(RequestLogsResponse {
+        logs,
+        cache_summary,
+    }))
+}
+
+async fn models(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ModelsResponse>> {
+    let tokio_handle = state.tokio_handle.clone();
+    let result = tokio_handle
+        .spawn(async move {
+            let config = (*state.config_snapshot()).clone();
+            let refresh_config = config.clone();
+            let fetched = state
+                .fetched_models_cache
+                .get_or_refresh(move || async move { fetch_all_models(&refresh_config).await })
+                .await;
+            build_models_response(&config, fetched, true)
+        })
+        .await;
+    let result = result.map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+/// The effort levels the web composer offers for a model: the shared ladder,
+/// or none when the catalog serves no effort rungs for the family and the
+/// model does not report reasoning.
+fn model_effort_ladder(
+    config: &MayConfig,
+    family_rungs: &crate::models::FamilyEffortRungs,
+    provider_id: &str,
+    model_id: &str,
+    abilities: &[String],
+) -> Vec<String> {
+    let family = crate::models::effort_family_base(model_id);
+    let served = family_rungs.contains_key(&(provider_id.to_string(), family.clone()));
+    let reasons = abilities.iter().any(|ability| ability == "reasoning")
+        || lookup_model_info(model_id)
+            .or_else(|| lookup_model_info(&family))
+            .is_some_and(|info| {
+                info.abilities()
+                    .contains(&aither_core::llm::model::Ability::Reasoning)
+            });
+    if !served && !reasons {
+        return Vec::new();
+    }
+    let provider_type = config
+        .provider
+        .get(provider_id)
+        .map(|instance| instance.resolve_type(provider_id));
+    crate::models::effort_ladder(family_rungs, provider_id, model_id, provider_type)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn build_models_response(
+    config: &MayConfig,
+    fetched: Vec<crate::models::FetchedModel>,
+    include_static_metadata: bool,
+) -> ModelsResponse {
+    let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
+    let mut family_rungs = crate::models::FamilyEffortRungs::new();
+    crate::models::record_family_effort_rungs(&mut family_rungs, &fetched);
+
+    for item in fetched {
+        let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
+        let new_entry = ModelInfoItem {
+            id: selector.clone(),
+            model_id: item.id.clone(),
+            provider_id: item.provider_id.clone(),
+            nickname: item.nickname,
+            context_window: item.context_window,
+            effort_ladder: model_effort_ladder(
+                config,
+                &family_rungs,
+                &item.provider_id,
+                &item.id,
+                &item.abilities,
+            ),
+            abilities: item.abilities,
+        };
+        model_map
+            .entry(selector)
+            .and_modify(|existing| {
+                // Prefer the entry with more abilities (richer metadata).
+                if new_entry.abilities.len() > existing.abilities.len() {
+                    *existing = new_entry.clone();
+                }
+            })
+            .or_insert(new_entry);
+    }
+
+    for tier in crate::config::ModelTier::ALL {
+        for selector in config.models.models_for_tier(*tier) {
+            let selector_key = selector.to_string();
+            model_map.entry(selector_key.clone()).or_insert_with(|| {
+                let static_info = if include_static_metadata {
+                    lookup_model_info(selector.model_id())
+                } else {
+                    None
+                };
+                let (nickname, context_window, abilities) = static_info.map_or_else(
+                    || (selector.model_id().to_string(), None, Vec::new()),
+                    |info| {
+                        (
+                            info.id().to_string(),
+                            info.max_input_tokens(),
+                            info.abilities()
+                                .iter()
+                                .map(|a| a.label().to_string())
+                                .collect::<Vec<_>>(),
+                        )
+                    },
+                );
+                ModelInfoItem {
+                    id: selector_key,
+                    model_id: selector.model_id().to_string(),
+                    provider_id: selector.provider_id().to_string(),
+                    nickname,
+                    context_window,
+                    effort_ladder: model_effort_ladder(
+                        config,
+                        &family_rungs,
+                        selector.provider_id(),
+                        selector.model_id(),
+                        &abilities,
+                    ),
+                    abilities,
+                }
+            });
+        }
+    }
+
+    // Canonicalize nicknames: prefer aither_models as the single source of truth for
+    // display names. This eliminates placeholder names from providers (e.g. Copilot
+    // returning "OpenAI model" or "github") without needing a hardcoded blocklist.
+    if include_static_metadata {
+        for item in model_map.values_mut() {
+            if let Some(info) = lookup_model_info(&item.model_id) {
+                item.nickname = info.id().to_string();
+            }
+        }
+    }
+
+    let mut details = model_map.into_values().collect::<Vec<_>>();
+    details.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then(a.model_id.cmp(&b.model_id))
+    });
+    let models_list = details.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+    ModelsResponse {
+        models: models_list,
+        details,
+    }
+}
+
+async fn models_by_provider(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ProviderModelsResponse>> {
+    let tokio_handle = state.tokio_handle.clone();
+    let result = tokio_handle
+        .spawn(async move {
+            let config = (*state.config_snapshot()).clone();
+            let refresh_config = config.clone();
+            let fetched = state
+                .fetched_models_cache
+                .get_or_refresh(move || async move { fetch_all_models(&refresh_config).await })
+                .await;
+            build_provider_models_response(&config, fetched)
+        })
+        .await;
+    let result = result.map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+fn build_provider_models_response(
+    config: &MayConfig,
+    fetched: Vec<crate::models::FetchedModel>,
+) -> ProviderModelsResponse {
+    let mut grouped: std::collections::HashMap<String, Vec<ModelInfoItem>> =
+        std::collections::HashMap::new();
+    let mut family_rungs = crate::models::FamilyEffortRungs::new();
+    crate::models::record_family_effort_rungs(&mut family_rungs, &fetched);
+
+    for item in fetched {
+        let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
+        let effort_ladder = model_effort_ladder(
+            config,
+            &family_rungs,
+            &item.provider_id,
+            &item.id,
+            &item.abilities,
+        );
+        grouped
+            .entry(item.provider_id.clone())
+            .or_default()
+            .push(ModelInfoItem {
+                id: selector,
+                model_id: item.id,
+                provider_id: item.provider_id,
+                nickname: item.nickname,
+                context_window: item.context_window,
+                effort_ladder,
+                abilities: item.abilities,
+            });
+    }
+
+    let mut providers = grouped
+        .into_iter()
+        .map(|(provider_id, mut details)| {
+            details.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+            details.dedup_by(|a, b| a.id == b.id);
+            let models_list = details.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+            ProviderModelsItem {
+                provider_id,
+                models: models_list,
+                details,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+    ProviderModelsResponse { providers }
+}
+
+/// Settles what a daemon that exited left running: session runtimes and
+/// scheduled-task runs. The two touch separate tables, so they run together.
+async fn recover_persisted_runs_after_restart(
+    runtime_service: &crate::session::SessionRuntimeService,
+    db: &crate::db::ChatDb,
+    previous: crate::db::PreviousDaemon,
+) -> anyhow::Result<()> {
+    let ((sessions, task_runs), cards) = futures_lite::future::zip(
+        futures_lite::future::zip(
+            runtime_service.runs().recover_after_restart(previous),
+            db.recover_task_runs_after_restart(),
+        ),
+        db.interrupt_running_subagent_cards(),
+    )
+    .await;
+    sessions.context("failed to reconcile persisted session runtime state after restart")?;
+    task_runs.context("failed to reconcile persisted scheduled-task runs after restart")?;
+    cards.context("failed to settle the subagent cards a stopped daemon left running")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "ui"))]
+    use super::DaemonMode;
+    use super::{
+        build_models_response, build_provider_models_response, recover_persisted_runs_after_restart,
+    };
+    use crate::config::MayConfig;
+    use crate::models::FetchedModel;
+
+    fn fetched(id: &str, abilities: &[&str]) -> FetchedModel {
+        FetchedModel {
+            id: id.to_string(),
+            nickname: id.to_string(),
+            context_window: None,
+            abilities: abilities.iter().map(ToString::to_string).collect(),
+            provider_id: "relay".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_interrupts_running_task_runs() {
+        use crate::db::{ChatDb, CreateScheduledTaskParams};
+        use crate::session::SessionRuntimeService;
+        use crate::task_trigger::PersistedTaskTrigger;
+        use crate::ui_event_bus::UiEventBus;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db opens");
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "task-1",
+            profile_id: "profile-1",
+            session_id: Some("session-1"),
+            name: "Demo task",
+            trigger: &PersistedTaskTrigger::Event {
+                event_name: "chat.turn.completed".to_string(),
+            },
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task persists");
+        let task = db
+            .get_scheduled_task("task-1")
+            .await
+            .expect("task lookup")
+            .expect("task exists");
+        db.start_task_run("run-1", &task, "event")
+            .await
+            .expect("run persists");
+        let running = crate::command_reading::Card::Subagent {
+            agent: "explorer".to_string(),
+            title: "Map".to_string(),
+            state: crate::command_reading::SubagentState::Running,
+            started_at: jiff::Timestamp::UNIX_EPOCH,
+            finished_at: None,
+            result: None,
+        };
+        db.set_tool_card("session-1", "call-1", &running)
+            .await
+            .expect("card persists");
+        assert_eq!(
+            db.task_run_status("run-1")
+                .await
+                .expect("status")
+                .as_deref(),
+            Some("running")
+        );
+
+        let service = SessionRuntimeService::new(
+            db.clone(),
+            UiEventBus::new(),
+            crate::session::MayHomePaths::new(dir.path().join("home")),
+        );
+        recover_persisted_runs_after_restart(&service, &db, crate::db::PreviousDaemon::Stopped)
+            .await
+            .expect("startup recovery succeeds");
+
+        assert_eq!(
+            db.task_run_status("run-1")
+                .await
+                .expect("status")
+                .as_deref(),
+            Some("interrupted")
+        );
+        let cards = db.tool_cards("session-1").await.expect("cards");
+        assert_eq!(cards["call-1"], running.interrupted());
+        assert!(matches!(
+            cards["call-1"],
+            crate::command_reading::Card::Subagent {
+                state: crate::command_reading::SubagentState::Interrupted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn model_lists_carry_each_models_effort_ladder() {
+        let models = vec![
+            fetched("o4-mini-low", &[]),
+            fetched("o4-mini-high", &[]),
+            fetched("gpt-reasoner", &["reasoning"]),
+            fetched("plain-chat", &["tool_use"]),
+        ];
+        let config = MayConfig::default();
+        let ladders = |details: &[crate::daemon::types::ModelInfoItem]| {
+            details
+                .iter()
+                .map(|item| (item.model_id.clone(), item.effort_ladder.clone()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+
+        let flat = ladders(&build_models_response(&config, models.clone(), false).details);
+        let grouped = build_provider_models_response(&config, models);
+        let grouped = ladders(&grouped.providers[0].details);
+        for ladders in [flat, grouped] {
+            assert_eq!(ladders["o4-mini-low"], ["low", "high"]);
+            assert_eq!(ladders["o4-mini-high"], ["low", "high"]);
+            assert_eq!(
+                ladders["gpt-reasoner"],
+                ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert_eq!(ladders["plain-chat"].len(), 0);
+        }
+    }
+
+    #[cfg(not(feature = "ui"))]
+    #[test]
+    fn rest_mode_is_always_supported() {
+        DaemonMode::Rest
+            .ensure_supported()
+            .expect("rest mode should always be available");
+    }
+
+    #[cfg(not(feature = "ui"))]
+    #[test]
+    fn ui_mode_requires_ui_feature() {
+        let error = DaemonMode::Ui
+            .ensure_supported()
+            .expect_err("ui mode should fail without the ui feature");
+        assert_eq!(
+            error.to_string(),
+            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+        );
+    }
+}

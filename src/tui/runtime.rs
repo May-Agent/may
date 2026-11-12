@@ -1,424 +1,242 @@
-use std::sync::Arc;
-
 use aither_core::llm::model::ReasoningEffort;
-use async_channel::Sender;
-use base64::Engine;
-use executor_core::{DefaultExecutor, spawn};
-use serde::Serialize;
+use executor_core::spawn;
 
-use crate::agent::{AgentHandle, AgentWorker, spawn_worker};
-use crate::ask_user::{AskUserBroker, Question, QuestionAnswer};
+use crate::agent::{AgentHandle, AgentWorker};
+use crate::ask_user::QuestionAnswer;
 use crate::session::AttachmentKind;
-use crate::tool_dispatch::ToolDispatchers;
-use crate::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
 use crate::tui::{App, Attachment, PendingMessage};
-use crate::workspace_request::WorkspaceRequestBroker;
-use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_session_title};
+use crate::{ChatMessage, MayConfig, SessionId};
 
+/// Error type for TUI runtime operations.
 #[derive(Debug, thiserror::Error)]
-enum TuiRuntimeError {
+pub enum TuiRuntimeError {
+    /// Database error.
+    #[error("database error: {0}")]
+    Database(#[from] crate::db::ChatDbError),
+    /// Session error.
+    #[error("session error: {0}")]
+    Session(#[from] crate::session::SessionError),
+    /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Agent environment resolution failed.
+    #[error("agent environment resolution failed: {0}")]
+    ResolveAgentEnvironment(#[from] crate::agent::ResolveAgentEnvironmentError),
+    /// No active session.
     #[error("No active session")]
     NoActiveSession,
+    /// A turn was started without holding the session's run lease.
+    #[error("no session run lease is held for this turn")]
+    NoRunLease,
+    /// The May daemon refused or could not be reached.
+    #[error(transparent)]
+    Daemon(#[from] crate::client::DaemonClientError),
+    /// The May daemon is not attached yet.
+    #[error("the May daemon is not attached")]
+    DaemonUnavailable,
+    /// History replay failed.
+    #[error("history replay failed: {0}")]
+    HistoryReplay(#[from] crate::session::HistoryReplayError),
+    /// Foreign transcript import failed.
+    #[error("import failed: {0}")]
+    Import(#[from] crate::session::import::ImportError),
+    /// Invalid pending message timestamp.
     #[error("invalid pending message timestamp: {0}")]
     InvalidPendingMessageTimestamp(#[source] jiff::Error),
+    /// Persisted image attachment is missing content.
     #[error("persisted image attachment is missing content")]
     PersistedImageMissingContent,
+    /// Unsupported persisted attachment type in TUI runtime.
     #[error("unsupported persisted attachment type in TUI runtime: {0}")]
     UnsupportedPersistedAttachmentType(AttachmentKind),
+    /// Failed to convert path into file URL.
     #[error("failed to convert path into file URL: {path}")]
-    FileUrlConversion { path: std::path::PathBuf },
+    FileUrlConversion {
+        /// Path that could not be converted.
+        path: std::path::PathBuf,
+    },
+    /// Failed to parse attachment URL.
     #[error("failed to parse attachment URL {url}: {source}")]
     AttachmentUrlParse {
+        /// URL that failed to parse.
         url: String,
+        /// Underlying URL parse error.
         #[source]
         source: url::ParseError,
     },
+    /// Attachment URL is not a local file URL.
     #[error("attachment URL is not a local file URL: {url}")]
-    NonLocalAttachmentUrl { url: String },
+    NonLocalAttachmentUrl {
+        /// URL that is not a local `file://` URL.
+        url: String,
+    },
+    /// An answer to an open question was refused.
+    #[error("{0}")]
+    Answer(#[from] crate::session::AnswerError),
+    /// Selected model is empty.
     #[error("Selected model is empty")]
     EmptySelectedModel,
+    /// No model configured.
     #[error("No model configured")]
     NoModelConfigured,
+    /// Location fetch failed.
     #[error("Location fetch failed: {0}")]
-    LocationFetch(#[source] anyhow::Error),
+    LocationFetch(#[source] crate::location::LocationError),
+    /// Agent initialization failed.
+    #[error("agent initialization failed: {0}")]
+    MayAgent(#[from] crate::agent::MayAgentError),
+    /// Agent operation failed.
+    #[error("agent operation failed: {0}")]
+    Agent(#[from] aither_agent::AgentError),
+    /// Failed to convert attachment path to URL.
     #[error("Failed to convert attachment path to URL: {path}")]
-    AttachmentPathToUrl { path: std::path::PathBuf },
-    #[error("Failed to serialize paste XML: {0}")]
-    SerializePasteXml(#[source] quick_xml::SeError),
+    AttachmentPathToUrl {
+        /// Path that could not be converted.
+        path: std::path::PathBuf,
+    },
+    /// Unable to determine attachment MIME type.
+    #[error("Unable to determine attachment MIME type: {path}")]
+    UnknownAttachmentMediaType {
+        /// Path whose MIME type could not be determined.
+        path: std::path::PathBuf,
+    },
+    /// Invalid data URL.
     #[error("invalid data URL")]
     InvalidDataUrl,
+    /// Failed to decode data URL.
     #[error("failed to decode data URL: {0}")]
     DecodeDataUrl(#[source] base64::DecodeError),
 }
 
+/// Whether the caller committed its response to a prompt a run is blocked on.
+///
+/// Only the committer wakes the run with its own response. When another
+/// process sharing the database committed first, it finds no waiter
+/// in its own registry and takes the resume path, so this process answers
+/// the live run with what was committed (`R`), read back by request id, and
+/// the user is told their own response was not used.
 #[derive(Debug, Clone)]
-pub struct LocalSessionRuntime {
-    runtime_service: Arc<crate::session::SessionRuntimeService>,
-    permission_approver: crate::agent::PermissionApprover,
-    oneshot_restricted: bool,
+#[must_use]
+pub enum ResponseCommit<R> {
+    /// This call committed the response; the caller wakes the run with it.
+    Committed,
+    /// Another response was committed first; the caller answers the run with
+    /// it.
+    Lost(R),
+    /// The prompt was withdrawn and nothing was committed; the run fails.
+    Withdrawn,
 }
 
-impl LocalSessionRuntime {
-    #[must_use]
-    pub fn new(db: ChatDb) -> Self {
-        let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
-            db,
-            crate::ui_event_bus::UiEventBus::new(),
+/// Read the daemon's answer to `POST /api/ask-user/respond`: `false` when the
+/// question is no longer open, an error for every other failure.
+fn committed_or_not_open<T>(
+    result: Result<T, crate::client::DaemonClientError>,
+) -> Result<bool, TuiRuntimeError> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(crate::client::DaemonClientError::Status { status, .. })
+            if status == crate::daemon::ASK_USER_NOT_OPEN =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod ask_user_commit_tests {
+    use super::*;
+    use crate::client::DaemonClientError;
+
+    fn refused(status: hyper::StatusCode, message: &str) -> Result<(), DaemonClientError> {
+        Err(DaemonClientError::Status {
+            path: "/api/ask-user/respond".to_string(),
+            status,
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn an_answer_the_daemon_took_is_committed() {
+        assert!(committed_or_not_open(Ok(())).expect("committed"));
+    }
+
+    #[test]
+    fn a_question_that_is_not_open_is_not_an_error() {
+        let result = committed_or_not_open(refused(
+            crate::daemon::ASK_USER_NOT_OPEN,
+            "ask_user request not found or withdrawn",
         ));
-        let permission_approver =
-            crate::agent::PermissionApprover::new().with_runtime_service(runtime_service.clone());
-        Self {
-            runtime_service,
-            permission_approver,
-            oneshot_restricted: false,
-        }
+        assert!(!result.expect("not open is not a failure"));
     }
 
-    pub const fn enable_oneshot_restricted_mode(&mut self) {
-        self.oneshot_restricted = true;
-    }
-
-    #[must_use]
-    pub fn permission_approver_for(
-        &self,
-        session_id: &SessionId,
-    ) -> crate::agent::PermissionApprover {
-        if self.oneshot_restricted {
-            return self
-                .permission_approver
-                .for_session(session_id.as_str().to_string())
-                .without_interactive_approval("restricted oneshot mode");
-        }
-        self.permission_approver
-            .for_session(session_id.as_str().to_string())
-    }
-
-    pub async fn sync_app_queue(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-    ) -> anyhow::Result<()> {
-        let runtime = self
-            .runtime_service
-            .get(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?;
-        let pending_immediate = match runtime.pending_immediate {
-            Some(message) => Some(pending_message_from_runtime(message).await?),
-            None => None,
-        };
-        let mut queued_messages = Vec::with_capacity(runtime.queued_messages.len());
-        for message in runtime.queued_messages {
-            queued_messages.push(pending_message_from_runtime(message).await?);
-        }
-        app.queue.replace(pending_immediate, queued_messages);
-        Ok(())
-    }
-
-    pub async fn enqueue_pending_message(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-        message: PendingMessage,
-    ) -> anyhow::Result<()> {
-        let runtime = self
-            .runtime_service
-            .enqueue(
-                session_id.as_str(),
-                pending_message_to_runtime(&message)?,
-                message.delivery_mode,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        let pending_immediate = match runtime.pending_immediate {
-            Some(message) => Some(pending_message_from_runtime(message).await?),
-            None => None,
-        };
-        let mut queued_messages = Vec::with_capacity(runtime.queued_messages.len());
-        for message in runtime.queued_messages {
-            queued_messages.push(pending_message_from_runtime(message).await?);
-        }
-        app.queue.replace(pending_immediate, queued_messages);
-        Ok(())
-    }
-
-    pub async fn take_next_dispatchable(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-    ) -> anyhow::Result<Option<PendingMessage>> {
-        let next = self
-            .runtime_service
-            .take_next_dispatchable(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?;
-        let next = match next {
-            Some(message) => Some(pending_message_from_runtime(message).await?),
-            None => None,
-        };
-        self.sync_app_queue(app, session_id).await?;
-        Ok(next)
-    }
-
-    pub async fn set_running(&self, session_id: &SessionId) -> anyhow::Result<()> {
-        self.runtime_service
-            .set_state(
-                session_id.as_str(),
-                crate::session::SessionRuntimeState::Running,
-            )
-            .await
-            .map_err(anyhow::Error::from)
-    }
-
-    pub async fn clear_running_if_needed(&self, session_id: &SessionId) -> anyhow::Result<()> {
-        self.runtime_service
-            .clear_running_if_needed(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)
-    }
-
-    pub async fn register_ask_user_request(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-        questions: &[Question],
-    ) -> anyhow::Result<String> {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.runtime_service
-            .set_waiting_ask_user(
-                session_id.as_str(),
-                Some(crate::session::PersistedAskUserRequest {
-                    id: request_id.clone(),
-                    questions: questions
-                        .iter()
-                        .map(|question| crate::session::PersistedAskUserQuestion {
-                            section: question.section.clone(),
-                            question: question.question.clone(),
-                            option: question.option.clone(),
-                            multi_select: question.multi_select,
-                        })
-                        .collect(),
-                }),
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        let questions_json = serde_json::to_value(questions).map_err(anyhow::Error::from)?;
-        app.session_manager
-            .append_message(crate::session::ChatMessage::ask_user_request(
-                &crate::session::history::AskUserRequestData {
-                    id: request_id.clone(),
-                    questions: questions_json,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(request_id)
-    }
-
-    pub async fn resolve_ask_user_response(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-        request_id: &str,
-        answers: &[QuestionAnswer],
-    ) -> anyhow::Result<()> {
-        self.runtime_service
-            .set_waiting_ask_user(session_id.as_str(), None)
-            .await
-            .map_err(anyhow::Error::from)?;
-        self.runtime_service
-            .set_state(
-                session_id.as_str(),
-                crate::session::SessionRuntimeState::Running,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        let answers_json = serde_json::to_value(answers).map_err(anyhow::Error::from)?;
-        app.session_manager
-            .append_message(crate::session::ChatMessage::ask_user_response(
-                &crate::session::history::AskUserResponseData {
-                    id: request_id.to_string(),
-                    answers: answers_json,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(())
-    }
-
-    pub async fn register_workspace_request(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-        request: &crate::workspace_request::RequestWorkspaceArgs,
-    ) -> anyhow::Result<String> {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.runtime_service
-            .set_waiting_workspace(
-                session_id.as_str(),
-                Some(crate::session::PersistedWorkspaceRequest {
-                    id: request_id.clone(),
-                    request: crate::session::PersistedWorkspaceRequestPayload {
-                        path: request.path.clone(),
-                        reason: request.reason.clone(),
-                        session_id: Some(session_id.as_str().to_string()),
-                    },
-                }),
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        app.session_manager
-            .append_message(crate::session::ChatMessage::workspace_request(
-                &crate::session::history::WorkspaceRequestData {
-                    id: request_id.clone(),
-                    path: request.path.clone(),
-                    reason: request.reason.clone(),
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(request_id)
-    }
-
-    pub async fn resolve_workspace_response(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-        request_id: &str,
-        approved: bool,
-    ) -> anyhow::Result<()> {
-        self.runtime_service
-            .set_waiting_workspace(session_id.as_str(), None)
-            .await
-            .map_err(anyhow::Error::from)?;
-        self.runtime_service
-            .set_state(
-                session_id.as_str(),
-                crate::session::SessionRuntimeState::Running,
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        app.session_manager
-            .append_message(crate::session::ChatMessage::workspace_response(
-                &crate::session::history::WorkspaceResponseData {
-                    id: request_id.to_string(),
-                    approved,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(())
-    }
-
-    pub async fn waiting_permission(
-        &self,
-        session_id: &SessionId,
-    ) -> anyhow::Result<Option<crate::session::PersistedPermissionRequest>> {
-        self.runtime_service
-            .get(session_id.as_str())
-            .await
-            .map(|runtime| runtime.waiting_permission)
-            .map_err(anyhow::Error::from)
-    }
-
-    pub async fn resolve_permission_response(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
-        request_id: &str,
-        approved: bool,
-    ) -> anyhow::Result<()> {
-        let responded = self.permission_approver.respond(request_id, approved);
-        self.runtime_service
-            .set_waiting_permission(session_id.as_str(), None)
-            .await
-            .map_err(anyhow::Error::from)?;
-        self.runtime_service
-            .set_state(
-                session_id.as_str(),
-                if responded {
-                    crate::session::SessionRuntimeState::Running
-                } else {
-                    crate::session::SessionRuntimeState::Idle
-                },
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        app.session_manager
-            .append_message(crate::session::ChatMessage::permission_response(
-                &crate::session::history::PermissionResponseData {
-                    id: request_id.to_string(),
-                    approved,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
-        if !responded {
-            tracing::warn!(
-                request_id,
-                "permission response resolved without a live waiter"
-            );
-        }
-        Ok(())
+    #[test]
+    fn a_storage_failure_is_an_error_naming_it() {
+        let error = committed_or_not_open(refused(
+            hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to store secret deploy_token: keychain error",
+        ))
+        .expect_err("a storage failure is not 'not open'");
+        assert!(error.to_string().contains("keychain error"), "{error}");
     }
 }
 
-fn pending_message_to_runtime(
-    message: &PendingMessage,
-) -> Result<crate::session::PendingUserMessage, TuiRuntimeError> {
-    Ok(crate::session::PendingUserMessage {
-        content: message.content.clone(),
-        attachments: message
-            .attachments
+/// Answers as `POST /api/ask-user/respond` takes them. A skipped answer is
+/// the user declining to give a secret.
+fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
+    use crate::ask_user::AnswerValue;
+    serde_json::Value::Array(
+        answers
             .iter()
-            .map(persisted_attachment_from_tui)
-            .collect::<Result<Vec<_>, _>>()?,
-        hidden_context_xml: message.hidden_context_xml.clone(),
-        created_at: message.queued_at.to_string(),
-        delivery_mode: message.delivery_mode,
-    })
+            .map(|answer| {
+                let value = match &answer.answer {
+                    AnswerValue::Selected(values) => {
+                        serde_json::json!({ "kind": "selected", "values": values })
+                    }
+                    AnswerValue::Custom(text) => {
+                        serde_json::json!({ "kind": "custom", "text": text })
+                    }
+                    AnswerValue::Skipped => serde_json::json!({ "kind": "declined" }),
+                };
+                serde_json::json!({ "section": answer.section, "answer": value })
+            })
+            .collect(),
+    )
 }
 
-async fn pending_message_from_runtime(
-    message: crate::session::PendingUserMessage,
-) -> Result<PendingMessage, TuiRuntimeError> {
-    let mut attachments = Vec::with_capacity(message.attachments.len());
-    for attachment in message.attachments {
-        attachments.push(tui_attachment_from_persisted(attachment).await?);
-    }
-    Ok(PendingMessage {
-        content: message.content,
-        hidden_context_xml: message.hidden_context_xml,
-        attachments,
-        queued_at: message
-            .created_at
-            .parse()
-            .map_err(TuiRuntimeError::InvalidPendingMessageTimestamp)?,
-        delivery_mode: message.delivery_mode,
-    })
-}
-
-fn persisted_attachment_from_tui(
+async fn persisted_attachment_from_tui(
+    client: &crate::client::DaemonClient,
+    session_id: &str,
     attachment: &Attachment,
 ) -> Result<crate::session::PersistedAttachment, TuiRuntimeError> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::id::new();
     match attachment {
-        Attachment::Image { path, data } => Ok(crate::session::PersistedAttachment {
-            id,
-            name: file_name_or_default(path, "image.png"),
-            attachment_type: AttachmentKind::Image,
-            url: file_url(path)?,
-            upload_data_url: Some(image_data_url(path, data)),
-            text_content: None,
-        }),
+        Attachment::Image { path, data } => {
+            let name = file_name_or_default(path, "image.png");
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let record: crate::session::PersistedAttachment = client
+                .post_raw(
+                    &format!(
+                        "/api/sessions/{session_id}/attachments?name={}",
+                        urlencoding(&name)
+                    ),
+                    data.clone(),
+                    mime.as_ref(),
+                )
+                .await?;
+            Ok(crate::session::PersistedAttachment {
+                id,
+                name,
+                attachment_type: AttachmentKind::Image,
+                url: record.url,
+                text_content: None,
+            })
+        }
         Attachment::FileReference { path } => Ok(crate::session::PersistedAttachment {
             id,
             name: file_name_or_default(path, "file"),
             attachment_type: AttachmentKind::File,
             url: file_url(path)?,
-            upload_data_url: None,
             text_content: None,
         }),
         Attachment::PastedText {
@@ -436,26 +254,35 @@ fn persisted_attachment_from_tui(
                 .map(|path| file_url(path))
                 .transpose()?
                 .unwrap_or_else(|| "may://inline-text".to_string()),
-            upload_data_url: None,
             text_content: Some(content.clone()),
         }),
     }
 }
 
-async fn tui_attachment_from_persisted(
+pub(super) async fn tui_attachment_from_persisted(
+    client: Option<&crate::client::DaemonClient>,
     attachment: crate::session::PersistedAttachment,
 ) -> Result<Attachment, TuiRuntimeError> {
     match attachment.attachment_type {
         AttachmentKind::Image => {
-            let path = path_from_attachment_url(&attachment.url)?;
-            let data = if async_fs::metadata(&path).await.is_ok() {
-                async_fs::read(&path).await?
-            } else if let Some(data_url) = attachment.upload_data_url.as_deref() {
-                decode_data_url(data_url)?
-            } else {
-                return Err(TuiRuntimeError::PersistedImageMissingContent);
+            let display_path = path_from_attachment_url(&attachment.url)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&attachment.name));
+            let data = match path_from_attachment_url(&attachment.url) {
+                Ok(path) if async_fs::metadata(&path).await.is_ok() => {
+                    async_fs::read(&path).await?
+                }
+                _ if attachment.url.starts_with("/api/sessions/") => {
+                    client
+                        .ok_or(TuiRuntimeError::PersistedImageMissingContent)?
+                        .get_bytes(&attachment.url)
+                        .await?
+                }
+                _ => return Err(TuiRuntimeError::PersistedImageMissingContent),
             };
-            Ok(Attachment::Image { path, data })
+            Ok(Attachment::Image {
+                path: display_path,
+                data,
+            })
         }
         AttachmentKind::File => Ok(Attachment::FileReference {
             path: path_from_attachment_url(&attachment.url)?,
@@ -503,56 +330,122 @@ fn file_name_or_default(path: &std::path::Path, default_name: &str) -> String {
         .map_or_else(|| default_name.to_string(), ToOwned::to_owned)
 }
 
-fn image_data_url(path: &std::path::Path, data: &[u8]) -> String {
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-    let mut url = String::from("data:");
-    url.push_str(mime.as_ref());
-    url.push_str(";base64,");
-    url.push_str(encoded.as_str());
-    url
+fn urlencoding(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
-fn decode_data_url(data_url: &str) -> Result<Vec<u8>, TuiRuntimeError> {
-    let Some((_, encoded)) = data_url.split_once(',') else {
-        return Err(TuiRuntimeError::InvalidDataUrl);
-    };
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(TuiRuntimeError::DecodeDataUrl)
+/// Result of starting the next queued turn.
+#[derive(Debug)]
+pub enum QueuedRun {
+    /// No message is dispatchable; the session was left untouched.
+    Nothing,
+    /// Another run holds the session; the queue was left untouched.
+    Busy,
+    /// The lease is held and the message was taken for the turn.
+    Started(PendingMessage, Box<crate::session::SessionRunGuard>),
+}
+
+/// Outcome of [`RuntimeDeps::begin_queued_run`].
+#[derive(Debug)]
+pub enum QueuedRunStart {
+    /// No message is dispatchable.
+    Nothing,
+    /// Another run holds the session; the queue was left untouched.
+    Busy,
+    /// The app holds the lease and the message is to run.
+    Started(PendingMessage),
 }
 
 /// Runtime dependencies shared by session and agent operations.
 #[derive(Debug, Clone)]
 pub struct RuntimeDeps {
-    workspace_broker: WorkspaceRequestBroker,
-    ask_user_broker: AskUserBroker,
-    tool_dispatchers: ToolDispatchers,
-    location_provider: Arc<crate::location::LocationProvider>,
-    local_runtime: LocalSessionRuntime,
+    tool_environments: crate::agent::ToolEnvironmentCache,
     oneshot_model: Option<String>,
     oneshot_reasoning_effort: Option<ReasoningEffort>,
+    /// The May daemon that runs this TUI's agents, when it is a client.
+    daemon: Option<crate::client::DaemonClient>,
+    /// The session's turns belong to this process, a one-shot run: the daemon
+    /// stops a turn whose client disconnects.
+    owns_turns: bool,
+}
+
+/// An agent worker under construction off the event loop.
+///
+/// Construction prepares the session's tool environments, which may ask the
+/// user for SSH consent, so the event loop awaits [`Self::wait`] alongside its
+/// ask-user queue instead of blocking on it. Dropping the build cancels it.
+#[derive(Debug)]
+pub struct PendingWorkerBuild {
+    model: String,
+    settings: crate::agent::AgentLiveSettings,
+    task: std::pin::Pin<Box<executor_core::AnyExecutorTask<Result<AgentWorker, TuiRuntimeError>>>>,
+}
+
+impl PendingWorkerBuild {
+    /// Model the worker is being built for.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Config values the worker is built from.
+    #[must_use]
+    pub const fn settings(&self) -> &crate::agent::AgentLiveSettings {
+        &self.settings
+    }
+
+    /// Waits for the worker; cancellation-safe, so it can be raced in a select.
+    ///
+    /// # Errors
+    /// Returns the agent construction failure.
+    pub async fn wait(&mut self) -> Result<AgentWorker, TuiRuntimeError> {
+        self.task.as_mut().await
+    }
 }
 
 impl RuntimeDeps {
-    pub const fn new(
-        local_runtime: LocalSessionRuntime,
-        workspace_broker: WorkspaceRequestBroker,
-        ask_user_broker: AskUserBroker,
-        tool_dispatchers: ToolDispatchers,
-        location_provider: Arc<crate::location::LocationProvider>,
-    ) -> Self {
+    /// Create the dependency bundle shared by every agent worker the runtime
+    /// spawns.
+    #[must_use]
+    pub const fn new(tool_environments: crate::agent::ToolEnvironmentCache) -> Self {
         Self {
-            workspace_broker,
-            ask_user_broker,
-            tool_dispatchers,
-            location_provider,
-            local_runtime,
+            tool_environments,
             oneshot_model: None,
             oneshot_reasoning_effort: None,
+            daemon: None,
+            owns_turns: false,
         }
     }
 
+    /// Run every agent in the daemon behind `client` instead of in-process.
+    #[must_use]
+    pub fn with_daemon(mut self, client: crate::client::DaemonClient) -> Self {
+        self.daemon = Some(client);
+        self
+    }
+
+    /// The daemon this TUI is a client of, if any.
+    #[must_use]
+    pub const fn daemon(&self) -> Option<&crate::client::DaemonClient> {
+        self.daemon.as_ref()
+    }
+
+    /// Forgets the prepared tool environment of a deleted session.
+    pub fn evict_session(&self, session_id: &SessionId) {
+        self.tool_environments.evict(session_id);
+    }
+
+    /// Return a copy that overrides the configured model and reasoning effort for
+    /// the next spawned worker only.
     #[must_use]
     pub fn with_oneshot_overrides(
         mut self,
@@ -561,81 +454,280 @@ impl RuntimeDeps {
     ) -> Self {
         self.oneshot_model = model;
         self.oneshot_reasoning_effort = reasoning_effort;
+        self.owns_turns = true;
         self
     }
 
-    pub async fn start_new_session(
+    /// Creates and activates a new session in memory only.
+    ///
+    /// Nothing reaches the daemon yet: the session row, its directories and
+    /// the agent worker are created by [`Self::materialize_session`] on the
+    /// first message sent.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when no model can be resolved for display.
+    pub async fn begin_new_session(
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
+        discard_ephemeral_session(app).await;
         let model = self
             .oneshot_model
             .clone()
-            .or_else(|| app.config.last_model.clone());
-        let (sandbox_dir, session_id, messages) = {
+            .or_else(|| app.config.last_model.as_ref().map(ToString::to_string));
+        let name = app.session_manager.issue_session_name().await?;
+        let (session_id, messages) = {
             let session = app
                 .session_manager
-                .create_session_with_model(model.clone())?;
-            (
-                session.sandbox_dir.clone(),
-                session.id.clone(),
-                session.history.messages().to_vec(),
-            )
+                .create_session_with_model(name, model.clone())?;
+            (session.id.clone(), session.history.messages().to_vec())
         };
 
-        app.session_manager.ensure_persisted().await?;
-        app.init_session(&session_id, &messages, model.as_deref());
-        self.local_runtime.sync_app_queue(app, &session_id).await?;
+        app.init_session(&session_id, &messages).await;
+        *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
-        let new_worker = self
-            .build_worker_for_session(
-                app,
-                sandbox_dir,
-                session_id,
-                selected_model.as_str(),
-                self.oneshot_reasoning_effort,
-            )
-            .await?;
-
         app.set_current_model(selected_model.as_str());
-        *worker = Some(new_worker);
         Ok(())
     }
 
-    pub async fn load_session(
+    /// Persist the current session and start building its worker — the
+    /// transition a session's first message performs. `Ok(None)` when the
+    /// current session was already materialized or none is active.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the session cannot be persisted or
+    /// the worker build fails to start.
+    pub async fn materialize_session(
+        &self,
+        app: &mut App,
+    ) -> Result<Option<PendingWorkerBuild>, TuiRuntimeError> {
+        if app
+            .session_manager
+            .current()
+            .is_none_or(|session| session.persisted)
+        {
+            return Ok(None);
+        }
+        app.session_manager.ensure_persisted().await?;
+        let session = app
+            .session_manager
+            .current()
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let sandbox_dir = session.sandbox_dir.clone();
+        let session_id = session.id.clone();
+        let selected_model = SelectedModel::resolve(&app.config, session.model.as_deref())?;
+        let reasoning_effort = self.oneshot_reasoning_effort.or_else(|| {
+            app.current_effort
+                .as_deref()
+                .and_then(parse_reasoning_effort)
+        });
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            selected_model,
+            reasoning_effort,
+            None,
+        )
+        .map(Some)
+    }
+
+    /// Activates a stored session and starts building its worker.
+    ///
+    /// The previous session's worker is dropped at once; messages sent before
+    /// the new worker is ready are queued for it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the session cannot be loaded or the worker build fails.
+    pub async fn begin_load_session(
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
         id: &SessionId,
-    ) -> anyhow::Result<()> {
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        discard_ephemeral_session(app).await;
         let session = app.session_manager.load_session(id).await?;
 
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
         let session_model = session.model.clone();
+        let events_cursor = session.events_cursor.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
 
-        app.init_session(&session_id, &messages, session_model.as_deref());
-        self.local_runtime.sync_app_queue(app, &session_id).await?;
+        app.init_session(&session_id, &messages).await;
+        *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
-        let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str(), None)
-            .await?;
-
-        app.set_current_model(selected_model.as_str());
-        *worker = Some(new_worker);
-        Ok(())
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            selected_model,
+            None,
+            events_cursor,
+        )
     }
 
-    pub async fn switch_model(
+    /// Import a foreign agent's global rules and skills: the daemon copies
+    /// the skills and opens the session that rewrites the rules into
+    /// `~/.may/AGENTS.md`, which this switches to. `None` when the agent has
+    /// no rules file, so only its skills were copied.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the daemon refuses the import or the
+    /// import session cannot be loaded.
+    pub async fn begin_rules_import(
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
+        source: crate::session::import::ForeignAgent,
+    ) -> Result<Option<PendingWorkerBuild>, TuiRuntimeError> {
+        app.chat.push_notice(&format!(
+            "Importing {}'s skills and global rules…",
+            source.product_name()
+        ));
+        let response: crate::rules_import::RulesImportResponse = self
+            .daemon()
+            .ok_or(TuiRuntimeError::DaemonUnavailable)?
+            .post(
+                "/api/rules/import",
+                &crate::rules_import::RulesImportRequest {
+                    source: source.label().to_string(),
+                    profile_id: app.current_profile_id.clone(),
+                },
+            )
+            .await?;
+        let skills = |names: &[String]| {
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        };
+        let skills_notice = format!(
+            "Skills imported: {}. Skipped, May already has one by that name: {}.",
+            skills(&response.imported_skills),
+            skills(&response.skipped_skills)
+        );
+        let Some(session_id) = response.session_id else {
+            app.chat.push_notice(&skills_notice);
+            app.chat.push_notice(&format!(
+                "No global rules to import: {} does not exist.",
+                response.rules_file
+            ));
+            return Ok(None);
+        };
+        let build = self
+            .begin_load_session(app, worker, &SessionId::from(session_id))
+            .await?;
+        app.chat.push_notice(&skills_notice);
+        Ok(Some(build))
+    }
+
+    /// Import a foreign agent transcript into a fresh session and start
+    /// building its worker.
+    ///
+    /// The transcript is located and parsed off the event loop, then the new
+    /// session is seeded with the converted messages and a provenance note.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the transcript cannot be found or
+    /// parsed, or when session/worker setup fails.
+    pub async fn begin_import_session(
+        &self,
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        source: crate::session::import::ForeignAgent,
+        query: &str,
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        discard_ephemeral_session(app).await;
+        let query_owned = query.to_string();
+        let mut imported =
+            blocking::unblock(move || crate::session::import::import(source, &query_owned)).await?;
+
+        let model = imported.model.clone();
+        let name = app.session_manager.issue_session_name().await?;
+        let (sandbox_dir, _session_id, imported_count) = {
+            let session = app
+                .session_manager
+                .create_session_with_model(name, model.clone())?;
+            (
+                session.sandbox_dir.clone(),
+                session.id.clone(),
+                imported.messages.len(),
+            )
+        };
+        app.session_manager.ensure_persisted().await?;
+        app.session_manager
+            .set_current_title(imported.title.clone())
+            .await?;
+
+        // Persist image payloads the parser decoded into the session dir,
+        // then fix the attachment URLs to their real paths.
+        for (rel, bytes) in &imported.files {
+            let path = sandbox_dir.join(rel);
+            if let Some(parent) = path.parent() {
+                async_fs::create_dir_all(parent).await?;
+            }
+            async_fs::write(&path, bytes).await?;
+        }
+        let provenance = serde_json::json!({
+            "kind": "imported_session",
+            "source": source.label(),
+            "source_session_id": imported.source_id,
+            "source_path": imported.source_path.display().to_string(),
+            "source_cwd": imported.cwd,
+            "note": "This session continues an imported foreign-agent transcript. Prior tool calls appear as `terminal` calls; reasoning state was preserved verbatim.",
+        });
+        let session_id = app
+            .session_manager
+            .current()
+            .map(|session| session.id.clone())
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let mut injected = Vec::with_capacity(imported.messages.len() + 1);
+        injected.push(ChatMessage::hidden_context(provenance.to_string()));
+        injected.append(&mut imported.messages);
+        let _: i64 = self
+            .daemon()
+            .ok_or(TuiRuntimeError::DaemonUnavailable)?
+            .post(
+                &format!("/api/sessions/{}/history", session_id.as_str()),
+                &injected,
+            )
+            .await?;
+        for message in injected {
+            app.session_manager.record_unpersisted(message);
+        }
+
+        let messages: Vec<_> = app
+            .session_manager
+            .current()
+            .map(|session| session.history.messages().to_vec())
+            .unwrap_or_default();
+        app.init_session(&session_id, &messages).await;
+        app.chat.push_notice(&format!(
+            "Imported {imported_count} messages from {} session {}",
+            source.label(),
+            imported.source_id
+        ));
+        *worker = None;
+
+        let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
+    }
+
+    /// Starts building a worker for the current session on `model`; the
+    /// current worker keeps serving until the new one is installed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the worker build cannot start.
+    pub fn begin_switch_model(
+        &self,
+        app: &App,
         model: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         let session = app
             .session_manager
             .current()
@@ -644,23 +736,72 @@ impl RuntimeDeps {
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
 
-        let selected_model = SelectedModel::new(model)?;
-        let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str(), None)
-            .await?;
-
-        app.set_current_model(selected_model.as_str());
-        *worker = Some(new_worker);
-        Ok(())
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            SelectedModel::new(model)?,
+            None,
+            None,
+        )
     }
 
+    /// Starts building a replacement worker for the current session from the
+    /// saved config, on the session's model; the current worker keeps serving
+    /// until the new one is installed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the worker build cannot start.
+    pub fn begin_reload_worker(&self, app: &App) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        let session = app
+            .session_manager
+            .current()
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let sandbox_dir = session.sandbox_dir.clone();
+        let session_id = session.id.clone();
+        let selected_model = SelectedModel::resolve(&app.config, session.model.as_deref())?;
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
+    }
+
+    /// Installs a worker finished by `build` as the current session's worker.
+    pub fn install_worker(
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        build: &PendingWorkerBuild,
+        new_worker: AgentWorker,
+    ) {
+        app.set_current_model(build.model());
+        app.worker_settings = build.settings().clone();
+        app.background = new_worker.background().cloned();
+        app.refresh_jobs();
+        *worker = Some(new_worker);
+    }
+
+    /// Start an agent turn for the current session.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when no session is active or the worker fails to start.
     pub async fn start_agent_task(
         &self,
         app: &mut App,
         worker: &AgentWorker,
         msg: PendingMessage,
         title_gen: &mut Option<TitleGenContext>,
-    ) -> anyhow::Result<AgentHandle> {
+    ) -> Result<AgentHandle, TuiRuntimeError> {
+        let turn = Self::show_agent_turn(app, msg, title_gen).await?;
+        Ok(worker.send(turn))
+    }
+
+    /// Shows `msg` as a turn in progress (user bubble, loading indicator) and
+    /// returns the turn to hand to a worker, which may not exist yet.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when an attachment cannot be persisted.
+    pub async fn show_agent_turn(
+        app: &mut App,
+        msg: PendingMessage,
+        title_gen: &mut Option<TitleGenContext>,
+    ) -> Result<crate::agent::RemoteTurn, TuiRuntimeError> {
         let needs_title = app
             .session_manager
             .current()
@@ -672,349 +813,503 @@ impl RuntimeDeps {
             });
         }
 
-        if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
-            app.session_manager
-                .append_message(ChatMessage::hidden_context(hidden_context_xml.to_string()))
-                .await
-                .map_err(anyhow::Error::from)?;
-        }
-
-        app.session_manager
-            .append_message(ChatMessage::user(&msg.content))
-            .await
-            .map_err(anyhow::Error::from)?;
-
-        let (prompt, image_urls) = prepare_message_content(&msg)?;
-        app.start_processing(&msg);
-        Ok(worker.run(
-            prompt,
-            msg.hidden_context_xml.as_ref().map(ToString::to_string),
-            image_urls,
-        ))
+        Self::display_remote_turn(app, msg).await
     }
 
+    /// Shows `msg` and builds the turn the daemon will run. The daemon writes
+    /// the turn's rows; the in-memory history records the message now so the
+    /// chat's history positions stay aligned until the turn's end reloads them.
+    async fn display_remote_turn(
+        app: &mut App,
+        msg: PendingMessage,
+    ) -> Result<crate::agent::RemoteTurn, TuiRuntimeError> {
+        let client = app.session_manager.daemon_handle()?;
+        let session_id = app
+            .session_manager
+            .current()
+            .map(|session| session.id.as_str().to_string())
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let mut attachments = Vec::with_capacity(msg.attachments.len());
+        for attachment in &msg.attachments {
+            attachments
+                .push(persisted_attachment_from_tui(&client, &session_id, attachment).await?);
+        }
+        if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
+            app.session_manager
+                .record_unpersisted(ChatMessage::hidden_context(hidden_context_xml.to_string()));
+        }
+        app.session_manager
+            .record_unpersisted(ChatMessage::user_with_attachments(
+                msg.content.clone(),
+                attachments.clone(),
+            ));
+        app.start_processing(&msg);
+        Ok(crate::agent::RemoteTurn {
+            content: msg.content,
+            attachments,
+            hidden_context_xml: msg.hidden_context_xml.as_ref().map(ToString::to_string),
+        })
+    }
+
+    /// Settle the app after a run finishes: persist the assistant message, save
+    /// the session, finish the run (which settles the session's runtime state
+    /// and releases its lease), and kick off title generation.
     pub async fn finish_agent_task(
         &self,
         app: &mut App,
         agent_handle: &mut Option<AgentHandle>,
         title_gen: &mut Option<TitleGenContext>,
-        assistant_response: &str,
+        _assistant_response: &AssistantReply,
+        _outcome: crate::session::RunOutcome,
     ) {
-        let session_id = app
+        let _session_id = app
             .session_manager
             .current()
             .map(|session| session.id.clone());
         *agent_handle = None;
         app.finish_processing();
+        app.clear_persistent_status();
+        app.chat
+            .fold_turn_work(app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()));
 
-        if !assistant_response.is_empty()
-            && let Err(error) = app
-                .session_manager
-                .append_message(ChatMessage::assistant(assistant_response))
-                .await
-        {
-            tracing::warn!(error = %error, "failed to persist assistant message");
+        // The daemon persisted the turn and names the session.
+        if let Err(error) = app.session_manager.refresh_history().await {
+            tracing::warn!(%error, "failed to reload the session history");
+        }
+        title_gen.take();
+    }
+
+    /// Rewind the conversation to just before the user message at
+    /// `history_index`, optionally restoring tracked files to that
+    /// prompt's checkpoint, then start building a worker that replays the
+    /// truncated history.
+    ///
+    /// The prompt's text and attachments are placed back in the input for
+    /// editing; pending queued messages are dropped with the abandoned
+    /// timeline; the current worker is dropped since its context still
+    /// holds it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when `history_index` does not identify
+    /// a user prompt, the persisted history cannot be truncated, or the
+    /// worker build cannot start.
+    pub async fn rewind_conversation(
+        &self,
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        history_index: usize,
+        restore_code: bool,
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        let Some((content, attachments)) = app.chat.prompt_rewind_payload(history_index) else {
+            return Err(crate::session::SessionError::NotFound(format!(
+                "no prompt at history position {history_index}"
+            ))
+            .into());
+        };
+        let point = app.session_manager.rewind_to_prompt(history_index).await?;
+
+        let session = app
+            .session_manager
+            .current()
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let session_id = session.id.clone();
+        let sandbox_dir = session.sandbox_dir.clone();
+        let model = session.model.clone();
+
+        if restore_code {
+            app.request_prompt_rewind(point.user_message_id);
         }
 
-        if let Err(e) = app.session_manager.save_current().await {
-            tracing::warn!("Failed to save session history: {}", e);
-        }
-        if let Some(session_id) = session_id.as_ref() {
-            if let Err(error) = self.local_runtime.clear_running_if_needed(session_id).await {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to clear local runtime state");
-            }
-            if let Err(error) = self.local_runtime.sync_app_queue(app, session_id).await {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to refresh local pending queue");
-            }
-        }
-
-        if let Some(ctx) = title_gen.take()
-            && !assistant_response.is_empty()
-        {
-            self.spawn_title_generation(
-                app.config.clone(),
-                app.session_manager.db().clone(),
-                app.session_manager.current().map(|s| s.id.clone()),
-                ctx.user_message,
-                assistant_response.to_string(),
+        app.chat.truncate_prompt_at(history_index);
+        app.input = content;
+        app.input_char_count = app.input.chars().count();
+        app.cursor = app.input_char_count;
+        app.attachments = attachments;
+        // The next send carries a one-shot notice: the conversation rolled
+        // back while the world — open and merged PRs — stands. The audit
+        // log already recorded a `rewound` event per session PR.
+        let mut notice =
+            "The conversation was rewound to an earlier point. Nothing outside the conversation changed — repository state, open and merged pull requests, and issues still stand as recorded. Undo landed code through a revert PR, never by rewriting history.".to_string();
+        let prs = &app.sidebar.prs;
+        if !prs.is_empty() {
+            let list = prs
+                .iter()
+                .map(|pr| format!("#{} {} ({})", pr.number, pr.title, pr.state))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = std::fmt::Write::write_fmt(
+                &mut notice,
+                format_args!(" Session pull requests: {list}."),
             );
         }
+        app.rewind_notice = crate::xml::XmlBlock::parse(notice).ok();
+        app.chat.push_notice(&format!(
+            "⏪ rewound to before this prompt{}",
+            if restore_code {
+                " (conversation + code)"
+            } else {
+                " (conversation)"
+            }
+        ));
+        app.scroll = usize::MAX;
+
+        *worker = None;
+        let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
-    async fn build_worker_for_session(
+    /// A worker for `session_id` whose agent runs in the daemon. The model,
+    /// reasoning effort and working directory the daemon runs the session
+    /// with are recorded on the session first. `events_cursor` is the
+    /// cursor `GET /api/sessions/{id}` reported when the session loaded —
+    /// the point its event stream resumes from.
+    fn begin_remote_worker(
+        app: &App,
+        client: crate::client::DaemonClient,
+        session_id: SessionId,
+        model: SelectedModel,
+        reasoning_effort: Option<ReasoningEffort>,
+        events_cursor: Option<String>,
+        owns_turns: bool,
+    ) -> PendingWorkerBuild {
+        let cwd = app.cwd.display().to_string();
+        let model_id = model.as_str().to_string();
+        let app_events = app.event_tx.clone();
+        let task = spawn(async move {
+            let mut body = serde_json::json!({
+                "model": model_id,
+                "cwd": cwd,
+            });
+            // An absent reasoningEffort leaves the stored level untouched; a
+            // serialized null would read as "clear" on the daemon's tri-state.
+            if let Some(effort) = reasoning_effort {
+                body["reasoningEffort"] = serde_json::json!(match effort {
+                    ReasoningEffort::None => "none",
+                    ReasoningEffort::Minimal => "minimal",
+                    ReasoningEffort::Low => "low",
+                    ReasoningEffort::Medium => "medium",
+                    ReasoningEffort::High => "high",
+                    ReasoningEffort::XHigh => "xhigh",
+                    ReasoningEffort::Max => "max",
+                });
+            }
+            let _: serde_json::Value = client
+                .patch(&format!("/api/sessions/{}", session_id.as_str()), &body)
+                .await
+                .map_err(TuiRuntimeError::from)?;
+            Ok(crate::tui::remote::spawn_remote_worker(
+                client,
+                session_id.as_str().to_string(),
+                app_events,
+                events_cursor,
+                owns_turns,
+            ))
+        });
+        PendingWorkerBuild {
+            model: model.0,
+            settings: crate::agent::AgentLiveSettings::of(&app.config),
+            task: Box::pin(task),
+        }
+    }
+
+    fn begin_worker_build(
         &self,
         app: &App,
-        sandbox_dir: std::path::PathBuf,
+        _sandbox_dir: std::path::PathBuf,
         session_id: SessionId,
-        model: &str,
+        model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> anyhow::Result<AgentWorker> {
-        let db = app.session_manager.db().clone();
-        let session_id_string = session_id.as_str().to_string();
-        let history_messages = app
-            .session_manager
-            .current()
-            .map(|session| session.history.to_aither_messages())
-            .unwrap_or_default();
-        let may_dir = app.session_manager.may_dir().to_path_buf();
-        let profile_model = if let Some(profile_id) = app
-            .session_manager
-            .current()
-            .and_then(|session| session.profile_id.clone())
-        {
-            app.session_manager
-                .db()
-                .get_profile(&profile_id)
-                .await
-                .map_err(anyhow::Error::from)?
-        } else {
-            None
-        };
-        let profile_persona = profile_model
-            .as_ref()
-            .and_then(|profile| profile.persona.clone());
-        let profile_memories = if let Some(ref profile) = profile_model {
-            let memories =
-                crate::memory::ProfileMemories::load(app.session_manager.db(), &profile.id)
-                    .await
-                    .map_err(anyhow::Error::from)?;
-            if memories.is_empty() {
-                None
-            } else {
-                Some(memories)
-            }
-        } else {
-            None
-        };
-        let location = if profile_model
-            .as_ref()
-            .is_some_and(|profile| profile.location_aware)
-        {
-            Some(
-                self.location_provider
-                    .get()
-                    .await
-                    .map_err(TuiRuntimeError::LocationFetch)?,
-            )
-        } else {
-            None
-        };
-        let profile_environment = profile_model
-            .as_ref()
-            .map(|profile| {
-                crate::profile::ProfileInfo::from_db_model(profile.clone())
-                    .map(|info| info.environment.into_kind())
-            })
-            .transpose()
-            .map_err(anyhow::Error::from)?;
-        let runtime = app
-            .session_manager
-            .db()
-            .get_session_runtime(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?
-            .unwrap_or_default();
-        let environment = resolve_agent_environment_for_tui(
-            profile_environment,
-            profile_model.as_ref(),
-            &may_dir,
-            &sandbox_dir,
-            &session_id,
-        )
-        .await?;
-        let permission_approver = self.local_runtime.permission_approver_for(&session_id);
-        let mut agent = MayAgent::from_config_with_model_and_permissions(
-            &app.config,
-            sandbox_dir,
-            may_dir,
-            app.cwd.clone(),
+        events_cursor: Option<String>,
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        if let Some(client) = self.daemon.clone() {
+            return Ok(Self::begin_remote_worker(
+                app,
+                client,
+                session_id,
+                model,
+                reasoning_effort,
+                events_cursor,
+                self.owns_turns,
+            ));
+        }
+        Ok(Self::begin_remote_worker(
+            app,
+            self.daemon
+                .clone()
+                .ok_or(TuiRuntimeError::DaemonUnavailable)?,
             session_id,
-            self.workspace_broker.clone(),
-            self.ask_user_broker.clone(),
             model,
             reasoning_effort,
-            profile_model.as_ref().map(|profile| profile.id.clone()),
-            Some(permission_approver),
-            profile_persona,
-            profile_memories,
-            runtime.plan_state,
-            location,
-            Some(self.tool_dispatchers.task.clone()),
-            Some(self.tool_dispatchers.notify.clone()),
-            self.tool_dispatchers.browser.clone(),
-            Some(self.tool_dispatchers.register_skills.clone()),
-            Some(self.tool_dispatchers.register_subagents.clone()),
-            environment,
-            0,
-        )
-        .await?;
-
-        if let Some(snapshot) =
-            crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
-        {
-            agent
-                .restore_checkpoint(snapshot.checkpoint.clone())
-                .map_err(anyhow::Error::from)?;
-            for message in crate::session::history_delta_since_snapshot(
-                &history_messages,
-                snapshot.history_message_count,
-            )? {
-                agent.push_message(message);
-            }
-        } else {
-            for message in history_messages {
-                agent.push_message(message);
-            }
-        }
-
-        Ok(spawn_worker(DefaultExecutor, agent, db))
+            events_cursor,
+            self.owns_turns,
+        ))
     }
 
+    /// Append a message to the pending queue and sync the app state.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn enqueue_pending_message(
         &self,
         app: &mut App,
         message: PendingMessage,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
+        // The local queue mirrors the message for display until the daemon
+        // dispatches it, and the next `runtime.changed` frame makes it
+        // authoritative.
+        app.queue.enqueue(message.clone());
+        self.post_enqueue(app, &message).await
+    }
+
+    /// Posts an already displayed queued message to the daemon, which
+    /// dispatches queued and steering messages itself; the turns they start
+    /// reach this TUI as foreign turns.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage or daemon failure.
+    pub async fn post_enqueue(
+        &self,
+        app: &mut App,
+        message: &PendingMessage,
+    ) -> Result<(), TuiRuntimeError> {
         let session_id = app
             .session_manager
             .current()
             .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
-        self.local_runtime
-            .enqueue_pending_message(app, &session_id, message)
-            .await
+        if let Some(client) = &self.daemon {
+            let body = serde_json::json!({
+                "sessionId": session_id.as_str(),
+                "content": message.content,
+                "attachments": futures_util::future::try_join_all(
+                    message
+                        .attachments
+                        .iter()
+                        .map(|attachment| {
+                            persisted_attachment_from_tui(
+                                client,
+                                session_id.as_str(),
+                                attachment,
+                            )
+                        }),
+                )
+                .await?,
+                "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
+                "mode": match message.delivery_mode.as_str() { "queue" => "queue", _ => "steer" },
+            });
+            if let Err(error) = client
+                .post::<_, serde_json::Value>(&format!("/api/sessions/{session_id}/turns"), &body)
+                .await
+            {
+                app.sync_queue_from_runtime();
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
 
-    pub async fn take_next_dispatchable(
+    ///
+    /// # Errors
+    /// Always succeeds.
+    pub const fn listen_for_agent_messages(&self) -> Result<(), TuiRuntimeError> {
+        Ok(())
+    }
+
+    /// Start the next queued turn; the daemon dispatches the queue, so a
+    /// client never has anything to start itself.
+    ///
+    /// # Errors
+    /// Always succeeds.
+    pub const fn begin_queued_run(
         &self,
-        app: &mut App,
-    ) -> anyhow::Result<Option<PendingMessage>> {
-        let Some(session_id) = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-        else {
-            return Ok(None);
-        };
-        self.local_runtime
-            .take_next_dispatchable(app, &session_id)
-            .await
+        _app: &mut App,
+    ) -> Result<QueuedRunStart, TuiRuntimeError> {
+        Ok(QueuedRunStart::Nothing)
     }
 
-    pub async fn mark_running(&self, app: &App) -> anyhow::Result<()> {
-        let session_id = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-            .ok_or(TuiRuntimeError::NoActiveSession)?;
-        self.local_runtime.set_running(&session_id).await
+    /// The daemon takes the run lease when the turn starts there.
+    ///
+    /// # Errors
+    /// Always succeeds.
+    pub const fn begin_run(&self, _app: &mut App) -> Result<bool, TuiRuntimeError> {
+        Ok(true)
     }
 
-    pub async fn register_ask_user_request(
+    /// Commit the user's answers to an open question; the answer joins the
+    /// session queue, which the event loop dispatches. Returns whether this
+    /// call committed them: `false` when the question is no longer open.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError::Daemon`] carrying the daemon's message when
+    /// the answers do not fit the question or could not be stored; the
+    /// question is still open then.
+    pub async fn answer_open_question(
         &self,
-        app: &mut App,
-        session_id: &SessionId,
-        questions: &[Question],
-    ) -> anyhow::Result<String> {
-        self.local_runtime
-            .register_ask_user_request(app, session_id, questions)
-            .await
-    }
-
-    pub async fn resolve_ask_user_response(
-        &self,
-        app: &mut App,
-        session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> anyhow::Result<()> {
-        self.local_runtime
-            .resolve_ask_user_response(app, session_id, request_id, answers)
-            .await
+    ) -> Result<bool, TuiRuntimeError> {
+        if let Some(client) = &self.daemon {
+            return committed_or_not_open(
+                client
+                    .post::<_, serde_json::Value>(
+                        &format!("/api/interactions/{request_id}"),
+                        &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
+                    )
+                    .await,
+            );
+        }
+        Ok(false)
     }
 
-    pub async fn register_workspace_request(
+    /// Commit the user's answers to the prompt a run is blocked on; the
+    /// caller wakes the run afterwards, only if this call committed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the answers do not fit the prompt or
+    /// on storage failure.
+    pub async fn resolve_ask_user_response(
         &self,
-        app: &mut App,
-        session_id: &SessionId,
-        request: &crate::workspace_request::RequestWorkspaceArgs,
-    ) -> anyhow::Result<String> {
-        self.local_runtime
-            .register_workspace_request(app, session_id, request)
-            .await
+        _session_id: &SessionId,
+        request_id: &str,
+        answers: &[QuestionAnswer],
+    ) -> Result<ResponseCommit<Vec<QuestionAnswer>>, TuiRuntimeError> {
+        let Some(client) = &self.daemon else {
+            return Ok(ResponseCommit::Lost(answers.to_vec()));
+        };
+        let committed = committed_or_not_open(
+            client
+                .post::<_, serde_json::Value>(
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
+                )
+                .await,
+        )?;
+        Ok(if committed {
+            ResponseCommit::Committed
+        } else {
+            ResponseCommit::Lost(answers.to_vec())
+        })
     }
 
+    /// Commit the workspace decision; the caller wakes the run afterwards,
+    /// only if this call committed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_workspace_response(
         &self,
-        app: &mut App,
-        session_id: &SessionId,
+        _session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> anyhow::Result<()> {
-        self.local_runtime
-            .resolve_workspace_response(app, session_id, request_id, approved)
-            .await
+    ) -> Result<ResponseCommit<bool>, TuiRuntimeError> {
+        if let Some(client) = &self.daemon {
+            let _: serde_json::Value = client
+                .post(
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "workspace", "approved": approved }),
+                )
+                .await?;
+            return Ok(ResponseCommit::Committed);
+        }
+        Ok(ResponseCommit::Lost(approved))
     }
 
-    pub async fn pending_permission(
-        &self,
-        app: &App,
-    ) -> anyhow::Result<Option<crate::session::PersistedPermissionRequest>> {
-        let Some(session_id) = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-        else {
-            return Ok(None);
-        };
-        self.local_runtime.waiting_permission(&session_id).await
-    }
-
+    /// Record the permission decision and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_permission_response(
         &self,
-        app: &mut App,
+        app: &App,
         request_id: &str,
         approved: bool,
-    ) -> anyhow::Result<()> {
-        let session_id = app
-            .session_manager
+    ) -> Result<(), TuiRuntimeError> {
+        app.session_manager
             .current()
-            .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
-        self.local_runtime
-            .resolve_permission_response(app, &session_id, request_id, approved)
-            .await
-    }
-
-    fn spawn_title_generation(
-        &self,
-        config: MayConfig,
-        db: crate::db::ChatDb,
-        session_id: Option<SessionId>,
-        user_message: String,
-        assistant_response: String,
-    ) {
-        let Some(session_id) = session_id else {
-            tracing::warn!("Session missing during title generation");
-            return;
-        };
-
-        spawn(async move {
-            if let Some(title) =
-                generate_session_title(&config, &user_message, &assistant_response).await
-                && let Err(e) = db
-                    .update_session(session_id.as_str(), Some(&title), None)
-                    .await
-            {
-                tracing::warn!("Failed to update session title in DB: {}", e);
-            }
-        })
-        .detach();
+        if let Some(client) = &self.daemon {
+            let _: serde_json::Value = client
+                .post(
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "permission", "approved": approved }),
+                )
+                .await?;
+            return Ok(());
+        }
+        Ok(())
     }
 }
 
+/// The assistant text a run streamed, with the emission time of its newest chunk.
+#[derive(Debug, Default)]
+pub struct AssistantReply {
+    text: String,
+    at: Option<jiff::Timestamp>,
+}
+
+impl AssistantReply {
+    /// Append a text chunk the agent emitted at `at`.
+    pub fn push(&mut self, chunk: &str, at: jiff::Timestamp) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.text.push_str(chunk);
+        self.at = Some(at);
+    }
+
+    /// Forget the accumulated reply.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.at = None;
+    }
+
+    /// The accumulated text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Emission time of the newest chunk; `None` while the reply is empty.
+    #[must_use]
+    pub const fn at(&self) -> Option<jiff::Timestamp> {
+        self.at
+    }
+}
+
+/// Drop the current session when nothing ever persisted it, removing the
+/// scratch dirs (pasted attachments, the file-diff base) it may have left.
+pub async fn discard_ephemeral_session(app: &mut App) {
+    let Some(session) = app.session_manager.current() else {
+        return;
+    };
+    if session.persisted {
+        return;
+    }
+    let sandbox_dir = session.sandbox_dir.clone();
+    app.session_manager.discard_current();
+    if let Err(error) = async_fs::remove_dir_all(&sandbox_dir).await {
+        tracing::debug!(%error, "ephemeral session scratch dir cleanup failed");
+    }
+}
+
+/// Reasoning-effort strings as the effort ladder carries them.
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    Some(match value {
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::XHigh,
+        "max" => ReasoningEffort::Max,
+        _ => return None,
+    })
+}
+
+/// Context needed to generate a session title once a run finishes.
 #[derive(Debug)]
 pub struct TitleGenContext {
+    /// The user message that opened the session.
     pub user_message: String,
 }
 
@@ -1035,15 +1330,15 @@ impl SelectedModel {
             return Self::new(model);
         }
 
-        if let Some(model) = config.last_model.as_deref() {
-            return Self::new(model);
+        if let Some(model) = config.last_model.as_ref().map(ToString::to_string) {
+            return Self::new(&model);
         }
 
         let model = config
             .default_model_for_tier(crate::config::ModelTier::Balanced)
             .ok_or(TuiRuntimeError::NoModelConfigured)?;
 
-        Self::new(model)
+        Self::new(&model.to_string())
     }
 
     fn as_str(&self) -> &str {
@@ -1051,99 +1346,13 @@ impl SelectedModel {
     }
 }
 
-fn prepare_message_content(
-    msg: &PendingMessage,
-) -> Result<(String, Vec<url::Url>), TuiRuntimeError> {
-    let mut parts = vec![msg.content.clone()];
-    let mut attachment_urls = Vec::new();
+#[cfg(test)]
+mod tests {
+    use super::urlencoding;
 
-    for attachment in &msg.attachments {
-        match attachment {
-            Attachment::Image { path, .. } => {
-                let url = url::Url::from_file_path(path).map_err(|()| {
-                    TuiRuntimeError::AttachmentPathToUrl {
-                        path: path.to_path_buf(),
-                    }
-                })?;
-                attachment_urls.push(url);
-            }
-            Attachment::FileReference { path } => {
-                parts.push(format!("\n[File reference: {}]", path.display()));
-            }
-            Attachment::PastedText {
-                content,
-                saved_path,
-            } => {
-                let char_count = content.chars().count();
-                let xml = build_pasted_text_xml(content, char_count, saved_path.as_ref())?;
-                parts.push(format!("\n{xml}"));
-            }
-        }
-    }
-
-    Ok((parts.join(""), attachment_urls))
-}
-
-async fn resolve_agent_environment_for_tui(
-    profile_environment: Option<crate::profile::ProfileEnvironment>,
-    profile_model: Option<&crate::db::entity::profiles::Model>,
-    may_dir: &std::path::Path,
-    sandbox_dir: &std::path::Path,
-    session_id: &SessionId,
-) -> anyhow::Result<crate::agent::AgentEnvironment> {
-    crate::agent::resolve_agent_environment_for_session(
-        profile_environment,
-        profile_model,
-        may_dir,
-        sandbox_dir,
-        session_id,
-    )
-    .await
-    .map_err(anyhow::Error::from)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PastedText {
-    #[serde(rename = "@chars")]
-    chars: usize,
-    #[serde(rename = "@truncated", skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
-    #[serde(rename = "@full_path", skip_serializing_if = "Option::is_none")]
-    full_path: Option<String>,
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-fn build_pasted_text_xml(
-    content: &str,
-    char_count: usize,
-    saved_path: Option<&std::path::PathBuf>,
-) -> Result<String, TuiRuntimeError> {
-    let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
-        let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
-        (truncated, true)
-    } else {
-        (content.to_string(), false)
-    };
-
-    let xml = PastedText {
-        chars: char_count,
-        truncated: is_truncated.then_some(true),
-        full_path: saved_path.map(|p| p.display().to_string()),
-        content: text_content,
-    };
-
-    quick_xml::se::to_string(&xml).map_err(TuiRuntimeError::SerializePasteXml)
-}
-
-pub async fn send_image_fetch_event(
-    event_tx: &Sender<crate::tui::AppEvent>,
-    url: String,
-    data: Option<Vec<u8>>,
-) {
-    let event = crate::tui::AppEvent::ImageFetchResult { url, data };
-    if let Err(e) = event_tx.send(event).await {
-        tracing::warn!("Failed to send image fetch event: {}", e);
+    #[test]
+    fn an_upload_name_is_query_safe() {
+        assert_eq!(urlencoding("my shot.png"), "my%20shot.png");
+        assert_eq!(urlencoding("a&b=1"), "a%26b%3D1");
     }
 }

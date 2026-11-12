@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use nucleo::{Config, Nucleo, Utf32String};
 
+use super::slash::SlashCommand;
+
 /// A completion item.
 #[derive(Debug, Clone)]
 pub struct CompletionItem {
@@ -27,21 +29,6 @@ pub enum CompletionMode {
     File,
 }
 
-/// Slash command definitions.
-pub static SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/session", "Switch or create sessions"),
-    ("/new", "Start a new session"),
-    ("/profile", "Switch profile (Ctrl+P)"),
-    ("/model", "Switch model for this session"),
-    ("/sandbox", "Open sandbox folder in Finder"),
-    ("/compact", "Compact conversation history"),
-    ("/mcp", "Manage MCP servers"),
-    ("/ssh", "Manage preconfigured SSH servers"),
-    ("/skill", "Manage installed skills"),
-    ("/config", "Open configuration"),
-    ("/quit", "Exit May"),
-];
-
 /// Completion state.
 pub struct Completion {
     /// Current mode.
@@ -58,6 +45,15 @@ pub struct Completion {
     workdir: PathBuf,
     /// Sandbox directory (lower priority).
     sandbox: PathBuf,
+}
+
+impl std::fmt::Debug for Completion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Completion")
+            .field("selected", &self.selected)
+            .field("workdir", &self.workdir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Completion {
@@ -85,6 +81,14 @@ impl Completion {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.mode != CompletionMode::None
+    }
+
+    /// Whether the palette has a selectable item. Empty slash queries (a
+    /// command plus arguments) stay in slash mode so further typing can
+    /// recover matches, but they must not intercept Enter / arrows / Esc.
+    #[must_use]
+    pub fn has_matches(&self) -> bool {
+        self.is_active() && !self.items.is_empty()
     }
 
     /// Get visible items (limited for display).
@@ -178,21 +182,25 @@ impl Completion {
     /// Update slash command items based on query.
     fn update_slash_items(&mut self) {
         let query_lower = self.query.to_lowercase();
-        self.items = SLASH_COMMANDS
-            .iter()
-            .filter(|(cmd, _)| {
-                if query_lower.is_empty() {
-                    true
-                } else {
-                    cmd.to_lowercase().contains(&query_lower)
-                }
+        self.items = SlashCommand::ALL
+            .into_iter()
+            .map(SlashCommand::spec)
+            .filter(|spec| {
+                query_lower.is_empty() || spec.name.to_lowercase().contains(&query_lower)
             })
-            .map(|(cmd, desc)| CompletionItem {
-                label: cmd.to_string(),
-                insert: cmd.to_string(),
-                description: desc.to_string(),
+            .map(|spec| CompletionItem {
+                label: spec.name.to_string(),
+                insert: spec.name.to_string(),
+                description: spec.description.to_string(),
             })
             .collect();
+    }
+
+    /// The labels of the current items.
+    #[cfg(test)]
+    #[must_use]
+    pub fn labels(&self) -> Vec<&str> {
+        self.items.iter().map(|item| item.label.as_str()).collect()
     }
 
     /// Initialize file matcher with files from directories.
@@ -202,19 +210,19 @@ impl Completion {
 
         // Add files from workdir (higher priority - add first)
         if self.workdir.exists() {
-            self.add_files_to_matcher(&matcher, &self.workdir, true);
+            Self::add_files_to_matcher(&matcher, &self.workdir, true);
         }
 
         // Add files from sandbox
         if self.sandbox.exists() && self.sandbox != self.workdir {
-            self.add_files_to_matcher(&matcher, &self.sandbox, false);
+            Self::add_files_to_matcher(&matcher, &self.sandbox, false);
         }
 
         self.file_matcher = Some(matcher);
     }
 
     /// Add files from a directory to the matcher.
-    fn add_files_to_matcher(&self, matcher: &Nucleo<PathBuf>, dir: &Path, _is_workdir: bool) {
+    fn add_files_to_matcher(matcher: &Nucleo<PathBuf>, dir: &Path, _is_workdir: bool) {
         let injector = matcher.injector();
 
         let walker = WalkBuilder::new(dir)
@@ -318,5 +326,59 @@ impl Completion {
 impl Default for Completion {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Completion;
+
+    #[test]
+    fn slash_arguments_do_not_match_and_do_not_accept_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("resume-claude 4928f530-2440-4156-a83d-fa44be29465a");
+        assert!(
+            completion.is_active(),
+            "slash mode stays on so further edits can recover matches"
+        );
+        assert!(completion.is_empty());
+        assert!(
+            !completion.has_matches(),
+            "Enter must submit `/resume-claude <id>` instead of swallowing it"
+        );
+        assert!(completion.complete().is_none());
+    }
+
+    #[test]
+    fn slash_command_name_still_accepts_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("resume-claude");
+        assert!(completion.has_matches());
+        assert_eq!(
+            completion.complete().map(|item| item.insert.as_str()),
+            Some("/resume-claude")
+        );
+    }
+
+    #[test]
+    fn two_word_slash_command_still_accepts_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("context dump");
+        assert!(completion.has_matches());
+        assert_eq!(
+            completion.complete().map(|item| item.insert.as_str()),
+            Some("/context dump")
+        );
+    }
+
+    #[test]
+    fn slash_prefix_still_accepts_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("resu");
+        assert!(completion.has_matches());
+        assert_eq!(
+            completion.complete().map(|item| item.insert.as_str()),
+            Some("/resume-codex")
+        );
     }
 }

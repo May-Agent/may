@@ -1,29 +1,135 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_sandbox::SshSessionAuthorizer;
+use askama::Template;
 
-use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload};
+use super::permission::PermissionError;
 
+use crate::PermissionHistoryMode;
+use crate::ask_user::{
+    AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, QuestionAnswer,
+};
+
+/// The choice a permission prompt offers: one allow option and a deny
+/// option. The live gate and the routing of a late answer both decide
+/// approval here, so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionChoice<'a> {
+    allow: &'a str,
+}
+
+impl<'a> PermissionChoice<'a> {
+    const DENY: &'static str = "Deny";
+
+    /// The choice that allows with the option labelled `allow`.
+    #[must_use]
+    pub const fn new(allow: &'a str) -> Self {
+        Self { allow }
+    }
+
+    /// Recover the choice from the options of a prompt built by
+    /// [`Self::options`].
+    #[must_use]
+    pub fn from_options(options: &'a [String]) -> Option<Self> {
+        options.first().map(|allow| Self::new(allow))
+    }
+
+    /// The options to show, allow first.
+    #[must_use]
+    pub fn options(&self) -> Vec<String> {
+        vec![self.allow.to_string(), Self::DENY.to_string()]
+    }
+
+    /// Whether `answers` select the allow option. Anything else, a typed
+    /// reply included, is not approval.
+    #[must_use]
+    pub fn allows(&self, answers: &[QuestionAnswer]) -> bool {
+        answers.iter().any(|answer| {
+            matches!(&answer.answer, AnswerValue::Selected(options) if options.iter().any(|option| option == self.allow))
+        })
+    }
+}
+
+#[derive(Template)]
+#[template(path = "ssh_connect_permission.txt", escape = "none")]
+struct SshConnectPermission<'a> {
+    target: &'a str,
+}
+
+/// Authorizes the SSH servers `terminal` commands name by asking the user through the
+/// ask-user broker.
+#[derive(Debug)]
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
     session_id: String,
+    db: crate::db::ChatDb,
 }
 
 impl MaySshAuthorizer {
-    pub fn new(session_id: impl Into<String>, broker: AskUserBroker) -> Arc<Self> {
+    /// Create an authorizer for `session_id` sharing `broker`.
+    pub fn new(
+        session_id: impl Into<String>,
+        broker: AskUserBroker,
+        db: crate::db::ChatDb,
+    ) -> Arc<Self> {
         Arc::new(Self {
             broker,
+            db,
             session_id: session_id.into(),
         })
     }
 
+    /// Whether [`Self::authorize_connect`] will wait for the user: a yolo
+    /// session answers at once.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the yolo switch cannot be read.
+    pub async fn will_ask(&self) -> Result<bool, PermissionError> {
+        Ok(!self
+            .db
+            .session_yolo(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?)
+    }
+
+    /// Ask whether commands may run on the server at `target`.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the question cannot be put or the
+    /// yolo grant cannot be recorded.
+    pub async fn authorize_connect(&self, target: &str) -> Result<bool, PermissionError> {
+        self.ask_permission(SshConnectPermission { target }, "Allow")
+            .await
+    }
+
     /// Ask a yes/no permission question via the `AskUser` UI.
-    async fn ask_permission(&self, question: String, allow_label: &str) -> Result<bool, String> {
+    async fn ask_permission<T: Template + Send>(
+        &self,
+        question: T,
+        allow_label: &str,
+    ) -> Result<bool, PermissionError> {
+        let question = question
+            .render()
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?;
+        // A yolo session grants at once and records it like a user approval.
+        if !self.will_ask().await? {
+            self.db
+                .append_granted_permission(
+                    &self.session_id,
+                    PermissionHistoryMode::Ssh,
+                    &question,
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?;
+            return Ok(true);
+        }
+        let choice = PermissionChoice::new(allow_label);
         let args = AskUserArgs {
             question: Some(question),
-            option: vec![allow_label.to_string(), "Deny".to_string()],
+            option: choice.options(),
             multi_select: false,
             questions: Vec::new(),
         };
@@ -34,35 +140,7 @@ impl MaySshAuthorizer {
                 request: args,
             })
             .await
-            .map_err(|e| e.to_string())?;
-        Ok(response.iter().any(|a| {
-            matches!(&a.answer, AnswerValue::Selected(opts) if opts.iter().any(|o| o == allow_label))
-        }))
-    }
-}
-
-impl SshSessionAuthorizer for MaySshAuthorizer {
-    fn authorize_connect(
-        &self,
-        target: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
-        let target = target.to_string();
-        Box::pin(async move {
-            self.ask_permission(format!("Allow SSH connection to {target}?"), "Allow")
-                .await
-        })
-    }
-
-    fn authorize_heel_install(
-        &self,
-        target: &str,
-        details: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
-        let target = target.to_string();
-        let details = details.to_string();
-        Box::pin(async move {
-            self.ask_permission(format!("{details} Install heel on {target}?"), "Install")
-                .await
-        })
+            .map_err(PermissionError::Internal)?;
+        Ok(choice.allows(&response))
     }
 }

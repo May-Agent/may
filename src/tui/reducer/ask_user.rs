@@ -1,17 +1,138 @@
-use anyhow::Result;
 use crossterm::event::KeyCode;
 use itertools::Itertools;
 
 use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::tui::app::{App, SendAction};
-use crate::tui::state::AppMode;
+use crate::tui::state::{AppMode, AskUserQuestionState, AskUserState};
 
-pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
-    let state = match &mut app.mode {
-        AppMode::AskUser(s) => s,
-        _ => return Ok(None),
+/// What a key did to the answer modal.
+#[derive(Debug)]
+pub enum AskUserKey {
+    /// The modal stays up, possibly changed.
+    Stay,
+    /// The modal closes and nothing is committed: an open question stays
+    /// open.
+    Close,
+    /// Every question has an answer; the modal closes and the answers are
+    /// committed.
+    Submit(Vec<QuestionAnswer>),
+}
+
+/// Show `prompt`, a prompt a run is blocked on. An open question being
+/// answered is parked in `parked` with its draft instead of being dropped.
+pub fn show_blocking_prompt(
+    mode: &mut AppMode,
+    parked: &mut Option<AskUserState>,
+    prompt: AppMode,
+) {
+    if let AppMode::AskUser(question) = std::mem::replace(mode, prompt)
+        && question.request.is_none()
+    {
+        *parked = Some(question);
+    }
+}
+
+/// Bring the parked open question back once nothing else holds the screen.
+pub fn restore_parked_question(mode: &mut AppMode, parked: &mut Option<AskUserState>) {
+    if matches!(mode, AppMode::Chat)
+        && let Some(question) = parked.take()
+    {
+        *mode = AppMode::AskUser(question);
+    }
+}
+
+pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::AskUser(state) = &mut app.mode else {
+        return None;
     };
+    match handle_key(state, code) {
+        AskUserKey::Stay => None,
+        AskUserKey::Close => {
+            app.mode = AppMode::Chat;
+            None
+        }
+        AskUserKey::Submit(answers) => {
+            let AppMode::AskUser(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
+                unreachable!("the key was handled in the answer modal");
+            };
+            Some(SendAction::RespondAskUser {
+                request_id: state.request_id,
+                request: state.request,
+                answers,
+            })
+        }
+    }
+}
 
+/// Apply `code` to the launch gate's repo-trust sheet: the same option
+/// list as an answer modal, but the answer goes to the client, which
+/// persists the level — `None` means bind nothing this launch.
+pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::RepoTrust(state) = &mut app.mode else {
+        return None;
+    };
+    let qi = state.ask.current_question;
+    let count = state.ask.questions[qi].option.len().max(1);
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            let cursor = &mut state.ask.question_states[qi].cursor;
+            *cursor = (*cursor + count - 1) % count;
+            None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let cursor = &mut state.ask.question_states[qi].cursor;
+            *cursor = (*cursor + 1) % count;
+            None
+        }
+        // Esc cancels a `/permission` re-ask; on the launch gate it stays —
+        // the only way out is answering or quitting.
+        KeyCode::Esc => {
+            if state.redecide {
+                let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat)
+                else {
+                    unreachable!("the key was handled in the repo-trust gate");
+                };
+                Some(SendAction::RespondRepoTrust {
+                    worktree: state.worktree,
+                    kind: state.kind,
+                    config_path: state.config_path,
+                    level: None,
+                })
+            } else {
+                None
+            }
+        }
+        KeyCode::Enter => {
+            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
+                unreachable!("the key was handled in the repo-trust gate");
+            };
+            let qi = state.ask.current_question;
+            let question = &state.ask.questions[qi];
+            let cursor = state.ask.question_states[qi].cursor;
+            let answer = QuestionAnswer {
+                section: question.section.clone(),
+                answer: AnswerValue::Selected(vec![question.option[cursor].clone()]),
+            };
+            match crate::trust::level_for_answer(&answer) {
+                // "exit — Do not bind this repository" quits for real.
+                None => Some(SendAction::Quit),
+                level => Some(SendAction::RespondRepoTrust {
+                    worktree: state.worktree,
+                    kind: state.kind,
+                    config_path: state.config_path,
+                    level,
+                }),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Apply `code` to the answer modal `state`.
+pub fn handle_key(state: &mut AskUserState, code: KeyCode) -> AskUserKey {
+    if state.current_secret().is_some() {
+        return handle_secret_key(state, code);
+    }
     if let Some(qs) = state.current_state_mut()
         && qs.custom_mode
     {
@@ -19,7 +140,7 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAc
             KeyCode::Esc => qs.custom_mode = false,
             KeyCode::Enter => {
                 qs.custom_mode = false;
-                return Ok(ask_user_advance_or_submit(app));
+                return advance_or_submit(state);
             }
             KeyCode::Backspace => {
                 qs.custom_text.pop();
@@ -29,7 +150,7 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAc
             }
             _ => {}
         }
-        return Ok(None);
+        return AskUserKey::Stay;
     }
 
     let item_count = state.current_item_count();
@@ -63,8 +184,7 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAc
         KeyCode::Char(' ') => {
             if let (Some(q), Some(qs)) = (&question, state.current_state_mut()) {
                 let cursor = qs.cursor;
-                let opt_count = q.option.len();
-                if cursor < opt_count {
+                if cursor < q.option.len() {
                     if q.multi_select {
                         if qs.selections.contains(&cursor) {
                             qs.selections.retain(|&x| x != cursor);
@@ -75,113 +195,381 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAc
                         qs.selections.clear();
                         qs.selections.push(cursor);
                     }
-                    qs.skipped = false;
+                    qs.custom_text.clear();
                 }
             }
         }
         KeyCode::Enter => {
             if let (Some(q), Some(qs)) = (&question, state.current_state_mut()) {
                 let cursor = qs.cursor;
-                let opt_count = q.option.len();
-
-                if cursor < opt_count {
+                if cursor < q.option.len() {
                     if !q.multi_select {
                         qs.selections.clear();
                         qs.selections.push(cursor);
-                        qs.skipped = false;
-                    }
-                    return Ok(ask_user_advance_or_submit(app));
-                } else if cursor == opt_count {
-                    if let Some(qs) = state.current_state_mut() {
-                        qs.skipped = true;
-                        qs.selections.clear();
                         qs.custom_text.clear();
                     }
-                    return Ok(ask_user_advance_or_submit(app));
-                } else if cursor == opt_count + 1 {
-                    if let Some(qs) = state.current_state_mut() {
-                        qs.custom_mode = true;
-                        qs.skipped = false;
-                        qs.selections.clear();
-                    }
-                } else if q.multi_select {
-                    return Ok(ask_user_advance_or_submit(app));
+                    return advance_or_submit(state);
                 }
+                qs.custom_mode = true;
+                qs.selections.clear();
             }
         }
-        KeyCode::Esc => return Ok(ask_user_submit_all_skipped(app)),
+        // An open question stays open when its modal closes; the user opens
+        // it again with `/questions`. A prompt a run blocks on has no other
+        // way to be answered, so its modal stays up.
+        KeyCode::Esc if state.request.is_none() => return AskUserKey::Close,
         _ => {}
     }
 
-    Ok(None)
+    AskUserKey::Stay
 }
 
-fn ask_user_advance_or_submit(app: &mut App) -> Option<SendAction> {
-    let state = match &mut app.mode {
-        AppMode::AskUser(s) => s,
-        _ => return None,
-    };
+/// Apply `code` to a secret question: the value is typed straight into the
+/// masked field, `Del` declines to give it, `Esc` leaves the question open.
+fn handle_secret_key(state: &mut AskUserState, code: KeyCode) -> AskUserKey {
+    match code {
+        KeyCode::Char(c) => {
+            if let Some(qs) = state.current_state_mut() {
+                qs.declined = false;
+                qs.custom_text.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(qs) = state.current_state_mut() {
+                qs.custom_text.pop();
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(qs) = state.current_state_mut() {
+                qs.custom_text.clear();
+                qs.declined = true;
+            }
+            return advance_or_submit(state);
+        }
+        KeyCode::Enter => return advance_or_submit(state),
+        KeyCode::Tab | KeyCode::Right if state.current_question + 1 < state.questions.len() => {
+            state.current_question += 1;
+        }
+        KeyCode::BackTab | KeyCode::Left if state.current_question > 0 => {
+            state.current_question -= 1;
+        }
+        KeyCode::Esc if state.request.is_none() => return AskUserKey::Close,
+        _ => {}
+    }
+    AskUserKey::Stay
+}
 
+/// Move on to the next question, or submit after the last. An unanswered
+/// question holds the user where it is: nothing is committed for it.
+fn advance_or_submit(state: &mut AskUserState) -> AskUserKey {
+    if !state
+        .current_state()
+        .is_some_and(AskUserQuestionState::is_answered)
+    {
+        return AskUserKey::Stay;
+    }
     if state.current_question + 1 < state.questions.len() {
         state.current_question += 1;
-        None
-    } else {
-        ask_user_submit(app)
+        return AskUserKey::Stay;
     }
+    // Last question answered: submit once every question has an answer,
+    // otherwise go back to the first one that has none.
+    if let Some(unanswered) = state
+        .question_states
+        .iter()
+        .position(|qs| !qs.is_answered())
+    {
+        state.current_question = unanswered;
+        return AskUserKey::Stay;
+    }
+    AskUserKey::Submit(answers(state))
 }
 
-fn ask_user_submit(app: &mut App) -> Option<SendAction> {
-    let mode = std::mem::replace(&mut app.mode, AppMode::Chat);
-    if let AppMode::AskUser(state) = mode {
-        let answers: Vec<QuestionAnswer> = state
-            .questions
-            .iter()
-            .zip(state.question_states.iter())
-            .map(|(q, qs)| {
-                let answer = if qs.skipped {
-                    AnswerValue::Skipped
-                } else if !qs.custom_text.is_empty() {
-                    AnswerValue::Custom(qs.custom_text.clone())
-                } else {
-                    let selected: Vec<String> = qs
-                        .selections
-                        .iter()
-                        .sorted()
-                        .filter_map(|&idx| q.option.get(idx).cloned())
-                        .collect();
-                    AnswerValue::Selected(selected)
-                };
-                QuestionAnswer {
-                    section: q.section.clone(),
-                    answer,
-                }
-            })
-            .collect();
-        return Some(SendAction::RespondAskUser {
-            request_id: state.request_id,
-            request: state.request,
-            answers,
-        });
-    }
-    None
-}
-
-fn ask_user_submit_all_skipped(app: &mut App) -> Option<SendAction> {
-    let mode = std::mem::replace(&mut app.mode, AppMode::Chat);
-    if let AppMode::AskUser(state) = mode {
-        let answers: Vec<QuestionAnswer> = state
-            .questions
-            .iter()
-            .map(|q| QuestionAnswer {
+fn answers(state: &AskUserState) -> Vec<QuestionAnswer> {
+    state
+        .questions
+        .iter()
+        .zip(state.question_states.iter())
+        .map(|(q, qs)| {
+            let answer = if qs.custom_text.trim().is_empty() && qs.declined {
+                AnswerValue::Skipped
+            } else if qs.custom_text.trim().is_empty() {
+                let selected: Vec<String> = qs
+                    .selections
+                    .iter()
+                    .sorted()
+                    .filter_map(|&idx| q.option.get(idx).cloned())
+                    .collect();
+                AnswerValue::Selected(selected)
+            } else {
+                AnswerValue::Custom(qs.custom_text.trim().to_string())
+            };
+            QuestionAnswer {
                 section: q.section.clone(),
-                answer: AnswerValue::Skipped,
-            })
-            .collect();
-        return Some(SendAction::RespondAskUser {
-            request_id: state.request_id,
-            request: state.request,
-            answers,
-        });
+                answer,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayload, Question};
+    use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+
+    fn open_question(multi_select: bool) -> AskUserState {
+        AskUserState::for_open_question(PersistedAskUserRequest {
+            id: "open-1".to_string(),
+            questions: vec![PersistedAskUserQuestion {
+                section: String::new(),
+                question: "Which database?".to_string(),
+                option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
+                multi_select,
+                secret: None,
+            }],
+        })
     }
-    None
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Chose {
+        Options(Vec<&'static str>),
+        Text(String),
+    }
+
+    /// What a submit committed; fails the test for any other outcome.
+    fn submitted(key: AskUserKey) -> Vec<Chose> {
+        let AskUserKey::Submit(answers) = key else {
+            panic!("expected a submit, got {key:?}");
+        };
+        answers
+            .into_iter()
+            .map(|answer| match answer.answer {
+                AnswerValue::Selected(values) => Chose::Options(
+                    values
+                        .iter()
+                        .map(|value| match value.as_str() {
+                            "PostgreSQL" => "PostgreSQL",
+                            "SQLite" => "SQLite",
+                            other => panic!("unexpected option {other}"),
+                        })
+                        .collect(),
+                ),
+                AnswerValue::Custom(text) => Chose::Text(text),
+                AnswerValue::Skipped => panic!("a skipped answer is never produced"),
+            })
+            .collect()
+    }
+
+    fn press(state: &mut AskUserState, codes: &[KeyCode]) -> AskUserKey {
+        let mut last = AskUserKey::Stay;
+        for &code in codes {
+            last = handle_key(state, code);
+        }
+        last
+    }
+
+    /// Esc closes the modal and commits nothing: the question stays open.
+    #[test]
+    fn esc_closes_the_modal_and_commits_nothing() {
+        let mut state = open_question(false);
+        assert!(matches!(
+            handle_key(&mut state, KeyCode::Esc),
+            AskUserKey::Close
+        ));
+
+        // Even with a choice made, Esc commits nothing.
+        let mut state = open_question(false);
+        assert!(matches!(
+            press(&mut state, &[KeyCode::Char(' '), KeyCode::Esc]),
+            AskUserKey::Close
+        ));
+    }
+
+    /// Esc cannot dismiss a prompt a run is blocked on: it has no other way
+    /// to be answered.
+    #[test]
+    fn esc_does_not_dismiss_a_prompt_a_run_blocks_on() {
+        let (tx, _rx) = async_channel::bounded(1);
+        let question = Question {
+            section: String::new(),
+            question: "Allow SSH?".to_string(),
+            option: vec!["Allow".to_string(), "Deny".to_string()],
+            multi_select: false,
+        };
+        let request = AskUserRequest::new(
+            AskUserRequestPayload {
+                session_id: "session".to_string(),
+                request: AskUserArgs {
+                    question: Some(question.question.clone()),
+                    option: question.option.clone(),
+                    multi_select: false,
+                    questions: Vec::new(),
+                },
+            },
+            tx,
+        );
+        let mut state = AskUserState::new("blocking-1".to_string(), request, vec![question]);
+        assert!(matches!(
+            handle_key(&mut state, KeyCode::Esc),
+            AskUserKey::Stay
+        ));
+    }
+
+    /// Enter with nothing selected and no text commits nothing.
+    #[test]
+    fn an_empty_enter_commits_nothing() {
+        // On the custom-answer row with no text.
+        let mut state = open_question(false);
+        let outcome = press(
+            &mut state,
+            &[KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Enter],
+        );
+        assert!(matches!(outcome, AskUserKey::Stay));
+
+        // A multi-select with nothing toggled.
+        let mut state = open_question(true);
+        assert!(matches!(
+            handle_key(&mut state, KeyCode::Enter),
+            AskUserKey::Stay
+        ));
+    }
+
+    /// There is no skip row: the list is the options and the custom answer.
+    #[test]
+    fn the_list_has_no_skip_row() {
+        let state = open_question(false);
+        assert_eq!(state.current_item_count(), 3);
+    }
+
+    /// A chosen option commits and delivers.
+    #[test]
+    fn an_answer_submits() {
+        let mut state = open_question(false);
+        let outcome = press(&mut state, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(submitted(outcome), [Chose::Options(vec!["SQLite"])]);
+
+        let mut state = open_question(false);
+        let mut keys = vec![KeyCode::Down, KeyCode::Down, KeyCode::Enter];
+        keys.extend("MIT".chars().map(KeyCode::Char));
+        keys.push(KeyCode::Enter);
+        assert_eq!(
+            submitted(press(&mut state, &keys)),
+            [Chose::Text("MIT".to_string())]
+        );
+    }
+
+    /// A multi-select submits the toggled options on Enter.
+    #[test]
+    fn a_multi_select_submits_its_toggled_options() {
+        let mut state = open_question(true);
+        let outcome = press(
+            &mut state,
+            &[
+                KeyCode::Char(' '),
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(
+            submitted(outcome),
+            [Chose::Options(vec!["PostgreSQL", "SQLite"])]
+        );
+    }
+
+    /// A blocking prompt that arrives while an open question is half
+    /// answered does not discard the draft: it comes back afterwards.
+    #[test]
+    fn a_blocking_prompt_keeps_the_open_question_draft() {
+        let mut mode = AppMode::AskUser(open_question(false));
+        let mut parked = None;
+        let AppMode::AskUser(state) = &mut mode else {
+            unreachable!("the mode was just set");
+        };
+        press(
+            state,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+                KeyCode::Char('M'),
+            ],
+        );
+
+        show_blocking_prompt(&mut mode, &mut parked, AppMode::Help);
+        assert!(matches!(mode, AppMode::Help), "the prompt is shown");
+        restore_parked_question(&mut mode, &mut parked);
+        assert!(
+            matches!(mode, AppMode::Help),
+            "the question waits while the prompt holds the screen"
+        );
+
+        mode = AppMode::Chat;
+        restore_parked_question(&mut mode, &mut parked);
+        let AppMode::AskUser(state) = mode else {
+            panic!("the open question comes back");
+        };
+        assert_eq!(state.request_id, "open-1");
+        assert!(state.question_states[0].custom_mode);
+        assert_eq!(state.question_states[0].custom_text, "M");
+    }
+
+    fn secret_question() -> AskUserState {
+        AskUserState::for_open_question(PersistedAskUserRequest {
+            id: "secret-1".to_string(),
+            questions: vec![PersistedAskUserQuestion {
+                section: "DEPLOY_TOKEN".to_string(),
+                question: "Deploy token?".to_string(),
+                option: Vec::new(),
+                multi_select: false,
+                secret: Some(crate::session::PersistedSecretRequest {
+                    name: "DEPLOY_TOKEN".to_string(),
+                    scope: crate::secrets::SecretScope::Session,
+                }),
+            }],
+        })
+    }
+
+    /// A secret question is typed into directly and submits the value as
+    /// the answer text; the state never prints it.
+    #[test]
+    fn a_secret_value_is_typed_straight_into_the_field_and_submitted() {
+        let mut state = secret_question();
+        let mut codes: Vec<KeyCode> = "s3cret".chars().map(KeyCode::Char).collect();
+        codes.push(KeyCode::Backspace);
+        codes.extend("t!".chars().map(KeyCode::Char));
+        codes.push(KeyCode::Enter);
+        let AskUserKey::Submit(answers) = press(&mut state, &codes) else {
+            panic!("the value is submitted");
+        };
+        assert!(matches!(&answers[0].answer, AnswerValue::Custom(text) if text == "s3cret!"));
+        assert!(!format!("{state:?}").contains("s3cret!"));
+    }
+
+    /// Del declines the secret: the answer is the skipped marker, which the
+    /// client sends as a refusal. An empty value cannot be submitted.
+    #[test]
+    fn a_secret_can_be_declined_but_not_submitted_empty() {
+        let mut state = secret_question();
+        assert!(matches!(
+            press(&mut state, &[KeyCode::Enter]),
+            AskUserKey::Stay
+        ));
+        let AskUserKey::Submit(answers) = press(&mut state, &[KeyCode::Char('x'), KeyCode::Delete])
+        else {
+            panic!("declining submits");
+        };
+        assert!(matches!(answers[0].answer, AnswerValue::Skipped));
+    }
+
+    /// Esc leaves the secret question open.
+    #[test]
+    fn escape_leaves_a_secret_question_open() {
+        let mut state = secret_question();
+        assert!(matches!(
+            press(&mut state, &[KeyCode::Char('x'), KeyCode::Esc]),
+            AskUserKey::Close
+        ));
+    }
 }

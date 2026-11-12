@@ -1,0 +1,656 @@
+//! Scheduled task REST API.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::mem;
+use std::sync::Arc;
+
+use base64::Engine;
+use skyzen::extract::PeerAddr;
+use skyzen::routing::Params;
+use skyzen::utils::{Json, State};
+use skyzen::{Body, Request, Result as SkyResult, StatusCode};
+
+use crate::db::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
+use crate::scheduler::{TaskRunStatus, WebhookOutcome};
+use crate::task_trigger::{
+    NormalizedTaskTrigger, PersistedTaskTrigger, TaskTriggerKind, TaskTriggerRequest,
+    TaskTriggerResponse, TaskWebhookRequest,
+};
+
+use super::error::{bad_request_error, internal_error, internal_error_message};
+use super::state::DaemonState;
+
+// ── Response type ──────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ScheduledTaskResponse {
+    pub id: String,
+    pub profile_id: String,
+    pub session_id: Option<String>,
+    pub name: String,
+    pub trigger: TaskTriggerResponse,
+    pub script_path: Option<String>,
+    pub script_inline: Option<String>,
+    pub needs_network: bool,
+    pub timeout_secs: i64,
+    pub approved: bool,
+    pub enabled: bool,
+    pub last_run_at: Option<String>,
+    pub last_run_status: Option<TaskRunStatus>,
+    pub last_run_output: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl ScheduledTaskResponse {
+    /// `funnel_base` is the Funnel base URL while Funnel exposes webhooks.
+    fn from_model(m: crate::db::entity::scheduled_tasks::Model, funnel_base: Option<&str>) -> Self {
+        let trigger = m
+            .persisted_trigger()
+            .expect("scheduled task trigger must remain valid")
+            .response(m.run_at.clone(), m.cron_expression.clone())
+            .with_funnel_base(funnel_base);
+        Self {
+            id: m.id,
+            profile_id: m.profile_id,
+            session_id: m.session_id,
+            name: m.name,
+            trigger,
+            script_path: m.script_path,
+            script_inline: m.script_inline,
+            needs_network: m.needs_network,
+            timeout_secs: m.timeout_secs,
+            approved: m.approved,
+            enabled: m.enabled,
+            last_run_at: m.last_run_at,
+            last_run_status: m
+                .last_run_status
+                .as_deref()
+                .map(TaskRunStatus::parse)
+                .transpose()
+                .expect("scheduled task last_run_status must be valid"),
+            last_run_output: m.last_run_output,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+// ── Request types ──────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CreateTaskRequest {
+    pub profile_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub name: String,
+    pub trigger: TaskTriggerRequest,
+    #[serde(default)]
+    pub script_path: Option<String>,
+    #[serde(default)]
+    pub script_inline: Option<String>,
+    #[serde(default)]
+    pub needs_network: bool,
+    /// Maximum runtime of one run in seconds.
+    pub timeout_secs: u32,
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UpdateTaskRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub cron_expression: Option<String>,
+    #[serde(default)]
+    pub run_at: Option<String>,
+    #[serde(default)]
+    pub script_path: Option<String>,
+    #[serde(default)]
+    pub script_inline: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WebhookInvocationRequest(TaskWebhookRequest);
+
+#[skyzen::error(status = StatusCode::BAD_REQUEST)]
+pub(super) enum WebhookInvocationRequestError {
+    #[error("failed to read webhook request body")]
+    InvalidBody,
+    #[error("webhook request contains a non-UTF8 header value")]
+    InvalidHeaderValue,
+    #[error("webhook request body exceeds the {limit} byte limit", status = StatusCode::PAYLOAD_TOO_LARGE)]
+    BodyTooLarge { limit: u64 },
+    #[error("webhook request needs the daemon state", status = StatusCode::INTERNAL_SERVER_ERROR)]
+    MissingState,
+}
+
+/// Reads `body` into memory, refusing it once it passes `limit` bytes: a
+/// declared length over the limit is refused without reading anything, and
+/// an undeclared or understated one stops being read at the limit.
+async fn read_bounded_body(
+    mut body: Body,
+    declared_length: Option<u64>,
+    limit: u64,
+) -> Result<Vec<u8>, WebhookInvocationRequestError> {
+    use futures_lite::StreamExt as _;
+
+    let too_large = || WebhookInvocationRequestError::BodyTooLarge { limit };
+    if declared_length.is_some_and(|length| length > limit) {
+        return Err(too_large());
+    }
+    let mut buffer = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| WebhookInvocationRequestError::InvalidBody)?;
+        if (buffer.len() as u64).saturating_add(chunk.len() as u64) > limit {
+            return Err(too_large());
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
+impl skyzen::extract::Extractor for WebhookInvocationRequest {
+    type Error = WebhookInvocationRequestError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let method = request.method().as_str().to_string();
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().map(ToOwned::to_owned);
+        let remote_addr = request
+            .extensions()
+            .get::<PeerAddr>()
+            .map(|addr| addr.to_string());
+
+        let mut headers = BTreeMap::new();
+        for (name, value) in request.headers() {
+            let value = value
+                .to_str()
+                .map_err(|_| WebhookInvocationRequestError::InvalidHeaderValue)?
+                .to_string();
+            headers
+                .entry(name.as_str().to_string())
+                .or_insert_with(Vec::new)
+                .push(value);
+        }
+
+        let limit = request
+            .extensions()
+            .get::<State<Arc<DaemonState>>>()
+            .ok_or(WebhookInvocationRequestError::MissingState)?
+            .config_snapshot()
+            .remote_access
+            .webhook_max_body_bytes;
+        let declared_length = request
+            .headers()
+            .get(skyzen::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let body = mem::replace(request.body_mut(), Body::empty());
+        let body = read_bounded_body(body, declared_length, limit).await?;
+        let body_size_bytes = body.len();
+        let body_text = std::str::from_utf8(body.as_slice())
+            .ok()
+            .map(ToOwned::to_owned);
+        let body_json = headers
+            .get(skyzen::header::CONTENT_TYPE.as_str())
+            .and_then(|values| values.first())
+            .filter(|value| value.starts_with("application/json"))
+            .and_then(|_| serde_json::from_slice(body.as_slice()).ok());
+
+        Ok(Self(TaskWebhookRequest {
+            method,
+            path,
+            query,
+            headers,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body.as_slice()),
+            body_text,
+            body_json,
+            remote_addr,
+            body_size_bytes,
+        }))
+    }
+}
+
+fn normalize_create_trigger(request: &CreateTaskRequest) -> SkyResult<NormalizedTaskTrigger> {
+    request.trigger.normalize().map_err(bad_request_error)
+}
+
+fn validate_existing_trigger(
+    current: &crate::db::entity::scheduled_tasks::Model,
+    next_cron: Option<&str>,
+    next_run_at: Option<&str>,
+) -> SkyResult<TaskTriggerKind> {
+    let trigger = current.persisted_trigger().map_err(bad_request_error)?;
+    match trigger {
+        PersistedTaskTrigger::Time { trigger_type } => {
+            TaskTriggerRequest::Time {
+                trigger_type,
+                run_at_utc: next_run_at.map(ToOwned::to_owned),
+                cron_utc: next_cron.map(ToOwned::to_owned),
+            }
+            .normalize()
+            .map_err(bad_request_error)?;
+            Ok(TaskTriggerKind::Time)
+        }
+        PersistedTaskTrigger::Event { .. } => Ok(TaskTriggerKind::Event),
+        PersistedTaskTrigger::Webhook { .. } => Ok(TaskTriggerKind::Webhook),
+    }
+}
+
+fn validate_script_fields(script_path: Option<&str>, script_inline: Option<&str>) -> SkyResult<()> {
+    let has_path = script_path
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_inline = script_inline
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    match (has_path, has_inline) {
+        (true, true) => Err(bad_request_error(
+            "Provide either script_path or script_inline, not both",
+        )),
+        (false, false) => Err(bad_request_error(
+            "Either script_path or script_inline is required",
+        )),
+        _ => Ok(()),
+    }
+}
+
+// ── Endpoints ──────────────────────────────────────────────
+
+pub(super) async fn list_tasks(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<Vec<ScheduledTaskResponse>>> {
+    let tasks = state
+        .db()
+        .list_scheduled_tasks(None)
+        .await
+        .map_err(internal_error)?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(Json(
+        tasks
+            .into_iter()
+            .map(|task| ScheduledTaskResponse::from_model(task, funnel.as_deref()))
+            .collect(),
+    ))
+}
+
+async fn spawn_on_tokio<T>(
+    state: &Arc<DaemonState>,
+    operation: &'static str,
+    future: impl Future<Output = SkyResult<T>> + Send + 'static,
+) -> SkyResult<T>
+where
+    T: Send + 'static,
+{
+    state
+        .tokio_handle
+        .clone()
+        .spawn(future)
+        .await
+        .map_err(|_| {
+            internal_error_message(format!(
+                "{operation} task panicked before producing a response"
+            ))
+        })?
+}
+
+pub(super) async fn create_task(
+    Json(req): Json<CreateTaskRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ScheduledTaskResponse>> {
+    let response = spawn_on_tokio(&state, "task create", {
+        let state = state.clone();
+        async move { run_create_task(state, req).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn run_create_task(
+    state: Arc<DaemonState>,
+    req: CreateTaskRequest,
+) -> SkyResult<ScheduledTaskResponse> {
+    let mut id = crate::id::new();
+    while state
+        .db()
+        .get_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+    {
+        id = crate::id::new();
+    }
+    let trigger = normalize_create_trigger(&req)?;
+    let normalized_script_path = req
+        .script_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let normalized_script_inline = req
+        .script_inline
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    validate_script_fields(normalized_script_path, normalized_script_inline)?;
+    state
+        .task_runtime
+        .validate_task_script_for_profile(
+            &req.profile_id,
+            normalized_script_path,
+            normalized_script_inline,
+            req.timeout_secs,
+        )
+        .await
+        .map_err(bad_request_error)?;
+
+    let persisted_trigger = trigger.clone().into_persisted();
+    let model = state
+        .db()
+        .create_scheduled_task(CreateScheduledTaskParams {
+            id: &id,
+            profile_id: &req.profile_id,
+            session_id: req.session_id.as_deref(),
+            name: &req.name,
+            trigger: &persisted_trigger,
+            cron_expression: trigger.cron_expression(),
+            run_at: trigger.run_at(),
+            script_path: normalized_script_path,
+            script_inline: normalized_script_inline,
+            needs_network: req.needs_network,
+            timeout_secs: req.timeout_secs,
+        })
+        .await
+        .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(ScheduledTaskResponse::from_model(model, funnel.as_deref()))
+}
+
+pub(super) async fn get_task(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ScheduledTaskResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+
+    let model = state
+        .db()
+        .get_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Task not found"))?;
+
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(Json(ScheduledTaskResponse::from_model(
+        model,
+        funnel.as_deref(),
+    )))
+}
+
+pub(super) async fn update_task(
+    params: Params,
+    Json(req): Json<UpdateTaskRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ScheduledTaskResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let response = spawn_on_tokio(&state, "task update", {
+        let state = state.clone();
+        async move { run_update_task(state, id, req).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn run_update_task(
+    state: Arc<DaemonState>,
+    id: String,
+    req: UpdateTaskRequest,
+) -> SkyResult<ScheduledTaskResponse> {
+    let db = state.db();
+    let current = db
+        .get_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Task not found"))?;
+
+    let normalized_run_at = req
+        .run_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let next_cron = req
+        .cron_expression
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| current.cron_expression.clone());
+    let next_run_at = normalized_run_at.clone().or_else(|| current.run_at.clone());
+    let current_kind =
+        validate_existing_trigger(&current, next_cron.as_deref(), next_run_at.as_deref())?;
+
+    let next_script_path = req
+        .script_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| current.script_path.clone());
+    let next_script_inline = req
+        .script_inline
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| current.script_inline.clone());
+    validate_script_fields(next_script_path.as_deref(), next_script_inline.as_deref())?;
+    let next_timeout_secs = match req.timeout_secs {
+        Some(secs) => secs,
+        None => u32::try_from(current.timeout_secs).map_err(|_| {
+            bad_request_error(format!(
+                "stored task timeout_secs is out of range: {}",
+                current.timeout_secs
+            ))
+        })?,
+    };
+    state
+        .task_runtime
+        .validate_task_script_for_profile(
+            &current.profile_id,
+            next_script_path.as_deref(),
+            next_script_inline.as_deref(),
+            next_timeout_secs,
+        )
+        .await
+        .map_err(bad_request_error)?;
+
+    let normalized_script_path_update = req
+        .script_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let normalized_script_inline_update = req
+        .script_inline
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let normalized_cron_update = if current_kind == TaskTriggerKind::Time {
+        req.cron_expression
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Some)
+    } else {
+        None
+    };
+    let normalized_run_at_update = match current_kind {
+        TaskTriggerKind::Time => normalized_run_at.as_deref().map(Some),
+        TaskTriggerKind::Event | TaskTriggerKind::Webhook => None,
+    };
+
+    db.update_scheduled_task(
+        &id,
+        UpdateScheduledTaskParams {
+            name: req.name.as_deref(),
+            enabled: req.enabled,
+            approved: None,
+            cron_expression: normalized_cron_update,
+            run_at: normalized_run_at_update,
+            script_path: normalized_script_path_update.map(Some),
+            script_inline: normalized_script_inline_update.map(Some),
+            timeout_secs: req.timeout_secs,
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    let model = db
+        .get_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Task not found"))?;
+
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(ScheduledTaskResponse::from_model(model, funnel.as_deref()))
+}
+
+pub(super) async fn delete_task(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::ApiHealth>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    spawn_on_tokio(&state, "task delete", {
+        let state = state.clone();
+        async move { run_delete_task(state, id).await }
+    })
+    .await?;
+    Ok(Json(super::types::API_OK))
+}
+
+async fn run_delete_task(state: Arc<DaemonState>, id: String) -> SkyResult<()> {
+    state
+        .task_runtime
+        .delete_task(&id)
+        .await
+        .map_err(super::error::internal_error_message)
+}
+
+pub(super) async fn approve_task(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::ApiHealth>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    spawn_on_tokio(&state, "task approve", {
+        let state = state.clone();
+        async move { run_approve_task(state, id).await }
+    })
+    .await?;
+    Ok(Json(super::types::API_OK))
+}
+
+async fn run_approve_task(state: Arc<DaemonState>, id: String) -> SkyResult<()> {
+    state
+        .db()
+        .approve_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    Ok(())
+}
+
+pub(super) async fn run_task(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let response = spawn_on_tokio(&state, "task run", {
+        let state = state.clone();
+        async move { run_manual_task(state, id).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn run_manual_task(
+    state: Arc<DaemonState>,
+    id: String,
+) -> SkyResult<super::types::TaskTriggerResponse> {
+    let task = state
+        .db()
+        .get_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Task not found"))?;
+
+    state
+        .task_runtime
+        .run_manual_task(task)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(super::types::TaskTriggerResponse {
+        ok: true,
+        status: super::types::TaskTriggerStatus::Triggered,
+        triggered: 1,
+    })
+}
+
+pub(super) async fn invoke_webhook_task(
+    params: Params,
+    webhook_request: WebhookInvocationRequest,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
+    let token = params.get("token").map_err(bad_request_error)?.to_string();
+    let response = spawn_on_tokio(&state, "task webhook", {
+        let state = state.clone();
+        async move { run_invoke_webhook_task(state, token, webhook_request.0).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn run_invoke_webhook_task(
+    state: Arc<DaemonState>,
+    token: String,
+    webhook_request: TaskWebhookRequest,
+) -> SkyResult<super::types::TaskTriggerResponse> {
+    let triggered = match state
+        .task_runtime
+        .dispatch_webhook(&token, webhook_request)
+        .await
+        .map_err(internal_error)?
+    {
+        WebhookOutcome::NotFound => return Err(bad_request_error("Webhook task not found")),
+        WebhookOutcome::SignatureRefused => {
+            return Err(skyzen::Error::msg("Webhook signature missing or invalid")
+                .set_status(StatusCode::UNAUTHORIZED));
+        }
+        WebhookOutcome::Triggered(triggered) => triggered,
+    };
+
+    Ok(super::types::TaskTriggerResponse {
+        ok: true,
+        status: super::types::TaskTriggerStatus::Triggered,
+        triggered,
+    })
+}

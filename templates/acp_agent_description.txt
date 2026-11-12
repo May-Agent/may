@@ -1,0 +1,1 @@
+{{ name }} {{ version }}, an external coding agent reached over ACP. It works in a space of its own and writes only there and in the worktrees it is granted.

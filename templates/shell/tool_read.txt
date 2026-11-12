@@ -1,0 +1,1 @@
+Read the new output of a background terminal task by its task id.

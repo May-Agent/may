@@ -1,75 +1,45 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
-use aither_core::{
-    EmbeddingModel,
-    llm::{Tool, ToolResult},
-};
-use aither_rag::{Document, Rag};
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator,
-    RecordBatchReader, StringArray,
-};
-use arrow_schema::{DataType, Field, Schema};
-use futures_lite::StreamExt;
-use lance_index::scalar::FullTextSearchQuery;
-use lancedb::index::Index;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::{Table, connect};
-use regex::RegexBuilder;
+use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
-use crate::agent::command_words::split_shell_words;
-use crate::agent::search_match::{extend_unique, push_unique};
-use crate::db::ChatDb;
-use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
+use crate::db::{ChatDb, IndexedMessageRow};
+use crate::repo_search::indexer::{
+    IndexerError, SESSIONS_COLLECTION, SearchIndexer, parse_message_doc_id,
+};
+use crate::repo_search::{CollectionBackend, RepoSearchCollections};
 
-const TABLE_NAME: &str = "session_messages";
-const INDEX_META_FILE: &str = "session_index.meta.json";
-const SEMANTIC_INDEX_FILE: &str = "session_index.semantic.redb";
+/// Session index as the `session` command queries it.
+pub type SessionSearchIndex = SearchIndexer<RepoSearchCollections>;
 
-/// Search across May sessions and messages.
-///
-/// Query rules:
-/// - Use `*` as query to disable text match and only apply filters.
-/// - `search_mode`: `hybrid` | `text` | `regex` | `fulltext` | `fuzzy` | `semantic`.
-/// - Default excludes current session so you can inspect other sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionSearchMode {
-    Hybrid,
-    Text,
-    Regex,
-    Fulltext,
-    Fuzzy,
-    Semantic,
-}
-
+/// Output shape for `session search`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionOutputMode {
+    /// Return grouped session summaries.
     Sessions,
+    /// Return matching messages flat.
     Messages,
 }
 
+/// Search May sessions by what was discussed, or inspect, read and list them.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionArgs {
     /// Optional command-form input. Supported:
     /// - `session <id> search <prompt>`
-    /// - `session <search>`
+    /// - `session search <prompt>`
+    /// - `session inspect <id>`
+    /// - `session messages <id>`
+    /// - `session list`
     #[serde(default)]
     pub command: Option<String>,
 
-    /// Query string. Use `*` for filter-only listing.
+    /// What to find, described in natural language.
     pub query: String,
-
-    /// Search mode: `hybrid`, `text`, `regex`, `fulltext`, `fuzzy`, `semantic`.
-    #[serde(default = "default_search_mode")]
-    pub search_mode: SessionSearchMode,
 
     /// Output mode: `sessions` (aggregated) or `messages`.
     #[serde(default = "default_output_mode")]
@@ -82,10 +52,6 @@ pub struct SessionArgs {
     /// Skip N rows after ranking.
     #[serde(default)]
     pub offset: usize,
-
-    /// Max rows to scan from `LanceDB` before local post-filtering.
-    #[serde(default = "default_scan_limit")]
-    pub scan_limit: usize,
 
     /// Filter by exact session id.
     #[serde(default)]
@@ -119,25 +85,18 @@ pub struct SessionArgs {
     #[serde(default)]
     pub title_contains: Option<String>,
 
-    /// Case sensitive matching for `text` / `regex` modes.
-    #[serde(default)]
-    pub case_sensitive: bool,
-
-    /// Regex pattern for `regex` mode (falls back to `query` if omitted).
-    #[serde(default)]
-    pub regex: Option<String>,
-
-    /// Max edit distance for `fuzzy` mode (0-2 recommended).
-    #[serde(default = "default_fuzzy_distance")]
-    pub fuzzy_distance: u32,
-
-    /// Search columns for fulltext/fuzzy mode. Defaults to `content,title,preview`.
-    #[serde(default)]
-    pub fields: Vec<String>,
-
     /// Include full message content in output.
     #[serde(default)]
     pub include_content: bool,
+
+    /// With `session messages <id>`: return only the messages around this
+    /// message id instead of the whole session.
+    #[serde(default)]
+    pub around: Option<i64>,
+
+    /// With `--around`: how many messages to return on each side. Default 3.
+    #[serde(default)]
+    pub context: Option<usize>,
 
     /// Include current session. Default false.
     #[serde(default)]
@@ -148,10 +107,6 @@ pub struct SessionArgs {
     pub include_archived: bool,
 }
 
-const fn default_search_mode() -> SessionSearchMode {
-    SessionSearchMode::Hybrid
-}
-
 const fn default_output_mode() -> SessionOutputMode {
     SessionOutputMode::Sessions
 }
@@ -160,19 +115,50 @@ const fn default_limit() -> usize {
     20
 }
 
-const fn default_scan_limit() -> usize {
-    2000
-}
-
-const fn default_fuzzy_distance() -> u32 {
-    1
-}
-
+/// `session` tool: natural-language search and inspection over session history.
 #[derive(Debug, Clone)]
 pub struct SessionTool {
     may_dir: PathBuf,
     current_session_id: String,
-    embedder: EmbeddingModelResolution,
+    index: Option<SessionSearchIndex>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SessionToolError {
+    #[error("database error: {0}")]
+    Database(#[from] crate::db::ChatDbError),
+    #[error("session command '{command}' contains invalid shell quoting: {source}")]
+    CommandWords {
+        command: String,
+        #[source]
+        source: shell_words::ParseError,
+    },
+    #[error("session search is unavailable: {0}")]
+    Index(#[from] IndexerError),
+    #[error("session search is unavailable: {0}")]
+    RepoSearch(#[from] crate::repo_search::RepoSearchError),
+    #[error("this session has no search index")]
+    NoIndex,
+    #[error("{command_name} command must not be empty")]
+    EmptyCommand { command_name: String },
+    #[error("{command_name} command must include a search prompt")]
+    MissingCommandPrompt { command_name: String },
+    #[error("invalid session command: missing prompt after 'search'")]
+    MissingSearchPrompt,
+    #[error(
+        "session search takes a description of what to find; use `session list` to list sessions by filters"
+    )]
+    WildcardQuery,
+    #[error("session action '{action}' requires a session id")]
+    MissingActionSessionId { action: &'static str },
+    #[error("session '{session_id}' was not found")]
+    SessionNotFound { session_id: String },
+    #[error("session '{session_id}' has no message {message_id}")]
+    MessageNotFound { session_id: String, message_id: i64 },
+    #[error(
+        "every matching message is already present in the current context window; refine the query to recall older or other-session content"
+    )]
+    AllResultsAlreadyInContext,
 }
 
 #[derive(Debug, Clone)]
@@ -180,17 +166,77 @@ struct SearchDefaults {
     current_session_id: String,
 }
 
+#[derive(Debug, Clone)]
+enum SessionExecutionPlan {
+    Search(SessionArgs),
+    Inspect(SessionInspectRequest),
+    Messages(SessionMessagesRequest),
+    List(SessionListRequest),
+}
+
+#[derive(Debug, Clone)]
+struct SessionInspectRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionMessagesRequest {
+    session_id: String,
+    around: Option<MessageWindow>,
+}
+
+/// The messages around one message of a session.
+#[derive(Debug, Clone, Copy)]
+struct MessageWindow {
+    message_id: i64,
+    context: usize,
+}
+
+const DEFAULT_AROUND_CONTEXT: usize = 3;
+
+impl SessionMessagesRequest {
+    fn new(session_id: String, args: &SessionArgs) -> Self {
+        Self {
+            session_id,
+            around: args.around.map(|message_id| MessageWindow {
+                message_id,
+                context: args.context.unwrap_or(DEFAULT_AROUND_CONTEXT),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionListRequest {
+    limit: usize,
+    offset: usize,
+    include_current: bool,
+    include_archived: bool,
+    current_session_id: String,
+    profile_id: Option<String>,
+    model: Option<String>,
+    title_contains: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+enum SessionCommandInput {
+    RawQuery,
+    Tokens(Vec<String>),
+}
+
 impl SessionTool {
+    /// Bind the tool to a session; `index` serves `session search`.
     #[must_use]
     pub const fn new(
         may_dir: PathBuf,
         current_session_id: String,
-        embedder: EmbeddingModelResolution,
+        index: Option<SessionSearchIndex>,
     ) -> Self {
         Self {
             may_dir,
             current_session_id,
-            embedder,
+            index,
         }
     }
 
@@ -198,29 +244,22 @@ impl SessionTool {
         self.may_dir.join("history.db")
     }
 
-    fn index_path(&self) -> PathBuf {
-        self.may_dir.join("session_index.lancedb")
-    }
+    async fn normalize_args(
+        &self,
+        mut args: SessionArgs,
+    ) -> Result<SessionExecutionPlan, SessionToolError> {
+        let defaults = SearchDefaults {
+            current_session_id: self.current_session_id.clone(),
+        };
 
-    fn index_meta_path(&self) -> PathBuf {
-        self.may_dir.join(INDEX_META_FILE)
-    }
-
-    fn semantic_index_path(&self) -> PathBuf {
-        self.may_dir.join(SEMANTIC_INDEX_FILE)
-    }
-
-    fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
         if let Some(command) = args.command.take() {
-            apply_command_form(&mut args, &command, "session")?;
+            let tokens = split_command_form_tokens(&command, "session")?;
+            let plan = build_execution_plan(args, SessionCommandInput::Tokens(tokens), &defaults)?;
+            return resolve_implicit_session_lookup(self.db_path(), plan).await;
         }
-        apply_search_defaults(
-            &mut args,
-            &SearchDefaults {
-                current_session_id: self.current_session_id.clone(),
-            },
-        );
-        normalize_common_args(args)
+
+        let plan = build_execution_plan(args, SessionCommandInput::RawQuery, &defaults)?;
+        resolve_implicit_session_lookup(self.db_path(), plan).await
     }
 }
 
@@ -232,17 +271,20 @@ impl Tool for SessionTool {
     type Arguments = SessionArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
-        let args = self.normalize_args(arguments)?;
-        execute_search(
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
+        let plan = self.normalize_args(arguments).await?;
+        execute_plan(
             self.db_path(),
-            self.index_path(),
-            self.index_meta_path(),
-            self.semantic_index_path(),
-            self.embedder.clone(),
-            args,
+            self.index.as_ref(),
+            self.current_session_id.clone(),
+            plan,
         )
         .await
+        .map_err(Into::into)
     }
 }
 
@@ -252,198 +294,347 @@ fn apply_search_defaults(args: &mut SessionArgs, defaults: &SearchDefaults) {
     }
 }
 
-fn normalize_common_args(mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
+fn normalize_common_args(mut args: SessionArgs) -> SessionArgs {
     args.limit = args.limit.clamp(1, 200);
-    args.scan_limit = args.scan_limit.clamp(args.limit, 50_000);
-    args.fuzzy_distance = args.fuzzy_distance.min(3);
-    if args.fields.is_empty() {
-        args.fields = vec![
-            "content".to_string(),
-            "title".to_string(),
-            "preview".to_string(),
-        ];
-    } else {
-        args.fields = args
-            .fields
-            .into_iter()
-            .map(|v| v.to_lowercase())
-            .filter(|f| {
-                matches!(
-                    f.as_str(),
-                    "content" | "title" | "preview" | "session_id" | "model" | "role"
-                )
-            })
-            .collect();
-        if args.fields.is_empty() {
-            args.fields = vec!["content".to_string()];
+    args
+}
+
+async fn execute_plan(
+    db_path: PathBuf,
+    index: Option<&SessionSearchIndex>,
+    current_session_id: String,
+    plan: SessionExecutionPlan,
+) -> Result<ToolResult, SessionToolError> {
+    match plan {
+        SessionExecutionPlan::Search(args) => {
+            let index = index.ok_or(SessionToolError::NoIndex)?;
+            execute_search(index, &current_session_id, args).await
         }
+        SessionExecutionPlan::Inspect(request) => execute_inspect(db_path, request).await,
+        SessionExecutionPlan::Messages(request) => execute_messages(db_path, request).await,
+        SessionExecutionPlan::List(request) => execute_list(db_path, request).await,
     }
-    Ok(args)
 }
 
 async fn execute_search(
-    db_path: PathBuf,
-    index_path: PathBuf,
-    index_meta_path: PathBuf,
-    semantic_index_path: PathBuf,
-    embedder: EmbeddingModelResolution,
+    index: &SessionSearchIndex,
+    current_session_id: &str,
     args: SessionArgs,
-) -> aither_core::Result<ToolResult> {
-    let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
-
-    let db = ChatDb::open(&db_path).await?;
-    let fingerprint = compute_fingerprint(&db).await?;
-
-    let table = ensure_index(
-        &index_path,
-        &index_meta_path,
-        &semantic_index_path,
-        &db,
-        &fingerprint,
-        embedder.clone(),
-    )
-    .await?;
-
-    if args.search_mode == SessionSearchMode::Semantic {
-        let embedder = embedder.require_ready(
-            "session semantic search requires a global models.embedding_model and at least one enabled provider that supports it",
-        )?;
-        return run_semantic_query(semantic_index_path, embedder, args).await;
+) -> Result<ToolResult, SessionToolError> {
+    let query = args.query.trim();
+    if query.is_empty() || query == "*" {
+        return Err(SessionToolError::WildcardQuery);
     }
-
-    let mut candidates = match args.search_mode {
-        SessionSearchMode::Fulltext => run_full_text_query(&table, &args, false).await?,
-        SessionSearchMode::Fuzzy => run_full_text_query(&table, &args, true).await?,
-        SessionSearchMode::Regex => run_plain_query(&table, &args).await?,
-        SessionSearchMode::Text => run_plain_query(&table, &args).await?,
-        SessionSearchMode::Hybrid => {
-            if query_enabled {
-                let mut merged = Vec::new();
-                let mut fts = run_full_text_query(&table, &args, false).await?;
-                let mut fuzzy = run_full_text_query(&table, &args, true).await?;
-                let mut plain = run_plain_query(&table, &args).await?;
-                merged.append(&mut fts);
-                merged.append(&mut fuzzy);
-                merged.append(&mut plain);
-                merged
-            } else {
-                run_plain_query(&table, &args).await?
-            }
-        }
-        SessionSearchMode::Semantic => unreachable!("semantic search handled earlier"),
-    };
-
-    let query_norm = if args.case_sensitive {
-        args.query.clone()
-    } else {
-        args.query.to_lowercase()
-    };
-
-    let regex_enabled =
-        args.search_mode == SessionSearchMode::Regex && (query_enabled || args.regex.is_some());
-    let regex = if regex_enabled {
-        let pattern = args
-            .regex
-            .as_deref()
-            .unwrap_or(args.query.as_str())
-            .to_string();
-        Some(
-            RegexBuilder::new(&pattern)
-                .case_insensitive(!args.case_sensitive)
-                .build()
-                .map_err(|e| anyhow::anyhow!("invalid regex pattern: {e}"))?,
-        )
-    } else {
-        None
-    };
-
-    for row in &mut candidates {
-        if row.matched_by.is_empty() {
-            push_unique(&mut row.matched_by, args.search_mode);
-        }
-
-        let haystack = searchable_text(row, &args.fields);
-        let haystack_norm = if args.case_sensitive {
-            haystack.clone()
-        } else {
-            haystack.to_lowercase()
-        };
-
-        if query_enabled
-            && args.search_mode != SessionSearchMode::Fulltext
-            && args.search_mode != SessionSearchMode::Fuzzy
-            && haystack_norm.contains(&query_norm)
-        {
-            row.score += 10.0;
-            push_unique(&mut row.matched_by, SessionSearchMode::Text);
-        }
-
-        if let Some(re) = &regex
-            && re.is_match(&haystack)
-        {
-            row.score += 15.0;
-            push_unique(&mut row.matched_by, SessionSearchMode::Regex);
-        }
-    }
-
-    candidates.retain(|row| {
-        if query_enabled && args.search_mode == SessionSearchMode::Text {
-            let haystack = searchable_text(row, &args.fields);
-            let haystack = if args.case_sensitive {
-                haystack
-            } else {
-                haystack.to_lowercase()
-            };
-            return haystack.contains(&query_norm);
-        }
-
-        if regex_enabled {
-            let Some(re) = &regex else {
-                return false;
-            };
-            return re.is_match(&searchable_text(row, &args.fields));
-        }
-
-        true
-    });
-
-    let mut deduped: HashMap<String, SessionMatchRow> = HashMap::new();
-    for row in candidates {
-        let key = format!("{}:{}", row.session_id, row.message_id);
-        match deduped.get_mut(&key) {
-            Some(existing) => {
-                if row.score > existing.score {
-                    *existing = row;
-                } else {
-                    extend_unique(&mut existing.matched_by, row.matched_by);
-                }
-            }
-            None => {
-                deduped.insert(key, row);
-            }
-        }
-    }
-
-    let mut rows: Vec<SessionMatchRow> = deduped.into_values().collect();
-    rows.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.timestamp.cmp(&a.timestamp))
-    });
+    // Messages written since the last drain become searchable first.
+    index.drain().await?;
+    let hits = index.backend().search(SESSIONS_COLLECTION, query).await?;
+    let ranked: Vec<(i64, f64)> = hits
+        .iter()
+        .filter_map(|hit| {
+            parse_message_doc_id(&hit.id).map(|(_, message_id)| (message_id, hit.score))
+        })
+        .collect();
+    let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
+    let mut by_id: HashMap<i64, IndexedMessageRow> = index
+        .db()
+        .indexed_messages(&ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.message_id, row))
+        .collect();
+    let rows: Vec<SessionMatchRow> = ranked
+        .into_iter()
+        .filter_map(|(id, score)| {
+            by_id
+                .remove(&id)
+                .map(|row| SessionMatchRow::from_indexed(row, score))
+        })
+        .filter(|row| row_matches_session_filters(row, &args))
+        .collect();
 
     let total_matches = rows.len();
-    finalize_rows_with_total(rows, total_matches, &args)
+    let rows = drop_rows_already_in_context(index.db(), current_session_id, rows).await?;
+    if total_matches > 0 && rows.is_empty() {
+        return Err(SessionToolError::AllResultsAlreadyInContext);
+    }
+    Ok(finalize_rows_with_total(&rows, total_matches, &args))
 }
 
-fn apply_command_form(
-    args: &mut SessionArgs,
+/// Removes current-session hits whose content already appears in the exact
+/// persisted context window from the latest checkpoint.
+async fn drop_rows_already_in_context(
+    db: &ChatDb,
+    current_session_id: &str,
+    rows: Vec<SessionMatchRow>,
+) -> Result<Vec<SessionMatchRow>, SessionToolError> {
+    if !rows.iter().any(|row| row.session_id == current_session_id) {
+        return Ok(rows);
+    }
+    let Some(snapshot) = db.get_session_context_snapshot(current_session_id).await? else {
+        return Ok(rows);
+    };
+    Ok(filter_rows_against_messages(
+        current_session_id,
+        &snapshot.checkpoint.context_window.messages,
+        rows,
+    ))
+}
+
+fn filter_rows_against_messages(
+    current_session_id: &str,
+    window: &[aither_core::llm::Message],
+    rows: Vec<SessionMatchRow>,
+) -> Vec<SessionMatchRow> {
+    rows.into_iter()
+        .filter(|row| {
+            if row.session_id != current_session_id {
+                return true;
+            }
+            let content = row.content.trim();
+            content.is_empty()
+                || !window
+                    .iter()
+                    .any(|message| message.content().contains(content))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct SessionSummaryView {
+    session_id: String,
+    title: String,
+    model: String,
+    profile_id: Option<String>,
+    archived: bool,
+    created_at: String,
+    updated_at: String,
+    message_count: i32,
+    preview: String,
+}
+
+impl From<crate::db::entity::sessions::Model> for SessionSummaryView {
+    fn from(value: crate::db::entity::sessions::Model) -> Self {
+        Self {
+            session_id: value.id,
+            title: value.title.unwrap_or_default(),
+            model: value.model.unwrap_or_default(),
+            profile_id: value.profile_id,
+            archived: value.archived,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            message_count: value.message_count,
+            preview: value.preview.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionMessageView {
+    message_id: i32,
+    role: String,
+    timestamp: Option<String>,
+    content: String,
+}
+
+impl From<crate::db::entity::messages::Model> for SessionMessageView {
+    fn from(value: crate::db::entity::messages::Model) -> Self {
+        Self {
+            message_id: value.id,
+            role: value.role,
+            timestamp: value.timestamp,
+            content: value.content,
+        }
+    }
+}
+
+/// What the model reads for `session inspect`.
+#[derive(Debug, Template)]
+#[template(path = "session_inspect.txt", escape = "none")]
+struct SessionInspectText {
+    session: SessionSummaryView,
+    final_assistant_message: Option<SessionMessageView>,
+    final_user_message: Option<SessionMessageView>,
+    latest_message: Option<SessionMessageView>,
+}
+
+/// What the model reads for `session messages`.
+#[derive(Debug, Template)]
+#[template(path = "session_messages.txt", escape = "none")]
+struct SessionMessagesText {
+    session: SessionSummaryView,
+    messages: Vec<SessionMessageView>,
+}
+
+/// What the model reads for `session list`.
+#[derive(Debug, Template)]
+#[template(path = "session_list.txt", escape = "none")]
+struct SessionListText {
+    total_matches: usize,
+    results: Vec<SessionSummaryView>,
+}
+
+/// What the model reads for a message-mode `session search`.
+#[derive(Debug, Template)]
+#[template(path = "session_search_messages.txt", escape = "none")]
+struct SessionSearchMessagesText {
+    query: String,
+    total_matches: usize,
+    items: Vec<MessageResult>,
+}
+
+/// What the model reads for a session-mode `session search`.
+#[derive(Debug, Template)]
+#[template(path = "session_search_sessions.txt", escape = "none")]
+struct SessionSearchSessionsText {
+    query: String,
+    total_matches: usize,
+    items: Vec<SessionResult>,
+}
+
+async fn execute_inspect(
+    db_path: PathBuf,
+    request: SessionInspectRequest,
+) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
+    let session = db.get_session(&request.session_id).await?.ok_or_else(|| {
+        SessionToolError::SessionNotFound {
+            session_id: request.session_id.clone(),
+        }
+    })?;
+    let messages = db.get_messages(&request.session_id).await?;
+    let latest_message = messages.last().cloned().map(SessionMessageView::from);
+    let final_assistant_message = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .cloned()
+        .map(SessionMessageView::from);
+    let final_user_message = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .cloned()
+        .map(SessionMessageView::from);
+
+    let text = SessionInspectText {
+        session: SessionSummaryView::from(session),
+        final_assistant_message,
+        final_user_message,
+        latest_message,
+    }
+    .render()
+    .expect("session inspect template must render");
+    Ok(ToolResult::text(text))
+}
+
+async fn execute_messages(
+    db_path: PathBuf,
+    request: SessionMessagesRequest,
+) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
+    let session = db.get_session(&request.session_id).await?.ok_or_else(|| {
+        SessionToolError::SessionNotFound {
+            session_id: request.session_id.clone(),
+        }
+    })?;
+    let messages = match request.around {
+        None => db.get_messages(&request.session_id).await?,
+        Some(window) => {
+            let context = i64::try_from(window.context).unwrap_or(i64::MAX);
+            db.messages_around(&request.session_id, window.message_id, context)
+                .await?
+                .ok_or_else(|| SessionToolError::MessageNotFound {
+                    session_id: request.session_id.clone(),
+                    message_id: window.message_id,
+                })?
+        }
+    }
+    .into_iter()
+    .map(SessionMessageView::from)
+    .collect::<Vec<_>>();
+
+    let text = SessionMessagesText {
+        session: SessionSummaryView::from(session),
+        messages,
+    }
+    .render()
+    .expect("session messages template must render");
+    Ok(ToolResult::text(text))
+}
+
+async fn execute_list(
+    db_path: PathBuf,
+    request: SessionListRequest,
+) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
+    let lowered_title = request.title_contains.as_deref().map(str::to_lowercase);
+    let mut sessions = db
+        .list_sessions()
+        .await?
+        .into_iter()
+        .filter(|session| {
+            if !request.include_current && session.id == request.current_session_id {
+                return false;
+            }
+            if !request.include_archived && session.archived {
+                return false;
+            }
+            if let Some(profile_id) = request.profile_id.as_deref()
+                && session.profile_id.as_deref() != Some(profile_id)
+            {
+                return false;
+            }
+            if let Some(model) = request.model.as_deref()
+                && session.model.as_deref() != Some(model)
+            {
+                return false;
+            }
+            if let Some(title_contains) = lowered_title.as_deref() {
+                let title = session.title.as_deref().unwrap_or_default().to_lowercase();
+                if !title.contains(title_contains) {
+                    return false;
+                }
+            }
+            if let Some(since) = request.since.as_deref()
+                && session.updated_at.as_str() < since
+            {
+                return false;
+            }
+            if let Some(until) = request.until.as_deref()
+                && session.updated_at.as_str() > until
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let total_matches = sessions.len();
+    let results = sessions
+        .into_iter()
+        .skip(request.offset)
+        .take(request.limit)
+        .map(SessionSummaryView::from)
+        .collect::<Vec<_>>();
+
+    let text = SessionListText {
+        total_matches,
+        results,
+    }
+    .render()
+    .expect("session list template must render");
+    Ok(ToolResult::text(text))
+}
+
+fn split_command_form_tokens(
     command: &str,
     command_name: &str,
-) -> aither_core::Result<()> {
+) -> Result<Vec<String>, SessionToolError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("{command_name} command must not be empty"));
+        return Err(SessionToolError::EmptyCommand {
+            command_name: command_name.to_string(),
+        });
     }
 
     let mut prefix = String::with_capacity(command_name.len() + 1);
@@ -454,54 +645,180 @@ fn apply_command_form(
         .unwrap_or(trimmed)
         .trim();
     if body.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{command_name} command must include a search prompt"
-        ));
+        return Err(SessionToolError::MissingCommandPrompt {
+            command_name: command_name.to_string(),
+        });
     }
 
-    let tokens = split_shell_words(body, command_name)?;
-    if let [session_id, keyword, prompt_tokens @ ..] = tokens.as_slice()
+    shell_words::split(body).map_err(|source| SessionToolError::CommandWords {
+        command: command_name.to_string(),
+        source,
+    })
+}
+
+fn build_execution_plan(
+    mut args: SessionArgs,
+    input: SessionCommandInput,
+    defaults: &SearchDefaults,
+) -> Result<SessionExecutionPlan, SessionToolError> {
+    match input {
+        SessionCommandInput::Tokens(tokens) => {
+            if let Some(plan) = plan_from_tokens(&tokens, &args, defaults)? {
+                return Ok(plan);
+            }
+            args.query = tokens.join(" ");
+        }
+        SessionCommandInput::RawQuery => {
+            if let Some(plan) = plan_from_raw_query(&args, defaults) {
+                return Ok(plan);
+            }
+        }
+    }
+
+    apply_search_defaults(&mut args, defaults);
+    Ok(SessionExecutionPlan::Search(normalize_common_args(args)))
+}
+
+async fn resolve_implicit_session_lookup(
+    db_path: PathBuf,
+    plan: SessionExecutionPlan,
+) -> Result<SessionExecutionPlan, SessionToolError> {
+    let SessionExecutionPlan::Search(args) = plan else {
+        return Ok(plan);
+    };
+    let Some(session_id) = implicit_session_lookup_candidate(&args) else {
+        return Ok(SessionExecutionPlan::Search(args));
+    };
+    let db = ChatDb::open(&db_path).await?;
+    if db.get_session(session_id).await?.is_some() {
+        return Ok(SessionExecutionPlan::Inspect(SessionInspectRequest {
+            session_id: session_id.to_string(),
+        }));
+    }
+    Ok(SessionExecutionPlan::Search(args))
+}
+
+fn implicit_session_lookup_candidate(args: &SessionArgs) -> Option<&str> {
+    if args.session_id.is_some() {
+        return None;
+    }
+    let candidate = args.query.trim();
+    if candidate.is_empty() || candidate == "*" || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn plan_from_tokens(
+    tokens: &[String],
+    args: &SessionArgs,
+    defaults: &SearchDefaults,
+) -> Result<Option<SessionExecutionPlan>, SessionToolError> {
+    let Some(first) = tokens.first().map(String::as_str) else {
+        return Ok(None);
+    };
+
+    if let [session_id, keyword, prompt_tokens @ ..] = tokens
         && keyword == "search"
     {
         let prompt = prompt_tokens.join(" ");
         if prompt.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid session command: missing prompt after 'search'"
-            ));
+            return Err(SessionToolError::MissingSearchPrompt);
         }
-        args.session_id = Some(session_id.clone());
-        args.query = prompt;
-        return Ok(());
+        let mut next_args = args.clone();
+        next_args.session_id = Some(session_id.clone());
+        next_args.query = prompt;
+        apply_search_defaults(&mut next_args, defaults);
+        return Ok(Some(SessionExecutionPlan::Search(normalize_common_args(
+            next_args,
+        ))));
     }
 
-    args.query = tokens.join(" ");
-    Ok(())
+    match first {
+        "search" => {
+            let prompt = tokens
+                .iter()
+                .skip(1)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if prompt.is_empty() {
+                return Err(SessionToolError::MissingSearchPrompt);
+            }
+            let mut next_args = args.clone();
+            next_args.query = prompt;
+            apply_search_defaults(&mut next_args, defaults);
+            Ok(Some(SessionExecutionPlan::Search(normalize_common_args(
+                next_args,
+            ))))
+        }
+        "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {
+            let session_id = tokens
+                .get(1)
+                .ok_or(SessionToolError::MissingActionSessionId { action: "inspect" })?;
+            Ok(Some(SessionExecutionPlan::Inspect(SessionInspectRequest {
+                session_id: session_id.clone(),
+            })))
+        }
+        "messages" if tokens.len() == 2 => {
+            let session_id = tokens
+                .get(1)
+                .ok_or(SessionToolError::MissingActionSessionId { action: "messages" })?;
+            Ok(Some(SessionExecutionPlan::Messages(
+                SessionMessagesRequest::new(session_id.clone(), args),
+            )))
+        }
+        "list" if tokens.len() == 1 => Ok(Some(SessionExecutionPlan::List(SessionListRequest {
+            limit: args.limit.clamp(1, 200),
+            offset: args.offset,
+            include_current: args.include_current,
+            include_archived: args.include_archived,
+            current_session_id: defaults.current_session_id.clone(),
+            profile_id: args.profile_id.clone(),
+            model: args.model.clone(),
+            title_contains: args.title_contains.clone(),
+            since: args.since.clone(),
+            until: args.until.clone(),
+        }))),
+        _ => Ok(None),
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionIndexMeta {
-    session_count: usize,
-    total_messages: usize,
-    latest_updated_at: String,
-    semantic_embedding_model: Option<String>,
-    semantic_embedding_dimensions: Option<usize>,
-}
+fn plan_from_raw_query(
+    args: &SessionArgs,
+    defaults: &SearchDefaults,
+) -> Option<SessionExecutionPlan> {
+    let trimmed = args.query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-#[derive(Debug, Clone)]
-struct SessionIndexRow {
-    session_id: String,
-    profile_id: String,
-    title: String,
-    model: String,
-    archived: String,
-    role: String,
-    content: String,
-    preview: String,
-    timestamp: String,
-    created_at: String,
-    updated_at: String,
-    message_id: i64,
-    message_count: i32,
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let first = tokens.first().copied()?;
+
+    match first {
+        "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {
+            Some(SessionExecutionPlan::Inspect(SessionInspectRequest {
+                session_id: tokens[1].to_string(),
+            }))
+        }
+        "messages" if tokens.len() == 2 => Some(SessionExecutionPlan::Messages(
+            SessionMessagesRequest::new(tokens[1].to_string(), args),
+        )),
+        "list" if tokens.len() == 1 => Some(SessionExecutionPlan::List(SessionListRequest {
+            limit: args.limit.clamp(1, 200),
+            offset: args.offset,
+            include_current: args.include_current,
+            include_archived: args.include_archived,
+            current_session_id: defaults.current_session_id.clone(),
+            profile_id: args.profile_id.clone(),
+            model: args.model.clone(),
+            title_contains: args.title_contains.clone(),
+            since: args.since.clone(),
+            until: args.until.clone(),
+        })),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -519,10 +836,29 @@ struct SessionMatchRow {
     message_id: i64,
     message_count: i32,
     score: f64,
-    matched_by: Vec<SessionSearchMode>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl SessionMatchRow {
+    fn from_indexed(row: IndexedMessageRow, score: f64) -> Self {
+        Self {
+            session_id: row.session_id,
+            profile_id: row.profile_id.unwrap_or_default(),
+            title: row.title.unwrap_or_default(),
+            model: row.model.unwrap_or_default(),
+            archived: row.archived,
+            role: row.role,
+            content: row.content,
+            preview: row.preview.unwrap_or_default(),
+            timestamp: row.timestamp.unwrap_or_default(),
+            updated_at: row.updated_at,
+            message_id: row.message_id,
+            message_count: row.message_count,
+            score,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct MessageResult {
     session_id: String,
     title: String,
@@ -531,9 +867,7 @@ struct MessageResult {
     timestamp: String,
     message_id: i64,
     score: f64,
-    matched_by: Vec<SessionSearchMode>,
     snippet: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 }
 
@@ -553,14 +887,13 @@ impl MessageResult {
             timestamp: row.timestamp,
             message_id: row.message_id,
             score: (row.score * 100.0).round() / 100.0,
-            matched_by: row.matched_by,
             snippet,
             content: include_content.then_some(row.content),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionResult {
     session_id: String,
     title: String,
@@ -570,488 +903,6 @@ struct SessionResult {
     match_count: usize,
     top_score: f64,
     highlights: Vec<MessageResult>,
-}
-
-async fn compute_fingerprint(db: &ChatDb) -> anyhow::Result<SessionIndexMeta> {
-    let sessions = db.list_sessions().await?;
-    let session_count = sessions.len();
-    let total_messages: usize = sessions
-        .iter()
-        .map(|s| s.message_count.max(0) as usize)
-        .sum();
-
-    let latest_updated_at = sessions
-        .iter()
-        .map(|s| s.updated_at.as_str())
-        .max()
-        .unwrap_or("")
-        .to_string();
-
-    Ok(SessionIndexMeta {
-        session_count,
-        total_messages,
-        latest_updated_at,
-        semantic_embedding_model: None,
-        semantic_embedding_dimensions: None,
-    })
-}
-
-async fn ensure_index(
-    index_path: &Path,
-    meta_path: &Path,
-    semantic_index_path: &Path,
-    db: &ChatDb,
-    fingerprint: &SessionIndexMeta,
-    embedder: EmbeddingModelResolution,
-) -> anyhow::Result<Table> {
-    let conn = connect(index_path.to_string_lossy().as_ref())
-        .execute()
-        .await?;
-
-    let mut should_rebuild = true;
-    let semantic_index_missing = matches!(
-        async_fs::metadata(semantic_index_path).await,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    );
-    let table_names = conn.table_names().execute().await?;
-    let has_table = table_names.iter().any(|name| name == TABLE_NAME);
-
-    if has_table
-        && let Ok(meta_raw) = async_fs::read_to_string(meta_path).await
-        && let Ok(saved_meta) = serde_json::from_str::<SessionIndexMeta>(&meta_raw)
-        && saved_meta.session_count == fingerprint.session_count
-        && saved_meta.total_messages == fingerprint.total_messages
-        && saved_meta.latest_updated_at == fingerprint.latest_updated_at
-    {
-        should_rebuild = false;
-    }
-
-    if should_rebuild {
-        if has_table {
-            conn.drop_table(TABLE_NAME, &[]).await?;
-        }
-
-        let rows = build_index_rows(db).await?;
-        let reader = rows_to_record_reader(&rows)?;
-        let table = conn.create_table(TABLE_NAME, reader).execute().await?;
-
-        for column in ["content", "title", "preview"] {
-            table
-                .create_index(&[column], Index::FTS(Default::default()))
-                .execute()
-                .await?;
-        }
-        table
-            .create_index(&["session_id"], Index::BTree(Default::default()))
-            .execute()
-            .await?;
-        table
-            .create_index(&["model"], Index::BTree(Default::default()))
-            .execute()
-            .await?;
-        table
-            .create_index(&["role"], Index::BTree(Default::default()))
-            .execute()
-            .await?;
-
-        let next_meta = SessionIndexMeta {
-            session_count: fingerprint.session_count,
-            total_messages: fingerprint.total_messages,
-            latest_updated_at: fingerprint.latest_updated_at.clone(),
-            semantic_embedding_model: embedder.ready().map(|value| value.selector().to_string()),
-            semantic_embedding_dimensions: embedder.ready().map(aither_core::EmbeddingModel::dim),
-        };
-        async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
-        if let Some(embedder) = embedder.clone_ready() {
-            rebuild_semantic_index(semantic_index_path, embedder, &rows).await?;
-        }
-
-        Ok(table)
-    } else {
-        if let Some(embedder) = embedder.clone_ready() {
-            let saved_meta = async_fs::read_to_string(meta_path)
-                .await
-                .ok()
-                .and_then(|raw| serde_json::from_str::<SessionIndexMeta>(&raw).ok());
-            let semantic_needs_rebuild = semantic_index_missing
-                || saved_meta.as_ref().is_none_or(|meta| {
-                    meta.semantic_embedding_model.as_deref() != Some(embedder.selector())
-                        || meta.semantic_embedding_dimensions != Some(embedder.dim())
-                });
-            if semantic_needs_rebuild {
-                let rows = build_index_rows(db).await?;
-                rebuild_semantic_index(semantic_index_path, embedder.clone(), &rows).await?;
-                let next_meta = SessionIndexMeta {
-                    session_count: fingerprint.session_count,
-                    total_messages: fingerprint.total_messages,
-                    latest_updated_at: fingerprint.latest_updated_at.clone(),
-                    semantic_embedding_model: Some(embedder.selector().to_string()),
-                    semantic_embedding_dimensions: Some(embedder.dim()),
-                };
-                async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
-            }
-        }
-        Ok(conn.open_table(TABLE_NAME).execute().await?)
-    }
-}
-
-async fn rebuild_semantic_index(
-    semantic_index_path: &Path,
-    embedder: MayEmbeddingModel,
-    rows: &[SessionIndexRow],
-) -> anyhow::Result<()> {
-    match async_fs::remove_file(semantic_index_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to remove stale session semantic index {}: {error}",
-                semantic_index_path.display()
-            ));
-        }
-    }
-
-    let rag = Rag::builder(embedder)
-        .index_path(semantic_index_path.to_path_buf())
-        .code_chunking(2400)
-        .top_k(2000)
-        .deduplication(false)
-        .auto_save(false)
-        .build()?;
-
-    for row in rows {
-        let mut metadata = aither_rag::Metadata::new();
-        metadata.insert("session_id".to_string(), row.session_id.clone());
-        metadata.insert("profile_id".to_string(), row.profile_id.clone());
-        metadata.insert("title".to_string(), row.title.clone());
-        metadata.insert("model".to_string(), row.model.clone());
-        metadata.insert("archived".to_string(), row.archived.clone());
-        metadata.insert("role".to_string(), row.role.clone());
-        metadata.insert("preview".to_string(), row.preview.clone());
-        metadata.insert("timestamp".to_string(), row.timestamp.clone());
-        metadata.insert("updated_at".to_string(), row.updated_at.clone());
-        metadata.insert("message_id".to_string(), row.message_id.to_string());
-        metadata.insert("message_count".to_string(), row.message_count.to_string());
-
-        rag.insert(Document::with_metadata(
-            format!("{}:{}", row.session_id, row.message_id),
-            row.content.clone(),
-            metadata,
-        ))
-        .await?;
-    }
-
-    rag.save()?;
-    Ok(())
-}
-
-async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
-    let sessions = db.list_sessions().await?;
-    let mut rows = Vec::new();
-
-    for session in sessions {
-        let session_id = session.id;
-        let title = session.title.unwrap_or_default();
-        let model = session.model.unwrap_or_default();
-        let preview = session.preview.unwrap_or_default();
-        let created_at = session.created_at;
-        let updated_at = session.updated_at;
-        let message_count = session.message_count;
-
-        let messages = db.get_messages(&session_id).await?;
-        for msg in messages {
-            if matches!(
-                msg.role.as_str(),
-                "permission_request"
-                    | "permission_response"
-                    | "ask_user_request"
-                    | "ask_user_response"
-                    | "hidden_context"
-            ) {
-                continue;
-            }
-            rows.push(SessionIndexRow {
-                session_id: session_id.clone(),
-                profile_id: session.profile_id.clone().unwrap_or_default(),
-                title: title.clone(),
-                model: model.clone(),
-                archived: if session.archived { "1" } else { "0" }.to_string(),
-                role: msg.role,
-                content: msg.content,
-                preview: preview.clone(),
-                timestamp: msg.timestamp.unwrap_or_default(),
-                created_at: created_at.clone(),
-                updated_at: updated_at.clone(),
-                message_id: i64::from(msg.id),
-                message_count,
-            });
-        }
-    }
-
-    Ok(rows)
-}
-
-fn rows_to_record_reader(
-    rows: &[SessionIndexRow],
-) -> anyhow::Result<Box<dyn RecordBatchReader + Send>> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("session_id", DataType::Utf8, false),
-        Field::new("profile_id", DataType::Utf8, false),
-        Field::new("title", DataType::Utf8, false),
-        Field::new("model", DataType::Utf8, false),
-        Field::new("archived", DataType::Utf8, false),
-        Field::new("role", DataType::Utf8, false),
-        Field::new("content", DataType::Utf8, false),
-        Field::new("preview", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Utf8, false),
-        Field::new("created_at", DataType::Utf8, false),
-        Field::new("updated_at", DataType::Utf8, false),
-        Field::new("message_id", DataType::Int64, false),
-        Field::new("message_count", DataType::Int32, false),
-    ]));
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.session_id.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.profile_id.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.title.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.model.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.archived.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.role.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.content.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.preview.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.timestamp.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.created_at.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| r.updated_at.as_str()),
-            )),
-            Arc::new(Int64Array::from_iter_values(
-                rows.iter().map(|r| r.message_id),
-            )),
-            Arc::new(Int32Array::from_iter_values(
-                rows.iter().map(|r| r.message_count),
-            )),
-        ],
-    )?;
-
-    let iter = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    Ok(Box::new(iter))
-}
-
-fn build_sql_filter(args: &SessionArgs) -> Option<String> {
-    let mut filters = Vec::new();
-
-    if let Some(session_id) = &args.session_id {
-        filters.push(binary_sql_expr(
-            "session_id",
-            BinaryOperator::Eq,
-            session_id,
-        ));
-    }
-
-    if let Some(excluded) = &args.exclude_session_id {
-        filters.push(binary_sql_expr(
-            "session_id",
-            BinaryOperator::NotEq,
-            excluded,
-        ));
-    }
-
-    if let Some(model) = &args.model {
-        filters.push(binary_sql_expr("model", BinaryOperator::Eq, model));
-    }
-
-    if let Some(profile_id) = &args.profile_id {
-        filters.push(binary_sql_expr(
-            "profile_id",
-            BinaryOperator::Eq,
-            profile_id,
-        ));
-    }
-
-    if let Some(role) = &args.role {
-        filters.push(binary_sql_expr("role", BinaryOperator::Eq, role));
-    }
-
-    if let Some(since) = &args.since {
-        filters.push(binary_sql_expr("timestamp", BinaryOperator::GtEq, since));
-    }
-
-    if let Some(until) = &args.until {
-        filters.push(binary_sql_expr("timestamp", BinaryOperator::LtEq, until));
-    }
-
-    if let Some(title_contains) = &args.title_contains {
-        filters.push(SqlExpr::Like {
-            negated: false,
-            any: false,
-            expr: Box::new(identifier_sql_expr("title")),
-            pattern: Box::new(string_sql_expr(contains_match_pattern(title_contains))),
-            escape_char: None,
-        });
-    }
-
-    if !args.include_archived {
-        filters.push(binary_sql_expr("archived", BinaryOperator::Eq, "0"));
-    }
-
-    filters
-        .into_iter()
-        .reduce(|left, right| SqlExpr::BinaryOp {
-            left: Box::new(left),
-            op: BinaryOperator::And,
-            right: Box::new(right),
-        })
-        .map(|expr| expr.to_string())
-}
-
-fn identifier_sql_expr(column: &str) -> SqlExpr {
-    SqlExpr::Identifier(Ident::new(column))
-}
-
-fn string_sql_expr(value: String) -> SqlExpr {
-    SqlExpr::value(SqlValue::SingleQuotedString(value))
-}
-
-fn contains_match_pattern(value: &str) -> String {
-    let mut pattern = String::with_capacity(value.len() + 2);
-    pattern.push('%');
-    pattern.push_str(value);
-    pattern.push('%');
-    pattern
-}
-
-fn binary_sql_expr(column: &str, op: BinaryOperator, value: &str) -> SqlExpr {
-    SqlExpr::BinaryOp {
-        left: Box::new(identifier_sql_expr(column)),
-        op,
-        right: Box::new(string_sql_expr(value.to_string())),
-    }
-}
-
-async fn run_plain_query(
-    table: &Table,
-    args: &SessionArgs,
-) -> anyhow::Result<Vec<SessionMatchRow>> {
-    let mut query = table
-        .query()
-        .select(Select::columns(&[
-            "session_id",
-            "profile_id",
-            "title",
-            "model",
-            "archived",
-            "role",
-            "content",
-            "preview",
-            "timestamp",
-            "updated_at",
-            "message_id",
-            "message_count",
-        ]))
-        .limit(args.scan_limit);
-
-    if let Some(filter) = build_sql_filter(args) {
-        query = query.only_if(filter);
-    }
-
-    let mut stream = query.execute().await?;
-    read_rows_from_stream(&mut stream).await
-}
-
-async fn run_full_text_query(
-    table: &Table,
-    args: &SessionArgs,
-    fuzzy: bool,
-) -> anyhow::Result<Vec<SessionMatchRow>> {
-    if args.query.trim() == "*" || args.query.trim().is_empty() {
-        return run_plain_query(table, args).await;
-    }
-
-    let mut fts = if fuzzy {
-        FullTextSearchQuery::new_fuzzy(args.query.clone(), Some(args.fuzzy_distance))
-    } else {
-        FullTextSearchQuery::new(args.query.clone())
-    };
-
-    let fts_columns: Vec<String> = args
-        .fields
-        .iter()
-        .filter(|f| matches!(f.as_str(), "content" | "title" | "preview"))
-        .cloned()
-        .collect();
-    if !fts_columns.is_empty() {
-        fts = fts.with_columns(&fts_columns)?;
-    }
-
-    let mut query = table
-        .query()
-        .full_text_search(fts)
-        .select(Select::columns(&[
-            "session_id",
-            "profile_id",
-            "title",
-            "model",
-            "archived",
-            "role",
-            "content",
-            "preview",
-            "timestamp",
-            "updated_at",
-            "message_id",
-            "message_count",
-            "_score",
-        ]))
-        .limit(args.scan_limit);
-
-    if let Some(filter) = build_sql_filter(args) {
-        query = query.only_if(filter);
-    }
-
-    let mut stream = query.execute().await?;
-    let mut rows = read_rows_from_stream(&mut stream).await?;
-    for row in &mut rows {
-        push_unique(
-            &mut row.matched_by,
-            if fuzzy {
-                SessionSearchMode::Fuzzy
-            } else {
-                SessionSearchMode::Fulltext
-            },
-        );
-    }
-    Ok(rows)
-}
-
-fn require_semantic_metadata<'a>(
-    metadata: &'a aither_rag::Metadata,
-    key: &str,
-) -> anyhow::Result<&'a str> {
-    metadata
-        .get(key)
-        .map(String::as_str)
-        .ok_or_else(|| anyhow::anyhow!("session semantic index entry is missing '{key}' metadata"))
 }
 
 fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> bool {
@@ -1090,187 +941,18 @@ fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> boo
     {
         return false;
     }
-    if let Some(title_contains) = &args.title_contains {
-        let title = if args.case_sensitive {
-            row.title.clone()
-        } else {
-            row.title.to_lowercase()
-        };
-        let needle = if args.case_sensitive {
-            title_contains.clone()
-        } else {
-            title_contains.to_lowercase()
-        };
-        if !title.contains(&needle) {
-            return false;
-        }
+    if let Some(title_contains) = &args.title_contains
+        && !row
+            .title
+            .to_lowercase()
+            .contains(&title_contains.to_lowercase())
+    {
+        return false;
     }
     args.include_archived || !row.archived
 }
 
-async fn run_semantic_query(
-    semantic_index_path: PathBuf,
-    embedder: MayEmbeddingModel,
-    args: SessionArgs,
-) -> anyhow::Result<ToolResult> {
-    if args.query.trim() == "*" {
-        return Err(anyhow::anyhow!(
-            "session semantic search does not support wildcard queries"
-        ));
-    }
-
-    match async_fs::metadata(&semantic_index_path).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "session semantic index is missing; rerun the query after indexing data"
-            ));
-        }
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to inspect session semantic index {}: {error}",
-                semantic_index_path.display()
-            ));
-        }
-    }
-
-    let rag = Rag::builder(embedder)
-        .index_path(semantic_index_path)
-        .code_chunking(2400)
-        .top_k(args.scan_limit)
-        .deduplication(false)
-        .auto_save(false)
-        .build()?;
-    rag.load()?;
-
-    let rows = rag
-        .search_with_k(args.query.as_str(), args.scan_limit)
-        .await?
-        .into_iter()
-        .map(|result| -> anyhow::Result<SessionMatchRow> {
-            let metadata = &result.chunk.metadata;
-            Ok(SessionMatchRow {
-                session_id: require_semantic_metadata(metadata, "session_id")?.to_string(),
-                profile_id: require_semantic_metadata(metadata, "profile_id")?.to_string(),
-                title: require_semantic_metadata(metadata, "title")?.to_string(),
-                model: require_semantic_metadata(metadata, "model")?.to_string(),
-                archived: require_semantic_metadata(metadata, "archived")? == "1",
-                role: require_semantic_metadata(metadata, "role")?.to_string(),
-                content: result.chunk.text,
-                preview: require_semantic_metadata(metadata, "preview")?.to_string(),
-                timestamp: require_semantic_metadata(metadata, "timestamp")?.to_string(),
-                updated_at: require_semantic_metadata(metadata, "updated_at")?.to_string(),
-                message_id: require_semantic_metadata(metadata, "message_id")?.parse::<i64>()?,
-                message_count: require_semantic_metadata(metadata, "message_count")?
-                    .parse::<i32>()?,
-                score: f64::from(result.score),
-                matched_by: vec![SessionSearchMode::Semantic],
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|row| row_matches_session_filters(row, &args))
-        .collect::<Vec<_>>();
-
-    let total_matches = rows.len();
-    finalize_rows_with_total(rows, total_matches, &args)
-}
-
-async fn read_rows_from_stream(
-    stream: &mut lancedb::arrow::SendableRecordBatchStream,
-) -> anyhow::Result<Vec<SessionMatchRow>> {
-    let mut rows = Vec::new();
-
-    while let Some(batch_res) = stream.next().await {
-        let batch = batch_res?;
-
-        let session_id = as_string(batch.column_by_name("session_id"), "session_id")?;
-        let title = as_string(batch.column_by_name("title"), "title")?;
-        let model = as_string(batch.column_by_name("model"), "model")?;
-        let profile_id = as_string(batch.column_by_name("profile_id"), "profile_id")?;
-        let archived = as_string(batch.column_by_name("archived"), "archived")?;
-        let role = as_string(batch.column_by_name("role"), "role")?;
-        let content = as_string(batch.column_by_name("content"), "content")?;
-        let preview = as_string(batch.column_by_name("preview"), "preview")?;
-        let timestamp = as_string(batch.column_by_name("timestamp"), "timestamp")?;
-        let updated_at = as_string(batch.column_by_name("updated_at"), "updated_at")?;
-        let message_id = as_i64(batch.column_by_name("message_id"), "message_id")?;
-        let message_count = as_i32(batch.column_by_name("message_count"), "message_count")?;
-
-        let score_col = batch.column_by_name("_score");
-        let scores = score_col
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
-            .map(|arr| {
-                (0..arr.len())
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            0.0
-                        } else {
-                            f64::from(arr.value(i))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![0.0; batch.num_rows()]);
-
-        for i in 0..batch.num_rows() {
-            rows.push(SessionMatchRow {
-                session_id: session_id.value(i).to_string(),
-                profile_id: profile_id.value(i).to_string(),
-                title: title.value(i).to_string(),
-                model: model.value(i).to_string(),
-                archived: archived.value(i) == "1",
-                role: role.value(i).to_string(),
-                content: content.value(i).to_string(),
-                preview: preview.value(i).to_string(),
-                timestamp: timestamp.value(i).to_string(),
-                updated_at: updated_at.value(i).to_string(),
-                message_id: message_id.value(i),
-                message_count: message_count.value(i),
-                score: scores[i],
-                matched_by: Vec::new(),
-            });
-        }
-    }
-
-    Ok(rows)
-}
-
-fn as_string<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a StringArray> {
-    column
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
-}
-
-fn as_i64<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int64Array> {
-    column
-        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
-}
-
-fn as_i32<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int32Array> {
-    column
-        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
-}
-
-fn searchable_text(row: &SessionMatchRow, fields: &[String]) -> String {
-    let mut parts = Vec::new();
-    for field in fields {
-        match field.as_str() {
-            "content" => parts.push(row.content.as_str()),
-            "title" => parts.push(row.title.as_str()),
-            "preview" => parts.push(row.preview.as_str()),
-            "session_id" => parts.push(row.session_id.as_str()),
-            "model" => parts.push(row.model.as_str()),
-            "role" => parts.push(row.role.as_str()),
-            _ => {}
-        }
-    }
-    parts.join("\n")
-}
-
-fn truncate_text(input: &str, max_chars: usize) -> String {
+pub(super) fn truncate_text(input: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in input.chars().enumerate() {
         if idx >= max_chars {
@@ -1283,27 +965,26 @@ fn truncate_text(input: &str, max_chars: usize) -> String {
 }
 
 fn finalize_rows_with_total(
-    rows: Vec<SessionMatchRow>,
+    rows: &[SessionMatchRow],
     total_matches: usize,
     args: &SessionArgs,
-) -> anyhow::Result<ToolResult> {
+) -> ToolResult {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
 
-    let value = if args.output_mode == SessionOutputMode::Messages {
+    let text = if args.output_mode == SessionOutputMode::Messages {
         let items: Vec<MessageResult> = rows
             .into_iter()
             .map(|row| MessageResult::from_row(row, args.include_content))
             .collect();
-        serde_json::json!({
-            "query": args.query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
-        })
+        SessionSearchMessagesText {
+            query: args.query.clone(),
+            total_matches,
+            items,
+        }
+        .render()
+        .expect("session search template must render")
     } else {
         let mut grouped: HashMap<String, SessionResult> = HashMap::new();
         for row in rows {
@@ -1338,32 +1019,30 @@ fn finalize_rows_with_total(
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
 
-        serde_json::json!({
-            "query": args.query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
-        })
+        SessionSearchSessionsText {
+            query: args.query.clone(),
+            total_matches,
+            items,
+        }
+        .render()
+        .expect("session search template must render")
     };
 
-    ToolResult::json(&value)
+    ToolResult::text(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn base_args() -> SessionArgs {
         SessionArgs {
             command: None,
             query: "*".to_string(),
-            search_mode: SessionSearchMode::Hybrid,
             output_mode: SessionOutputMode::Sessions,
             limit: 20,
             offset: 0,
-            scan_limit: 2000,
             session_id: None,
             exclude_session_id: None,
             model: None,
@@ -1372,10 +1051,8 @@ mod tests {
             since: None,
             until: None,
             title_contains: None,
-            case_sensitive: false,
-            regex: None,
-            fuzzy_distance: 1,
-            fields: Vec::new(),
+            around: None,
+            context: None,
             include_content: false,
             include_current: false,
             include_archived: false,
@@ -1384,57 +1061,98 @@ mod tests {
 
     #[test]
     fn parses_scoped_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(
-            &mut args,
-            "session abc123 search investigate failures",
-            "session",
+        let tokens =
+            split_command_form_tokens("session abc123 search investigate failures", "session")
+                .expect("command form should parse");
+        let plan = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
         )
-        .expect("command form should parse");
+        .expect("plan should parse")
+        .expect("search plan should be produced");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.query, "investigate failures");
     }
 
     #[test]
     fn parses_global_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(&mut args, "session recall onboarding decision", "session")
+        let tokens = split_command_form_tokens("session recall onboarding decision", "session")
             .expect("global command form should parse");
+        let plan = build_execution_plan(
+            base_args(),
+            SessionCommandInput::Tokens(tokens),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("search plan should parse");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id, None);
         assert_eq!(args.query, "recall onboarding decision");
     }
 
     #[test]
     fn parses_quoted_scoped_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(
-            &mut args,
+        let tokens = split_command_form_tokens(
             "session abc123 search \"investigate spaced failures\"",
             "session",
         )
         .expect("quoted scoped command form should parse");
+        let plan = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("plan should parse")
+        .expect("search plan should be produced");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.query, "investigate spaced failures");
     }
 
     #[test]
     fn parses_quoted_global_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(
-            &mut args,
-            "session \"recall onboarding decision\"",
-            "session",
+        let tokens = split_command_form_tokens("session \"recall onboarding decision\"", "session")
+            .expect("quoted global command form should parse");
+        let plan = build_execution_plan(
+            base_args(),
+            SessionCommandInput::Tokens(tokens),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
         )
-        .expect("quoted global command form should parse");
+        .expect("search plan should parse");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id, None);
         assert_eq!(args.query, "recall onboarding decision");
     }
 
     #[test]
     fn rejects_missing_prompt_in_scoped_command() {
-        let mut args = base_args();
-        let err = apply_command_form(&mut args, "session abc123 search", "session")
-            .expect_err("missing prompt must fail");
+        let tokens =
+            split_command_form_tokens("session abc123 search", "session").expect("tokens parse");
+        let err = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect_err("missing prompt must fail");
         assert!(
             err.to_string().contains("missing prompt"),
             "unexpected error: {err}"
@@ -1442,39 +1160,265 @@ mod tests {
     }
 
     #[test]
-    fn session_search_mode_serializes_as_lowercase_string() {
-        let value =
-            serde_json::to_value(vec![SessionSearchMode::Fulltext, SessionSearchMode::Regex])
-                .expect("session search modes should serialize");
-        assert_eq!(value, serde_json::json!(["fulltext", "regex"]));
+    fn parses_inspect_command_form() {
+        let tokens = split_command_form_tokens("session inspect abc123", "session")
+            .expect("inspect command form should parse");
+        let plan = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("plan should parse")
+        .expect("inspect plan should be produced");
+        let SessionExecutionPlan::Inspect(request) = plan else {
+            panic!("expected inspect plan");
+        };
+        assert_eq!(request.session_id, "abc123");
     }
 
     #[test]
-    fn sql_filter_ast_builds_expected_predicates() {
+    fn parses_raw_query_inspect_action() {
         let mut args = base_args();
-        args.session_id = Some("session-1".to_string());
-        args.model = Some("gpt-5".to_string());
-        args.profile_id = Some("work".to_string());
-        args.since = Some("2026-03-12T00:00:00Z".to_string());
+        args.query = "inspect abc123".to_string();
+        let plan = plan_from_raw_query(
+            &args,
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("inspect plan should be produced");
+        let SessionExecutionPlan::Inspect(request) = plan else {
+            panic!("expected inspect plan");
+        };
+        assert_eq!(request.session_id, "abc123");
+    }
 
-        let filter = build_sql_filter(&args).expect("filter should be built");
+    #[tokio::test]
+    async fn single_token_query_becomes_implicit_inspect_when_session_exists() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("abc123", Some("session"), Some("gpt-5"))
+            .await
+            .expect("session should be created");
 
-        assert!(filter.contains("session_id = 'session-1'"));
-        assert!(filter.contains("model = 'gpt-5'"));
-        assert!(filter.contains("profile_id = 'work'"));
-        assert!(filter.contains("timestamp >= '2026-03-12T00:00:00Z'"));
-        assert!(filter.contains("archived = '0'"));
-        assert!(filter.contains(" AND "));
+        let mut args = base_args();
+        args.query = "abc123".to_string();
+
+        let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
+            .await
+            .expect("implicit inspect should resolve");
+
+        let SessionExecutionPlan::Inspect(request) = plan else {
+            panic!("expected inspect plan");
+        };
+        assert_eq!(request.session_id, "abc123");
+    }
+
+    #[tokio::test]
+    async fn single_token_query_stays_search_when_session_missing() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let _db = ChatDb::open(&db_path).await.expect("db should open");
+
+        let mut args = base_args();
+        args.query = "abc123".to_string();
+
+        let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
+            .await
+            .expect("search should remain valid");
+
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
+        assert_eq!(args.query, "abc123");
+    }
+
+    #[tokio::test]
+    async fn messages_around_returns_exactly_the_window() {
+        use crate::db::MessageMeta;
+        use crate::session::MessageRole;
+
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("s1", Some("t"), Some("m"))
+            .await
+            .expect("session");
+        db.create_session("s2", Some("t"), Some("m"))
+            .await
+            .expect("session");
+        let mut ids = Vec::new();
+        for n in 0..9 {
+            // An interleaved row of another session must not enter the window.
+            let session = if n == 4 { "s2" } else { "s1" };
+            let message = db
+                .append_message(
+                    session,
+                    MessageRole::User,
+                    &format!("body {n}"),
+                    Some("2026-01-01T00:00:00Z"),
+                    MessageMeta::default(),
+                )
+                .await
+                .expect("append");
+            ids.push(i64::from(message.id));
+        }
+
+        let mut args = base_args();
+        args.around = Some(ids[6]);
+        args.context = Some(2);
+        let request = SessionMessagesRequest::new("s1".to_string(), &args);
+        let text = execute_messages(db_path.clone(), request)
+            .await
+            .expect("messages")
+            .as_text()
+            .expect("text")
+            .to_string();
+        assert!(text.contains("5 message(s):"), "{text}");
+        for n in [3, 5, 6, 7, 8] {
+            assert!(
+                text.contains(&format!("body {n}\n")) || text.ends_with(&format!("body {n}\n")),
+                "{text}"
+            );
+        }
+        for n in [0, 1, 2, 4] {
+            assert!(!text.contains(&format!("body {n}")), "{text}");
+        }
+
+        let mut args = base_args();
+        args.around = Some(ids[4]);
+        let missing = execute_messages(
+            db_path,
+            SessionMessagesRequest::new("s1".to_string(), &args),
+        )
+        .await
+        .expect_err("message of another session");
+        assert!(missing.to_string().contains("has no message"), "{missing}");
+    }
+
+    fn match_row(session_id: &str, message_id: i64, content: &str) -> SessionMatchRow {
+        SessionMatchRow {
+            session_id: session_id.to_string(),
+            profile_id: "profile".to_string(),
+            title: "title".to_string(),
+            model: "model".to_string(),
+            archived: false,
+            role: "user".to_string(),
+            content: content.to_string(),
+            preview: String::new(),
+            timestamp: String::new(),
+            updated_at: String::new(),
+            message_id,
+            message_count: 1,
+            score: 1.0,
+        }
     }
 
     #[test]
-    fn sql_filter_ast_quotes_embedded_single_quotes() {
-        let mut args = base_args();
-        args.title_contains = Some("owner's update".to_string());
+    fn current_context_filter_removes_only_visible_current_session_hits() {
+        let window = vec![aither_core::llm::Message::user(
+            "Already visible current-session content",
+        )];
+        let rows = vec![
+            match_row("current", 1, "Already visible current-session content"),
+            match_row("current", 2, "Older content not in the window"),
+            match_row("other", 3, "Already visible current-session content"),
+        ];
 
-        let filter = build_sql_filter(&args).expect("title filter should be built");
+        let filtered = filter_rows_against_messages("current", &window, rows);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].message_id, 2);
+        assert_eq!(filtered[1].session_id, "other");
+    }
 
-        assert!(filter.contains("title LIKE '%owner''s update%'"));
-        assert!(!filter.contains("owner's update%' OR"));
+    fn summary(session_id: &str, archived: bool) -> SessionSummaryView {
+        SessionSummaryView {
+            session_id: session_id.to_string(),
+            title: "Plan".to_string(),
+            model: "m1".to_string(),
+            profile_id: Some("p1".to_string()),
+            archived,
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-02".to_string(),
+            message_count: 4,
+            preview: "first words".to_string(),
+        }
+    }
+
+    fn message(message_id: i32, role: &str, content: &str) -> SessionMessageView {
+        SessionMessageView {
+            message_id,
+            role: role.to_string(),
+            timestamp: Some("2026-01-02T10:00:00Z".to_string()),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn list_result_reads_as_sentences_and_session_lines() {
+        let text = SessionListText {
+            total_matches: 5,
+            results: vec![summary("s1", false), summary("s2", true)],
+        }
+        .render()
+        .expect("session list template must render");
+        assert_eq!(
+            text,
+            "Showing 2 of 5 matching session(s).\n\nSession s1 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, profile p1, created 2026-01-01)\nPreview: first words\n\nSession s2 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, archived, profile p1, created 2026-01-01)\nPreview: first words\n"
+        );
+    }
+
+    #[test]
+    fn messages_result_lists_each_message_with_role_and_time() {
+        let text = SessionMessagesText {
+            session: summary("s1", false),
+            messages: vec![message(1, "user", "hi"), message(2, "assistant", "hello")],
+        }
+        .render()
+        .expect("session messages template must render");
+        assert_eq!(
+            text,
+            "Session s1 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, profile p1, created 2026-01-01)\nPreview: first words\n2 message(s):\n\nMessage 1 (user, 2026-01-02T10:00:00Z):\nhi\n\nMessage 2 (assistant, 2026-01-02T10:00:00Z):\nhello\n"
+        );
+    }
+
+    #[test]
+    fn inspect_result_names_the_final_messages() {
+        let text = SessionInspectText {
+            session: summary("s1", false),
+            final_assistant_message: Some(message(2, "assistant", "done")),
+            final_user_message: Some(message(1, "user", "go")),
+            latest_message: None,
+        }
+        .render()
+        .expect("session inspect template must render");
+        assert_eq!(
+            text,
+            "Session s1 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, profile p1, created 2026-01-01)\nPreview: first words\n\nFinal assistant message:\nMessage 2 (assistant, 2026-01-02T10:00:00Z):\ndone\n\nFinal user message:\nMessage 1 (user, 2026-01-02T10:00:00Z):\ngo\n"
+        );
+    }
+
+    #[test]
+    fn search_results_state_query_mode_and_matches() {
+        let item = MessageResult::from_row(match_row("s1", 7, "needle in a haystack"), true);
+        let text = SessionSearchMessagesText {
+            query: "needle".to_string(),
+            total_matches: 1,
+            items: vec![item],
+        }
+        .render()
+        .expect("session search template must render");
+        assert!(
+            text.starts_with(
+                "Search \"needle\": showing 1 of 1 matching message(s).\n\nMessage 7 ("
+            ),
+            "unexpected search text: {text}"
+        );
+        assert!(text.contains("score 1."), "{text}");
+        assert!(text.contains("Snippet: needle in a haystack"), "{text}");
+        assert!(text.contains("Content:\nneedle in a haystack"), "{text}");
     }
 }

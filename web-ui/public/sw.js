@@ -1,76 +1,39 @@
+// Shows the notifications the daemon pushes when a session waits on the
+// user, and opens that session when one is clicked.
+
 self.addEventListener('push', (event) => {
-  if (!event.data) {
-    console.error('May Push: missing payload data')
-    return
-  }
-
-  let payload
-  try {
-    payload = event.data.json()
-  } catch (error) {
-    console.error('May Push: invalid JSON payload', error)
-    return
-  }
-
-  if (typeof payload !== 'object' || payload === null) {
-    console.error('May Push: payload must be an object')
-    return
-  }
-
-  if (typeof payload.title !== 'string' || payload.title.trim().length === 0) {
-    console.error('May Push: payload.title must be a non-empty string')
-    return
-  }
-
-  if (typeof payload.body !== 'string' || payload.body.trim().length === 0) {
-    console.error('May Push: payload.body must be a non-empty string')
-    return
-  }
-
+  if (!event.data) return;
+  const payload = event.data.json();
   event.waitUntil(
-    self.registration.showNotification(payload.title.trim(), {
+    self.registration.showNotification(payload.title, {
       body: payload.body,
-      data: payload,
-      tag: 'may-notification',
+      tag: payload.sessionId ?? payload.notificationId,
       renotify: true,
-      requireInteraction: false,
+      data: { sessionId: payload.sessionId, profileId: payload.profileId },
     }),
-  )
-})
+  );
+});
+
+function sessionPath({ sessionId, profileId }) {
+  if (!sessionId || !profileId) return '/';
+  return `/p/${encodeURIComponent(profileId)}/s/${encodeURIComponent(sessionId)}`;
+}
 
 self.addEventListener('notificationclick', (event) => {
-  event.notification.close()
-  const payload = event.notification.data || {}
-  const notificationId =
-    typeof payload.notificationId === 'string' && payload.notificationId.trim().length > 0
-      ? payload.notificationId.trim()
-      : ''
-
-  event.waitUntil((async () => {
-    const clientsList = await clients.matchAll({
-      type: 'window',
-      includeUncontrolled: true,
-    })
-
-    if (clientsList.length > 0) {
-      const client = clientsList[0]
-      await client.focus()
-      client.postMessage({
-        type: 'may-notification-click',
-        payload,
-      })
-      return
-    }
-
-    const targetPath = notificationId
-      ? `/chat/new?notification=${encodeURIComponent(notificationId)}`
-      : '/chat/new'
-    const opened = await clients.openWindow(targetPath)
-    if (opened) {
-      opened.postMessage({
-        type: 'may-notification-click',
-        payload,
-      })
-    }
-  })())
-})
+  event.notification.close();
+  const path = sessionPath(event.notification.data ?? {});
+  event.waitUntil(
+    (async () => {
+      const clients = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true,
+      });
+      const existing = clients.find((c) => 'focus' in c);
+      if (existing) {
+        const navigated = await existing.navigate(path);
+        return (navigated ?? existing).focus();
+      }
+      return self.clients.openWindow(path);
+    })(),
+  );
+});

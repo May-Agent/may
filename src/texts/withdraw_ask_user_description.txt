@@ -1,0 +1,1 @@
+Withdraw an open ask_user question by its request_id when the work moved on. A withdrawn question leaves the user's view and a later answer to it is not delivered. To change a question, withdraw it and ask the new one.

@@ -1,60 +1,56 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
+use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::AgentEnvironment;
 use crate::container::ContainerRuntime;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::profiles;
+use crate::profile::ContainerProfilePreferences;
 use crate::profile::ProfileEnvironment;
 use crate::session::SessionId;
 
+/// Error type for resolving the environment an agent session runs in.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveAgentEnvironmentError {
-    #[error("remote profile model is missing")]
-    MissingRemoteProfileModel,
+    /// Container profile model is missing.
     #[error("container profile model is missing")]
     MissingContainerProfileModel,
-    #[error("failed to load config.toml for remote profile: {0}")]
-    LoadRemoteConfig(crate::config::ConfigError),
-    #[error("{0}")]
-    ResolveRemoteServer(String),
+    /// No container runtime available for container profile.
     #[error("no container runtime available for container profile: {0}")]
     DetectContainerRuntime(crate::container::ContainerError),
-    #[error("invalid container profile image tag: {0}")]
-    ContainerImageTag(crate::container::ContainerError),
-    #[error("invalid container profile configuration: {0}")]
-    ContainerProfileConfig(crate::container::ContainerError),
-    #[error("invalid container mount configuration: {0}")]
-    ContainerMountConfig(crate::container::ContainerError),
-    #[error("container image build failed: {0}")]
+    /// Container image pull failed.
+    #[error("container image pull failed: {0}")]
     EnsureContainerImage(crate::container::ContainerError),
+    /// Container start failed.
     #[error("container start failed: {0}")]
     StartContainer(crate::container::ContainerError),
+    /// The container's IPC bridge route could not be resolved.
+    #[error("container IPC route resolution failed: {0}")]
+    ResolveContainerIpcRoute(crate::container::ContainerError),
 }
 
+/// Resolve the container/local environment an agent session should run in,
+/// deriving image tag, mounts, and tool environments from the profile.
+///
+/// # Errors
+///
+/// Returns [`ResolveAgentEnvironmentError`] when the profile requires a
+/// container environment but its model row is missing, when no container
+/// runtime can be detected, when the profile's image tag is invalid, when the
+/// image fails to build, when the container fails to start, or when the
+/// container's IPC route cannot be resolved.
 pub async fn resolve_agent_environment_for_session(
     profile_environment: Option<ProfileEnvironment>,
     profile_model: Option<&profiles::Model>,
+    container_preferences: Option<ContainerProfilePreferences>,
     may_dir: &Path,
     sandbox_dir: &Path,
     session_id: &SessionId,
 ) -> Result<AgentEnvironment, ResolveAgentEnvironmentError> {
     match profile_environment {
         Some(ProfileEnvironment::Container { .. }) => {}
-        Some(ProfileEnvironment::Remote { .. }) => {
-            let profile =
-                profile_model.ok_or(ResolveAgentEnvironmentError::MissingRemoteProfileModel)?;
-            let config_path = may_dir.join("config.toml");
-            let config = crate::config::MayConfig::load_from(&config_path)
-                .await
-                .map_err(ResolveAgentEnvironmentError::LoadRemoteConfig)?;
-            let ssh_server =
-                crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
-                    .map_err(ResolveAgentEnvironmentError::ResolveRemoteServer)?;
-            return Ok(AgentEnvironment::Remote { ssh_server });
-        }
         _ => return Ok(AgentEnvironment::Local),
     }
 
@@ -66,26 +62,17 @@ pub async fn resolve_agent_environment_for_session(
         .map_err(ResolveAgentEnvironmentError::DetectContainerRuntime)?;
     let container_manager = ContainerManager::new(Arc::new(runtime), may_dir.to_path_buf());
 
-    let default_image_tag = crate::container::profile::default_image_tag(may_dir, profile)
-        .await
-        .map_err(ResolveAgentEnvironmentError::ContainerImageTag)?;
-    let image_spec =
-        crate::container::profile::image_spec_for_profile(may_dir, profile, &default_image_tag)
-            .map_err(ResolveAgentEnvironmentError::ContainerProfileConfig)?;
-    let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-        .map_err(ResolveAgentEnvironmentError::ContainerMountConfig)?;
+    let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
+    let image = crate::container::image::MAY_WORKSPACE_IMAGE;
 
-    crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
+    crate::container::image::ensure_image(container_manager.runtime(), image)
         .await
         .map_err(ResolveAgentEnvironmentError::EnsureContainerImage)?;
 
     let container_name =
         crate::container::profile::container_name_for_profile_session(profile, session_id);
-    let mut launch_spec = ContainerLaunchSpec::new(
-        container_name,
-        image_spec.tag.clone(),
-        sandbox_dir.to_path_buf(),
-    );
+    let mut launch_spec =
+        ContainerLaunchSpec::new(container_name, image.to_string(), sandbox_dir.to_path_buf());
     for mount in extra_mounts {
         launch_spec = launch_spec.with_mount(mount);
     }
@@ -95,14 +82,20 @@ pub async fn resolve_agent_environment_for_session(
         .await
         .map_err(ResolveAgentEnvironmentError::StartContainer)?;
 
-    let container_exec = ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+    let container_exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
         container_manager.runtime().client.clone(),
     ))));
 
+    let container_ipc_route = container_manager
+        .runtime()
+        .ipc_route(&container_id)
+        .await
+        .map_err(ResolveAgentEnvironmentError::ResolveContainerIpcRoute)?;
+
     Ok(AgentEnvironment::Container {
         container_id,
-        container_ipc_host: container_manager.runtime().host_gateway().to_string(),
+        container_ipc_route,
         container_exec,
-        browser_backend: None,
+        browser_cdp_endpoint: None,
     })
 }

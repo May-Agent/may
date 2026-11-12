@@ -6,21 +6,23 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 
 use crate::session::PendingUserMessageMode;
-use crate::xml_fragment::XmlFragment;
-
-/// Threshold for auto-saving pasted text to file (chars).
-pub const LARGE_PASTE_THRESHOLD: usize = 4000;
-
-/// Maximum chars shown in LLM context for large pastes.
-pub const PASTE_TRUNCATE_LIMIT: usize = 2000;
+use crate::xml::XmlBlock;
 
 /// An attachment to a message.
 #[derive(Debug, Clone)]
 pub enum Attachment {
     /// Pasted image (saved to session `files/images/`)
-    Image { path: PathBuf, data: Vec<u8> },
+    Image {
+        /// Path the image was saved to.
+        path: PathBuf,
+        /// Encoded image bytes.
+        data: Vec<u8>,
+    },
     /// File reference (@file mention)
-    FileReference { path: PathBuf },
+    FileReference {
+        /// Referenced file path.
+        path: PathBuf,
+    },
     /// Pasted text (may be saved to file if large)
     PastedText {
         /// Full text content
@@ -30,19 +32,52 @@ pub enum Attachment {
     },
 }
 
+impl Attachment {
+    /// Stable key under which this attachment's image bytes live in the
+    /// terminal image cache. `None` for non-image attachments.
+    #[must_use]
+    pub fn image_cache_key(&self) -> Option<String> {
+        match self {
+            Self::Image { path, .. } => Some(path.display().to_string()),
+            Self::FileReference { .. } | Self::PastedText { .. } => None,
+        }
+    }
+}
+
 /// A pending message in the queue.
 #[derive(Debug, Clone)]
 pub struct PendingMessage {
     /// Message content
     pub content: String,
     /// Structured hidden context injected as a system message for the next run.
-    pub hidden_context_xml: Option<XmlFragment>,
+    pub hidden_context_xml: Option<XmlBlock>,
     /// Attachments
     pub attachments: Vec<Attachment>,
     /// When the message was queued
     pub queued_at: Timestamp,
     /// Whether this should steer the running agent or wait in the queue.
     pub delivery_mode: PendingUserMessageMode,
+    /// ID of an existing chat element already rendering this message (a
+    /// bash-mode terminal block); `start_processing` then skips the user
+    /// bubble. Transient — not persisted with the queue.
+    pub display: Option<String>,
+}
+
+impl PendingMessage {
+    /// A daemon-reported queued message as a display row: the preview
+    /// renders content and delivery mode; its attachments stay server-side
+    /// until the turn it starts writes them to history.
+    #[must_use]
+    pub fn from_wire(msg: &crate::session::PendingUserMessage) -> Self {
+        Self {
+            content: msg.content.clone(),
+            hidden_context_xml: msg.hidden_context_xml.clone(),
+            attachments: Vec::new(),
+            queued_at: msg.created_at.parse().unwrap_or_else(|_| Timestamp::now()),
+            delivery_mode: msg.delivery_mode,
+            display: None,
+        }
+    }
 }
 
 /// Message queue for concurrent user input.
@@ -122,6 +157,7 @@ mod tests {
             attachments: Vec::new(),
             queued_at: Timestamp::now(),
             delivery_mode: mode,
+            display: None,
         }
     }
 

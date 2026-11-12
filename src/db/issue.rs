@@ -1,0 +1,822 @@
+//! Issue CRUD for the may issue store on [`ChatDb`].
+//!
+//! Issues are scoped to an `issue_projects` row keyed by the repository
+//! identity (canonicalized git common dir, or the canonical directory for
+//! non-git workspaces), so every session and worktree of one repository on
+//! this machine reads and writes the same issues.
+
+use crate::issue::{
+    IssueComment, IssueDetail, IssueListState, IssueRelationKind, IssueState, IssueSummary,
+    RelatedIssue,
+};
+
+use super::common::{I64ValueRow, row_not_found, storage_error};
+use super::entity::issues::{CommentModel, Model};
+use super::{ChatDb, ChatDbError, query};
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+struct LabelNameRow {
+    name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+struct RelatedIssueRow {
+    number: i64,
+    title: String,
+    state: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+struct LabelIdRow {
+    id: i64,
+}
+
+impl ChatDb {
+    /// Fetch (creating if needed) the project row for `repo_key`.
+    pub(crate) async fn ensure_issue_project(&self, repo_key: &str) -> Result<i64, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT OR IGNORE INTO issue_projects (repo_key, created_at) VALUES (?, ?)",
+            repo_key,
+            now
+        )
+        .execute()
+        .await?;
+        query!(
+            self.db,
+            "SELECT id AS value FROM issue_projects WHERE repo_key = ?",
+            repo_key
+        )
+        .fetch_one::<I64ValueRow>()
+        .await
+        .map(|row| row.value)
+        .map_err(Into::into)
+    }
+
+    /// Fetch the project row id for `repo_key`, when it exists.
+    async fn find_issue_project(&self, repo_key: &str) -> Result<Option<i64>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT id AS value FROM issue_projects WHERE repo_key = ?",
+            repo_key
+        )
+        .fetch_optional::<I64ValueRow>()
+        .await?
+        .map(|row| row.value))
+    }
+
+    /// The `repo_key` of the `issue_projects` row `project_id` belongs to,
+    /// when it exists.
+    pub(crate) async fn repo_key_of_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT repo_key AS value FROM issue_projects WHERE id = ?",
+            project_id
+        )
+        .fetch_optional::<super::common::StringValueRow>()
+        .await?
+        .map(|row| row.value))
+    }
+
+    async fn issue_row(&self, project_id: i64, number: i64) -> Result<Option<Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM issues WHERE project_id = ? AND number = ?",
+            project_id,
+            number
+        )
+        .fetch_optional::<Model>()
+        .await?)
+    }
+
+    async fn require_issue(&self, project_id: i64, number: i64) -> Result<Model, ChatDbError> {
+        self.issue_row(project_id, number)
+            .await?
+            .ok_or_else(|| row_not_found(format!("issue #{number}")))
+    }
+
+    async fn issue_labels(&self, issue_id: i64) -> Result<Vec<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT label.name AS name FROM issue_labels AS label INNER JOIN issue_label_assignments AS assignment ON assignment.label_id = label.id WHERE assignment.issue_id = ? ORDER BY label.name ASC",
+            issue_id
+        )
+        .fetch_all::<LabelNameRow>()
+        .await?
+        .into_iter()
+        .map(|row| row.name)
+        .collect())
+    }
+
+    async fn issue_comments(&self, issue_id: i64) -> Result<Vec<IssueComment>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM issue_comments WHERE issue_id = ? ORDER BY id ASC",
+            issue_id
+        )
+        .fetch_all::<CommentModel>()
+        .await?
+        .into_iter()
+        .map(|row| IssueComment {
+            id: row.id,
+            author: None,
+            body: row.body,
+            created_at: row.created_at,
+        })
+        .collect())
+    }
+
+    async fn issue_related(
+        &self,
+        issue_id: i64,
+        kind: IssueRelationKind,
+    ) -> Result<Vec<RelatedIssue>, ChatDbError> {
+        query!(
+            self.db,
+            "SELECT issue.number AS number, issue.title AS title, issue.state AS state FROM issue_relations AS relation INNER JOIN issues AS issue ON issue.id = relation.related_issue_id WHERE relation.issue_id = ? AND relation.kind = ? ORDER BY issue.number ASC",
+            issue_id,
+            kind.as_str()
+        )
+        .fetch_all::<RelatedIssueRow>()
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(RelatedIssue {
+                repository: None,
+                number: row.number,
+                title: row.title,
+                state: row.state.parse().map_err(|error: String| {
+                    storage_error(crate::db::common::db_custom_error(
+                        "invalid issue state: ",
+                        &error,
+                    ))
+                })?,
+            })
+        })
+        .collect()
+    }
+
+    async fn issue_detail(&self, row: Model) -> Result<IssueDetail, ChatDbError> {
+        let (labels, comments, sub_issues, blocked_by) = futures_lite::future::try_zip(
+            futures_lite::future::try_zip(self.issue_labels(row.id), self.issue_comments(row.id)),
+            futures_lite::future::try_zip(
+                self.issue_related(row.id, IssueRelationKind::SubIssue),
+                self.issue_related(row.id, IssueRelationKind::BlockedBy),
+            ),
+        )
+        .await
+        .map(|((labels, comments), (sub_issues, blocked_by))| {
+            (labels, comments, sub_issues, blocked_by)
+        })?;
+        Ok(IssueDetail {
+            number: row.number,
+            title: row.title,
+            body: row.body,
+            state: row.state.parse().map_err(|error: String| {
+                storage_error(crate::db::common::db_custom_error(
+                    "invalid issue state: ",
+                    &error,
+                ))
+            })?,
+            labels,
+            comments,
+            sub_issues,
+            blocked_by,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+
+    /// Fetch (creating if needed) a label row within an existing transaction.
+    ///
+    /// Runs on the caller's transaction rather than `self.db`: writing through
+    /// another pool connection while the transaction holds SQLite's write lock
+    /// deadlocks into `database is locked`.
+    async fn ensure_issue_label_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        project_id: i64,
+        name: &str,
+    ) -> Result<i64, ChatDbError> {
+        query!(
+            tx,
+            "INSERT OR IGNORE INTO issue_labels (project_id, name) VALUES (?, ?)",
+            project_id,
+            name
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "SELECT id FROM issue_labels WHERE project_id = ? AND name = ?",
+            project_id,
+            name
+        )
+        .fetch_one::<LabelIdRow>()
+        .await
+        .map(|row| row.id)
+        .map_err(Into::into)
+    }
+
+    /// Create an issue in the project keyed by `repo_key`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn create_issue(
+        &self,
+        repo_key: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<IssueDetail, ChatDbError> {
+        let project_id = self.ensure_issue_project(repo_key).await?;
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "INSERT INTO issues (project_id, number, title, body, state, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, 'open', ?, ? FROM issues WHERE project_id = ?",
+            project_id,
+            title,
+            body,
+            now.clone(),
+            now,
+            project_id
+        )
+        .execute()
+        .await?;
+        let row = tx
+            .query(
+                "SELECT * FROM issues WHERE project_id = ? AND number = (SELECT MAX(number) FROM issues WHERE project_id = ?)",
+            )
+            .bind(project_id)
+            .bind(project_id)
+            .fetch_one::<Model>()
+            .await?;
+        for label in labels {
+            let label_id = self
+                .ensure_issue_label_in_tx(&mut tx, project_id, label.as_str())
+                .await?;
+            query!(
+                tx,
+                "INSERT OR IGNORE INTO issue_label_assignments (issue_id, label_id) VALUES (?, ?)",
+                row.id,
+                label_id
+            )
+            .execute()
+            .await?;
+        }
+        tx.commit().await?;
+        self.issue_detail(row).await
+    }
+
+    /// Fetch one issue with labels, comments and relations.
+    ///
+    /// Returns `Ok(None)` when the project or the issue does not exist.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn get_issue(
+        &self,
+        repo_key: &str,
+        number: i64,
+    ) -> Result<Option<IssueDetail>, ChatDbError> {
+        let Some(project_id) = self.find_issue_project(repo_key).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.issue_row(project_id, number).await? else {
+            return Ok(None);
+        };
+        self.issue_detail(row).await.map(Some)
+    }
+
+    /// Issues of `repo_key` updated after `since` (any time when `None`),
+    /// oldest update first.
+    ///
+    /// A page holds the first `limit` such issues plus every other issue
+    /// sharing the last one's `updated_at`, so a caller that resumes after
+    /// the newest timestamp it saw never skips the rest of a tie.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the query fails.
+    pub async fn issues_updated_since(
+        &self,
+        repo_key: &str,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, ChatDbError> {
+        let Some(project_id) = self.find_issue_project(repo_key).await? else {
+            return Ok(Vec::new());
+        };
+        let since = since.unwrap_or("");
+        let rows = query!(
+            self.db,
+            "SELECT * FROM issues WHERE project_id = ? AND updated_at > ? AND updated_at <= (SELECT MAX(updated_at) FROM (SELECT updated_at FROM issues WHERE project_id = ? AND updated_at > ? ORDER BY updated_at LIMIT ?)) ORDER BY updated_at, number",
+            project_id,
+            since,
+            project_id,
+            since,
+            limit
+        )
+        .fetch_all::<Model>()
+        .await?;
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            summaries.push(IssueSummary {
+                number: row.number,
+                title: row.title,
+                state: row.state.parse().map_err(|error: String| {
+                    storage_error(crate::db::common::db_custom_error(
+                        "invalid issue state: ",
+                        &error,
+                    ))
+                })?,
+                labels: self.issue_labels(row.id).await?,
+                updated_at: row.updated_at,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// List issues in the project keyed by `repo_key`, newest first.
+    ///
+    /// `labels` filters to issues carrying every listed label.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn list_issues(
+        &self,
+        repo_key: &str,
+        state: IssueListState,
+        labels: &[String],
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, ChatDbError> {
+        let Some(project_id) = self.find_issue_project(repo_key).await? else {
+            return Ok(Vec::new());
+        };
+        // The label filter runs in the query so `LIMIT` counts matching rows.
+        let wanted: std::collections::BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+        let wanted_json = serde_json::to_string(&wanted)
+            .map_err(|error| storage_error(format!("issue label filter rejected: {error}")))?;
+        let wanted_count = i64::try_from(wanted.len())
+            .map_err(|error| storage_error(format!("issue label filter rejected: {error}")))?;
+        let rows = query!(
+            self.db,
+            "SELECT * FROM issues WHERE project_id = ? AND (? = 'all' OR state = ?) AND (SELECT COUNT(DISTINCT label.name) FROM issue_label_assignments AS assignment INNER JOIN issue_labels AS label ON label.id = assignment.label_id WHERE assignment.issue_id = issues.id AND label.name IN (SELECT value FROM json_each(?))) = ? ORDER BY number DESC LIMIT ?",
+            project_id,
+            state.as_str(),
+            state.as_str(),
+            wanted_json,
+            wanted_count,
+            limit
+        )
+        .fetch_all::<Model>()
+        .await?;
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let issue_labels = self.issue_labels(row.id).await?;
+            summaries.push(IssueSummary {
+                number: row.number,
+                title: row.title,
+                state: row.state.parse().map_err(|error: String| {
+                    storage_error(crate::db::common::db_custom_error(
+                        "invalid issue state: ",
+                        &error,
+                    ))
+                })?,
+                labels: issue_labels,
+                updated_at: row.updated_at,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Update an issue's title, body and/or state.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RowNotFound`] when the issue does not exist.
+    pub async fn update_issue(
+        &self,
+        repo_key: &str,
+        number: i64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<IssueState>,
+    ) -> Result<IssueDetail, ChatDbError> {
+        let project_id = self.ensure_issue_project(repo_key).await?;
+        let now = jiff::Timestamp::now().to_string();
+        // One statement assigning only the fields present in the change, so
+        // concurrent updates of different fields cannot restore stale values.
+        let changed = query!(
+            self.db,
+            "UPDATE issues SET title = COALESCE(?, title), body = COALESCE(?, body), state = COALESCE(?, state), updated_at = ? WHERE project_id = ? AND number = ?",
+            title.map(str::to_owned),
+            body.map(str::to_owned),
+            state.map(|state| state.as_str().to_owned()),
+            now,
+            project_id,
+            number
+        )
+        .execute()
+        .await?;
+        if changed.rows_written == 0 {
+            return Err(row_not_found(format!("issue #{number}")));
+        }
+        self.issue_detail(self.require_issue(project_id, number).await?)
+            .await
+    }
+
+    /// Add a comment to an issue and return the refreshed detail.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RowNotFound`] when the issue does not exist.
+    pub async fn add_issue_comment(
+        &self,
+        repo_key: &str,
+        number: i64,
+        body: &str,
+    ) -> Result<(IssueDetail, i64), ChatDbError> {
+        let project_id = self.ensure_issue_project(repo_key).await?;
+        let row = self.require_issue(project_id, number).await?;
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        let comment_id = query!(
+            tx,
+            "INSERT INTO issue_comments (issue_id, body, created_at) VALUES (?, ?, ?) RETURNING id AS value",
+            row.id,
+            body,
+            now.clone()
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?
+        .value;
+        query!(
+            tx,
+            "UPDATE issues SET updated_at = ? WHERE id = ?",
+            now,
+            row.id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        let detail = self
+            .issue_detail(self.require_issue(project_id, number).await?)
+            .await?;
+        Ok((detail, comment_id))
+    }
+
+    /// Add and/or remove labels on an issue and return the refreshed detail.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RowNotFound`] when the issue does not exist.
+    pub async fn edit_issue_labels(
+        &self,
+        repo_key: &str,
+        number: i64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<IssueDetail, ChatDbError> {
+        let project_id = self.ensure_issue_project(repo_key).await?;
+        let row = self.require_issue(project_id, number).await?;
+        let mut tx = self.db.begin().await?;
+        for label in add {
+            let label_id = self
+                .ensure_issue_label_in_tx(&mut tx, project_id, label.as_str())
+                .await?;
+            query!(
+                tx,
+                "INSERT OR IGNORE INTO issue_label_assignments (issue_id, label_id) VALUES (?, ?)",
+                row.id,
+                label_id
+            )
+            .execute()
+            .await?;
+        }
+        for label in remove {
+            query!(
+                tx,
+                "DELETE FROM issue_label_assignments WHERE issue_id = ? AND label_id IN (SELECT id FROM issue_labels WHERE project_id = ? AND name = ?)",
+                row.id,
+                project_id,
+                label.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            tx,
+            "UPDATE issues SET updated_at = ? WHERE id = ?",
+            now,
+            row.id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.issue_detail(row).await
+    }
+
+    /// Add or remove a sub-issue / blocked-by edge between two issues.
+    ///
+    /// `kind` is interpreted from the subject issue's perspective:
+    /// `SubIssue` records `target` as a child of `number`, `BlockedBy`
+    /// records `number` as blocked by `target`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RowNotFound`] when either issue does not exist,
+    /// and [`ChatDbError`] on storage failure.
+    pub async fn edit_issue_relation(
+        &self,
+        repo_key: &str,
+        number: i64,
+        kind: IssueRelationKind,
+        target_number: i64,
+        add: bool,
+    ) -> Result<IssueDetail, ChatDbError> {
+        let project_id = self.ensure_issue_project(repo_key).await?;
+        let row = self.require_issue(project_id, number).await?;
+        let target = self.require_issue(project_id, target_number).await?;
+        if row.id == target.id {
+            return Err(storage_error(
+                "issue relation rejected: an issue cannot relate to itself".to_string(),
+            ));
+        }
+        if add {
+            query!(
+                self.db,
+                "INSERT OR IGNORE INTO issue_relations (issue_id, related_issue_id, kind) VALUES (?, ?, ?)",
+                row.id,
+                target.id,
+                kind.as_str()
+            )
+            .execute()
+            .await?;
+        } else {
+            query!(
+                self.db,
+                "DELETE FROM issue_relations WHERE issue_id = ? AND related_issue_id = ? AND kind = ?",
+                row.id,
+                target.id,
+                kind.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        self.issue_detail(row).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::issue::IssueListState;
+
+    async fn test_db() -> (tempfile::TempDir, ChatDb) {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn issues_are_scoped_by_repo_key() {
+        let (_dir, db) = test_db().await;
+        let created = db
+            .create_issue("repo-a", "first", "body", &["bug".to_string()])
+            .await
+            .expect("create");
+        assert_eq!(created.number, 1);
+        let second = db
+            .create_issue("repo-a", "second", "", &[])
+            .await
+            .expect("create");
+        assert_eq!(second.number, 2);
+
+        // A different repository identity sees none of repo-a's issues.
+        assert!(
+            db.list_issues("repo-b", IssueListState::All, &[], 100)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert!(db.get_issue("repo-b", 1).await.expect("get").is_none());
+        // Numbering is per project.
+        let foreign = db
+            .create_issue("repo-b", "other repo", "", &[])
+            .await
+            .expect("create");
+        assert_eq!(foreign.number, 1);
+    }
+
+    #[tokio::test]
+    async fn issue_lifecycle_round_trip() {
+        let (_dir, db) = test_db().await;
+        db.create_issue("repo", "parent", "p", &[])
+            .await
+            .expect("create");
+        db.create_issue("repo", "child", "c", &[])
+            .await
+            .expect("create");
+        db.create_issue("repo", "blocker", "b", &[])
+            .await
+            .expect("create");
+
+        let detail = db
+            .edit_issue_relation("repo", 1, IssueRelationKind::SubIssue, 2, true)
+            .await
+            .expect("sub-issue add");
+        assert_eq!(detail.sub_issues.len(), 1);
+        assert_eq!(detail.sub_issues[0].number, 2);
+
+        let detail = db
+            .edit_issue_relation("repo", 1, IssueRelationKind::BlockedBy, 3, true)
+            .await
+            .expect("blocked-by add");
+        assert_eq!(detail.blocked_by.len(), 1);
+        assert_eq!(detail.blocked_by[0].number, 3);
+
+        let detail = db
+            .edit_issue_labels("repo", 1, &["area:x".to_string()], &[])
+            .await
+            .expect("label add");
+        assert_eq!(detail.labels, ["area:x".to_string()]);
+
+        let (detail, comment_id) = db
+            .add_issue_comment("repo", 1, "a comment")
+            .await
+            .expect("comment");
+        assert_eq!(detail.comments[0].id, comment_id);
+        assert_eq!(detail.comments.len(), 1);
+        assert_eq!(detail.comments[0].body, "a comment");
+
+        let detail = db
+            .update_issue("repo", 1, Some("renamed"), None, Some(IssueState::Closed))
+            .await
+            .expect("update");
+        assert_eq!(detail.title, "renamed");
+        assert_eq!(detail.state, IssueState::Closed);
+
+        let open = db
+            .list_issues("repo", IssueListState::Open, &[], 100)
+            .await
+            .expect("list open");
+        assert_eq!(open.len(), 2);
+        let filtered = db
+            .list_issues("repo", IssueListState::All, &["area:x".to_string()], 100)
+            .await
+            .expect("list filtered");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].number, 1);
+
+        let detail = db
+            .edit_issue_relation("repo", 1, IssueRelationKind::SubIssue, 2, false)
+            .await
+            .expect("sub-issue remove");
+        assert!(detail.sub_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_filter_applies_before_limit() {
+        let (_dir, db) = test_db().await;
+        db.create_issue(
+            "repo",
+            "old match",
+            "",
+            &["bug".to_string(), "x".to_string()],
+        )
+        .await
+        .expect("create");
+        for n in 0..5 {
+            db.create_issue("repo", &format!("newer {n}"), "", &["x".to_string()])
+                .await
+                .expect("create");
+        }
+        let listed = db
+            .list_issues("repo", IssueListState::All, &["bug".to_string()], 2)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].number, 1);
+        let both = db
+            .list_issues(
+                "repo",
+                IssueListState::Open,
+                &["bug".to_string(), "x".to_string(), "bug".to_string()],
+                1,
+            )
+            .await
+            .expect("list");
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].number, 1);
+    }
+
+    #[tokio::test]
+    async fn updates_of_different_fields_on_stale_reads_both_survive() {
+        let (_dir, db) = test_db().await;
+        db.create_issue("repo", "title", "body", &[])
+            .await
+            .expect("create");
+        // Two writers read the issue before either writes.
+        let stale_a = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        let stale_b = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        assert_eq!(stale_a.state, IssueState::Open);
+        assert_eq!(stale_b.title, "title");
+        db.update_issue("repo", 1, Some("renamed"), None, None)
+            .await
+            .expect("rename");
+        db.update_issue("repo", 1, None, None, Some(IssueState::Closed))
+            .await
+            .expect("close");
+        let detail = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        assert_eq!(detail.title, "renamed");
+        assert_eq!(detail.body, "body");
+        assert_eq!(detail.state, IssueState::Closed);
+    }
+
+    /// Issues that share an `updated_at` across the page size come back in
+    /// one page, so resuming after the page's newest timestamp skips none.
+    #[tokio::test]
+    async fn a_page_keeps_an_updated_at_tie_whole() {
+        let (_dir, db) = test_db().await;
+        for title in ["a", "b", "c", "d"] {
+            db.create_issue("repo", title, "", &[])
+                .await
+                .expect("create");
+        }
+        db.execute_for_test(
+            "UPDATE issues SET updated_at = CASE number WHEN 1 THEN '2026-01-01T00:00:00Z' WHEN 4 THEN '2026-01-03T00:00:00Z' ELSE '2026-01-02T00:00:00Z' END",
+        )
+        .await
+        .expect("set timestamps");
+
+        let first = db
+            .issues_updated_since("repo", None, 2)
+            .await
+            .expect("first page");
+        let numbers: Vec<i64> = first.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [1, 2, 3], "the tie at the page edge stays whole");
+
+        let resume = first.last().expect("a page").updated_at.clone();
+        let second = db
+            .issues_updated_since("repo", Some(&resume), 2)
+            .await
+            .expect("second page");
+        let numbers: Vec<i64> = second.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [4]);
+
+        let last = second.last().expect("a page").updated_at.clone();
+        assert!(
+            db.issues_updated_since("repo", Some(&last), 2)
+                .await
+                .expect("past the end")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_bumps_updated_at_for_incremental_index() {
+        let (_dir, db) = test_db().await;
+        let created = db.create_issue("repo", "t", "", &[]).await.expect("create");
+        let since = created.updated_at.clone();
+        assert!(
+            db.issues_updated_since("repo", Some(&since), 10)
+                .await
+                .expect("since")
+                .is_empty()
+        );
+        let (detail, _) = db
+            .add_issue_comment("repo", 1, "hello")
+            .await
+            .expect("comment");
+        assert!(detail.updated_at > since);
+        let seen = db
+            .issues_updated_since("repo", Some(&since), 10)
+            .await
+            .expect("since");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].number, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_issue_and_self_relation_fail() {
+        let (_dir, db) = test_db().await;
+        db.create_issue("repo", "only", "", &[])
+            .await
+            .expect("create");
+        assert!(matches!(
+            db.update_issue("repo", 9, None, None, None).await,
+            Err(ChatDbError::RowNotFound(_))
+        ));
+        assert!(matches!(
+            db.edit_issue_relation("repo", 1, IssueRelationKind::BlockedBy, 1, true)
+                .await,
+            Err(ChatDbError::Storage(_))
+        ));
+    }
+}

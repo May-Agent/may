@@ -1,0 +1,128 @@
+import { useEffect, useState } from 'react';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
+import { getSessionContextDebug } from '@/lib/api/logs';
+import { isDraftSessionId } from '@/lib/stores/sessions';
+import { useTranslation } from '@/lib/i18n';
+import type { SessionContextDebugResponse } from '@/lib/types';
+import { cn } from '@/lib/utils';
+
+const POLL_MS = 15_000;
+
+function formatTokens(n: number | null | undefined): string {
+  if (n == null) return '—';
+  if (n < 1000) return n.toString();
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+function tone(fraction: number): { stroke: string; text: string } {
+  if (fraction >= 0.9) return { stroke: 'stroke-destructive', text: 'text-destructive' };
+  if (fraction >= 0.7) return { stroke: 'stroke-foreground', text: 'text-foreground' };
+  return { stroke: 'stroke-muted-foreground', text: 'text-muted-foreground' };
+}
+
+export function ContextRing({ sessionId }: { sessionId: string }) {
+  const { t } = useTranslation();
+  const [data, setData] = useState<SessionContextDebugResponse | null>(null);
+
+  useEffect(() => {
+    if (isDraftSessionId(sessionId)) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await getSessionContextDebug(sessionId);
+        if (!cancelled) setData(res);
+      } catch {
+        // ignore — context debug is best-effort
+      }
+    };
+    void load();
+    const handle = window.setInterval(load, POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+  }, [sessionId]);
+
+  const metrics = data?.windowSnapshot?.metrics;
+  const fraction = metrics?.usageFraction ?? 0;
+  const pct = Math.min(100, Math.max(0, Math.round(fraction * 100)));
+  const totalWindow = metrics?.contextWindow ?? null;
+  const { stroke, text } = tone(fraction);
+
+  const radius = 7;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - Math.min(1, fraction));
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            'group inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs font-medium tabular-nums transition-colors hover:bg-accent hover:text-foreground touch:h-11 touch:px-3',
+            text,
+          )}
+          aria-label={t('chat.context')}
+        >
+          <svg width="16" height="16" viewBox="0 0 18 18" aria-hidden>
+            <circle cx="9" cy="9" r={radius} fill="none" className="stroke-border" strokeWidth="2" />
+            <circle
+              cx="9"
+              cy="9"
+              r={radius}
+              fill="none"
+              className={cn(stroke, 'transition-[stroke-dashoffset] duration-500')}
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeDasharray={circumference}
+              strokeDashoffset={dashOffset}
+              transform="rotate(-90 9 9)"
+            />
+          </svg>
+          <span>{pct}%</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72 space-y-3">
+        <div className="text-[13px] font-medium">{t('chat.context')}</div>
+        {!metrics ? (
+          <div className="text-xs text-muted-foreground">
+            Context metrics will appear after May’s first reply.
+          </div>
+        ) : (
+          <>
+            <div className="text-xs text-muted-foreground">
+              {t('chat.contextUsage', {
+                used: pct.toString(),
+                total: totalWindow ? formatTokens(totalWindow) : '—',
+              })}
+            </div>
+            <div className="grid grid-cols-2 gap-x-4">
+              <Stat label="Window" value={formatTokens(metrics.contextWindow)} />
+              <Stat label="Estimated" value={formatTokens(metrics.estimatedTokens)} />
+              <Stat label="Recent messages" value={metrics.recentMessageCount.toString()} />
+              <Stat label="System blocks" value={metrics.systemBlockCount.toString()} />
+              <Stat
+                label="Handoff"
+                value={metrics.hasHandoff ? 'active' : '—'}
+              />
+            </div>
+          </>
+        )}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2 border-b border-border py-1 text-xs">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="tabular-nums">{value}</span>
+    </div>
+  );
+}

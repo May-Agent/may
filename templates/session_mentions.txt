@@ -1,0 +1,4 @@
+<session_mentions>
+{% for session in sessions %}Session {{ session.id }} titled "{{ session.title }}" (model: {{ session.model }}).
+{% for message in session.recent_user_messages %}  Recent user message: {{ message }}
+{% endfor %}{% endfor %}</session_mentions>

@@ -19,7 +19,8 @@ Ask: **"Will you edit this in Keynote/PowerPoint later?"**
 If the topic needs research, use the builtin research subagent:
 
 ```bash
-subagent --subagent "research" --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
+echo "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights." > tmp/research.md
+subagent research --prompt-file tmp/research.md
 ```
 
 If the user asks for current, recent, or externally grounded material, research is required.
@@ -37,7 +38,8 @@ Gather from user:
 Launch art direction subagent to create design guide and outline:
 
 ```bash
-subagent --subagent "skills/slide/subagents/art_direction.md" --prompt "Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]."
+echo "Follow skills/slide/references/art_direction.md. Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]." > tmp/art_direction.md
+subagent general --prompt-file tmp/art_direction.md
 ```
 
 The subagent returns a YAML design guide containing:
@@ -59,18 +61,67 @@ If the user asked only for outline/design review, stop after this phase.
 
 ### Phase 5: Parallel Slide Creation (Subagents)
 
+Prepare one session-scoped Slidev runtime before launching any slide creators. This
+installation must finish first so parallel subagents never race through Bun's shared
+package cache:
+
+```bash
+mkdir -p artifacts/temp .slidev-toolchain
+cp skills/slide/assets/template/package.json .slidev-toolchain/package.json
+(cd .slidev-toolchain && bun install)
+cp .slidev-toolchain/package.json artifacts/temp/package.json
+ln -s ../../.slidev-toolchain/node_modules artifacts/temp/node_modules
+```
+
+If the selected theme is not already listed in the template package, read
+`skills/slide/references/themes.md` and install its exact package here with
+`(cd .slidev-toolchain && bun add [PACKAGE])`, then refresh the creator manifest
+with `cp .slidev-toolchain/package.json artifacts/temp/package.json`. The template
+already includes the `default` and `seriph` theme packages, so those themes need no
+additional install. Keep setup commands cwd-neutral: never replace these subshells
+with a bare `cd`. Do not launch slide creators until the runtime and selected theme
+are installed successfully. The artifact renderer reuses `.slidev-toolchain`, so
+cleanup removes `artifacts/temp`, not `.slidev-toolchain`.
+
+Open the May-managed browser once before launching slide creators:
+
+```bash
+browser open
+```
+
+Slide creators share this managed browser for visual verification. They must not
+install Playwright or launch their own Chromium instances.
+
 Launch one slide_creator subagent per slide **in parallel**:
 
 ```bash
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Slide 1: [SPEC]. Design: [DESIGN_GUIDE]"
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Slide 2: [SPEC]. Design: [DESIGN_GUIDE]"
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Slide 3: [SPEC]. Design: [DESIGN_GUIDE]"
+pids=""
+echo "Follow skills/slide/references/slide_creator.md. Slide 1: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_1.md
+subagent general --prompt-file tmp/slide_1.md | jq -er '.result' > artifacts/temp/slide_1.result.md &
+pids="$pids $!"
+echo "Follow skills/slide/references/slide_creator.md. Slide 2: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_2.md
+subagent general --prompt-file tmp/slide_2.md | jq -er '.result' > artifacts/temp/slide_2.result.md &
+pids="$pids $!"
+echo "Follow skills/slide/references/slide_creator.md. Slide 3: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_3.md
+subagent general --prompt-file tmp/slide_3.md | jq -er '.result' > artifacts/temp/slide_3.result.md &
+pids="$pids $!"
 # ... one per slide
+for pid in $pids; do
+  wait "$pid" || exit $?
+done
+for slide in artifacts/temp/slide_*.result.md; do
+  test -s "$slide" || exit 1
+done
 ```
+
+The `jq -er '.result'` extraction is required because every IPC command returns a
+structured JSON envelope. Never concatenate the envelope itself into the deck.
+The background jobs plus explicit `wait` are what make creation parallel; a list
+of plain sequential `subagent` commands is not parallel.
 
 Each subagent:
 1. Creates standalone temp file with slide content
-2. Renders to PNG for visual verification
+2. Renders to PNG with the prepared session runtime for visual verification
 3. Views the image to ensure quality
 4. Iterates until the slide looks correct
 5. Returns verified slide markdown
@@ -104,6 +155,7 @@ Clean up temp files:
 
 ```bash
 rm -rf artifacts/temp
+browser close
 ```
 
 Then return artifact tag for frontend-native Slidev rendering:

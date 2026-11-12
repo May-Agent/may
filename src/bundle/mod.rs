@@ -1,7 +1,8 @@
 //! Bundled resources extraction.
 //!
-//! Skills and subagents are embedded in the binary and extracted
-//! to the canonical May home on first run.
+//! Skills are embedded in the binary and extracted
+//! to the canonical May home on first run. The subagent definitions are
+//! embedded too and handed to the subagent tool.
 //! Local/heel session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
 
@@ -13,69 +14,75 @@ use include_dir::{Dir, include_dir};
 
 use crate::session::SessionPaths;
 
-// Embed the skills and subagents directories at compile time
+// Embed the skills directory at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
-static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/bundle/subagents");
-
-// Embed container build context managed by May.
-static CONTAINER_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/container");
+// The subagent definitions, one TOML file each.
+static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/subagents");
 
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 /// Bundled resources manager.
+#[derive(Debug)]
 pub struct Bundle;
 
 impl Bundle {
     /// Extract bundled resources to ~/.may/ if not already present.
-    /// Creates ~/.may/skills/, ~/.may/subagents/, and ~/.may/container/ directories.
+    /// Creates ~/.may/skills/ directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when a bundled resource directory or file
+    /// cannot be extracted under `may_dir`.
     pub async fn ensure_extracted(may_dir: &Path) -> Result<(), BundleError> {
         let skills_dir = may_dir.join("skills");
-        let subagents_dir = may_dir.join("subagents");
-        let container_dir = may_dir.join("container");
-        let heel_dir = container_dir.join("heel");
-        let heel_bin_dir = heel_dir.join("bin");
-
         Self::ensure_materialized_dir(&skills_dir).await?;
-        Self::ensure_materialized_dir(&subagents_dir).await?;
-        Self::ensure_materialized_dir(&container_dir).await?;
-        Self::ensure_materialized_dir(&heel_dir).await?;
-        Self::remove_legacy_heel_source_tree(&heel_dir).await?;
-        async_fs::create_dir_all(&heel_bin_dir).await?;
 
         // Built-in resources must stay in lockstep with the running binary.
-        // Always overwrite bundled content to avoid stale skills/subagents after upgrades.
+        // Always overwrite bundled content to avoid stale skills after upgrades.
         Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
-
-        Self::extract_dir_overwrite(&SUBAGENTS_DIR, &subagents_dir).await?;
-
-        // Extract container build context. Managed files are always overwritten since they
-        // are owned by the running May binary rather than user content.
-        Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir).await?;
 
         Ok(())
     }
 
-    /// Get the container build context directory path.
+    /// The subagents May ships: the definitions `subagent <name>` runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an embedded definition is invalid, which a test rules out.
     #[must_use]
-    pub fn container_context_dir(may_dir: &Path) -> std::path::PathBuf {
-        may_dir.join("container")
+    pub fn subagent_definitions() -> Vec<crate::harness::subagent_file::SubagentDefinition> {
+        SUBAGENTS_DIR
+            .files()
+            .map(|file| {
+                let path = file.path().display();
+                let source = file
+                    .contents_utf8()
+                    .unwrap_or_else(|| panic!("subagent definition {path} is not UTF-8"));
+                crate::harness::subagent_file::SubagentDefinition::parse(source)
+                    .unwrap_or_else(|error| panic!("subagent definition {path}: {error}"))
+            })
+            .collect()
     }
 
     /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when a symlink or its parent directory cannot
+    /// be created.
     pub async fn create_sandbox_home_symlinks(
         sandbox_dir: &Path,
         home_root: &Path,
     ) -> Result<(), BundleError> {
         let session_paths = SessionPaths::new(sandbox_dir.to_path_buf());
-        let subagents_target = home_root.join("subagents");
         let skills_target = home_root.join("skills");
 
-        Self::create_dir_symlink(sandbox_dir, &subagents_target, "subagents").await?;
         Self::create_dir_symlink(sandbox_dir, &skills_target, "skills").await?;
 
         async_fs::create_dir_all(session_paths.tmp_dir()).await?;
@@ -132,37 +139,8 @@ impl Bundle {
         }
     }
 
-    async fn remove_legacy_heel_source_tree(heel_dir: &Path) -> Result<(), BundleError> {
-        for legacy_entry in [
-            "Cargo.lock",
-            "Cargo.toml",
-            "cli",
-            "nodejs",
-            "src",
-            "templates",
-        ] {
-            Self::remove_path_if_exists(&heel_dir.join(legacy_entry)).await?;
-        }
-        Ok(())
-    }
-
-    async fn remove_path_if_exists(path: &Path) -> Result<(), BundleError> {
-        match async_fs::symlink_metadata(path).await {
-            Ok(metadata) if metadata.is_dir() => {
-                async_fs::remove_dir_all(path).await?;
-                Ok(())
-            }
-            Ok(_) => {
-                async_fs::remove_file(path).await?;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(BundleError::Io(error)),
-        }
-    }
-
     /// Create directory symlink from parent/name to target.
-    async fn create_dir_symlink(
+    pub(crate) async fn create_dir_symlink(
         parent: &Path,
         target: &Path,
         name: &str,
@@ -192,5 +170,64 @@ impl Bundle {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use include_dir::{Dir, DirEntry};
+
+    use super::{Bundle, SKILLS_DIR, SUBAGENTS_DIR};
+
+    fn collect_dirs<'a>(dir: &'a Dir<'a>, found: &mut Vec<&'a std::path::Path>) {
+        for entry in dir.entries() {
+            if let DirEntry::Dir(sub) = entry {
+                found.push(sub.path());
+                collect_dirs(sub, found);
+            }
+        }
+    }
+
+    #[test]
+    fn new_repo_skill_links_every_reference_file() {
+        let skill = SKILLS_DIR
+            .get_file("new-repo/SKILL.md")
+            .and_then(|file| file.contents_utf8())
+            .expect("new-repo/SKILL.md is bundled");
+        assert!(skill.starts_with("---\nname: new-repo\n"));
+        let references = SKILLS_DIR
+            .get_dir("new-repo/references")
+            .expect("new-repo/references is bundled");
+        let mut count = 0;
+        for file in references.files() {
+            let name = file.path().file_name().unwrap().to_string_lossy();
+            assert!(
+                skill.contains(&format!("references/{name}")),
+                "SKILL.md does not link {name}"
+            );
+            count += 1;
+        }
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn every_bundled_subagent_definition_parses() {
+        let names: Vec<_> = Bundle::subagent_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(names.len(), SUBAGENTS_DIR.files().count());
+        assert!(names.iter().any(|name| name == "explore"));
+    }
+
+    #[test]
+    fn bundled_skills_have_no_subagents_directory() {
+        let mut dirs = Vec::new();
+        collect_dirs(&SKILLS_DIR, &mut dirs);
+        let offending: Vec<_> = dirs
+            .iter()
+            .filter(|path| path.file_name().is_some_and(|name| name == "subagents"))
+            .collect();
+        assert!(offending.is_empty(), "skill-local subagents: {offending:?}");
     }
 }

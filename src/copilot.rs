@@ -6,11 +6,10 @@
 //! The OAuth token must be exchanged for a session token before making API calls.
 //! Use [`get_session_token`] to get a session token for API calls.
 
+use crate::auth_store::{delete_file, load_json, save_json};
 use crate::config::MayConfig;
 use aither_copilot::auth::{CopilotToken, SessionToken};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Token file name for OAuth token (long-lived).
 const TOKEN_FILE: &str = "copilot_token.json";
@@ -21,49 +20,15 @@ const SESSION_FILE: &str = "copilot_session.json";
 /// Error type for Copilot token operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CopilotTokenError {
+    /// Failed to get May directory.
     #[error("Failed to get May directory: {0}")]
     MayDir(#[from] crate::config::ConfigError),
-    #[error("Failed to read token file: {0}")]
-    Read(std::io::Error),
-    #[error("Failed to write token file: {0}")]
-    Write(std::io::Error),
-    #[error("Failed to parse token file: {0}")]
-    Parse(#[from] serde_json::Error),
+    /// Credential store error.
+    #[error("Credential store error: {0}")]
+    Store(#[from] crate::auth_store::AuthStoreError),
+    /// Token exchange failed.
     #[error("Token exchange failed: {0}")]
     Exchange(#[from] aither_copilot::CopilotError),
-}
-
-// ─── Generic JSON file I/O helpers ──────────────────────────────────────────
-
-/// Load a JSON file, returning `Ok(None)` if not found.
-async fn load_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, CopilotTokenError> {
-    match async_fs::read_to_string(path).await {
-        Ok(content) => Ok(Some(serde_json::from_str(&content)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(CopilotTokenError::Read(e)),
-    }
-}
-
-/// Save a value as a JSON file, creating parent directories if needed.
-async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CopilotTokenError> {
-    if let Some(parent) = path.parent() {
-        async_fs::create_dir_all(parent)
-            .await
-            .map_err(CopilotTokenError::Write)?;
-    }
-    let content = serde_json::to_string_pretty(value)?;
-    async_fs::write(path, content)
-        .await
-        .map_err(CopilotTokenError::Write)
-}
-
-/// Delete a file if it exists.
-async fn delete_file(path: &Path) -> Result<(), CopilotTokenError> {
-    match async_fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(CopilotTokenError::Write(e)),
-    }
 }
 
 // ─── Path helpers ───────────────────────────────────────────────────────────
@@ -83,26 +48,53 @@ fn session_path() -> Result<PathBuf, CopilotTokenError> {
 /// Load the Copilot token from disk.
 ///
 /// Returns `Ok(None)` if the token file doesn't exist.
+///
+/// # Errors
+///
+/// Returns [`CopilotTokenError`] when the token path cannot be resolved or
+/// the token file cannot be read or parsed.
 pub async fn load_copilot_token() -> Result<Option<CopilotToken>, CopilotTokenError> {
-    load_json(&token_path()?).await
+    Ok(load_json(&token_path()?).await?)
 }
 
 /// Save the Copilot token to disk.
+///
+/// # Errors
+///
+/// Returns [`CopilotTokenError`] when the token path cannot be resolved or
+/// the write fails.
 pub async fn save_copilot_token(token: &CopilotToken) -> Result<(), CopilotTokenError> {
-    save_json(&token_path()?, token).await
+    save_json(&token_path()?, token).await?;
+    Ok(())
 }
 
 /// Delete the Copilot token from disk.
+///
+/// # Errors
+///
+/// Returns [`CopilotTokenError`] when the token path cannot be resolved or
+/// removing the file fails.
 pub async fn delete_copilot_token() -> Result<(), CopilotTokenError> {
-    delete_file(&token_path()?).await
+    delete_file(&token_path()?).await?;
+    Ok(())
 }
 
 /// Delete cached Copilot session token from disk.
+///
+/// # Errors
+///
+/// Returns [`CopilotTokenError`] when the session-token path cannot be
+/// resolved or removing the file fails.
 pub async fn delete_session_token() -> Result<(), CopilotTokenError> {
-    delete_file(&session_path()?).await
+    delete_file(&session_path()?).await?;
+    Ok(())
 }
 
 /// Delete both OAuth and cached session tokens from disk.
+///
+/// # Errors
+///
+/// Returns [`CopilotTokenError`] when either token deletion fails.
 pub async fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
     delete_session_token().await?;
     delete_copilot_token().await?;
@@ -112,17 +104,18 @@ pub async fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
 /// Check if a Copilot token exists on disk.
 #[must_use]
 pub fn has_copilot_token() -> bool {
-    token_path().map(|p| p.exists()).unwrap_or(false)
+    token_path().is_ok_and(|p| p.exists())
 }
 
 /// Load cached session token from disk.
 async fn load_session_token() -> Result<Option<SessionToken>, CopilotTokenError> {
-    load_json(&session_path()?).await
+    Ok(load_json(&session_path()?).await?)
 }
 
 /// Save session token to disk.
 async fn save_session_token(token: &SessionToken) -> Result<(), CopilotTokenError> {
-    save_json(&session_path()?, token).await
+    save_json(&session_path()?, token).await?;
+    Ok(())
 }
 
 /// Check if a session token is still valid (not expired).
@@ -131,8 +124,7 @@ fn is_session_valid(token: &SessionToken) -> bool {
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
 
     // Add 60 second buffer to avoid edge cases
     token.expires_at > now + 60
@@ -162,11 +154,15 @@ pub struct CopilotCredentials {
 /// - `Ok(Some(credentials))` - valid credentials with token and endpoint
 /// - `Ok(None)` - no OAuth token configured
 /// - `Err` - error during token exchange
+///
+/// # Errors
+///
+/// Returns [`CopilotTokenError`] when loading the OAuth token fails or the
+/// session-token exchange with GitHub fails.
 pub async fn get_copilot_credentials() -> Result<Option<CopilotCredentials>, CopilotTokenError> {
     // First, check if we have an OAuth token
-    let oauth_token = match load_copilot_token().await? {
-        Some(t) => t,
-        None => return Ok(None),
+    let Some(oauth_token) = load_copilot_token().await? else {
+        return Ok(None);
     };
 
     // Try to load cached session token

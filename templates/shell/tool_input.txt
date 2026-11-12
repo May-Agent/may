@@ -1,0 +1,1 @@
+Send input to a background terminal task that is waiting on stdin.

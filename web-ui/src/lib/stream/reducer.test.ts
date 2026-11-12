@@ -1,0 +1,452 @@
+import { describe, expect, test } from 'bun:test';
+import { applyEvent, emptyTurn, reduceEvents } from './reducer';
+import type { ChatStreamEvent } from '../types';
+import { projectField } from './partialJson';
+
+function stream(events: ChatStreamEvent[]) {
+  return reduceEvents(events);
+}
+
+describe('reducer', () => {
+  test('start initializes fresh turn', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+    ]);
+    expect(t.turnId).toBe('t1');
+    expect(t.sessionId).toBe('s1');
+    expect(t.assistantId).toBe('a1');
+    expect(t.status).toBe('streaming');
+    expect(t.lastSeq).toBe(1);
+  });
+
+  test('text chunks concatenate in order', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Hello ' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'world' },
+    ]);
+    expect(t.text).toBe('Hello world');
+  });
+
+  test('out-of-order event with stale seq is dropped', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 5, turnId: 't1', chunk: 'B' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'A' },
+    ]);
+    expect(t.text).toBe('B');
+    expect(t.lastSeq).toBe(5);
+  });
+
+  test('tool_start → tool_delta → tool_end builds monotonic argumentsRaw', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'tool_start',
+        seq: 2,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        arguments: '{"command":"',
+      },
+      {
+        kind: 'tool_delta',
+        seq: 3,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        argumentsFragment: 'npm run',
+      },
+      {
+        kind: 'tool_delta',
+        seq: 4,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        argumentsFragment: ' build","description":"build prod"}',
+      },
+      {
+        kind: 'tool_end',
+        seq: 5,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        arguments: '{"command":"npm run build","description":"build prod"}',
+        result: { exitCode: 0 },
+      },
+    ]);
+    expect(t.tools.length).toBe(1);
+    const tool = t.tools[0]!;
+    expect(tool.status).toBe('done');
+    expect(tool.argumentsRaw).toBe(
+      '{"command":"npm run build","description":"build prod"}',
+    );
+    expect(tool.result).toEqual({ exitCode: 0 });
+    expect(projectField(tool.argumentsRaw, 'command')).toBe('npm run build');
+    expect(projectField(tool.argumentsRaw, 'description')).toBe('build prod');
+  });
+
+  test('command field is readable every frame of stream', () => {
+    // This is THE test for "streaming tool calls feel mature" — the user
+    // should see the command text appear character by character.
+    const events: ChatStreamEvent[] = [
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'tool_start',
+        seq: 2,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        arguments: '{"command":"',
+      },
+    ];
+
+    let state = emptyTurn('', '', '');
+    const frames: string[] = [];
+    const fragments = ['g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's', '"'];
+    let seq = 2;
+    state = applyEvent(state, events[0]!);
+    state = applyEvent(state, events[1]!);
+    frames.push(projectField(state.tools[0]!.argumentsRaw, 'command'));
+
+    for (const frag of fragments) {
+      seq += 1;
+      state = applyEvent(state, {
+        kind: 'tool_delta',
+        seq,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        argumentsFragment: frag,
+      });
+      frames.push(projectField(state.tools[0]!.argumentsRaw, 'command'));
+    }
+
+    expect(frames[0]).toBe('');
+    expect(frames[1]).toBe('g');
+    expect(frames[2]).toBe('gi');
+    expect(frames[frames.length - 1]).toBe('git status');
+    // Monotonic growth.
+    for (let i = 1; i < frames.length; i++) {
+      expect(frames[i]!.startsWith(frames[i - 1]!)).toBe(true);
+    }
+  });
+
+  test('tool_delta can upgrade placeholder tool metadata', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'tool_start',
+        seq: 2,
+        turnId: 't1',
+        id: 'c1',
+        name: '',
+        variant: 'generic',
+        arguments: '{"script":"date"}',
+      },
+      {
+        kind: 'tool_delta',
+        seq: 3,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        argumentsFragment: '',
+      },
+    ]);
+
+    expect(t.tools.length).toBe(1);
+    expect(t.tools[0]?.name).toBe('terminal');
+    expect(t.tools[0]?.variant).toBe('terminal');
+    expect(t.tools[0]?.argumentsRaw).toBe('{"script":"date"}');
+  });
+
+  test('todo_update replaces the plan snapshot', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'todo_update',
+        seq: 2,
+        turnId: 't1',
+        rows: [
+          { section: 'doing', title: 'step 1', detail: '', blocking: null, references: [] },
+          { section: 'queued', title: 'step 2', detail: '', blocking: 'q1', references: [] },
+        ],
+      },
+      { kind: 'todo_update', seq: 3, turnId: 't1', rows: [] },
+    ]);
+    expect(t.todo?.rows).toEqual([]);
+  });
+
+  test('todo_update carries rows with their section and blocking mark', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'todo_update',
+        seq: 2,
+        turnId: 't1',
+        rows: [
+          { section: 'doing', title: 'step 1', detail: '', blocking: null, references: [] },
+          { section: 'queued', title: 'step 2', detail: '', blocking: 'q1', references: [] },
+        ],
+      },
+    ]);
+    expect(t.todo?.rows.map((row) => row.section)).toEqual(['doing', 'queued']);
+    expect(t.todo?.rows[1]?.blocking).toBe('q1');
+  });
+
+  test('error marks turn done and preserves retryable flag', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'partial' },
+      {
+        kind: 'error',
+        seq: 3,
+        turnId: 't1',
+        code: 'provider_unavailable',
+        message: 'upstream 503',
+        retryable: true,
+      },
+    ]);
+    expect(t.status).toBe('done');
+    expect(t.error?.code).toBe('provider_unavailable');
+    expect(t.error?.retryable).toBe(true);
+    // Text up to the error is preserved.
+    expect(t.text).toBe('partial');
+  });
+
+  test('done event finalizes text with canonical assistant content', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Hel' },
+      {
+        kind: 'done',
+        seq: 3,
+        turnId: 't1',
+        sessionId: 's1',
+        userMessageId: null,
+        messageIds: ['a1'],
+        assistant: {
+          id: 'a1',
+          role: 'assistant',
+          content: 'Hello, world!',
+          timestamp: '2026-04-20T00:00:00Z',
+        },
+      },
+    ]);
+    expect(t.status).toBe('done');
+    expect(t.text).toBe('Hello, world!');
+  });
+
+  test('segments preserve chronological order of text and tool events', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Let me search. ' },
+      {
+        kind: 'tool_start',
+        seq: 3,
+        turnId: 't1',
+        id: 'c1',
+        name: 'web_search',
+        variant: 'web_search',
+        arguments: '{"q":"may"}',
+      },
+      {
+        kind: 'tool_end',
+        seq: 4,
+        turnId: 't1',
+        id: 'c1',
+        name: 'web_search',
+        variant: 'web_search',
+        arguments: '{"q":"may"}',
+        result: {},
+      },
+      { kind: 'text', seq: 5, turnId: 't1', chunk: 'Found it. ' },
+      {
+        kind: 'tool_start',
+        seq: 6,
+        turnId: 't1',
+        id: 'c2',
+        name: 'web_fetch',
+        variant: 'web_fetch',
+        arguments: '{"url":"x"}',
+      },
+      { kind: 'text', seq: 7, turnId: 't1', chunk: 'Done.' },
+    ]);
+    const kinds = t.segments.map((s) => (s.kind === 'text' ? 'text' : s.toolId));
+    expect(kinds).toEqual(['text', 'c1', 'text', 'c2', 'text']);
+    expect(t.segments[0]).toMatchObject({ kind: 'text', text: 'Let me search. ' });
+    expect(t.segments[2]).toMatchObject({ kind: 'text', text: 'Found it. ' });
+    expect(t.segments[4]).toMatchObject({ kind: 'text', text: 'Done.' });
+    expect(t.text).toBe('Let me search. Found it. Done.');
+  });
+
+  test('consecutive text chunks coalesce into one segment', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Hel' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'lo ' },
+      { kind: 'text', seq: 4, turnId: 't1', chunk: 'world' },
+    ]);
+    expect(t.segments.length).toBe(1);
+    expect(t.segments[0]).toMatchObject({ kind: 'text', text: 'Hello world' });
+  });
+
+  test('reasoning_end records the phase duration', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning_end', seq: 2, turnId: 't1', seconds: 7 },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'answer' },
+    ]);
+    expect(t.reasoningMs).toBe(7000);
+    expect(t.reasoning).toBe('');
+    // A stale reasoning_end does not overwrite a newer measurement.
+    const t2 = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning_end', seq: 5, turnId: 't1', seconds: 7 },
+      { kind: 'reasoning_end', seq: 3, turnId: 't1', seconds: 2 },
+    ]);
+    expect(t2.reasoningMs).toBe(7000);
+  });
+
+  test('ping bumps seq but leaves state otherwise untouched', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'x' },
+      { kind: 'ping', seq: 3, turnId: 't1' },
+    ]);
+    expect(t.text).toBe('x');
+    expect(t.lastSeq).toBe(3);
+    expect(t.status).toBe('streaming');
+  });
+
+  test('hold records the quota reset and a retried start clears it', () => {
+    const held = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'hold',
+        seq: 2,
+        turnId: 't1',
+        reason: 'quota',
+        until: '2026-11-04T05:40:00Z',
+        message: 'usage limit reached',
+      },
+    ]);
+    expect(held.hold).toEqual({
+      reason: 'quota',
+      until: '2026-11-04T05:40:00Z',
+      message: 'usage limit reached',
+    });
+
+    const retried = applyEvent(held, {
+      kind: 'start',
+      seq: 3,
+      turnId: 't2',
+      sessionId: 's1',
+      assistantId: 'a2',
+    });
+    expect(retried.hold).toBeNull();
+    expect(retried.turnId).toBe('t2');
+  });
+
+  test('translated attaches the translation to the reply streamed last and keeps the original', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'All done.' },
+      {
+        kind: 'translated',
+        seq: 3,
+        turnId: 't1',
+        text: '全部完成。',
+        language: 'cmn',
+        languageName: 'Chinese',
+      },
+    ]);
+    expect(t.text).toBe('All done.');
+    expect(t.segments).toEqual([
+      {
+        kind: 'text',
+        text: 'All done.',
+        seq: 2,
+        translation: { text: '全部完成。', language: 'cmn', languageName: 'Chinese' },
+      },
+    ]);
+    expect(t.lastSeq).toBe(3);
+  });
+
+  test('a reply without a translation event carries none', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Hi' },
+    ]);
+    expect(t.segments[0]).toEqual({ kind: 'text', text: 'Hi', seq: 2 });
+  });
+
+  test('retract discards the streamed text but keeps tools', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'partial ans' },
+      { kind: 'retract', seq: 3, turnId: 't1' },
+      {
+        kind: 'hold',
+        seq: 4,
+        turnId: 't1',
+        reason: 'retry',
+        until: '2026-11-04T05:40:00Z',
+        message: 'overloaded',
+        retry: 2,
+      },
+    ]);
+    expect(t.text).toBe('');
+    expect(t.segments).toEqual([]);
+    expect(t.hold).toMatchObject({ reason: 'retry', retry: 2 });
+  });
+
+  test('a retried response keeps the finished ones and drops its own thinking, text and tool', () => {
+    const summary = {};
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning', seq: 2, turnId: 't1', chunk: 'first thought ' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'Looking.' },
+      { kind: 'tool_start', seq: 4, turnId: 't1', id: 'c1', name: 'terminal', variant: 'terminal', arguments: '{}', summary },
+      { kind: 'tool_end', seq: 5, turnId: 't1', id: 'c1', name: 'terminal', variant: 'terminal', result: 'ok', summary },
+      { kind: 'reasoning', seq: 6, turnId: 't1', chunk: '考え中 ' },
+      { kind: 'text', seq: 7, turnId: 't1', chunk: 'half an ans' },
+      { kind: 'tool_delta', seq: 8, turnId: 't1', id: 'c2', name: 'terminal', variant: 'terminal', argumentsFragment: '{"c', summary },
+      { kind: 'retract', seq: 9, turnId: 't1' },
+      {
+        kind: 'hold',
+        seq: 10,
+        turnId: 't1',
+        reason: 'retry',
+        until: '2026-11-04T05:40:00Z',
+        message: 'stream broke',
+        retry: 1,
+      },
+    ] as ChatStreamEvent[]);
+    expect(t.text).toBe('Looking.');
+    expect(t.reasoning).toBe('first thought ');
+    expect(t.tools.map((tool) => tool.id)).toEqual(['c1']);
+    expect(t.segments.map((s) => s.kind)).toEqual(['text', 'tool']);
+    expect(t.hold).toMatchObject({ reason: 'retry', retry: 1 });
+
+    // The replacement streaming ends the wait.
+    const next = applyEvent(t, { kind: 'text', seq: 11, turnId: 't1', chunk: 'whole' });
+    expect(next.hold).toBeNull();
+    expect(next.text).toBe('Looking.whole');
+  });
+
+  test('a network hold carries no instant', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'hold', seq: 2, turnId: 't1', reason: 'network', message: 'offline' },
+    ]);
+    expect(t.hold).toEqual({ reason: 'network', message: 'offline' });
+  });
+});

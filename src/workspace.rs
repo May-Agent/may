@@ -37,17 +37,208 @@ pub struct WorkspaceConfig {
     /// Working directories with read/write access (user-approved).
     #[serde(default)]
     pub workdirs: Vec<WorkspaceDir>,
+    /// Per-project settings keyed by directory.
+    ///
+    /// `path` is any directory inside the project; it is canonicalized and
+    /// resolved to a repository identity the same way session workspaces
+    /// are, so every worktree of one repository matches the same entry.
+    #[serde(default)]
+    pub projects: Vec<ProjectConfig>,
+}
+
+/// Per-project configuration entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// A directory inside the project (typically the main checkout root).
+    /// Absent for a GitHub repository trusted without any local checkout
+    /// ([`Self::repository`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The GitHub repository of an entry that has no checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<GitHubRepository>,
+    /// Issue backend for this project; absent means local may issues.
+    #[serde(default)]
+    pub issues: ProjectIssues,
+    /// Local check command run inside the session clone before a `pr`
+    /// merge, e.g. `checks = "cargo test"`.
+    #[serde(default)]
+    pub checks: Option<String>,
+    /// PR backend and landing policy for this project.
+    #[serde(default)]
+    pub pr: ProjectPr,
+}
+
+impl ProjectConfig {
+    /// Whether this entry's path belongs to the repository `identity`.
+    #[must_use]
+    pub fn has_identity(&self, identity: &Path) -> bool {
+        self.path.as_deref().is_some_and(|path| {
+            crate::issue::repository_identity(path).is_ok_and(|k| k == identity)
+        })
+    }
+
+    /// Whether this entry covers the GitHub repository `owner_repo`, through
+    /// its own `repository` or its checkout's `origin`.
+    #[must_use]
+    pub fn covers_github(&self, owner_repo: &GitHubRepository) -> bool {
+        self.github_repository().as_ref() == Some(owner_repo)
+    }
+
+    /// The GitHub repository this project publishes to, independent of its
+    /// issue backend: the GitHub `origin` of its path, else the repository a
+    /// GitHub issue backend names (a project whose origin is not GitHub).
+    #[must_use]
+    pub fn github_repository(&self) -> Option<GitHubRepository> {
+        if let Some(repository) = &self.repository {
+            return Some(repository.clone());
+        }
+        if let Some(path) = &self.path
+            && let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(path)
+            && let Ok(repository) = owner_repo.parse()
+        {
+            return Some(repository);
+        }
+        match &self.issues {
+            ProjectIssues::Github { repository } => Some(repository.clone()),
+            ProjectIssues::May => None,
+        }
+    }
+}
+
+/// `pr` settings for a project.
+///
+/// `backend` overrides detection (`"may"` or `"github"`); `screen` runs
+/// every published text through the outbound screen before it reaches
+/// GitHub — the "PRs only" trust mode's guard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectPr {
+    /// `"may"` or `"github"`; absent detects GitHub remotes automatically.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Best-effort `git pull` of every recorded local checkout after a PR
+    /// merges; absent means on.
+    #[serde(default)]
+    pub pull_sync: Option<bool>,
+    /// Screen published text (PR title/body) before it leaves the machine.
+    #[serde(default)]
+    pub screen: Option<bool>,
+    /// Default `--hold` when false: the PR opens but never merges itself.
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
+    /// Merge waits for an explicit user approval (#322 wires the UI).
+    #[serde(default)]
+    pub require_review: Option<bool>,
+}
+
+impl ProjectPr {
+    /// Whether recorded local checkouts are pulled after a PR merges.
+    #[must_use]
+    pub fn pulls_after_merge(&self) -> bool {
+        self.pull_sync != Some(false)
+    }
+}
+
+/// Issue backend selected for a project.
+///
+/// Serialized as an internally tagged table, e.g.:
+/// `issues = { backend = "github", repository = "owner/repo" }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+pub enum ProjectIssues {
+    /// Local may issue store (default).
+    #[default]
+    May,
+    /// GitHub issues on the named repository.
+    Github {
+        /// `owner/repo` of the GitHub repository.
+        repository: GitHubRepository,
+    },
+}
+
+/// A GitHub repository in `owner/repo` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRepository {
+    owner: String,
+    repo: String,
+}
+
+impl GitHubRepository {
+    /// Repository owner.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Repository name.
+    #[must_use]
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+}
+
+impl std::fmt::Display for GitHubRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.repo)
+    }
+}
+
+/// Error type for a malformed `owner/repo` string.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid GitHub repository '{0}': expected owner/repo")]
+pub struct GitHubRepositoryError(String);
+
+impl std::str::FromStr for GitHubRepository {
+    type Err = GitHubRepositoryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || GitHubRepositoryError(value.to_string());
+        let (owner, repo) = value.split_once('/').ok_or_else(invalid)?;
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            return Err(invalid());
+        }
+        Ok(Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        })
+    }
+}
+
+impl Serialize for GitHubRepository {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for GitHubRepository {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// Error type for workspace configuration operations.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceConfigError {
+    /// Failed to read workspace config.
     #[error("Failed to read workspace config: {0}")]
     Read(#[from] std::io::Error),
+    /// Failed to parse workspace config.
     #[error("Failed to parse workspace config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// Failed to serialize workspace config.
     #[error("Failed to serialize workspace config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    /// Several `[[projects]]` entries name one repository.
+    #[error(
+        "workspace config has several [[projects]] entries for the repository {identity}: {paths}; keep one"
+    )]
+    DuplicateProject {
+        /// The shared repository identity.
+        identity: String,
+        /// The entries' paths, comma separated.
+        paths: String,
+    },
 }
 
 impl WorkspaceConfig {
@@ -55,36 +246,126 @@ impl WorkspaceConfig {
     ///
     /// Returns `Ok(default)` if the file does not exist,
     /// but propagates parse errors so corrupt configs are not silently dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError::Read`] when the file exists but cannot
+    /// be read, and [`WorkspaceConfigError`] when its TOML fails to parse.
     pub fn load(config_path: &Path) -> Result<Self, WorkspaceConfigError> {
         match fs::read_to_string(config_path) {
-            Ok(content) => Ok(toml::from_str(&content)?),
+            Ok(content) => {
+                let config: Self = toml::from_str(&content)?;
+                config.check_projects_unique()?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(WorkspaceConfigError::Read(e)),
         }
     }
 
+    /// The `[[projects]]` entry for a repository identity
+    /// ([`crate::issue::repository_identity`]). Loading guarantees at most
+    /// one entry per identity; an entry whose path no longer resolves
+    /// matches nothing.
+    #[must_use]
+    pub fn project_for_identity(&self, identity: &Path) -> Option<&ProjectConfig> {
+        self.projects.iter().find(|p| p.has_identity(identity))
+    }
+
+    /// The `[[projects]]` entry for a GitHub repository, whether it holds a
+    /// checkout or only the repository.
+    #[must_use]
+    pub fn project_for_github(&self, owner_repo: &GitHubRepository) -> Option<&ProjectConfig> {
+        self.projects.iter().find(|p| p.covers_github(owner_repo))
+    }
+
+    fn check_projects_unique(&self) -> Result<(), WorkspaceConfigError> {
+        let mut seen: Vec<(PathBuf, &ProjectConfig)> = Vec::new();
+        for project in &self.projects {
+            let Some(project_path) = project.path.as_deref() else {
+                continue;
+            };
+            let identity = match crate::issue::repository_identity(project_path) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    // Every lookup treats this entry as a non-match; this is
+                    // the one place a load reports why.
+                    tracing::warn!(
+                        path = %project_path.display(),
+                        %error,
+                        "project entry no longer resolves to a repository; it matches nothing"
+                    );
+                    continue;
+                }
+            };
+            let paths = seen
+                .iter()
+                .filter(|(i, _)| *i == identity)
+                .filter_map(|(_, p)| p.path.as_deref().map(|path| path.display().to_string()))
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                let paths = paths
+                    .into_iter()
+                    .chain([project_path.display().to_string()])
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(WorkspaceConfigError::DuplicateProject {
+                    identity: identity.display().to_string(),
+                    paths,
+                });
+            }
+            seen.push((identity, project));
+        }
+        Ok(())
+    }
+
     /// Save workspace config to file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError`] when serializing or writing the file
+    /// fails.
     pub fn save(&self, config_path: &Path) -> Result<(), WorkspaceConfigError> {
         let content = toml::to_string_pretty(self)?;
         fs::write(config_path, content)?;
         Ok(())
     }
 
-    /// Add a working directory with read/write access.
+    /// Add a working directory with read/write access, upgrading an
+    /// existing entry — a recorded read-only decision becomes writable.
     pub fn add_workdir(&mut self, path: PathBuf, description: Option<String>) {
-        // Canonicalize the path
-        let canonical = path.canonicalize().unwrap_or(path);
+        self.record_workdir(path, Permission::ReadWrite, description);
+    }
 
-        // Check if already exists
-        if self.workdirs.iter().any(|d| d.path == canonical) {
+    /// Record an access decision for a directory: the entry is created or
+    /// its permission replaced.
+    pub fn record_workdir(
+        &mut self,
+        path: PathBuf,
+        permission: Permission,
+        description: Option<String>,
+    ) {
+        let canonical = path.canonicalize().unwrap_or(path);
+        if let Some(entry) = self.workdirs.iter_mut().find(|d| d.path == canonical) {
+            entry.permission = permission;
+            if let Some(description) = description {
+                entry.description = Some(description);
+            }
             return;
         }
-
         self.workdirs.push(WorkspaceDir {
             path: canonical,
-            permission: Permission::ReadWrite,
+            permission,
             description,
         });
+    }
+
+    /// Whether a workdir entry covers `path` at any permission — the
+    /// directory's access was decided, grant or denial.
+    #[must_use]
+    pub fn covers(&self, path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.workdirs.iter().any(|d| canonical.starts_with(&d.path))
     }
 
     /// Remove a working directory.
@@ -104,6 +385,7 @@ impl WorkspaceConfig {
 }
 
 /// The complete workspace state for a May session.
+#[derive(Debug)]
 pub struct Workspace {
     /// Session sandbox directory (always read/write).
     pub sandbox: PathBuf,
@@ -117,6 +399,11 @@ pub struct Workspace {
 
 impl Workspace {
     /// Create a new workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError`] when loading the workspace config
+    /// fails.
     pub fn new(
         sandbox: PathBuf,
         cwd: PathBuf,
@@ -132,6 +419,10 @@ impl Workspace {
     }
 
     /// Add a working directory (requires user approval).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError`] when saving the updated config fails.
     pub fn add_workdir(
         &mut self,
         path: PathBuf,
@@ -161,5 +452,86 @@ impl Workspace {
             }
         }
         dirs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_directory_is_readable_but_not_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Workspace::new(
+            dir.path().join("sandbox"),
+            dir.path().join("launch"),
+            dir.path().join("workspace.toml"),
+        )
+        .expect("workspace");
+
+        assert!(
+            workspace
+                .readable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == workspace.cwd.as_path()),
+            "the directory the session was launched from must be readable"
+        );
+        assert!(
+            !workspace
+                .writable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == workspace.cwd.as_path()),
+            "the launch directory stays read-only by default"
+        );
+    }
+
+    #[test]
+    fn approved_workdirs_are_readable_and_writable_per_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("work")).expect("workdir");
+        let mut config = WorkspaceConfig::default();
+        config.add_workdir(dir.path().join("work"), None);
+        let workspace = Workspace {
+            sandbox: dir.path().join("sandbox"),
+            cwd: dir.path().join("launch"),
+            config,
+            config_path: dir.path().join("workspace.toml"),
+        };
+
+        let work = dir.path().join("work").canonicalize().expect("canonical");
+        assert!(
+            workspace
+                .readable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == work.as_path())
+        );
+        assert!(
+            workspace
+                .writable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == work.as_path())
+        );
+    }
+
+    #[test]
+    fn a_denied_workdir_is_decided_and_an_approval_upgrades_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = WorkspaceConfig::default();
+        // Denial persists as read-only — a decided directory, not a grant.
+        config.record_workdir(
+            dir.path().to_path_buf(),
+            Permission::ReadOnly,
+            Some("launch directory".to_string()),
+        );
+        assert!(config.covers(dir.path()));
+        assert!(!config.has_write_access(dir.path()));
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("subdir");
+        assert!(config.covers(&sub));
+
+        // A later approval upgrades the recorded denial to read/write.
+        config.add_workdir(dir.path().to_path_buf(), None);
+        assert_eq!(config.workdirs.len(), 1);
+        assert!(config.has_write_access(dir.path()));
     }
 }

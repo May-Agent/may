@@ -12,12 +12,18 @@ use zenwave::ResponseExt;
 const IPINFO_URL: &str = "https://ipinfo.io/json";
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Approximate geographic location derived from IP.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LocationInfo {
+    /// City name from the geolocation lookup.
     pub city: String,
+    /// Region/state name from the geolocation lookup.
     pub region: String,
+    /// Country name or code from the geolocation lookup.
     pub country: String,
+    /// IANA timezone name reported for the location.
     pub timezone: String,
 }
 
@@ -33,6 +39,17 @@ pub struct LocationProvider {
     cache: ArcSwapOption<CachedLocation>,
 }
 
+/// Error type for the IP geolocation lookup.
+#[derive(Debug, thiserror::Error)]
+pub enum LocationError {
+    /// Failed to fetch location from ipinfo.io.
+    #[error("failed to fetch location from ipinfo.io")]
+    Fetch(#[source] BoxError),
+    /// Failed to decode location response from ipinfo.io.
+    #[error("failed to decode location response from ipinfo.io")]
+    Decode(#[source] BoxError),
+}
+
 impl Default for LocationProvider {
     fn default() -> Self {
         Self::new()
@@ -40,6 +57,7 @@ impl Default for LocationProvider {
 }
 
 impl LocationProvider {
+    /// Create a provider with an empty cache.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -48,7 +66,12 @@ impl LocationProvider {
     }
 
     /// Get the current location, fetching from ipinfo.io if cache is stale.
-    pub async fn get(&self) -> anyhow::Result<LocationInfo> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocationError::Fetch`] when the ipinfo.io request fails and
+    /// [`LocationError::Decode`] when the response cannot be decoded.
+    pub async fn get(&self) -> Result<LocationInfo, LocationError> {
         if let Some(cached) = self.cache.load_full()
             && cached.fetched_at.elapsed() < CACHE_TTL
         {
@@ -64,9 +87,14 @@ impl LocationProvider {
     }
 
     /// Fetch location from ipinfo.io.
-    async fn fetch() -> anyhow::Result<LocationInfo> {
-        let response = zenwave::get(IPINFO_URL).await?;
-        let info: LocationInfo = response.into_json().await?;
+    async fn fetch() -> Result<LocationInfo, LocationError> {
+        let response = zenwave::get(IPINFO_URL)
+            .await
+            .map_err(|error| LocationError::Fetch(Box::new(error)))?;
+        let info: LocationInfo = response
+            .into_json()
+            .await
+            .map_err(|error| LocationError::Decode(Box::new(error)))?;
         tracing::debug!(
             city = %info.city,
             region = %info.region,

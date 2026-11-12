@@ -1,57 +1,97 @@
 import { useEffect, useState } from 'react';
-import { BookOpen } from 'lucide-react';
+import { Save, CheckCircle2 } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
-import { useStore } from '@/lib/store';
+import { SectionHeader } from './SectionHeader';
+import { useTranslation } from '@/lib/i18n';
+import { getMemory, saveMemory } from '@/lib/api/memory';
 
 export function MemorySection() {
-  const { memoryContent, refreshMemory, saveMemory } = useStore();
-  const [memoryOverride, setMemoryOverride] = useState('');
-  const [memoryDirty, setMemoryDirty] = useState(false);
-  const memoryDraft = memoryDirty ? memoryOverride : memoryContent;
+  const { t } = useTranslation();
+  const [initial, setInitial] = useState('');
+  const [content, setContent] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
 
   useEffect(() => {
-    void refreshMemory();
-  }, [refreshMemory]);
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await getMemory();
+        if (cancelled) return;
+        setInitial(res.content);
+        setContent(res.content);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const dirty = content !== initial;
+
+  const onSave = async () => {
+    setSaving(true);
+    try {
+      const res = await saveMemory(content);
+      setInitial(res.content);
+      setContent(res.content);
+      setSavedAt(Date.now());
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const showSaved = savedAt !== null && !dirty;
 
   return (
-    <section className="space-y-4">
-      <div className="flex items-center gap-2 text-sm font-medium uppercase text-muted-foreground tracking-wide">
-        <BookOpen className="h-4 w-4" /> Memory
-      </div>
-      <div className="space-y-2">
-        <Label>MEMORY.md</Label>
-        <Textarea
-          value={memoryDraft}
-          onChange={(e) => {
-            setMemoryOverride(e.target.value);
-            setMemoryDirty(true);
-          }}
-          placeholder="Write memory context for future sessions..."
-          className="min-h-[220px] font-mono text-sm"
-        />
-        <div className="flex gap-2">
-          <Button
-            variant="outline"
-            onClick={async () => {
-              await refreshMemory();
-              setMemoryDirty(false);
-            }}
-          >
-            Reload
-          </Button>
-          <Button
-            onClick={async () => {
-              await saveMemory(memoryDraft);
-              setMemoryDirty(false);
-            }}
-            disabled={!memoryDirty}
-          >
-            Save memory
-          </Button>
+    <section>
+      <SectionHeader
+        title={t('settings.memory.title')}
+        description={t('settings.memory.description')}
+        action={
+          <div className="flex items-center gap-2">
+            {showSaved && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="size-3.5" />
+                {t('settings.memory.saved')}
+              </span>
+            )}
+            <Button size="sm" disabled={!dirty || saving} onClick={onSave}>
+              <Save className="size-3.5" />
+              {t('settings.memory.save')}
+            </Button>
+          </div>
+        }
+      />
+
+      {loading ? (
+        <div className="py-10 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+      ) : (
+        <div className="space-y-2">
+          <Textarea
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            placeholder={t('settings.memory.empty')}
+            spellCheck={false}
+            className="min-h-[320px] font-mono text-xs leading-relaxed"
+          />
+          <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+            <span>
+              {content.length.toLocaleString()} {content.length === 1 ? 'character' : 'characters'}
+            </span>
+            {dirty && <span>· unsaved changes</span>}
+          </div>
         </div>
-      </div>
+      )}
     </section>
   );
 }

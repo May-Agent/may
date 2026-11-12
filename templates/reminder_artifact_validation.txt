@@ -1,0 +1,5 @@
+<system-reminder>
+The declared {{ artifact_type }} artifact at {{ path }} failed validation (validation id {{ validation_id }}). Diagnostics:
+{% for diagnostic in diagnostics %}- {{ diagnostic }}
+{% endfor %}Inspect and repair the source, validate it again, and do not claim completion until it renders without diagnostics. Return the artifact control tag again after the repair.
+</system-reminder>

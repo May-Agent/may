@@ -1,0 +1,22 @@
+merged PR #{{ number }}{% if let Some(sha) = merge_sha %} as {{ sha }}{% else %} upstream{% endif %}
+{% match clone -%}
+{% when CloneFate::Deleted -%}
+The session clone repos/{{ clone_dir }} was deleted, ignored files included; the next `repo clone` or `pr open` for this repository clones it again at the new HEAD.
+{% when CloneFate::Kept -%}
+The session clone repos/{{ clone_dir }} was kept: it holds commits or changes this PR did not land.
+{% endmatch -%}
+{% match remote_branch -%}
+{% when RemoteBranch::Local -%}
+{% when RemoteBranch::Deleted with (branch) -%}
+The remote branch {{ branch }} was deleted.
+{% when RemoteBranch::NotDeleted with (branch, reason) -%}
+The remote branch {{ branch }} was not deleted: {{ reason }}
+{% endmatch -%}
+{% for checkout in pull_sync -%}
+{% match checkout.failure -%}
+{% when Some with (reason) -%}
+The checkout {{ checkout.path }} was not synced: {{ reason }}
+{% when None -%}
+The checkout {{ checkout.path }} was synced.
+{% endmatch -%}
+{% endfor -%}

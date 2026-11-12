@@ -1,0 +1,734 @@
+//! Issue tracking: may issues by default, GitHub when configured.
+//!
+//! [`IssueStore`] is the issue backend contract. The may backend
+//! ([`MayIssueStore`]) stores issues in the session's history database
+//! ([`crate::db`]) keyed by the repository identity, so every session and
+//! worktree of one repository on this machine shares the same issues. The
+//! GitHub backend ([`GitHubIssueStore`]) acts on the repository named by the
+//! project's entry in `workspace.toml` (`[[projects]]` with
+//! `issues.backend = "github"`). [`resolve_issue_store`] picks the backend
+//! and returns it as a [`ResolvedIssueStore`].
+
+pub mod github;
+pub mod may;
+pub mod owner;
+pub mod provenance;
+pub mod search;
+pub mod target;
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+pub use github::{GhCliTokenSource, GitHubIssueStore, GitHubTokenSource};
+pub use may::MayIssueStore;
+
+use crate::db::ChatDb;
+use crate::workspace::WorkspaceConfigError;
+
+/// Lifecycle state of an issue.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueState {
+    /// Open issue.
+    Open,
+    /// Closed issue.
+    Closed,
+}
+
+impl IssueState {
+    /// Persisted / wire form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl fmt::Display for IssueState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IssueState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            other => Err(format!("unknown issue state: {other}")),
+        }
+    }
+}
+
+/// State filter for `issue list`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueListState {
+    /// Open issues only.
+    Open,
+    /// Closed issues only.
+    Closed,
+    /// Every issue regardless of state.
+    All,
+}
+
+impl IssueListState {
+    /// Persisted / wire form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Relation kinds tracked between issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueRelationKind {
+    /// The related issue is a sub-issue (child) of the subject.
+    SubIssue,
+    /// The subject is blocked by the related issue.
+    BlockedBy,
+}
+
+impl IssueRelationKind {
+    /// Persisted / wire form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubIssue => "sub_issue",
+            Self::BlockedBy => "blocked_by",
+        }
+    }
+}
+
+/// An issue as shown in `issue list`.
+#[derive(Debug, Clone)]
+pub struct IssueSummary {
+    /// Issue number within the repository.
+    pub number: i64,
+    /// Issue title.
+    pub title: String,
+    /// Issue state.
+    pub state: IssueState,
+    /// Label names on the issue.
+    pub labels: Vec<String>,
+    /// Last update timestamp (ISO 8601).
+    pub updated_at: String,
+}
+
+/// One comment on an issue.
+#[derive(Debug, Clone)]
+pub struct IssueComment {
+    /// Comment id on its backend.
+    pub id: i64,
+    /// Author handle; `None` for may issues (they have no authors).
+    pub author: Option<String>,
+    /// Comment body (markdown).
+    pub body: String,
+    /// Creation timestamp (ISO 8601).
+    pub created_at: String,
+}
+
+/// An issue after a comment was added to it.
+#[derive(Debug, Clone)]
+pub struct CommentedIssue {
+    /// The refreshed issue.
+    pub detail: IssueDetail,
+    /// Id of the comment that was added.
+    pub comment_id: i64,
+}
+
+/// A related issue in compact form.
+#[derive(Debug, Clone)]
+pub struct RelatedIssue {
+    /// `owner/repo` the issue lives in, which a GitHub relation may take
+    /// outside the store's own repository; `None` in the may backend, whose
+    /// relations stay inside its one repository.
+    pub repository: Option<String>,
+    /// Issue number within the repository.
+    pub number: i64,
+    /// Issue title.
+    pub title: String,
+    /// Issue state.
+    pub state: IssueState,
+}
+
+/// An issue with its labels, comments and relations.
+#[derive(Debug, Clone)]
+pub struct IssueDetail {
+    /// Issue number within the repository.
+    pub number: i64,
+    /// Issue title.
+    pub title: String,
+    /// Issue body (markdown).
+    pub body: String,
+    /// Issue state.
+    pub state: IssueState,
+    /// Label names on the issue.
+    pub labels: Vec<String>,
+    /// Comments oldest-first.
+    pub comments: Vec<IssueComment>,
+    /// Sub-issues of this issue.
+    pub sub_issues: Vec<RelatedIssue>,
+    /// Issues this issue is blocked by.
+    pub blocked_by: Vec<RelatedIssue>,
+    /// Creation timestamp (ISO 8601).
+    pub created_at: String,
+    /// Last update timestamp (ISO 8601).
+    pub updated_at: String,
+}
+
+/// What deciding whether an issue's work can go on needs of it: its state
+/// and what blocks it, without its body, comments or sub-issues.
+#[derive(Debug, Clone)]
+pub struct IssueStatus {
+    /// Issue state.
+    pub state: IssueState,
+    /// Issues this issue is blocked by.
+    pub blocked_by: Vec<RelatedIssue>,
+}
+
+/// Error type for issue-backend operations.
+#[derive(Debug, thiserror::Error)]
+pub enum IssueError {
+    /// Storage failure in the may backend.
+    #[error(transparent)]
+    Database(#[from] crate::db::ChatDbError),
+    /// HTTP transport or API error in the GitHub backend.
+    #[error("GitHub API error: {0}")]
+    GitHub(String),
+    /// The `gh` CLI could not provide a token.
+    #[error("gh authentication failed: {0}")]
+    GitHubAuth(String),
+    /// The referenced issue does not exist.
+    #[error("issue #{0} not found")]
+    NotFound(i64),
+    /// The operation was rejected (for example a self-relation).
+    #[error("{0}")]
+    Invalid(String),
+    /// The search index could not be reached or refreshed.
+    #[error("issue search is unavailable: {0}")]
+    Search(String),
+    /// Issue ownership could not be decided.
+    #[error("issue ownership is unavailable: {0}")]
+    Ownership(String),
+    /// The operation is reserved for the main agent; the text is rendered from
+    /// the refusal template.
+    #[error("{0}")]
+    Reserved(String),
+    /// The user's approval for publishing was denied or could not be asked.
+    #[error("{0}")]
+    ApprovalDenied(String),
+    /// Workspace configuration could not be read.
+    #[error(transparent)]
+    WorkspaceConfig(#[from] WorkspaceConfigError),
+    /// A workspace directory's repository identity could not be resolved.
+    #[error("failed to resolve the repository identity for {}: {source}", .path.display())]
+    Identity {
+        /// Directory whose identity was being resolved.
+        path: PathBuf,
+        /// The canonicalize or git-discovery failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// What an issue is about, which decides whether creating it needs approval.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueKind {
+    /// Something behaves wrongly.
+    Bug,
+    /// New or changed functionality.
+    Feature,
+    /// Something is slower or heavier than it should be.
+    Performance,
+}
+
+impl IssueKind {
+    /// The kind as typed on the command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bug => "bug",
+            Self::Feature => "feature",
+            Self::Performance => "performance",
+        }
+    }
+}
+
+/// Backend identity surfaced to the base system prompt.
+#[derive(Debug, Clone)]
+pub struct IssueBackendInfo {
+    /// Short backend name (`may` or `github`).
+    pub name: &'static str,
+    /// `owner/repo` when the backend is GitHub.
+    pub repository: Option<String>,
+}
+
+/// An issue store: the backend a session reads and writes issues through.
+///
+/// Implemented by [`MayIssueStore`] and [`GitHubIssueStore`]; call sites
+/// hold the type-erased [`ResolvedIssueStore`] returned by
+/// [`resolve_issue_store`].
+pub trait IssueStore: Send + Sync + fmt::Debug {
+    /// Backend identity for the system prompt.
+    fn info(&self) -> IssueBackendInfo;
+
+    /// Stable name of this backend's issue set, keying its search index.
+    fn search_key(&self) -> String;
+
+    /// Whether the user owns the repository the issues live in: its owner's
+    /// login is the user's, or the user has admin permission on it. A failed
+    /// lookup is an error, never "owned".
+    fn owned_by_user(&self) -> impl Future<Output = Result<bool, IssueError>> + Send;
+
+    /// Whether the user's account opened issue `number`, which is also
+    /// every issue the agent opened.
+    fn opened_by_user(&self, number: i64) -> impl Future<Output = Result<bool, IssueError>> + Send;
+
+    /// Issues updated at or after `since` (every issue when `None`), oldest
+    /// update first: the ones at `since` itself, then at least `limit`
+    /// newer ones as long as more exist, never cutting through a group of
+    /// issues sharing one update time. Drives the search index's
+    /// incremental sync, which skips what it already indexed.
+    fn updated_since(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send;
+
+    /// Create an issue; returns the created detail.
+    fn create(
+        &self,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
+
+    /// Fetch one issue with labels, comments and relations.
+    fn get(&self, number: i64) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
+
+    /// Fetch one issue's state and blockers only.
+    fn status(&self, number: i64) -> impl Future<Output = Result<IssueStatus, IssueError>> + Send;
+
+    /// List issues, newest first.
+    fn list(
+        &self,
+        state: IssueListState,
+        labels: &[String],
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send;
+
+    /// Update title, body and/or state.
+    fn edit(
+        &self,
+        number: i64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<IssueState>,
+    ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
+
+    /// Add a comment; returns the refreshed detail and the comment's id.
+    fn comment(
+        &self,
+        number: i64,
+        body: &str,
+    ) -> impl Future<Output = Result<CommentedIssue, IssueError>> + Send;
+
+    /// Add and/or remove labels; returns the refreshed detail.
+    fn edit_labels(
+        &self,
+        number: i64,
+        add: &[String],
+        remove: &[String],
+    ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
+
+    /// Add or remove a sub-issue / blocked-by edge; returns the refreshed
+    /// detail of the subject issue.
+    fn edit_relation(
+        &self,
+        number: i64,
+        kind: IssueRelationKind,
+        target_number: i64,
+        add: bool,
+    ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
+}
+
+/// The store a session resolved from its workspace configuration.
+///
+/// The backend is chosen at runtime from `workspace.toml`, so the choice
+/// is held here; every method forwards to the selected [`IssueStore`].
+#[derive(Debug, Clone)]
+pub enum ResolvedIssueStore {
+    /// Issues in the session's history database.
+    May(MayIssueStore),
+    /// Issues of the configured GitHub repository.
+    GitHub(GitHubIssueStore<GhCliTokenSource>),
+}
+
+impl IssueStore for ResolvedIssueStore {
+    fn info(&self) -> IssueBackendInfo {
+        match self {
+            Self::May(store) => store.info(),
+            Self::GitHub(store) => store.info(),
+        }
+    }
+
+    fn search_key(&self) -> String {
+        match self {
+            Self::May(store) => store.search_key(),
+            Self::GitHub(store) => store.search_key(),
+        }
+    }
+
+    async fn owned_by_user(&self) -> Result<bool, IssueError> {
+        match self {
+            Self::May(store) => store.owned_by_user().await,
+            Self::GitHub(store) => store.owned_by_user().await,
+        }
+    }
+
+    async fn opened_by_user(&self, number: i64) -> Result<bool, IssueError> {
+        match self {
+            Self::May(store) => store.opened_by_user(number).await,
+            Self::GitHub(store) => store.opened_by_user(number).await,
+        }
+    }
+
+    async fn updated_since(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, IssueError> {
+        match self {
+            Self::May(store) => store.updated_since(since, limit).await,
+            Self::GitHub(store) => store.updated_since(since, limit).await,
+        }
+    }
+
+    async fn create(
+        &self,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<IssueDetail, IssueError> {
+        match self {
+            Self::May(store) => store.create(title, body, labels).await,
+            Self::GitHub(store) => store.create(title, body, labels).await,
+        }
+    }
+
+    async fn get(&self, number: i64) -> Result<IssueDetail, IssueError> {
+        match self {
+            Self::May(store) => store.get(number).await,
+            Self::GitHub(store) => store.get(number).await,
+        }
+    }
+
+    async fn status(&self, number: i64) -> Result<IssueStatus, IssueError> {
+        match self {
+            Self::May(store) => store.status(number).await,
+            Self::GitHub(store) => store.status(number).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        state: IssueListState,
+        labels: &[String],
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, IssueError> {
+        match self {
+            Self::May(store) => store.list(state, labels, limit).await,
+            Self::GitHub(store) => store.list(state, labels, limit).await,
+        }
+    }
+
+    async fn edit(
+        &self,
+        number: i64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<IssueState>,
+    ) -> Result<IssueDetail, IssueError> {
+        match self {
+            Self::May(store) => store.edit(number, title, body, state).await,
+            Self::GitHub(store) => store.edit(number, title, body, state).await,
+        }
+    }
+
+    async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
+        match self {
+            Self::May(store) => store.comment(number, body).await,
+            Self::GitHub(store) => store.comment(number, body).await,
+        }
+    }
+
+    async fn edit_labels(
+        &self,
+        number: i64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<IssueDetail, IssueError> {
+        match self {
+            Self::May(store) => store.edit_labels(number, add, remove).await,
+            Self::GitHub(store) => store.edit_labels(number, add, remove).await,
+        }
+    }
+
+    async fn edit_relation(
+        &self,
+        number: i64,
+        kind: IssueRelationKind,
+        target_number: i64,
+        add: bool,
+    ) -> Result<IssueDetail, IssueError> {
+        match self {
+            Self::May(store) => store.edit_relation(number, kind, target_number, add).await,
+            Self::GitHub(store) => store.edit_relation(number, kind, target_number, add).await,
+        }
+    }
+}
+
+/// Resolve the issue store for a workspace.
+///
+/// `cwd` is the session's working directory, `workspace_config_path` the
+/// workspace.toml holding per-project entries, and `db` the session's
+/// already-open chat database the may store writes through. A `[[projects]]`
+/// entry whose path resolves to the same repository identity selects the
+/// GitHub store; everything else falls back to the local store.
+///
+/// # Errors
+/// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
+/// be loaded and [`IssueError::Identity`] when a repository identity cannot
+/// be resolved.
+pub fn resolve_issue_store(
+    cwd: &Path,
+    workspace_config_path: &Path,
+    db: ChatDb,
+) -> Result<ResolvedIssueStore, IssueError> {
+    let identity = repository_identity(cwd)?;
+    if let Some(repository) = project_github_repository(&identity, workspace_config_path)? {
+        return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+            repository,
+            GhCliTokenSource,
+        )));
+    }
+    Ok(ResolvedIssueStore::May(MayIssueStore::new(
+        db,
+        identity.display().to_string(),
+    )))
+}
+
+/// Resolve the issue store of a session bound to `binding`.
+///
+/// A GitHub binding uses the GitHub store when its project keeps issues on
+/// GitHub and the local store otherwise; a local binding always uses the
+/// local store, keyed by its repository identity. Without a binding the
+/// working directory decides ([`resolve_issue_store`]).
+///
+/// # Errors
+/// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
+/// be loaded and [`IssueError::Identity`] when an unbound session's identity
+/// cannot be resolved.
+pub fn resolve_bound_issue_store(
+    binding: Option<&crate::session::RepoBinding>,
+    cwd: &Path,
+    workspace_config_path: &Path,
+    db: ChatDb,
+) -> Result<ResolvedIssueStore, IssueError> {
+    use crate::session::RepoBinding;
+    match binding {
+        None => resolve_issue_store(cwd, workspace_config_path, db),
+        Some(RepoBinding::Local(identity)) => Ok(ResolvedIssueStore::May(MayIssueStore::new(
+            db,
+            identity.display().to_string(),
+        ))),
+        Some(RepoBinding::Github(repository)) => {
+            let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
+            if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
+                .project_for_github(repository)
+                .map(|project| &project.issues)
+            {
+                return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+                    repository.clone(),
+                    GhCliTokenSource,
+                )));
+            }
+            // Issues kept internal have one key per repository, whatever
+            // directory the session runs in: the identity of the project's
+            // checkout when the workspace names one, else the repository.
+            let key = match config
+                .project_for_github(repository)
+                .and_then(|project| project.path.as_deref())
+            {
+                Some(path) => repository_identity(path)?.display().to_string(),
+                None => format!("github:{repository}"),
+            };
+            Ok(ResolvedIssueStore::May(MayIssueStore::new(db, key)))
+        }
+    }
+}
+
+/// The GitHub repository the workspace config assigns the project with
+/// `identity`, or `None` when the project has no entry or keeps its issues
+/// locally.
+///
+/// # Errors
+/// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
+/// be loaded.
+pub(crate) fn project_github_repository(
+    identity: &Path,
+    workspace_config_path: &Path,
+) -> Result<Option<crate::workspace::GitHubRepository>, IssueError> {
+    let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
+    Ok(
+        match config
+            .project_for_identity(identity)
+            .map(|project| &project.issues)
+        {
+            Some(crate::workspace::ProjectIssues::Github { repository }) => {
+                Some(repository.clone())
+            }
+            _ => None,
+        },
+    )
+}
+
+/// The repository identity an issue namespace is keyed by.
+///
+/// The canonicalized git common dir of `dir`
+/// (`git rev-parse --git-common-dir`), so all worktrees of one repository
+/// share one key, or the canonicalized directory itself when it is not
+/// inside a git repository.
+///
+/// # Errors
+/// Returns [`IssueError::Identity`] when `dir` or the discovered git common
+/// dir cannot be canonicalized, or when git discovery fails for a reason
+/// other than the directory not being a repository.
+pub fn repository_identity(dir: &Path) -> Result<PathBuf, IssueError> {
+    let canonical = dunce::canonicalize(dir).map_err(|error| IssueError::Identity {
+        path: dir.to_path_buf(),
+        source: Box::new(error),
+    })?;
+    match git2::Repository::discover(&canonical) {
+        Ok(repo) => dunce::canonicalize(repo.commondir()).map_err(|error| IssueError::Identity {
+            path: repo.commondir().to_path_buf(),
+            source: Box::new(error),
+        }),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(canonical),
+        Err(error) => Err(IssueError::Identity {
+            path: dir.to_path_buf(),
+            source: Box::new(error),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResolvedIssueStore, resolve_issue_store};
+    use crate::db::ChatDb;
+    use crate::workspace::{ProjectConfig, ProjectIssues, WorkspaceConfig};
+
+    fn github_project(path: std::path::PathBuf, repository: &str) -> ProjectConfig {
+        ProjectConfig {
+            path: Some(path),
+            repository: None,
+            issues: ProjectIssues::Github {
+                repository: repository.parse().expect("owner/repo"),
+            },
+            checks: None,
+            pr: crate::workspace::ProjectPr::default(),
+        }
+    }
+
+    /// A prs-only repository's May issues have one key, whether the session
+    /// runs in the project's checkout or in no directory at all.
+    #[tokio::test]
+    async fn internal_issues_of_a_github_binding_share_one_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        git2::Repository::init(&repo).expect("git init");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let binding = crate::session::RepoBinding::parse("github:owner/repo").expect("binding");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let config_path = dir.path().join("workspace.toml");
+        let key = |cwd: &std::path::Path| {
+            super::IssueStore::search_key(
+                &super::resolve_bound_issue_store(Some(&binding), cwd, &config_path, db.clone())
+                    .expect("store"),
+            )
+        };
+
+        let config = WorkspaceConfig {
+            projects: vec![ProjectConfig {
+                path: Some(repo.clone()),
+                repository: Some("owner/repo".parse().expect("owner/repo")),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: crate::workspace::ProjectPr::default(),
+            }],
+            ..WorkspaceConfig::default()
+        };
+        config.save(&config_path).expect("save workspace config");
+        assert_eq!(key(&repo), key(&elsewhere));
+
+        WorkspaceConfig::default()
+            .save(&config_path)
+            .expect("save workspace config");
+        assert_eq!(key(&repo), key(&elsewhere));
+    }
+
+    /// A trusted project whose directory was deleted matches nothing: the
+    /// project that still exists resolves to its GitHub store, and a
+    /// directory with no project falls back to the local store.
+    #[tokio::test]
+    async fn a_project_whose_path_is_gone_matches_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        git2::Repository::init(&repo).expect("git init");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let config = WorkspaceConfig {
+            projects: vec![
+                github_project(dir.path().join("gone"), "owner/gone"),
+                github_project(repo.clone(), "owner/repo"),
+            ],
+            ..WorkspaceConfig::default()
+        };
+        let config_path = dir.path().join("workspace.toml");
+        config.save(&config_path).expect("save workspace config");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+
+        let resolved =
+            resolve_issue_store(&repo, &config_path, db.clone()).expect("existing project");
+        let ResolvedIssueStore::GitHub(store) = resolved else {
+            panic!("the existing project resolves to its GitHub store");
+        };
+        assert_eq!(store.repository().to_string(), "owner/repo");
+
+        let resolved =
+            resolve_issue_store(&elsewhere, &config_path, db).expect("unconfigured directory");
+        assert!(matches!(resolved, ResolvedIssueStore::May(_)));
+    }
+}

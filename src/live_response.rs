@@ -1,7 +1,6 @@
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use async_channel::{Receiver, Sender};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub struct LiveResponseRegistry<Response> {
@@ -16,56 +15,45 @@ impl<Response> LiveResponseRegistry<Response> {
         }
     }
 
-    pub(crate) fn open(&self, request_id: String) -> Receiver<Response> {
+    pub(crate) fn open(&self, request_id: &str) -> Receiver<Response> {
         let (tx, rx) = async_channel::bounded(1);
         self.senders.rcu(|senders| {
             let mut next = HashMap::clone(senders);
-            next.insert(request_id.clone(), tx.clone());
+            next.insert(request_id.to_string(), tx.clone());
             next
         });
         rx
     }
 
-    pub(crate) fn try_open(&self, request_id: String) -> Option<Receiver<Response>> {
-        let (tx, rx) = async_channel::bounded(1);
-        loop {
-            let current = self.senders.load_full();
-            if current.contains_key(request_id.as_str()) {
-                return None;
-            }
+    /// Take the waiter of `request_id` out of the registry, so that no other
+    /// path can resolve it. Returns `None` when nobody waits.
+    pub(crate) fn take(&self, request_id: &str) -> Option<Sender<Response>> {
+        let mut taken = None;
+        self.senders.rcu(|senders| {
+            let mut next = HashMap::clone(senders);
+            taken = next.remove(request_id);
+            next
+        });
+        taken
+    }
 
-            let mut next = HashMap::clone(current.as_ref());
-            next.insert(request_id.clone(), tx.clone());
-            let previous =
-                Guard::into_inner(self.senders.compare_and_swap(&current, Arc::new(next)));
-            if Arc::ptr_eq(&current, &previous) {
-                return Some(rx);
-            }
-        }
+    /// Put a waiter taken with [`Self::take`] back, because it was not
+    /// resolved.
+    pub(crate) fn restore(&self, request_id: &str, sender: &Sender<Response>) {
+        self.senders.rcu(|senders| {
+            let mut next = HashMap::clone(senders);
+            next.insert(request_id.to_string(), sender.clone());
+            next
+        });
     }
 
     pub(crate) fn resolve(&self, request_id: &str, response: Response) -> bool {
-        let tx = self.senders.load().get(request_id).cloned();
-        if let Some(tx) = tx {
-            self.senders.rcu(|senders| {
-                let mut next = HashMap::clone(senders);
-                next.remove(request_id);
-                next
-            });
-            return tx.try_send(response).is_ok();
-        }
-        false
+        self.take(request_id)
+            .is_some_and(|tx| tx.try_send(response).is_ok())
     }
 
-    pub(crate) fn discard(&self, request_id: &str) -> bool {
-        if !self.senders.load().contains_key(request_id) {
-            return false;
-        }
-        self.senders.rcu(|senders| {
-            let mut next = HashMap::clone(senders);
-            next.remove(request_id);
-            next
-        });
-        true
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<String> {
+        self.senders.load().keys().cloned().collect()
     }
 }

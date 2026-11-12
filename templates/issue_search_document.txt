@@ -1,0 +1,11 @@
+{{ detail.title }}
+{%- if !detail.labels.is_empty() %}
+Labels: {% for label in detail.labels %}{{ label }}{% if !loop.last %}, {% endif %}{% endfor %}
+{%- endif %}
+
+{{ detail.body }}
+{%- for comment in detail.comments %}
+
+Comment{% if let Some(author) = comment.author %} by {{ author }}{% endif %}:
+{{ comment.body }}
+{%- endfor %}

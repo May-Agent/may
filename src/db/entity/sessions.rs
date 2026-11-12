@@ -1,9 +1,13 @@
 //! Session row model for the chat history database.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Session row model.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
+    /// Session id.
     pub id: String,
+    /// Session title, once assigned.
     pub title: Option<String>,
+    /// Model bound to the session.
     pub model: Option<String>,
     /// Last message preview (truncated).
     pub preview: Option<String>,
@@ -19,6 +23,27 @@ pub struct Model {
     pub folder_id: Option<String>,
     /// Display order within the pinned section.
     pub pin_sort_order: Option<i32>,
+    /// Creation timestamp (ISO 8601).
     pub created_at: String,
+    /// Last update timestamp (ISO 8601).
     pub updated_at: String,
+    /// Per-session reasoning/thinking depth override ("low" | "medium" | "high").
+    /// NULL means "no override; provider/model default applies".
+    pub reasoning_effort: Option<String>,
+    /// Host directory the session works in, when a client named one (the
+    /// TUI's launch directory); `None` uses the daemon's.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Repository the session is bound to: `github:owner/repo`, a local
+    /// repository identity, or `None` for a repo-less chat.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Whether nobody answers prompts for this session (a `may <prompt>`
+    /// one-shot run): permission requests are refused instead of asked.
+    #[serde(default)]
+    pub non_interactive: bool,
+    /// The agent whose global rules this session imports (`claude` or
+    /// `codex`), for a session `/import-claude` or `/import-codex` opened.
+    #[serde(default)]
+    pub rules_import: Option<String>,
 }

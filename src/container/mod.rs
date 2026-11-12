@@ -4,45 +4,157 @@
 //! heel sandbox.
 
 pub mod browser;
-pub mod heel;
 pub mod image;
+pub mod image_ref;
 pub mod lifecycle;
 pub mod profile;
+pub mod stage;
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use crate::tools::HostProgram;
 use aither_sandbox::{ContainerRuntimeKind, RuntimePreference};
 use bollard::Docker;
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
-use zenwave::ResponseExt;
+
+/// How long a socket probe waits for the runtime to answer its ping.
+const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The per-request timeout of the client kept for container operations:
+/// bollard's own default.
+const DOCKER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Error type for container operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ContainerError {
+    /// Docker API error.
     #[error("Docker API error: {0}")]
     Docker(#[from] bollard::errors::Error),
+    /// No container runtime found (tried `OrbStack`, Podman, Docker).
     #[error("No container runtime found (tried OrbStack, Podman, Docker)")]
     NoRuntime,
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[doc = "Managed tools failed integrity or read-only preparation."]
+    #[error("baseline tools preparation failed: {0}")]
+    Tools(#[from] crate::tools::ToolRuntimeError),
+    /// Container not found.
     #[error("Container not found: {0}")]
     NotFound(String),
-    #[error("Image build failed: {0}")]
-    ImageBuildFailed(String),
+    /// Image pull failed.
+    #[error("Image pull failed: {0}")]
+    ImagePullFailed(String),
+    /// Container runtime bootstrap failed.
     #[error("Container runtime bootstrap failed: {0}")]
     Bootstrap(String),
+    /// Managed Podman download requires explicit user approval before downloading binaries.
     #[error("Managed Podman download requires explicit user approval before downloading binaries")]
     ManagedPodmanDownloadApprovalRequired,
+    /// The container exposes no gateway the host bridge can bind.
+    #[error("container {0} exposes no gateway for the host IPC bridge")]
+    IpcRouteNoGateway(String),
+    /// The container's networks report different gateway addresses.
+    #[error("container {0} reports conflicting gateways for the host IPC bridge: {1:?}")]
+    IpcRouteConflictingGateways(String, Vec<String>),
+    /// The container's gateway cannot bind the host bridge.
+    #[error("container {0} gateway {1} is not a usable bridge bind: {2}")]
+    IpcRouteUnusableGateway(String, String, String),
+    /// The host platform has no container IPC bridge route: neither a
+    /// Docker Desktop-family host (macOS, Windows) nor native Linux.
+    #[error("container IPC bridge routes are unsupported on this platform")]
+    IpcRouteUnsupportedPlatform,
+}
+
+/// The hostname that resolves to the host machine from inside a container of
+/// `kind`.
+const fn host_gateway_name(kind: ContainerRuntimeKind) -> &'static str {
+    match kind {
+        ContainerRuntimeKind::Podman => "host.containers.internal",
+        _ => "host.docker.internal",
+    }
+}
+
+/// The Docker Desktop route to the host's IPC bridge, used on macOS and
+/// Windows hosts.
+///
+/// Docker Desktop runs its engine in a VM and forwards the host gateway name
+/// to the host's loopback interface, so the bridge binds loopback and the
+/// container dials the gateway name. `OrbStack` and Podman machine forward
+/// their gateway names the same way.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn docker_desktop_ipc_route(kind: ContainerRuntimeKind) -> aither_sandbox::HostRoute {
+    aither_sandbox::HostRoute::new(
+        host_gateway_name(kind),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    )
+    .expect("loopback is a usable host route")
+}
+
+/// The gateway address a container uses to reach its host, selected from the
+/// container's own inspection: exactly one distinct non-empty reported
+/// gateway, and that address binds the IPC bridge.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn select_ipc_gateway(
+    inspect: &bollard::models::ContainerInspectResponse,
+    container_id: &str,
+    host_name: &str,
+) -> Result<aither_sandbox::HostRoute, ContainerError> {
+    let mut gateways: Vec<String> = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .map(|networks| {
+            networks
+                .values()
+                .filter_map(|endpoint| endpoint.gateway.as_deref())
+                .filter(|gateway| !gateway.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    gateways.sort_unstable();
+    gateways.dedup();
+    match gateways.as_slice() {
+        [] => Err(ContainerError::IpcRouteNoGateway(container_id.to_string())),
+        [gateway] => {
+            let address = gateway.parse::<std::net::IpAddr>().map_err(|error| {
+                ContainerError::IpcRouteUnusableGateway(
+                    container_id.to_string(),
+                    gateway.clone(),
+                    error.to_string(),
+                )
+            })?;
+            aither_sandbox::HostRoute::new(host_name, address).map_err(|error| {
+                ContainerError::IpcRouteUnusableGateway(
+                    container_id.to_string(),
+                    gateway.clone(),
+                    error.to_string(),
+                )
+            })
+        }
+        _ => Err(ContainerError::IpcRouteConflictingGateways(
+            container_id.to_string(),
+            gateways,
+        )),
+    }
 }
 
 /// A detected and connected container runtime.
 pub struct ContainerRuntime {
+    /// Detected runtime kind.
     pub kind: ContainerRuntimeKind,
+    /// Bollard client connected to the runtime.
     pub client: Docker,
 }
 
+/// Options controlling container-runtime detection.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeDetectOptions {
+    /// Whether detection may download a managed Podman when no runtime is
+    /// found.
     pub allow_managed_podman_download: bool,
 }
 
@@ -58,15 +170,78 @@ impl ContainerRuntime {
     /// The hostname that resolves to the host machine from inside a container.
     #[must_use]
     pub const fn host_gateway(&self) -> &'static str {
-        match self.kind {
-            ContainerRuntimeKind::Podman => "host.containers.internal",
-            _ => "host.docker.internal",
-        }
+        host_gateway_name(self.kind)
+    }
+
+    /// The route a container uses to reach the host's IPC bridge: the
+    /// [`host_gateway`](Self::host_gateway) name it dials plus the host
+    /// address the bridge binds.
+    ///
+    /// The bridge executes host IPC commands for whoever connects, so the
+    /// bind is never a wildcard: on macOS and Windows hosts Docker Desktop,
+    /// `OrbStack` and Podman machine forward the gateway name to host loopback
+    /// (see [`docker_desktop_ipc_route`]); on native Linux the bind is the
+    /// container network's gateway as the host owns it.
+    ///
+    /// # Errors
+    /// Fails when the container reports no gateway or conflicting gateways,
+    /// when the gateway cannot bind the bridge, or when the platform cannot
+    /// route host IPC at all.
+    pub async fn ipc_route(
+        &self,
+        container_id: &str,
+    ) -> Result<aither_sandbox::HostRoute, ContainerError> {
+        self.resolve_ipc_route(container_id).await
+    }
+
+    /// The Docker Desktop route: the container's own network is irrelevant
+    /// because the engine VM forwards the gateway name to host loopback.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn resolve_ipc_route(
+        &self,
+        _container_id: &str,
+    ) -> std::future::Ready<Result<aither_sandbox::HostRoute, ContainerError>> {
+        std::future::ready(Ok(docker_desktop_ipc_route(self.kind)))
+    }
+
+    /// The native Linux route.
+    #[cfg(target_os = "linux")]
+    async fn resolve_ipc_route(
+        &self,
+        container_id: &str,
+    ) -> Result<aither_sandbox::HostRoute, ContainerError> {
+        // Native Docker and Podman resolve the host gateway name to the
+        // container network's gateway, so the bridge binds that exact
+        // address — read from the container's own inspection, never a
+        // hardcoded subnet.
+        let inspect = self
+            .client
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(ContainerError::Docker)?;
+        select_ipc_gateway(&inspect, container_id, self.host_gateway())
+    }
+
+    /// Hosts that are neither Docker Desktop hosts nor native Linux.
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    fn resolve_ipc_route(
+        &self,
+        _container_id: &str,
+    ) -> std::future::Ready<Result<aither_sandbox::HostRoute, ContainerError>> {
+        std::future::ready(Err(ContainerError::IpcRouteUnsupportedPlatform))
     }
 
     /// Detect and connect to the best available container runtime.
     ///
     /// Default priority: `OrbStack` > Podman > Docker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when no runtime can be found or reached,
+    /// including failures of a managed Podman bootstrap when one is attempted.
     pub async fn detect() -> Result<Self, ContainerError> {
         Self::detect_with_preference_and_options(
             RuntimePreference::default(),
@@ -76,6 +251,11 @@ impl ContainerRuntime {
     }
 
     /// Detect and connect to a container runtime using a specific selection order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when none of the runtimes in `preference`'s
+    /// order can be found or reached.
     pub async fn detect_with_preference(
         preference: RuntimePreference,
     ) -> Result<Self, ContainerError> {
@@ -83,6 +263,14 @@ impl ContainerRuntime {
     }
 
     /// Detect and connect to a container runtime with explicit managed-runtime options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::NoRuntime`] when none of the candidates connect,
+    /// or the errors of managed Podman bootstrap —
+    /// [`ContainerError::Bootstrap`],
+    /// [`ContainerError::ManagedPodmanDownloadApprovalRequired`],
+    /// [`ContainerError::Io`] — when a managed download is attempted.
     pub async fn detect_with_preference_and_options(
         preference: RuntimePreference,
         options: RuntimeDetectOptions,
@@ -96,26 +284,52 @@ impl ContainerRuntime {
             }
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(rt) = Self::bootstrap_managed_podman(options).await? {
-                return Ok(rt);
-            }
-        }
-
-        Err(ContainerError::NoRuntime)
+        Self::managed_runtime(options)
+            .await?
+            .ok_or(ContainerError::NoRuntime)
     }
 
-    /// Try connecting to a Docker-compatible socket.
+    /// Fall back to a May-managed Podman when no system runtime answered.
+    #[cfg(target_os = "macos")]
+    async fn managed_runtime(
+        options: RuntimeDetectOptions,
+    ) -> Result<Option<Self>, ContainerError> {
+        Self::bootstrap_managed_podman(options).await
+    }
+
+    /// No managed runtime exists off macOS, so the download option has nothing
+    /// to govern here.
+    #[cfg(not(target_os = "macos"))]
+    fn managed_runtime(
+        _options: RuntimeDetectOptions,
+    ) -> impl std::future::Future<Output = Result<Option<Self>, ContainerError>> {
+        std::future::ready(Ok(None))
+    }
+
+    /// Try connecting to a Docker-compatible endpoint: a Unix socket on Unix
+    /// hosts, a named pipe on Windows hosts.
     async fn try_connect(socket_path: &Path, kind: ContainerRuntimeKind) -> Option<Self> {
         if !socket_path.exists() {
             return None;
         }
 
-        let url = format!("unix://{}", socket_path.display());
-        let client = Docker::connect_with_socket(&url, 5, bollard::API_DEFAULT_VERSION).ok()?;
+        let Some(endpoint) = socket_path.to_str() else {
+            tracing::warn!(socket = %socket_path.display(), "Runtime endpoint path is not UTF-8");
+            return None;
+        };
+        // `connect_with_socket` dials a Unix socket on Unix and a named pipe
+        // on Windows. bollard applies one timeout to every request, so only
+        // the probe gets the short one: creating or starting a container on
+        // a busy host can take longer.
+        let client = Docker::connect_with_socket(
+            endpoint,
+            DOCKER_REQUEST_TIMEOUT.as_secs(),
+            bollard::API_DEFAULT_VERSION,
+        )
+        .ok()?;
+        let probe = client.clone().with_timeout(DOCKER_PROBE_TIMEOUT);
 
-        match client.ping().await {
+        match probe.ping().await {
             Ok(_) => Some(Self { kind, client }),
             Err(e) => {
                 tracing::debug!(socket = %socket_path.display(), error = %e, "Runtime socket ping failed");
@@ -134,30 +348,42 @@ impl ContainerRuntime {
 
         let may_dir = crate::config::MayConfig::may_dir()
             .map_err(|e| ContainerError::Bootstrap(format!("failed to resolve ~/.may: {e}")))?;
-        let bin_dir = may_dir.join("bin");
-        tokio::fs::create_dir_all(&bin_dir).await?;
-        let podman_bin = bin_dir.join("podman");
+        let host_programs = may_dir.join("cache").join("host-programs");
+        let distribution = crate::tools::embedded_distribution()?;
+        let target = crate::tools::ToolTarget::native()?;
 
-        if !tokio::fs::try_exists(&podman_bin).await? {
+        // A prepared binary that still has its pinned digest needs no
+        // download and no approval; anything else is fetched through the
+        // tool distribution, which verifies it before it is run.
+        let podman_bin = if let Some(prepared) = distribution
+            .cached_host_program(HostProgram::Podman, &target, &host_programs)
+            .await?
+        {
+            prepared
+        } else {
             if !options.allow_managed_podman_download {
                 return Err(ContainerError::ManagedPodmanDownloadApprovalRequired);
             }
-            download_managed_podman_binary(&podman_bin, &may_dir).await?;
-        }
+            tracing::info!("Downloading managed Podman");
+            distribution
+                .prepare_host_program(HostProgram::Podman, &target, &host_programs)
+                .await?
+        };
 
-        let socket_path = ensure_managed_podman_machine(&podman_bin).await?;
+        let socket_path = ensure_managed_podman_machine(podman_bin.path()).await?;
         Ok(Self::try_connect(&socket_path, ContainerRuntimeKind::Podman).await)
     }
 }
 
 fn socket_candidates(kind: ContainerRuntimeKind) -> Vec<PathBuf> {
     match kind {
-        ContainerRuntimeKind::OrbStack => dirs::home_dir()
-            .map(|home| vec![home.join(".orbstack/run/docker.sock")])
-            .unwrap_or_else(|| {
+        ContainerRuntimeKind::OrbStack => dirs::home_dir().map_or_else(
+            || {
                 tracing::warn!("failed to resolve home directory while probing OrbStack socket");
                 Vec::new()
-            }),
+            },
+            |home| vec![home.join(".orbstack/run/docker.sock")],
+        ),
         ContainerRuntimeKind::Podman => {
             let mut candidates = Vec::new();
             if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -168,230 +394,18 @@ fn socket_candidates(kind: ContainerRuntimeKind) -> Vec<PathBuf> {
             }
             candidates
         }
-        ContainerRuntimeKind::Docker => vec![PathBuf::from("/var/run/docker.sock")],
+        ContainerRuntimeKind::Docker => vec![PathBuf::from(DOCKER_ENGINE_ENDPOINT)],
     }
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Debug, serde::Deserialize)]
-struct GithubRelease {
-    assets: Vec<GithubAsset>,
-}
+/// The Docker Engine's local endpoint: the Unix socket on Unix hosts.
+#[cfg(unix)]
+const DOCKER_ENGINE_ENDPOINT: &str = "/var/run/docker.sock";
 
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[cfg(target_os = "macos")]
-fn podman_asset_name_candidates_for_current_arch() -> Result<&'static [&'static str], ContainerError>
-{
-    match std::env::consts::ARCH {
-        // Newer Podman releases ship `.zip`; older releases used `.tar.gz`.
-        "aarch64" => Ok(&[
-            "podman-remote-release-darwin_arm64.zip",
-            "podman-remote-release-darwin_arm64.tar.gz",
-        ]),
-        "x86_64" => Ok(&[
-            "podman-remote-release-darwin_amd64.zip",
-            "podman-remote-release-darwin_amd64.tar.gz",
-        ]),
-        other => Err(ContainerError::Bootstrap(format!(
-            "unsupported macOS architecture for managed Podman bootstrap: {other}"
-        ))),
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn download_managed_podman_binary(
-    podman_bin: &Path,
-    may_dir: &Path,
-) -> Result<(), ContainerError> {
-    let release_response =
-        zenwave::get("https://api.github.com/repos/containers/podman/releases/latest")
-            .await
-            .map_err(|e| {
-                ContainerError::Bootstrap(format!("failed to query Podman release metadata: {e}"))
-            })?;
-    let release: GithubRelease = release_response.into_json().await.map_err(|e| {
-        ContainerError::Bootstrap(format!("failed to parse Podman release metadata: {e}"))
-    })?;
-
-    let asset_name_candidates = podman_asset_name_candidates_for_current_arch()?;
-    let asset = asset_name_candidates
-        .iter()
-        .find_map(|candidate| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name == *candidate)
-                .cloned()
-        })
-        .ok_or_else(|| {
-            ContainerError::Bootstrap(format!(
-                "Podman release asset not found: expected one of [{}]",
-                asset_name_candidates.join(", ")
-            ))
-        })?;
-
-    tracing::info!(asset = %asset.name, "Downloading managed Podman binary");
-    let archive_response = zenwave::get(asset.browser_download_url.as_str())
-        .await
-        .map_err(|e| ContainerError::Bootstrap(format!("failed to download Podman asset: {e}")))?;
-    let bytes = archive_response.into_bytes().await.map_err(|e| {
-        ContainerError::Bootstrap(format!("failed to read Podman asset bytes: {e}"))
-    })?;
-
-    let archive_path = may_dir.join(&asset.name);
-    tokio::fs::write(&archive_path, bytes.as_ref()).await?;
-    extract_podman_binary(&archive_path, &asset.name, podman_bin).await?;
-    tokio::fs::remove_file(&archive_path).await.map_err(|e| {
-        ContainerError::Bootstrap(format!("failed to remove temporary Podman archive: {e}"))
-    })?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn extract_podman_binary(
-    archive_path: &Path,
-    archive_name: &str,
-    destination: &Path,
-) -> Result<(), ContainerError> {
-    if archive_name.ends_with(".zip") {
-        return extract_podman_binary_from_zip(archive_path, destination).await;
-    }
-    if archive_name.ends_with(".tar.gz") {
-        return extract_podman_binary_from_tar_gz(archive_path, destination).await;
-    }
-    Err(ContainerError::Bootstrap(format!(
-        "unsupported Podman archive format for {archive_name}"
-    )))
-}
-
-#[cfg(target_os = "macos")]
-async fn extract_podman_binary_from_tar_gz(
-    archive_path: &Path,
-    destination: &Path,
-) -> Result<(), ContainerError> {
-    let archive_path = archive_path.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::fs::File;
-
-        use flate2::read::GzDecoder;
-
-        let file = File::open(&archive_path)?;
-        let decoder = GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        let mut extracted = false;
-
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let entry_path = entry.path()?.into_owned();
-            let file_name = entry_path.file_name().and_then(|name| name.to_str());
-            if file_name == Some("podman") {
-                let parent = destination.parent().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid podman destination path: {}", destination.display()),
-                    )
-                })?;
-                std::fs::create_dir_all(parent)?;
-                entry.unpack(&destination)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))?;
-                }
-                extracted = true;
-                break;
-            }
-        }
-
-        if !extracted {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "podman binary not found in archive {}",
-                    archive_path.display()
-                ),
-            ));
-        }
-
-        Ok::<(), std::io::Error>(())
-    })
-    .await
-    .map_err(|e| ContainerError::Bootstrap(format!("podman extraction task failed: {e}")))?
-    .map_err(|e| ContainerError::Bootstrap(format!("failed to extract Podman binary: {e}")))?;
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn extract_podman_binary_from_zip(
-    archive_path: &Path,
-    destination: &Path,
-) -> Result<(), ContainerError> {
-    let archive_path = archive_path.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::fs::File;
-        use std::io;
-
-        let file = File::open(&archive_path)?;
-        let mut archive = zip::ZipArchive::new(file).map_err(io::Error::other)?;
-        let mut extracted = false;
-
-        for index in 0..archive.len() {
-            let mut entry = archive.by_index(index).map_err(io::Error::other)?;
-            let Some(file_name) = std::path::Path::new(entry.name())
-                .file_name()
-                .and_then(|name| name.to_str())
-            else {
-                continue;
-            };
-            if file_name != "podman" {
-                continue;
-            }
-
-            let parent = destination.parent().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid podman destination path: {}", destination.display()),
-                )
-            })?;
-            std::fs::create_dir_all(parent)?;
-            let mut out = File::create(&destination)?;
-            std::io::copy(&mut entry, &mut out)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))?;
-            }
-            extracted = true;
-            break;
-        }
-
-        if !extracted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "podman binary not found in archive {}",
-                    archive_path.display()
-                ),
-            ));
-        }
-
-        Ok::<(), io::Error>(())
-    })
-    .await
-    .map_err(|e| ContainerError::Bootstrap(format!("podman extraction task failed: {e}")))?
-    .map_err(|e| ContainerError::Bootstrap(format!("failed to extract Podman binary: {e}")))?;
-
-    Ok(())
-}
+/// The Docker Engine's local endpoint: the named pipe Docker Desktop serves
+/// on Windows hosts.
+#[cfg(windows)]
+const DOCKER_ENGINE_ENDPOINT: &str = r"\\.\pipe\docker_engine";
 
 #[cfg(target_os = "macos")]
 async fn ensure_managed_podman_machine(podman_bin: &Path) -> Result<PathBuf, ContainerError> {
@@ -496,4 +510,119 @@ async fn run_command_checked<const N: usize>(
     })?;
 
     Ok(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::models::{ContainerInspectResponse, EndpointSettings, NetworkSettings};
+    use std::collections::HashMap;
+
+    fn inspect_with_gateways(gateways: &[&str]) -> ContainerInspectResponse {
+        let networks: HashMap<String, EndpointSettings> = gateways
+            .iter()
+            .enumerate()
+            .map(|(index, gateway)| {
+                (
+                    format!("net{index}"),
+                    EndpointSettings {
+                        gateway: Some((*gateway).to_string()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        ContainerInspectResponse {
+            network_settings: Some(NetworkSettings {
+                networks: Some(networks),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_ipc_gateway_uses_the_inspected_gateway() {
+        let bind = select_ipc_gateway(
+            &inspect_with_gateways(&["172.30.5.1"]),
+            "container",
+            "host.docker.internal",
+        )
+        .expect("a reported gateway binds the bridge");
+        assert_eq!(
+            bind.address(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 30, 5, 1))
+        );
+    }
+
+    #[test]
+    fn select_ipc_gateway_errors_without_a_gateway() {
+        for inspect in [
+            ContainerInspectResponse::default(),
+            inspect_with_gateways(&[""]),
+        ] {
+            assert!(
+                matches!(
+                    select_ipc_gateway(&inspect, "container", "host.docker.internal"),
+                    Err(ContainerError::IpcRouteNoGateway(_))
+                ),
+                "inspection without a non-empty gateway must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn select_ipc_gateway_errors_on_conflicting_gateways() {
+        let error = select_ipc_gateway(
+            &inspect_with_gateways(&["172.30.5.1", "172.17.0.1"]),
+            "container",
+            "host.docker.internal",
+        )
+        .expect_err("distinct gateways must conflict");
+        assert!(matches!(
+            error,
+            ContainerError::IpcRouteConflictingGateways(_, _)
+        ));
+    }
+
+    #[test]
+    fn select_ipc_gateway_accepts_a_duplicate_gateway() {
+        let bind = select_ipc_gateway(
+            &inspect_with_gateways(&["172.30.5.1", "172.30.5.1"]),
+            "container",
+            "host.docker.internal",
+        )
+        .expect("a gateway repeated across networks is unambiguous");
+        assert_eq!(
+            bind.address(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 30, 5, 1))
+        );
+    }
+
+    #[test]
+    fn select_ipc_gateway_rejects_unusable_gateways() {
+        for gateway in ["not-an-ip", "0.0.0.0", "224.0.0.1"] {
+            assert!(
+                matches!(
+                    select_ipc_gateway(
+                        &inspect_with_gateways(&[gateway]),
+                        "container",
+                        "host.docker.internal"
+                    ),
+                    Err(ContainerError::IpcRouteUnusableGateway(_, _, _))
+                ),
+                "gateway {gateway} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_desktop_route_dials_host_docker_internal_over_loopback() {
+        let route = docker_desktop_ipc_route(ContainerRuntimeKind::Docker);
+        assert_eq!(route.name(), "host.docker.internal");
+        assert_eq!(
+            route.address(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
 }

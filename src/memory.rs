@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use aither_cloud::CloudProvider;
 use aither_core::LanguageModel;
 use aither_core::llm::{LLMRequest, Message};
 use futures_lite::StreamExt;
@@ -15,7 +14,16 @@ use crate::db::ChatDb;
 
 const PREFERENCE_PROMPT: &str = include_str!("../templates/preference_extraction_prompt.txt");
 const RECENCY_PROMPT: &str = include_str!("../templates/recency_extraction_prompt.txt");
-const MEMORY_PROCESS_INTERVAL: Duration = Duration::from_secs(45);
+/// Placeholder in the extraction templates replaced with the existing memory text.
+const CURRENT_PLACEHOLDER: &str = "{current}";
+/// Placeholder in the extraction templates replaced with the conversation text.
+const CONVERSATION_PLACEHOLDER: &str = "{conversation}";
+/// Cheap DB sweep cadence; extraction itself runs at most once per profile/day.
+const MEMORY_JOB_SWEEP_INTERVAL: Duration = Duration::from_mins(5);
+/// A dirty profile is refreshed at most once per 24 hours.
+const MEMORY_REFRESH_AGE: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
+/// Batch the first few chat turns before creating a profile's initial memory.
+const INITIAL_MEMORY_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_secs(15 * 60);
 const MAX_PROFILE_SESSIONS: usize = 3;
 const MAX_SESSION_MESSAGES: usize = 80;
 const MAX_CONVERSATION_CHARS: usize = 30_000;
@@ -23,15 +31,32 @@ const MAX_CONVERSATION_CHARS: usize = 30_000;
 /// Profile memory processor.
 ///
 /// Runs in the background, polling durable dirty jobs from the database.
+#[derive(Debug)]
 pub struct MemoryProcessor {
     db: ChatDb,
 }
 
-#[derive(Clone)]
+#[derive(Debug, thiserror::Error)]
+enum MemoryProcessingError {
+    #[error("database error: {0}")]
+    Database(#[from] crate::db::ChatDbError),
+    #[error("no memory extraction providers configured")]
+    NoProviders,
+    #[error("all memory extraction providers failed: {details}")]
+    AllProvidersFailed { details: String },
+    #[error("memory extraction LLM error: {0}")]
+    Llm(#[from] crate::agent::RedactedError<aither_cloud::CloudError>),
+}
+
+/// A provider candidate for memory extraction, tried in order.
+#[derive(Debug, Clone)]
 pub struct MemoryExtractionProvider {
+    /// Identifier of the LLM provider, used in diagnostics.
     pub provider_id: String,
+    /// Model name to run extraction with.
     pub model: String,
-    pub llm: CloudProvider,
+    /// Client used to run the extraction prompt.
+    pub llm: crate::agent::ProviderLlm,
 }
 
 impl MemoryProcessor {
@@ -43,7 +68,7 @@ impl MemoryProcessor {
     pub fn new(db: ChatDb, providers: Vec<MemoryExtractionProvider>) -> Self {
         let worker_db = db.clone();
         tokio::spawn(async move {
-            Self::worker(worker_db, providers).await;
+            Box::pin(Self::worker(worker_db, providers)).await;
         });
 
         Self { db }
@@ -57,13 +82,25 @@ impl MemoryProcessor {
     }
 
     async fn worker(db: ChatDb, providers: Vec<MemoryExtractionProvider>) {
-        let mut ticker = tokio::time::interval(MEMORY_PROCESS_INTERVAL);
+        let mut ticker = tokio::time::interval(MEMORY_JOB_SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;
+            let now = jiff::Timestamp::now();
+            let refresh_cutoff = now
+                .checked_sub(MEMORY_REFRESH_AGE)
+                .expect("24h profile-memory cutoff subtraction must not overflow")
+                .to_string();
+            let initial_cutoff = now
+                .checked_sub(INITIAL_MEMORY_GRACE)
+                .expect("15m initial profile-memory cutoff subtraction must not overflow")
+                .to_string();
 
-            let dirty_jobs = match db.list_dirty_profile_memory_jobs().await {
+            let dirty_jobs = match db
+                .list_due_profile_memory_jobs(&refresh_cutoff, &initial_cutoff)
+                .await
+            {
                 Ok(dirty_jobs) => dirty_jobs,
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to load dirty profile memory jobs");
@@ -89,7 +126,14 @@ impl MemoryProcessor {
                     continue;
                 }
 
-                match Self::process_request(&db, &providers, &job.profile_id, &conversation).await {
+                match Box::pin(Self::process_request(
+                    &db,
+                    &providers,
+                    &job.profile_id,
+                    &conversation,
+                ))
+                .await
+                {
                     Ok(()) => {
                         if let Err(error) = db
                             .mark_profile_memory_job_processed(&job.profile_id, &job.updated_at)
@@ -106,7 +150,10 @@ impl MemoryProcessor {
         }
     }
 
-    async fn build_profile_conversation(db: &ChatDb, profile_id: &str) -> anyhow::Result<String> {
+    async fn build_profile_conversation(
+        db: &ChatDb,
+        profile_id: &str,
+    ) -> Result<String, MemoryProcessingError> {
         let sessions = db
             .list_sessions_for_profile(profile_id)
             .await?
@@ -152,9 +199,9 @@ impl MemoryProcessor {
         providers: &[MemoryExtractionProvider],
         profile_id: &str,
         conversation: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), MemoryProcessingError> {
         if providers.is_empty() {
-            return Err(anyhow::anyhow!("no memory extraction providers configured"));
+            return Err(MemoryProcessingError::NoProviders);
         }
 
         // Extract preference memory
@@ -164,12 +211,12 @@ impl MemoryProcessor {
             .map(|m| m.content)
             .unwrap_or_default();
 
-        let preference_result = Self::extract(
+        let preference_result = Box::pin(Self::extract(
             providers,
             PREFERENCE_PROMPT,
             &current_preference,
             conversation,
-        )
+        ))
         .await?;
 
         if !preference_result.trim().is_empty() {
@@ -185,8 +232,13 @@ impl MemoryProcessor {
             .map(|m| m.content)
             .unwrap_or_default();
 
-        let recency_result =
-            Self::extract(providers, RECENCY_PROMPT, &current_recency, conversation).await?;
+        let recency_result = Box::pin(Self::extract(
+            providers,
+            RECENCY_PROMPT,
+            &current_recency,
+            conversation,
+        ))
+        .await?;
 
         if !recency_result.trim().is_empty() {
             db.upsert_profile_memory(profile_id, "recency", &recency_result)
@@ -203,14 +255,14 @@ impl MemoryProcessor {
         template: &str,
         current: &str,
         conversation: &str,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, MemoryProcessingError> {
         let prompt = template
-            .replace("{current}", current)
-            .replace("{conversation}", conversation);
+            .replace(CURRENT_PLACEHOLDER, current)
+            .replace(CONVERSATION_PLACEHOLDER, conversation);
         let mut errors = Vec::new();
 
         for provider in providers {
-            match Self::extract_with_provider(&provider.llm, &prompt).await {
+            match Box::pin(Self::extract_with_provider(&provider.llm, &prompt)).await {
                 Ok(content) => return Ok(content),
                 Err(error) => {
                     let error_text = error.to_string();
@@ -228,13 +280,15 @@ impl MemoryProcessor {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "all memory extraction providers failed: {}",
-            errors.join(" | ")
-        ))
+        Err(MemoryProcessingError::AllProvidersFailed {
+            details: errors.join(" | "),
+        })
     }
 
-    async fn extract_with_provider(llm: &CloudProvider, prompt: &str) -> anyhow::Result<String> {
+    async fn extract_with_provider(
+        llm: &crate::agent::ProviderLlm,
+        prompt: &str,
+    ) -> Result<String, MemoryProcessingError> {
         let request = LLMRequest::new(vec![Message::user(prompt)]);
 
         let mut stream = std::pin::pin!(llm.respond(request));
@@ -250,13 +304,21 @@ impl MemoryProcessor {
 }
 
 /// Profile memories to inject into agent context (read-only).
+#[derive(Debug, Clone)]
 pub struct ProfileMemories {
+    /// Long-lived user preference memory, when present.
     pub preference: Option<String>,
+    /// Memory of recent activity, when present.
     pub recency: Option<String>,
 }
 
 impl ProfileMemories {
     /// Load profile memories from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](crate::db::ChatDbError) when reading the profile
+    /// memories fails.
     pub async fn load(db: &ChatDb, profile_id: &str) -> Result<Self, crate::db::ChatDbError> {
         let memories = db.get_profile_memories(profile_id).await?;
         let mut preference = None;

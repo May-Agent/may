@@ -1,0 +1,2 @@
+Code search is unavailable: {{ reason }}
+This is an internal May error. Report a bug.

@@ -4,30 +4,79 @@ pub(super) mod ask_user;
 pub(super) mod manage;
 pub(super) mod navigation;
 
-use anyhow::Result;
-
 use super::app::{App, SendAction};
+use super::error::AppResult;
 use super::event::AppEvent;
-use super::state::AppMode;
+use super::state::{AppMode, StatusNotice};
 
 /// Reduce a single UI event into state transitions and optional actions.
-pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>> {
+///
+/// # Errors
+///
+/// Returns [`TuiError`](crate::tui::error::TuiError) when the underlying
+/// handler fails — e.g. a database write for a UI action errors.
+pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendAction>> {
     match event {
-        AppEvent::Key(code, modifiers) => app.handle_key(code, modifiers),
+        AppEvent::Key(code, modifiers) => {
+            // Any key press dismisses the current notice; the key still
+            // dispatches normally.
+            app.status = None;
+            app.handle_key(code, modifiers)
+        }
         AppEvent::Tick => {
+            // Sweep a transient status notice whose deadline passed; the tick
+            // cadence bounds how long an expired notice can linger.
+            StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
+            app.compaction.clear_expired(std::time::Instant::now());
+            app.sync_profile_follow();
+            if app.new_year.check_due(std::time::Instant::now()) {
+                let zone = crate::tui::new_year::user_zone(&app.config.time);
+                app.new_year.set_date(jiff::Timestamp::now(), &zone);
+            }
+            app.new_year.tick();
+            if app.processing
+                || app.index_loading
+                || (matches!(app.mode, AppMode::SessionSelect)
+                    && app.session_list.iter().any(|session| session.working))
+            {
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            }
             if app.processing {
-                app.chat.tick_loading();
                 if let Some(start) = app.thinking_start {
-                    let secs = start.elapsed().as_secs();
-                    app.chat.update_thinking(secs);
+                    app.chat.update_thinking(start.elapsed().as_secs_f64());
                 }
+                // Bind running terminal calls to their jobs and poll live
+                // output + file-diff previews.
+                app.poll_live_output();
+            }
+            // The jobs list and subagent runs arrive as `BackgroundLoaded`
+            // events while anything runs; nothing to poll for them here.
+            // Same cadence for an open job/subagent detail view.
+            if let AppMode::JobDetail(state) = &app.mode
+                && state.refreshed.is_none_or(|t| t.elapsed().as_secs() >= 1)
+            {
+                app.refresh_job_detail();
             }
             Ok(None)
         }
         AppEvent::Resize(_, _) => Ok(None),
-        AppEvent::Paste(text) => app.handle_bracketed_paste(text),
+        AppEvent::Paste(text) => Ok(app.handle_paste_event(text)),
         AppEvent::Mouse(mouse) => app.handle_mouse(mouse),
 
+        AppEvent::EffortLoaded(effort) => {
+            app.current_effort = effort;
+            if matches!(app.mode, AppMode::EffortSelect) {
+                app.effort_index = app.effort_ladder_index();
+            }
+            Ok(None)
+        }
+        AppEvent::EffortApplied(result) => {
+            match result {
+                Ok(effort) => app.current_effort = effort,
+                Err(e) => app.chat.push_error(&format!("Failed to set effort: {e}")),
+            }
+            Ok(None)
+        }
         AppEvent::SessionsLoaded(result) => {
             app.status = None;
             match result {
@@ -45,7 +94,24 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
             }
             Ok(None)
         }
+        AppEvent::AcpAgentsLoaded(result) => {
+            app.acp_agents_loaded(result);
+            Ok(None)
+        }
+        AppEvent::AcpConnectFinished(result) => {
+            app.acp_connect_finished(result);
+            Ok(None)
+        }
+        AppEvent::ResumeSessionsLoaded(sessions) => {
+            if let AppMode::ResumePicker(state) = &mut app.mode {
+                state.sessions = sessions;
+                state.loading = false;
+                state.selected = 0;
+            }
+            Ok(None)
+        }
         AppEvent::SessionDeleted {
+            deleted: _,
             was_current,
             result,
         } => {
@@ -148,17 +214,390 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
             }
             Ok(None)
         }
+        AppEvent::ProfileSessionsPushed(ps) => {
+            // Same lists with newer state: the selection stays where it is.
+            if matches!(app.mode, AppMode::SessionSelect) {
+                let selected_id = app
+                    .filtered_sessions()
+                    .get(app.session_selected)
+                    .and_then(|(index, _)| app.session_list.get(*index))
+                    .map(|summary| summary.id.clone());
+                app.profile_sessions = Some(ps);
+                app.build_session_list_from_profile();
+                let filtered = app.filtered_sessions();
+                let kept = selected_id.and_then(|id| {
+                    filtered
+                        .iter()
+                        .position(|(index, _)| app.session_list[*index].id == id)
+                });
+                let last = filtered.len().saturating_sub(1);
+                app.session_selected = kept.unwrap_or_else(|| app.session_selected.min(last));
+            }
+            Ok(None)
+        }
+        AppEvent::SshProbed { name, result } => {
+            if app.ssh_probed(&name, result) {
+                app.persist_config_background();
+            }
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat
                     .push_error(&format!("Failed to save config: {error}"));
-                app.status = Some("Config save failed".to_string());
+                app.set_status("Config save failed");
             }
             Ok(None)
         }
-        AppEvent::ImageFetchResult { url, data } => {
-            app.handle_image_fetch_result(url, data);
+        AppEvent::ImageDecoded { key, state } => {
+            app.handle_image_decoded(key, state);
             Ok(None)
+        }
+
+        AppEvent::SidebarTasks {
+            session_id,
+            content,
+            title,
+        } => {
+            let current = app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id);
+            if current {
+                let missing = app.sidebar.set_tasks(&session_id, content.as_deref());
+                app.sidebar.title = title;
+                app.request_issue_lookups(session_id, missing);
+            }
+            Ok(None)
+        }
+        AppEvent::SidebarIssues { session_id, issues } => {
+            app.sidebar.set_issues(&session_id, issues);
+            Ok(None)
+        }
+        AppEvent::SidebarPrs { session_id, prs } => {
+            app.sidebar.set_prs(&session_id, prs);
+            Ok(None)
+        }
+        AppEvent::BackgroundLoaded { jobs, subagents } => {
+            app.jobs = jobs;
+            app.subagents = subagents;
+            let row_count = jobs_rows(app).len();
+            if app.jobs_selected >= row_count && app.jobs_selected > 0 {
+                app.jobs_selected = row_count.saturating_sub(1);
+            }
+            Ok(None)
+        }
+        AppEvent::SessionRuntime(event) => {
+            app.session_runtime = event.runtime;
+            app.close_resolved_permission();
+            app.sync_queue_from_runtime();
+            Ok(None)
+        }
+        AppEvent::IndexCoverage(snapshot) => {
+            app.index_loading = false;
+            app.index_failed = snapshot.error.is_some();
+            if snapshot.error.is_none() {
+                app.index_coverage = snapshot.index;
+            }
+            Ok(None)
+        }
+        AppEvent::TurnStarted { message_id } => {
+            app.request_prompt_mark(i64::from(message_id));
+            Ok(None)
+        }
+        AppEvent::TurnWithdrawn { content, own } => {
+            app.withdraw_turn(content, own);
+            Ok(Some(SendAction::ReloadHistory))
+        }
+        AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::UserNotification(notification) => {
+            Ok(Some(SendAction::DesktopNotification(notification)))
+        }
+        AppEvent::Sleep(status) => {
+            if status.asleep != app.asleep {
+                app.asleep = status.asleep;
+                app.chat.push_notice(if status.asleep {
+                    "You are asleep: agents keep working and collect their questions. /sleep off ends it"
+                } else {
+                    "You are awake"
+                });
+            }
+            // The first report only sets the baseline: a reminder raised
+            // before this client attached is not shown again.
+            match app.sleep_reminders.replace(status.reminders) {
+                Some(seen) if status.reminders > seen => app.chat.push_notice(
+                    "It is about when you usually go to sleep. Run /sleep and get some rest",
+                ),
+                _ => {}
+            }
+            Ok(None)
+        }
+        AppEvent::PromptSuggestion {
+            session_id, text, ..
+        } => {
+            app.prompt_suggestion =
+                text.map(|text| crate::tui::app::PromptSuggestion { session_id, text });
+            Ok(None)
+        }
+        AppEvent::Recap {
+            session_id,
+            state,
+            summary,
+            next_action,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                if state == "ready" {
+                    if let Some(summary) = summary {
+                        app.chat.push_recap(&summary, next_action);
+                        app.scroll = usize::MAX;
+                    }
+                } else {
+                    app.chat.push_notice("Recap failed — try again");
+                }
+            }
+            Ok(None)
+        }
+        AppEvent::ToolCard { call_id, card } => {
+            app.chat.set_tool_card(&call_id, card);
+            Ok(None)
+        }
+        AppEvent::Warning {
+            session_id,
+            message,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.chat.push_warning(&message);
+                app.scroll = usize::MAX;
+            }
+            Ok(None)
+        }
+        AppEvent::ContextWindow { session_id, window } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.context_window = Some(window);
+            }
+            Ok(None)
+        }
+        AppEvent::Compaction { session_id, phase } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.compaction.apply(phase, std::time::Instant::now());
+            }
+            Ok(None)
+        }
+        AppEvent::Status(message) => {
+            app.set_status(message);
+            Ok(None)
+        }
+        AppEvent::JobKilled { pid, ok } => {
+            app.set_status(if ok {
+                format!("Killed job {pid}")
+            } else {
+                format!("Job {pid} already finished")
+            });
+            Ok(None)
+        }
+        AppEvent::JobDetailLoaded { job, output } => {
+            if let AppMode::JobDetail(state) = &mut app.mode
+                && let super::state::JobDetailTarget::Job(pid) = state.target
+                && job.as_ref().is_none_or(|loaded| loaded.pid == pid)
+            {
+                state.job = job;
+                state.output = output;
+            }
+            Ok(None)
+        }
+        AppEvent::TerminalOutputs(deltas) => {
+            for delta in deltas {
+                // A call that already ended dropped its binding at
+                // ToolCallEnd — the final result is authoritative, so a
+                // delta arriving late is dropped rather than appended.
+                let Some(read) = app.live_reads.get_mut(&delta.call_id) else {
+                    continue;
+                };
+                read.cursor = delta.cursor;
+                read.pending.extend_from_slice(&delta.bytes);
+                let complete = super::app::utf8_complete_len(&read.pending);
+                let bytes: Vec<u8> = read.pending.drain(..complete).collect();
+                if !matches!(delta.status, aither_sandbox::JobStatus::Running) {
+                    app.live_reads.remove(&delta.call_id);
+                }
+                if !bytes.is_empty() {
+                    app.chat
+                        .append_tool_output(&delta.call_id, &String::from_utf8_lossy(&bytes));
+                }
+            }
+            Ok(None)
+        }
+        AppEvent::BtwDelta(text) => {
+            if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
+                state.answer.push_str(&text);
+            }
+            Ok(None)
+        }
+        AppEvent::BtwFinished => {
+            if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
+                state.loading = false;
+                state.done = true;
+            }
+            Ok(None)
+        }
+        AppEvent::BtwFailed(error) => {
+            if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
+                state.loading = false;
+                state.done = true;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressLoaded(report) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.report = Some(report);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressFailed(error) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
+        AppEvent::BashFinished(outcome) => {
+            use std::fmt::Write as _;
+
+            let outcome = *outcome;
+            let mut output = outcome.stdout.clone();
+            if !outcome.stderr.is_empty() {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&outcome.stderr);
+            }
+            if let Some(error) = &outcome.error {
+                output.clone_from(error);
+            }
+            let status = if outcome.error.is_some() || outcome.exit_code != 0 {
+                super::ui::chat::ToolStatus::Failed(format!("exit {}", outcome.exit_code))
+            } else {
+                super::ui::chat::ToolStatus::Done
+            };
+            app.chat
+                .update_tool_with_output(&outcome.call_id, status, Some(&output));
+            if outcome.had_secret {
+                app.chat.push_notice(crate::secrets::SECRET_WARNING);
+            }
+            app.scroll = usize::MAX;
+
+            // The agent sees the same masked transcript the TUI shows.
+            // When the stored secrets cannot be read the transcript cannot be
+            // masked, so nothing is sent to the agent.
+            let masked_command = match &app.secrets {
+                Ok(secrets) => secrets.mask(&outcome.command).0,
+                Err(error) => {
+                    app.chat.push_error(&error.to_string());
+                    return Ok(None);
+                }
+            };
+            let mut content = format!("! {masked_command}\n");
+            if let Some(error) = &outcome.error {
+                let _ = write!(content, "\n<error>{error}</error>");
+            } else {
+                if !outcome.stdout.is_empty() {
+                    let _ = write!(content, "\n<stdout>\n{}\n</stdout>", outcome.stdout);
+                }
+                if !outcome.stderr.is_empty() {
+                    let _ = write!(content, "\n<stderr>\n{}\n</stderr>", outcome.stderr);
+                }
+                if outcome.exit_code != 0 {
+                    let _ = write!(content, "\n<exit>{}</exit>", outcome.exit_code);
+                }
+            }
+            let msg = super::queue::PendingMessage {
+                content,
+                hidden_context_xml: None,
+                attachments: Vec::new(),
+                queued_at: jiff::Timestamp::now(),
+                delivery_mode: crate::session::PendingUserMessageMode::Steer,
+                display: Some(outcome.call_id),
+            };
+            Ok(Some(if app.processing {
+                SendAction::EnqueuePending(msg)
+            } else {
+                SendAction::Send(msg)
+            }))
+        }
+        AppEvent::SecretStored { key, result } => {
+            match result {
+                Ok(()) => {
+                    // Refresh the in-memory snapshot so new bash runs mask
+                    // and inject the secret just stored.
+                    app.secrets = crate::secrets::Secrets::load(
+                        &crate::secrets::SecretStore::new(app.session_manager.may_dir()),
+                        &app.config,
+                    );
+                    if let Err(error) = &app.secrets {
+                        app.chat.push_error(&error.to_string());
+                    }
+                    app.chat.push_notice(&format!(
+                        "Secret {key} stored in the OS keychain — injected into shell environments"
+                    ));
+                }
+                Err(error) => app
+                    .chat
+                    .push_error(&format!("Failed to store secret: {error}")),
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Rows of the jobs panel: running subagents first, then registry jobs
+/// (running before finished).
+pub fn jobs_rows(app: &App) -> Vec<JobRow> {
+    let mut rows: Vec<JobRow> = app
+        .subagents
+        .iter()
+        .cloned()
+        .map(JobRow::Subagent)
+        .collect();
+    let mut jobs: Vec<aither_sandbox::JobInfo> = app.jobs.clone();
+    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::JobStatus::Running));
+    rows.extend(jobs.into_iter().map(JobRow::Job));
+    rows
+}
+
+/// One selectable row in the jobs panel.
+#[derive(Debug)]
+pub enum JobRow {
+    /// A `subagent` IPC call in flight, with live counters.
+    Subagent(crate::agent::SubagentRunSnapshot),
+    /// A background terminal job from the registry.
+    Job(aither_sandbox::JobInfo),
+}
+
+impl JobRow {
+    /// `JobDetailTarget` selecting this row's detail view.
+    #[must_use]
+    pub const fn detail_target(&self) -> super::state::JobDetailTarget {
+        match self {
+            Self::Subagent(run) => super::state::JobDetailTarget::Subagent(run.run_id),
+            Self::Job(job) => super::state::JobDetailTarget::Job(job.pid),
         }
     }
 }

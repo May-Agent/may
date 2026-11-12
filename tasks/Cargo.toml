@@ -1,0 +1,20 @@
+[package]
+name = "may-tasks"
+version = "0.1.0"
+edition = "2024"
+description = "The tasks.md format and the `tasks` command that edits it"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[[bin]]
+name = "tasks"
+path = "src/main.rs"
+
+[dependencies]
+askama = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.24.0"
+
+[lints]
+workspace = true

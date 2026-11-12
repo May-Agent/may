@@ -10,11 +10,11 @@
 //!   (the section key), type, and credentials. Providers don't select models - they
 //!   just provide access.
 //!
-//! - **Models**: User preferences for which models to use per tier. Each tier (advanced,
-//!   balanced, fast, `image_generation`) can have multiple models in priority order.
-//!   The system will try providers in order and failover to the next model if all fail.
+//! - **Models**: User preferences for which explicit provider/model selectors to use per tier.
+//!   Each selector is stored as `<provider_id>::<model_id>`. Each tier (advanced, balanced,
+//!   fast, `image_generation`) can have multiple selectors in priority order.
 //!
-//! - **Preferences**: Global settings like load balancing strategy and warnings.
+//! - **Preferences**: Global settings like warnings and network policy.
 //!
 //! # Example config
 //!
@@ -35,160 +35,122 @@
 //! base_url = "http://192.168.1.100:11434/v1"
 //!
 //! [models]
-//! advanced = ["claude-opus-4", "gpt-4.5"]
-//! balanced = ["claude-sonnet-4", "gemini-2.5-flash"]
-//! fast = ["claude-haiku-4", "gpt-4o-mini"]
-//! image_generation = ["dall-e-3"]
+//! advanced = ["anthropic::claude-opus-4", "openai::gpt-4.5"]
+//! balanced = ["anthropic::claude-sonnet-4", "google::gemini-2.5-flash"]
+//! fast = ["anthropic::claude-haiku-4", "openai::gpt-4o-mini"]
+//! image_generation = ["openai::gpt-image-1"]
 //! default_tier = "balanced"
 //!
 //! [preferences]
-//! load_balance_strategy = "round_robin"
 //! warn_on_model_change = true
+//! show_decode_speed = true
 //! ```
 
 use async_fs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use crate::cache_lifetime::CacheLifetime;
+use crate::model_selector::ModelSelector;
 use crate::network_policy::NetworkPolicyConfig;
 
-/// Infer model tier from aither-models metadata.
-///
-/// Uses model mode, pricing percentiles, and context window as signals.
-#[must_use]
-pub fn get_model_tier(model_id: &str) -> ModelTier {
-    let chat_price_breakpoints = chat_price_breakpoints();
-    aither_models::lookup(model_id).map_or(ModelTier::Balanced, |info| {
-        infer_model_tier(info, chat_price_breakpoints)
-    })
-}
+pub use aither_models::{ModelTier, tier as get_model_tier};
 
-fn chat_price_breakpoints() -> Option<(f64, f64)> {
-    let mut prices = aither_models::models_by_mode(aither_models::ModelMode::Chat)
-        .map(|info| info.pricing().output_per_token())
-        .filter(|price| price.is_finite() && *price > 0.0)
-        .collect::<Vec<_>>();
-    if prices.len() < 3 {
-        return None;
-    }
+/// Directory under `~/.may` where rolling network audit logs are stored.
+pub const NETWORK_AUDIT_LOG_SUBDIR: &str = "logs/network";
 
-    prices.sort_by(f64::total_cmp);
-    let low_index = prices.len() / 3;
-    let high_index = (prices.len() * 2) / 3;
-    Some((prices[low_index], prices[high_index]))
-}
-
-fn infer_model_tier(
-    info: &aither_models::ModelEntry,
-    chat_price_breakpoints: Option<(f64, f64)>,
-) -> ModelTier {
-    match info.mode() {
-        aither_models::ModelMode::ImageGeneration => return ModelTier::ImageGeneration,
-        aither_models::ModelMode::Chat => {}
-        _ => return ModelTier::Balanced,
-    }
-
-    let output_price = info.pricing().output_per_token();
-    if let Some((fast_ceiling, advanced_floor)) = chat_price_breakpoints
-        && output_price.is_finite()
-        && output_price > 0.0
-    {
-        if output_price <= fast_ceiling {
-            return ModelTier::Fast;
-        }
-        if output_price >= advanced_floor {
-            return ModelTier::Advanced;
-        }
-        return ModelTier::Balanced;
-    }
-
-    match info.max_input_tokens() {
-        Some(tokens) if tokens <= 32_768 => ModelTier::Fast,
-        Some(tokens) if tokens >= 200_000 => ModelTier::Advanced,
-        _ => ModelTier::Balanced,
-    }
-}
+/// Number of rotated daily network audit log files retained.
+pub const NETWORK_AUDIT_MAX_FILES: usize = 14;
 
 fn normalize_base_url(url: &str) -> &str {
     url.trim_end_matches('/')
 }
 
-/// Normalize a model ID for relaxed comparison by stripping trailing date and
-/// `-preview` suffixes.  Examples:
-///   `claude-3-5-sonnet-20241022` → `claude-3-5-sonnet`
-///   `o3-2025-04-16`              → `o3`
-///   `gpt-4o-2024-08-06-preview`  → `gpt-4o`
-pub fn normalize_model_id_for_relaxed_match(model_id: &str) -> String {
-    static SUFFIX_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"-(?:\d{8}|\d{4}-\d{2}-\d{2}|preview)$")
-            .expect("model suffix regex must be valid")
-    });
-
-    let mut current = model_id.trim().to_ascii_lowercase();
-    loop {
-        let Some(m) = SUFFIX_RE.find(&current) else {
-            break;
-        };
-        current.truncate(m.start());
-    }
-    current
-}
-
-/// Model ID matching mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// Only exact (case-insensitive) matches.
-    Strict,
-    /// Normalized relaxed matching (strips dates, versions, etc.).
-    Relaxed,
-}
-
-impl MatchMode {
-    /// Create from a `strict_model_matching` preference flag.
-    #[must_use]
-    pub const fn from_strict_flag(strict: bool) -> Self {
-        if strict { Self::Strict } else { Self::Relaxed }
-    }
-}
-
-#[must_use]
-pub fn model_ids_match(candidate: &str, requested: &str, mode: MatchMode) -> bool {
-    if candidate.eq_ignore_ascii_case(requested) {
-        return true;
-    }
-    if mode == MatchMode::Strict {
-        return false;
-    }
-    normalize_model_id_for_relaxed_match(candidate)
-        == normalize_model_id_for_relaxed_match(requested)
-}
-
 /// Configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Home directory not found.
     #[error("Home directory not found")]
     NoHomeDir,
+    /// The home directory does not resolve to a real path.
+    #[error("Home directory {} does not resolve: {source}", home.display())]
+    HomeUnresolvable {
+        /// The home directory as the environment names it.
+        home: PathBuf,
+        /// The resolution failure.
+        source: std::io::Error,
+    },
+    /// Failed to read config.
     #[error("Failed to read config: {0}")]
     Read(#[from] std::io::Error),
+    /// Failed to parse config.
     #[error("Failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// Failed to serialize config.
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
-    #[error(
-        "legacy config section `[playwright]` is no longer supported; rename it to `[browser]`"
-    )]
-    LegacyPlaywrightSection,
+    /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
+    /// Invalid `[ci]` config.
+    #[error("invalid ci config: {0}")]
+    InvalidCiConfig(String),
+    /// A provider instance already exists under the ID with a different type.
+    #[error(
+        "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
+    )]
+    ProviderTypeMismatch {
+        /// Provider ID from the config section key.
+        id: String,
+        /// Provider type the caller requires.
+        expected: ProviderType,
+        /// Provider type the existing instance resolves to.
+        actual: ProviderType,
+    },
+    /// An ACP agent cannot be registered as a subagent type under its name.
+    #[error("cannot connect ACP agent `{name}`: {reason}")]
+    InvalidAcpAgent {
+        /// The subagent type name.
+        name: String,
+        /// Why the name cannot be used.
+        reason: String,
+    },
+    /// Invalid provider config.
+    #[error("invalid provider config for `{id}`: {reason}")]
+    InvalidProviderConfig {
+        /// Provider ID from the config section key.
+        id: String,
+        /// What is wrong with the configuration.
+        reason: String,
+    },
+}
+
+/// Wire API a `custom` provider speaks.
+///
+/// `Custom` providers default to the Chat Completions API; select
+/// `Responses` for backends that implement the `OpenAI` Responses API
+/// (required for provider-hosted tools such as `native_tools.web_search`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, skyzen::ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderApi {
+    /// `POST /v1/chat/completions`
+    #[default]
+    ChatCompletions,
+    /// `POST /v1/responses`
+    Responses,
 }
 
 /// LLM provider types.
 ///
 /// This represents the type of provider (API format and default base URL).
 /// Users configure individual provider instances with credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     /// Anthropic Claude models
@@ -200,6 +162,8 @@ pub enum ProviderType {
     Google,
     /// GitHub Copilot (OAuth, `OpenAI` format)
     Copilot,
+    /// `ChatGPT` subscription (OAuth, Codex Responses backend)
+    Chatgpt,
     /// `OpenRouter` (aggregator, `OpenAI` format)
     OpenRouter,
     /// `DeepSeek` (`OpenAI` format)
@@ -216,6 +180,8 @@ pub enum ProviderType {
     Mistral,
     /// xAI Grok
     XAI,
+    /// xAI Grok subscription (OAuth, `api.x.ai`)
+    Grok,
     /// Custom provider (user specifies `base_url`)
     Custom,
 }
@@ -228,10 +194,41 @@ impl ProviderType {
             Self::Google => Some(aither_models::Provider::Google),
             Self::DeepSeek => Some(aither_models::Provider::DeepSeek),
             Self::Mistral => Some(aither_models::Provider::Mistral),
-            Self::XAI => Some(aither_models::Provider::XAI),
+            Self::XAI | Self::Grok => Some(aither_models::Provider::XAI),
             Self::Groq => Some(aither_models::Provider::Groq),
             Self::Together => Some(aither_models::Provider::Together),
-            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Copilot => None,
+            Self::OpenRouter
+            | Self::Ollama
+            | Self::LMStudio
+            | Self::Custom
+            | Self::Copilot
+            | Self::Chatgpt => None,
+        }
+    }
+
+    /// The prompt-cache block size the provider publishes, in tokens: it
+    /// caches and serves whole blocks only. `None` where no size is
+    /// published.
+    #[must_use]
+    pub const fn cache_block_tokens(self) -> Option<NonZeroU64> {
+        match self {
+            // OpenAI's prompt caching guide: cache hits grow in 128-token
+            // increments past the first 1024 tokens.
+            Self::OpenAI => NonZeroU64::new(128),
+            Self::Anthropic
+            | Self::Google
+            | Self::Copilot
+            | Self::Chatgpt
+            | Self::OpenRouter
+            | Self::DeepSeek
+            | Self::Ollama
+            | Self::LMStudio
+            | Self::Groq
+            | Self::Together
+            | Self::Mistral
+            | Self::XAI
+            | Self::Grok
+            | Self::Custom => None,
         }
     }
 
@@ -243,6 +240,7 @@ impl ProviderType {
                     | aither_models::Provider::Anthropic
                     | aither_models::Provider::Copilot
             ),
+            Self::Chatgpt => matches!(provider, aither_models::Provider::OpenAI),
             _ => self
                 .catalog_provider()
                 .is_some_and(|expected| expected == *provider),
@@ -268,6 +266,7 @@ impl ProviderType {
         Self::OpenAI,
         Self::Google,
         Self::Copilot,
+        Self::Chatgpt,
         Self::OpenRouter,
         Self::DeepSeek,
         Self::Ollama,
@@ -276,6 +275,7 @@ impl ProviderType {
         Self::Together,
         Self::Mistral,
         Self::XAI,
+        Self::Grok,
         Self::Custom,
     ];
 
@@ -287,6 +287,7 @@ impl ProviderType {
             Self::OpenAI => "OpenAI (GPT)",
             Self::Google => "Google (Gemini)",
             Self::Copilot => "GitHub Copilot",
+            Self::Chatgpt => "ChatGPT (subscription)",
             Self::OpenRouter => "OpenRouter",
             Self::DeepSeek => "DeepSeek",
             Self::Ollama => "Ollama (Local)",
@@ -295,6 +296,7 @@ impl ProviderType {
             Self::Together => "Together AI",
             Self::Mistral => "Mistral AI",
             Self::XAI => "xAI (Grok)",
+            Self::Grok => "xAI Grok (subscription)",
             Self::Custom => "Custom Provider",
         }
     }
@@ -307,6 +309,7 @@ impl ProviderType {
             Self::OpenAI => "openai",
             Self::Google => "google",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
             Self::Ollama => "ollama",
@@ -315,6 +318,7 @@ impl ProviderType {
             Self::Together => "together",
             Self::Mistral => "mistral",
             Self::XAI => "xai",
+            Self::Grok => "grok",
             Self::Custom => "custom",
         }
     }
@@ -337,6 +341,7 @@ impl ProviderType {
             Self::OpenAI => Some("https://api.openai.com/v1"),
             Self::Google => Some("https://generativelanguage.googleapis.com/v1beta"),
             Self::Copilot => Some("https://api.githubcopilot.com"),
+            Self::Chatgpt => Some("https://chatgpt.com/backend-api/codex"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
             Self::Ollama => Some("http://localhost:11434/v1"),
@@ -344,7 +349,7 @@ impl ProviderType {
             Self::Groq => Some("https://api.groq.com/openai/v1"),
             Self::Together => Some("https://api.together.xyz/v1"),
             Self::Mistral => Some("https://api.mistral.ai/v1"),
-            Self::XAI => Some("https://api.x.ai/v1"),
+            Self::XAI | Self::Grok => Some("https://api.x.ai/v1"),
             Self::Custom => None,
         }
     }
@@ -357,9 +362,10 @@ impl ProviderType {
             Self::OpenAI => "openai",
             Self::Google => "google",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
             Self::DeepSeek => "deepseek",
             Self::Mistral => "mistral",
-            Self::XAI => "xai",
+            Self::XAI | Self::Grok => "xai",
             Self::Groq => "groq",
             Self::Together => "together",
             Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom => "unknown",
@@ -372,7 +378,12 @@ impl ProviderType {
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Custom
+            Self::Ollama
+                | Self::LMStudio
+                | Self::Copilot
+                | Self::Chatgpt
+                | Self::Grok
+                | Self::Custom
         )
     }
 
@@ -385,7 +396,7 @@ impl ProviderType {
     /// Whether this provider type uses OAuth authentication.
     #[must_use]
     pub const fn uses_oauth(self) -> bool {
-        matches!(self, Self::Copilot)
+        matches!(self, Self::Copilot | Self::Chatgpt | Self::Grok)
     }
 
     /// Parse provider type from an ID string.
@@ -397,6 +408,7 @@ impl ProviderType {
             "openai" | "gpt" => Self::OpenAI,
             "google" | "gemini" => Self::Google,
             "copilot" | "github" => Self::Copilot,
+            "chatgpt" | "codex" => Self::Chatgpt,
             "openrouter" => Self::OpenRouter,
             "deepseek" => Self::DeepSeek,
             "ollama" => Self::Ollama,
@@ -404,7 +416,8 @@ impl ProviderType {
             "groq" => Self::Groq,
             "together" => Self::Together,
             "mistral" => Self::Mistral,
-            "xai" | "grok" => Self::XAI,
+            "xai" => Self::XAI,
+            "grok" | "xai-oauth" => Self::Grok,
             _ => Self::Custom,
         }
     }
@@ -417,11 +430,10 @@ impl ProviderType {
     /// by any native provider.
     #[must_use]
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        if self == Self::OpenRouter
-            || self == Self::Ollama
-            || self == Self::LMStudio
-            || self == Self::Custom
-        {
+        if matches!(
+            self,
+            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Chatgpt
+        ) {
             return true;
         }
 
@@ -439,54 +451,39 @@ impl ProviderType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiFormat {
+    /// `OpenAI` chat-completions API format.
     #[default]
     OpenAI,
+    /// `Anthropic` messages API format.
     Anthropic,
+    /// Google Gemini API format.
     Gemini,
 }
 
-/// Model tier preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    /// Flagship models - highest capability
-    Advanced,
-    /// Balanced models - good capability/cost ratio
-    #[default]
-    Balanced,
-    /// Fast models - optimized for speed
-    Fast,
-    /// Image generation models
-    ImageGeneration,
+/// Provider-native hosted tool toggles.
+///
+/// These enable server-side tools the provider executes instead of the
+/// harness. Hosted web search is turned on from the model's abilities;
+/// `web_search` here still gates custom Responses endpoints. Hosted fetch
+/// suppresses the matching `webfetch` terminal command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeToolsConfig {
+    /// Hosted web search (`OpenAI` `web_search`, Claude `web_search`, Gemini
+    /// `google_search`). Only takes effect when the model reports the
+    /// `web_search` ability.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Hosted URL fetch (Claude `web_fetch`, Gemini `url_context`). `OpenAI`
+    /// has no standalone fetch tool, so `webfetch` stays registered there.
+    #[serde(default)]
+    pub web_fetch: bool,
 }
 
-impl ModelTier {
-    /// All tiers for iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::Advanced,
-        Self::Balanced,
-        Self::Fast,
-        Self::ImageGeneration,
-    ];
-
+impl NativeToolsConfig {
+    /// Returns true when no hosted tools are enabled.
     #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "Advanced (Flagship)",
-            Self::Balanced => "Balanced",
-            Self::Fast => "Fast",
-            Self::ImageGeneration => "Image Generation",
-        }
-    }
-
-    #[must_use]
-    pub const fn short_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "advanced",
-            Self::Balanced => "balanced",
-            Self::Fast => "fast",
-            Self::ImageGeneration => "image",
-        }
+    pub const fn is_empty(&self) -> bool {
+        !self.web_search && !self.web_fetch
     }
 }
 
@@ -503,6 +500,13 @@ pub struct ProviderInstance {
     /// API key (not needed for Ollama/Copilot)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Provider-native hosted tool toggles.
+    #[serde(default, skip_serializing_if = "NativeToolsConfig::is_empty")]
+    pub native_tools: NativeToolsConfig,
+    /// Wire API the provider speaks (custom providers only; defaults to
+    /// chat-completions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ProviderApi>,
     /// Base URL override (required for Custom, optional for others)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -512,6 +516,9 @@ pub struct ProviderInstance {
     /// Whether this provider is enabled
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Default cache lifetime of the main conversation on this provider.
+    #[serde(default, skip_serializing_if = "CacheLifetime::is_default")]
+    pub cache_lifetime: CacheLifetime,
 }
 
 const fn default_true() -> bool {
@@ -523,9 +530,12 @@ impl Default for ProviderInstance {
         Self {
             provider_type: None,
             api_key: None,
+            native_tools: NativeToolsConfig::default(),
+            api: None,
             base_url: None,
             display_name: None,
             enabled: true,
+            cache_lifetime: CacheLifetime::default(),
         }
     }
 }
@@ -541,12 +551,14 @@ impl ProviderInstance {
     }
 
     /// Set API key.
+    #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
     /// Set base URL.
+    #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = Some(url.into());
         self
@@ -577,6 +589,33 @@ impl ProviderInstance {
         self.display_name
             .clone()
             .unwrap_or_else(|| self.resolve_type(id).display_name().to_string())
+    }
+
+    /// Check this instance for consistency.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidProviderConfig`] when `api` is set on a
+    /// non-custom provider, or a `custom` provider enables `native_tools`
+    /// without selecting the Responses API.
+    pub fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        let invalid = |reason: String| ConfigError::InvalidProviderConfig {
+            id: id.to_string(),
+            reason,
+        };
+        if self.api.is_some() && self.resolve_type(id) != ProviderType::Custom {
+            return Err(invalid(
+                "api is only supported for custom providers".to_string(),
+            ));
+        }
+        if self.resolve_type(id) == ProviderType::Custom
+            && !self.native_tools.is_empty()
+            && self.api != Some(ProviderApi::Responses)
+        {
+            return Err(invalid(
+                "native_tools requires api = \"responses\" on a custom provider".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Check if this instance is valid/complete.
@@ -644,70 +683,39 @@ impl ProviderInstance {
             return false;
         };
         let normalized_explicit = normalize_base_url(explicit_base_url);
-        provider_type.base_url().map_or(true, |default_url| {
-            normalize_base_url(default_url) != normalized_explicit
-        })
-    }
-}
-
-/// Load balancing strategy for distributing requests across providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadBalanceStrategy {
-    /// Distribute requests evenly across providers (default)
-    #[default]
-    RoundRobin,
-    /// Only use secondary providers when primary fails
-    FailoverOnly,
-    /// Random selection among available providers
-    Random,
-}
-
-impl LoadBalanceStrategy {
-    #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::RoundRobin => "Round Robin (Even Distribution)",
-            Self::FailoverOnly => "Failover Only",
-            Self::Random => "Random",
-        }
+        provider_type
+            .base_url()
+            .is_none_or(|default_url| normalize_base_url(default_url) != normalized_explicit)
     }
 }
 
 /// Model preferences per tier.
 ///
-/// Each tier has a list of models in priority order.
-/// The system tries providers for the first model, then fails over to the next.
+/// Each tier has a list of explicit provider/model selectors in priority order.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelsConfig {
     /// Advanced/flagship models in priority order
     #[serde(default)]
-    pub advanced: Vec<String>,
+    pub advanced: Vec<ModelSelector>,
     /// Balanced models in priority order
     #[serde(default)]
-    pub balanced: Vec<String>,
+    pub balanced: Vec<ModelSelector>,
     /// Fast models in priority order
     #[serde(default)]
-    pub fast: Vec<String>,
+    pub fast: Vec<ModelSelector>,
     /// Image generation models in priority order
     #[serde(default)]
-    pub image_generation: Vec<String>,
-    /// Global embedding model used for semantic search/indexing.
+    pub image_generation: Vec<ModelSelector>,
+    /// Model compaction runs on instead of the session model. Idle
+    /// compaction is off while one is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<String>,
-    /// Optional explicit embedding dimensions for providers that require it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_dimensions: Option<usize>,
-    /// Model to provider mapping (`model_id` -> `provider_id`).
-    /// Populated when models are added via the tier picker.
-    #[serde(default)]
-    pub model_providers: HashMap<String, String>,
+    pub compaction_model: Option<ModelSelector>,
 }
 
 impl ModelsConfig {
     /// Get models for a tier.
     #[must_use]
-    pub fn models_for_tier(&self, tier: ModelTier) -> &[String] {
+    pub fn models_for_tier(&self, tier: ModelTier) -> &[ModelSelector] {
         match tier {
             ModelTier::Advanced => &self.advanced,
             ModelTier::Balanced => &self.balanced,
@@ -717,7 +725,7 @@ impl ModelsConfig {
     }
 
     /// Get mutable models for a tier.
-    pub const fn models_for_tier_mut(&mut self, tier: ModelTier) -> &mut Vec<String> {
+    pub const fn models_for_tier_mut(&mut self, tier: ModelTier) -> &mut Vec<ModelSelector> {
         match tier {
             ModelTier::Advanced => &mut self.advanced,
             ModelTier::Balanced => &mut self.balanced,
@@ -737,69 +745,166 @@ impl ModelsConfig {
 
     /// Check if no models are configured.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         !self.has_any_models()
     }
 
-    /// Add a model to a tier (avoids duplicates).
-    /// Also stores the provider mapping for direct provider lookup during model switching.
+    /// Add a selector to a tier (avoids duplicates).
     pub fn add_model(&mut self, tier: ModelTier, model_id: &str, provider_id: &str) {
+        self.add_selector(tier, ModelSelector::new(provider_id, model_id));
+    }
+
+    /// Add `selector` to `tier` unless already present.
+    pub fn add_selector(&mut self, tier: ModelTier, selector: ModelSelector) {
         let list = self.models_for_tier_mut(tier);
-        if !list.contains(&model_id.to_string()) {
-            list.push(model_id.to_string());
+        if !list.contains(&selector) {
+            list.push(selector);
         }
-        // Store the provider mapping
-        self.model_providers
-            .insert(model_id.to_string(), provider_id.to_string());
-    }
-
-    /// Get the provider ID for a model (if known).
-    #[must_use]
-    pub fn provider_for_model(&self, model_id: &str, strict: bool) -> Option<&str> {
-        if let Some(provider) = self.model_providers.get(model_id) {
-            return Some(provider.as_str());
-        }
-
-        if strict {
-            return None;
-        }
-
-        self.model_providers
-            .iter()
-            .find(|(saved, _)| model_ids_match(saved, model_id, MatchMode::Relaxed))
-            .map(|(_, provider)| provider.as_str())
-    }
-
-    #[must_use]
-    pub fn embedding_model(&self) -> Option<&str> {
-        self.embedding_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// SSH server definition usable as a remote environment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
 pub struct SshServerConfig {
+    /// Server name referenced by profiles.
     pub name: String,
+    /// SSH target (`user@host[:port]`).
     pub target: String,
+    /// The platform the server reported when it was added.
+    pub platform: SshPlatformConfig,
+}
+
+/// The operating system and architecture an SSH server reported, as
+/// `uname -s` and `uname -m` print them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
+pub struct SshPlatformConfig {
+    /// The kernel name (`Linux`, `Darwin`).
+    pub os: String,
+    /// The machine hardware name (`x86_64`, `arm64`).
+    pub arch: String,
+}
+
+impl fmt::Display for SshPlatformConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.os, self.arch)
+    }
+}
+
+impl SshServerConfig {
+    /// A server named `name` at `target`, with the platform it reports.
+    ///
+    /// # Errors
+    /// Fails when the server cannot be reached or does not answer
+    /// `uname -s -m`, so a server that cannot run commands is never saved.
+    pub async fn probe(
+        name: String,
+        target: String,
+    ) -> Result<Self, aither_sandbox::SshProbeError> {
+        let platform = aither_sandbox::probe_ssh_os(&aither_sandbox::SshServer {
+            name: name.clone(),
+            target: target.clone(),
+        })
+        .await?;
+        Ok(Self {
+            name,
+            target,
+            platform: SshPlatformConfig {
+                os: platform.os,
+                arch: platform.arch,
+            },
+        })
+    }
+}
+
+/// An installed ACP agent connected as a subagent type (`/connect`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
+pub struct AcpAgentConfig {
+    /// Program to launch, resolved through `PATH`.
+    pub command: String,
+    /// Arguments to the program.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the agent process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The model every session runs, when the agent advertises models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The session mode every session runs, when the agent advertises modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// What the main agent reads to decide when to delegate to this agent.
+    pub description: String,
+    /// Directories the agent process may read and write besides the
+    /// session's own, where it keeps its state and login (`~/.codex`). A
+    /// leading `~` is the user's home. Its terminal commands do not get them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<String>)]
+    pub grants: Vec<PathBuf>,
+}
+
+impl AcpAgentConfig {
+    /// The grants with a leading `~` expanded against `home`.
+    #[must_use]
+    pub fn grants_in(&self, home: &Path) -> Vec<PathBuf> {
+        self.grants
+            .iter()
+            .map(|grant| {
+                grant
+                    .strip_prefix("~")
+                    .map_or_else(|_| grant.clone(), |rest| home.join(rest))
+            })
+            .collect()
+    }
+}
+
+/// Whether `name` can be the subagent type of a connected ACP agent.
+///
+/// The `subagent` command reads a name containing `/` or ending in `.md` as a
+/// subagent file, and the built-in types own their names, so a connection
+/// under either would never be reachable or would shadow a built-in.
+///
+/// # Errors
+/// Returns [`ConfigError::InvalidAcpAgent`] naming the reason.
+pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
+    let reject = |reason: &str| {
+        Err(ConfigError::InvalidAcpAgent {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        })
+    };
+    match crate::harness::subagent_file::validate_subagent_name(name) {
+        Err(crate::harness::subagent_file::DefinitionError::Reserved(_)) => {
+            return reject("the name belongs to a built-in subagent type");
+        }
+        Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
+        Ok(()) => {}
+    }
+    if crate::bundle::Bundle::subagent_definitions()
+        .iter()
+        .any(|bundled| bundled.name == name)
+    {
+        return reject("the name belongs to a built-in subagent type");
+    }
+    Ok(())
 }
 
 /// Global preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
-    /// Load balancing strategy
-    #[serde(default)]
-    pub load_balance_strategy: LoadBalanceStrategy,
     /// Warn user when changing model mid-conversation
     #[serde(default = "default_true")]
     pub warn_on_model_change: bool,
     /// Show token/context usage in chat UI.
     #[serde(default = "default_true")]
     pub show_token_usage: bool,
-    /// Strict model matching (no relaxed fallback aliases).
-    #[serde(default)]
-    pub strict_model_matching: bool,
+    /// Show real-time decode speed (tok/s) while responses stream.
+    #[serde(default = "default_true")]
+    pub show_decode_speed: bool,
+    /// Park a turn on an upstream quota or rate limit and resume it at the
+    /// reset instant the provider announces.
+    #[serde(default = "default_true")]
+    pub auto_continue_on_quota_reset: bool,
     /// Global network restriction settings.
     #[serde(default)]
     pub network_policy: NetworkPolicyConfig,
@@ -808,10 +913,10 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            load_balance_strategy: LoadBalanceStrategy::RoundRobin,
             warn_on_model_change: true,
             show_token_usage: true,
-            strict_model_matching: false,
+            show_decode_speed: true,
+            auto_continue_on_quota_reset: true,
             network_policy: NetworkPolicyConfig::default(),
         }
     }
@@ -820,8 +925,10 @@ impl Default for Preferences {
 /// UI appearance preferences persisted in config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Appearance {
+    /// UI font family.
     #[serde(default = "default_ui_font")]
     pub font: String,
+    /// UI theme name.
     #[serde(default = "default_ui_theme")]
     pub theme: String,
 }
@@ -849,20 +956,19 @@ fn default_ui_theme() -> String {
 /// manages. The runtime may be provisioned locally by May or exposed through a
 /// remote CDP endpoint. Agents use the May-managed `browser` command and must
 /// not install or manage browser binaries themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserBackendKind {
+    /// May runs and manages the browser process.
+    #[default]
     Managed,
+    /// Connect to an external Chrome `DevTools` Protocol endpoint.
     RemoteCdp,
 }
 
-impl Default for BrowserBackendKind {
-    fn default() -> Self {
-        Self::Managed
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Settings for the browser automation runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserConfig {
     /// Whether browser automation is enabled.
     #[serde(default)]
@@ -876,24 +982,90 @@ pub struct BrowserConfig {
     /// CDP endpoint for a remotely managed browser runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cdp_endpoint: Option<String>,
-    /// JPEG quality for screencast frames (1-100). Lower = less bandwidth.
-    #[serde(default = "default_screencast_quality")]
-    pub screencast_quality: u32,
+    /// JPEG quality for raw screencast frames (1-100). Trades CPU for
+    /// fidelity at the *first* lossy stage of the pipeline.
+    #[serde(default = "default_screencast_jpeg_quality")]
+    pub screencast_jpeg_quality: u32,
+    /// Initial H.264 target bitrate in kilobits per second. The encoder
+    /// thread starts here; the adaptive ABR loop may lower it on RTCP
+    /// REMB drops and ramp back up on recovery.
+    #[serde(default = "default_encoder_initial_bitrate_kbps")]
+    pub encoder_initial_bitrate_kbps: u32,
     /// Max width for screencast frames in pixels. Lower = less bandwidth.
+    /// Updated by the viewport-resize command when the panel is resized.
     #[serde(default = "default_screencast_max_width")]
     pub screencast_max_width: u32,
+    /// Max height for screencast frames in pixels. Independent of width
+    /// so the screencast can match the rendered viewport instead of being
+    /// clipped to a hardcoded aspect ratio.
+    #[serde(default = "default_screencast_max_height")]
+    pub screencast_max_height: u32,
+    /// Encode every Nth screencast frame. 1 = every frame (max fps).
+    /// 2 caps to ~15 fps which is plenty for screen content and halves
+    /// outbound bitrate for free.
+    #[serde(default = "default_every_nth_frame")]
+    pub every_nth_frame: u32,
+    /// Disable common automation fingerprints surfaced to target sites:
+    /// the `AutomationControlled` blink feature, navigator.webdriver,
+    /// chrome.runtime stub, plugin/language emptiness, and WebGL
+    /// vendor/renderer overrides. Default on; turn off to debug a site
+    /// that misbehaves under the stealth shim.
+    #[serde(default = "default_stealth_enabled")]
+    pub stealth_enabled: bool,
+    /// Optional source for seeding the managed browser's profile from a
+    /// real system Chrome profile. The first time the managed profile
+    /// directory is empty, May copies from this path so cookies and
+    /// logged-in state carry over; subsequent runs use the may-managed
+    /// copy and never touch the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_profile: Option<SystemProfileConfig>,
+}
+
+/// Existing Chromium profile seeded into the managed browser on first launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemProfileConfig {
+    /// Absolute path to a Chromium-family user-data-dir/profile-dir to
+    /// seed from on first launch.
+    pub path: PathBuf,
+    /// When true (default) the source profile is copied into May's home
+    /// dir and never written to again. Setting this to false lets May
+    /// use the source profile in-place — only safe when no other
+    /// browser instance is running against it.
+    #[serde(default = "default_system_profile_copy")]
+    pub copy_on_first_use: bool,
+}
+
+const fn default_system_profile_copy() -> bool {
+    true
 }
 
 const fn default_browser_port() -> u16 {
     39222
 }
 
-const fn default_screencast_quality() -> u32 {
-    60
+const fn default_screencast_jpeg_quality() -> u32 {
+    80
+}
+
+const fn default_encoder_initial_bitrate_kbps() -> u32 {
+    4000
 }
 
 const fn default_screencast_max_width() -> u32 {
-    1280
+    1920
+}
+
+const fn default_screencast_max_height() -> u32 {
+    1200
+}
+
+const fn default_every_nth_frame() -> u32 {
+    2
+}
+
+const fn default_stealth_enabled() -> bool {
+    true
 }
 
 impl Default for BrowserConfig {
@@ -903,13 +1075,22 @@ impl Default for BrowserConfig {
             backend: BrowserBackendKind::Managed,
             port: default_browser_port(),
             remote_cdp_endpoint: None,
-            screencast_quality: default_screencast_quality(),
+            screencast_jpeg_quality: default_screencast_jpeg_quality(),
+            encoder_initial_bitrate_kbps: default_encoder_initial_bitrate_kbps(),
             screencast_max_width: default_screencast_max_width(),
+            screencast_max_height: default_screencast_max_height(),
+            every_nth_frame: default_every_nth_frame(),
+            stealth_enabled: default_stealth_enabled(),
+            system_profile: None,
         }
     }
 }
 
 impl BrowserConfig {
+    /// Check the browser config for consistency.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidBrowserConfig`] when `remote_cdp` is selected without a `remote_cdp_endpoint`, or any value is out of range.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.backend == BrowserBackendKind::RemoteCdp
             && self
@@ -925,11 +1106,16 @@ impl BrowserConfig {
         Ok(())
     }
 
+    /// Whether this backend requires May to run the browser process.
     #[must_use]
     pub const fn requires_managed_runtime(&self) -> bool {
         matches!(self.backend, BrowserBackendKind::Managed)
     }
 
+    /// The configured remote CDP endpoint.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidBrowserConfig`] when the endpoint is missing or blank.
     pub fn remote_cdp_endpoint(&self) -> Result<&str, ConfigError> {
         self.remote_cdp_endpoint
             .as_deref()
@@ -944,39 +1130,170 @@ impl BrowserConfig {
     }
 }
 
-/// Cloudflare-based remote access configuration for the May UI server.
+/// `tailscale` command run when no other binary is configured.
+pub const DEFAULT_TAILSCALE_BINARY: &str = "tailscale";
+
+/// Remote access to the May daemon over Tailscale: `tailscale serve` exposes
+/// the daemon's loopback listener on the tailnet over HTTPS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteAccessConfig {
-    /// Whether the server should keep remote access enabled.
+    /// Whether the daemon keeps remote access enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Cloudflared executable path or command name.
-    #[serde(default = "default_cloudflared_binary")]
-    pub cloudflared_binary: String,
-    /// Remotely managed Cloudflare tunnel token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tunnel_token: Option<String>,
-    /// Public HTTPS URL routed to this server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_url: Option<String>,
+    /// Tailscale CLI path or command name.
+    #[serde(default = "default_tailscale_binary")]
+    pub tailscale_binary: String,
+    /// Tailnet HTTPS port the daemon is served on.
+    #[serde(default = "default_tailscale_https_port")]
+    pub https_port: u16,
     /// Whether local-environment profiles may be exposed remotely.
     #[serde(default)]
     pub allow_local_environment: bool,
+    /// Tailscale logins allowed to use remote access besides the login that
+    /// owns this node, which is always accepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_logins: Vec<String>,
+    /// Whether Tailscale Funnel exposes the webhook routes
+    /// (`/api/tasks/webhook/*`, and nothing else) to the internet.
+    #[serde(default)]
+    pub funnel: bool,
+    /// Funnel HTTPS port: 443, 8443 or 10000. It must differ from
+    /// `https_port` while remote access is enabled, because Funnel exposes
+    /// its whole port.
+    #[serde(default = "default_tailscale_https_port")]
+    pub funnel_port: u16,
+    /// Largest webhook delivery body, in bytes, accepted on any listener;
+    /// a larger delivery is refused with 413 before it is buffered.
+    #[serde(default = "default_webhook_max_body_bytes")]
+    pub webhook_max_body_bytes: u64,
 }
 
-fn default_cloudflared_binary() -> String {
-    "cloudflared".to_string()
+/// Default for `[remote_access] webhook_max_body_bytes`: 25 MiB, which holds
+/// the largest payload GitHub delivers (it caps webhook payloads at 25 MB).
+#[must_use]
+pub const fn default_webhook_max_body_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+fn default_tailscale_binary() -> String {
+    DEFAULT_TAILSCALE_BINARY.to_string()
+}
+
+const fn default_tailscale_https_port() -> u16 {
+    443
 }
 
 impl Default for RemoteAccessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            cloudflared_binary: default_cloudflared_binary(),
-            tunnel_token: None,
-            public_url: None,
+            tailscale_binary: default_tailscale_binary(),
+            https_port: default_tailscale_https_port(),
+            allowed_logins: Vec::new(),
             allow_local_environment: false,
+            funnel: false,
+            funnel_port: default_tailscale_https_port(),
+            webhook_max_body_bytes: default_webhook_max_body_bytes(),
         }
+    }
+}
+
+/// Scheduling priority applied to every command May runs.
+///
+/// Relative to the host: `Low` and `Lowest` yield CPU and disk bandwidth to
+/// interactive work instead of capping it. SSH commands are unaffected — the
+/// remote host owns its own scheduling.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandPriority {
+    /// Run at the host's own CPU and I/O priority.
+    #[default]
+    Normal,
+    /// Yield under contention: `nice 10`, utility I/O.
+    Low,
+    /// Yield most strongly under contention: `nice 19`, background I/O.
+    Lowest,
+}
+
+impl CommandPriority {
+    /// Maps the configured level onto the sandbox process priority.
+    ///
+    /// # Panics
+    /// Panics only if the compiled-in nice-level constants were somehow invalid (they are fixed at 10/19).
+    #[must_use]
+    pub fn process_priority(self) -> aither_sandbox::ProcessPriority {
+        match self {
+            Self::Normal => aither_sandbox::ProcessPriority::default(),
+            Self::Low => aither_sandbox::ProcessPriority::new(
+                aither_sandbox::CpuPriority::Nice(
+                    aither_sandbox::NiceLevel::new(10).expect("configured nice level is valid"),
+                ),
+                aither_sandbox::IoPriority::Utility,
+            ),
+            Self::Lowest => aither_sandbox::ProcessPriority::new(
+                aither_sandbox::CpuPriority::Nice(
+                    aither_sandbox::NiceLevel::new(19).expect("configured nice level is valid"),
+                ),
+                aither_sandbox::IoPriority::Background,
+            ),
+        }
+    }
+}
+
+/// Which video codec the browser and desktop streams offer viewers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamCodec {
+    /// Hardware H.264 where the host has an encoder, software AV1 otherwise.
+    #[default]
+    Auto,
+    /// Hardware H.264 only; a host without an encoder fails the stream.
+    H264,
+    /// Software AV1 only, even where hardware H.264 exists.
+    Av1,
+}
+
+/// Settings shared by the browser and desktop streams.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamConfig {
+    /// Codec the streams encode and negotiate.
+    #[serde(default)]
+    pub codec: StreamCodec,
+}
+
+/// `[computer]` section: the macOS desktop helper (`MayComputerAgent.app`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerConfig {
+    /// `codesign` identity (SHA-1 hash or name, e.g. an Apple Development
+    /// certificate) that signs the helper bundle. macOS only credits an
+    /// Accessibility grant to a bundle whose designated requirement is an
+    /// identifier plus certificate, and keeps the grant across rebuilds
+    /// only when the certificate stays the same. Unset signs ad hoc, which
+    /// leaves the requirement a bare cdhash. Changing it re-signs the
+    /// bundle and restarts a running helper on the next request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_identity: Option<String>,
+}
+
+/// Local and container command sandboxing settings.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Priority commands run at.
+    #[serde(default)]
+    pub command_priority: CommandPriority,
+    /// Jobserver tokens shared by every terminal on the machine; unset uses
+    /// the host's available parallelism. A change applies to the running
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_pool_size: Option<std::num::NonZeroUsize>,
+}
+
+impl SandboxConfig {
+    /// The size of the machine-wide jobserver pool.
+    #[must_use]
+    pub fn job_pool_size(&self) -> std::num::NonZeroUsize {
+        self.job_pool_size
+            .unwrap_or_else(crate::jobserver::default_pool_size)
     }
 }
 
@@ -988,6 +1305,9 @@ pub struct MayConfig {
     /// `0` means unlimited.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    /// Local and container command sandboxing settings.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     /// Configured provider instances, keyed by ID.
     /// Example: `[provider.anthropic]`, `[provider.my-ollama]`
     #[serde(default)]
@@ -1004,15 +1324,683 @@ pub struct MayConfig {
     /// Managed browser automation settings.
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Settings shared by the browser and desktop streams.
+    #[serde(default)]
+    pub stream: StreamConfig,
+    /// macOS desktop helper settings.
+    #[serde(default)]
+    pub computer: ComputerConfig,
     /// Remote access settings.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
+    /// Daemon listener settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+    /// Prompt suggestion settings.
+    #[serde(default)]
+    pub suggestions: SuggestionsConfig,
+    /// `/sleep` settings.
+    #[serde(default)]
+    pub sleep: SleepConfig,
+    /// Recap settings.
+    #[serde(default)]
+    pub recap: RecapConfig,
+    /// CI duration thresholds.
+    #[serde(default)]
+    pub ci: CiConfig,
+    /// Session list settings.
+    #[serde(default)]
+    pub sessions: SessionsConfig,
+    /// Communication and working languages.
+    #[serde(default)]
+    pub language: LanguageConfig,
+    /// Context compaction thresholds.
+    #[serde(default)]
+    pub context: ContextConfig,
+    /// The user's timezone.
+    #[serde(default)]
+    pub time: TimeConfig,
+    /// When host memory pressure and machine load count as high.
+    #[serde(default)]
+    pub host_load: HostLoadSettings,
+    /// When free disk space counts as low.
+    #[serde(default)]
+    pub disk: DiskSettings,
+    /// How long an agent's `tasks.md` may grow.
+    #[serde(default)]
+    pub tasks: TasksSettings,
+    /// When the repeated calls of a turn count as a loop.
+    #[serde(default)]
+    pub loop_detection: LoopDetectionSettings,
+    /// The shell's time bounds and output budgets.
+    #[serde(default)]
+    pub shell: ShellSettings,
+    /// How long `/connect` waits on a candidate ACP agent.
+    #[serde(default)]
+    pub acp: AcpSettings,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_model: Option<String>,
+    pub last_model: Option<ModelSelector>,
+    /// Last reasoning effort selected via /effort (the effective effort of
+    /// sessions that never chose one; medium before the first selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_effort: Option<String>,
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
+    /// Connected ACP agents, keyed by the subagent type name they register.
+    /// Example: `[acp_agents.devin]`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub acp_agents: BTreeMap<String, AcpAgentConfig>,
+    /// When the agent's issues, pull requests and comments need approval.
+    #[serde(default)]
+    pub issue_approval: IssueApprovalConfig,
+}
+
+/// What publishing one kind of text asks of the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// No prompt.
+    None,
+    /// A prompt that is approved when nobody answers it.
+    Auto,
+    /// A prompt that needs an explicit approval; unanswered, it is denied.
+    Required,
+}
+
+/// `[issue_approval]` section: the approval each kind of publishing needs.
+///
+/// An issue on an external repository (one the user neither owns nor has
+/// admin permission on) is held to the stricter of `external_issue` and its
+/// kind's entry. Anything on an owned repository, and a comment on an issue
+/// or pull request the user or the agent opened, is approved without a
+/// prompt and has no entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IssueApprovalConfig {
+    /// Creating an issue on an external repository.
+    pub external_issue: ApprovalPolicy,
+    /// Opening a pull request on an external repository.
+    pub external_pull_request: ApprovalPolicy,
+    /// Commenting on an external repository.
+    pub external_comment: ApprovalPolicy,
+    /// A bug issue.
+    pub bug: ApprovalPolicy,
+    /// A feature issue.
+    pub feature: ApprovalPolicy,
+    /// A performance issue.
+    pub performance: ApprovalPolicy,
+}
+
+impl Default for IssueApprovalConfig {
+    fn default() -> Self {
+        Self {
+            external_issue: ApprovalPolicy::Required,
+            external_pull_request: ApprovalPolicy::Required,
+            external_comment: ApprovalPolicy::Required,
+            bug: ApprovalPolicy::None,
+            feature: ApprovalPolicy::Auto,
+            performance: ApprovalPolicy::None,
+        }
+    }
+}
+
+/// `[suggestions]` section: the generated next-prompt ghost text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SuggestionsConfig {
+    /// Whether a completed turn schedules a suggested next prompt.
+    pub enabled: bool,
+}
+
+impl Default for SuggestionsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `[sleep]` section: the health reminder around `/sleep`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SleepConfig {
+    /// Whether May suggests running `/sleep` at the user's median `/sleep`
+    /// time of day.
+    pub reminder: bool,
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        Self { reminder: true }
+    }
+}
+
+/// `[recap]` section: the catch-up card an idle session receives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecapConfig {
+    /// Whether an idle session that outgrew its last recap gets a new one.
+    pub auto: bool,
+    /// Minutes of inactivity before an auto recap is generated.
+    pub idle_minutes: u64,
+}
+
+impl Default for RecapConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            idle_minutes: 30,
+        }
+    }
+}
+
+/// `[ci]` section: when a CI job counts as abnormally long. Read when a PR's
+/// checks finish, so a change applies to the next run without a restart.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CiConfig {
+    /// Minutes after which any job is abnormally long: the point where a
+    /// waiting agent's prompt cache goes cold.
+    pub max_job_minutes: u64,
+    /// A job is abnormally long when it runs past this multiple of its
+    /// baseline, the median of its last successful runs on the base branch.
+    pub baseline_multiple: f64,
+    /// Seconds between two reads of the checks of each in-flight GitHub PR
+    /// (the alerts and the sidebars' per-check view). Read on every tick.
+    pub pr_poll_seconds: u64,
+}
+
+impl CiConfig {
+    /// Check both thresholds can be exceeded.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidCiConfig`] when the limit is zero or the
+    /// multiple is not a finite number above 1.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_job_minutes == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.max_job_minutes must be above 0".to_string(),
+            ));
+        }
+        if !self.baseline_multiple.is_finite() || self.baseline_multiple <= 1.0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.baseline_multiple must be a number above 1".to_string(),
+            ));
+        }
+        if self.pr_poll_seconds == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.pr_poll_seconds must be above 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CiConfig {
+    fn default() -> Self {
+        Self {
+            max_job_minutes: 40,
+            baseline_multiple: 2.0,
+            pr_poll_seconds: 60,
+        }
+    }
+}
+
+/// `[sessions]` section: which sessions the session lists show.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Hours a session stays listed after it went idle; an idle, unpinned
+    /// session older than this is archived.
+    pub recent_hours: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self { recent_hours: 48 }
+    }
+}
+
+/// A language named in `config.toml`: an English name (`Chinese`), a native
+/// name or an ISO 639-3 code, rejected at load when unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ConfiguredLanguage(pub crate::harness::language::Language);
+
+impl TryFrom<String> for ConfiguredLanguage {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, String> {
+        name.parse::<crate::harness::language::Language>()
+            .map(Self)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl From<ConfiguredLanguage> for String {
+    fn from(language: ConfiguredLanguage) -> Self {
+        language.0.name().to_string()
+    }
+}
+
+/// `[language]` section: what the agent talks to the user in, and what it
+/// writes in for others to read (issue and PR text, messages to other agents).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LanguageConfig {
+    /// The language replies, questions and recaps are written in; unset
+    /// leaves the agent to follow the user's own messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub communication: Option<ConfiguredLanguage>,
+    /// The language written for others; English when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working: Option<ConfiguredLanguage>,
+}
+
+impl LanguageConfig {
+    /// The languages the session's agent is held to.
+    #[must_use]
+    pub fn languages(&self) -> crate::harness::language::Languages {
+        let languages = self
+            .communication
+            .map_or_else(crate::harness::language::Languages::unset, |language| {
+                crate::harness::language::Languages::new(language.0)
+            });
+        self.working
+            .map_or(languages, |working| languages.with_working(working.0))
+    }
+}
+
+/// `[context]` section: when a session's conversation is compacted.
+///
+/// The pause point is `min(window - handoff_reserve, compact_ceiling)`
+/// tokens; the distances are token counts before it. aither applies them, and
+/// a change reaches running sessions at their next turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Tokens kept free below the window for the compaction request and the
+    /// handoff the model writes; it does not grow with the window.
+    pub handoff_reserve: usize,
+    /// Most tokens the conversation may hold before it is compacted,
+    /// whatever the window.
+    pub compact_ceiling: usize,
+    /// Tokens before the pause point at which compaction starts in the
+    /// background while the run keeps streaming.
+    pub start_distance: usize,
+    /// Tokens before the pause point at which the agent is told once to save
+    /// its work and call `compact` itself.
+    pub warn_distance: usize,
+    /// Tokens before the warn point from which a model that counts through a
+    /// provider endpoint is asked for an exact count.
+    pub count_distance: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        let policy = aither_agent::ContextPolicy::default();
+        Self {
+            handoff_reserve: policy.handoff_reserve,
+            compact_ceiling: policy.compact_ceiling,
+            start_distance: policy.start_distance,
+            warn_distance: policy.warn_distance,
+            count_distance: policy.count_distance,
+        }
+    }
+}
+
+impl ContextConfig {
+    /// The aither policy these thresholds configure; every other threshold
+    /// keeps aither's default.
+    #[must_use]
+    pub fn policy(&self) -> aither_agent::ContextPolicy {
+        aither_agent::ContextPolicy {
+            handoff_reserve: self.handoff_reserve,
+            compact_ceiling: self.compact_ceiling,
+            start_distance: self.start_distance,
+            warn_distance: self.warn_distance,
+            count_distance: self.count_distance,
+            ..aither_agent::ContextPolicy::default()
+        }
+    }
+}
+
+/// `[time]` section: the timezone the agent talks to the user in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TimeConfig {
+    /// IANA name of the user's timezone (`"Asia/Shanghai"`); unset follows
+    /// the host's system timezone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<TimeZoneName>,
+}
+
+impl TimeConfig {
+    /// The user's timezone: the configured one, else the host's.
+    #[must_use]
+    pub fn user_timezone(&self) -> TimeZoneName {
+        self.timezone.clone().unwrap_or_else(TimeZoneName::system)
+    }
+}
+
+/// The name of a timezone the agent states to the model: an IANA name, or a
+/// UTC offset for a host whose system timezone has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct TimeZoneName(String);
+
+/// A configured timezone that is not in the timezone database.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown timezone '{name}': expected an IANA name such as 'Asia/Shanghai'")]
+pub struct TimeZoneNameError {
+    name: String,
+}
+
+impl TimeZoneName {
+    /// The host's system timezone.
+    #[must_use]
+    pub fn system() -> Self {
+        let zone = jiff::tz::TimeZone::system();
+        Self(zone.iana_name().map_or_else(
+            || format!("UTC{}", zone.to_offset(jiff::Timestamp::now())),
+            str::to_string,
+        ))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for TimeZoneName {
+    type Err = TimeZoneNameError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let name = name.trim();
+        jiff::tz::TimeZone::get(name)
+            .map(|_| Self(name.to_string()))
+            .map_err(|_| TimeZoneNameError {
+                name: name.to_string(),
+            })
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeZoneName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for TimeZoneName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `[acp]` section: the bounds `/connect` puts on a candidate ACP agent.
+/// Durations are written as `"30s"`, `"1m"`. A change applies to the next
+/// `/connect`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AcpSettings {
+    /// How long the trial session's handshake (`initialize`, `session/new`,
+    /// the mode and model) may take before the agent is killed and the
+    /// connection refused.
+    #[serde(with = "duration_text")]
+    pub trial_limit: Duration,
+}
+
+impl Default for AcpSettings {
+    fn default() -> Self {
+        Self {
+            trial_limit: Duration::from_secs(60),
+        }
+    }
+}
+
+/// `[host_load]` section: when the session agent is told the host is under
+/// high load.
+///
+/// The terminal's foreground window grows meanwhile. Memory pressure is not
+/// configured here: aither's memory guard warns on the platform's own
+/// pressure levels. Durations are written as `"30s"`, `"1m"`.
+///
+/// A change reaches a running session at its next turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HostLoadSettings {
+    /// Machine load at or above which the host counts as loaded: on macOS
+    /// the load average per core, on Linux the share of the last ten
+    /// seconds runnable tasks waited for a CPU.
+    pub load_threshold: f64,
+    /// How long a condition must hold before the agent is told it started.
+    #[serde(with = "duration_text")]
+    pub start_after: Duration,
+    /// How long a condition must be gone before the agent is told it ended.
+    #[serde(with = "duration_text")]
+    pub end_after: Duration,
+    /// How often the host is read.
+    #[serde(with = "duration_text")]
+    pub poll_interval: Duration,
+    /// The terminal's foreground window while high load lasts.
+    #[serde(with = "duration_text")]
+    pub high_load_foreground_wait: Duration,
+}
+
+impl Default for HostLoadSettings {
+    fn default() -> Self {
+        let defaults = crate::harness::host_load::HostLoadConfig::new();
+        Self {
+            load_threshold: defaults.load_threshold.0,
+            start_after: defaults.start_after,
+            end_after: defaults.end_after,
+            poll_interval: defaults.poll_interval,
+            high_load_foreground_wait: defaults.high_load_foreground_wait,
+        }
+    }
+}
+
+impl HostLoadSettings {
+    /// The aither monitor configuration these settings describe.
+    #[must_use]
+    pub const fn monitor_config(&self) -> crate::harness::host_load::HostLoadConfig {
+        crate::harness::host_load::HostLoadConfig::new()
+            .load_threshold(crate::harness::host_load::MachineLoad(self.load_threshold))
+            .start_after(self.start_after)
+            .end_after(self.end_after)
+            .poll_interval(self.poll_interval)
+            .high_load_foreground_wait(self.high_load_foreground_wait)
+    }
+}
+
+/// `[disk]` section: how little free space the home environment's volume may
+/// have before the agent is told, in bytes.
+///
+/// The defaults are aither's: yellow below 10 GiB free, red below 5 GiB and
+/// final below 3 GiB. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiskSettings {
+    /// Free bytes below which the disk is at the yellow level.
+    pub yellow_free_bytes: u64,
+    /// Free bytes below which the disk is at the red level.
+    pub red_free_bytes: u64,
+    /// Free bytes below which the disk is at the final level.
+    pub final_free_bytes: u64,
+}
+
+impl DiskSettings {
+    const GIB: u64 = 1024 * 1024 * 1024;
+}
+
+impl Default for DiskSettings {
+    fn default() -> Self {
+        Self {
+            yellow_free_bytes: 10 * Self::GIB,
+            red_free_bytes: 5 * Self::GIB,
+            final_free_bytes: 3 * Self::GIB,
+        }
+    }
+}
+
+/// `[tasks]` section: the `tasks.md` every agent keeps, a subagent's in its
+/// own space. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TasksSettings {
+    /// Lines `tasks.md` may hold before the agent is asked to rewrite it.
+    pub line_limit: usize,
+}
+
+impl Default for TasksSettings {
+    fn default() -> Self {
+        Self {
+            line_limit: crate::tasks_md::schema::DEFAULT_LINE_LIMIT,
+        }
+    }
+}
+
+/// `[loop_detection]` section: when a turn's tool calls count as a loop.
+///
+/// Each value is a number of repetitions in a row: at the alert threshold the
+/// agent is told once, at the end threshold the turn ends and the user is told
+/// why. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LoopDetectionSettings {
+    /// Repetitions of one group of calls (same tools, same arguments) at
+    /// which the agent is alerted.
+    pub cycle_alert: usize,
+    /// Repetitions of one group of calls at which the turn ends.
+    pub cycle_end: usize,
+    /// Calls in a row failing with the same error at which the agent is
+    /// alerted.
+    pub failure_alert: usize,
+    /// Calls in a row failing with the same error at which the turn ends.
+    pub failure_end: usize,
+}
+
+impl Default for LoopDetectionSettings {
+    fn default() -> Self {
+        Self {
+            // Gemini CLI's loop detection service alerts at 5 identical
+            // calls in a row (`TOOL_CALL_LOOP_THRESHOLD`).
+            cycle_alert: 5,
+            // Twice the alert: after the alert the agent gets as many calls
+            // again as it took to raise it, while one that heeds the alert
+            // breaks the cycle with its next call.
+            cycle_end: 10,
+            // The cycle's value: a run of identical failures is at least as
+            // strong a sign of a loop as a run of identical calls, so it is
+            // raised no later.
+            failure_alert: 5,
+            // Twice the alert, as for the cycle.
+            failure_end: 10,
+        }
+    }
+}
+
+/// `[shell]` section: how long a script may run and how much of its output
+/// reaches the model. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ShellSettings {
+    /// How long a `terminal` call waits before its script becomes a
+    /// background task.
+    #[serde(with = "duration_text")]
+    pub foreground_wait: Duration,
+    /// The longest `timeout` a script may ask for.
+    #[serde(with = "duration_text")]
+    pub timeout_cap: Duration,
+    /// How long a background task runs before the agent is told it is
+    /// still running.
+    #[serde(with = "duration_text")]
+    pub long_job_alert: Duration,
+    /// The longest a `monitor` may run.
+    #[serde(with = "duration_text")]
+    pub monitor_max_timeout: Duration,
+    /// Seconds between a `monitor`'s deliveries when its call states none.
+    #[serde(with = "duration_text")]
+    pub monitor_default_interval: Duration,
+    /// How long the agent has to act on a final memory warning.
+    #[serde(with = "duration_text")]
+    pub response_window: Duration,
+    /// Bytes a subagent's sandbox may send while its commits are imported.
+    pub subagent_import_bytes: u64,
+    /// Output bytes returned inline before the rest is saved to a file.
+    pub inline_output_bytes: usize,
+    /// Bytes of a saved output kept as its preview.
+    pub preview_bytes: usize,
+    /// Output lines returned inline when a call states no `max_lines`.
+    pub default_lines: u32,
+    /// The most output lines a call may ask for.
+    pub ceiling_lines: u32,
+    /// Bytes a `terminal_read` returns when its call states no `max_bytes`.
+    pub read_bytes: usize,
+    /// Pixels of the longer side of media delivered at `low` resolution.
+    pub media_low: u32,
+    /// Pixels of the longer side of media delivered at `medium` resolution.
+    pub media_medium: u32,
+    /// Pixels of the longer side of media delivered at `high` resolution.
+    pub media_high: u32,
+    /// Characters of a job's script shown in the job list.
+    pub job_preview_bytes: usize,
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            foreground_wait: Duration::from_secs(10),
+            timeout_cap: Duration::from_mins(120),
+            long_job_alert: Duration::from_mins(40),
+            monitor_max_timeout: Duration::from_secs(7200),
+            monitor_default_interval: Duration::from_secs(10),
+            response_window: Duration::from_secs(120),
+            subagent_import_bytes: 1024 * 1024 * 1024,
+            inline_output_bytes: 16_000,
+            preview_bytes: 16_000,
+            default_lines: 200,
+            ceiling_lines: 800,
+            read_bytes: 32 * 1024,
+            media_low: 512,
+            media_medium: 1024,
+            media_high: 2048,
+            job_preview_bytes: 50,
+        }
+    }
+}
+
+/// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
+mod duration_text {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&humantime::format_duration(*value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        humantime::parse_duration(text.trim()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Where the May daemon listens besides its unix socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DaemonConfig {
+    /// TCP port on `127.0.0.1` for the web UI and API; `None` uses 8787.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Further TCP addresses to serve on, such as a tailnet address
+    /// (`"100.101.102.103:8787"`). A loopback address serves the local
+    /// routes; on any other address each peer must be identified through
+    /// tailscaled's `WhoIs` or its request is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<std::net::SocketAddr>,
 }
 
 const fn default_max_iterations() -> usize {
@@ -1023,42 +2011,90 @@ impl Default for MayConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
+            sandbox: SandboxConfig::default(),
             provider: HashMap::new(),
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
             appearance: Appearance::default(),
             browser: BrowserConfig::default(),
+            stream: StreamConfig::default(),
+            computer: ComputerConfig::default(),
             remote_access: RemoteAccessConfig::default(),
+            daemon: DaemonConfig::default(),
+            suggestions: SuggestionsConfig::default(),
+            sleep: SleepConfig::default(),
+            recap: RecapConfig::default(),
+            ci: CiConfig::default(),
+            sessions: SessionsConfig::default(),
+            language: LanguageConfig::default(),
+            context: ContextConfig::default(),
+            time: TimeConfig::default(),
+            host_load: HostLoadSettings::default(),
+            disk: DiskSettings::default(),
+            tasks: TasksSettings::default(),
+            loop_detection: LoopDetectionSettings::default(),
+            shell: ShellSettings::default(),
+            acp: AcpSettings::default(),
             last_model: None,
+            last_effort: None,
             ssh_servers: Vec::new(),
+            acp_agents: BTreeMap::new(),
+            issue_approval: IssueApprovalConfig::default(),
         }
     }
 }
 
 impl MayConfig {
     /// Get the May directory path (~/.may/).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined.
     pub fn may_dir() -> Result<PathBuf, ConfigError> {
-        dirs::home_dir()
-            .map(|h| h.join(".may"))
-            .ok_or(ConfigError::NoHomeDir)
+        Ok(Self::home_dir()?.join(".may"))
+    }
+
+    /// The user's home directory with every symlink resolved.
+    ///
+    /// The sandbox grants only real paths and never follows an ungranted
+    /// link, so every path May renders or hands to a command derives from
+    /// this one spelling.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined or it
+    /// does not resolve.
+    pub fn home_dir() -> Result<PathBuf, ConfigError> {
+        Self::resolve_home(dirs::home_dir().ok_or(ConfigError::NoHomeDir)?)
+    }
+
+    /// `home` with every symlink resolved.
+    pub(crate) fn resolve_home(home: PathBuf) -> Result<PathBuf, ConfigError> {
+        dunce::canonicalize(&home).map_err(|source| ConfigError::HomeUnresolvable { home, source })
     }
 
     /// Get the config file path (~/.may/config.toml).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined.
     pub fn config_path() -> Result<PathBuf, ConfigError> {
         Ok(Self::may_dir()?.join("config.toml"))
     }
 
     /// Load configuration from ~/.may/config.toml or use defaults.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when the file exists but cannot be read or parsed.
     pub async fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
         Self::load_from(&path).await
     }
 
     /// Load configuration from a specific path.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when the file exists but cannot be read or parsed.
     pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match async_fs::read_to_string(path).await {
             Ok(content) => {
-                reject_legacy_config_sections(&content)?;
                 let config: Self = toml::from_str(&content)?;
                 config.validate()?;
                 Ok(config)
@@ -1069,12 +2105,18 @@ impl MayConfig {
     }
 
     /// Save configuration to ~/.may/config.toml.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when serialization or the filesystem write fails.
     pub async fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
         self.save_to(&path).await
     }
 
     /// Save configuration to a specific path.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when serialization or the filesystem write fails.
     pub async fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
         if let Some(parent) = path.parent() {
@@ -1085,8 +2127,41 @@ impl MayConfig {
         Ok(())
     }
 
+    /// Check the whole config for consistency.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when any section contains an invalid value.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.browser.validate()
+        self.browser.validate()?;
+        self.ci.validate()?;
+        for (id, instance) in &self.provider {
+            instance.validate(id)?;
+        }
+        for name in self.acp_agents.keys() {
+            check_acp_agent_name(name)?;
+        }
+        Ok(())
+    }
+
+    /// Connect an ACP agent as a subagent type, replacing the connection
+    /// already under `name`.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidAcpAgent`] when `name` cannot be a
+    /// subagent type name; nothing is changed then.
+    pub fn connect_acp_agent(
+        &mut self,
+        name: String,
+        agent: AcpAgentConfig,
+    ) -> Result<(), ConfigError> {
+        check_acp_agent_name(&name)?;
+        self.acp_agents.insert(name, agent);
+        Ok(())
+    }
+
+    /// Disconnect the ACP agent under `name`. Returns true if it was connected.
+    pub fn disconnect_acp_agent(&mut self, name: &str) -> bool {
+        self.acp_agents.remove(name).is_some()
     }
 
     /// Check if configuration is complete enough to use.
@@ -1115,19 +2190,60 @@ impl MayConfig {
         self.provider.insert(id.into(), provider);
     }
 
+    /// Sets the cache lifetime of provider `id` from the text a settings
+    /// editor submitted: a duration such as `1h`, or `permanent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error when `text` is neither; the config is unchanged.
+    pub fn set_provider_cache_lifetime(
+        &mut self,
+        id: &str,
+        text: &str,
+    ) -> Result<(), crate::cache_lifetime::CacheLifetimeParseError> {
+        let lifetime = text.parse()?;
+        if let Some(instance) = self.provider.get_mut(id) {
+            instance.cache_lifetime = lifetime;
+        }
+        Ok(())
+    }
+
+    /// Register a provider after a completed OAuth flow.
+    ///
+    /// Re-authentication keeps an existing instance in place — only its type
+    /// is validated and made explicit — so fields the flow does not own
+    /// (`native_tools`, `base_url`, `display_name`, `enabled`) survive. A
+    /// fresh instance is inserted only when no provider with `id` exists.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::ProviderTypeMismatch`] when a provider with `id`
+    /// already exists but resolves to a different provider type.
+    pub fn ensure_authenticated_provider(
+        &mut self,
+        id: impl Into<String>,
+        provider_type: ProviderType,
+    ) -> Result<(), ConfigError> {
+        let id = id.into();
+        if let Some(existing) = self.provider.get_mut(&id) {
+            let actual = existing.resolve_type(&id);
+            if actual != provider_type {
+                return Err(ConfigError::ProviderTypeMismatch {
+                    id,
+                    expected: provider_type,
+                    actual,
+                });
+            }
+            existing.provider_type = Some(provider_type);
+            return Ok(());
+        }
+        self.provider
+            .insert(id, ProviderInstance::new(provider_type));
+        Ok(())
+    }
+
     /// Remove a provider by ID.
     pub fn remove_provider(&mut self, id: &str) {
         self.provider.remove(id);
-    }
-
-    /// Get all valid provider IDs that can serve a model.
-    #[must_use]
-    pub fn providers_for_model(&self, model_id: &str) -> Vec<&str> {
-        self.provider
-            .iter()
-            .filter(|(id, p)| p.can_serve_model(id, model_id))
-            .map(|(id, _)| id.as_str())
-            .collect()
     }
 
     /// Get all provider IDs.
@@ -1159,17 +2275,8 @@ impl MayConfig {
 
     /// Get the first available model for a tier.
     #[must_use]
-    pub fn default_model_for_tier(&self, tier: ModelTier) -> Option<&str> {
-        self.models
-            .models_for_tier(tier)
-            .first()
-            .map(std::string::String::as_str)
-    }
-
-    /// Create a provider resolver for runtime model selection.
-    #[must_use]
-    pub fn create_resolver(&self) -> ProviderResolver {
-        ProviderResolver::new(self)
+    pub fn default_model_for_tier(&self, tier: ModelTier) -> Option<&ModelSelector> {
+        self.models.models_for_tier(tier).first()
     }
 
     /// Get all available models from configured providers.
@@ -1180,8 +2287,7 @@ impl MayConfig {
     #[must_use]
     pub fn available_models(&self) -> Vec<AvailableModel> {
         let mut models = Vec::new();
-        let mut has_any_model_provider = false;
-        let chat_price_breakpoints = chat_price_breakpoints();
+        let registry = aither_models::ModelRegistry::bundled();
 
         for (id, instance) in &self.provider {
             if !instance.is_valid(id) {
@@ -1192,7 +2298,17 @@ impl MayConfig {
 
             // Providers that can serve arbitrary models (proxies/aggregators)
             if instance.is_generic_model_proxy(id) {
-                has_any_model_provider = true;
+                for info in aither_models::all_models() {
+                    if info.is_deprecated() {
+                        continue;
+                    }
+                    models.push(AvailableModel {
+                        selector: ModelSelector::new(id, info.id()),
+                        id: info.id().to_string(),
+                        provider_id: id.clone(),
+                        tier: Some(registry.tier_of(info)),
+                    });
+                }
                 continue;
             }
 
@@ -1212,49 +2328,25 @@ impl MayConfig {
                     continue;
                 }
                 models.push(AvailableModel {
+                    selector: ModelSelector::new(id, info.id()),
                     id: info.id().to_string(),
                     provider_id: id.clone(),
-                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
+                    tier: Some(registry.tier_of(info)),
                 });
             }
         }
 
-        // If we have an "any model" provider (OpenRouter, Ollama, custom),
-        // include ALL known models since they can potentially serve them
-        if has_any_model_provider {
-            for info in aither_models::all_models() {
-                if info.is_deprecated() {
-                    continue;
-                }
-                // Skip if we already have this model from a direct provider
-                if models.iter().any(|m| m.id == info.id()) {
-                    continue;
-                }
-                models.push(AvailableModel {
-                    id: info.id().to_string(),
-                    provider_id: String::new(), // Multiple providers could serve this
-                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
-                });
-            }
-        }
-
-        // Sort by model ID
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.sort_by(|a, b| a.provider_id.cmp(&b.provider_id).then(a.id.cmp(&b.id)));
+        models.dedup_by(|a, b| a.selector == b.selector);
         models
     }
-}
-
-fn reject_legacy_config_sections(content: &str) -> Result<(), ConfigError> {
-    let document = toml::from_str::<toml::Value>(content).map_err(ConfigError::Parse)?;
-    if document.get("playwright").is_some() {
-        return Err(ConfigError::LegacyPlaywrightSection);
-    }
-    Ok(())
 }
 
 /// An available model from a configured provider.
 #[derive(Debug, Clone)]
 pub struct AvailableModel {
+    /// Explicit provider/model selector.
+    pub selector: ModelSelector,
     /// Model ID
     pub id: String,
     /// Provider ID that can serve this model
@@ -1263,154 +2355,321 @@ pub struct AvailableModel {
     pub tier: Option<ModelTier>,
 }
 
-/// Runtime resolver for selecting providers for models.
-///
-/// Handles load balancing and failover across providers.
-pub struct ProviderResolver {
-    /// Provider instances (cloned from config), keyed by ID
-    providers: HashMap<String, ProviderInstance>,
-    /// Models config
-    models: ModelsConfig,
-    /// Load balance strategy
-    strategy: LoadBalanceStrategy,
-    /// Round-robin counter per model
-    counters: HashMap<String, AtomicUsize>,
-    /// Temporarily failed providers (`model_id` -> `provider_ids`).
-    /// Uses `RefCell` because `ProviderResolver` is always thread-local (created per-request).
-    failed: std::cell::RefCell<HashMap<String, Vec<String>>>,
-}
-
-/// A selected provider with its ID.
-#[derive(Debug, Clone)]
-pub struct SelectedProvider<'a> {
-    /// The provider ID
-    pub id: &'a str,
-    /// The provider instance
-    pub instance: &'a ProviderInstance,
-}
-
-impl ProviderResolver {
-    /// Create a new resolver from config.
-    #[must_use]
-    pub fn new(config: &MayConfig) -> Self {
-        Self {
-            providers: config.provider.clone(),
-            models: config.models.clone(),
-            strategy: config.preferences.load_balance_strategy,
-            counters: HashMap::new(),
-            failed: std::cell::RefCell::new(HashMap::new()),
-        }
-    }
-
-    /// Get all provider IDs that can serve a model, excluding failed ones.
-    fn available_provider_ids(&self, model_id: &str) -> Vec<&str> {
-        let failed = self.failed.borrow();
-        let failed_ids = failed.get(model_id);
-
-        let mut explicit = Vec::new();
-        let mut generic = Vec::new();
-
-        for (id, p) in &self.providers {
-            if !p.can_serve_model(id, model_id) || failed_ids.is_some_and(|list| list.contains(id))
-            {
-                continue;
-            }
-
-            if p.is_generic_model_proxy(id) {
-                generic.push(id.as_str());
-            } else {
-                explicit.push(id.as_str());
-            }
-        }
-
-        // Prefer explicit provider-model matches first; keep generic aggregators as fallback.
-        explicit.sort_unstable();
-        generic.sort_unstable();
-        explicit.extend(generic);
-        explicit
-    }
-
-    /// Select the next provider for a model based on strategy.
-    pub fn select_provider(&self, model_id: &str) -> Option<SelectedProvider<'_>> {
-        let available = self.available_provider_ids(model_id);
-        if available.is_empty() {
-            return None;
-        }
-
-        let id = match self.strategy {
-            LoadBalanceStrategy::FailoverOnly => available.first().copied(),
-            LoadBalanceStrategy::Random => {
-                use std::collections::hash_map::RandomState;
-                use std::hash::{BuildHasher, Hasher};
-                let idx = RandomState::new().build_hasher().finish() as usize % available.len();
-                available.get(idx).copied()
-            }
-            LoadBalanceStrategy::RoundRobin => {
-                // Get or create counter for this model
-                let counter = self
-                    .counters
-                    .get(model_id)
-                    .map_or(0, |c| c.fetch_add(1, Ordering::Relaxed));
-                let idx = counter % available.len();
-                available.get(idx).copied()
-            }
-        }?;
-
-        self.providers
-            .get(id)
-            .map(|instance| SelectedProvider { id, instance })
-    }
-
-    /// Get a provider by ID.
-    pub fn get_provider(&self, id: &str) -> Option<&ProviderInstance> {
-        self.providers.get(id)
-    }
-
-    /// Mark a provider as failed for a model.
-    pub fn mark_failed(&self, model_id: &str, provider_id: &str) {
-        let mut failed = self.failed.borrow_mut();
-        failed
-            .entry(model_id.to_string())
-            .or_default()
-            .push(provider_id.to_string());
-    }
-
-    /// Clear failed status for a model (e.g., after some time).
-    pub fn clear_failed(&self, model_id: &str) {
-        let mut failed = self.failed.borrow_mut();
-        failed.remove(model_id);
-    }
-
-    /// Clear all failed status.
-    pub fn clear_all_failed(&self) {
-        let mut failed = self.failed.borrow_mut();
-        failed.clear();
-    }
-
-    /// Check if any providers are available for a model.
-    pub fn has_available_provider(&self, model_id: &str) -> bool {
-        !self.available_provider_ids(model_id).is_empty()
-    }
-
-    /// Get the next model in a tier after the current one fails.
-    pub fn next_model_in_tier(&self, tier: ModelTier, current_model: &str) -> Option<&str> {
-        let models = self.models.models_for_tier(tier);
-        let current_idx = models.iter().position(|m| m == current_model)?;
-        models.get(current_idx + 1).map(std::string::String::as_str)
-    }
-
-    /// Get the first model in a tier.
-    pub fn first_model_in_tier(&self, tier: ModelTier) -> Option<&str> {
-        self.models
-            .models_for_tier(tier)
-            .first()
-            .map(std::string::String::as_str)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_language_section_names_the_communication_language() {
+        let config: MayConfig = toml::from_str("[language]\ncommunication = \"zh\"\n").unwrap();
+        let languages = config.language.languages();
+        assert_eq!(languages.communication().unwrap().name(), "Chinese");
+        assert_eq!(languages.working().name(), "English");
+        assert!(languages.enforced());
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("communication = \"Chinese\""), "{saved}");
+        assert!(!MayConfig::default().language.languages().enforced());
+    }
+
+    #[test]
+    fn only_openai_publishes_a_cache_block_size() {
+        assert_eq!(
+            ProviderType::OpenAI.cache_block_tokens(),
+            NonZeroU64::new(128)
+        );
+        assert_eq!(ProviderType::Custom.cache_block_tokens(), None);
+        assert_eq!(
+            ProviderType::from_id("openai").cache_block_tokens(),
+            NonZeroU64::new(128)
+        );
+    }
+
+    #[test]
+    fn an_ssh_server_keeps_the_platform_it_reported() {
+        let config: MayConfig = toml::from_str(
+            "[[ssh_servers]]\nname = \"box\"\ntarget = \"me@box\"\n[ssh_servers.platform]\nos = \"Linux\"\narch = \"x86_64\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.ssh_servers()[0].platform.to_string(), "Linux x86_64");
+        let saved = toml::to_string(&config).unwrap();
+        let reloaded: MayConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.ssh_servers(), config.ssh_servers());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_be_probed_is_not_added() {
+        let error = SshServerConfig::probe("gone".into(), "nobody@host.invalid".into())
+            .await
+            .expect_err("an unresolvable host has no platform");
+        assert!(
+            matches!(
+                error,
+                aither_sandbox::SshProbeError::Upload(_)
+                    | aither_sandbox::SshProbeError::Failed { .. }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_language_is_rejected_at_load() {
+        let error = toml::from_str::<MayConfig>("[language]\nworking = \"Klingonese\"\n")
+            .expect_err("unknown language");
+        assert!(error.to_string().contains("Klingonese"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cache_lifetime_and_compaction_model_survive_a_saved_config() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("config.toml");
+        let mut config = MayConfig::default();
+        config.upsert_provider(
+            "anthropic",
+            ProviderInstance::new(ProviderType::Anthropic).with_api_key("k"),
+        );
+        config.upsert_provider(
+            "openai",
+            ProviderInstance::new(ProviderType::OpenAI).with_api_key("k"),
+        );
+        config.upsert_provider("ollama", ProviderInstance::new(ProviderType::Ollama));
+        // The TUI cache-lifetime edit applies its text through this setter.
+        config
+            .set_provider_cache_lifetime("anthropic", "90m")
+            .expect("duration parses");
+        config
+            .set_provider_cache_lifetime("openai", "permanent")
+            .expect("permanent parses");
+        config.models.compaction_model = Some(ModelSelector::new("openai", "gpt-5-mini"));
+        config.save_to(&path).await.expect("config saves");
+
+        let written = std::fs::read_to_string(&path).expect("config file");
+        assert!(written.contains("cache_lifetime = \"1h 30m\""), "{written}");
+        assert!(
+            written.contains("cache_lifetime = \"permanent\""),
+            "{written}"
+        );
+        assert_eq!(
+            written.matches("cache_lifetime").count(),
+            2,
+            "the one-hour default is omitted: {written}"
+        );
+
+        let loaded = MayConfig::load_from(&path).await.expect("config loads");
+        assert_eq!(
+            loaded.provider["anthropic"].cache_lifetime,
+            CacheLifetime::Limited(Duration::from_mins(90))
+        );
+        assert_eq!(
+            loaded.provider["openai"].cache_lifetime,
+            CacheLifetime::Permanent
+        );
+        assert_eq!(
+            loaded.provider["ollama"].cache_lifetime,
+            CacheLifetime::default()
+        );
+        assert_eq!(
+            loaded.provider["ollama"].cache_lifetime,
+            CacheLifetime::Limited(Duration::from_hours(1))
+        );
+        assert_eq!(
+            loaded.models.compaction_model,
+            config.models.compaction_model
+        );
+    }
+
+    #[test]
+    fn invalid_cache_lifetime_edit_leaves_the_config_unchanged() {
+        let mut config = MayConfig::default();
+        config.upsert_provider("openai", ProviderInstance::new(ProviderType::OpenAI));
+        config
+            .set_provider_cache_lifetime("openai", "soon")
+            .expect_err("not a duration");
+        assert!(config.provider["openai"].cache_lifetime.is_default());
+    }
+
+    #[test]
+    fn acp_agent_grants_expand_a_leading_tilde_against_the_home() {
+        let agent = AcpAgentConfig {
+            grants: vec![PathBuf::from("~/.codex"), PathBuf::from("/opt/state")],
+            ..devin_connection()
+        };
+        assert_eq!(
+            agent.grants_in(Path::new("/Users/me")),
+            [
+                PathBuf::from("/Users/me/.codex"),
+                PathBuf::from("/opt/state")
+            ]
+        );
+    }
+
+    fn devin_connection() -> AcpAgentConfig {
+        AcpAgentConfig {
+            command: "devin".to_string(),
+            args: vec!["acp".to_string()],
+            env: BTreeMap::from([("DEVIN_LOG".to_string(), "warn".to_string())]),
+            model: Some("opus".to_string()),
+            mode: None,
+            description: "Devin CLI".to_string(),
+            grants: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connected_acp_agents_survive_a_saved_config() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("config.toml");
+        let mut config = MayConfig::default();
+        config
+            .connect_acp_agent("devin".to_string(), devin_connection())
+            .expect("a plain name connects");
+        config.save_to(&path).await.expect("config saves");
+
+        let written = std::fs::read_to_string(&path).expect("config file");
+        assert!(written.contains("[acp_agents.devin]"), "{written}");
+        let section = &written[written.find("[acp_agents.devin]").expect("section")..];
+        assert!(
+            !section.contains("\nmode ="),
+            "unset mode is omitted: {section}"
+        );
+
+        let loaded = MayConfig::load_from(&path).await.expect("config loads");
+        assert_eq!(loaded.acp_agents["devin"], devin_connection());
+
+        let minimal: MayConfig = toml::from_str(
+            "[acp_agents.codex]\ncommand = \"codex-acp\"\ndescription = \"Codex\"\n",
+        )
+        .expect("only command and description are required");
+        let codex = &minimal.acp_agents["codex"];
+        assert!(codex.args.is_empty() && codex.env.is_empty());
+        assert!(codex.model.is_none() && codex.mode.is_none());
+    }
+
+    #[test]
+    fn acp_agent_names_that_cannot_be_subagent_types_are_refused() {
+        let mut config = MayConfig::default();
+        for name in [
+            "explore", "plan", "research", "fork", "", "a/b", "notes.md", "x y",
+        ] {
+            let error = config
+                .connect_acp_agent(name.to_string(), devin_connection())
+                .expect_err(name);
+            assert!(
+                matches!(error, ConfigError::InvalidAcpAgent { .. }),
+                "{name}"
+            );
+        }
+        assert!(
+            config.acp_agents.is_empty(),
+            "a refused name changes nothing"
+        );
+        config
+            .acp_agents
+            .insert("plan".to_string(), devin_connection());
+        config
+            .validate()
+            .expect_err("a hand-edited colliding name fails validation");
+    }
+
+    #[test]
+    fn stream_codec_defaults_to_auto_and_roundtrips() {
+        assert_eq!(MayConfig::default().stream.codec, StreamCodec::Auto);
+        let config: MayConfig = toml::from_str("").expect("a config without stream parses");
+        assert_eq!(config.stream.codec, StreamCodec::Auto);
+        for (input, expected) in [
+            ("auto", StreamCodec::Auto),
+            ("h264", StreamCodec::H264),
+            ("av1", StreamCodec::Av1),
+        ] {
+            let config: MayConfig =
+                toml::from_str(&format!("[stream]\ncodec = \"{input}\"\n")).expect("codec parses");
+            assert_eq!(config.stream.codec, expected);
+            let saved = toml::to_string(&config).expect("config serializes");
+            let reloaded: MayConfig = toml::from_str(&saved).expect("saved config parses");
+            assert_eq!(reloaded.stream.codec, expected);
+        }
+        assert!(toml::from_str::<MayConfig>("[stream]\ncodec = \"vp9\"\n").is_err());
+    }
+
+    #[test]
+    fn command_priority_defaults_to_normal() {
+        assert_eq!(
+            MayConfig::default().sandbox.command_priority,
+            CommandPriority::Normal
+        );
+        let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
+        assert_eq!(config.sandbox.command_priority, CommandPriority::Normal);
+    }
+
+    #[test]
+    fn command_priority_roundtrips_and_rejects_unknown() {
+        for (input, expected) in [
+            ("normal", CommandPriority::Normal),
+            ("low", CommandPriority::Low),
+            ("lowest", CommandPriority::Lowest),
+        ] {
+            let document = toml::to_string(&serde_json::json!({
+                "sandbox": { "command_priority": input }
+            }))
+            .expect("fixture serializes");
+            let config: MayConfig = toml::from_str(&document).expect("priority parses");
+            assert_eq!(config.sandbox.command_priority, expected);
+            let parsed: CommandPriority =
+                serde_json::from_value(serde_json::json!(input)).expect("json parses");
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_value(expected).expect("serializes"),
+                serde_json::json!(input)
+            );
+        }
+        let document = toml::to_string(&serde_json::json!({
+            "sandbox": { "command_priority": "urgent" }
+        }))
+        .expect("fixture serializes");
+        assert!(
+            toml::from_str::<MayConfig>(&document).is_err(),
+            "an unknown priority must be rejected"
+        );
+    }
+
+    #[test]
+    fn job_pool_size_defaults_to_available_parallelism_and_roundtrips() {
+        let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
+        assert_eq!(config.sandbox.job_pool_size, None);
+        assert_eq!(
+            config.sandbox.job_pool_size(),
+            std::thread::available_parallelism().expect("host reports its parallelism")
+        );
+
+        let config: MayConfig =
+            toml::from_str("[sandbox]\njob_pool_size = 6\n").expect("size parses");
+        assert_eq!(config.sandbox.job_pool_size().get(), 6);
+        let saved = toml::to_string(&config).expect("config serializes");
+        let reloaded: MayConfig = toml::from_str(&saved).expect("saved config parses");
+        assert_eq!(reloaded.sandbox.job_pool_size().get(), 6);
+
+        let unset = toml::to_string(&MayConfig::default()).expect("config serializes");
+        assert!(!unset.contains("job_pool_size"));
+        assert!(toml::from_str::<MayConfig>("[sandbox]\njob_pool_size = 0\n").is_err());
+    }
+
+    #[test]
+    fn command_priority_maps_to_process_priority() {
+        use aither_sandbox::{CpuPriority, IoPriority};
+
+        assert!(CommandPriority::Normal.process_priority().is_normal());
+
+        let low = CommandPriority::Low.process_priority();
+        assert!(matches!(low.cpu(), CpuPriority::Nice(level) if level.get() == 10));
+        assert_eq!(low.io(), IoPriority::Utility);
+
+        let lowest = CommandPriority::Lowest.process_priority();
+        assert!(matches!(
+            lowest.cpu(),
+            CpuPriority::Nice(level) if level.get() == 19
+        ));
+        assert_eq!(lowest.io(), IoPriority::Background);
+    }
 
     #[test]
     fn test_default_config() {
@@ -1433,6 +2692,10 @@ mod tests {
         assert_eq!(anthropic.api_key.as_deref(), Some("sk-ant-test"));
 
         assert_eq!(config.models.balanced.len(), 2);
+        assert_eq!(
+            config.models.balanced[0].to_string(),
+            "anthropic::claude-sonnet-4"
+        );
         assert!(config.is_configured());
     }
 
@@ -1537,7 +2800,7 @@ mod tests {
 
     #[test]
     fn test_provider_can_serve_model() {
-        let anthropic_model = "claude-sonnet-4-20250514";
+        let anthropic_model = "claude-sonnet-4-5-20250929";
 
         // OpenAI can serve GPT models even when catalog canonical IDs collide across providers.
         assert!(ProviderType::OpenAI.can_serve_model("gpt-4o"));
@@ -1576,53 +2839,73 @@ mod tests {
     }
 
     #[test]
-    fn test_providers_for_model() {
-        let anthropic_model = "claude-sonnet-4-20250514";
+    fn ensure_authenticated_provider_inserts_when_absent() {
         let mut config = MayConfig::default();
-        config.upsert_provider("anthropic", ProviderInstance::default().with_api_key("key"));
-        config.upsert_provider(
-            "openrouter",
-            ProviderInstance::default().with_api_key("key"),
+        config
+            .ensure_authenticated_provider("copilot", ProviderType::Copilot)
+            .expect("insert succeeds");
+        assert_eq!(
+            config.get_provider("copilot").map(|p| p.provider_type),
+            Some(Some(ProviderType::Copilot))
         );
-        config.models.balanced = vec![anthropic_model.to_string()];
-
-        let providers = config.providers_for_model(anthropic_model);
-        assert_eq!(providers.len(), 2); // Both can serve it
     }
 
     #[test]
-    fn test_resolver_failover() {
-        let anthropic_model = "claude-sonnet-4-20250514";
+    fn ensure_authenticated_provider_preserves_existing_instance() {
         let mut config = MayConfig::default();
-        config.upsert_provider(
-            "anthropic",
-            ProviderInstance::default().with_api_key("key1"),
+        let mut instance = ProviderInstance::new(ProviderType::Chatgpt)
+            .with_base_url("https://proxy.internal/codex");
+        instance.native_tools.web_search = true;
+        instance.native_tools.web_fetch = true;
+        instance.display_name = Some("Work ChatGPT".to_string());
+        instance.enabled = false;
+        config.upsert_provider("chatgpt", instance);
+
+        config
+            .ensure_authenticated_provider("chatgpt", ProviderType::Chatgpt)
+            .expect("matching type succeeds");
+
+        let kept = config.get_provider("chatgpt").expect("provider exists");
+        assert!(kept.native_tools.web_search);
+        assert!(kept.native_tools.web_fetch);
+        assert_eq!(
+            kept.base_url.as_deref(),
+            Some("https://proxy.internal/codex")
         );
-        config.upsert_provider(
-            "openrouter",
-            ProviderInstance::default().with_api_key("key2"),
+        assert_eq!(kept.display_name.as_deref(), Some("Work ChatGPT"));
+        assert!(!kept.enabled);
+    }
+
+    #[test]
+    fn ensure_authenticated_provider_infers_type_from_id() {
+        // An existing `[provider.copilot]` section with no explicit `type`
+        // field resolves to Copilot and is kept on re-auth.
+        let mut config = MayConfig::default();
+        config.upsert_provider("copilot", ProviderInstance::default());
+
+        config
+            .ensure_authenticated_provider("copilot", ProviderType::Copilot)
+            .expect("inferred type matches");
+        assert_eq!(
+            config.get_provider("copilot").map(|p| p.provider_type),
+            Some(Some(ProviderType::Copilot))
         );
-        config.models.balanced = vec![anthropic_model.to_string()];
-        config.preferences.load_balance_strategy = LoadBalanceStrategy::FailoverOnly;
+    }
 
-        let resolver = config.create_resolver();
+    #[test]
+    fn ensure_authenticated_provider_rejects_type_mismatch() {
+        let mut config = MayConfig::default();
+        config.upsert_provider("chatgpt", ProviderInstance::new(ProviderType::OpenAI));
 
-        // First selection should pick one of the providers
-        let first = resolver.select_provider(anthropic_model);
-        assert!(first.is_some());
-        let first_id = first.unwrap().id;
-
-        // Mark first as failed
-        resolver.mark_failed(anthropic_model, first_id);
-
-        // Now should select the other provider
-        let second = resolver.select_provider(anthropic_model);
-        assert!(second.is_some());
-        assert_ne!(second.unwrap().id, first_id);
-
-        // Clear failures
-        resolver.clear_failed(anthropic_model);
-        assert!(resolver.select_provider(anthropic_model).is_some());
+        let error = config
+            .ensure_authenticated_provider("chatgpt", ProviderType::Chatgpt)
+            .expect_err("type mismatch must fail");
+        assert!(matches!(error, ConfigError::ProviderTypeMismatch { .. }));
+        // The existing instance is untouched.
+        assert_eq!(
+            config.get_provider("chatgpt").map(|p| p.provider_type),
+            Some(Some(ProviderType::OpenAI))
+        );
     }
 
     #[test]
@@ -1632,10 +2915,38 @@ mod tests {
             "anthropic",
             ProviderInstance::default().with_api_key("test-key"),
         );
-        config.models.balanced = vec!["claude-sonnet-4".to_string()];
+        config.models.balanced = vec![ModelSelector::new("anthropic", "claude-sonnet-4")];
 
         let toml = toml::to_string_pretty(&config).unwrap();
         assert!(toml.contains("[provider.anthropic]"));
         assert!(toml.contains("[models]"));
+        assert!(toml.contains("anthropic::claude-sonnet-4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_reached_through_a_symlink_resolves_to_the_real_path() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let linked = links.path().join("home");
+        std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+
+        let resolved = MayConfig::resolve_home(linked).unwrap();
+
+        assert_eq!(resolved, dunce::canonicalize(real.path()).unwrap());
+        assert_eq!(
+            resolved.join(".may"),
+            dunce::canonicalize(real.path()).unwrap().join(".may")
+        );
+    }
+
+    #[test]
+    fn a_home_that_does_not_resolve_is_an_error() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+
+        assert!(matches!(
+            MayConfig::resolve_home(missing),
+            Err(ConfigError::HomeUnresolvable { .. })
+        ));
     }
 }

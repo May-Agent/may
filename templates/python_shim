@@ -1,0 +1,46 @@
+#!/bin/sh
+# `python3` and `python` of a terminal: the interpreter of the project
+# environment that holds the working directory, otherwise May's managed
+# `python3`.
+#
+# The project environment is `$UV_PROJECT_ENVIRONMENT` when set, else `.venv`,
+# looked up in the working directory and each parent up to the repository
+# root (the nearest directory holding a `.git`); outside a repository only
+# the working directory is looked at.
+
+name=${0##*/}
+own=$(cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+
+directory=$(pwd -P)
+while :; do
+    case ${UV_PROJECT_ENVIRONMENT:-.venv} in
+        /*) environment=${UV_PROJECT_ENVIRONMENT} ;;
+        *) environment=$directory/${UV_PROJECT_ENVIRONMENT:-.venv} ;;
+    esac
+    for candidate in "$environment/bin/$name" "$environment/bin/python3"; do
+        if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+            exec "$candidate" "$@"
+        fi
+    done
+    if [ -e "$directory/.git" ] || [ "$directory" = / ]; then
+        break
+    fi
+    directory=$(dirname -- "$directory")
+done
+
+# The managed interpreter: the next `python3` on the PATH after this directory.
+rest=$PATH
+while [ -n "$rest" ]; do
+    case $rest in
+        *:*) entry=${rest%%:*}; rest=${rest#*:} ;;
+        *) entry=$rest; rest= ;;
+    esac
+    [ -n "$entry" ] || continue
+    resolved=$(cd -P -- "$entry" 2>/dev/null && pwd -P) || continue
+    [ "$resolved" = "$own" ] && continue
+    if [ -x "$resolved/python3" ] && [ ! -d "$resolved/python3" ]; then
+        exec "$resolved/python3" "$@"
+    fi
+done
+echo "$name: no python3 found on PATH" >&2
+exit 127

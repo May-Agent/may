@@ -1,11 +1,23 @@
 //! UI components for the TUI.
 
+pub mod band;
 pub mod chat;
+pub mod chat_layout;
 pub mod file_picker;
+pub(super) mod highlight;
 pub mod image;
+#[cfg(unix)]
+mod image_probe;
+mod kitty_diacritics;
 mod layout;
+pub mod links;
 pub mod markdown;
 pub mod streaming_markdown;
+pub mod sweep;
+#[cfg(test)]
+pub(crate) mod test_screen;
+mod welcome;
+pub mod wrap;
 
 use ratatui::Frame;
 

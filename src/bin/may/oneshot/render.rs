@@ -1,0 +1,398 @@
+//! Event lines of the one-shot stream.
+//!
+//! Assistant text goes to stdout and every event line to stderr. The two
+//! share a terminal, so [`OneShotOutput`] ends the text's line before it
+//! writes an event line.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, Write};
+
+use aither_agent::{AgentError, AgentEvent, OutputKind, TimedEvent, ToolOrigin};
+use aither_core::llm::tool::{CommandOutcome, ToolResult};
+use askama::Template;
+use jiff::{SignedDuration, Timestamp};
+use serde::Deserialize;
+
+/// Longest one-line summary of a call, in characters.
+const SUMMARY_LIMIT: usize = 100;
+
+/// Longest error message shown on a failure line, in characters.
+const MESSAGE_LIMIT: usize = 300;
+
+/// What a tool call is shown as, remembered from its start event.
+struct StartedCall {
+    at: Timestamp,
+    name: String,
+    label: String,
+    /// Whether the provider runs the call itself.
+    hosted: bool,
+}
+
+/// The arguments of `terminal` the start line reads.
+#[derive(Deserialize)]
+struct TerminalCall {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    script: String,
+}
+
+/// How long a call ran.
+struct Elapsed(SignedDuration);
+
+impl fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let millis = self.0.as_millis();
+        if millis < 1000 {
+            write!(f, "{millis}ms")
+        } else {
+            write!(f, "{:.1}s", self.0.as_secs_f64())
+        }
+    }
+}
+
+enum ToolOutcome<'a> {
+    Done,
+    Exited { code: i32 },
+    Background { task_id: &'a str },
+    Killed { task_id: &'a str },
+}
+
+enum LineKind<'a> {
+    RunStart,
+    Thinking {
+        text: &'a str,
+    },
+    ToolStart {
+        name: &'a str,
+        label: &'a str,
+    },
+    BuiltInTool {
+        tool: &'a str,
+        detail: &'a str,
+    },
+    ToolFinished {
+        name: &'a str,
+        label: &'a str,
+        elapsed: Option<Elapsed>,
+        outcome: ToolOutcome<'a>,
+    },
+    ToolFailed {
+        name: &'a str,
+        label: &'a str,
+        elapsed: Option<Elapsed>,
+        message: &'a str,
+    },
+    Paused {
+        reason: String,
+    },
+    Resumed {
+        reason: String,
+    },
+    /// Token counts; a count the provider did not report is omitted.
+    Usage {
+        prompt: Option<u32>,
+        cache_read: Option<u32>,
+        cache_write: Option<u32>,
+        completion: Option<u32>,
+        total: Option<u32>,
+    },
+    CompactionRecovery {
+        error: &'a AgentError,
+        alerts_removed: usize,
+        outputs_spilled: usize,
+    },
+    Error {
+        error: &'a AgentError,
+    },
+}
+
+#[derive(Template)]
+#[template(path = "oneshot_event_line.txt", escape = "none")]
+struct EventLine<'a> {
+    at: Timestamp,
+    kind: LineKind<'a>,
+}
+
+/// Collapses `text` to one line of at most `limit` characters.
+fn one_line(text: &str, limit: usize) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or_default();
+    let more_lines = lines.next().is_some();
+    let collapsed = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &collapsed[..end]),
+        None if more_lines => format!("{collapsed} …"),
+        None => collapsed,
+    }
+}
+
+/// Hosted search/fetch as a verb headline; other hosted tools keep `[name]`.
+fn hosted_headline(tool: &str, detail: &str) -> (String, String) {
+    match tool {
+        "websearch" | "web_search" | "google_search" => (
+            "Searched".to_string(),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("\"{detail}\"")
+            },
+        ),
+        "webfetch" | "web_fetch" => ("Fetched".to_string(), detail.to_string()),
+        _ => (tool.to_string(), detail.to_string()),
+    }
+}
+
+/// Names a call by its tool and arguments.
+fn call_label(name: &str, arguments: &str) -> String {
+    if name == "terminal"
+        && let Ok(call) = serde_json::from_str::<TerminalCall>(arguments)
+    {
+        let description = one_line(&call.description, SUMMARY_LIMIT);
+        return if description.is_empty() {
+            one_line(&call.script, SUMMARY_LIMIT)
+        } else {
+            description
+        };
+    }
+    one_line(arguments, SUMMARY_LIMIT)
+}
+
+/// The two streams of a one-shot run.
+pub struct OneShotOutput<O, E> {
+    stdout: O,
+    stderr: E,
+    /// Whether the last assistant text left stdout inside a line.
+    stdout_open: bool,
+    calls: HashMap<String, StartedCall>,
+}
+
+impl<O: Write, E: Write> OneShotOutput<O, E> {
+    pub fn new(stdout: O, stderr: E) -> Self {
+        Self {
+            stdout,
+            stderr,
+            stdout_open: false,
+            calls: HashMap::new(),
+        }
+    }
+
+    /// Writes streamed assistant text to stdout.
+    pub fn text(&mut self, text: &str) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.stdout.write_all(text.as_bytes())?;
+        self.stdout.flush()?;
+        self.stdout_open = !text.ends_with('\n');
+        Ok(())
+    }
+
+    /// Ends the assistant text's line, if it is open.
+    pub fn end_text_line(&mut self) -> io::Result<()> {
+        if self.stdout_open {
+            self.stdout.write_all(b"\n")?;
+            self.stdout.flush()?;
+            self.stdout_open = false;
+        }
+        Ok(())
+    }
+
+    /// The stderr stream, for a line written outside the event stream.
+    pub fn stderr(&mut self) -> io::Result<&mut E> {
+        self.end_text_line()?;
+        Ok(&mut self.stderr)
+    }
+
+    fn write_line(&mut self, at: Timestamp, kind: LineKind<'_>) -> anyhow::Result<()> {
+        let line = EventLine { at, kind }.render()?;
+        let stderr = self.stderr()?;
+        // The template renders the line without its terminator.
+        stderr.write_all(line.as_bytes())?;
+        stderr.write_all(b"\n")?;
+        stderr.flush()?;
+        Ok(())
+    }
+
+    /// Writes the line for one agent event, if it has one.
+    pub fn event(&mut self, result: &Result<TimedEvent, AgentError>) -> anyhow::Result<()> {
+        // Every line opens with the UTC time the agent emitted the event. A
+        // run error is not an event and carries no emission time, so it is
+        // stamped on receipt.
+        let at = result
+            .as_ref()
+            .map_or_else(|_| Timestamp::now(), |timed| timed.at);
+        let timed = match result {
+            Ok(timed) => timed,
+            Err(error) => return self.write_line(at, LineKind::Error { error }),
+        };
+        // A subagent's events ride its parent's stream; its own runs report
+        // elsewhere.
+        if !timed.agent.is_main() {
+            return Ok(());
+        }
+        match &timed.event {
+            AgentEvent::RunStarted { .. } => self.write_line(at, LineKind::RunStart),
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Reasoning,
+                text,
+                ..
+            } if !text.trim().is_empty() => self.write_line(at, LineKind::Thinking { text }),
+            AgentEvent::ToolCallStarted {
+                call,
+                name,
+                arguments,
+                origin: ToolOrigin::Hosted,
+                ..
+            } => {
+                let detail = arguments
+                    .as_str()
+                    .map_or_else(|| arguments.to_string(), str::to_owned);
+                let detail = one_line(&detail, SUMMARY_LIMIT);
+                let (label, rest) = hosted_headline(name, &detail);
+                self.calls.insert(
+                    call.as_str().to_owned(),
+                    StartedCall {
+                        at,
+                        name: name.clone(),
+                        label: String::new(),
+                        hosted: true,
+                    },
+                );
+                self.write_line(
+                    at,
+                    LineKind::BuiltInTool {
+                        tool: &label,
+                        detail: &rest,
+                    },
+                )
+            }
+            AgentEvent::ToolCallStarted {
+                call,
+                name,
+                arguments,
+                ..
+            } => {
+                let label = call_label(name, &arguments.to_string());
+                self.write_line(
+                    at,
+                    LineKind::ToolStart {
+                        name,
+                        label: &label,
+                    },
+                )?;
+                self.calls.insert(
+                    call.as_str().to_owned(),
+                    StartedCall {
+                        at,
+                        name: name.clone(),
+                        label,
+                        hosted: false,
+                    },
+                );
+                Ok(())
+            }
+            AgentEvent::ToolCallEnded { call, result, .. } => {
+                let Some(started) = self.calls.remove(call.as_str()) else {
+                    return Ok(());
+                };
+                // The provider's own result is not a line of its own.
+                if started.hosted {
+                    return Ok(());
+                }
+                let name = started.name.as_str();
+                let label = started.label.as_str();
+                let elapsed = Some(Elapsed(at.duration_since(started.at)));
+                match result {
+                    ToolResult::Error { message } => {
+                        let message = one_line(message, MESSAGE_LIMIT);
+                        self.write_line(
+                            at,
+                            LineKind::ToolFailed {
+                                name,
+                                label,
+                                elapsed,
+                                message: &message,
+                            },
+                        )
+                    }
+                    other => {
+                        let outcome = match other.command().map(|command| &command.outcome) {
+                            Some(CommandOutcome::Exited { code }) => {
+                                ToolOutcome::Exited { code: *code }
+                            }
+                            Some(CommandOutcome::Running { task_id, .. }) => {
+                                ToolOutcome::Background { task_id }
+                            }
+                            Some(CommandOutcome::Killed { task_id, .. }) => {
+                                ToolOutcome::Killed { task_id }
+                            }
+                            None => ToolOutcome::Done,
+                        };
+                        self.write_line(
+                            at,
+                            LineKind::ToolFinished {
+                                name,
+                                label,
+                                elapsed,
+                                outcome,
+                            },
+                        )
+                    }
+                }
+            }
+            AgentEvent::Paused { kind, subject, .. } => self.write_line(
+                at,
+                LineKind::Paused {
+                    reason: format!("{kind}: {subject}"),
+                },
+            ),
+            AgentEvent::Resumed { pause, .. } => self.write_line(
+                at,
+                LineKind::Resumed {
+                    reason: format!("pause {pause}"),
+                },
+            ),
+            AgentEvent::RequestEnded {
+                usage: Some(usage), ..
+            } => self.write_line(
+                at,
+                LineKind::Usage {
+                    prompt: usage.prompt_tokens,
+                    cache_read: usage.cache_read_tokens,
+                    cache_write: usage.cache_write_tokens,
+                    completion: usage.completion_tokens,
+                    total: usage.total_tokens,
+                },
+            ),
+            AgentEvent::CompactionRecovery {
+                error,
+                alerts_removed,
+                outputs_spilled,
+                ..
+            } => self.write_line(
+                at,
+                LineKind::CompactionRecovery {
+                    error,
+                    alerts_removed: *alerts_removed,
+                    outputs_spilled: *outputs_spilled,
+                },
+            ),
+            // The failure of a run reaches the stream as its error, and the
+            // rest is UI progress: one-shot mode ignores it.
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl OneShotOutput<Vec<u8>, Vec<u8>> {
+    pub fn stdout_bytes(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub fn stderr_bytes(&self) -> &[u8] {
+        &self.stderr
+    }
+}

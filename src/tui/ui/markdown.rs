@@ -23,11 +23,12 @@ impl ImageSupport {
 }
 
 /// Result of rendering markdown with image position tracking.
+#[derive(Debug)]
 pub struct MarkdownRenderResult {
     /// Rendered lines
     pub lines: Vec<Line<'static>>,
-    /// Image positions: (url, `line_index`) for each image
-    pub image_positions: Vec<(String, usize)>,
+    /// Image positions: (url, `line_index`, caption) for each image
+    pub image_positions: Vec<(String, usize, String)>,
 }
 
 /// Render markdown text to ratatui lines.
@@ -50,10 +51,15 @@ pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line
 /// Render markdown and return both lines and image positions.
 ///
 /// Use this when you need to know where images are located in the rendered output
-/// for rendering actual images as overlays.
+/// for rendering actual images as overlays. Tables are laid out to `width`
+/// display columns.
 #[must_use]
-pub fn render_markdown_with_positions(text: &str, images: ImageSupport) -> MarkdownRenderResult {
-    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
+pub fn render_markdown_with_positions(
+    text: &str,
+    images: ImageSupport,
+    width: usize,
+) -> MarkdownRenderResult {
+    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled()).with_width(width);
     renderer.push(text);
     renderer.flush(); // Ensure last line is parsed even without trailing newline
     MarkdownRenderResult {

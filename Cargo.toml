@@ -5,10 +5,17 @@ edition = "2024"
 description = "May - A warm, boundaried AI assistant"
 license = "MIT"
 build = "build.rs"
+repository = "https://github.com/May-Agent/may"
+publish = false
 
 [[bin]]
 name = "may"
-path = "src/bin/may.rs"
+path = "src/bin/may/main.rs"
+
+[workspace]
+members = [".", "tasks"]
+# `cargo build` also builds the `tasks` binary that sits beside `may`.
+default-members = [".", "tasks"]
 
 [features]
 default = []
@@ -16,21 +23,55 @@ ui = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
+# The `tasks.md` parser and the `tasks` command; the container image tag is
+# derived from this crate's directory.
+may-tasks = { path = "tasks" }
+libc = "0.2.191"
 # Aither framework
-aither-core = { path = "../aither/core" }
-aither-agent = { path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
-aither-sandbox = { path = "../aither/sandbox" }
-aither-cloud = { path = "../aither/cloud" }
-aither-rag = { path = "../aither/rag" }
-aither-copilot = { path = "../aither/copilot" }
-aither-models = { path = "../aither/models" }
-aither-mcp = { path = "../aither/mcp" }
+aither-core = { version = "0.30.0" }
+aither-agent = { version = "0.30.0", features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
+aither-connectivity = { version = "0.30.0" }
+# The parser the harness applies `apply_patch` with; a call's reading uses it
+# to place each hunk in the file it edits.
+aither-patch = { version = "0.30.0" }
+aither-sandbox = { version = "0.30.0", features = ["code-folding", "connectivity", "jobserver"] }
+aither-cloud = { version = "0.30.0" }
+aither-copilot = { version = "0.30.0" }
+aither-codex = { version = "0.30.0" }
+aither-models = { version = "0.30.0" }
+aither-mcp = { version = "0.30.0" }
+aither-browser = { version = "0.30.0" }
+# Exact token counts (`LanguageModel::count_text`) for the decode meter.
+aither-openai = { version = "0.30.0", default-features = false, features = ["tokenizer"] }
+# Decides which `sed` forms a script may run (`aither_sed::supports`); the host
+# `sed` runs them, and a script's other `sed` calls are refused.
+aither-sed = { version = "0.30.0", default-features = false }
+# Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
+# builds on.
+aither-acp = { version = "0.30.0" }
+# The sandbox ACP agents and their terminal commands run in; the version
+# aither-sandbox builds its own sandboxes with.
+heel = { version = "0.9.5", default-features = false }
+
+# ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
+acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
+
+# repo-search daemon client; its crate version is 0.0.9 inside the
+# v0.0.14 binary pinned in `src/tools/host-programs.json`. Not published
+# past 0.0.4 on crates.io.
+repo-search-client = { git = "https://github.com/May-Agent/repo-search", branch = "main", default-features = false, features = ["launcher"] }
+async-lock = "3"
 
 # Container runtime (Docker/OrbStack/Podman)
-bollard = "0.20"
+bollard = "0.21"
 tar = "0.4"
 flate2 = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# The tool distribution's artifacts: versions, xz archives, concurrent loads.
+semver = { version = "1.0.28", features = ["serde"] }
+percent-encoding = "2.3"
+lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz"] }
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -41,8 +82,14 @@ async-stream = "0.3"
 event-listener = "5"
 executor-core = { version = "0.7", features = ["tokio"] }
 async-fs = "2.1"
+async-io = "2.6"
+async-process = "2.5"
+humantime = { version = "2.4", default-features = false }
+async-net = "2"
 async-channel = "2"
+strsim = { version = "0.11", default-features = false }
 blocking = "1"
+terminal-colorsaurus = { version = "1.0.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -51,33 +98,43 @@ serde_json = "1.0"
 serde_yml = "0.0.12"
 rmp-serde = "1.3"
 toml = "0.8"
-quick-xml = { version = "0.37", features = ["serialize"] }
 dashmap = "6"
+# Partial JSON repair for streaming tool-call argument projection.
+partial-json-fixer = "0.5"
 
 # Utils
 jiff = { version = "0.2", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
 petname = "2"
-hostname = "0.4"
 cron = "0.15"
 chrono = "0.4"
 shell-escape = "0.1"
 shell-words = "1.1"
-arc-swap = "1"
+arc-swap = { version = "1", features = ["weak"] }
+aho-corasick = { version = "1.1.5", features = ["std", "perf-literal"] }
+whatlang = { version = "0.18", default-features = false }
+similar = "3"
 fastrand = "2"
 
 # Web Push notifications
 web-push = "0.11"
 p256 = "0.13"
 dirs = "6"
+which = { version = "8", default-features = false }
+shlex = "2"
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+getrandom = "0.4"
 
-# Markdown parsing (incremental/streaming)
+# Markdown parsing
+# - streamdown-parser: incremental / streaming renderer for assistant output
+# - pulldown-cmark: CommonMark AST parser for structured input (checklists,
+#   prompt @-mentions, tasks.md, etc.) where one-shot correctness matters
+#   more than streaming
 streamdown-parser = "0.1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # TUI
 ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
@@ -94,16 +151,25 @@ open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # HTTP client for fetching images
-zenwave = { path = "../zenwave" }
-hyper = { version = "1", features = ["server", "http1"] }
+zenwave = "0.7"
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# hyper over futures-io streams, for daemon connections outside tokio
+smol-hyper = { version = "0.1.1", default-features = false }
 http-body-util = "0.1"
 
 # Browser automation (CDP) and WebRTC live streaming
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 chromiumoxide_fetcher = "0.9.1"
 webrtc = "0.17"
-openh264 = "0.9"
+# webrtc-rs interceptors are `async_trait` traits.
+async-trait = { version = "0.1.92", default-features = false }
+# Hardware H.264 (software AV1 on hosts without an encoder) and the
+# platform JPEG decode that feeds it.
+mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "dev", default-features = false, features = ["software-encode"] }
+# RGB/BGRA to NV12 for the frames that cannot go to the encoder as surfaces;
+# already in the lockfile through mediax-codec.
+yuv = { version = "0.8", default-features = false }
 
 # GStreamer encoding (optional, runtime-detected, user installs GStreamer)
 gstreamer = { version = "0.23", optional = true }
@@ -111,8 +177,11 @@ gstreamer-app = { version = "0.23", optional = true }
 gstreamer-video = { version = "0.23", optional = true }
 
 # Web server for `may ui`
-skyzen = { path = "../skyzen", features = ["hyper"] }
-skyzen-services = { path = "../skyzen/services", features = ["runtime-tokio-rustls", "sqlite"] }
+skyzen = { version = "0.5.1", features = ["hyper"] }
+# The daemon serves the router itself and renders errors as skyzen does.
+skyzen-core = "0.2"
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+skyzen-services = { version = "0.3.1", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # File picker
 nucleo = "0.5"
@@ -120,34 +189,70 @@ ignore = "0.4"
 
 # Logging
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
+
+# Per-session open lock (flock)
+fd-lock = "4.0.4"
 
 # Templating
-askama = "0.15"
+askama = "0.16"
+
+# Shell parsing: terminal calls are read before they run
+brush-parser = { version = "0.3.0", default-features = false }
 
 # Embedded resources
 include_dir = "0.7"
 itertools = "0.14.0"
 tempfile = "3.24.0"
 git2 = "0.20.3"
+mime = "0.3"
 mime_guess = "2"
 rustls = { version = "0.23", features = ["ring"] }
 regex = "1.12"
 globset = "0.4"
 notify = "8"
 fs_extra = "1.3"
-sqlparser = "0.58.0"
 walkdir = "2"
+sha2 = "0.10"
+hmac = { version = "0.12", default-features = false }
+subtle = { version = "2.6", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-# Session retrieval index
-lancedb = { version = "0.23.1", default-features = false }
-lance-index = "1.0.1"
-arrow-array = "56.2"
-arrow-schema = "56.2"
+dunce = "1.0.5"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
+linkify = { version = "0.11.0", default-features = false }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+clap_complete = { version = "4.6.11", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
+# that arboard's get_image performs on every clipboard image.
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
+waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false, features = ["display-stream"] }
+waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false }
+waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false }
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
-serial_test = "3"
+# File locks, so the E2E tests that share host state stay serial across the
+# processes nextest runs them in.
+serial_test = { version = "3.5.0", default-features = false, features = ["async", "file_locks"] }
+# Builds the tar.xz artifacts the distribution tests extract.
+lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
+# Checks that every model-facing id word is one o200k_base token.
+tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio-test = "0.4"
+# Places jobs in a container or on a remote host for the memory guard's tests.
+aither-sandbox = { version = "0.30.0", features = ["test-util"] }
 
 [workspace.lints]
 rust.missing_docs = "warn"
@@ -162,7 +267,74 @@ clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "warn"
 clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
+# A raw line-count cap fights the deliberately linear structure of the TUI draw
+# and event-dispatch passes; splitting them at an arbitrary boundary adds
+# indirection without a real abstraction.
+clippy.too_many_lines = { level = "allow", priority = 1 }
+# Flag groups appear naturally in serde wire structs and TUI state; packing
+# them into bitflags/enums would obscure the declared shape.
+clippy.struct_excessive_bools = { level = "allow", priority = 1 }
+# serde's `skip_serializing_if` expects predicates of the form `fn(&T) -> bool`;
+# the suggested by-value signature cannot satisfy that contract.
+clippy.trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
+# u64 -> f64 casts in usage-metric rate calculations are intentional; the only
+# conversion path is `as`, and counter magnitudes never approach 2^53.
+clippy.cast_precision_loss = { level = "allow", priority = 1 }
 
 
 [lints]
 workspace = true
+
+# Baseline tool preparation hashes and inflates ~120 MB of pinned tool
+# artifacts before every agent is built; unoptimized, these crates make that
+# take seconds in dev and test builds.
+# The software AV1 encoder (hosts without a hardware encoder) is unusable
+# unoptimized: seconds per 640x360 frame in dev and test builds. Its generic
+# code is instantiated in mediax-codec, which needs the same level.
+[profile.dev.package.rav1e]
+opt-level = 3
+
+[profile.dev.package.mediax-codec]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.zip]
+opt-level = 3
+
+[profile.dev.package.tar]
+opt-level = 3
+
+[profile.dev.package.lzma-rust2]
+opt-level = 3
+
+# The aither redesign (May-Agent/aither#593) is released once, as a whole;
+# until then May follows aither's main branch.
+[patch.crates-io]
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-agent = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-patch = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-codex = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-models = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-browser = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-sed = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main" }

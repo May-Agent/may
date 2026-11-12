@@ -3,7 +3,19 @@
 use crate::MayConfig;
 use crate::ask_user::{AskUserRequest, Question};
 use crate::config::ProviderType;
+use crate::session::PersistedSecretRequest;
+use crate::session::import::ForeignSessionSummary;
 use crate::workspace_request::WorkspaceRequest;
+
+/// Which sessions the session popup lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionView {
+    /// Pinned, running and recently used sessions (`/session`).
+    #[default]
+    Recent,
+    /// Archived sessions (`/archive`); opening one makes it recent again.
+    Archive,
+}
 
 /// Application mode.
 #[derive(Debug)]
@@ -22,14 +34,30 @@ pub enum AppMode {
     Config,
     /// Quick model selector popup (anchored near input)
     ModelSelect,
+    /// Reasoning-effort selector popup (`/effort`)
+    EffortSelect,
     /// Model picker for tier configuration in Config screen
     TierModelPicker,
     /// GitHub Copilot OAuth authentication
     CopilotAuth,
+    /// `ChatGPT` subscription OAuth authentication
+    ChatgptAuth,
+    /// `/login` provider picker
+    Login,
+    /// `/connect` picker for ACP agents
+    Connect(super::connect::ConnectState),
+    /// xAI Grok OAuth authentication
+    GrokAuth,
+    /// `OpenRouter` OAuth authentication
+    OpenrouterAuth,
     /// Permission approval dialog for elevated terminal modes.
     PermissionConfirm(PermissionConfirmState),
     /// Workspace access confirmation dialog
     WorkspaceConfirm(WorkspaceConfirmState),
+    /// Startup prompt offering read/write access to the launch directory
+    LaunchGrant(LaunchGrantState),
+    /// Startup prompt deciding the launch repository's trust level
+    RepoTrust(RepoTrustState),
     /// MCP server management overlay
     McpManage,
     /// SSH server management overlay
@@ -40,20 +68,259 @@ pub enum AppMode {
     SkillManage,
     /// Profile switcher popup
     ProfileSelect,
+    /// Rewind picker: restore the conversation (and optionally the code)
+    /// to the point before a user prompt
+    Rewind(RewindState),
+    /// `/resume-claude` picker over Claude Code transcripts
+    ResumePicker(ResumePickerState),
+    /// Background jobs and running subagents viewer
+    Jobs,
+    /// Detail view of one background job or subagent run
+    JobDetail(JobDetailState),
+    /// `/btw` side-question overlay: answered outside conversation history
+    Btw(BtwState),
+    /// `/progress` overlay: the remaining work with a progress bar
+    Progress(ProgressState),
+    /// Zoomed image overlay (click an inline image to open)
+    ImageView(ImageViewState),
+    /// Quit confirmation shown while the session's agent still runs
+    QuitConfirm(QuitConfirmState),
+}
+
+/// State for the zoomed image overlay.
+#[derive(Debug, Clone)]
+pub struct ImageViewState {
+    /// Key of the decoded image in `App::image_cache`.
+    pub key: String,
+    /// Path or URL shown under the image.
+    pub caption: String,
+}
+
+impl AppMode {
+    /// Stable name of the current mode for diagnostics.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::SessionSelect => "session-select",
+            Self::FilePicker => "file-picker",
+            Self::Help => "help",
+            Self::ToolDetail => "tool-detail",
+            Self::Config => "config",
+            Self::ModelSelect => "model-select",
+            Self::EffortSelect => "effort-select",
+            Self::TierModelPicker => "tier-model-picker",
+            Self::CopilotAuth => "copilot-auth",
+            Self::ChatgptAuth => "chatgpt-auth",
+            Self::Login => "login",
+            Self::Connect(_) => "connect",
+            Self::GrokAuth => "grok-auth",
+            Self::OpenrouterAuth => "openrouter-auth",
+            Self::PermissionConfirm(_) => "permission-confirm",
+            Self::WorkspaceConfirm(_) => "workspace-confirm",
+            Self::LaunchGrant(_) => "launch-grant",
+            Self::RepoTrust(_) => "repo-trust",
+            Self::McpManage => "mcp-manage",
+            Self::SshManage => "ssh-manage",
+            Self::AskUser(_) => "ask-user",
+            Self::SkillManage => "skill-manage",
+            Self::ProfileSelect => "profile-select",
+            Self::Rewind(_) => "rewind",
+            Self::ResumePicker(_) => "resume-picker",
+            Self::Jobs => "jobs",
+            Self::JobDetail(_) => "job-detail",
+            Self::Btw(_) => "btw",
+            Self::Progress(_) => "progress",
+            Self::ImageView(_) => "image-view",
+            Self::QuitConfirm(_) => "quit-confirm",
+        }
+    }
+}
+
+/// State of the quit confirmation: the screen the user was on when they
+/// asked to quit, restored when they cancel it.
+#[derive(Debug)]
+pub struct QuitConfirmState {
+    /// Mode to go back to when the quit is cancelled.
+    pub return_to: Box<AppMode>,
+}
+
+/// `/btw` overlay state: type a question, stream a one-off answer.
+#[derive(Debug, Clone, Default)]
+pub struct BtwState {
+    /// Question text being typed, then the submitted question.
+    pub input: String,
+    /// Answer streamed back so far.
+    pub answer: String,
+    /// A request is in flight.
+    pub loading: bool,
+    /// The request finished (answer complete) or failed.
+    pub done: bool,
+    /// Failure text when the request failed.
+    pub error: Option<String>,
+    /// Scroll offset (lines) for long answers.
+    pub scroll: u16,
+}
+
+/// `/progress` overlay state: one request, then the report it returns.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressState {
+    /// The request is in flight.
+    pub loading: bool,
+    /// The report once it arrived.
+    pub report: Option<crate::daemon::ProgressReport>,
+    /// Failure text when the request failed.
+    pub error: Option<String>,
+    /// Scroll offset (lines) for a long report.
+    pub scroll: u16,
+}
+
+/// What the job-detail view is showing.
+#[derive(Debug, Clone, Copy)]
+pub enum JobDetailTarget {
+    /// A background terminal job — output is fetched live by pid.
+    Job(u32),
+    /// A tracked `subagent` run — stats refresh from the tracker.
+    Subagent(u64),
+}
+
+/// State for the job/subagent detail view.
+#[derive(Debug)]
+pub struct JobDetailState {
+    /// Which entry the view follows.
+    pub target: JobDetailTarget,
+    /// Latest job info for a `Job` target; `None` once the pid is gone.
+    pub job: Option<aither_sandbox::JobInfo>,
+    /// Latest buffered output for a `Job` target.
+    pub output: Option<Vec<u8>>,
+    /// Latest snapshot for a `Subagent` target; kept after the run ends.
+    pub subagent: Option<crate::agent::SubagentRunSnapshot>,
+    /// Whether the followed entry has finished.
+    pub finished: bool,
+    /// Scroll offset into the rendered body.
+    pub scroll: usize,
+    /// Last time the view refreshed its data.
+    pub refreshed: Option<std::time::Instant>,
+}
+
+impl JobDetailState {
+    /// Empty detail state for `target`.
+    #[must_use]
+    pub const fn new(target: JobDetailTarget) -> Self {
+        Self {
+            target,
+            job: None,
+            output: None,
+            subagent: None,
+            finished: false,
+            scroll: 0,
+            refreshed: None,
+        }
+    }
+}
+
+/// One rewindable prompt: a user message plus the code changes the turn
+/// it started is known to have made.
+#[derive(Debug, Clone)]
+pub struct RewindPrompt {
+    /// Position of the persisted user message in session history; the
+    /// rewind cut point.
+    pub history_index: usize,
+    /// Full prompt text (restored into the input box on rewind).
+    pub content: String,
+    /// Attachments carried by the prompt (restored with the text).
+    pub attachments: Vec<crate::tui::queue::Attachment>,
+    /// Files changed by the turn this prompt started (all roots), when
+    /// the turn's tool calls are still in the stream.
+    pub files: usize,
+    /// Total added lines.
+    pub additions: usize,
+    /// Total deleted lines.
+    pub deletions: usize,
+}
+
+/// Searchable Claude Code session picker opened by `/resume-claude`.
+#[derive(Debug)]
+pub struct ResumePickerState {
+    /// Transcripts, newest mtime first.
+    pub sessions: Vec<ForeignSessionSummary>,
+    /// Cursor in the filtered list.
+    pub selected: usize,
+    /// Filter over title, cwd, and id.
+    pub search: String,
+    /// Listing is still running off the event loop.
+    pub loading: bool,
+}
+
+impl ResumePickerState {
+    /// Empty picker shown while transcripts are listed.
+    #[must_use]
+    pub const fn loading() -> Self {
+        Self {
+            sessions: Vec::new(),
+            selected: 0,
+            search: String::new(),
+            loading: true,
+        }
+    }
+
+    /// Indices into `sessions` matching `search` (title, cwd, id).
+    #[must_use]
+    pub fn filtered(&self) -> Vec<usize> {
+        if self.search.is_empty() {
+            return (0..self.sessions.len()).collect();
+        }
+        let query = self.search.to_lowercase();
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                session.title.to_lowercase().contains(&query)
+                    || session.id.to_lowercase().contains(&query)
+                    || session
+                        .cwd
+                        .as_ref()
+                        .is_some_and(|cwd| cwd.to_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
+/// Rewind picker state: first pick a prompt, then the restoration scope.
+#[derive(Debug)]
+pub struct RewindState {
+    /// User prompts, oldest first.
+    pub targets: Vec<RewindPrompt>,
+    /// Cursor position; `targets.len()` is the trailing `(current)` entry,
+    /// which selects nothing and simply closes the picker.
+    pub selected: usize,
 }
 
 /// Per-question interaction state.
 pub struct AskUserQuestionState {
-    /// Cursor position in the option list (includes extra items: skip, custom).
+    /// Cursor position in the option list (includes the extra custom item).
     pub cursor: usize,
     /// Selected option indices (for the predefined options).
     pub selections: Vec<usize>,
     /// Whether the user is typing a custom answer.
     pub custom_mode: bool,
-    /// Custom answer text buffer.
+    /// Custom answer text buffer; the secret value of a secret question.
     pub custom_text: String,
-    /// Whether this question was skipped.
-    pub skipped: bool,
+    /// The user declined to give the secret this question asks for.
+    pub declined: bool,
+}
+
+impl std::fmt::Debug for AskUserQuestionState {
+    /// Without the text buffer, which may hold a secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskUserQuestionState")
+            .field("cursor", &self.cursor)
+            .field("selections", &self.selections)
+            .field("custom_mode", &self.custom_mode)
+            .field("declined", &self.declined)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AskUserQuestionState {
@@ -63,6 +330,14 @@ impl Default for AskUserQuestionState {
 }
 
 impl AskUserQuestionState {
+    /// Whether the user chose an option, wrote a text or declined a secret.
+    /// Nothing else answers a question.
+    #[must_use]
+    pub fn is_answered(&self) -> bool {
+        self.declined || !self.selections.is_empty() || !self.custom_text.trim().is_empty()
+    }
+
+    /// Create empty question state.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -70,7 +345,7 @@ impl AskUserQuestionState {
             selections: Vec::new(),
             custom_mode: false,
             custom_text: String::new(),
-            skipped: false,
+            declined: false,
         }
     }
 }
@@ -81,17 +356,21 @@ impl std::fmt::Debug for AskUserState {
         f.debug_struct("AskUserState")
             .field("question_count", &self.questions.len())
             .field("current_question", &self.current_question)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
+/// Live `ask_user` interaction state (request id, question states, focus).
 pub struct AskUserState {
     /// Stable persisted request identifier.
     pub request_id: String,
-    /// The original request (holds the response channel).
-    pub request: AskUserRequest,
+    /// The prompt a run is blocked on (holds the response channel); `None`
+    /// for an open question, which no run waits on.
+    pub request: Option<AskUserRequest>,
     /// Normalized list of questions.
     pub questions: Vec<Question>,
+    /// The secret each question collects, parallel to `questions`.
+    pub secrets: Vec<Option<PersistedSecretRequest>>,
     /// Current question index.
     pub current_question: usize,
     /// Per-question state.
@@ -99,8 +378,40 @@ pub struct AskUserState {
 }
 
 impl AskUserState {
+    /// Build interaction state for `request` and its `questions`.
     #[must_use]
     pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
+        let secrets = questions.iter().map(|_| None).collect();
+        Self::build(request_id, Some(request), questions, secrets)
+    }
+
+    /// Build interaction state for the open question `open`.
+    #[must_use]
+    pub fn for_open_question(open: crate::session::PersistedAskUserRequest) -> Self {
+        let (questions, secrets) = open
+            .questions
+            .into_iter()
+            .map(|question| {
+                (
+                    Question {
+                        section: question.section,
+                        question: question.question,
+                        option: question.option,
+                        multi_select: question.multi_select,
+                    },
+                    question.secret,
+                )
+            })
+            .unzip();
+        Self::build(open.id, None, questions, secrets)
+    }
+
+    fn build(
+        request_id: String,
+        request: Option<AskUserRequest>,
+        questions: Vec<Question>,
+        secrets: Vec<Option<PersistedSecretRequest>>,
+    ) -> Self {
         let states = questions
             .iter()
             .map(|_| AskUserQuestionState::new())
@@ -109,6 +420,7 @@ impl AskUserState {
             request_id,
             request,
             questions,
+            secrets,
             current_question: 0,
             question_states: states,
         }
@@ -132,10 +444,16 @@ impl AskUserState {
     }
 
     /// Total number of items in the list for current question:
-    /// options + "Skip" + "Custom answer"
+    /// options + "Custom answer"
     #[must_use]
     pub fn current_item_count(&self) -> usize {
-        self.current().map_or(0, |q| q.option.len() + 2)
+        self.current().map_or(0, |q| q.option.len() + 1)
+    }
+
+    /// The secret the current question collects, if it asks for one.
+    #[must_use]
+    pub fn current_secret(&self) -> Option<&PersistedSecretRequest> {
+        self.secrets.get(self.current_question)?.as_ref()
     }
 
     /// Whether there are multiple questions.
@@ -145,16 +463,74 @@ impl AskUserState {
     }
 }
 
+/// Startup prompt offering to grant the agent read/write access to the
+/// directory May was launched in.
 #[derive(Debug)]
-pub struct WorkspaceConfirmState {
-    pub request_id: String,
-    pub request: WorkspaceRequest,
+pub struct LaunchGrantState {
+    /// The launch directory being offered.
+    pub path: std::path::PathBuf,
+    /// `workspace.toml` the decision is written to.
+    pub config_path: std::path::PathBuf,
+    /// `/permission` re-asks an answered gate: Esc cancels rather than
+    /// downgrading a recorded decision.
+    pub redecide: bool,
+    /// Cursor over the grant options — grant first, read-only second.
+    pub selected: usize,
 }
 
+/// Startup prompt deciding the launch repository's trust level. The
+/// option list renders through the `ask_user` sheet; the answer is
+/// persisted by the client and never reaches the agent.
+#[derive(Debug)]
+pub struct RepoTrustState {
+    /// The option-list sheet state.
+    pub ask: AskUserState,
+    /// The repository's worktree root.
+    pub worktree: std::path::PathBuf,
+    /// Whether the remote is GitHub-backed.
+    pub kind: crate::trust::RepoKind,
+    /// `workspace.toml` the decision is written to.
+    pub config_path: std::path::PathBuf,
+    /// `/permission` re-asks an answered gate: no `exit` option and Esc
+    /// cancels instead of quitting.
+    pub redecide: bool,
+}
+
+/// Pending workspace-access confirmation shown in the TUI.
+#[derive(Debug)]
+pub struct WorkspaceConfirmState {
+    /// Persisted request id.
+    pub request_id: String,
+    /// Directory the agent asks for.
+    pub path: String,
+    /// Why it asks.
+    pub reason: String,
+    /// The in-process request to answer; `None` when the agent runs in the
+    /// daemon, which holds the waiting request.
+    pub request: Option<WorkspaceRequest>,
+}
+
+/// Pending permission confirmation shown in the TUI.
 #[derive(Debug)]
 pub struct PermissionConfirmState {
+    /// ID of the pending permission request being confirmed.
     pub request_id: String,
+    /// The permission request being confirmed.
     pub request: crate::session::PersistedPermissionRequestPayload,
+    /// Whether the raw script shows instead of the reading.
+    pub show_script: bool,
+}
+
+impl PermissionConfirmState {
+    /// The reading the dialog shows, unless the raw script was asked for
+    /// or May recognised nothing in the script.
+    #[must_use]
+    pub fn shown_reading(&self) -> Option<&crate::command_reading::CommandReading> {
+        self.request
+            .reading
+            .as_ref()
+            .filter(|reading| reading.recognises_any() && !self.show_script)
+    }
 }
 
 /// Status of Copilot OAuth authentication flow.
@@ -164,7 +540,9 @@ pub enum CopilotAuthStatus {
     RequestingCode,
     /// Waiting for user to authorize in browser
     WaitingForUser {
+        /// User code shown for device authorization.
         user_code: String,
+        /// URL the user must visit to authorize.
         verification_uri: String,
     },
     /// Successfully authenticated
@@ -172,6 +550,111 @@ pub enum CopilotAuthStatus {
     /// Authentication failed
     Failed(String),
 }
+
+/// Status of `ChatGPT` OAuth authentication flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatgptAuthStatus {
+    /// Talking to the `OpenAI` auth service (requesting a device code).
+    Working,
+    /// Browser flow: waiting for the user to authorize; the loopback listener
+    /// on localhost:1455 will receive the callback.
+    WaitingForCallback {
+        /// Loopback URL shown to the user while awaiting the callback.
+        url: String,
+    },
+    /// Device flow (SSH/headless): user authorizes on the verification page.
+    WaitingForUser {
+        /// User code shown for device authorization.
+        user_code: String,
+        /// URL the user must visit to authorize.
+        verification_uri: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Status of xAI Grok OAuth authentication flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrokAuthStatus {
+    /// Requesting device code from xAI
+    RequestingCode,
+    /// Waiting for user to authorize on the verification page
+    WaitingForUser {
+        /// User code shown for device authorization.
+        user_code: String,
+        /// URL the user must visit to authorize.
+        verification_uri: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Status of `OpenRouter` OAuth login flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenrouterAuthStatus {
+    /// Building the authorization URL / binding the callback listener.
+    Working,
+    /// Waiting for the browser callback on localhost:54549.
+    WaitingForCallback {
+        /// Authorization URL shown to the user.
+        url: String,
+    },
+    /// Manual entry: the loopback callback cannot reach this machine, so the
+    /// user pastes the redirect URL, the code, or an `sk-or-` key.
+    ManualEntry {
+        /// Authorization URL shown to the user.
+        url: String,
+        /// Input buffer collecting the pasted text.
+        input: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Which screen an OAuth flow returns to when it closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthReturn {
+    /// Back to the settings screen (flow started from a provider row).
+    Config,
+    /// Back to the `/login` picker (flow started there).
+    Login,
+}
+
+/// One entry in the `/login` provider picker.
+#[derive(Debug, Clone, Copy)]
+pub struct LoginProvider {
+    /// Stable identifier dispatched on selection.
+    pub id: &'static str,
+    /// Display name.
+    pub name: &'static str,
+    /// What the sign-in unlocks.
+    pub detail: &'static str,
+}
+
+/// Providers offered by `/login`, in display order.
+pub const LOGIN_PROVIDERS: &[LoginProvider] = &[
+    LoginProvider {
+        id: "chatgpt",
+        name: "OpenAI",
+        detail: "ChatGPT Plus/Pro subscription (Codex)",
+    },
+    LoginProvider {
+        id: "grok",
+        name: "xAI Grok",
+        detail: "SuperGrok / X Premium+ subscription",
+    },
+    LoginProvider {
+        id: "openrouter",
+        name: "OpenRouter",
+        detail: "one key for every model",
+    },
+];
 
 /// Character filter for paste validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,15 +686,20 @@ impl PasteFilter {
 }
 
 /// Represents an active text input field for paste handling.
+#[derive(Debug)]
 pub enum ActiveTextInput<'a> {
     /// Input with cursor position tracking (insert at cursor)
     Cursored {
+        /// The buffer being edited.
         input: &'a mut String,
+        /// Cursor position within the buffer.
         cursor: &'a mut usize,
     },
     /// Simple input (append at end) with character filter
     Simple {
+        /// The buffer being edited.
         input: &'a mut String,
+        /// Filter deciding which characters are accepted.
         filter: PasteFilter,
     },
 }
@@ -219,29 +707,182 @@ pub enum ActiveTextInput<'a> {
 /// A visual cursor position in the rendered chat viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionPoint {
+    /// Line in the rendered viewport.
     pub line: usize,
+    /// Column in the rendered viewport.
     pub column: usize,
 }
 
 /// Drag selection in rendered chat content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextSelection {
+    /// Fixed end of the selection.
     pub anchor: SelectionPoint,
+    /// Moving end of the selection.
     pub cursor: SelectionPoint,
 }
 
 impl TextSelection {
+    /// Whether the selection covers zero cells.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.anchor == self.cursor
     }
 
+    /// (start, end) ordering of the selection ends.
     #[must_use]
     pub fn normalized(&self) -> (SelectionPoint, SelectionPoint) {
         if (self.anchor.line, self.anchor.column) <= (self.cursor.line, self.cursor.column) {
             (self.anchor, self.cursor)
         } else {
             (self.cursor, self.anchor)
+        }
+    }
+
+    /// Word-shaped selection covering `point.column` in `text`: the maximal
+    /// run of same-class characters around it. `None` when the column lands
+    /// past the line's content.
+    #[must_use]
+    pub fn word_at(text: &str, point: SelectionPoint) -> Option<Self> {
+        let chars: Vec<char> = text.chars().collect();
+        if point.column >= chars.len() {
+            return None;
+        }
+        let word = is_word_char(chars[point.column]);
+        let start = (0..point.column)
+            .rev()
+            .find(|&i| is_word_char(chars[i]) != word)
+            .map_or(0, |i| i + 1);
+        let end = (point.column + 1..chars.len())
+            .find(|&i| is_word_char(chars[i]) != word)
+            .unwrap_or(chars.len());
+        Some(Self {
+            anchor: SelectionPoint {
+                line: point.line,
+                column: start,
+            },
+            cursor: SelectionPoint {
+                line: point.line,
+                column: end,
+            },
+        })
+    }
+}
+
+/// Character class a double-click expands over: word characters form runs,
+/// everything else (whitespace, punctuation) forms runs of its own.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// A status-line notice. Transient notices carry a deadline and clear once
+/// it passes; a persistent notice is live state (a quota-reset wait) and
+/// stays until its owner clears it.
+#[derive(Debug, Clone)]
+pub struct StatusNotice {
+    /// Text shown in the status line.
+    pub text: String,
+    /// Deadline after which the notice clears; `None` marks a persistent
+    /// notice.
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl StatusNotice {
+    /// A notice that clears itself `lifetime` after creation.
+    pub fn transient(text: impl Into<String>, lifetime: std::time::Duration) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: Some(std::time::Instant::now() + lifetime),
+        }
+    }
+
+    /// A notice that stays until cleared explicitly — live state, not a
+    /// flash; only owners that know why it exists may set it.
+    pub fn persistent(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: None,
+        }
+    }
+
+    /// Whether the notice survives until cleared explicitly.
+    #[must_use]
+    pub const fn is_persistent(&self) -> bool {
+        self.expires_at.is_none()
+    }
+
+    /// Whether the notice's deadline passed at `now`. Persistent notices
+    /// never expire.
+    #[must_use]
+    pub fn expired(&self, now: std::time::Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Drop the notice in `slot` once its deadline has passed. Event-loop
+    /// ticks call this so a transient notice disappears without user input.
+    pub fn clear_expired(slot: &mut Option<Self>, now: std::time::Instant) {
+        if slot.as_ref().is_some_and(|notice| notice.expired(now)) {
+            *slot = None;
+        }
+    }
+}
+
+/// How long the context meter reads `Compacted` before the new usage.
+///
+/// Long enough to notice at a glance while working
+/// elsewhere in the terminal, short enough that the figure it hides is
+/// back before the user wonders about it.
+pub const COMPACTED_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What the status bar's context meter shows: the usage figure, or the
+/// state of a compaction in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionMeter {
+    /// No compaction to report: the meter shows the context usage.
+    #[default]
+    Idle,
+    /// A compaction is running.
+    Compacting,
+    /// A compaction finished; the meter reads `Compacted` until `until`.
+    Compacted {
+        /// When the meter returns to the usage figure.
+        until: std::time::Instant,
+    },
+}
+
+impl CompactionMeter {
+    /// Follow the compaction to `phase`, reported at `now`. Only a compaction
+    /// that replaced the context reads `Compacted`; any other end returns the
+    /// meter to the usage figure.
+    pub fn apply(&mut self, phase: crate::client::CompactionPhase, now: std::time::Instant) {
+        use crate::client::CompactionPhase;
+        *self = match phase {
+            CompactionPhase::Started => Self::Compacting,
+            CompactionPhase::Applied => Self::Compacted {
+                until: now + COMPACTED_HOLD,
+            },
+            CompactionPhase::NothingToCompact
+            | CompactionPhase::Failed
+            | CompactionPhase::Discarded => Self::Idle,
+        };
+    }
+
+    /// Return to the usage figure, as when the session changes.
+    pub const fn cancel(&mut self) {
+        *self = Self::Idle;
+    }
+
+    /// Whether `Compacted` is on screen, so ticks redraw until it clears.
+    #[must_use]
+    pub const fn is_holding(self) -> bool {
+        matches!(self, Self::Compacted { .. })
+    }
+
+    /// Return to the usage figure once the hold has passed at `now`; ticks
+    /// call this.
+    pub fn clear_expired(&mut self, now: std::time::Instant) {
+        if matches!(*self, Self::Compacted { until } if now >= until) {
+            *self = Self::Idle;
         }
     }
 }
@@ -283,9 +924,12 @@ pub enum SkillAddMode {
 /// Config section tabs (like Claude Code's /config).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigSection {
+    /// Provider list section.
     #[default]
     Providers,
+    /// Model selection section.
     Models,
+    /// Preferences section.
     Preferences,
 }
 
@@ -331,9 +975,19 @@ pub enum ConfigEditMode {
     #[default]
     None,
     /// Editing a text field (provider API key, base URL, etc.)
-    Text { input: String, cursor: usize },
+    Text {
+        /// Current text being edited.
+        input: String,
+        /// Cursor position within `input`, in characters.
+        cursor: usize,
+    },
     /// Selecting from a list (provider type, model list)
-    List { items: Vec<String>, selected: usize },
+    List {
+        /// Selectable items.
+        items: Vec<String>,
+        /// Index of the highlighted item.
+        selected: usize,
+    },
     /// Editing a custom provider (name, `base_url`, `api_key`)
     CustomProvider {
         /// Which field is focused (0=name, `1=base_url`, `2=api_key`)
@@ -353,7 +1007,18 @@ pub enum ConfigEditMode {
     },
 }
 
+/// Which setting the config screen's text edit writes to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfigTextTarget {
+    /// The selected row's primary value: API key, model list, preference.
+    #[default]
+    Primary,
+    /// The selected provider's cache lifetime.
+    CacheLifetime,
+}
+
 /// Unified config state for all sections.
+#[derive(Debug)]
 pub struct ConfigState {
     /// Current section (Tab to switch)
     pub section: ConfigSection,
@@ -361,6 +1026,8 @@ pub struct ConfigState {
     pub selected: usize,
     /// Edit mode (text input, list selection, or none)
     pub edit_mode: ConfigEditMode,
+    /// Setting the active text edit writes to
+    pub text_target: ConfigTextTarget,
     /// Cached provider list for display
     pub provider_ids: Vec<String>,
     /// Whether we detected API key from env var
@@ -375,6 +1042,7 @@ impl Default for ConfigState {
             section: ConfigSection::Providers,
             selected: 0,
             edit_mode: ConfigEditMode::None,
+            text_target: ConfigTextTarget::default(),
             provider_ids: Vec::new(),
             key_from_env: false,
             key_env_var_name: None,
@@ -394,8 +1062,8 @@ impl ConfigState {
     pub const fn row_count(&self, _config: &MayConfig) -> usize {
         match self.section {
             ConfigSection::Providers => self.provider_ids.len() + 1,
-            ConfigSection::Models => 4,
-            ConfigSection::Preferences => 3,
+            ConfigSection::Models => 5,
+            ConfigSection::Preferences => 4,
         }
     }
 
@@ -407,6 +1075,7 @@ impl ConfigState {
 
     /// Start text editing mode.
     pub fn start_text_edit(&mut self, initial: &str) {
+        self.text_target = ConfigTextTarget::Primary;
         let len = initial.len();
         self.edit_mode = ConfigEditMode::Text {
             input: initial.to_string(),
@@ -416,6 +1085,7 @@ impl ConfigState {
 
     /// Cancel editing.
     pub fn cancel_edit(&mut self) {
+        self.text_target = ConfigTextTarget::Primary;
         self.edit_mode = ConfigEditMode::None;
     }
 
@@ -451,6 +1121,8 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
         ProviderType::Mistral => &["MISTRAL_API_KEY"][..],
         ProviderType::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
         ProviderType::Copilot
+        | ProviderType::Chatgpt
+        | ProviderType::Grok
         | ProviderType::Ollama
         | ProviderType::LMStudio
         | ProviderType::Custom => return None,
@@ -464,4 +1136,124 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
         }
     }
     None
+}
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{ResumePickerState, SelectionPoint, StatusNotice, TextSelection};
+
+    fn point(line: usize, column: usize) -> SelectionPoint {
+        SelectionPoint { line, column }
+    }
+
+    #[test]
+    fn word_at_selects_the_word_run_around_the_column() {
+        // Inside the word — the whole word is covered, whichever char is hit.
+        for column in [2, 3, 4, 5] {
+            let sel = TextSelection::word_at("a word here", point(0, column))
+                .expect("column lands on 'word'");
+            assert_eq!(
+                sel.normalized(),
+                (point(0, 2), point(0, 6)),
+                "column {column}"
+            );
+        }
+
+        // Word run at line start and line end.
+        let sel = TextSelection::word_at("first second", point(0, 0)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 0), point(0, 5)));
+        let sel = TextSelection::word_at("first second", point(0, 11)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 6), point(0, 12)));
+    }
+
+    #[test]
+    fn word_at_treats_underscore_as_word_and_selects_punctuation_runs() {
+        let sel = TextSelection::word_at("foo_bar baz", point(0, 4)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 0), point(0, 7)));
+
+        // A click on punctuation selects the punctuation run.
+        let sel = TextSelection::word_at("a::b", point(0, 2)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 1), point(0, 3)));
+    }
+
+    #[test]
+    fn word_at_returns_none_past_the_content() {
+        assert!(TextSelection::word_at("", point(0, 0)).is_none());
+        assert!(TextSelection::word_at("abc", point(0, 3)).is_none());
+        assert!(TextSelection::word_at("abc", point(0, 10)).is_none());
+    }
+
+    #[test]
+    fn word_at_columns_are_char_indices_not_display_cells() {
+        // Wide chars take two cells but one char index each.
+        let sel = TextSelection::word_at("你好 world", point(0, 3)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 3), point(0, 8)));
+    }
+
+    #[test]
+    fn resume_picker_filters_title_cwd_and_id() {
+        use std::path::PathBuf;
+
+        use crate::session::import::ForeignSessionSummary;
+
+        let summary = |id: &str, title: &str, cwd: &str| ForeignSessionSummary {
+            id: id.to_string(),
+            path: PathBuf::from(id),
+            cwd: Some(cwd.to_string()),
+            title: title.to_string(),
+            modified: None,
+        };
+        let sessions = vec![
+            summary("aaaa-1111", "fix the picker", "/Users/lexoliu/Coding/may"),
+            summary("bbbb-2222", "unrelated", "/tmp/other"),
+        ];
+        let picker = |search: &str| ResumePickerState {
+            sessions: sessions.clone(),
+            selected: 0,
+            search: search.to_string(),
+            loading: false,
+        };
+        assert_eq!(picker("").filtered(), vec![0, 1]);
+        assert_eq!(picker("picker").filtered(), vec![0]);
+        assert_eq!(picker("coding/may").filtered(), vec![0]);
+        assert_eq!(picker("bbbb").filtered(), vec![1]);
+    }
+
+    #[test]
+    fn transient_notice_clears_after_expiry() {
+        let mut status = Some(StatusNotice::transient(
+            "Copied selection",
+            Duration::from_secs(2),
+        ));
+
+        // Before the deadline the notice stays.
+        StatusNotice::clear_expired(&mut status, Instant::now());
+        assert!(status.is_some());
+
+        // Past the deadline the same sweep drops it.
+        StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3));
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn every_transient_notice_expires() {
+        let mut status = Some(StatusNotice::transient(
+            "^C Press Ctrl+C again to exit",
+            Duration::from_secs(2),
+        ));
+
+        StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3600));
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn persistent_notice_survives_the_sweep() {
+        let mut status = Some(StatusNotice::persistent(
+            "Usage limit reached — continuing automatically at 2am",
+        ));
+
+        StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3600));
+        assert!(status.is_some());
+    }
 }

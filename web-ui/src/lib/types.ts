@@ -1,0 +1,930 @@
+import type { UiConfigResponse } from './api/config';
+
+/** Machine-readable error codes (snake_case) emitted by the Rust backend. */
+export type ApiErrorCode =
+  | 'bad_request'
+  | 'internal_error'
+  | 'not_found'
+  | 'browser_takeover_active'
+  | 'session_not_found'
+  | 'model_not_configured'
+  | 'provider_unavailable'
+  | 'profile_configuration_invalid'
+  | 'container_preparing'
+  | 'container_build_failed'
+  | 'container_start_failed'
+  | 'container_runtime_unavailable'
+  | 'managed_podman_approval_required'
+  | 'location_unavailable'
+  | 'github_unauthenticated'
+  | 'repo_declined'
+  | 'loop_stopped';
+
+/** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
+export type ToolVariant =
+  | 'terminal'
+  | 'terminal_input'
+  | 'terminal_kill'
+  | 'terminal_read'
+  | 'browser'
+  | 'web_search'
+  | 'web_fetch'
+  | 'ask'
+  | 'session'
+  | 'task'
+  | 'compact'
+  | 'generic';
+
+export type MessageRole = 'user' | 'assistant' | 'system';
+
+export type AttachmentKind =
+  | 'image'
+  | 'document'
+  | 'text'
+  | 'file'
+  | 'pdf'
+  | 'audio'
+  | 'video';
+
+export interface ApiAttachment {
+  id: string;
+  name: string;
+  type: AttachmentKind;
+  url: string;
+  textContent?: string | null;
+}
+
+export type TerminalCommandMode = 'default' | 'unsafe';
+/** Scope of a permission request; `ssh` is still a wire value of it. */
+export type PermissionRequestMode = TerminalCommandMode | 'ssh';
+export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
+
+
+export interface RequestStats {
+  providerId?: string | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  contextWindow?: number | null;
+  elapsedMs?: number | null;
+}
+
+/** A reply translated into the communication language for display. */
+export interface ReplyTranslation {
+  text: string;
+  /** ISO 639-3 code of the communication language. */
+  language: string;
+  /** Display name of the communication language. */
+  languageName: string;
+}
+
+export interface ApiMessage {
+  id: string;
+  role: MessageRole;
+  /** The reply as the model wrote it; the original behind `translation`. */
+  content: string;
+  /** Present when the reply was not in the communication language. */
+  translation?: ReplyTranslation | null;
+  timestamp: string;
+  attachments?: ApiAttachment[];
+  thinking?: string | null;
+  isStreaming?: boolean | null;
+  isThinking?: boolean | null;
+  toolEvent?: unknown;
+  stats?: RequestStats | null;
+}
+
+// ── Session runtime (mirrors src/session/runtime.rs) ────────
+
+export type SessionRuntimeState =
+  | 'idle'
+  | 'running'
+  | 'waiting_permission'
+  | 'waiting_workspace'
+  | 'waiting_ask_user';
+
+export type SessionPlanState = 'disabled' | 'draft' | 'approved';
+
+export type PendingUserMessageMode = 'steer' | 'queue';
+
+export interface BrowserInteractionState {
+  takeoverActive?: boolean;
+  takeoverAlertPending?: boolean;
+}
+
+export interface TerminalRuntimeState {
+  taskId?: string | null;
+  outputFile?: string | null;
+  outputPreview?: string | null;
+  inputNotice?: string | null;
+  backgroundReason?: string | null;
+}
+
+export interface SessionInteractionState {
+  browser?: BrowserInteractionState;
+  terminal?: TerminalRuntimeState;
+}
+
+export interface PendingUserMessage {
+  content: string;
+  attachments?: ApiAttachment[];
+  hiddenContextXml?: unknown;
+  createdAt: string;
+  deliveryMode: PendingUserMessageMode;
+}
+
+export interface PersistedPermissionRequest {
+  id: string;
+  mode: string;
+  script: string;
+  sessionId?: string | null;
+  /** How the daemon read the script; absent for a request with no script. */
+  reading?: CommandReading | null;
+}
+
+export type DiffOp = 'context' | 'added' | 'removed';
+
+export interface DiffLine {
+  op: DiffOp;
+  text: string;
+  old?: number | null;
+  new?: number | null;
+}
+
+export interface DiffHunk {
+  anchor?: string | null;
+  lines: DiffLine[];
+}
+
+export type FileChange =
+  | { kind: 'add'; lines: DiffLine[] }
+  | { kind: 'delete' }
+  | { kind: 'update'; movedTo?: string | null; hunks: DiffHunk[] };
+
+export interface FileEdit {
+  path: string;
+  change: FileChange;
+}
+
+/** What one command of a terminal script does, as the daemon read it. */
+export type CommandIntent =
+  | { kind: 'edit'; files: FileEdit[] }
+  | { kind: 'read'; path: string; range: unknown }
+  | { kind: 'search'; tool: string; pattern?: string | null; paths: string[] }
+  | { kind: 'list'; tool: string; paths: string[] }
+  | { kind: 'git'; subcommand?: string | null }
+  | { kind: 'build'; tool: string; subcommand?: string | null; target?: string | null }
+  | { kind: 'tasks'; args: string[] }
+  | { kind: 'unknown'; source: string };
+
+export type StepLink = 'start' | 'pipe' | 'and' | 'or' | 'then';
+
+export interface CommandStep {
+  link: StepLink;
+  intent: CommandIntent;
+  /** The command in plain words; the source text for an unknown one. */
+  line: string;
+}
+
+export interface CommandReading {
+  steps: CommandStep[];
+}
+
+export type RowChangeKind = 'added' | 'started' | 'finished' | 'blocked' | 'unblocked' | 'edited';
+
+/** A `tasks.md` row as a card shows it. */
+export interface RowView {
+  section: string;
+  title: string;
+  detail: string;
+}
+
+export interface RowChange {
+  change: RowChangeKind;
+  before?: RowView | null;
+  after?: RowView | null;
+}
+
+export interface AskedCard {
+  section: string;
+  question: string;
+  options: string[];
+  multiSelect: boolean;
+  secret: boolean;
+}
+
+export interface AnswerCard {
+  section: string;
+  text: string;
+}
+
+/**
+ * What a `terminal` call of one of May's commands renders as, built by the
+ * daemon from what the command did. A call without one shows as the
+ * ordinary command row.
+ */
+export type CommandCard =
+  | { kind: 'tasks'; changes: RowChange[] }
+  | {
+      kind: 'subagent';
+      agent: string;
+      title: string;
+      state: 'running' | 'done' | 'interrupted';
+      startedAt: string;
+      finishedAt?: string | null;
+      result?: string | null;
+    }
+  | { kind: 'askUser'; requestId: string; questions: AskedCard[]; answers?: AnswerCard[] | null };
+
+export interface PersistedWorkspaceRequest {
+  id: string;
+  path: string;
+  reason: string;
+  sessionId?: string | null;
+}
+
+export interface PersistedAskUserQuestion {
+  section: string;
+  question: string;
+  option: string[];
+  multiSelect: boolean;
+  /** Set when the question asks for a secret value, which is stored and never read back. */
+  secret?: { name: string; scope: 'global' | 'session' } | null;
+}
+
+export interface PersistedAskUserRequest {
+  id: string;
+  questions: PersistedAskUserQuestion[];
+}
+
+export interface SessionRuntimeSummary {
+  state?: SessionRuntimeState;
+  planState?: SessionPlanState;
+  yolo?: boolean;
+  interactions?: SessionInteractionState;
+  queuedCount?: number;
+  pendingImmediate?: PendingUserMessage | null;
+  queuedMessages?: PendingUserMessage[];
+  waitingPermission?: PersistedPermissionRequest | null;
+  waitingWorkspace?: PersistedWorkspaceRequest | null;
+  waitingAskUser?: PersistedAskUserRequest | null;
+  openQuestions?: PersistedAskUserRequest[];
+  updatedAt?: string | null;
+}
+
+export interface ApiSession {
+  id: string;
+  title: string;
+  lastModified: string;
+  preview: string;
+  profileId: string | null;
+  model: string;
+  reasoningEffort?: string | null;
+  runtime: SessionRuntimeSummary;
+  repo?: string | null;
+  /** Cursor the session's event stream resumes from. */
+  cursor?: string;
+}
+
+export interface ChatRequestPayload {
+  sessionId: string;
+  content: string;
+  attachments?: ApiAttachment[];
+  hiddenContextXml?: string;
+  deliveryMode?: PendingUserMessageMode;
+}
+
+// ── Turn events: `session_turn` frames on the session stream ─
+
+export interface SseStart {
+  kind: 'start';
+  seq: number;
+  turnId: string;
+  sessionId: string;
+  assistantId: string;
+}
+
+export interface SseText {
+  kind: 'text';
+  seq: number;
+  turnId: string;
+  chunk: string;
+}
+
+export interface SseReasoning {
+  kind: 'reasoning';
+  seq: number;
+  turnId: string;
+  chunk: string;
+}
+
+/**
+ * The reply just streamed was not in the communication language: show this
+ * translation of it, marked as translated, with the streamed original one
+ * toggle away.
+ */
+export interface SseTranslated extends ReplyTranslation {
+  kind: 'translated';
+  seq: number;
+  turnId: string;
+}
+
+/**
+ * Closes a reasoning phase: `seconds` is how long the model spent on it,
+ * whether or not the provider returned readable reasoning text. Emitted
+ * just before the first visible output that follows the phase.
+ */
+export interface SseReasoningEnd {
+  kind: 'reasoning_end';
+  seq: number;
+  turnId: string;
+  seconds: number;
+}
+
+/**
+ * Backend-projected summary fields. Populated server-side from cumulative
+ * argument JSON via `partial-json-fixer`. The frontend reads these directly
+ * for the summary chip — no client-side partial-JSON parsing.
+ */
+export interface ToolSummary {
+  description?: string | null;
+  script?: string | null;
+  query?: string | null;
+  url?: string | null;
+  action?: string | null;
+  target?: string | null;
+  prompt?: string | null;
+  /** How the daemon read a terminal call's script, once the call is complete. */
+  reading?: CommandReading | null;
+  /** Why a terminal-family call's complete arguments do not match the tool's schema. */
+  argumentsError?: string | null;
+  /** The card of a call that ran one of May's commands, once the daemon built it. */
+  card?: CommandCard | null;
+}
+
+export interface SseToolStart {
+  kind: 'tool_start';
+  seq: number;
+  turnId: string;
+  id: string;
+  name: string;
+  variant: ToolVariant;
+  arguments: string;
+  summary?: ToolSummary;
+}
+
+export interface SseToolDelta {
+  kind: 'tool_delta';
+  seq: number;
+  turnId: string;
+  id: string;
+  name: string;
+  variant: ToolVariant;
+  argumentsFragment: string;
+  summary?: ToolSummary;
+}
+
+export interface SseToolEnd {
+  kind: 'tool_end';
+  seq: number;
+  turnId: string;
+  id: string;
+  name: string;
+  variant: ToolVariant;
+  arguments?: string;
+  result: unknown;
+  summary?: ToolSummary;
+}
+
+/**
+ * The card of the terminal call `id` changed. Carries no `seq`: it can also
+ * arrive after the turn that ran the command, when an answer comes in.
+ */
+export interface SseToolCard {
+  kind: 'tool_card';
+  turnId: string;
+  id: string;
+  /** Absent when the call has none, so the ordinary command row shows. */
+  card: CommandCard | null;
+}
+
+/** A section of `tasks.md` that holds rows. */
+export type TaskSection = 'roots' | 'doing' | 'queued';
+
+/** An issue or pull request a row names. */
+export interface TaskReference {
+  /** `owner/repo` when the row writes one. */
+  repository: string | null;
+  number: number;
+  pullRequest: boolean;
+}
+
+/** One row of `Roots`, `Doing` or `Queued`, parsed by the daemon. */
+export interface TaskRow {
+  section: TaskSection;
+  /** First line of the row; the sidebar shows this alone. */
+  title: string;
+  /** Detail lines joined by newlines; empty when the row has none. */
+  detail: string;
+  /** Payload of the row's `BLOCKING <what>` mark. */
+  blocking: string | null;
+  references: TaskReference[];
+}
+
+export interface SseTodoUpdate {
+  kind: 'todo_update';
+  seq: number;
+  turnId: string;
+  /** All rows of the document; empty once every row is deleted. */
+  rows: TaskRow[];
+}
+
+export interface SseError {
+  kind: 'error';
+  seq: number;
+  turnId: string;
+  code: ApiErrorCode;
+  message: string;
+  retryable: boolean;
+}
+
+export interface SseDone {
+  kind: 'done';
+  seq: number;
+  turnId: string;
+  sessionId: string;
+  /** The reply, under the id of the first assistant message the turn stored. */
+  assistant: ApiMessage;
+  /** The stored user message the turn answers, as the session's messages name it. */
+  userMessageId: string | null;
+  /** Every assistant message the turn stored, as the session's messages name them. */
+  messageIds: string[];
+}
+
+/**
+ * The turn paused for a browser takeover; carries the partial reply, which
+ * is absent when the pause came before the turn stored one.
+ */
+export interface SsePaused {
+  kind: 'paused';
+  seq: number;
+  turnId: string;
+  sessionId: string;
+  assistant: ApiMessage | null;
+  userMessageId: string | null;
+  messageIds: string[];
+}
+
+/** Last event of every turn, however it ended. */
+export interface SseEnd {
+  kind: 'end';
+  seq: number;
+  turnId: string;
+  outcome: 'completed' | 'paused' | 'cancelled' | 'failed';
+}
+
+export interface SsePing {
+  kind: 'ping';
+  seq: number;
+  turnId: string;
+}
+
+/** Live decode-speed sample emitted while model output streams. */
+export interface SseSpeed {
+  kind: 'speed';
+  seq: number;
+  turnId: string;
+  tokensPerSecond: number;
+}
+
+/** What a parked turn waits for. */
+export type HoldReason =
+  /** An upstream quota reset; the turn continues at `until`. */
+  | { reason: 'quota'; until: string }
+  /** Retry number `retry` of a transient provider failure, at `until`. */
+  | { reason: 'retry'; until: string; retry: number }
+  /** The network is gone; the turn continues once it is back. */
+  | { reason: 'network' };
+
+/** The turn is parked. */
+export type SseHold = {
+  kind: 'hold';
+  seq: number;
+  turnId: string;
+  message: string;
+} & HoldReason;
+
+/** The text the turn streamed so far is discarded: its attempt failed and is resubmitted. */
+export interface SseRetract {
+  kind: 'retract';
+  seq: number;
+  turnId: string;
+}
+
+/**
+ * The turn was stopped before any tool call or response text: the daemon
+ * withdrew it, so its message left the conversation. The client that sent
+ * the message puts it back into its composer.
+ */
+export interface SseWithdrawn {
+  kind: 'withdrawn';
+  seq: number;
+  turnId: string;
+  content: string;
+  attachments: ApiAttachment[];
+}
+
+export type ChatStreamEvent =
+  | SseStart
+  | SseText
+  | SseReasoning
+  | SseTranslated
+  | SseReasoningEnd
+  | SseToolStart
+  | SseToolDelta
+  | SseToolEnd
+  | SseToolCard
+  | SseTodoUpdate
+  | SseError
+  | SseDone
+  | SsePaused
+  | SseEnd
+  | SsePing
+  | SseSpeed
+  | SseHold
+  | SseRetract
+  | SseWithdrawn;
+
+// ── UI event stream /api/events ─────────────────────────────
+
+export interface BrowserStatusPayload {
+  enabled: boolean;
+  running: boolean;
+  cdpEndpoint?: string | null;
+  ownerSessionId?: string | null;
+  takeoverSessionId?: string | null;
+}
+
+export interface ProfileSessions {
+  profile: import('./api/profiles').ProfileInfo;
+  pinned: Array<
+    | ({ type: 'session' } & ProfileSessionSummary)
+    | {
+        type: 'folder';
+        id: string;
+        name: string;
+        sessions: ProfileSessionSummary[];
+      }
+  >;
+  regular: ProfileSessionSummary[];
+  archived: ProfileSessionSummary[];
+}
+
+export interface ProfileSessionSummary {
+  id: string;
+  title: string | null;
+  runtime: SessionRuntimeSummary;
+  updated_at?: string | null;
+  profile_id?: string | null;
+  repo?: string | null;
+  /** Something runs in the session: a turn, a background command or a subagent. */
+  working?: boolean;
+}
+
+export type ProfileSessionsPayload = {
+  profileSessions: ProfileSessions;
+};
+
+export interface SessionRuntimePayload {
+  sessionId: string;
+  runtime: SessionRuntimeSummary;
+}
+
+export interface SessionRuntimesPayload {
+  sessions: SessionRuntimePayload[];
+}
+
+export type BrowserLifecycleEvent =
+  | { kind: 'chromeFetching'; progressBytes: number; totalBytes: number | null }
+  | { kind: 'starting' }
+  | { kind: 'ready' }
+  | { kind: 'navigating'; url: string }
+  | { kind: 'pageLoaded'; url: string; title: string | null }
+  | { kind: 'peerConnected'; count: number }
+  | { kind: 'peerDisconnected'; count: number }
+  | { kind: 'takeoverChanged'; sessionId: string | null }
+  | { kind: 'encoderStalled' }
+  | { kind: 'stopped' }
+  | { kind: 'error'; message: string };
+
+export type UiEvent =
+  | { kind: 'heartbeat'; ok: boolean }
+  | { kind: 'config'; payload: UiConfigResponse }
+  | { kind: 'browser_status'; payload: BrowserStatusPayload }
+  | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
+  | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
+  | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
+  | { kind: 'container_prepare'; payload: unknown }
+  | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
+  | { kind: 'sleep'; payload: SleepStatus }
+  | { kind: 'request_logs'; payload: RequestLogsResponse }
+  | { kind: 'notification_mailbox'; payload: unknown }
+  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse };
+
+// ── Artifacts ──────────────────────────────────────────────
+
+export interface ArtifactEntry {
+  path: string;
+  name: string;
+  size: number;
+  isHtml: boolean;
+  fingerprint: string;
+}
+
+export interface SessionArtifactsResponse {
+  artifacts: ArtifactEntry[];
+}
+
+export interface SlidevPreviewResponse {
+  previewUrl?: string;
+  diagnostics: string[];
+}
+
+export interface ArtifactDiagnosticsResponse {
+  repairScheduled: boolean;
+}
+
+// ── Plan / TASKS ───────────────────────────────────────────
+
+export interface SessionTasksPayload {
+  content: string;
+  planState: SessionPlanState;
+  /** Parsed rows of `content`; set by the daemon, ignored when saving. */
+  rows?: TaskRow[];
+}
+
+export interface SessionPlanStateRequest {
+  planState: SessionPlanState;
+}
+
+export interface SessionPlanStateResponse {
+  planState: SessionPlanState;
+}
+
+export interface SessionYoloResponse {
+  yolo: boolean;
+}
+
+// ── Memory ─────────────────────────────────────────────────
+
+export interface MemoryPayload {
+  content: string;
+}
+
+export interface MemorySaveRequest {
+  content: string;
+  explicitUserRequest?: boolean;
+}
+
+// ── Scheduled tasks (triggers) ─────────────────────────────
+
+export type TaskRunStatus = 'running' | 'success' | 'failed' | 'interrupted';
+export type TimeTriggerType = 'once' | 'cron';
+
+export type TaskTriggerRequest =
+  | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
+  | { kind: 'event'; eventName: string }
+  | { kind: 'webhook'; signature?: WebhookSignature | null };
+
+export interface WebhookSignature {
+  secret: string;
+  header: string;
+}
+
+export type TaskTriggerResponse =
+  | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
+  | { kind: 'event'; eventName: string }
+  | { kind: 'webhook'; token: string; webhookPath: string; publicUrl?: string | null; signature?: WebhookSignature | null };
+
+export interface ScheduledTaskResponse {
+  id: string;
+  profileId: string;
+  sessionId: string | null;
+  name: string;
+  trigger: TaskTriggerResponse;
+  scriptPath: string | null;
+  scriptInline: string | null;
+  needsNetwork: boolean;
+  approved: boolean;
+  enabled: boolean;
+  lastRunAt: string | null;
+  lastRunStatus: TaskRunStatus | null;
+  lastRunOutput: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateTaskRequest {
+  profileId: string;
+  sessionId?: string | null;
+  name: string;
+  trigger: TaskTriggerRequest;
+  scriptPath?: string | null;
+  scriptInline?: string | null;
+  needsNetwork?: boolean;
+}
+
+export interface UpdateTaskRequest {
+  name?: string | null;
+  enabled?: boolean | null;
+  cronExpression?: string | null;
+  runAt?: string | null;
+  scriptPath?: string | null;
+  scriptInline?: string | null;
+}
+
+// ── Network access ─────────────────────────────────────────
+
+export type NetworkAccessSource =
+  | 'chat'
+  | 'exec'
+  | 'task_local'
+  | 'task_validation_local'
+  | 'task_remote'
+  | 'task_container'
+  | 'task_validation_container';
+
+export interface NetworkAccessLogEntryResponse {
+  id: number;
+  sessionId: string | null;
+  profileId: string | null;
+  source: NetworkAccessSource;
+  mode: 'network';
+  domain: string;
+  port: number;
+  allowed: boolean;
+  reason: string | null;
+  timestamp: string;
+}
+
+export interface NetworkAccessLogsResponse {
+  items: NetworkAccessLogEntryResponse[];
+}
+
+// ── Request logs ───────────────────────────────────────────
+
+export interface RequestLogEntry {
+  sessionId: string;
+  timestamp: string;
+  model: string;
+  providerId: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  contextWindow: number | null;
+  elapsedMs: number;
+  ok: boolean;
+  error: string | null;
+}
+
+export interface RequestLogCacheSummary {
+  assistantMessageCount: number;
+  cacheHitMessageCount: number;
+  promptTokensTotal: number;
+  cacheReadTokensTotal: number;
+  cacheWriteTokensTotal: number;
+  cacheReadHitRate: number | null;
+}
+
+export interface RequestLogsResponse {
+  logs: RequestLogEntry[];
+  cacheSummary: RequestLogCacheSummary;
+}
+
+// ── Context debug ──────────────────────────────────────────
+
+export interface ContextDebugMessage {
+  role: string;
+  content: string;
+  attachments: string[];
+  toolCallId: string | null;
+  toolCallNames: string[];
+}
+
+export interface SessionContextWindowMetricsResponse {
+  usageFraction: number;
+  contextWindow: number;
+  estimatedTokens: number;
+  systemBlockCount: number;
+  recentMessageCount: number;
+  recentSystemMessageCount: number;
+  hasHandoff: boolean;
+}
+
+export interface SessionContextWindowSnapshotResponse {
+  phase: string;
+  metrics: SessionContextWindowMetricsResponse;
+  assembledMessages: ContextDebugMessage[];
+}
+
+export interface SessionContextDebugResponse {
+  sessionId: string;
+  timestamp: string;
+  model: string;
+  providerId: string;
+  prompt: string;
+  promptAttachments: string[];
+  assembledMessages: ContextDebugMessage[];
+  windowSnapshot?: SessionContextWindowSnapshotResponse;
+}
+
+// ── Remote access ──────────────────────────────────────────
+
+export type RemoteAccessState = 'disabled' | 'starting' | 'running' | 'error';
+
+/** The login owning this node, as Tailscale reports it. */
+export type OwnerLogin =
+  | { state: 'resolved'; login: string }
+  | { state: 'unresolved'; reason: string };
+
+/** Who remote access accepts now: the node owner (when resolved) plus the listed logins. */
+export interface AcceptedLogins {
+  owner: OwnerLogin;
+  listed: string[];
+}
+
+/** The user's global sleep state, from the `sleep` event. */
+export interface SleepStatus {
+  asleep: boolean;
+  /** The session `/sleep` ran in, while asleep. */
+  origin: string | null;
+  /** Health reminders the daemon has raised; a client shows one when it grows. */
+  reminders: number;
+}
+
+export interface RemoteAccessStatusResponse {
+  state: RemoteAccessState;
+  enabled: boolean;
+  publicUrl?: string | null;
+  /** Internet-facing base URL of the webhook routes, while Funnel is on. */
+  funnelUrl?: string | null;
+  lastError?: string | null;
+  recentLogs: string[];
+  /** Absent until the daemon first resolves the allow-list. */
+  accepted?: AcceptedLogins | null;
+}
+
+// ── Profiles (expanded) ────────────────────────────────────
+
+export type ProfileEnvironmentKind = 'local' | 'container';
+
+export interface ProfileContainerMount {
+  hostPath: string;
+  containerPath: string;
+  access?: 'read_only' | 'read_write';
+}
+
+export interface ProfilePreferences {
+  container?: {
+    mounts?: ProfileContainerMount[] | null;
+  } | null;
+}
+
+export interface CreateProfileRequest {
+  name: string;
+  icon?: string | null;
+  environment?: ProfileEnvironmentKind;
+  persona?: string | null;
+  preferences?: ProfilePreferences | null;
+  locationAware?: boolean;
+}
+
+export interface UpdateProfileRequest {
+  name?: string | null;
+  icon?: string | null;
+  environment?: ProfileEnvironmentKind | null;
+  sortOrder?: number | null;
+  persona?: string | null;
+  preferences?: ProfilePreferences | null;
+  locationAware?: boolean | null;
+}
+
+// ── Profiles ────────────────────────────────────────────────
+
+export interface ApiProfile {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  defaultModel?: string | null;
+  description?: string | null;
+}
+
+export interface ProfilesResponse {
+  items: ApiProfile[];
+  currentProfileId: string | null;
+}

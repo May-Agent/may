@@ -1,33 +1,42 @@
 //! Container image management for May workspace environments.
 
-use std::path::{Path, PathBuf};
-
-use aither_sandbox::ContainerImageSpec;
-use bollard::query_parameters::{BuildImageOptionsBuilder, ListImagesOptionsBuilder};
+use bollard::query_parameters::{CreateImageOptionsBuilder, ListImagesOptionsBuilder};
 use futures_lite::StreamExt;
 
 use super::{ContainerError, ContainerRuntime};
 
-/// Default image tag for the May workspace container.
-pub const MAY_IMAGE_TAG: &str = "may-workspace:latest";
+/// The GHCR reference of the workspace image May runs containers from.
+///
+/// Derived at build time from the content hash of everything the image
+/// carries, so the binary always names exactly the image CI published for it.
+pub const MAY_WORKSPACE_IMAGE: &str = env!("MAY_WORKSPACE_IMAGE");
 
+/// Stage of an image ensure/pull operation reported via [`ImagePullProgress`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImageBuildPhase {
+pub enum ImagePullPhase {
+    /// Checking whether the image already exists locally.
     CheckingExisting,
+    /// The image already exists; no pull is needed.
     AlreadyExists,
-    BuildStarting,
-    BuildOutput,
-    BuildCompleted,
+    /// A pull is starting.
+    PullStarting,
+    /// A line of pull output was produced.
+    PullProgress,
+    /// The pull finished successfully.
+    PullCompleted,
 }
 
+/// A progress update emitted while ensuring or pulling a container image.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageBuildProgress {
-    pub phase: ImageBuildPhase,
+pub struct ImagePullProgress {
+    /// Stage this update belongs to.
+    pub phase: ImagePullPhase,
+    /// Human-readable description of the update.
     pub message: String,
 }
 
-impl ImageBuildProgress {
-    fn new(phase: ImageBuildPhase, message: impl Into<String>) -> Self {
+impl ImagePullProgress {
+    fn new(phase: ImagePullPhase, message: impl Into<String>) -> Self {
         Self {
             phase,
             message: message.into(),
@@ -35,19 +44,14 @@ impl ImageBuildProgress {
     }
 }
 
-/// Build the default image spec for the bundled May workspace image.
-#[must_use]
-pub fn default_image_spec(context_dir: impl Into<PathBuf>) -> ContainerImageSpec {
-    ContainerImageSpec::new(MAY_IMAGE_TAG, context_dir)
-}
-
 /// Check if an image already exists.
-pub async fn image_exists(
-    runtime: &ContainerRuntime,
-    spec: &ContainerImageSpec,
-) -> Result<bool, ContainerError> {
+///
+/// # Errors
+///
+/// Returns [`ContainerError::Docker`] when the image list query fails.
+pub async fn image_exists(runtime: &ContainerRuntime, image: &str) -> Result<bool, ContainerError> {
     let filters: std::collections::HashMap<String, Vec<String>> =
-        [("reference".to_string(), vec![spec.tag.clone()])].into();
+        [("reference".to_string(), vec![image.to_string()])].into();
     let opts = ListImagesOptionsBuilder::default()
         .filters(&filters)
         .build();
@@ -55,138 +59,101 @@ pub async fn image_exists(
     Ok(!images.is_empty())
 }
 
-/// Build a container image from a Docker build context.
-pub async fn build_image(
+/// Pull a container image and stream progress messages to callback.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::Docker`] when the daemon rejects or fails the
+/// pull request.
+pub async fn pull_image_with_progress<F>(
     runtime: &ContainerRuntime,
-    spec: &ContainerImageSpec,
-) -> Result<(), ContainerError> {
-    build_image_with_progress(runtime, spec, |_| {}).await
-}
-
-/// Build a container image and stream progress messages to callback.
-pub async fn build_image_with_progress<F>(
-    runtime: &ContainerRuntime,
-    spec: &ContainerImageSpec,
+    image: &str,
     mut on_progress: F,
 ) -> Result<(), ContainerError>
 where
-    F: FnMut(ImageBuildProgress),
+    F: FnMut(ImagePullProgress),
 {
-    tracing::info!(
-        context = %spec.context_dir.display(),
-        tag = %spec.tag,
-        dockerfile = ?spec.dockerfile,
-        "Building container image"
-    );
-    on_progress(ImageBuildProgress::new(
-        ImageBuildPhase::BuildStarting,
-        format!("building image {}", spec.tag),
+    tracing::info!(image, "Pulling container image");
+    on_progress(ImagePullProgress::new(
+        ImagePullPhase::PullStarting,
+        format!("pulling image {image}"),
     ));
 
-    let tar_bytes = create_tar_context(&spec.context_dir)?;
-
-    let mut opts_builder = BuildImageOptionsBuilder::default().t(&spec.tag).rm(true);
-
-    if let Some(ref dockerfile) = spec.dockerfile {
-        let relative = dockerfile_relative_to_context(dockerfile, &spec.context_dir)?;
-        opts_builder = opts_builder.dockerfile(&relative);
-    }
-
-    let opts = opts_builder.build();
-    let body = bollard::body_full(tar_bytes.into());
-    let mut stream = runtime.client.build_image(opts, None, Some(body));
+    let opts = CreateImageOptionsBuilder::default()
+        .from_image(image)
+        .build();
+    let mut stream = runtime.client.create_image(Some(opts), None, None);
 
     while let Some(result) = stream.next().await {
-        match result {
-            Ok(info) => {
-                if let Some(stream_text) = &info.stream {
-                    let trimmed = stream_text.trim();
-                    if !trimmed.is_empty() {
-                        tracing::debug!(target: "container::build", "{trimmed}");
-                        on_progress(ImageBuildProgress::new(
-                            ImageBuildPhase::BuildOutput,
-                            trimmed.to_string(),
-                        ));
-                    }
-                }
-                if let Some(ref detail) = info.error_detail {
-                    let msg = detail.message.as_deref().unwrap_or("unknown build error");
-                    return Err(ContainerError::ImageBuildFailed(msg.to_string()));
-                }
-            }
-            Err(e) => return Err(ContainerError::Docker(e)),
+        let info = result?;
+        let Some(status) = info.status.as_deref() else {
+            continue;
+        };
+        let progress =
+            info.progress_detail
+                .as_ref()
+                .and_then(|detail| match (detail.current, detail.total) {
+                    (Some(current), Some(total)) if total > 0 => Some(format!("{current}/{total}")),
+                    _ => None,
+                });
+        let message = match (&info.id, progress) {
+            (Some(id), Some(progress)) => format!("{id}: {status} {progress}"),
+            (Some(id), None) => format!("{id}: {status}"),
+            _ => status.to_string(),
+        };
+        if !message.is_empty() {
+            tracing::debug!(target: "container::pull", "{message}");
+            on_progress(ImagePullProgress::new(
+                ImagePullPhase::PullProgress,
+                message,
+            ));
         }
     }
 
-    tracing::info!(tag = %spec.tag, "Container image built successfully");
-    on_progress(ImageBuildProgress::new(
-        ImageBuildPhase::BuildCompleted,
-        format!("image {} is ready", spec.tag),
+    tracing::info!(image, "Container image pulled successfully");
+    on_progress(ImagePullProgress::new(
+        ImagePullPhase::PullCompleted,
+        format!("image {image} is ready"),
     ));
     Ok(())
 }
 
-/// Ensure the requested container image exists, building it if needed.
-pub async fn ensure_image(
-    runtime: &ContainerRuntime,
-    spec: &ContainerImageSpec,
-) -> Result<(), ContainerError> {
-    ensure_image_with_progress(runtime, spec, |_| {}).await
+/// Ensure the requested container image exists, pulling it if needed.
+///
+/// # Errors
+///
+/// Returns [`ContainerError`] when checking for the image or pulling it
+/// fails; see [`ensure_image_with_progress`].
+pub async fn ensure_image(runtime: &ContainerRuntime, image: &str) -> Result<(), ContainerError> {
+    ensure_image_with_progress(runtime, image, |_| {}).await
 }
 
 /// Ensure image exists and stream progress messages to callback.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::Docker`] when the image query fails, or the
+/// errors of [`pull_image_with_progress`] when a pull is needed.
 pub async fn ensure_image_with_progress<F>(
     runtime: &ContainerRuntime,
-    spec: &ContainerImageSpec,
+    image: &str,
     mut on_progress: F,
 ) -> Result<(), ContainerError>
 where
-    F: FnMut(ImageBuildProgress),
+    F: FnMut(ImagePullProgress),
 {
-    on_progress(ImageBuildProgress::new(
-        ImageBuildPhase::CheckingExisting,
-        format!("checking image {}", spec.tag),
+    on_progress(ImagePullProgress::new(
+        ImagePullPhase::CheckingExisting,
+        format!("checking image {image}"),
     ));
-    if image_exists(runtime, spec).await? {
-        tracing::debug!(tag = %spec.tag, "Container image already exists");
-        on_progress(ImageBuildProgress::new(
-            ImageBuildPhase::AlreadyExists,
-            format!("image {} already exists", spec.tag),
+    if image_exists(runtime, image).await? {
+        tracing::debug!(image, "Container image already exists");
+        on_progress(ImagePullProgress::new(
+            ImagePullPhase::AlreadyExists,
+            format!("image {image} already exists"),
         ));
         return Ok(());
     }
 
-    build_image_with_progress(runtime, spec, on_progress).await
-}
-
-fn dockerfile_relative_to_context(
-    dockerfile: &Path,
-    context_dir: &Path,
-) -> Result<String, ContainerError> {
-    let context = context_dir.canonicalize()?;
-    let dockerfile_path = dockerfile.canonicalize()?;
-    let relative = dockerfile_path.strip_prefix(&context).map_err(|_| {
-        ContainerError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "dockerfile {} must be inside build context {}",
-                dockerfile_path.display(),
-                context.display()
-            ),
-        ))
-    })?;
-
-    Ok(relative.to_string_lossy().to_string())
-}
-
-/// Create a tar archive from a directory for the Docker build context.
-fn create_tar_context(context_dir: &Path) -> Result<Vec<u8>, ContainerError> {
-    let buf = Vec::new();
-    let mut archive = tar::Builder::new(buf);
-    archive.append_dir_all(".", context_dir)?;
-    archive.into_inner().map_err(|e| {
-        ContainerError::Io(std::io::Error::other(format!(
-            "Failed to finalize tar archive: {e}"
-        )))
-    })
+    pull_image_with_progress(runtime, image, on_progress).await
 }

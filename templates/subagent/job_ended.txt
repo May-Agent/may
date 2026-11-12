@@ -1,0 +1,1 @@
+Background task '{{ task_id }}' {% match end %}{% when JobEnd::Exited { code } %}exited with code {{ code }}{% when JobEnd::Killed %}was killed{% when JobEnd::Failed { error } %}failed: {{ error }}{% endmatch %}. Read what it printed with `{{ read_tool }}`.

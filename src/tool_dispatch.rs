@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ChatDb;
+use crate::SkillManager;
 use crate::agent::browser_tool::BrowserToolError;
 use crate::agent::browser_tool::{BrowserBroker, BrowserRequest, BrowserResult};
-use crate::agent::notify_tool::{NotifyArgs, NotifyBroker, NotifyResult};
 use crate::agent::register_tool::{RegisterBroker, RegisterRequest, RegisterResult};
 use crate::agent::task_tool::TaskBroker;
 use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, Question};
@@ -13,42 +13,56 @@ use crate::browser_service::{
     BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
     persist_browser_page_capture,
 };
-use crate::config::{BrowserConfig, SshServerConfig};
+use crate::config::BrowserConfig;
 use crate::network_policy::NetworkPolicyConfig;
-use crate::notification::NotificationManager;
-use crate::notification_service::NotificationService;
+use crate::notification::{NotificationManager, NotificationService};
 use crate::scheduler::TaskRuntime;
 use crate::session::{MayHomePaths, SessionStore};
-use crate::{SkillManager, SubagentManager};
 
+/// Failures while wiring the shared IPC command brokers.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolDispatchError {
+    /// Failed to initialize notification manager.
     #[error("failed to initialize notification manager: {0}")]
     InitializeNotificationManager(crate::notification::NotificationError),
+    /// Failed to load task runtime.
     #[error("failed to load task runtime: {0}")]
     LoadTaskRuntime(crate::db::ChatDbError),
+    /// Failed to configure task runtime.
     #[error("failed to configure task runtime: {0}")]
-    ConfigureTaskRuntime(String),
+    ConfigureTaskRuntime(aither_sandbox::NetworkPolicyError),
 }
 
+/// Live broker handles for the shared terminal commands.
 #[derive(Debug, Clone)]
 pub struct ToolDispatchers {
+    /// Broker for the `task` command.
     pub task: TaskBroker,
-    pub notify: NotifyBroker,
+    /// Broker for `browser` commands, when enabled.
     pub browser: Option<BrowserBroker>,
+    /// Broker for skill registration.
     pub register_skills: RegisterBroker,
-    pub register_subagents: RegisterBroker,
+    /// Broker for the `tunnel` command.
+    pub tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
-#[derive(Clone)]
+/// Dependencies needed to construct the shared IPC brokers.
+#[derive(Debug, Clone)]
 pub struct ToolDispatchConfig {
+    /// `~/.may` data directory.
     pub may_dir: PathBuf,
+    /// Working directory for spawned commands.
     pub cwd: PathBuf,
+    /// Database handle.
     pub db: ChatDb,
+    /// Browser automation config.
     pub browser_config: BrowserConfig,
-    pub ssh_servers: Vec<SshServerConfig>,
+    /// Network policy applied to brokered commands.
     pub network_policy: NetworkPolicyConfig,
+    /// Broker for `ask_user` prompts.
     pub ask_user_broker: AskUserBroker,
+    /// Baseline tool distribution prepared for task terminals.
+    pub tool_distribution: Arc<crate::tools::ToolDistribution>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +89,10 @@ impl BrowserServiceRuntime {
 }
 
 impl ToolDispatchers {
+    /// Construct every broker and spawn its servicing task.
+    ///
+    /// # Errors
+    /// Returns [`ToolDispatchError`] when a broker or its backing task fails to initialize.
     pub async fn spawn(config: ToolDispatchConfig) -> Result<Self, ToolDispatchError> {
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
         let notification_manager = Arc::new(
@@ -88,14 +106,17 @@ impl ToolDispatchers {
             ui_event_bus.clone(),
         ));
         let task_runtime = Arc::new(
-            TaskRuntime::load(config.db.clone(), config.may_dir.clone())
-                .await
-                .map_err(ToolDispatchError::LoadTaskRuntime)?
-                .with_notifier(notification_service.clone())
-                .with_ui_event_bus(ui_event_bus)
-                .with_ssh_servers(config.ssh_servers.clone())
-                .with_network_policy(config.network_policy.clone())
-                .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
+            TaskRuntime::load(
+                config.db.clone(),
+                config.may_dir.clone(),
+                config.tool_distribution.clone(),
+            )
+            .await
+            .map_err(ToolDispatchError::LoadTaskRuntime)?
+            .with_notifier(notification_service.clone())
+            .with_ui_event_bus(ui_event_bus)
+            .with_network_policy(&config.network_policy)
+            .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
         );
         let registration = RegistrationRuntime {
             may_dir: config.may_dir.clone(),
@@ -103,22 +124,14 @@ impl ToolDispatchers {
             db: config.db.clone(),
             ask_user_broker: config.ask_user_broker,
         };
+        let daemon_socket = crate::daemon::DaemonPaths::new(config.may_dir.clone()).socket();
 
         let (task, task_queue) = crate::agent::task_channel();
         tokio::spawn(async move {
             while let Some(request) = task_queue.next().await {
-                let result = task_runtime
-                    .create_task_from_tool_request(request.args.clone())
-                    .await;
-                let _ = request.respond(result);
-            }
-        });
-
-        let (notify, notify_queue) = crate::agent::notify_channel();
-        tokio::spawn(async move {
-            while let Some(request) = notify_queue.next().await {
                 let result =
-                    handle_notify_request(&notification_service, request.args.clone()).await;
+                    Box::pin(task_runtime.create_task_from_tool_request(request.args.clone()))
+                        .await;
                 let _ = request.respond(result);
             }
         });
@@ -144,53 +157,58 @@ impl ToolDispatchers {
 
         let (register_skills, register_skills_queue) =
             crate::agent::register_tool::skills_channel();
-        let registration_for_skills = registration.clone();
         tokio::spawn(async move {
             while let Some(request) = register_skills_queue.next().await {
                 let result =
-                    handle_register_skills_request(&registration_for_skills, request.args.clone())
-                        .await;
+                    handle_register_skills_request(&registration, request.args.clone()).await;
                 let _ = request.respond(result);
             }
         });
 
-        let (register_subagents, register_subagents_queue) =
-            crate::agent::register_tool::subagents_channel();
+        // Exec mode has no in-process daemon, so tunnel registrations go
+        // through the running daemon's REST API over its unix socket.
+        let (tunnel, tunnel_queue) = crate::agent::tunnel_tool::channel();
         tokio::spawn(async move {
-            while let Some(request) = register_subagents_queue.next().await {
-                let result =
-                    handle_register_subagents_request(&registration, request.args.clone()).await;
+            while let Some(request) = tunnel_queue.next().await {
+                let result = handle_exec_tunnel_request(&daemon_socket, request.args.clone()).await;
                 let _ = request.respond(result);
             }
         });
 
         Ok(Self {
             task,
-            notify,
             browser,
             register_skills,
-            register_subagents,
+            tunnel,
         })
     }
 }
 
-async fn handle_notify_request(
-    notification_service: &Arc<NotificationService>,
-    args: NotifyArgs,
-) -> Result<NotifyResult, String> {
-    let payload = crate::notification::NotificationPayload {
-        notification_id: None,
-        title: args.title,
-        body: args.body,
-        session_id: args.session_id,
-        callback_context_xml: args.callback_context_xml,
-        callback_message: args.callback_message,
-    };
-    let sent = notification_service
-        .send_payload(payload)
+/// Forwards a `tunnel` command request to the running daemon's REST API;
+/// `may exec` has no in-process daemon to register with.
+async fn handle_exec_tunnel_request(
+    socket_path: &Path,
+    args: crate::agent::tunnel_tool::TunnelRequest,
+) -> Result<crate::agent::tunnel_tool::TunnelResult, String> {
+    let client = crate::client::DaemonClient::new(socket_path.to_path_buf());
+    let response: crate::daemon::types::TunnelRegisterResponse = client
+        .post(
+            "/api/tunnels",
+            &crate::daemon::types::TunnelRegisterRequest {
+                session_id: args.session_id,
+                url: args.url,
+            },
+        )
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(NotifyResult { sent })
+        .map_err(|error| {
+            format!("tunnel needs the running May daemon ({error}); start it with `may daemon`")
+        })?;
+    Ok(crate::agent::tunnel_tool::TunnelResult {
+        id: response.id,
+        url: response.url,
+        path: response.path,
+        local_url: response.local_url,
+    })
 }
 
 async fn handle_browser_request(
@@ -204,20 +222,18 @@ async fn handle_browser_request(
         ));
     }
 
+    let browser_not_running_error = || {
+        BrowserToolError::request_failed(
+            "browser is not running; call browser open before browser cdp-endpoint or browser read",
+        )
+    };
+
     match request.args {
         crate::agent::BrowserArgs::Status => {
             let status = match browser_service_status(browser_service.socket_path().as_path()).await
             {
                 Ok(Some(status)) => Some(status),
-                Ok(None) => Some(
-                    ensure_browser_service_started(
-                        browser_service.may_dir.as_path(),
-                        &browser_service.browser_config,
-                    )
-                    .await
-                    .map_err(BrowserToolError::request_failed)?,
-                ),
-                Err(_) => Some(
+                Ok(None) | Err(_) => Some(
                     ensure_browser_service_started(
                         browser_service.may_dir.as_path(),
                         &browser_service.browser_config,
@@ -265,26 +281,37 @@ async fn handle_browser_request(
             })
         }
         crate::agent::BrowserArgs::CdpEndpoint => {
-            let status = ensure_browser_service_started(
-                browser_service.may_dir.as_path(),
-                &browser_service.browser_config,
-            )
-            .await
-            .map_err(BrowserToolError::request_failed)?;
+            let Some(status) = browser_service_status(browser_service.socket_path().as_path())
+                .await
+                .map_err(BrowserToolError::request_failed)?
+            else {
+                return Err(browser_not_running_error());
+            };
+            if !status.running {
+                return Err(browser_not_running_error());
+            }
             Ok(BrowserResult {
                 running: true,
                 cdp_endpoint: status.cdp_endpoint,
                 page: None,
             })
         }
-        crate::agent::BrowserArgs::Read { url, options } => {
+        crate::agent::BrowserArgs::Read {
+            url,
+            detail,
+            screenshot,
+        } => {
+            let options = crate::agent::BrowserArgs::read_options(detail, screenshot);
             let request = BrowserServiceRequest::Read { url, options };
-            let status = ensure_browser_service_started(
-                browser_service.may_dir.as_path(),
-                &browser_service.browser_config,
-            )
-            .await
-            .map_err(BrowserToolError::request_failed)?;
+            let Some(status) = browser_service_status(browser_service.socket_path().as_path())
+                .await
+                .map_err(BrowserToolError::request_failed)?
+            else {
+                return Err(browser_not_running_error());
+            };
+            if !status.running {
+                return Err(browser_not_running_error());
+            }
             let response = query_browser_service(browser_service.socket_path().as_path(), &request)
                 .await
                 .map_err(BrowserToolError::request_failed)?;
@@ -294,10 +321,19 @@ async fn handle_browser_request(
                         resolve_browser_session_paths(browser_service, session_id.as_str())
                             .await
                             .map_err(BrowserToolError::request_failed)?;
-                    let page =
-                        persist_browser_page_capture(session_id.as_str(), &session_paths, payload)
-                            .await
-                            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let session_ids = browser_service
+                        .db
+                        .session_ids(session_id.as_str())
+                        .await
+                        .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let page = persist_browser_page_capture(
+                        session_id.as_str(),
+                        &session_paths,
+                        session_ids.allocator(),
+                        *payload,
+                    )
+                    .await
+                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                     Ok(BrowserResult {
                         running: true,
                         cdp_endpoint: status.cdp_endpoint,
@@ -333,10 +369,9 @@ async fn resolve_browser_session_paths(
     tokio::fs::create_dir_all(session_paths.root())
         .await
         .map_err(|error| {
-            path_error_text(
-                "failed to create session root ",
-                session_paths.root(),
-                &error,
+            format!(
+                "failed to create session root {}: {error}",
+                session_paths.root().display()
             )
         })?;
     Ok(session_paths)
@@ -357,32 +392,12 @@ async fn handle_register_skills_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    path_error_text("failed to register skill from ", &source, &error)
+                    format!(
+                        "failed to register skill from {}: {error}",
+                        source.display()
+                    )
                 })?;
             Ok(vec![info.dir_name])
-        },
-    )
-    .await
-}
-
-async fn handle_register_subagents_request(
-    runtime: &RegistrationRuntime,
-    request: RegisterRequest,
-) -> Result<RegisterResult, String> {
-    handle_register_request(
-        runtime,
-        request,
-        "subagent definitions",
-        "subagents",
-        |subagents_dir, source| async move {
-            let manager = SubagentManager::from_subagents_dir(subagents_dir);
-            let infos = manager
-                .register_from_local_path(&source)
-                .await
-                .map_err(|error| {
-                    path_error_text("failed to register subagents from ", &source, &error)
-                })?;
-            Ok(infos.into_iter().map(|item| item.file_name).collect())
         },
     )
     .await
@@ -432,10 +447,9 @@ async fn resolve_registration_target_dir(
     tokio::fs::create_dir_all(session_paths.root())
         .await
         .map_err(|error| {
-            path_error_text(
-                "failed to create session root ",
-                session_paths.root(),
-                &error,
+            format!(
+                "failed to create session root {}: {error}",
+                session_paths.root().display()
             )
         })?;
     Ok(session_paths.home_root().join(target_dir_name))
@@ -453,16 +467,19 @@ async fn resolve_registration_source_path(cwd: &Path, raw_path: &str) -> Result<
         cwd.join(path)
     };
     let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
-        path_error_text("failed to resolve registration path ", &candidate, &error)
+        format!(
+            "failed to resolve registration path {}: {error}",
+            candidate.display()
+        )
     })?;
     let project_root = tokio::fs::canonicalize(cwd)
         .await
-        .map_err(|error| path_error_text("failed to resolve project root ", cwd, &error))?;
+        .map_err(|error| format!("failed to resolve project root {}: {error}", cwd.display()))?;
 
     if !canonical.starts_with(&project_root) {
-        return Err(path_message(
-            "registration path must be inside project root ",
-            &project_root,
+        return Err(format!(
+            "registration path must be inside project root {}",
+            project_root.display()
         ));
     }
 
@@ -502,7 +519,7 @@ async fn request_registration_approval(
             .iter()
             .any(|value| value.eq_ignore_ascii_case("approve")),
         AnswerValue::Custom(value) => value.eq_ignore_ascii_case("approve"),
-        AnswerValue::Skipped => false,
+        AnswerValue::Skipped => unreachable!("May never produces a skipped answer"),
     });
     if approved {
         Ok(())
@@ -517,47 +534,18 @@ fn build_registration_approval_message(
     source_label: &str,
     target_dir_name: &str,
 ) -> String {
-    let source_display = source.display().to_string();
-    join_text(&[
-        "Session ",
-        session_id,
-        " requests registering ",
-        source_label,
-        " from ",
-        source_display.as_str(),
-        " into this session's ",
-        target_dir_name,
-        ". Approve?",
-    ])
-}
-
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut output = String::with_capacity(capacity);
-    for part in parts {
-        output.push_str(part);
-    }
-    output
-}
-
-fn path_message(prefix: &str, path: &Path) -> String {
-    let path_text = path.display().to_string();
-    join_text(&[prefix, path_text.as_str()])
-}
-
-fn path_error_text(prefix: &str, path: &Path, error: &impl std::fmt::Display) -> String {
-    let path_text = path.display().to_string();
-    let error_text = error.to_string();
-    join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
+    format!(
+        "Session {session_id} requests registering {source_label} from {} into this session's {target_dir_name}. Approve?",
+        source.display()
+    )
 }
 
 fn session_error_text(prefix: &str, session_id: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[prefix, session_id, ": ", error_text.as_str()])
+    format!("{prefix}{session_id}: {error}")
 }
 
 fn session_not_found_text(session_id: &str) -> String {
-    join_text(&["session not found: ", session_id])
+    format!("session not found: {session_id}")
 }
 
 async fn browser_service_status(
@@ -566,12 +554,11 @@ async fn browser_service_status(
     let request = BrowserServiceRequest::Status;
     match query_browser_service(socket_path, &request).await? {
         Some(BrowserServiceResponse::Ok { payload }) => Ok(Some(payload)),
-        Some(BrowserServiceResponse::Stopped) => Ok(None),
+        Some(BrowserServiceResponse::Stopped) | None => Ok(None),
         Some(BrowserServiceResponse::Error { message }) => Err(message),
         Some(BrowserServiceResponse::ReadOk { .. }) => {
             Err("browser service returned page payload for status request".to_string())
         }
-        None => Ok(None),
     }
 }
 
@@ -624,9 +611,8 @@ async fn ensure_browser_service_started(
                 last_error =
                     Some("browser service returned page payload for startup request".to_string());
             }
-            Ok(None) => {}
+            Ok(None | Some(BrowserServiceResponse::Ok { .. })) => {}
             Err(error) => last_error = Some(error),
-            Ok(Some(BrowserServiceResponse::Ok { .. })) => {}
         }
     }
 
@@ -636,9 +622,7 @@ async fn ensure_browser_service_started(
 async fn stop_browser_service(socket_path: &Path, _port: u16) -> Result<(), String> {
     let request = BrowserServiceRequest::Stop;
     match query_browser_service(socket_path, &request).await? {
-        Some(BrowserServiceResponse::Ok { .. }) | Some(BrowserServiceResponse::Stopped) | None => {
-            Ok(())
-        }
+        Some(BrowserServiceResponse::Ok { .. } | BrowserServiceResponse::Stopped) | None => Ok(()),
         Some(BrowserServiceResponse::Error { message }) => Err(message),
         Some(BrowserServiceResponse::ReadOk { .. }) => {
             Err("browser service returned page payload for stop request".to_string())

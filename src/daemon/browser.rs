@@ -1,0 +1,345 @@
+//! Browser live view API endpoints.
+//!
+//! - `GET  /api/browser/status` — Browser status
+//! - `POST /api/browser/start`  — Start the browser
+//! - `POST /api/browser/stop`   — Stop the browser
+//! - `POST /api/browser/offer`  — WebRTC SDP offer → answer (WHEP-style signaling)
+
+use std::sync::Arc;
+
+use skyzen::utils::{Json, State};
+use skyzen::{Result as SkyResult, StatusCode};
+
+use super::chat::spawn_follow_up_runs;
+use super::error::{internal_error, internal_error_message};
+use super::error_chain::error_chain_text;
+use super::state::DaemonState;
+use super::types::BrowserTakeoverResponse;
+use crate::ui_event_bus::UiEventTopics;
+
+#[derive(serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserStatus {
+    enabled: bool,
+    running: bool,
+    cdp_endpoint: Option<String>,
+    owner_session_id: Option<String>,
+    takeover_session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WebRtcOfferRequest {
+    sdp: String,
+    /// Session that initiated the offer. Required so the actor's takeover
+    /// gate can match `DataChannel` input messages against the current
+    /// owner; rejected as 400 if missing or empty.
+    session_id: String,
+}
+
+#[derive(serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WebRtcAnswerResponse {
+    sdp: String,
+}
+
+#[derive(serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserTakeoverRequest {
+    session_id: String,
+}
+
+#[derive(serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserResizeViewportRequest {
+    width: u32,
+    height: u32,
+    #[serde(default = "default_dpr")]
+    device_scale_factor: f64,
+}
+
+const fn default_dpr() -> f64 {
+    1.0
+}
+
+#[derive(serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserResizeViewportResponse {
+    ok: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum EnsureBrowserRuntimeError {
+    #[error("browser automation is not enabled")]
+    Unavailable,
+    #[error("failed to start browser runtime")]
+    Start {
+        #[source]
+        source: crate::container::browser::BrowserError,
+    },
+}
+
+pub(super) async fn ensure_browser_runtime_started(
+    state: &DaemonState,
+) -> Result<Arc<crate::container::browser::BrowserManager>, EnsureBrowserRuntimeError> {
+    let browser_manager = state
+        .browser_manager()
+        .ok_or(EnsureBrowserRuntimeError::Unavailable)?;
+    if browser_manager.is_running() {
+        return Ok(browser_manager);
+    }
+    browser_manager
+        .start()
+        .await
+        .map_err(|source| EnsureBrowserRuntimeError::Start { source })?;
+    Ok(browser_manager)
+}
+
+pub(super) async fn browser_status(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<BrowserStatus>> {
+    let enabled = state.config_snapshot().browser.enabled;
+    let owner_session_id = state.browser_owner_session_id();
+    let takeover_session_id = state
+        .runtime_service
+        .find_browser_takeover_session()
+        .await
+        .map_err(internal_error)?;
+    let Some(bm) = state.browser_manager() else {
+        return Ok(Json(BrowserStatus {
+            enabled,
+            running: false,
+            cdp_endpoint: None,
+            owner_session_id,
+            takeover_session_id,
+        }));
+    };
+    let running = bm.is_running();
+    Ok(Json(BrowserStatus {
+        enabled,
+        running,
+        cdp_endpoint: if running { bm.cdp_endpoint() } else { None },
+        owner_session_id,
+        takeover_session_id,
+    }))
+}
+
+pub(super) async fn browser_start(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<BrowserStatus>> {
+    let tokio_handle = state.tokio_handle.clone();
+    let response = tokio_handle
+        .spawn({
+            let state = state.clone();
+            async move { run_browser_start(state).await }
+        })
+        .await
+        .map_err(|_| {
+            internal_error_message("browser start task panicked before producing a response")
+        })??;
+    Ok(Json(response))
+}
+
+pub(super) async fn browser_stop(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<BrowserStatus>> {
+    let tokio_handle = state.tokio_handle.clone();
+    let response = tokio_handle
+        .spawn({
+            let state = state.clone();
+            async move { run_browser_stop(state).await }
+        })
+        .await
+        .map_err(|_| {
+            internal_error_message("browser stop task panicked before producing a response")
+        })??;
+    Ok(Json(response))
+}
+
+/// WebRTC SDP offer/answer signaling endpoint.
+///
+/// Client sends an SDP offer (recvonly video + `DataChannel`).
+/// Server responds with SDP answer containing ICE candidates.
+/// After this single round-trip, WebRTC media/data flows directly.
+pub(super) async fn browser_offer(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<WebRtcOfferRequest>,
+) -> SkyResult<Json<WebRtcAnswerResponse>> {
+    let tokio_handle = state.tokio_handle.clone();
+    let response = tokio_handle
+        .spawn({
+            let state = state.clone();
+            async move { run_browser_offer(state, req).await }
+        })
+        .await
+        .map_err(|_| {
+            internal_error_message("browser offer task panicked before producing a response")
+        })??;
+    Ok(Json(response))
+}
+
+async fn run_browser_start(state: Arc<DaemonState>) -> SkyResult<BrowserStatus> {
+    let bm = ensure_browser_runtime_started(state.as_ref())
+        .await
+        .map_err(|error| {
+            let status = match error {
+                EnsureBrowserRuntimeError::Unavailable => StatusCode::NOT_FOUND,
+                EnsureBrowserRuntimeError::Start { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            skyzen::Error::msg(error_chain_text(&error)).set_status(status)
+        })?;
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+
+    Ok(BrowserStatus {
+        enabled: true,
+        running: true,
+        cdp_endpoint: bm.cdp_endpoint(),
+        owner_session_id: state.browser_owner_session_id(),
+        takeover_session_id: state
+            .runtime_service
+            .find_browser_takeover_session()
+            .await
+            .map_err(internal_error)?,
+    })
+}
+
+async fn run_browser_stop(state: Arc<DaemonState>) -> SkyResult<BrowserStatus> {
+    let Some(bm) = state.browser_manager() else {
+        return Err(skyzen::Error::msg("Browser automation is not enabled")
+            .set_status(StatusCode::NOT_FOUND));
+    };
+
+    bm.stop().await.map_err(internal_error)?;
+    state.set_browser_owner_session_id(None);
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+
+    Ok(BrowserStatus {
+        enabled: true,
+        running: false,
+        cdp_endpoint: None,
+        owner_session_id: None,
+        takeover_session_id: state
+            .runtime_service
+            .find_browser_takeover_session()
+            .await
+            .map_err(internal_error)?,
+    })
+}
+
+async fn run_browser_offer(
+    state: Arc<DaemonState>,
+    req: WebRtcOfferRequest,
+) -> SkyResult<WebRtcAnswerResponse> {
+    let Some(bm) = state.browser_manager() else {
+        return Err(skyzen::Error::msg("Browser automation is not enabled")
+            .set_status(StatusCode::NOT_FOUND));
+    };
+
+    let session_id = req.session_id.trim();
+    if session_id.is_empty() {
+        return Err(
+            skyzen::Error::msg("sessionId is required for browser offer")
+                .set_status(StatusCode::BAD_REQUEST),
+        );
+    }
+
+    let answer_sdp = bm
+        .handle_offer(session_id.to_string(), req.sdp)
+        .await
+        .map_err(|error| match error {
+            // The viewer cannot decode the stream's codec: its offer is the problem.
+            crate::container::browser::BrowserError::OfferCodec(error) => {
+                skyzen::Error::msg(error.to_string()).set_status(StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            error => internal_error(error),
+        })?;
+
+    Ok(WebRtcAnswerResponse { sdp: answer_sdp })
+}
+
+/// Resize the rendered viewport to follow the panel size on the client.
+pub(super) async fn browser_resize_viewport(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BrowserResizeViewportRequest>,
+) -> SkyResult<Json<BrowserResizeViewportResponse>> {
+    let Some(bm) = state.browser_manager() else {
+        return Err(skyzen::Error::msg("Browser automation is not enabled")
+            .set_status(StatusCode::NOT_FOUND));
+    };
+    if req.width == 0 || req.height == 0 {
+        return Err(
+            skyzen::Error::msg("width and height must be positive integers")
+                .set_status(StatusCode::BAD_REQUEST),
+        );
+    }
+    bm.resize_viewport(req.width, req.height, req.device_scale_factor)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(BrowserResizeViewportResponse { ok: true }))
+}
+
+/// Mark that user has taken over browser control for a session.
+pub(super) async fn browser_takeover_start(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BrowserTakeoverRequest>,
+) -> SkyResult<Json<BrowserTakeoverResponse>> {
+    let session_id = req.session_id.trim();
+    if session_id.is_empty() {
+        return Err(
+            skyzen::Error::msg("session_id is required").set_status(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    let session_id = session_id.to_string();
+    state
+        .runtime_service
+        .set_browser_takeover_owner(session_id.as_str())
+        .await
+        .map_err(internal_error)?;
+    // Interrupt an in-flight model request immediately. The chat loop checks
+    // the persisted takeover owner after cancellation and records the run as a
+    // takeover pause rather than an ordinary user cancellation.
+    let _ = state
+        .runtime_service
+        .runs()
+        .cancel(session_id.as_str(), crate::session::CancelReason::User);
+    if let Some(bm) = state.browser_manager() {
+        bm.set_takeover(Some(session_id.clone()));
+    }
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+    Ok(Json(BrowserTakeoverResponse {
+        ok: true,
+        session_id,
+    }))
+}
+
+/// Release browser takeover for a session and enqueue post-takeover alert.
+pub(super) async fn browser_takeover_stop(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BrowserTakeoverRequest>,
+) -> SkyResult<Json<BrowserTakeoverResponse>> {
+    let session_id = req.session_id.trim();
+    if session_id.is_empty() {
+        return Err(
+            skyzen::Error::msg("session_id is required").set_status(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    let session_id = session_id.to_string();
+    let runtime = state
+        .runtime_service
+        .clear_browser_takeover_owner(session_id.as_str())
+        .await
+        .map_err(internal_error)?;
+    if let Some(bm) = state.browser_manager() {
+        bm.set_takeover(None);
+    }
+    if runtime.can_dispatch_follow_up() {
+        spawn_follow_up_runs(state.clone(), session_id.clone());
+    }
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+    Ok(Json(BrowserTakeoverResponse {
+        ok: true,
+        session_id,
+    }))
+}

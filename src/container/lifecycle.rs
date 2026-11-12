@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use aither_sandbox::{ContainerLaunchSpec, MountAccess};
 use arc_swap::ArcSwap;
-use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
@@ -16,6 +16,37 @@ use tokio::time::Instant;
 
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
+
+/// Where a container's host workspace directory is bind-mounted, and the
+/// working directory of its commands. Every host-to-container workspace path
+/// derives from this one definition.
+pub const CONTAINER_WORKSPACE: &str = "/workspace";
+
+/// The workspace mount of a container session.
+///
+/// The session's host directory is mounted at [`CONTAINER_WORKSPACE`]; a
+/// container session declares it so subagent commands can be confined to their
+/// own space inside it.
+///
+/// # Panics
+/// Never in practice: the workspace path is a constant absolute path.
+#[must_use]
+pub fn workspace_mount(host_root: impl Into<std::path::PathBuf>) -> aither_sandbox::MountRoot {
+    aither_sandbox::MountRoot::new(
+        host_root,
+        aither_sandbox::ContainerPath::new(CONTAINER_WORKSPACE)
+            .expect("the container workspace is an absolute path"),
+    )
+}
+
+/// The in-container path of `file_name` in the container's workspace mount.
+#[must_use]
+pub fn container_workspace_path(file_name: &str) -> String {
+    format!("{CONTAINER_WORKSPACE}/{file_name}")
+}
+
+/// Workspace subdirectories bind-mounted into the container's `~/.may`.
+const WORKSPACE_MOUNT_DIRS: [&str; 2] = ["skills", "subagents"];
 
 const LABEL_MANAGED: &str = "may.managed";
 const LABEL_SPEC_FINGERPRINT: &str = "may.spec-fingerprint";
@@ -26,10 +57,22 @@ const DEFAULT_AUTO_STOP_MINUTES: u64 = 30;
 
 #[derive(Debug, Clone)]
 struct SharedHostPaths {
-    memory_file: PathBuf,
+    memories_dir: PathBuf,
+}
+
+#[derive(serde::Serialize)]
+struct SpecFingerprintPayload<'a> {
+    env: &'a [String],
+    host_gateway: &'a str,
+    image: &'a str,
+    mounts: &'a [String],
+    name: &'a str,
+    rev: &'a str,
+    workspace: String,
 }
 
 /// Manages container lifecycle for profile-based isolation.
+#[derive(Debug)]
 pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,
@@ -38,6 +81,8 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
+    /// Create a container manager bound to a detected `runtime`, persisting
+    /// managed-container state under `may_dir`.
     #[must_use]
     pub fn new(runtime: Arc<ContainerRuntime>, may_dir: PathBuf) -> Self {
         Self {
@@ -58,6 +103,12 @@ impl ContainerManager {
     /// - If the container exists and is running, returns its ID.
     /// - If the container exists but is stopped, starts it.
     /// - If the container doesn't exist, creates and starts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when inspecting, creating, or starting the
+    /// container fails, when a stale container cannot be replaced, or when shared
+    /// host paths cannot be prepared.
     pub async fn ensure_running(
         &self,
         spec: &ContainerLaunchSpec,
@@ -66,7 +117,7 @@ impl ContainerManager {
 
         let host_gateway = self.runtime.host_gateway().to_string();
         let shared_paths = self.ensure_shared_paths().await?;
-        let spec_fingerprint = self.compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
+        let spec_fingerprint = Self::compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
 
         if let Some(container) = self.find_container_by_name(spec.name.as_str()).await? {
             let id = container
@@ -100,7 +151,7 @@ impl ContainerManager {
                     .create_container(spec, &host_gateway, &shared_paths, &spec_fingerprint)
                     .await?;
                 self.runtime.client.start_container(&new_id, None).await?;
-                self.touch_activity(&new_id).await;
+                self.touch_activity(&new_id);
                 tracing::info!(
                     container_id = %new_id,
                     name = %spec.name,
@@ -110,13 +161,13 @@ impl ContainerManager {
             }
 
             if is_running {
-                self.touch_activity(&id).await;
+                self.touch_activity(&id);
                 return Ok(id);
             }
 
             // Container exists but isn't running — start it
             self.runtime.client.start_container(&id, None).await?;
-            self.touch_activity(&id).await;
+            self.touch_activity(&id);
             tracing::info!(container_id = %id, "Started existing container");
             return Ok(id);
         }
@@ -128,13 +179,17 @@ impl ContainerManager {
 
         // Start it
         self.runtime.client.start_container(&id, None).await?;
-        self.touch_activity(&id).await;
+        self.touch_activity(&id);
         tracing::info!(container_id = %id, name = %spec.name, "Created and started container");
 
         Ok(id)
     }
 
     /// Resolve a managed container id by deterministic container name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the container list query fails.
     pub async fn resolve_container_id_by_name(
         &self,
         name: &str,
@@ -144,6 +199,10 @@ impl ContainerManager {
     }
 
     /// Resolve a managed container id by name, but only when it is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the container list query fails.
     pub async fn resolve_running_container_id_by_name(
         &self,
         name: &str,
@@ -167,8 +226,13 @@ impl ContainerManager {
         shared_paths: &SharedHostPaths,
         spec_fingerprint: &str,
     ) -> Result<String, ContainerError> {
-        let env = self.effective_env(spec, host_gateway);
-        let mounts = self.effective_mounts(spec, shared_paths)?;
+        // A bind mount whose source is missing fails the create, so the
+        // workspace subdirectories the container mounts exist first.
+        for dir in WORKSPACE_MOUNT_DIRS {
+            async_fs::create_dir_all(spec.workspace.join(dir)).await?;
+        }
+        let env = Self::effective_env(spec, host_gateway);
+        let mounts = Self::effective_mounts(spec, shared_paths);
 
         let host_config = HostConfig {
             mounts: Some(mounts),
@@ -189,8 +253,8 @@ impl ContainerManager {
 
         let config = ContainerCreateBody {
             image: Some(spec.image.clone()),
-            hostname: Some(spec.name.clone()),
-            working_dir: Some("/workspace".to_string()),
+            hostname: Some(container_hostname(&spec.name)),
+            working_dir: Some(CONTAINER_WORKSPACE.to_string()),
             env: Some(env),
             host_config: Some(host_config),
             // Keep container alive with a long-running process
@@ -214,6 +278,15 @@ impl ContainerManager {
 
     async fn ensure_shared_paths(&self) -> Result<SharedHostPaths, ContainerError> {
         let home_paths = MayHomePaths::new(self.may_dir.clone());
+        let memories_dir = Self::ensure_memories_dir(&home_paths).await?;
+        Ok(SharedHostPaths { memories_dir })
+    }
+
+    /// Ensures the global memories directory and its index exist, returning
+    /// the directory's canonical path.
+    async fn ensure_memories_dir(home_paths: &MayHomePaths) -> Result<PathBuf, ContainerError> {
+        let memories_dir = home_paths.memories_dir();
+        tokio::fs::create_dir_all(&memories_dir).await?;
         let memory_file = home_paths.memory_file();
         if tokio::fs::metadata(&memory_file).await.is_err() {
             tokio::fs::write(&memory_file, "").await?;
@@ -224,92 +297,89 @@ impl ContainerManager {
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
                     "failed to canonicalize may dir {}: {error}",
-                    self.may_dir.display()
+                    home_paths.root().display()
                 ))
             })?;
-        let memory_file = tokio::fs::canonicalize(home_paths.memory_file())
+        let canonical = tokio::fs::canonicalize(&memories_dir)
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
-                    "failed to canonicalize global memory file {}: {error}",
-                    home_paths.memory_file().display()
+                    "failed to canonicalize global memories dir {}: {error}",
+                    memories_dir.display()
                 ))
             })?;
-        Ok(SharedHostPaths { memory_file })
+        // Windows canonical paths carry the `\\?\` verbatim prefix, which container
+        // runtimes reject as a bind-mount source.
+        Ok(dunce::simplified(&canonical).to_path_buf())
     }
 
-    fn effective_env(&self, spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
+    fn effective_env(spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
         let mut env = vec![
             "TERM=xterm-256color".to_string(),
             format!("MAY_HOST_GATEWAY={host_gateway}"),
+            // `~` is the mounted session workspace, matching a local session's
+            // HOME; churn-heavy caches stay on the container's own filesystem.
+            format!("HOME={CONTAINER_WORKSPACE}"),
+            format!("XDG_CONFIG_HOME={CONTAINER_WORKSPACE}/.config"),
+            "XDG_CACHE_HOME=/root/.cache".to_string(),
+            "BUN_INSTALL_CACHE_DIR=/root/.cache/bun".to_string(),
+            format!("PYTHONPATH={CONTAINER_WORKSPACE}/skills/python"),
         ];
         env.extend(spec.env.iter().cloned());
         env
     }
 
-    fn effective_mounts(
-        &self,
-        spec: &ContainerLaunchSpec,
-        shared_paths: &SharedHostPaths,
-    ) -> Result<Vec<Mount>, ContainerError> {
+    fn effective_mounts(spec: &ContainerLaunchSpec, shared_paths: &SharedHostPaths) -> Vec<Mount> {
         let mut mounts = vec![
-            // Session sandbox -> /workspace
+            // Session sandbox -> CONTAINER_WORKSPACE
             Mount {
-                target: Some("/workspace".to_string()),
+                target: Some(CONTAINER_WORKSPACE.to_string()),
                 source: Some(spec.workspace.display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
-            // Global memory file is shared across sessions.
+            // Global memories directory is shared across sessions; the
+            // container's HOME is the workspace, so `~/.may/memories` lands here.
             Mount {
-                target: Some("/root/.may/MEMORY.md".to_string()),
-                source: Some(shared_paths.memory_file.display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            },
-            // Session-scoped skill/subagent roots mapped into container ~/.may.
-            Mount {
-                target: Some("/root/.may/skills".to_string()),
-                source: Some(spec.workspace.join("skills").display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            },
-            Mount {
-                target: Some("/root/.may/subagents".to_string()),
-                source: Some(spec.workspace.join("subagents").display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                target: Some(format!("{CONTAINER_WORKSPACE}/.may/memories")),
+                source: Some(shared_paths.memories_dir.display().to_string()),
+                typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
         ];
+        // Workspace-scoped skill/subagent roots mapped into container ~/.may.
+        mounts.extend(WORKSPACE_MOUNT_DIRS.iter().map(|dir| Mount {
+            target: Some(format!("/root/.may/{dir}")),
+            source: Some(spec.workspace.join(dir).display().to_string()),
+            typ: Some(MountType::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        }));
 
         for mount in &spec.mounts {
             mounts.push(Mount {
-                target: Some(mount.container_path.display().to_string()),
+                target: Some(mount.container_path.to_string()),
                 source: Some(mount.host_path.display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(mount.access == MountAccess::ReadOnly),
                 ..Default::default()
             });
         }
 
-        Ok(mounts)
+        mounts
     }
 
     fn compute_spec_fingerprint(
-        &self,
         spec: &ContainerLaunchSpec,
         host_gateway: &str,
         shared_paths: &SharedHostPaths,
     ) -> Result<String, ContainerError> {
-        let mut env = self.effective_env(spec, host_gateway);
+        let mut env = Self::effective_env(spec, host_gateway);
         env.sort_unstable();
 
-        let mut mounts: Vec<String> = self
-            .effective_mounts(spec, shared_paths)?
+        let mut mounts: Vec<String> = Self::effective_mounts(spec, shared_paths)
             .iter()
             .map(|mount| {
                 format!(
@@ -322,15 +392,17 @@ impl ContainerManager {
             .collect();
         mounts.sort_unstable();
 
-        let payload = serde_json::to_string(&serde_json::json!({
-            "rev": SPEC_FINGERPRINT_REVISION,
-            "name": spec.name,
-            "image": spec.image,
-            "workspace": spec.workspace.display().to_string(),
-            "host_gateway": host_gateway,
-            "env": env,
-            "mounts": mounts,
-        }))
+        // Field order matches the sorted-key ordering serde_json's default
+        // map produced previously, so fingerprints stay byte-identical.
+        let payload = serde_json::to_string(&SpecFingerprintPayload {
+            env: &env,
+            host_gateway,
+            image: &spec.image,
+            mounts: &mounts,
+            name: &spec.name,
+            rev: SPEC_FINGERPRINT_REVISION,
+            workspace: spec.workspace.display().to_string(),
+        })
         .map_err(|error| {
             ContainerError::Bootstrap(format!(
                 "failed to serialize container spec fingerprint payload: {error}"
@@ -338,7 +410,7 @@ impl ContainerManager {
         })?;
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        payload.hash(&mut hasher);
+        payload.as_str().hash(&mut hasher);
         Ok(format!("{:016x}", hasher.finish()))
     }
 
@@ -357,6 +429,10 @@ impl ContainerManager {
     }
 
     /// Stop a container gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the stop request fails.
     pub async fn stop(&self, container_id: &str) -> Result<(), ContainerError> {
         let opts = StopContainerOptionsBuilder::default().t(10).build();
         self.runtime
@@ -371,6 +447,10 @@ impl ContainerManager {
     }
 
     /// Remove a container (force).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the remove request fails.
     pub async fn remove(&self, container_id: &str) -> Result<(), ContainerError> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         self.runtime
@@ -385,7 +465,7 @@ impl ContainerManager {
     }
 
     /// Record activity for a container (resets auto-stop timer).
-    pub async fn touch_activity(&self, container_id: &str) {
+    pub fn touch_activity(&self, container_id: &str) {
         self.update_activity(|activity| {
             activity.insert(container_id.to_string(), Instant::now());
         });
@@ -460,6 +540,10 @@ impl ContainerManager {
     }
 
     /// Check if a container is currently running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when inspecting the container fails.
     pub async fn is_running(&self, container_id: &str) -> Result<bool, ContainerError> {
         let info = self
             .runtime
@@ -468,5 +552,100 @@ impl ContainerManager {
             .await?;
         let running = info.state.and_then(|s| s.running).unwrap_or(false);
         Ok(running)
+    }
+}
+
+/// Longest hostname a container accepts: one DNS label. Linux refuses a
+/// `sethostname` over 64 bytes, which fails the container's start.
+const HOSTNAME_MAX: usize = 63;
+
+/// The container's hostname: its name as a DNS label of at most
+/// [`HOSTNAME_MAX`] bytes. A longer name keeps its end, which carries the
+/// session id.
+fn container_hostname(name: &str) -> String {
+    let label: Vec<u8> = name
+        .bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => byte,
+            b'A'..=b'Z' => byte.to_ascii_lowercase(),
+            _ => b'-',
+        })
+        .collect();
+    let excess = label.len().saturating_sub(HOSTNAME_MAX);
+    String::from_utf8(label.into_iter().skip(excess).collect())
+        .expect("a hostname label is ASCII")
+        .trim_matches('-')
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_sandbox::ContainerPath;
+
+    use super::*;
+
+    fn shared_paths() -> SharedHostPaths {
+        SharedHostPaths {
+            memories_dir: "/managed/memories".into(),
+        }
+    }
+
+    #[test]
+    fn profile_mounts_preserve_access_and_workspace_mounts() {
+        let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host").with_mount(
+            aither_sandbox::MountSpec::read_only(
+                "/project-host",
+                ContainerPath::new("/project").unwrap(),
+            ),
+        );
+        let shared = shared_paths();
+        let mounts = ContainerManager::effective_mounts(&spec, &shared);
+        let project = mounts
+            .iter()
+            .find(|mount| mount.target.as_deref() == Some("/project"))
+            .unwrap();
+        assert_eq!(project.source.as_deref(), Some("/project-host"));
+        assert_eq!(project.typ, Some(MountType::BIND));
+        assert_eq!(project.read_only, Some(true));
+        assert_eq!(
+            mounts
+                .iter()
+                .find(|mount| mount.target.as_deref() == Some("/workspace"))
+                .unwrap()
+                .read_only,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_container_hostname_is_one_label_ending_in_the_session_id() {
+        assert_eq!(
+            container_hostname("may-default-quick-session"),
+            "may-default-quick-session"
+        );
+
+        let session = "permissively-thunderously-fluttering-gnatcatcher";
+        let name = format!("may-0b8e6c1e-3f2a-4c55-9d0e-7a1b2c3d4e5f-{session}");
+        let hostname = container_hostname(&name);
+        assert!(hostname.len() <= HOSTNAME_MAX, "{hostname}");
+        assert!(hostname.ends_with(session), "{hostname}");
+        assert!(!hostname.starts_with('-'), "{hostname}");
+
+        let odd = container_hostname("may-Work_Profile.v2-session");
+        assert_eq!(odd, "may-work-profile-v2-session");
+    }
+
+    #[test]
+    fn shared_path_change_invalidates_container_fingerprint() {
+        let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host");
+        let first = shared_paths();
+        let mut second = first.clone();
+        second.memories_dir = "/managed/memories-2".into();
+        assert_ne!(
+            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &first)
+                .unwrap(),
+            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &second)
+                .unwrap()
+        );
     }
 }

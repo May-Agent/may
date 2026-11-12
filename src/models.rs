@@ -1,7 +1,9 @@
 //! Model fetching from provider APIs.
 
-use aither_cloud::{ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider};
-use aither_core::llm::{LanguageModelProvider, model::Ability};
+use aither_cloud::{
+    ClaudeProvider, CloudModelProvider, CodexProvider, CopilotProvider, GeminiProvider,
+};
+use aither_core::llm::LanguageModelProvider;
 use aither_models::lookup as lookup_model_info;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -11,14 +13,30 @@ use crate::config::{MayConfig, ProviderInstance, ProviderType};
 /// Error type for model fetching operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelFetchError {
-    #[error("Provider error: {0}")]
-    Provider(#[from] anyhow::Error),
+    /// Provider error.
+    #[error("provider error: {0}")]
+    Provider(String),
+    /// HTTP error.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    /// Copilot not authenticated.
     #[error("Copilot not authenticated")]
     CopilotNotAuthenticated,
+    /// Copilot auth error.
     #[error("Copilot auth error: {0}")]
     CopilotAuth(#[from] crate::copilot::CopilotTokenError),
+    /// `ChatGPT` not authenticated.
+    #[error("ChatGPT not authenticated")]
+    ChatgptNotAuthenticated,
+    /// `ChatGPT` auth error.
+    #[error("ChatGPT auth error: {0}")]
+    ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
+    /// xAI Grok not authenticated.
+    #[error("xAI Grok not authenticated")]
+    GrokNotAuthenticated,
+    /// xAI Grok auth error.
+    #[error("xAI Grok auth error: {0}")]
+    GrokAuth(#[from] crate::grok::GrokAuthError),
 }
 
 /// Fetched model info.
@@ -105,7 +123,7 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
         .into_iter()
         .flat_map(|entry| {
             entry.models.into_iter().map(move |mut model| {
-                model.provider_id = entry.provider_id.clone();
+                model.provider_id.clone_from(&entry.provider_id);
                 model
             })
         })
@@ -117,14 +135,6 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
     models
 }
 
-/// Fetch models from a single provider.
-pub(crate) async fn fetch_models_for_provider_instance(
-    id: &str,
-    instance: &ProviderInstance,
-) -> Result<Vec<FetchedModel>, ModelFetchError> {
-    fetch_models_for_provider(id, instance).await
-}
-
 async fn fetch_models_for_provider(
     id: &str,
     instance: &ProviderInstance,
@@ -132,6 +142,13 @@ async fn fetch_models_for_provider(
     let ptype = instance.resolve_type(id);
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
+
+    if ptype == ProviderType::Grok {
+        let Some(token) = crate::grok::get_access_token().await? else {
+            return Err(ModelFetchError::GrokNotAuthenticated);
+        };
+        return fetch_openai_compatible_models(id, &token, base_url).await;
+    }
 
     if matches!(
         ptype,
@@ -172,6 +189,22 @@ async fn fetch_models_for_provider(
                 .base_url(credentials.api_endpoint)
                 .into()
         }
+        ProviderType::Chatgpt => {
+            let mut credentials = crate::chatgpt::load_credentials()
+                .await?
+                .ok_or(ModelFetchError::ChatgptNotAuthenticated)?;
+            if credentials.is_expired(std::time::Duration::from_secs(60)) {
+                credentials = aither_codex::auth::refresh_tokens(&credentials.refresh_token)
+                    .await
+                    .map_err(crate::chatgpt::ChatgptAuthError::Codex)?;
+                crate::chatgpt::save_credentials(&credentials).await?;
+            }
+            let mut provider = CodexProvider::new(credentials);
+            if let Some(url) = base_url {
+                provider = provider.with_base_url(url);
+            }
+            provider.into()
+        }
         ProviderType::OpenAI
         | ProviderType::OpenRouter
         | ProviderType::DeepSeek
@@ -179,6 +212,7 @@ async fn fetch_models_for_provider(
         | ProviderType::Together
         | ProviderType::Mistral
         | ProviderType::XAI
+        | ProviderType::Grok
         | ProviderType::Ollama
         | ProviderType::LMStudio
         | ProviderType::Custom => unreachable!("handled above"),
@@ -187,25 +221,23 @@ async fn fetch_models_for_provider(
     let profiles = provider
         .list_models()
         .await
-        .map_err(|e| ModelFetchError::Provider(e.into()))?;
+        .map_err(|error| ModelFetchError::Provider(error.to_string()))?;
     Ok(profiles
         .into_iter()
         .map(|p| {
             let model_id = p.name;
             let provider_description = p.description.trim();
-            let nickname = aither_models::lookup(&model_id)
-                .map(|info| info.id().to_string())
-                .or_else(|| {
-                    if provider_description.is_empty() {
-                        None
-                    } else {
-                        Some(provider_description.to_string())
-                    }
-                })
-                .unwrap_or_else(|| model_id.clone());
+            let nickname = if provider_description.is_empty() {
+                model_id.clone()
+            } else {
+                provider_description.to_string()
+            };
 
-            let mut abilities: Vec<String> =
-                p.abilities.into_iter().map(ability_to_label).collect();
+            let mut abilities: Vec<String> = p
+                .abilities
+                .into_iter()
+                .map(|a| a.label().to_string())
+                .collect();
 
             // Enrich with abilities from the static model database when the
             // provider API returns none (Claude/Gemini list_models omit them).
@@ -215,7 +247,7 @@ async fn fetch_models_for_provider(
                 abilities = info
                     .abilities()
                     .iter()
-                    .map(|a| ability_to_label(*a))
+                    .map(|a| a.label().to_string())
                     .collect();
             }
 
@@ -269,16 +301,14 @@ async fn fetch_openai_compatible_models(
                 });
             let nickname = model
                 .description
-                .clone()
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| aither_models::lookup(&model_id).map(|info| info.id().to_string()))
                 .unwrap_or_else(|| model_id.clone());
 
             let abilities = aither_models::lookup(&model_id)
                 .map(|info| {
                     info.abilities()
                         .iter()
-                        .map(|ability| ability_to_label(*ability))
+                        .map(|ability| ability.label().to_string())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -312,22 +342,304 @@ struct OpenAiModelDescriptor {
     input_token_limit: Option<u32>,
 }
 
+/// Trailing tokens a provider catalog uses to encode a reasoning-effort rung
+/// inside the model uid (`o4-mini-high`, `claude-opus-5-5-low`).
+const EFFORT_UID_TOKENS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Speed markers that may follow the effort rung in a uid
+/// (`claude-opus-5-5-low-fast`, `o4-mini-high-lightning`). The marker belongs to
+/// the family, the effort rung does not.
+const EFFORT_UID_TAGS: &[&str] = &["-fast", "-lightning"];
+
+/// The family a catalog uid belongs to once its effort rung is stripped.
+///
+/// `o4-mini-high` and `o4-mini-max` share the `o4-mini` family, and a trailing
+/// speed marker stays with the family (`o4-mini-high-lightning` →
+/// `o4-mini-lightning`). Providers whose catalog encodes effort in the uid
+/// pick the rung through the reasoning-effort ladder rather than a suffixed
+/// model.
 #[must_use]
-pub fn ability_to_label(ability: Ability) -> String {
-    match ability {
-        Ability::ToolUse => "tool_use".to_string(),
-        Ability::Vision => "vision".to_string(),
-        Ability::Audio => "audio".to_string(),
-        Ability::AudioOutput => "audio_output".to_string(),
-        Ability::Video => "video".to_string(),
-        Ability::WebSearch => "web_search".to_string(),
-        Ability::Pdf => "pdf".to_string(),
-        Ability::CodeExecution => "code_execution".to_string(),
-        Ability::Reasoning => "reasoning".to_string(),
-        Ability::ImageGeneration => "image_generation".to_string(),
-        Ability::ComputerUse => "computer_use".to_string(),
-        Ability::PromptCaching => "prompt_caching".to_string(),
-        Ability::AssistantPrefill => "assistant_prefill".to_string(),
-        _ => panic!("unsupported ability variant: {ability:?}"),
+pub fn effort_family_base(model_id: &str) -> String {
+    for tag in EFFORT_UID_TAGS.iter().chain([&""]) {
+        let Some(core) = model_id.strip_suffix(tag) else {
+            continue;
+        };
+        for token in EFFORT_UID_TOKENS {
+            let suffix = format!("-{token}");
+            if let Some(base) = core.strip_suffix(&suffix)
+                && !base.is_empty()
+            {
+                return format!("{base}{tag}");
+            }
+        }
+    }
+    model_id.to_string()
+}
+
+/// The context window of `model_id` on `provider_id`: what the provider
+/// reports in its model list, else the `aither_models` table (also looked up
+/// by effort family, so `o4-mini-high` resolves like `o4-mini`).
+#[must_use]
+pub fn resolve_context_window(
+    fetched: &[FetchedModel],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<u32> {
+    let family = effort_family_base(model_id);
+    let reported = |wanted: &str| {
+        fetched
+            .iter()
+            .find(|model| model.provider_id == provider_id && model.id == wanted)
+            .and_then(|model| model.context_window)
+    };
+    let tabled = |wanted: &str| {
+        lookup_model_info(wanted).and_then(aither_models::ModelEntry::max_input_tokens)
+    };
+    reported(model_id)
+        .or_else(|| reported(&family))
+        .or_else(|| tabled(model_id))
+        .or_else(|| tabled(&family))
+}
+
+/// Whether two selector strings address the same selectable model.
+///
+/// The provider ids must match and the model ids must collapse to the same
+/// effort family (`relay::o4-mini-high` and `relay::o4-mini` are one picker entry).
+/// Strings that fail to parse only match exactly.
+#[must_use]
+pub fn same_selectable_model(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Ok(a), Ok(b)) = (
+        a.parse::<crate::ModelSelector>(),
+        b.parse::<crate::ModelSelector>(),
+    ) else {
+        return false;
+    };
+    a.provider_id() == b.provider_id()
+        && effort_family_base(a.model_id()) == effort_family_base(b.model_id())
+}
+
+/// Position of `rung` on the canonical effort order (`none` … `max`),
+/// for sorting a family's served rungs.
+#[must_use]
+pub fn effort_rung_rank(rung: &str) -> usize {
+    EFFORT_UID_TOKENS
+        .iter()
+        .position(|token| *token == rung)
+        .unwrap_or(usize::MAX)
+}
+
+/// The effort rung a catalog uid expresses, if it carries one
+/// (`o4-mini-high-lightning` → `high`).
+#[must_use]
+pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
+    for tag in EFFORT_UID_TAGS.iter().chain([&""]) {
+        let Some(core) = model_id.strip_suffix(tag) else {
+            continue;
+        };
+        for token in EFFORT_UID_TOKENS {
+            if core
+                .strip_suffix(&format!("-{token}"))
+                .is_some_and(|base| !base.is_empty())
+            {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+/// The effort rungs a catalog serves per `(provider id, family base)`, in
+/// canonical order.
+pub type FamilyEffortRungs = std::collections::HashMap<(String, String), Vec<&'static str>>;
+
+/// Record the rungs the catalog encodes in model uids into `rungs`, keeping
+/// each family's rungs sorted and unique.
+pub fn record_family_effort_rungs(rungs: &mut FamilyEffortRungs, models: &[FetchedModel]) {
+    for model in models {
+        let Some(rung) = effort_uid_token(&model.id) else {
+            continue;
+        };
+        let family = rungs
+            .entry((model.provider_id.clone(), effort_family_base(&model.id)))
+            .or_default();
+        if !family.contains(&rung) {
+            family.push(rung);
+        }
+    }
+    for family in rungs.values_mut() {
+        family.sort_by_key(|rung| effort_rung_rank(rung));
+    }
+}
+
+/// The level a session uses before any selection.
+pub const DEFAULT_EFFORT: &str = "medium";
+
+/// The reasoning-effort ladder a provider's wire protocol expresses.
+///
+/// Every rung is concrete — the session's effort is the one it last selected, and
+/// "default" before any selection means medium, not a provider-decided
+/// level. Families outside a ladder still take it: vendors map what they can
+/// on their own API-compat layer and reject what a model does not have.
+#[must_use]
+pub const fn provider_effort_ladder(
+    provider_type: Option<ProviderType>,
+) -> &'static [&'static str] {
+    const OPENAI: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const CLAUDE: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+    const GEMINI: &[&str] = &["minimal", "low", "medium", "high"];
+    match provider_type {
+        Some(ProviderType::Anthropic) => CLAUDE,
+        Some(ProviderType::Google) => GEMINI,
+        _ => OPENAI,
+    }
+}
+
+/// The effort rungs offered for `model_id` on `provider_id`: the family's
+/// served rungs when the catalog reports them, else the provider protocol's
+/// generic ladder.
+#[must_use]
+pub fn effort_ladder(
+    family_rungs: &FamilyEffortRungs,
+    provider_id: &str,
+    model_id: &str,
+    provider_type: Option<ProviderType>,
+) -> Vec<&'static str> {
+    family_rungs
+        .get(&(provider_id.to_string(), effort_family_base(model_id)))
+        .cloned()
+        .unwrap_or_else(|| provider_effort_ladder(provider_type).to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FamilyEffortRungs, FetchedModel, ProviderType, effort_ladder, effort_rung_rank,
+        record_family_effort_rungs, same_selectable_model,
+    };
+
+    fn fetched(provider_id: &str, id: &str) -> FetchedModel {
+        FetchedModel {
+            id: id.to_string(),
+            nickname: id.to_string(),
+            context_window: None,
+            abilities: Vec::new(),
+            provider_id: provider_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn family_rungs_are_sorted_and_the_catalog_beats_the_provider_ladder() {
+        let mut rungs = FamilyEffortRungs::new();
+        record_family_effort_rungs(
+            &mut rungs,
+            &[
+                fetched("relay", "o4-mini-high"),
+                fetched("relay", "o4-mini-low"),
+                fetched("relay", "o4-mini-high"),
+            ],
+        );
+        assert_eq!(
+            effort_ladder(&rungs, "relay", "o4-mini", None),
+            ["low", "high"]
+        );
+        assert_eq!(
+            effort_ladder(&rungs, "relay", "o4-mini-low", None),
+            ["low", "high"]
+        );
+        assert_eq!(
+            effort_ladder(&rungs, "relay", "gpt-x", Some(ProviderType::Google)),
+            ["minimal", "low", "medium", "high"]
+        );
+    }
+
+    fn with_window(provider_id: &str, id: &str, window: u32) -> FetchedModel {
+        FetchedModel {
+            context_window: Some(window),
+            ..fetched(provider_id, id)
+        }
+    }
+
+    #[test]
+    fn a_provider_reported_window_resolves_a_model_the_table_lacks() {
+        let list = [with_window("relay", "relay-only-model", 262_144)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "relay-only-model"),
+            Some(262_144)
+        );
+        assert_eq!(
+            super::resolve_context_window(&list, "other", "relay-only-model"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_provider_window_beats_the_table_and_the_table_fills_the_rest() {
+        let table = aither_models::lookup("gpt-4o")
+            .and_then(aither_models::ModelEntry::max_input_tokens)
+            .expect("the table lists gpt-4o");
+        assert_eq!(
+            super::resolve_context_window(&[], "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [fetched("relay", "gpt-4o")];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [with_window("relay", "gpt-4o", 12_345)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn an_effort_rung_resolves_through_its_family() {
+        let list = [with_window("relay", "o4-mini", 4_321)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "o4-mini-high"),
+            Some(4_321)
+        );
+    }
+
+    #[test]
+    fn same_model_matches_across_effort_rungs_on_one_provider() {
+        assert!(same_selectable_model(
+            "relay::o4-mini-high",
+            "relay::o4-mini"
+        ));
+        assert!(same_selectable_model(
+            "relay::o4-mini",
+            "relay::o4-mini-max"
+        ));
+        assert!(same_selectable_model(
+            "relay::o4-mini-high-lightning",
+            "relay::o4-mini-lightning"
+        ));
+    }
+
+    #[test]
+    fn same_model_requires_the_same_provider_and_family() {
+        assert!(!same_selectable_model("google::o4-mini", "relay::o4-mini"));
+        assert!(!same_selectable_model(
+            "relay::o4-mini-high",
+            "relay::o5-mini"
+        ));
+    }
+
+    #[test]
+    fn unparseable_selectors_only_match_exactly() {
+        assert!(same_selectable_model("o4-mini-high", "o4-mini-high"));
+        assert!(!same_selectable_model("o4-mini-high", "o4-mini"));
+    }
+
+    #[test]
+    fn effort_rung_rank_orders_the_ladder() {
+        let mut rungs = vec!["max", "medium", "high"];
+        rungs.sort_by_key(|rung| effort_rung_rank(rung));
+        assert_eq!(rungs, ["medium", "high", "max"]);
     }
 }

@@ -1,0 +1,221 @@
+name: Container image
+
+# CI calls this workflow ahead of the tests that pull its image, for every
+# pull request, merge group and main push that selects the tests. The caller's
+# concurrency group cancels a superseded pull request run, called jobs
+# included.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+# Fork pull requests cannot push to GHCR; they build each image for its
+# platform only to prove it compiles. Called from CI, `github.event` is the
+# caller's event, so this reads the same there.
+env:
+  CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+jobs:
+  refs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      base: ${{ steps.refs.outputs.base }}
+      workspace: ${{ steps.refs.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: nasm
+      - id: refs
+        run: cargo run --locked --example container_image --timings -- refs >> "$GITHUB_OUTPUT"
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-container-image-refs
+          path: target/cargo-timings/
+
+  base:
+    needs: refs
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      REF: ${{ needs.refs.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: exists
+        if: env.CAN_PUSH == 'true'
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/login-action@v3
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push linux/${{ matrix.arch }}
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --tag "$REF-${{ matrix.arch }}" \
+            --push \
+            ./container/base
+      - name: Build linux/${{ matrix.arch }} (no push)
+        if: env.CAN_PUSH != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --tag "$REF-${{ matrix.arch }}" \
+            --load \
+            ./container/base
+
+  base-manifest:
+    needs: [refs, base]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      REF: ${{ needs.refs.outputs.base }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch manifest
+        id: manifest
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "$REF already published; leaving it untouched"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$REF" "$REF-amd64" "$REF-arm64"
+          echo "digest=$(docker buildx imagetools inspect "$REF" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@v4
+        if: steps.manifest.outputs.digest != ''
+        with:
+          subject-name: ghcr.io/may-agent/may-workspace-base
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+  workspace:
+    needs: [refs, base-manifest]
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REF: ${{ needs.refs.outputs.workspace }}
+      BASE: ${{ needs.refs.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: exists
+        if: env.CAN_PUSH == 'true'
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/login-action@v3
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: steps.exists.outputs.exists != 'true' && runner.arch == 'X64'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: nasm
+      - name: Stage the workspace context
+        if: steps.exists.outputs.exists != 'true'
+        run: cargo run --locked --example container_image --timings -- stage ${{ matrix.arch }} ./container/workspace
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-container-image-stage-${{ matrix.arch }}
+          path: target/cargo-timings/
+      - name: Build and push linux/${{ matrix.arch }}
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg "BASE=$BASE" \
+            --tag "$REF-${{ matrix.arch }}" \
+            --push \
+            ./container/workspace
+      - name: Build linux/${{ matrix.arch }} (no push)
+        if: env.CAN_PUSH != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg "BASE=$BASE" \
+            --tag "$REF-${{ matrix.arch }}" \
+            --load \
+            ./container/workspace
+
+  workspace-manifest:
+    needs: [refs, workspace]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      REF: ${{ needs.refs.outputs.workspace }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch manifest
+        id: manifest
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "$REF already published; leaving it untouched"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$REF" "$REF-amd64" "$REF-arm64"
+          echo "digest=$(docker buildx imagetools inspect "$REF" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@v4
+        if: steps.manifest.outputs.digest != ''
+        with:
+          subject-name: ghcr.io/may-agent/may-workspace
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true

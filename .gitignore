@@ -1,5 +1,14 @@
 /target
 .DS_Store
 *.png
+*.log
+!/tests/fixtures/ci/*.log
 .leash/
 .heel/
+.codex-*
+.playwright-cli/
+
+# CI-generated container workspace context
+container/workspace/heel
+container/workspace/tasks
+container/workspace/tools/

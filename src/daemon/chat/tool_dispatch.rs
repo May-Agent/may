@@ -1,0 +1,319 @@
+//! Tool-dispatch request handlers used by the chat SSE loop.
+//!
+//! Each `handle_*_request` maps a typed tool-call from an agent into
+//! a concrete side effect against `DaemonState` (creating a task,
+//! driving the managed browser, or registering
+//! skills/subagents after user approval). All helpers in this file are
+//! `pub(super)` so the chat module that wires the tool-dispatch loop
+//! can invoke them without re-exporting anything.
+
+use std::sync::Arc;
+
+use crate::agent::browser_tool::BrowserToolError;
+use crate::harness::ask_user;
+use crate::ui_event_bus::UiEventTopics;
+
+use super::super::browser::ensure_browser_runtime_started;
+use super::super::error_chain::error_chain_text;
+use super::super::helpers::load_session_paths;
+use super::super::state::DaemonState;
+use crate::browser_service::persist_browser_page_capture;
+
+pub(super) async fn handle_task_request(
+    state: &Arc<DaemonState>,
+    request: crate::agent::task_tool::TaskCreateRequest,
+) -> Result<crate::agent::task_tool::TaskCreateResult, String> {
+    let mut result = state
+        .task_runtime
+        .create_task_from_tool_request(request)
+        .await?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    result.trigger = result.trigger.with_funnel_base(funnel.as_deref());
+    Ok(result)
+}
+
+pub(super) async fn handle_browser_request(
+    state: &Arc<DaemonState>,
+    request: crate::agent::browser_tool::BrowserRequest,
+) -> Result<crate::agent::browser_tool::BrowserResult, BrowserToolError> {
+    let session_id = request.session_id;
+    let Some(browser_manager) = state.browser_manager() else {
+        return Err(BrowserToolError::UnavailableInRuntime);
+    };
+
+    let browser_not_running_error = || {
+        BrowserToolError::request_failed(
+            "browser is not running; call browser open before browser cdp-endpoint or browser read",
+        )
+    };
+
+    match request.args {
+        crate::agent::browser_tool::BrowserArgs::Status => {
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: browser_manager.is_running(),
+                cdp_endpoint: None,
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::Start => {
+            let browser_manager = ensure_browser_runtime_started(state.as_ref())
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error_chain_text(&error)))?;
+            state.set_browser_owner_session_id(Some(session_id.clone()));
+            state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: true,
+                cdp_endpoint: browser_manager.cdp_endpoint(),
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::Stop => {
+            browser_manager
+                .stop()
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            state.set_browser_owner_session_id(None);
+            state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: false,
+                cdp_endpoint: None,
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::CdpEndpoint => {
+            if !browser_manager.is_running() {
+                return Err(browser_not_running_error());
+            }
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: true,
+                cdp_endpoint: browser_manager.cdp_endpoint(),
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::Read {
+            url,
+            detail,
+            screenshot,
+        } => {
+            let options = crate::agent::browser_tool::BrowserArgs::read_options(detail, screenshot);
+            let browser_manager = ensure_browser_runtime_started(state.as_ref())
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error_chain_text(&error)))?;
+            state.set_browser_owner_session_id(Some(session_id.clone()));
+            state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            let capture = browser_manager
+                .read_page(url, options)
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error_chain_text(&error)))?;
+            let session_paths = load_session_paths(state, session_id.as_str())
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            let session_ids = state
+                .db()
+                .session_ids(session_id.as_str())
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            let page = persist_browser_page_capture(
+                session_id.as_str(),
+                &session_paths,
+                session_ids.allocator(),
+                capture,
+            )
+            .await
+            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: true,
+                cdp_endpoint: browser_manager.cdp_endpoint(),
+                page: Some(page),
+            })
+        }
+    }
+}
+
+pub(super) async fn handle_register_skills_request(
+    state: &Arc<DaemonState>,
+    request: crate::agent::register_tool::RegisterRequest,
+) -> Result<crate::agent::register_tool::RegisterResult, String> {
+    handle_register_request(
+        state,
+        request,
+        "skill",
+        "skills",
+        |skills_dir, source| async move {
+            let manager = crate::skill::SkillManager::from_skills_dir(skills_dir);
+            let info = manager
+                .register_from_local_path(&source)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to register skill from {}: {error}",
+                        source.display()
+                    )
+                })?;
+            Ok(vec![info.dir_name])
+        },
+    )
+    .await
+}
+
+async fn handle_register_request<F, Fut>(
+    state: &Arc<DaemonState>,
+    request: crate::agent::register_tool::RegisterRequest,
+    source_label: &str,
+    target_dir_name: &str,
+    register: F,
+) -> Result<crate::agent::register_tool::RegisterResult, String>
+where
+    F: FnOnce(std::path::PathBuf, std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+{
+    let source =
+        resolve_registration_source_path(state, request.session_id.as_str(), &request.path).await?;
+    let session_root = resolve_session_root(state, request.session_id.as_str()).await?;
+    let target_dir = session_root.join(target_dir_name);
+    let approval_message = build_registration_approval_message(
+        request.session_id.as_str(),
+        &source,
+        source_label,
+        target_dir_name,
+    );
+    request_registration_approval(state, request.session_id.as_str(), &approval_message).await?;
+    Ok(crate::agent::register_tool::RegisterResult {
+        registered: register(target_dir, source).await?,
+    })
+}
+
+fn build_registration_approval_message(
+    session_id: &str,
+    source: &std::path::Path,
+    source_label: &str,
+    target_dir_name: &str,
+) -> String {
+    format!(
+        "Session {session_id} requests registering {source_label} from {} into this session's {target_dir_name}. Approve?",
+        source.display()
+    )
+}
+
+async fn resolve_session_root(
+    state: &DaemonState,
+    session_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let session_root = load_session_paths(state, session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .root()
+        .to_path_buf();
+    tokio::fs::create_dir_all(&session_root)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to create session root {}: {error}",
+                session_root.display()
+            )
+        })?;
+    let session_root_canonical = tokio::fs::canonicalize(&session_root)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to resolve session {}: {error}",
+                session_root.display()
+            )
+        })?;
+    Ok(session_root_canonical)
+}
+
+async fn resolve_registration_source_path(
+    state: &DaemonState,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = raw_path.trim();
+    if path.is_empty() {
+        return Err("registration path must not be empty".to_string());
+    }
+    let session = state
+        .db()
+        .get_session(session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("session {session_id} not found"))?;
+    let session_dir = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
+
+    let candidate = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        session_dir.join(path)
+    };
+
+    let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+        format!(
+            "failed to resolve registration path {}: {error}",
+            candidate.display()
+        )
+    })?;
+    let project_root = tokio::fs::canonicalize(&session_dir)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to resolve project root {}: {error}",
+                session_dir.display()
+            )
+        })?;
+
+    if !canonical.starts_with(&project_root) {
+        return Err(format!(
+            "registration path must be inside project root {}",
+            project_root.display()
+        ));
+    }
+
+    Ok(canonical)
+}
+
+async fn request_registration_approval(
+    state: &DaemonState,
+    session_id: &str,
+    question: &str,
+) -> Result<(), String> {
+    let (tx, rx) = async_channel::bounded(1);
+    let request = ask_user::AskUserRequest::new(
+        ask_user::AskUserRequestPayload {
+            session_id: session_id.to_string(),
+            request: ask_user::AskUserArgs {
+                question: None,
+                option: Vec::new(),
+                multi_select: false,
+                questions: vec![ask_user::Question {
+                    section: "registration".to_string(),
+                    question: question.to_string(),
+                    option: vec!["approve".to_string(), "deny".to_string()],
+                    multi_select: false,
+                }],
+            },
+        },
+        tx,
+    );
+    state
+        .ask_user_approver
+        .enqueue(request, Some(session_id.to_string()))
+        .await;
+    let answers = rx
+        .recv()
+        .await
+        .map_err(|error| format!("failed to receive user approval: {error}"))?;
+
+    let approved = answers.into_iter().any(|answer| match answer.answer {
+        ask_user::AnswerValue::Selected(values) => values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("approve")),
+        ask_user::AnswerValue::Custom(value) => value.eq_ignore_ascii_case("approve"),
+        ask_user::AnswerValue::Skipped => unreachable!("May never produces a skipped answer"),
+    });
+
+    if !approved {
+        return Err("user denied registration request".to_string());
+    }
+
+    Ok(())
+}

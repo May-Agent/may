@@ -1,0 +1,327 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  merge_group:
+    branches: [main, dev]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Selects the jobs the change reads (.github/scripts/ci-scope.sh holds the
+  # path rules). The ruleset requires one check, `CI result`, which needs
+  # `fmt`, `clippy`, `web-ui` and both test jobs and passes when each of them
+  # succeeded or was skipped by its job-level `if`. Should this job itself
+  # fail, the others run, so a broken scope never skips coverage.
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      fmt: ${{ steps.scope.outputs.fmt }}
+      clippy: ${{ steps.scope.outputs.clippy }}
+      test: ${{ steps.scope.outputs.test }}
+      web_ui: ${{ steps.scope.outputs.web_ui }}
+      acceptance: ${{ steps.scope.outputs.acceptance }}
+    steps:
+      # The diff needs the base commit, which a shallow clone lacks.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # A pull request measures from the merge base with its base branch; a
+      # merge group from the main commit it is built on; a push from the commit
+      # main pointed at before. A push with no previous commit (all zeros) has no
+      # base, so it selects everything.
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            pull_request) range="${PR_BASE}...${PR_HEAD}" ;;
+            merge_group) range="${GROUP_BASE}..${GROUP_HEAD}" ;;
+            push) range="${PUSH_BEFORE}..${PUSH_AFTER}" ;;
+            *) echo "::error::unexpected event ${EVENT}"; exit 1 ;;
+          esac
+          if [ "${EVENT}" = push ] && [ "${PUSH_BEFORE}" = 0000000000000000000000000000000000000000 ]; then
+            printf 'fmt=true\nclippy=true\ntest=true\nweb_ui=true\nacceptance=true\n' | tee -a "${GITHUB_OUTPUT}"
+          else
+            git diff --name-only "${range}" | tee /dev/stderr | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
+          fi
+
+  # The container tests in test-ubuntu pull the workspace image, whose tag is a
+  # content hash of its inputs; it is built and pushed here first, and skipped
+  # when that tag already exists. Same scope gate as the tests.
+  container-image:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    uses: ./.github/workflows/container-image.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+  fmt:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.fmt == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  clippy:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.clippy == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      # A rebuilt merge queue deletes its old group branches but leaves their
+      # runs queued; such a run ends here instead of holding a runner.
+      - name: Stop a superseded merge group
+        if: github.event_name == 'merge_group'
+        run: |
+          if ! git ls-remote --exit-code "https://github.com/${{ github.repository }}" "${{ github.ref }}" > /dev/null; then
+            echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
+            exit 1
+          fi
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Only main saves: a PR or merge-group cache lives in a scope nothing
+      # else restores, and its size evicts main's under the cache limit.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The `ui` feature's build script builds and embeds web-ui with bun.
+      - uses: ./.github/actions/install-bun
+      - name: bun install
+        working-directory: web-ui
+        run: bun install --frozen-lockfile
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: nasm
+      - name: cargo clippy (default features)
+        run: cargo clippy --locked --all-targets --timings -- -D warnings
+      - name: cargo clippy (ui)
+        run: cargo clippy --locked --all-targets --features ui --timings -- -D warnings
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-clippy
+          path: target/cargo-timings/
+
+  test-ubuntu:
+    name: test (ubuntu-latest)
+    # Not gated on the image's result: a failed image fails the run on its own,
+    # and a skipped required check would report success.
+    needs: [scope, container-image]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Full debuginfo for this dependency tree overflows the hosted runner's disk;
+      # line tables keep test backtraces readable.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/test
+
+  test-macos:
+    name: test (macos-latest)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # See test-ubuntu.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/test
+
+  # Runs tests/fixtures/verify_baseline_tools.sh through the real sandboxed
+  # terminal of `may exec` against the real managed tools the embedded
+  # distribution pins (search, JSON and edit commands, the managed bash, sed,
+  # uutils, uv and Python) on both OSes the distribution serves. The
+  # distribution pins every tool, so the cache of the downloads is keyed on its
+  # manifests and the restored directory serves a warm run.
+  verify-tools:
+    name: Verify Tools (${{ matrix.os }})
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.acceptance == 'true') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # The pinned tools come from GitHub releases; the job token authenticates
+      # the downloads.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-verify-tools
+      # See the `test` action.
+      - name: Drop restored test scratch
+        shell: bash
+        run: |
+          chmod -R u+w target/tmp 2>/dev/null || true
+          rm -rf target/tmp
+      - id: downloads
+        uses: ./.github/actions/restore-test-downloads
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: nasm
+      - name: Run the baseline tools acceptance script
+        run: >
+          cargo test --locked --timings --test terminal_first_e2e
+          -- --ignored --exact --nocapture
+          the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-verify-tools-${{ matrix.os }}
+          path: target/cargo-timings/
+      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.downloads.outputs.tools-path }}
+          key: ${{ steps.downloads.outputs.tools-key }}
+
+  # Runs a command of a container session through `may exec` in a real
+  # Docker container of the workspace image, and checks it runs at the
+  # configured nice level, runs a prepared tool from the tools mount and
+  # reaches May's IPC commands through the relayed endpoint. The test is
+  # ignored in the plain test jobs, which only compile it.
+  container-acceptance:
+    name: Container Acceptance
+    needs: [scope, container-image]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.acceptance == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-container-acceptance
+      - name: Drop restored test scratch
+        run: |
+          chmod -R u+w target/tmp 2>/dev/null || true
+          rm -rf target/tmp
+      - id: downloads
+        uses: ./.github/actions/restore-test-downloads
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.arch == 'X64'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: nasm
+      - name: Run the container acceptance test
+        run: >
+          cargo test --locked --timings --test terminal_first_e2e
+          -- --ignored --exact --nocapture
+          a_container_command_runs_at_the_configured_nice_and_reaches_ipc
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-container-acceptance
+          path: target/cargo-timings/
+      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.downloads.outputs.tools-path }}
+          key: ${{ steps.downloads.outputs.tools-key }}
+
+  web-ui:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.web_ui == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-bun
+      - name: bun install
+        working-directory: web-ui
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        working-directory: web-ui
+        run: bunx tsc -b
+      - name: lint
+        working-directory: web-ui
+        run: bun run lint
+      - name: bun test
+        working-directory: web-ui
+        run: bun test
+
+  result:
+    # The one required check on `main`: green when every job it needs
+    # succeeded or was skipped by the scope.
+    name: CI result
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - test-ubuntu
+      - test-macos
+      - web-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" = failure ] || [ "$result" = cancelled ]; then
+              echo "::error::a needed job ended $result"
+              exit 1
+            fi
+          done

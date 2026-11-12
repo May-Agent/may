@@ -1,0 +1,36 @@
+name: Restore test downloads
+description: Restore the pinned artifacts the terminal E2E suite and the sandbox unit tests download from GitHub releases (the managed baseline tools with their prepared runtimes, and heel), keyed on the pins, and export MAY_TEST_CACHE so the tests use the restored directory. The caller saves the cache after its tests with actions/cache/save and the outputs below.
+outputs:
+  tools-path:
+    description: Directory holding the baseline tool artifacts, prepared runtimes and heel.
+    value: ${{ steps.key.outputs.tools-path }}
+  tools-key:
+    description: Cache key of the baseline tools and heel.
+    value: ${{ steps.key.outputs.tools-key }}
+  tools-hit:
+    description: "'true' when the baseline tools were restored exactly."
+    value: ${{ steps.tools.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: |
+        set -euo pipefail
+        digest() { sha256sum "$@" 2>/dev/null || shasum -a 256 "$@"; }
+        # The manifests pin every baseline artifact, the interpreter uv
+        # installs into a prepared runtime and heel, so their hash keys the
+        # directory.
+        tools="$(cat src/tools/tool-distribution-*.json src/tools/host-programs.json | digest | cut -d' ' -f1)"
+        root="${RUNNER_TEMP}/may-test-cache"
+        mkdir -p "${root}"
+        {
+          echo "tools-key=may-tools-${RUNNER_OS}-${RUNNER_ARCH}-${tools}"
+          echo "tools-path=${root}/may-tools"
+        } >> "${GITHUB_OUTPUT}"
+        echo "MAY_TEST_CACHE=${root}" >> "${GITHUB_ENV}"
+    - id: tools
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.key.outputs.tools-path }}
+        key: ${{ steps.key.outputs.tools-key }}

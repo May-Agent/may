@@ -17,20 +17,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::StreamCodec;
+use crate::video::{
+    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, GateChange, RawFrame, SourceGate,
+    StreamFormat, VideoCodec, encode_loop, encoder_control,
+};
+use arc_swap::ArcSwapOption;
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxProperty, AxValue, EnableParams as AccessibilityEnableParams,
     GetFullAxTreeParams as GetFullAccessibilityTreeParams,
 };
+use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
-    StartScreencastParams,
+    AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, CaptureScreenshotParams,
+    EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+    StopScreencastParams, Viewport,
 };
+use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
+use chromiumoxide::error::CdpError;
 use chromiumoxide::page::Page;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide_fetcher::{
@@ -41,19 +51,14 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use walkdir::WalkDir;
-use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -68,51 +73,84 @@ use crate::config::{BrowserBackendKind, BrowserConfig as MayBrowserConfig};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Validation failure for a browser input payload received over the `DataChannel`.
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserInputError {
+    /// A `navigate` input arrived with an empty URL.
     #[error("navigate input requires a non-empty url")]
     EmptyNavigationUrl,
+    /// A press/release mouse input arrived without naming a button.
+    #[error("mouse input with event type {event_type:?} requires a button")]
+    MissingMouseButton {
+        /// Mouse event type that required a button.
+        event_type: MouseEventType,
+    },
 }
 
+/// Failures from the managed browser runtime and its WebRTC pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
+    /// No browser session is currently running.
     #[error("Browser not running")]
     NotRunning,
+    /// The managed browser binary/profile has not been provisioned yet.
     #[error("Managed browser runtime is not provisioned")]
     NotProvisioned,
+    /// The browser actor's command channel closed mid-operation.
     #[error("browser actor unexpectedly closed while handling {operation}")]
-    ActorClosed { operation: &'static str },
+    ActorClosed {
+        /// Operation being handled when the actor exited.
+        operation: &'static str,
+    },
+    /// A CDP browser operation failed.
     #[error("browser operation failed during {operation}")]
     BrowserOperation {
+        /// Operation that failed.
         operation: &'static str,
+        /// Underlying driver error.
         #[source]
         source: BoxError,
     },
+    /// A WebRTC negotiation or track operation failed.
     #[error("webrtc operation failed during {operation}")]
     WebRtcOperation {
+        /// Operation that failed.
         operation: &'static str,
+        /// Underlying driver error.
         #[source]
         source: BoxError,
     },
-    #[error("encoder operation failed during {operation}")]
-    EncoderOperation {
-        operation: &'static str,
-        #[source]
-        source: BoxError,
-    },
+    /// A managed-browser provisioning step failed.
     #[error("provisioning operation failed during {operation}")]
     ProvisioningOperation {
+        /// Operation that failed.
         operation: &'static str,
+        /// Underlying error.
         #[source]
         source: BoxError,
     },
+    /// A `DataChannel` input message failed to deserialize.
     #[error("browser input payload is invalid")]
     InvalidInputPayload {
+        /// JSON decoding error.
         #[source]
         source: serde_json::Error,
     },
+    /// The input payload failed validation.
     #[error(transparent)]
     InvalidInput(#[from] BrowserInputError),
+    /// The managed browser failed to start.
+    #[error(transparent)]
+    ManagedBrowserStartup(#[from] ManagedBrowserStartupError),
+    /// No usable page appeared during startup.
+    #[error(transparent)]
+    BrowserPageReady(#[from] BrowserPageReadyError),
+    /// The stream codec could not be selected.
+    #[error(transparent)]
+    CodecSelection(#[from] crate::video::FrameError),
+    /// The viewer's offer cannot use the stream's codec.
+    #[error(transparent)]
+    OfferCodec(#[from] crate::video::OfferCodecError),
 }
 
 impl BrowserError {
@@ -136,16 +174,6 @@ impl BrowserError {
         }
     }
 
-    fn encoder_operation(
-        operation: &'static str,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::EncoderOperation {
-            operation,
-            source: Box::new(source),
-        }
-    }
-
     fn provisioning_operation(
         operation: &'static str,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -155,6 +183,47 @@ impl BrowserError {
             source: Box::new(source),
         }
     }
+}
+
+/// Failures while bringing up the managed Chrome process.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedBrowserStartupError {
+    /// The debugger metadata endpoint responded but lacked `webSocketDebuggerUrl`.
+    #[error("managed browser debugger metadata at {url} did not include webSocketDebuggerUrl")]
+    MissingWebSocketDebuggerUrl {
+        /// Metadata endpoint that was queried.
+        url: reqwest::Url,
+    },
+    /// The debugger metadata endpoint did not return decodable JSON.
+    #[error("failed to decode managed browser debugger metadata from {url}")]
+    DecodeDebuggerMetadata {
+        /// Metadata endpoint that was queried.
+        url: reqwest::Url,
+        /// HTTP/JSON decoding error.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// The debugger websocket endpoint did not appear before the deadline.
+    #[error(
+        "managed browser did not expose a websocket endpoint on port {port} within {timeout:?}"
+    )]
+    Timeout {
+        /// Port Chrome was expected to listen on.
+        port: u16,
+        /// How long startup waited before giving up.
+        timeout: Duration,
+    },
+}
+
+/// Failures waiting for the managed browser's initial page.
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserPageReadyError {
+    /// No page target appeared before the deadline.
+    #[error("browser did not expose an initial page within {timeout:?}")]
+    Timeout {
+        /// How long startup waited for an initial page.
+        timeout: Duration,
+    },
 }
 
 // ── DataChannel input messages ─────────────────────────────────────────────────
@@ -167,13 +236,25 @@ enum InputMessage {
     Navigate { url: String },
 }
 
+/// Mouse event kinds accepted over the browser input `DataChannel`,
+/// deserialized from `camelCase` JSON.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum MouseEventType {
+pub enum MouseEventType {
+    /// Button press (`mousePressed`).
     MousePressed,
+    /// Button release (`mouseReleased`).
     MouseReleased,
+    /// Pointer motion (`mouseMoved`).
     MouseMoved,
+    /// Scroll wheel (`mouseWheel`).
     MouseWheel,
+}
+
+impl MouseEventType {
+    const fn requires_button(&self) -> bool {
+        matches!(self, Self::MousePressed | Self::MouseReleased)
+    }
 }
 
 impl From<MouseEventType> for DispatchMouseEventType {
@@ -259,21 +340,24 @@ struct KeyboardInput {
 
 // ── Internal types ─────────────────────────────────────────────────────────────
 
-/// An encoded video frame ready for WebRTC.
-struct EncodedSample {
-    data: Vec<u8>,
-    duration: Duration,
-}
-
 /// Active browser session with all associated tasks.
 struct BrowserSession {
     browser: Browser,
     page: Arc<Page>,
-    owns_browser_process: bool,
-    _handler: tokio::task::JoinHandle<()>,
-    _cdp_reader: tokio::task::JoinHandle<()>,
-    _sample_writer: tokio::task::JoinHandle<()>,
-    _audio_writer: tokio::task::JoinHandle<()>,
+    backing: BrowserSessionBacking,
+    handler: tokio::task::JoinHandle<()>,
+    cdp_reader: tokio::task::JoinHandle<()>,
+    sample_writer: tokio::task::JoinHandle<()>,
+    /// Whether the CDP screencast runs: only while a viewer is attached.
+    screencast: SourceGate,
+    /// Feeds the encoder beside the screencast reader, for the snapshot a
+    /// joining viewer gets.
+    frames: mpsc::Sender<RawFrame>,
+}
+
+enum BrowserSessionBacking {
+    Managed { owns_process: bool },
+    RemoteCdp,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -288,6 +372,28 @@ enum ManagedBrowserListenerState {
     NotListening,
     Managed,
     ExternalProcess,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedBrowserPaths {
+    executable: PathBuf,
+    profile_dir: PathBuf,
+}
+
+impl ManagedBrowserPaths {
+    fn discover(may_dir: &Path) -> Option<Self> {
+        let profile_dir =
+            crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_profile_dir();
+        managed_browser_executable(may_dir).map(|executable| Self {
+            executable,
+            profile_dir,
+        })
+    }
+
+    fn owns_process_command(&self, command_line: &str) -> bool {
+        let profile_arg = format!("--user-data-dir={}", self.profile_dir.display());
+        command_line.contains(profile_arg.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +430,10 @@ enum BrowserCommand {
         reply: oneshot::Sender<Result<(), BrowserError>>,
     },
     HandleOffer {
+        /// Session that originated the offer; the actor records it on the
+        /// peer so the takeover gate knows which `DataChannel` may drive
+        /// browser input.
+        session_id: String,
         offer_sdp: String,
         reply: oneshot::Sender<Result<String, BrowserError>>,
     },
@@ -335,29 +445,165 @@ enum BrowserCommand {
     DropPeer {
         peer_id: String,
     },
+    /// Switch the stream to another codec: close every peer, rebuild the
+    /// WebRTC stack and restart the encoder, leaving the browser running.
+    SetCodec {
+        preference: StreamCodec,
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
+    /// Mirror takeover ownership from the database into the actor so the
+    /// `DataChannel` input gate has a consistent, lock-free view without
+    /// async DB round-trips on the hot path.
+    SetTakeover {
+        session_id: Option<String>,
+    },
+    /// Resize the rendered viewport to match the live-view panel. Updates
+    /// the CDP emulation metrics and re-issues `StartScreencast` so the
+    /// next encoded frames carry the new resolution.
+    ResizeViewport {
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
+}
+
+/// Sequential, transient lifecycle facts produced by the browser actor.
+///
+/// Unlike `BrowserStatusEventPayload`, which is a snapshot reconciled on
+/// every topic notification, lifecycle events are point-in-time and must
+/// be streamed in order. They ride the existing `/api/events` SSE stream
+/// as the `browser_lifecycle` event kind (see `AGENTS.md`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BrowserLifecycleEvent {
+    /// Managed browser binary is being downloaded.
+    ChromeFetching {
+        /// Bytes downloaded so far.
+        progress_bytes: u64,
+        /// Total download size when the server reports it.
+        total_bytes: Option<u64>,
+    },
+    /// Browser process is launching.
+    Starting,
+    /// Browser is up and the encoding pipeline is running.
+    Ready,
+    /// The page is navigating to a new URL.
+    Navigating {
+        /// URL being navigated to.
+        url: String,
+    },
+    /// A navigation finished and the page is interactive.
+    PageLoaded {
+        /// URL that finished loading.
+        url: String,
+        /// Document title after load, when known.
+        title: Option<String>,
+    },
+    /// A WebRTC peer attached to the video stream.
+    PeerConnected {
+        /// Number of peers attached after this connect.
+        count: usize,
+    },
+    /// A WebRTC peer detached.
+    PeerDisconnected {
+        /// Number of peers still attached after this disconnect.
+        count: usize,
+    },
+    /// Input takeover ownership moved to another session.
+    TakeoverChanged {
+        /// Session that now owns input takeover; `None` means the agent owns the page.
+        session_id: Option<String>,
+    },
+    /// The H.264 encoder produced no frame within its watchdog window.
+    EncoderStalled,
+    /// The browser session shut down.
+    Stopped,
+    /// An unrecoverable runtime failure occurred.
+    Error {
+        /// Human-readable failure description.
+        message: String,
+    },
+}
+
+/// Lightweight publisher used by the browser actor to emit lifecycle
+/// events without holding an `Option<broadcast::Sender>` everywhere.
+/// Cloning is cheap; emissions are fire-and-forget.
+#[derive(Debug, Clone)]
+pub struct BrowserLifecyclePublisher {
+    tx: tokio::sync::broadcast::Sender<BrowserLifecycleEvent>,
+}
+
+impl BrowserLifecyclePublisher {
+    /// Wrap an existing broadcast sender used to fan out lifecycle events.
+    #[must_use]
+    pub const fn new(tx: tokio::sync::broadcast::Sender<BrowserLifecycleEvent>) -> Self {
+        Self { tx }
+    }
+
+    /// A publisher that drops every event. Used by standalone CLI flows
+    /// (`may browser` IPC subprocess) where there is no SSE consumer.
+    #[must_use]
+    pub fn noop() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        Self { tx }
+    }
+
+    /// Publish a lifecycle event; silently dropped when nobody is subscribed.
+    pub fn emit(&self, event: BrowserLifecycleEvent) {
+        // Fire-and-forget: a closed channel just means nobody is currently
+        // subscribed (no SSE clients), which is fine.
+        let _ = self.tx.send(event);
+    }
 }
 
 struct BrowserRuntime {
     session: Option<BrowserSession>,
     video_track: Arc<TrackLocalStaticSample>,
-    audio_track: Arc<TrackLocalStaticSample>,
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
+    lifecycle: BrowserLifecyclePublisher,
+    /// The codec the stream was negotiated with, fixed at construction.
+    codec: VideoCodec,
+    /// The running encoder's request channel: a new peer asks it for an IDR
+    /// so the viewer doesn't wait for the next scheduled keyframe, and each
+    /// peer reports its bandwidth estimate. `None` while the browser is off.
+    encoder_control: Option<EncoderControl>,
+    /// The session currently authorised to drive the browser via its
+    /// `DataChannel`. `None` means the agent owns the page and any peer
+    /// input is silently dropped.
+    takeover_owner: Arc<ArcSwapOption<String>>,
 }
 
 impl BrowserRuntime {
     fn new(
+        codec: VideoCodec,
         video_track: Arc<TrackLocalStaticSample>,
-        audio_track: Arc<TrackLocalStaticSample>,
         webrtc_api: webrtc::api::API,
+        lifecycle: BrowserLifecyclePublisher,
     ) -> Self {
         Self {
             session: None,
             video_track,
-            audio_track,
             webrtc_api,
             peers: HashMap::new(),
+            lifecycle,
+            codec,
+            encoder_control: None,
+            takeover_owner: Arc::new(ArcSwapOption::empty()),
         }
+    }
+
+    fn set_takeover(&self, session_id: Option<String>) {
+        let next = session_id.clone().map(Arc::new);
+        let previous = self.takeover_owner.load_full();
+        let previous_id = previous.as_ref().map(|s| s.as_ref().clone());
+        if previous_id == session_id {
+            return;
+        }
+        self.takeover_owner.store(next);
+        self.lifecycle
+            .emit(BrowserLifecycleEvent::TakeoverChanged { session_id });
     }
 
     fn publish_snapshot(&self, snapshot_tx: &watch::Sender<BrowserRuntimeSnapshot>) {
@@ -371,8 +617,191 @@ impl BrowserRuntime {
         });
     }
 
-    fn drop_peer(&mut self, peer_id: &str) {
-        self.peers.remove(peer_id);
+    /// Brings the CDP screencast in line with the peers map: running while at
+    /// least one viewer is attached, stopped otherwise so nothing is captured,
+    /// decoded or encoded for nobody.
+    async fn sync_screencast(&mut self, config: &MayBrowserConfig) -> Result<(), BrowserError> {
+        let viewers = self.peers.len();
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        let Some(change) = session.screencast.required(viewers) else {
+            return Ok(());
+        };
+        match change {
+            GateChange::Start => {
+                let params = StartScreencastParams::builder()
+                    .format(StartScreencastFormat::Jpeg)
+                    .quality(i64::from(config.screencast_jpeg_quality))
+                    .max_width(i64::from(config.screencast_max_width))
+                    .max_height(i64::from(config.screencast_max_height))
+                    .every_nth_frame(i64::from(config.every_nth_frame.max(1)))
+                    .build();
+                session
+                    .page
+                    .execute(params)
+                    .await
+                    .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
+            }
+            GateChange::Stop => {
+                session
+                    .page
+                    .execute(StopScreencastParams::default())
+                    .await
+                    .map_err(|error| BrowserError::browser_operation("stop screencast", error))?;
+            }
+        }
+        session.screencast.applied(change);
+        tracing::debug!(?change, viewers, "browser screencast gate");
+        Ok(())
+    }
+
+    /// Pushes one fresh frame of the page to the encoder so a joining viewer
+    /// gets a picture at once: the screencast emits only on damage, and a
+    /// still page would leave the pending keyframe request unanswered.
+    async fn push_snapshot(&self, config: &MayBrowserConfig) -> Result<(), BrowserError> {
+        let session = self.session.as_ref().ok_or(BrowserError::NotRunning)?;
+        let (width, height, dpr): (f64, f64, f64) = session
+            .page
+            .evaluate("[innerWidth, innerHeight, devicePixelRatio]")
+            .await
+            .map_err(|error| BrowserError::browser_operation("measure the viewport", error))?
+            .into_value()
+            .map_err(|error| BrowserError::browser_operation("read the viewport", error))?;
+        let clip = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            scale: snapshot_scale(
+                (width, height),
+                dpr,
+                (config.screencast_max_width, config.screencast_max_height),
+            ),
+        };
+        let params = CaptureScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Jpeg)
+            .quality(i64::from(config.screencast_jpeg_quality))
+            .clip(clip)
+            .build();
+        let shot = session
+            .page
+            .execute(params)
+            .await
+            .map_err(|error| BrowserError::browser_operation("capture a snapshot", error))?;
+        let data: &str = shot.result.data.as_ref();
+        let jpeg = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|error| {
+                BrowserError::browser_operation("decode a snapshot", std::io::Error::other(error))
+            })?;
+        // Like the screencast reader: a full queue already holds frames the
+        // pending keyframe request applies to, and the actor never blocks.
+        match session.frames.try_send(RawFrame::Jpeg(jpeg)) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(BrowserError::NotRunning),
+        }
+    }
+
+    async fn drop_peer(&mut self, peer_id: &str, config: &MayBrowserConfig) {
+        if let Some(peer) = self.peers.remove(peer_id) {
+            tracing::debug!(peer_id, "browser peer went away");
+            // Closing stops the RTP sender, which ends the peer's RTCP follower
+            // and takes its bandwidth estimate out of the encoder's minimum.
+            tokio::spawn(async move {
+                if let Err(error) = peer.close().await {
+                    tracing::debug!(%error, "closing a browser stream peer failed");
+                }
+            });
+            self.lifecycle
+                .emit(BrowserLifecycleEvent::PeerDisconnected {
+                    count: self.peers.len(),
+                });
+            if let Err(error) = self.sync_screencast(config).await {
+                tracing::warn!(%error, "stopping the screencast failed");
+            }
+        }
+    }
+
+    /// Switches to the codec `preference` selects. The new codec is selected
+    /// before anything changes, so a refusal leaves the stream as it was.
+    async fn set_codec(
+        &mut self,
+        preference: StreamCodec,
+        config: &MayBrowserConfig,
+    ) -> Result<(), BrowserError> {
+        let codec = VideoCodec::select(stream_format(config), preference)?;
+        let (api, video_track) = codec
+            .webrtc("video", "browser-screencast")
+            .map_err(|error| BrowserError::web_rtc_operation("build webrtc stack", error))?;
+
+        // Peers negotiated the old codec; they reconnect and renegotiate.
+        for (_, peer) in std::mem::take(&mut self.peers) {
+            tokio::spawn(async move {
+                let _ = peer.close().await;
+            });
+        }
+        self.sync_screencast(config).await?;
+
+        self.codec = codec;
+        self.webrtc_api = api;
+        self.video_track = video_track;
+
+        if let Some(session) = self.session.as_mut() {
+            // The old reader's queue closes with it, which ends the old
+            // encoder thread; the writer ends with the encoder.
+            session.cdp_reader.abort();
+            session.sample_writer.abort();
+            let (control, requests) = encoder_control();
+            let (cdp_reader, sample_writer, frames) = start_encoding_pipeline(
+                session.page.clone(),
+                self.video_track.clone(),
+                self.codec,
+                requests,
+            )
+            .await?;
+            session.cdp_reader = cdp_reader;
+            session.sample_writer = sample_writer;
+            session.frames = frames;
+            self.encoder_control = Some(control);
+        }
+        tracing::info!(codec = codec.name(), "stream codec switched");
+        Ok(())
+    }
+
+    async fn resize_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> Result<(), BrowserError> {
+        let session = self.session.as_ref().ok_or(BrowserError::NotRunning)?;
+        let page = session.page.clone();
+        let dpr = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+            device_scale_factor
+        } else {
+            1.0
+        };
+        // An even viewport gives even frames at an integral scale factor, which
+        // the encoder takes as surfaces; an odd one costs a CPU crop per frame.
+        // Rounding up adds one CSS pixel and cuts none.
+        let params = SetDeviceMetricsOverrideParams::builder()
+            .width(i64::from(width.saturating_add(width % 2)))
+            .height(i64::from(height.saturating_add(height % 2)))
+            .device_scale_factor(dpr)
+            .mobile(false)
+            .build()
+            .map_err(|error| {
+                BrowserError::browser_operation(
+                    "build device metrics override params",
+                    std::io::Error::other(error),
+                )
+            })?;
+        page.execute(params).await.map_err(|error| {
+            BrowserError::browser_operation("set device metrics override", error)
+        })?;
+        // A new frame size makes the encoder start over with an IDR by itself.
+        Ok(())
     }
 }
 
@@ -380,8 +809,9 @@ impl BrowserRuntime {
 
 /// Manages a browser instance with WebRTC live streaming and input forwarding.
 ///
-/// Video pipeline: CDP screencast → JPEG → H.264 (Screen Content) → WebRTC
+/// Video pipeline: CDP screencast → JPEG → hardware H.264 (software AV1 without one) → WebRTC
 /// Input pipeline: WebRTC `DataChannel` → JSON → CDP Input.dispatch*
+#[derive(Debug)]
 pub struct BrowserManager {
     command_tx: mpsc::UnboundedSender<BrowserCommand>,
     snapshot_rx: watch::Receiver<BrowserRuntimeSnapshot>,
@@ -389,66 +819,35 @@ pub struct BrowserManager {
 
 impl BrowserManager {
     /// Create a new browser manager. Sets up the WebRTC API and shared video track.
-    pub fn new(config: MayBrowserConfig, may_dir: PathBuf) -> Result<Self, BrowserError> {
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] when the config fails validation or codec/interceptor registration fails.
+    pub fn new(
+        config: MayBrowserConfig,
+        may_dir: PathBuf,
+        lifecycle: BrowserLifecyclePublisher,
+        preference: StreamCodec,
+    ) -> Result<Self, BrowserError> {
         config
             .validate()
             .map_err(|error| BrowserError::browser_operation("validate browser config", error))?;
-        // Register default codecs: H.264, VP8, VP9, AV1 — SDP negotiation picks the best
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .map_err(|error| BrowserError::web_rtc_operation("register default codecs", error))?;
-
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut media_engine).map_err(|error| {
-            BrowserError::web_rtc_operation("register default interceptors", error)
-        })?;
-
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .build();
-
+        let codec = VideoCodec::select(stream_format(&config), preference)?;
         // Shared video track — all peer connections receive from this single track
-        let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_string(),
-                ..Default::default()
-            },
-            "video".to_owned(),
-            "browser-screencast".to_owned(),
-        ));
-        let audio_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48_000,
-                channels: 2,
-                ..Default::default()
-            },
-            "audio".to_owned(),
-            "browser-audio".to_owned(),
-        ));
-
+        let (api, video_track) = codec
+            .webrtc("video", "browser-screencast")
+            .map_err(|error| BrowserError::web_rtc_operation("build webrtc stack", error))?;
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let actor_tx = command_tx.clone();
         let (snapshot_tx, snapshot_rx) = watch::channel(BrowserRuntimeSnapshot::default());
-        let config_for_actor = config.clone();
-        let may_dir_for_actor = may_dir.clone();
 
         tokio::spawn(async move {
-            let mut runtime = BrowserRuntime::new(video_track, audio_track, api);
+            let mut runtime = BrowserRuntime::new(codec, video_track, api, lifecycle);
             runtime.publish_snapshot(&snapshot_tx);
 
             while let Some(command) = command_rx.recv().await {
                 match command {
                     BrowserCommand::Start { reply } => {
-                        let result = runtime
-                            .start(&config_for_actor, may_dir_for_actor.as_path())
-                            .await;
+                        let result = runtime.start(&config, may_dir.as_path()).await;
                         runtime.publish_snapshot(&snapshot_tx);
                         let _ = reply.send(result);
                     }
@@ -457,8 +856,16 @@ impl BrowserManager {
                         runtime.publish_snapshot(&snapshot_tx);
                         let _ = reply.send(result);
                     }
-                    BrowserCommand::HandleOffer { offer_sdp, reply } => {
-                        let _ = reply.send(runtime.handle_offer(offer_sdp, actor_tx.clone()).await);
+                    BrowserCommand::HandleOffer {
+                        session_id,
+                        offer_sdp,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            runtime
+                                .handle_offer(session_id, offer_sdp, actor_tx.clone(), &config)
+                                .await,
+                        );
                     }
                     BrowserCommand::ReadPage {
                         url,
@@ -468,7 +875,27 @@ impl BrowserManager {
                         let _ = reply.send(runtime.read_page(url.as_str(), options).await);
                     }
                     BrowserCommand::DropPeer { peer_id } => {
-                        runtime.drop_peer(peer_id.as_str());
+                        runtime.drop_peer(peer_id.as_str(), &config).await;
+                    }
+                    BrowserCommand::SetCodec { preference, reply } => {
+                        let result = runtime.set_codec(preference, &config).await;
+                        runtime.publish_snapshot(&snapshot_tx);
+                        let _ = reply.send(result);
+                    }
+                    BrowserCommand::SetTakeover { session_id } => {
+                        runtime.set_takeover(session_id);
+                    }
+                    BrowserCommand::ResizeViewport {
+                        width,
+                        height,
+                        device_scale_factor,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            runtime
+                                .resize_viewport(width, height, device_scale_factor)
+                                .await,
+                        );
                     }
                 }
             }
@@ -485,7 +912,8 @@ impl BrowserManager {
     }
 
     /// Whether the browser is currently running.
-    pub async fn is_running(&self) -> bool {
+    #[must_use]
+    pub fn is_running(&self) -> bool {
         self.snapshot_rx.borrow().running
     }
 
@@ -506,6 +934,9 @@ impl BrowserManager {
     }
 
     /// Launch the browser and start the encoding pipeline.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::ActorClosed`] if the browser actor is not reachable, or the actor's startup error.
     pub async fn start(&self) -> Result<(), BrowserError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
@@ -518,7 +949,31 @@ impl BrowserManager {
         })?
     }
 
+    /// Move the stream to the codec `preference` selects: viewers are
+    /// disconnected (they renegotiate), the encoder restarts, and the browser
+    /// itself keeps running. Nothing changes when the codec cannot be selected.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::CodecSelection`] when the codec is unavailable on this host, or the actor's restart error.
+    pub async fn set_codec(&self, preference: StreamCodec) -> Result<(), BrowserError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::SetCodec {
+                preference,
+                reply: reply_tx,
+            })
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "set stream codec",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await set codec reply",
+        })?
+    }
+
     /// Stop the browser and clean up all resources.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::ActorClosed`] if the browser actor is not reachable, or the actor's shutdown error.
     pub async fn stop(&self) -> Result<(), BrowserError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
@@ -537,10 +992,22 @@ impl BrowserManager {
     /// 1. Client creates offer (recvonly video + `DataChannel`)
     /// 2. Server creates answer with video track + ICE candidates
     /// 3. Connection established, video flows, `DataChannel` ready for input
-    pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, BrowserError> {
+    ///
+    /// `session_id` identifies which May session originated the offer; it
+    /// is recorded on the peer so the takeover gate can match input
+    /// messages against the current `takeover_owner`.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::ActorClosed`] if the browser actor is not reachable, or the actor's offer-handling error.
+    pub async fn handle_offer(
+        &self,
+        session_id: String,
+        offer_sdp: String,
+    ) -> Result<String, BrowserError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::HandleOffer {
+                session_id,
                 offer_sdp,
                 reply: reply_tx,
             })
@@ -552,6 +1019,43 @@ impl BrowserManager {
         })?
     }
 
+    /// Mirror takeover ownership into the actor. Pass `None` to clear.
+    pub fn set_takeover(&self, session_id: Option<String>) {
+        let _ = self
+            .command_tx
+            .send(BrowserCommand::SetTakeover { session_id });
+    }
+
+    /// Resize the rendered viewport to match the live-view panel size.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::ActorClosed`] if the browser actor is not reachable, or the actor's resize error.
+    pub async fn resize_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> Result<(), BrowserError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::ResizeViewport {
+                width,
+                height,
+                device_scale_factor,
+                reply: reply_tx,
+            })
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "resize browser viewport",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await resize viewport reply",
+        })?
+    }
+
+    /// Read the current page content and capture a snapshot.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::ActorClosed`] if the browser actor is not reachable, or the actor's page-read error.
     pub async fn read_page(
         &self,
         url: String,
@@ -573,6 +1077,10 @@ impl BrowserManager {
     }
 }
 
+/// Download the managed Chrome for Testing binary into the May cache directory and return its executable path.
+///
+/// # Errors
+/// Returns [`BrowserError`] when the cache directory cannot be created or the fetcher fails to download the browser.
 pub async fn provision_managed_browser(may_dir: &Path) -> Result<PathBuf, BrowserError> {
     let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
     tokio::fs::create_dir_all(&cache_dir)
@@ -598,6 +1106,10 @@ pub async fn provision_managed_browser(may_dir: &Path) -> Result<PathBuf, Browse
     Ok(installation.executable_path)
 }
 
+/// Provision the managed browser runtime when the config requires it and seed the profile on first run.
+///
+/// # Errors
+/// Returns [`BrowserError`] when config validation, browser download, or profile seeding fails.
 pub async fn prepare_browser_runtime(
     config: &MayBrowserConfig,
     may_dir: &Path,
@@ -607,17 +1119,143 @@ pub async fn prepare_browser_runtime(
     })?;
     if config.requires_managed_runtime() {
         let _ = provision_managed_browser(may_dir).await?;
+        if let Some(seed) = config.system_profile.as_ref() {
+            seed_system_profile_if_empty(may_dir, seed).await?;
+        }
     }
     Ok(())
 }
 
-#[must_use]
-pub fn provisioned_browser_executable(may_dir: &Path) -> Option<PathBuf> {
-    managed_browser_executable(may_dir).map(PathBuf::from)
+/// First-run seed for the managed Chrome profile from a real system
+/// Chrome user-data-dir. Idempotent: if the managed profile already has
+/// any content the seed is skipped, so re-running with `system_profile`
+/// set never overwrites accumulated session state.
+async fn seed_system_profile_if_empty(
+    may_dir: &Path,
+    seed: &crate::config::SystemProfileConfig,
+) -> Result<(), BrowserError> {
+    let target = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_profile_dir();
+
+    let already_seeded = match tokio::fs::read_dir(&target).await {
+        Ok(mut iter) => iter.next_entry().await.ok().flatten().is_some(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(BrowserError::browser_operation(
+                "inspect managed browser profile dir",
+                error,
+            ));
+        }
+    };
+    if already_seeded {
+        return Ok(());
+    }
+
+    let source = seed.path.clone();
+    if tokio::fs::metadata(&source).await.is_err() {
+        return Err(BrowserError::browser_operation(
+            "stat system browser profile source",
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("system profile path missing: {}", source.display()),
+            ),
+        ));
+    }
+
+    if seed.copy_on_first_use {
+        tokio::fs::create_dir_all(&target).await.map_err(|error| {
+            BrowserError::browser_operation("prepare managed browser profile dir", error)
+        })?;
+        let target_clone = target.clone();
+        // fs_extra is a sync API and copying a Chrome profile can move
+        // hundreds of MB; do it on the blocking pool so the actor isn't
+        // pinned during seeding.
+        tokio::task::spawn_blocking(move || copy_dir_recursive(&source, &target_clone))
+            .await
+            .map_err(|error| {
+                BrowserError::browser_operation(
+                    "join system profile copy task",
+                    std::io::Error::other(error.to_string()),
+                )
+            })??;
+        tracing::info!(
+            target = %target.display(),
+            "Seeded managed browser profile from system Chrome"
+        );
+    } else {
+        // In-place mode: symlink the source into the managed location
+        // so May reads/writes the user's real profile directly.
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                BrowserError::browser_operation("prepare managed browser profile parent", error)
+            })?;
+        }
+        let source_for_symlink = source.clone();
+        let target_for_symlink = target.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&source_for_symlink, &target_for_symlink)
+            }
+            #[cfg(not(unix))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "system profile in-place mode requires unix symlinks",
+                ))
+            }
+        })
+        .await
+        .map_err(|error| {
+            BrowserError::browser_operation(
+                "join system profile symlink task",
+                std::io::Error::other(error.to_string()),
+            )
+        })?
+        .map_err(|error| {
+            BrowserError::browser_operation("symlink system profile in place", error)
+        })?;
+    }
+
+    Ok(())
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), BrowserError> {
+    for entry in WalkDir::new(src) {
+        let entry =
+            entry.map_err(|error| BrowserError::browser_operation("walk system profile", error))?;
+        let from = entry.path();
+        let relative = from.strip_prefix(src).map_err(|error| {
+            BrowserError::browser_operation("strip prefix during profile copy", error)
+        })?;
+        let to = dst.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&to).map_err(|error| {
+                BrowserError::browser_operation("create dir during profile copy", error)
+            })?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    BrowserError::browser_operation("create dir during profile copy", error)
+                })?;
+            }
+            std::fs::copy(from, &to).map_err(|error| {
+                BrowserError::browser_operation("copy file during profile copy", error)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Path of the already-provisioned managed browser executable, if present in the cache.
+#[must_use]
+pub fn provisioned_browser_executable(may_dir: &Path) -> Option<PathBuf> {
+    managed_browser_executable(may_dir)
+}
+
+/// Kill a stale managed Chrome process on `port` and remove profile lock files left by an unclean shutdown.
 pub async fn stop_managed_browser(port: u16, may_dir: &Path) {
-    cleanup_stale_chrome(port).await;
+    let paths = ManagedBrowserPaths::discover(may_dir);
+    cleanup_stale_chrome(port, paths.as_ref()).await;
     cleanup_profile_lock_files(
         crate::session::MayHomePaths::new(may_dir.to_path_buf())
             .browser_profile_dir()
@@ -636,12 +1274,39 @@ impl BrowserRuntime {
             return Ok(());
         }
 
-        let (browser, mut handler, owns_browser_process) = match config.backend {
+        self.lifecycle.emit(BrowserLifecycleEvent::Starting);
+
+        let result = self.start_inner(config, may_dir).await;
+        match &result {
+            Ok(()) => self.lifecycle.emit(BrowserLifecycleEvent::Ready),
+            Err(error) => self.lifecycle.emit(BrowserLifecycleEvent::Error {
+                message: error.to_string(),
+            }),
+        }
+        result
+    }
+
+    async fn start_inner(
+        &mut self,
+        config: &MayBrowserConfig,
+        may_dir: &Path,
+    ) -> Result<(), BrowserError> {
+        let (mut browser, mut handler, backing) = match config.backend {
             BrowserBackendKind::Managed => {
-                match inspect_managed_browser_listener_state(config.port).await? {
+                prepare_browser_runtime(config, may_dir).await?;
+                let paths =
+                    ManagedBrowserPaths::discover(may_dir).ok_or(BrowserError::NotProvisioned)?;
+                match inspect_managed_browser_listener_state(config.port, &paths).await? {
                     ManagedBrowserListenerState::Managed => {
-                        let endpoint =
-                            resolve_local_browser_websocket_endpoint(config.port).await?;
+                        tracing::info!(
+                            port = config.port,
+                            "Connecting to existing managed browser"
+                        );
+                        let endpoint = wait_for_local_browser_websocket_endpoint(
+                            config.port,
+                            managed_browser_launch_timeout(),
+                        )
+                        .await?;
                         let (browser, handler) =
                             Browser::connect(endpoint).await.map_err(|error| {
                                 BrowserError::browser_operation(
@@ -649,7 +1314,13 @@ impl BrowserRuntime {
                                     error,
                                 )
                             })?;
-                        (browser, handler, false)
+                        (
+                            browser,
+                            handler,
+                            BrowserSessionBacking::Managed {
+                                owns_process: false,
+                            },
+                        )
                     }
                     ManagedBrowserListenerState::ExternalProcess => {
                         return Err(BrowserError::browser_operation(
@@ -661,52 +1332,34 @@ impl BrowserRuntime {
                         ));
                     }
                     ManagedBrowserListenerState::NotListening => {
-                        cleanup_stale_chrome(config.port).await;
-
-                        let may_dir = may_dir.to_path_buf();
-                        let browser_paths = tokio::task::spawn_blocking(move || {
-                            let home = crate::session::MayHomePaths::new(may_dir);
-                            (
-                                managed_browser_executable(home.root()),
-                                home.browser_profile_dir(),
-                            )
-                        })
-                        .await
-                        .map_err(|error| {
-                            BrowserError::browser_operation(
-                                "resolve managed browser paths",
-                                std::io::Error::other(error.to_string()),
-                            )
-                        })?;
-                        let (binary_path, profile_dir) = browser_paths;
-                        cleanup_profile_lock_files(profile_dir.as_path()).await;
-                        tokio::fs::create_dir_all(&profile_dir)
+                        cleanup_stale_chrome(config.port, Some(&paths)).await;
+                        cleanup_profile_lock_files(paths.profile_dir.as_path()).await;
+                        tokio::fs::create_dir_all(&paths.profile_dir)
                             .await
                             .map_err(|error| {
                                 BrowserError::browser_operation("create browser profile dir", error)
                             })?;
 
-                        let mut builder = BrowserConfig::builder()
-                            .new_headless_mode()
-                            .port(config.port)
-                            .arg("--remote-allow-origins=*")
-                            .arg("--remote-debugging-address=0.0.0.0")
-                            .user_data_dir(profile_dir);
-
-                        let path = binary_path.ok_or(BrowserError::NotProvisioned)?;
-                        builder = builder.chrome_executable(path);
-
-                        let browser_config = builder.build().map_err(|error| {
-                            BrowserError::browser_operation(
-                                "build browser launch config",
-                                std::io::Error::other(error),
-                            )
-                        })?;
+                        tracing::info!(
+                            port = config.port,
+                            executable = %paths.executable.display(),
+                            profile_dir = %paths.profile_dir.display(),
+                            "Launching managed browser"
+                        );
+                        let browser_config = build_managed_browser_launch_config(
+                            config.port,
+                            &paths,
+                            config.stealth_enabled,
+                        )?;
                         let (browser, handler) =
                             Browser::launch(browser_config).await.map_err(|error| {
                                 BrowserError::browser_operation("launch managed browser", error)
                             })?;
-                        (browser, handler, true)
+                        (
+                            browser,
+                            handler,
+                            BrowserSessionBacking::Managed { owns_process: true },
+                        )
                     }
                 }
             }
@@ -717,49 +1370,67 @@ impl BrowserRuntime {
                 let (browser, handler) = Browser::connect(endpoint).await.map_err(|error| {
                     BrowserError::browser_operation("connect to remote cdp endpoint", error)
                 })?;
-                (browser, handler, false)
+                (browser, handler, BrowserSessionBacking::RemoteCdp)
             }
         };
 
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-        let page = Arc::new(
-            browser
-                .new_page("about:blank")
+        let page = Arc::new(match &backing {
+            BrowserSessionBacking::Managed { owns_process } => {
+                let timeout = managed_browser_start_operation_timeout();
+                tokio::time::timeout(timeout, browser.new_page("about:blank"))
+                    .await
+                    .map_err(|_| {
+                        managed_browser_start_timeout_error(
+                            &mut browser,
+                            *owns_process,
+                            "create managed browser page",
+                            timeout,
+                        )
+                    })?
+                    .map_err(|error| {
+                        BrowserError::browser_operation("create managed browser page", error)
+                    })?
+            }
+            BrowserSessionBacking::RemoteCdp => acquire_browser_page(&mut browser).await?,
+        });
+
+        if config.stealth_enabled {
+            // Page.addScriptToEvaluateOnNewDocument runs the shim before
+            // any page script across every navigation, so each fresh
+            // document boots with the patched fingerprints in place.
+            let stealth_params = AddScriptToEvaluateOnNewDocumentParams::builder()
+                .source(include_str!("stealth.js"))
+                .build()
+                .map_err(|error| {
+                    BrowserError::browser_operation(
+                        "build stealth shim params",
+                        std::io::Error::other(error),
+                    )
+                })?;
+            page.execute(stealth_params)
                 .await
-                .map_err(|error| BrowserError::browser_operation("open blank page", error))?,
-        );
+                .map_err(|error| BrowserError::browser_operation("inject stealth shim", error))?;
+        }
 
-        let max_width = i64::from(config.screencast_max_width);
-        let max_height = max_width * 5 / 8;
-        page.execute(
-            StartScreencastParams::builder()
-                .format(StartScreencastFormat::Jpeg)
-                .quality(i64::from(config.screencast_quality))
-                .max_width(max_width)
-                .max_height(max_height)
-                .every_nth_frame(1)
-                .build(),
-        )
-        .await
-        .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
-
-        let (cdp_reader, sample_writer) = start_encoding_pipeline(
-            page.clone(),
-            self.video_track.clone(),
-            config.screencast_quality,
-        )
-        .await?;
-        let audio_writer = start_audio_pipeline(self.audio_track.clone());
+        // The screencast starts with the first viewer (`sync_screencast`): a
+        // browser nobody watches captures and encodes nothing.
+        let (control, requests) = encoder_control();
+        let (cdp_reader, sample_writer, frames) =
+            start_encoding_pipeline(page.clone(), self.video_track.clone(), self.codec, requests)
+                .await?;
+        self.encoder_control = Some(control);
 
         self.session = Some(BrowserSession {
             browser,
             page,
-            owns_browser_process,
-            _handler: handler_task,
-            _cdp_reader: cdp_reader,
-            _sample_writer: sample_writer,
-            _audio_writer: audio_writer,
+            backing,
+            handler: handler_task,
+            cdp_reader,
+            sample_writer,
+            screencast: SourceGate::stopped(),
+            frames,
         });
 
         tracing::info!(backend = ?config.backend, "Browser started with WebRTC streaming");
@@ -772,17 +1443,26 @@ impl BrowserRuntime {
             let _ = peer.close().await;
         }
 
+        self.encoder_control = None;
+        let was_running = self.session.is_some();
         if let Some(mut session) = self.session.take() {
-            session._cdp_reader.abort();
-            session._sample_writer.abort();
-            session._audio_writer.abort();
-            session._handler.abort();
-            if session.owns_browser_process {
-                let _ = session.browser.close().await;
-            } else {
-                let _ = session.page.as_ref().clone().close().await;
+            session.cdp_reader.abort();
+            session.sample_writer.abort();
+            session.handler.abort();
+            match session.backing {
+                BrowserSessionBacking::Managed { owns_process } => {
+                    let _ =
+                        shutdown_managed_browser_session(&mut session.browser, owns_process).await;
+                }
+                BrowserSessionBacking::RemoteCdp => {
+                    let _ = session.page.as_ref().clone().close().await;
+                }
             }
             tracing::info!("Browser stopped");
+        }
+
+        if was_running {
+            self.lifecycle.emit(BrowserLifecycleEvent::Stopped);
         }
 
         Ok(())
@@ -790,9 +1470,12 @@ impl BrowserRuntime {
 
     async fn handle_offer(
         &mut self,
+        session_id: String,
         offer_sdp: String,
         peer_events: mpsc::UnboundedSender<BrowserCommand>,
+        config: &MayBrowserConfig,
     ) -> Result<String, BrowserError> {
+        self.codec.check_offer(&offer_sdp)?;
         let page = self
             .session
             .as_ref()
@@ -800,7 +1483,7 @@ impl BrowserRuntime {
             .page
             .clone();
 
-        let config = RTCConfiguration {
+        let rtc_config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
@@ -810,7 +1493,7 @@ impl BrowserRuntime {
 
         let peer_connection = Arc::new(
             self.webrtc_api
-                .new_peer_connection(config)
+                .new_peer_connection(rtc_config)
                 .await
                 .map_err(|error| {
                     BrowserError::web_rtc_operation("create peer connection", error)
@@ -821,23 +1504,29 @@ impl BrowserRuntime {
             .add_track(Arc::clone(&self.video_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(|error| BrowserError::web_rtc_operation("add video track", error))?;
-        let audio_rtp_sender = peer_connection
-            .add_track(Arc::clone(&self.audio_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await
-            .map_err(|error| BrowserError::web_rtc_operation("add audio track", error))?;
 
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            while video_rtp_sender.read(&mut buf).await.is_ok() {}
-        });
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            while audio_rtp_sender.read(&mut buf).await.is_ok() {}
-        });
+        // No audio track is offered: there is no audio source plumbed
+        // through CDP, and previously we advertised an Opus track that
+        // only carried silence. That forced every viewer to negotiate an
+        // audio m-line for nothing and drained RTCP into /dev/null.
+        // Viewer RTCP → encoder: PLI/FIR request an IDR, REMB reports the
+        // viewer's bandwidth estimate.
+        let control = self
+            .encoder_control
+            .clone()
+            .ok_or(BrowserError::NotRunning)?;
+        let peer_id = crate::id::new();
+        tokio::spawn(control.follow_peer(video_rtp_sender, peer_id.clone()));
 
-        setup_data_channel_handler(&peer_connection, page);
+        setup_data_channel_handler(
+            &peer_connection,
+            page,
+            session_id,
+            self.takeover_owner.clone(),
+            peer_id.clone(),
+            peer_events.clone(),
+        );
 
-        let peer_id = uuid::Uuid::new_v4().to_string();
         setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
 
         let offer = RTCSessionDescription::offer(offer_sdp)
@@ -853,6 +1542,13 @@ impl BrowserRuntime {
             .map_err(|error| BrowserError::web_rtc_operation("create answer", error))?;
 
         let mut gather_complete = peer_connection.gathering_complete_promise().await;
+
+        // Ask for the IDR *before* the answer is sent so the encoder emits a
+        // keyframe on its next frame, giving the new viewer a decodable first
+        // frame as soon as RTP packets start flowing.
+        if let Some(control) = &self.encoder_control {
+            control.request_keyframe();
+        }
 
         peer_connection
             .set_local_description(answer)
@@ -875,7 +1571,19 @@ impl BrowserRuntime {
             )
         })?;
 
-        self.peers.insert(peer_id, peer_connection);
+        // The keyframe requested above is read at the first frame of the
+        // screencast this starts, so the viewer's first frame is an IDR.
+        self.peers.insert(peer_id.clone(), peer_connection);
+        if let Err(error) = self.sync_screencast(config).await {
+            self.drop_peer(&peer_id, config).await;
+            return Err(error);
+        }
+        if let Err(error) = self.push_snapshot(config).await {
+            tracing::warn!(%error, "snapshot for the joining viewer failed");
+        }
+        self.lifecycle.emit(BrowserLifecycleEvent::PeerConnected {
+            count: self.peers.len(),
+        });
         Ok(local_desc.sdp)
     }
 
@@ -890,25 +1598,38 @@ impl BrowserRuntime {
             .ok_or(BrowserError::NotRunning)?
             .page
             .clone();
-        read_page_capture(page, url, options).await
+        self.lifecycle.emit(BrowserLifecycleEvent::Navigating {
+            url: url.to_string(),
+        });
+        let capture = read_page_capture(page, url, options).await?;
+        self.lifecycle.emit(BrowserLifecycleEvent::PageLoaded {
+            url: capture.page.url.clone(),
+            title: Some(capture.page.title.clone()).filter(|t| !t.is_empty()),
+        });
+        Ok(capture)
     }
 }
 
 async fn inspect_managed_browser_listener_state(
     port: u16,
+    paths: &ManagedBrowserPaths,
 ) -> Result<ManagedBrowserListenerState, BrowserError> {
-    tokio::task::spawn_blocking(move || inspect_managed_browser_listener_state_blocking(port))
-        .await
-        .map_err(|error| {
-            BrowserError::browser_operation(
-                "inspect managed browser listener state",
-                std::io::Error::other(error.to_string()),
-            )
-        })?
+    let paths = paths.clone();
+    tokio::task::spawn_blocking(move || {
+        inspect_managed_browser_listener_state_blocking(port, &paths)
+    })
+    .await
+    .map_err(|error| {
+        BrowserError::browser_operation(
+            "inspect managed browser listener state",
+            std::io::Error::other(error.to_string()),
+        )
+    })?
 }
 
 fn inspect_managed_browser_listener_state_blocking(
     port: u16,
+    paths: &ManagedBrowserPaths,
 ) -> Result<ManagedBrowserListenerState, BrowserError> {
     let output = std::process::Command::new("lsof")
         .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
@@ -934,7 +1655,7 @@ fn inspect_managed_browser_listener_state_blocking(
                 std::io::Error::other(format!("ps failed for pid {pid}")),
             ));
         }
-        if String::from_utf8_lossy(&command.stdout).contains("chromiumoxide-runner") {
+        if paths.owns_process_command(String::from_utf8_lossy(&command.stdout).as_ref()) {
             return Ok(ManagedBrowserListenerState::Managed);
         }
     }
@@ -942,35 +1663,227 @@ fn inspect_managed_browser_listener_state_blocking(
     Ok(ManagedBrowserListenerState::ExternalProcess)
 }
 
-async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, BrowserError> {
-    let mut endpoint = String::from("http://127.0.0.1:");
-    endpoint.push_str(&port.to_string());
-    endpoint.push_str("/json/version");
-    let response = reqwest::get(endpoint.as_str()).await.map_err(|error| {
-        BrowserError::browser_operation("fetch browser version metadata", error)
-    })?;
-    if !response.status().is_success() {
-        return Err(BrowserError::browser_operation(
-            "validate browser version metadata response",
-            std::io::Error::other(format!(
-                "browser debugger metadata request to {} returned HTTP {}",
-                endpoint,
-                response.status()
-            )),
-        ));
+const fn managed_browser_launch_timeout() -> Duration {
+    Duration::from_millis(chromiumoxide::browser::LAUNCH_TIMEOUT)
+}
+
+const fn managed_browser_start_operation_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+const fn browser_initial_page_timeout() -> Duration {
+    Duration::from_secs(3)
+}
+
+fn managed_browser_start_timeout_error(
+    browser: &mut Browser,
+    owns_process: bool,
+    operation: &'static str,
+    timeout: Duration,
+) -> BrowserError {
+    if owns_process {
+        match browser.try_wait() {
+            Ok(Some(status)) => {
+                return BrowserError::browser_operation(
+                    operation,
+                    std::io::Error::other(format!(
+                        "managed browser exited with status {status} during startup"
+                    )),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return BrowserError::browser_operation(
+                    "inspect managed browser process state",
+                    error,
+                );
+            }
+        }
     }
-    let metadata: BrowserVersionMetadata = response.json().await.map_err(|error| {
-        BrowserError::browser_operation("decode browser version metadata", error)
-    })?;
-    metadata.web_socket_debugger_url.ok_or_else(|| {
-        BrowserError::browser_operation(
-            "read browser websocket endpoint",
-            std::io::Error::other(format!(
-                "browser debugger metadata at {} did not include webSocketDebuggerUrl",
-                endpoint
-            )),
-        )
+
+    BrowserError::browser_operation(
+        operation,
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("browser startup operation exceeded {timeout:?}"),
+        ),
+    )
+}
+
+fn managed_browser_debugger_metadata_url(port: u16) -> reqwest::Url {
+    let mut url =
+        reqwest::Url::parse("http://127.0.0.1").expect("static managed browser URL must parse");
+    url.set_port(Some(port))
+        .expect("managed browser port must be valid");
+    url.set_path("/json/version");
+    url
+}
+
+fn build_managed_browser_launch_config(
+    port: u16,
+    paths: &ManagedBrowserPaths,
+    stealth_enabled: bool,
+) -> Result<BrowserConfig, BrowserError> {
+    let mut builder = BrowserConfig::builder()
+        .new_headless_mode()
+        .port(port)
+        .arg("--remote-allow-origins=*")
+        .arg("--remote-debugging-address=0.0.0.0")
+        .user_data_dir(paths.profile_dir.clone())
+        .chrome_executable(paths.executable.clone());
+    if stealth_enabled {
+        // The single most-detected automation signal is the
+        // AutomationControlled blink feature — fingerprinting libraries
+        // read it before they reach for navigator.webdriver. Combined
+        // with the Page.addScriptToEvaluateOnNewDocument shim below,
+        // stock bot.sannysoft.com / creepjs reads pass.
+        builder = builder
+            .arg("--disable-blink-features=AutomationControlled")
+            .arg("--no-default-browser-check")
+            .arg("--no-first-run");
+    }
+    builder.build().map_err(|error| {
+        BrowserError::browser_operation("build browser launch config", std::io::Error::other(error))
     })
+}
+
+async fn wait_for_local_browser_websocket_endpoint(
+    port: u16,
+    timeout: Duration,
+) -> Result<String, BrowserError> {
+    let metadata_url = managed_browser_debugger_metadata_url(port);
+    let client = reqwest::Client::new();
+    let start = Instant::now();
+
+    loop {
+        match client.get(metadata_url.clone()).send().await {
+            Ok(response) if response.status().is_success() => {
+                let metadata: BrowserVersionMetadata = response.json().await.map_err(|source| {
+                    ManagedBrowserStartupError::DecodeDebuggerMetadata {
+                        url: metadata_url.clone(),
+                        source,
+                    }
+                })?;
+                return metadata.web_socket_debugger_url.ok_or_else(|| {
+                    ManagedBrowserStartupError::MissingWebSocketDebuggerUrl {
+                        url: metadata_url.clone(),
+                    }
+                    .into()
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.is_connect() || error.is_timeout() => {}
+            Err(error) => {
+                return Err(BrowserError::browser_operation(
+                    "fetch managed browser debugger metadata",
+                    error,
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(ManagedBrowserStartupError::Timeout { port, timeout }.into());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn shutdown_managed_browser_session(
+    browser: &mut Browser,
+    owns_process: bool,
+) -> Result<(), BrowserError> {
+    let _ = browser.close().await;
+
+    if !owns_process {
+        return Ok(());
+    }
+
+    if browser
+        .try_wait()
+        .map_err(|error| {
+            BrowserError::browser_operation("inspect managed browser shutdown", error)
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    match tokio::time::timeout(Duration::from_secs(3), browser.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(BrowserError::browser_operation(
+            "wait for managed browser shutdown",
+            error,
+        )),
+        Err(_) => match browser.kill().await {
+            Some(Ok(())) | None => Ok(()),
+            Some(Err(error)) => Err(BrowserError::browser_operation(
+                "kill managed browser after shutdown timeout",
+                error,
+            )),
+        },
+    }
+}
+
+async fn acquire_browser_page(browser: &mut Browser) -> Result<Page, BrowserError> {
+    let timeout = browser_initial_page_timeout();
+    let start = Instant::now();
+    let mut page_target_id: Option<TargetId> = None;
+
+    loop {
+        let target_id = if let Some(target_id) = page_target_id.clone() {
+            target_id
+        } else {
+            let targets = browser
+                .fetch_targets()
+                .await
+                .map_err(|error| BrowserError::browser_operation("fetch browser targets", error))?;
+            let discovered_target_id = first_page_target_id(targets.as_slice()).ok_or_else(|| {
+                BrowserError::browser_operation(
+                    "discover initial browser page target",
+                    std::io::Error::other("no page target exposed by browser"),
+                )
+            });
+            match discovered_target_id {
+                Ok(target_id) => {
+                    tracing::debug!(target_id = ?target_id, "discovered initial browser page target");
+                    page_target_id = Some(target_id.clone());
+                    target_id
+                }
+                Err(_) if start.elapsed() < timeout => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        match browser.get_page(target_id.clone()).await {
+            Ok(page) => return Ok(page),
+            Err(CdpError::NotFound) => {
+                tracing::debug!(target_id = ?target_id, "browser page target not ready yet");
+            }
+            Err(error) => {
+                return Err(BrowserError::browser_operation(
+                    "acquire browser page from target",
+                    error,
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(BrowserPageReadyError::Timeout { timeout }.into());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn first_page_target_id(targets: &[TargetInfo]) -> Option<TargetId> {
+    targets
+        .iter()
+        .find(|target| target.r#type == "page")
+        .map(|target| target.target_id.clone())
 }
 
 async fn read_page_capture(
@@ -1010,7 +1923,7 @@ async fn read_page_capture(
     })
 }
 
-fn capture_limits(detail: BrowserReadDetail) -> BrowserCaptureLimits {
+const fn capture_limits(detail: BrowserReadDetail) -> BrowserCaptureLimits {
     match detail {
         BrowserReadDetail::Brief => BrowserCaptureLimits {
             text_excerpt_chars: 1_200,
@@ -1069,13 +1982,13 @@ async fn read_accessibility_snapshot(
         .map_err(|error| BrowserError::browser_operation("read accessibility tree", error))?;
 
     Ok(summarize_accessibility_tree(
-        response.result.nodes,
+        &response.result.nodes,
         limits.accessibility_nodes,
     ))
 }
 
 fn summarize_accessibility_tree(
-    nodes: Vec<AxNode>,
+    nodes: &[AxNode],
     max_nodes: usize,
 ) -> BrowserAccessibilitySnapshot {
     let total_nodes = nodes.len();
@@ -1313,11 +2226,34 @@ async fn capture_page_screenshot(
     }))
 }
 
+/// The clip scale that keeps a snapshot of a `viewport` (CSS pixels) at
+/// `dpr` within `max` pixels, as the screencast does; never above 1.
+fn snapshot_scale(viewport: (f64, f64), dpr: f64, max: (u32, u32)) -> f64 {
+    let fit = |pixels: f64, limit: u32| f64::from(limit) / (pixels * dpr);
+    fit(viewport.0, max.0).min(fit(viewport.1, max.1)).min(1.0)
+}
+
+const fn stream_format(config: &MayBrowserConfig) -> StreamFormat {
+    StreamFormat {
+        max_width: config.screencast_max_width,
+        max_height: config.screencast_max_height,
+        initial_bitrate_kbps: config.encoder_initial_bitrate_kbps,
+    }
+}
+
 async fn start_encoding_pipeline(
     page: Arc<Page>,
     video_track: Arc<TrackLocalStaticSample>,
-    screencast_quality: u32,
-) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
+    codec: VideoCodec,
+    requests: crate::video::EncoderRequests,
+) -> Result<
+    (
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        mpsc::Sender<RawFrame>,
+    ),
+    BrowserError,
+> {
     let mut event_stream = page
         .event_listener::<EventScreencastFrame>()
         .await
@@ -1325,9 +2261,14 @@ async fn start_encoding_pipeline(
             BrowserError::browser_operation("subscribe to screencast frames", error)
         })?;
 
-    let (jpeg_tx, jpeg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Bounded queue. On full we drop the *new* frame rather than block:
+    // for screen content there are no decode dependencies between frames
+    // so a fresher frame loses no information when the next one arrives,
+    // and not blocking keeps the CDP reader from stalling the actor.
+    let (jpeg_tx, jpeg_rx) = tokio::sync::mpsc::channel::<RawFrame>(FRAME_QUEUE_CAPACITY);
     let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
 
+    let snapshot_tx = jpeg_tx.clone();
     let page_ack = page.clone();
     let cdp_reader = tokio::spawn(async move {
         while let Some(event) = event_stream.next().await {
@@ -1348,19 +2289,24 @@ async fn start_encoding_pipeline(
                 }
             };
 
-            if jpeg_tx.send(jpeg_bytes).is_err() {
-                break;
+            match jpeg_tx.try_send(RawFrame::Jpeg(jpeg_bytes)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("encoder queue saturated, dropping screencast frame");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
         tracing::info!("CDP screencast reader stopped");
     });
 
-    std::thread::Builder::new()
-        .name("browser-encoder".into())
-        .spawn(move || {
-            encode_loop(jpeg_rx, sample_tx, screencast_quality);
-        })
-        .map_err(|error| BrowserError::encoder_operation("spawn browser encoder thread", error))?;
+    // Encoder is CPU-bound so it goes on the blocking pool, not the
+    // tokio worker threads. spawn_blocking returns a JoinHandle the same
+    // shape as tokio::spawn, so the rest of the pipeline lifecycle
+    // (abort on session stop) is uniform.
+    tokio::task::spawn_blocking(move || {
+        encode_loop(jpeg_rx, &sample_tx, codec, &requests);
+    });
 
     let sample_writer = tokio::spawn(async move {
         while let Some(encoded) = sample_rx.recv().await {
@@ -1378,148 +2324,7 @@ async fn start_encoding_pipeline(
         tracing::info!("WebRTC sample writer stopped");
     });
 
-    Ok((cdp_reader, sample_writer))
-}
-
-fn start_audio_pipeline(audio_track: Arc<TrackLocalStaticSample>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(20));
-        let silence_frame = bytes::Bytes::from_static(&[0xF8, 0xFF, 0xFE]);
-        loop {
-            ticker.tick().await;
-            if let Err(e) = audio_track
-                .write_sample(&Sample {
-                    data: silence_frame.clone(),
-                    duration: Duration::from_millis(20),
-                    ..Default::default()
-                })
-                .await
-            {
-                tracing::trace!(error = %e, "WebRTC audio sample write skipped");
-            }
-        }
-    })
-}
-
-// ── H.264 encoding loop (dedicated thread) ─────────────────────────────────────
-
-fn encode_loop(
-    frame_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    sample_tx: tokio::sync::mpsc::Sender<EncodedSample>,
-    quality: u32,
-) {
-    use openh264::OpenH264API;
-    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
-    use openh264::formats::{RgbSliceU8, YUVBuffer};
-
-    // Screen Content Real-Time mode: optimized for text/UI edges, solid backgrounds
-    let config = EncoderConfig::new()
-        .usage_type(UsageType::ScreenContentRealTime)
-        .bitrate(BitRate::from_bps(quality * 40_000))
-        .max_frame_rate(FrameRate::from_hz(30.0));
-
-    let api = OpenH264API::from_source();
-    let mut encoder = match Encoder::with_api_config(api, config) {
-        Ok(enc) => enc,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create H.264 encoder");
-            return;
-        }
-    };
-
-    let mut last_frame_time: Option<Instant> = None;
-    let mut last_keyframe = Instant::now();
-    let keyframe_interval = Duration::from_secs(2);
-
-    while let Ok(jpeg_bytes) = frame_rx.recv() {
-        // Decode JPEG → RGB
-        let img = match image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg) {
-            Ok(img) => img,
-            Err(e) => {
-                tracing::warn!(error = %e, "JPEG decode failed");
-                continue;
-            }
-        };
-
-        let rgb = normalize_rgb_frame_for_h264(img.to_rgb8());
-        let (w, h) = (rgb.width() as usize, rgb.height() as usize);
-
-        // Compute inter-frame duration
-        let now = Instant::now();
-        let duration = last_frame_time.map_or(Duration::from_millis(33), |t| now.duration_since(t));
-        last_frame_time = Some(now);
-
-        // Periodic keyframes for new viewers / packet loss recovery
-        if now.duration_since(last_keyframe) > keyframe_interval {
-            encoder.force_intra_frame();
-            last_keyframe = now;
-        }
-
-        // RGB → YUV420 → H.264
-        let rgb_source = RgbSliceU8::new(rgb.as_raw(), (w, h));
-        let yuv = YUVBuffer::from_rgb_source(rgb_source);
-        let bitstream = match encoder.encode(&yuv) {
-            Ok(bs) => bs,
-            Err(e) => {
-                tracing::warn!(error = %e, "H.264 encode failed");
-                continue;
-            }
-        };
-
-        let data = bitstream.to_vec();
-        if data.is_empty() {
-            continue;
-        }
-
-        if sample_tx
-            .blocking_send(EncodedSample { data, duration })
-            .is_err()
-        {
-            break; // WebRTC writer stopped
-        }
-    }
-
-    tracing::info!("Browser encoder thread stopped");
-}
-
-fn normalize_rgb_frame_for_h264(rgb: image::RgbImage) -> image::RgbImage {
-    let width = rgb.width();
-    let height = rgb.height();
-    let normalized_width = if width % 2 == 0 { width } else { width + 1 };
-    let normalized_height = if height % 2 == 0 { height } else { height + 1 };
-
-    if normalized_width == width && normalized_height == height {
-        return rgb;
-    }
-
-    let mut normalized = image::RgbImage::new(normalized_width, normalized_height);
-
-    for y in 0..height {
-        for x in 0..width {
-            normalized.put_pixel(x, y, *rgb.get_pixel(x, y));
-        }
-    }
-
-    if normalized_width != width {
-        let edge_x = width - 1;
-        for y in 0..height {
-            normalized.put_pixel(normalized_width - 1, y, *rgb.get_pixel(edge_x, y));
-        }
-    }
-
-    if normalized_height != height {
-        let edge_y = height - 1;
-        for x in 0..normalized_width {
-            let source_x = x.min(width - 1);
-            normalized.put_pixel(
-                x,
-                normalized_height - 1,
-                *normalized.get_pixel(source_x, edge_y),
-            );
-        }
-    }
-
-    normalized
+    Ok((cdp_reader, sample_writer, snapshot_tx))
 }
 
 // ── DataChannel input handler ──────────────────────────────────────────────────
@@ -1533,11 +2338,10 @@ fn setup_peer_connection_lifecycle(
         let peer_id = peer_id.clone();
         let peer_events = peer_events.clone();
         Box::pin(async move {
+            // `Disconnected` is transient: ICE recovers or moves on to `Failed`.
             if matches!(
                 state,
-                RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
             ) {
                 let _ = peer_events.send(BrowserCommand::DropPeer { peer_id });
             }
@@ -1545,21 +2349,45 @@ fn setup_peer_connection_lifecycle(
     }));
 }
 
-fn setup_data_channel_handler(pc: &RTCPeerConnection, page: Arc<Page>) {
+fn setup_data_channel_handler(
+    pc: &RTCPeerConnection,
+    page: Arc<Page>,
+    peer_session_id: String,
+    takeover_owner: Arc<ArcSwapOption<String>>,
+    peer_id: String,
+    peer_events: mpsc::UnboundedSender<BrowserCommand>,
+) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let page = page.clone();
+        let peer_session_id = peer_session_id.clone();
+        let takeover_owner = takeover_owner.clone();
+        let peer_id = peer_id.clone();
+        let peer_events = peer_events.clone();
         Box::pin(async move {
             let label = dc.label().to_owned();
             tracing::debug!(label, "DataChannel opened for browser input");
 
+            // The channel closes with the viewer's connection, long before ICE
+            // gives up on a viewer that closed: webrtc does not move the
+            // connection to `Closed` on the viewer's DTLS close alert.
+            dc.on_close(Box::new(move || {
+                let _ = peer_events.send(BrowserCommand::DropPeer {
+                    peer_id: peer_id.clone(),
+                });
+                Box::pin(async {})
+            }));
+
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let page = page.clone();
+                let peer_session_id = peer_session_id.clone();
+                let takeover_owner = takeover_owner.clone();
                 Box::pin(async move {
-                    let text = match String::from_utf8(msg.data.to_vec()) {
-                        Ok(s) => s,
-                        Err(_) => return,
+                    let Ok(text) = String::from_utf8(msg.data.to_vec()) else {
+                        return;
                     };
-                    if let Err(e) = handle_input_message(&page, &text).await {
+                    if let Err(e) =
+                        handle_input_message(&page, &text, &peer_session_id, &takeover_owner).await
+                    {
                         tracing::warn!(error = %e, "Browser input handling failed");
                     }
                 })
@@ -1568,9 +2396,35 @@ fn setup_data_channel_handler(pc: &RTCPeerConnection, page: Arc<Page>) {
     }));
 }
 
-async fn handle_input_message(page: &Page, text: &str) -> Result<(), BrowserError> {
+/// Returns true if the `peer_session_id` currently owns input over the
+/// browser. Pure function over the snapshot — exercised by the takeover
+/// gate unit test.
+fn takeover_allows_input(peer_session_id: &str, takeover_owner: &ArcSwapOption<String>) -> bool {
+    let owner = takeover_owner.load();
+    owner
+        .as_ref()
+        .is_some_and(|owner_id| owner_id.as_str() == peer_session_id)
+}
+
+async fn handle_input_message(
+    page: &Page,
+    text: &str,
+    peer_session_id: &str,
+    takeover_owner: &ArcSwapOption<String>,
+) -> Result<(), BrowserError> {
     let msg: InputMessage = serde_json::from_str(text)
         .map_err(|source| BrowserError::InvalidInputPayload { source })?;
+
+    if !takeover_allows_input(peer_session_id, takeover_owner) {
+        // Silently drop input when this peer has not been granted
+        // takeover. The agent owns the page in that state and arbitrary
+        // user clicks would race with agent-driven CDP commands.
+        tracing::debug!(
+            peer_session_id,
+            "browser input dropped — peer is not the takeover owner"
+        );
+        return Ok(());
+    }
 
     match msg {
         InputMessage::Mouse(input) => dispatch_mouse(page, input).await,
@@ -1589,11 +2443,17 @@ async fn handle_input_message(page: &Page, text: &str) -> Result<(), BrowserErro
 }
 
 async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserError> {
-    let event_type = DispatchMouseEventType::from(input.event_type);
-    let button = input.button.map_or(MouseButton::None, MouseButton::from);
+    let event_type = input.event_type;
+    let button = match input.button {
+        Some(button) => MouseButton::from(button),
+        None if event_type.requires_button() => {
+            return Err(BrowserInputError::MissingMouseButton { event_type }.into());
+        }
+        None => MouseButton::None,
+    };
 
     let mut builder = DispatchMouseEventParams::builder()
-        .r#type(event_type)
+        .r#type(DispatchMouseEventType::from(event_type))
         .x(input.x)
         .y(input.y)
         .button(button);
@@ -1655,19 +2515,11 @@ async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), Brow
 /// When the server exits without cleanly shutting down `BrowserManager`,
 /// Chrome processes survive and hold the CDP port. This function detects
 /// and kills any chromiumoxide-launched Chrome on the target port.
-async fn cleanup_stale_chrome(port: u16) {
+async fn cleanup_stale_chrome(port: u16, paths: Option<&ManagedBrowserPaths>) {
+    let Some(paths) = paths.cloned() else {
+        return;
+    };
     let _ = tokio::task::spawn_blocking(move || {
-        // Clean up singleton lock files
-        let dir = std::env::temp_dir().join("chromiumoxide-runner");
-        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-            let path = dir.join(name);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-
-        // Kill any Chrome processes using our port that have chromiumoxide-runner user-data-dir.
-        // This avoids killing the user's regular Chrome.
         let Ok(output) = std::process::Command::new("lsof")
             .args(["-ti", &format!(":{port}")])
             .output()
@@ -1686,7 +2538,7 @@ async fn cleanup_stale_chrome(port: u16) {
                 continue;
             };
             let args = String::from_utf8_lossy(&cmdline.stdout);
-            if args.contains("chromiumoxide-runner") {
+            if paths.owns_process_command(args.as_ref()) {
                 tracing::info!(pid, "Killing stale Chrome process on port {port}");
                 let _ = std::process::Command::new("kill")
                     .arg(pid.to_string())
@@ -1695,45 +2547,6 @@ async fn cleanup_stale_chrome(port: u16) {
         }
     })
     .await;
-}
-
-#[cfg(test)]
-mod tests {
-    use image::{Rgb, RgbImage};
-
-    use super::normalize_rgb_frame_for_h264;
-
-    #[test]
-    fn normalize_rgb_frame_for_h264_preserves_even_dimensions() {
-        let mut rgb = RgbImage::new(4, 6);
-        rgb.put_pixel(3, 5, Rgb([12, 34, 56]));
-
-        let normalized = normalize_rgb_frame_for_h264(rgb.clone());
-
-        assert_eq!(normalized.width(), 4);
-        assert_eq!(normalized.height(), 6);
-        assert_eq!(normalized, rgb);
-    }
-
-    #[test]
-    fn normalize_rgb_frame_for_h264_pads_odd_dimensions_with_edge_pixels() {
-        let mut rgb = RgbImage::new(3, 5);
-        for y in 0..5 {
-            for x in 0..3 {
-                rgb.put_pixel(x, y, Rgb([(x * 10) as u8, (y * 20) as u8, 99]));
-            }
-        }
-
-        let normalized = normalize_rgb_frame_for_h264(rgb);
-
-        assert_eq!(normalized.width(), 4);
-        assert_eq!(normalized.height(), 6);
-        assert_eq!(*normalized.get_pixel(0, 0), Rgb([0, 0, 99]));
-        assert_eq!(*normalized.get_pixel(2, 4), Rgb([20, 80, 99]));
-        assert_eq!(*normalized.get_pixel(3, 1), Rgb([20, 20, 99]));
-        assert_eq!(*normalized.get_pixel(1, 5), Rgb([10, 80, 99]));
-        assert_eq!(*normalized.get_pixel(3, 5), Rgb([20, 80, 99]));
-    }
 }
 
 async fn cleanup_profile_lock_files(profile_dir: &Path) {
@@ -1750,7 +2563,7 @@ async fn cleanup_profile_lock_files(profile_dir: &Path) {
 }
 
 /// Resolve the provisioned browser binary path. Runs in `spawn_blocking` since it does filesystem I/O.
-fn managed_browser_executable(may_dir: &Path) -> Option<String> {
+fn managed_browser_executable(may_dir: &Path) -> Option<PathBuf> {
     let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
     if !cache_dir.exists() {
         return None;
@@ -1768,5 +2581,55 @@ fn managed_browser_executable(may_dir: &Path) -> Option<String> {
         .into_iter()
         .filter_map(Result::ok)
         .find(|entry| entry.file_type().is_file() && entry.file_name() == binary_name)
-        .map(|entry| entry.path().to_string_lossy().to_string())
+        .map(walkdir::DirEntry::into_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwapOption;
+
+    use super::{snapshot_scale, takeover_allows_input};
+
+    #[test]
+    fn snapshot_within_the_limit_is_not_scaled() {
+        assert!((snapshot_scale((1280.0, 720.0), 1.0, (1920, 1080)) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_shrinks_to_the_tighter_limit_counting_the_pixel_ratio() {
+        // 1920x1080 CSS at 2x is 3840x2160 device pixels: half fits 1920x1080.
+        let scale = snapshot_scale((1920.0, 1080.0), 2.0, (1920, 1080));
+        assert!((scale - 0.5).abs() < 1e-9);
+        // Width is the tighter side here.
+        let scale = snapshot_scale((4000.0, 1000.0), 1.0, (2000, 2000));
+        assert!((scale - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn takeover_gate_blocks_input_when_no_owner() {
+        let owner: ArcSwapOption<String> = ArcSwapOption::empty();
+        assert!(!takeover_allows_input("session-a", &owner));
+    }
+
+    #[test]
+    fn takeover_gate_blocks_input_for_non_matching_session() {
+        let owner = ArcSwapOption::new(Some(Arc::new("session-a".to_owned())));
+        assert!(!takeover_allows_input("session-b", &owner));
+    }
+
+    #[test]
+    fn takeover_gate_allows_input_for_owning_session() {
+        let owner = ArcSwapOption::new(Some(Arc::new("session-a".to_owned())));
+        assert!(takeover_allows_input("session-a", &owner));
+    }
+
+    #[test]
+    fn takeover_gate_releases_after_clear() {
+        let owner = ArcSwapOption::new(Some(Arc::new("session-a".to_owned())));
+        assert!(takeover_allows_input("session-a", &owner));
+        owner.store(None);
+        assert!(!takeover_allows_input("session-a", &owner));
+    }
 }
