@@ -34,3 +34,9 @@ runs:
       with:
         path: ${{ steps.key.outputs.tools-path }}
         key: ${{ steps.key.outputs.tools-key }}
+    # The shim directories beside the prepared runtimes are written by the
+    # code under test, not downloaded, so the key does not cover them: a
+    # cache another branch saved holds that branch's shims. Each test run
+    # writes its own.
+    - shell: bash
+      run: rm -rf "${{ steps.key.outputs.tools-path }}"/runtimes/*/shims

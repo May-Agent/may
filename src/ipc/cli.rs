@@ -1040,6 +1040,14 @@ pub fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> V
         }));
     }
 
+    // Bound fields are options, so they belong before the option terminator;
+    // everything from the terminator on is positional.
+    let terminator = cli_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(cli_args.len());
+    let positionals = cli_args.split_off(terminator);
+
     // Options already spelled out in the verbatim argv keep their value; a
     // same-named bound field would only come from piped stdin.
     let declared: HashSet<String> = cli_args
@@ -1064,6 +1072,7 @@ pub fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> V
             .expect("flatten_args_to_cli keys must resolve back into the map");
         flatten_named_arg_to_cli(&mut cli_args, key, value);
     }
+    cli_args.extend(positionals);
     cli_args
 }
 
@@ -1109,7 +1118,70 @@ mod tests {
     use serde::Deserialize;
     use serde_json::Value;
 
-    use super::requests_help;
+    use super::{flatten_args_to_cli, requests_help};
+
+    fn bound(argv: &[&str], input: &str) -> std::collections::HashMap<String, Value> {
+        std::collections::HashMap::from([
+            ("args".to_string(), serde_json::json!(argv)),
+            ("input".to_string(), Value::String(input.to_string())),
+        ])
+    }
+
+    #[test]
+    fn piped_stdin_is_bound_before_the_option_terminator() {
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--", "word"], "x")),
+            words(&["--input", "x", "--", "word"])
+        );
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--verbose"], "x")),
+            words(&["--verbose", "--input", "x"])
+        );
+    }
+
+    #[test]
+    fn a_literal_option_after_the_terminator_is_not_declared() {
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--", "--input"], "x")),
+            words(&["--input", "x", "--", "--input"])
+        );
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct Piped {
+        /// The first word.
+        prompt: String,
+        /// Piped stdin.
+        #[serde(default)]
+        input: Option<String>,
+    }
+
+    /// What the command receives once the rebuilt line is parsed.
+    fn parsed(argv: &[&str], input: &str) -> Value {
+        let schema = serde_json::to_value(schemars::schema_for!(Piped)).expect("a schema");
+        super::cli_to_json(&schema, &flatten_args_to_cli(&bound(argv, input))).expect("parses")
+    }
+
+    #[test]
+    fn piped_stdin_reaches_its_field_through_the_terminator() {
+        assert_eq!(
+            parsed(&["--", "word"], "x"),
+            serde_json::json!({ "prompt": "word", "input": "x" })
+        );
+        assert_eq!(
+            parsed(&["--", "--input"], "x"),
+            serde_json::json!({ "prompt": "--input", "input": "x" })
+        );
+    }
+
+    #[test]
+    fn an_option_before_the_terminator_still_wins_over_stdin() {
+        assert_eq!(
+            flatten_args_to_cli(&bound(&["--input", "a", "--", "word"], "x")),
+            words(&["--input", "a", "--", "word"])
+        );
+    }
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[allow(dead_code)]

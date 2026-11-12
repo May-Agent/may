@@ -124,9 +124,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: cargo clippy (default features)
         run: cargo clippy --locked --all-targets --timings -- -D warnings
       - name: cargo clippy (ui)
@@ -208,9 +206,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: Run the baseline tools acceptance script
         run: >
           cargo test --locked --timings --test terminal_first_e2e
@@ -260,9 +256,7 @@ jobs:
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
         if: runner.arch == 'X64'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: nasm
+        uses: ./.github/actions/install-nasm
       - name: Run the container acceptance test
         run: >
           cargo test --locked --timings --test terminal_first_e2e
