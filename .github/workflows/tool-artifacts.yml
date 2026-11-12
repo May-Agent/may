@@ -122,7 +122,8 @@ jobs:
           [ "$("${check}/aither-sed" --version)" = "aither-sed ${version}" ]
           [ "$(printf 'a\nb\nc\nd\n' | "${check}/aither-sed" -n '2,3p;$p')" = "$(printf 'b\nc\nd')" ]
           status=0
-          "${check}/aither-sed" 's/a/b/' </dev/null 2>/dev/null || status=$?
+          [ "$(printf 'a\n' | "${check}/aither-sed" 's/a/b/')" = b ]
+          "${check}/aither-sed" 'w out' </dev/null 2>/dev/null || status=$?
           [ "${status}" = 1 ]
       # The heel executable the tool distribution pins for this runner
       # (src/tools/host-programs.json), as HEEL_BIN.
