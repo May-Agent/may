@@ -1,11 +1,12 @@
 # may-sed
 
-The `sed` of sandboxed agent scripts. The `aither-sed` binary implements
-exactly the GNU `sed -n` forms whose script is made of `p` commands addressed
-by `N`, `N,M`, `N,$` or `$`, joined by `;`, over files, `-` or standard
-input; any other option or script is refused with a message naming the tools
-to use instead. `may_sed::supports` decides whether a call is one of those
-forms, which May's command policy uses to let only them reach the host `sed`.
+The `sed` of sandboxed agent scripts. The `aither-sed` binary runs every
+script on [uutils' `sed`](https://crates.io/crates/sed) in its `--sandbox`
+mode, which refuses the `w`/`W`/`r`/`R`/`e` commands and the `s///w` and
+`s///e` flags while the script compiles, before any file is opened; it also
+refuses `-i`/`--in-place`. Every refusal names `apply_patch` as the way to
+change files. Substitutions, regex addresses and ranges, `-E`, `d`, `q`, `y`,
+`=` and the other commands that write nothing run the same on every platform.
 
 `aither-sed --version` prints `aither-sed <version>`. The prebuilt binaries
 (macOS arm64, Linux musl x86_64/arm64) are built by the `tool-artifacts`
