@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/May-Agent/may/compare/v0.1.1...v0.1.2) - 2026-11-13
+
+### Fixed
+
+- *(cloud)* relay an answer to the codespace daemon that holds the question
+- *(cloud)* end a bootstrap step's input once it is written
+
+### Other
+
+- Merge pull request #1177 from May-Agent/fix/1176-cloud-interactions
+- *(cloud)* record each request again until the codespace's events mirror it
+- *(deps)* take aither's fix for a machine with no system bus
+- *(cloud)* hold every question on the codespace and let its events mirror it
+- Merge pull request #1174 from May-Agent/fix/1173-stdin-eof
+
 ## [0.1.1](https://github.com/May-Agent/may/compare/v0.1.0...v0.1.1) - 2026-11-12
 
 ### Added
