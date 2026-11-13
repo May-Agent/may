@@ -446,6 +446,19 @@ impl<B: CloudBackend> CloudSessions<B> {
             .map(|runtime| runtime.clone())
     }
 
+    /// The cloud session whose codespace daemon holds the pending request
+    /// `request_id` (a permission, workspace or question), going by the
+    /// runtime state mirrored from it.
+    pub(crate) fn session_awaiting(&self, request_id: &str) -> Option<String> {
+        self.mirror.runtimes.iter().find_map(|runtime| {
+            let pending: PendingRequests = serde_json::from_value(runtime.value().clone()).ok()?;
+            pending
+                .ids()
+                .any(|id| id == request_id)
+                .then(|| runtime.key().clone())
+        })
+    }
+
     fn host_for(&self, row: CloudSessionRow) -> CloudHost {
         let (requests, inbox) = async_channel::unbounded();
         let row = Arc::new(row);
@@ -1313,6 +1326,42 @@ struct RemoteSession<'a> {
     repo: Option<&'a str>,
 }
 
+/// The requests a session's runtime state shows as waiting for the user.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingRequests {
+    waiting_permission: Option<PendingRequest>,
+    waiting_workspace: Option<PendingRequest>,
+    waiting_ask_user: Option<PendingRequest>,
+    #[serde(default)]
+    open_questions: Vec<PendingRequest>,
+}
+
+#[derive(serde::Deserialize)]
+struct PendingRequest {
+    id: String,
+}
+
+impl PendingRequests {
+    fn ids(&self) -> impl Iterator<Item = &str> {
+        [
+            &self.waiting_permission,
+            &self.waiting_workspace,
+            &self.waiting_ask_user,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(&self.open_questions)
+        .map(|request| request.id.as_str())
+    }
+}
+
+/// The request a path under `/api/interactions/{id}` answers.
+fn interaction_of(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/api/interactions/")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 /// The session a path under `/api/sessions/{id}` names, and what follows
 /// the id.
 fn session_of(path: &str) -> Option<(&str, &str)> {
@@ -1333,8 +1382,8 @@ fn is_message(method: &hyper::Method, tail: &str) -> bool {
 }
 
 /// Relays every request under `/api/sessions/{id}` of a cloud session to
-/// the codespace daemon. Deleting the session deletes its codespace before
-/// the local row goes.
+/// the codespace daemon, and the answer to a question it holds. Deleting the
+/// session deletes its codespace before the local row goes.
 pub struct CloudSessionRelay<B: CloudBackend = GitHubCloud> {
     sessions: Arc<CloudSessions<B>>,
 }
@@ -1349,8 +1398,15 @@ impl<B: CloudBackend> CloudSessionRelay<B> {
 impl<B: CloudBackend> Middleware for CloudSessionRelay<B> {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
         let path = request.uri().path().to_owned();
-        let Some((session_id, tail)) = session_of(&path) else {
-            return next.run(request).await;
+        // An answer to a question the agent asked in a codespace goes to
+        // the codespace daemon that holds the request.
+        let answered = interaction_of(&path)
+            .filter(|_| request.method() == hyper::Method::POST)
+            .and_then(|id| self.sessions.session_awaiting(id));
+        let (session_id, tail) = match (&answered, session_of(&path)) {
+            (Some(session_id), _) => (session_id.as_str(), "/interactions"),
+            (None, Some(session)) => session,
+            (None, None) => return next.run(request).await,
         };
         let Some(host) = self.sessions.host(session_id) else {
             return next.run(request).await;

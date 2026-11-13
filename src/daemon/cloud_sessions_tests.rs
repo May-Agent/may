@@ -1142,3 +1142,134 @@ fn a_display_name_stays_within_githubs_limit() {
     assert!(name.len() <= 48, "{name}");
     assert!(long.starts_with(name.trim_start_matches("May ")));
 }
+
+/// What a request through a router with the relay in front of a route that
+/// answers `418`, which only a request the relay left alone reaches.
+async fn through_the_relay(
+    sessions: &Arc<CloudSessions<TestCloud>>,
+    uri: &str,
+    body: Value,
+) -> (skyzen::StatusCode, String) {
+    use skyzen::routing::{CreateRouteNode as _, Route};
+
+    async fn answered_here() -> skyzen::StatusCode {
+        skyzen::StatusCode::IM_A_TEAPOT
+    }
+    let router = Route::new(("/api/interactions/{id}".post(answered_here),))
+        .layer(super::CloudSessionRelay::new(sessions.clone()))
+        .build();
+    let request = hyper::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .body(skyzen::Body::from(body.to_string()))
+        .expect("request");
+    let response = match router.go(request).await {
+        Ok(response) => response,
+        Err(error) => skyzen::error_response(&*error),
+    };
+    let status = response.status();
+    (
+        status,
+        response
+            .into_body()
+            .into_string()
+            .await
+            .expect("body")
+            .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn an_answer_reaches_the_codespace_daemon_holding_the_question() {
+    use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+
+    let github = RecordedGitHub::serve().await;
+    let (daemon, remote, _) = codespace_daemon().await;
+    let sessions = fronting(TestCloud::new(&github, daemon)).await;
+    github.reads_as(&["Available"]);
+    sessions
+        .host(SESSION)
+        .expect("a cloud session")
+        .endpoint(true)
+        .await
+        .expect("served");
+
+    // The codespace daemon's agent asks a question.
+    remote
+        .runtime_service
+        .set_waiting_ask_user(
+            SESSION,
+            Some(PersistedAskUserRequest {
+                id: "ask".into(),
+                questions: vec![PersistedAskUserQuestion {
+                    section: "repository".into(),
+                    question: "どのリポジトリ? 어떤 저장소? 哪个仓库?".into(),
+                    option: vec!["Hello-World".into()],
+                    multi_select: false,
+                    secret: None,
+                }],
+            }),
+        )
+        .await
+        .expect("question recorded");
+    let waiting = json!({
+        "sessions": [{"sessionId": SESSION, "runtime": {
+            "state": "waiting_ask_user",
+            "waitingAskUser": {"id": "ask", "questions": []},
+            "waitingPermission": {"id": "permission"},
+            "waitingWorkspace": {"id": "workspace"},
+        }}]
+    });
+    sessions.mirror.runtime(SESSION, &waiting.to_string());
+    assert_eq!(sessions.session_awaiting("ask").as_deref(), Some(SESSION));
+    assert_eq!(sessions.session_awaiting("other"), None);
+
+    // The answer, given to the fronting daemon, resumes the codespace's
+    // turn: the question is no longer open there.
+    let answer = json!({"kind": "askUser", "answers": [
+        {"section": "repository", "answer": {"kind": "selected", "values": ["Hello-World"]}}
+    ]});
+    let (status, body) = through_the_relay(&sessions, "/api/interactions/ask", answer).await;
+    assert_eq!(status, skyzen::StatusCode::OK, "{body}");
+    assert_eq!(
+        remote
+            .runtime_service
+            .get(SESSION)
+            .await
+            .expect("runtime")
+            .waiting_ask_user,
+        None
+    );
+
+    // The followed codespace reports the question gone; its events then
+    // stay quiet while a permission and a workspace request, held there,
+    // reach its approvers, which know no such request: the codespace
+    // refuses them, the fronting daemon does not answer them itself.
+    eventually("the question leaves the mirrored runtime", || async {
+        sessions.session_awaiting("ask").is_none()
+    })
+    .await;
+    sessions.mirror.runtime(SESSION, &waiting.to_string());
+    for kind in ["permission", "workspace"] {
+        let (status, body) = through_the_relay(
+            &sessions,
+            &format!("/api/interactions/{kind}"),
+            json!({"kind": kind, "approved": true}),
+        )
+        .await;
+        assert!(
+            status.is_client_error() && status != skyzen::StatusCode::IM_A_TEAPOT,
+            "{kind}: {status} {body}"
+        );
+    }
+
+    // A request no codespace holds is the fronting daemon's own.
+    let (status, _) = through_the_relay(
+        &sessions,
+        "/api/interactions/other",
+        json!({"kind": "permission", "approved": true}),
+    )
+    .await;
+    assert_eq!(status, skyzen::StatusCode::IM_A_TEAPOT);
+}
