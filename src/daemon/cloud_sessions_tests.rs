@@ -1182,7 +1182,11 @@ async fn through_the_relay(
 
 #[tokio::test]
 async fn an_answer_reaches_the_codespace_daemon_holding_the_question() {
-    use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+    use crate::session::{
+        PersistedAskUserQuestion, PersistedAskUserRequest, PersistedPermissionRequest,
+        PersistedPermissionRequestPayload, PersistedWorkspaceRequest,
+        PersistedWorkspaceRequestPayload,
+    };
 
     let github = RecordedGitHub::serve().await;
     let (daemon, remote, _) = codespace_daemon().await;
@@ -1213,15 +1217,11 @@ async fn an_answer_reaches_the_codespace_daemon_holding_the_question() {
         )
         .await
         .expect("question recorded");
-    let waiting = json!({
-        "sessions": [{"sessionId": SESSION, "runtime": {
-            "state": "waiting_ask_user",
-            "waitingAskUser": {"id": "ask", "questions": []},
-            "waitingPermission": {"id": "permission"},
-            "waitingWorkspace": {"id": "workspace"},
-        }}]
-    });
-    sessions.mirror.runtime(SESSION, &waiting.to_string());
+    // The fronting daemon learns of it from the codespace's events.
+    eventually("the question is mirrored", || async {
+        sessions.session_awaiting("ask").is_some()
+    })
+    .await;
     assert_eq!(sessions.session_awaiting("ask").as_deref(), Some(SESSION));
     assert_eq!(sessions.session_awaiting("other"), None);
 
@@ -1242,15 +1242,47 @@ async fn an_answer_reaches_the_codespace_daemon_holding_the_question() {
         None
     );
 
-    // The followed codespace reports the question gone; its events then
-    // stay quiet while a permission and a workspace request, held there,
-    // reach its approvers, which know no such request: the codespace
-    // refuses them, the fronting daemon does not answer them itself.
-    eventually("the question leaves the mirrored runtime", || async {
-        sessions.session_awaiting("ask").is_none()
+    // A permission and a workspace request the codespace holds are
+    // answered there too.
+    remote
+        .runtime_service
+        .set_waiting_permission(
+            SESSION,
+            Some(PersistedPermissionRequest {
+                id: "permission".into(),
+                request: PersistedPermissionRequestPayload::new(
+                    crate::PermissionRequestMode::Default,
+                    "echo 日本語 한국어 中文".into(),
+                    Some(SESSION.into()),
+                    None,
+                ),
+            }),
+        )
+        .await
+        .expect("permission recorded");
+    eventually("the permission request is mirrored", || async {
+        sessions.session_awaiting("permission").is_some()
     })
     .await;
-    sessions.mirror.runtime(SESSION, &waiting.to_string());
+    remote
+        .runtime_service
+        .set_waiting_workspace(
+            SESSION,
+            Some(PersistedWorkspaceRequest {
+                id: "workspace".into(),
+                request: PersistedWorkspaceRequestPayload {
+                    path: std::env::temp_dir().display().to_string(),
+                    reason: "write access".into(),
+                    session_id: Some(SESSION.into()),
+                },
+            }),
+        )
+        .await
+        .expect("workspace recorded");
+    eventually("the workspace request is mirrored", || async {
+        sessions.session_awaiting("workspace").is_some()
+    })
+    .await;
     for kind in ["permission", "workspace"] {
         let (status, body) = through_the_relay(
             &sessions,
@@ -1258,11 +1290,11 @@ async fn an_answer_reaches_the_codespace_daemon_holding_the_question() {
             json!({"kind": kind, "approved": true}),
         )
         .await;
-        assert!(
-            status.is_client_error() && status != skyzen::StatusCode::IM_A_TEAPOT,
-            "{kind}: {status} {body}"
-        );
+        assert_eq!(status, skyzen::StatusCode::OK, "{kind}: {body}");
     }
+    let remaining = remote.runtime_service.get(SESSION).await.expect("runtime");
+    assert!(remaining.waiting_permission.is_none());
+    assert!(remaining.waiting_workspace.is_none());
 
     // A request no codespace holds is the fronting daemon's own.
     let (status, _) = through_the_relay(
