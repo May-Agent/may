@@ -1244,46 +1244,48 @@ async fn an_answer_reaches_the_codespace_daemon_holding_the_question() {
 
     // A permission and a workspace request the codespace holds are
     // answered there too.
-    remote
-        .runtime_service
-        .set_waiting_permission(
-            SESSION,
-            Some(PersistedPermissionRequest {
-                id: "permission".into(),
-                request: PersistedPermissionRequestPayload::new(
-                    crate::PermissionRequestMode::Default,
-                    "echo 日本語 한국어 中文".into(),
-                    Some(SESSION.into()),
-                    None,
-                ),
-            }),
-        )
-        .await
-        .expect("permission recorded");
-    eventually("the permission request is mirrored", || async {
-        sessions.session_awaiting("permission").is_some()
-    })
-    .await;
-    remote
-        .runtime_service
-        .set_waiting_workspace(
-            SESSION,
-            Some(PersistedWorkspaceRequest {
-                id: "workspace".into(),
-                request: PersistedWorkspaceRequestPayload {
-                    path: std::env::temp_dir().display().to_string(),
-                    reason: "write access".into(),
-                    session_id: Some(SESSION.into()),
-                },
-            }),
-        )
-        .await
-        .expect("workspace recorded");
-    eventually("the workspace request is mirrored", || async {
-        sessions.session_awaiting("workspace").is_some()
-    })
-    .await;
+    // The turn the first answer resumed on the codespace settles on its
+    // own time and rewrites the session's runtime, so each request is
+    // recorded again until its events have mirrored it.
     for kind in ["permission", "workspace"] {
+        eventually(&format!("the {kind} request is mirrored"), || async {
+            if kind == "permission" {
+                remote
+                    .runtime_service
+                    .set_waiting_permission(
+                        SESSION,
+                        Some(PersistedPermissionRequest {
+                            id: kind.into(),
+                            request: PersistedPermissionRequestPayload::new(
+                                crate::PermissionRequestMode::Default,
+                                "echo 日本語 한국어 中文".into(),
+                                Some(SESSION.into()),
+                                None,
+                            ),
+                        }),
+                    )
+                    .await
+                    .expect("permission recorded");
+            } else {
+                remote
+                    .runtime_service
+                    .set_waiting_workspace(
+                        SESSION,
+                        Some(PersistedWorkspaceRequest {
+                            id: kind.into(),
+                            request: PersistedWorkspaceRequestPayload {
+                                path: std::env::temp_dir().display().to_string(),
+                                reason: "write access".into(),
+                                session_id: Some(SESSION.into()),
+                            },
+                        }),
+                    )
+                    .await
+                    .expect("workspace recorded");
+            }
+            sessions.session_awaiting(kind).is_some()
+        })
+        .await;
         let (status, body) = through_the_relay(
             &sessions,
             &format!("/api/interactions/{kind}"),
