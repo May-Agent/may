@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/May-Agent/may/compare/patch/v0.1.2...patch/v0.1.3) - 2026-11-13
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.2](https://github.com/May-Agent/may/compare/patch/v0.1.1...patch/v0.1.2) - 2026-11-12
 
 ### Added
