@@ -693,14 +693,20 @@ async fn wait_or_cancel(guard: &SessionRunGuard, wait: Duration) -> Result<(), &
 
 /// Why a run the user stopped reports it ended.
 const USER_CANCELLED: &str = "run cancelled by user";
+/// Why a run whose owning client disconnected reports it ended.
+const CLIENT_DISCONNECTED: &str = "run cancelled: its client disconnected";
 
 const fn cancellation_reason_of<E>(cancel: &Result<CancelReason, E>) -> &'static str {
     match cancel {
         Ok(CancelReason::User) => USER_CANCELLED,
         Ok(CancelReason::DaemonRestarting) => "run interrupted: the daemon is restarting",
-        Ok(CancelReason::ClientDisconnected) => "run cancelled: its client disconnected",
+        Ok(CancelReason::ClientDisconnected) => CLIENT_DISCONNECTED,
         Err(_) => "run cancellation channel closed unexpectedly",
     }
+}
+
+fn cancels_agent_work(reason: &str) -> bool {
+    reason == USER_CANCELLED || reason == CLIENT_DISCONNECTED
 }
 
 /// Race the wait for the network to return against run cancellation:
@@ -2646,7 +2652,8 @@ fn run_agent_loop_attempts<'a>(
             }
 
             if let Some(reason) = cancellation_reason {
-                if reason == USER_CANCELLED {
+                let stop_agent_work = cancels_agent_work(reason);
+                if stop_agent_work {
                     // Background completions wait for the user's next input.
                     agent.interrupt();
                 }
@@ -2680,12 +2687,13 @@ fn run_agent_loop_attempts<'a>(
                     record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
                     return Err(AgentLoopError::Cancelled(reason));
                 }
-                if reason == USER_CANCELLED {
+                if stop_agent_work {
                     let killed = agent.kill_running_terminal_jobs().await;
                     tracing::info!(
                         session_id = %session_id,
                         killed,
-                        "stopped terminal jobs after user cancelled the run"
+                        reason,
+                        "stopped terminal jobs after cancelling the run"
                     );
                     persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
                 }
@@ -6976,6 +6984,88 @@ mod tests {
             .await
             .expect("history");
         assert_eq!(user_rows(&history), vec!["hello".to_string()]);
+    }
+
+    /// A client disconnect while a terminal job runs stops the running
+    /// terminal jobs and persists the stopped tool call so history and
+    /// background state do not remain open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_disconnect_stops_terminal_jobs_and_persists_stopped_call() {
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let session_files = may_dir.path().join("sessions/session/files");
+        std::fs::create_dir_all(&session_files).expect("session files");
+        let gate = session_files.join("gate");
+        let started = session_files.join("started");
+        let finished = session_files.join("finished");
+        let script = format!(
+            "mkfifo '{}' && touch '{}' && exec 3<>'{}' && read -r _ <&3 && touch '{}'",
+            gate.display(),
+            started.display(),
+            gate.display(),
+            finished.display(),
+        );
+        let arguments = serde_json::json!({
+            "script": script,
+            "description": "waits on a gate until client disconnects",
+            "timeout": 60,
+        })
+        .to_string();
+        let provider = stub_provider(vec![
+            sse_tool_call("call_1", "terminal", &arguments),
+            sse_text("done"),
+        ])
+        .await;
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+
+        let disconnect = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !started.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the terminal job never started"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::ClientDisconnected),
+                "the run is live"
+            );
+        };
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(run_prompt_turn(&state, &mut sink), disconnect).0
+        })
+        .await
+        .expect("client disconnect stops the turn promptly");
+        assert!(
+            matches!(
+                result,
+                Err(super::AgentLoopError::Cancelled(reason)) if reason == super::CLIENT_DISCONNECTED
+            ),
+            "expected ClientDisconnected cancellation, got: {result:?}"
+        );
+        assert!(
+            !finished.exists(),
+            "the terminal job was killed before sleeping to completion"
+        );
+
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        let stopped_recorded = history.messages().iter().any(|message| {
+            matches!(message.role, super::MessageRole::Tool)
+                && serde_json::from_str::<super::ToolEventRecord>(&message.content).is_ok_and(
+                    |record| matches!(record, super::ToolEventRecord::Stopped { ref id, .. } if id == "call_1"),
+                )
+        });
+        assert!(
+            stopped_recorded,
+            "client disconnect must persist ToolEventRecord::Stopped for active terminal calls"
+        );
     }
 }
 
