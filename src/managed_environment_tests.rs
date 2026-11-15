@@ -2,9 +2,7 @@
 //! the base tools first, the host's own toolchain after them.
 
 use std::fmt::Write as _;
-use std::path::Path;
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aither_sandbox::SubagentGrant;
 
@@ -64,36 +62,81 @@ async fn base_commands_resolve_to_the_managed_directory_and_the_toolchain_to_the
     }
 }
 
-/// A credential store aither's read policy denies.
-const CREDENTIAL: &str = ".ssh";
+/// Credential directories inside the user's home that aither's read policy denies.
+const CREDENTIALS: &[&str] = &[".ssh", ".config/gh"];
+
+/// Removes a directory entry created by a test when the host had none.
+struct CreatedDir(Option<PathBuf>);
+
+impl Drop for CreatedDir {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+}
+
+/// Ensures `path` exists for a negative-read test and removes newly created
+/// empty directories on drop without touching pre-existing host state.
+fn ensure_test_dir(path: &Path) -> Vec<CreatedDir> {
+    let mut created = Vec::new();
+    let mut missing = Vec::new();
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.exists() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    for dir in missing.iter().rev() {
+        std::fs::create_dir(dir).expect("test credential directory creates");
+        created.push(CreatedDir(Some(dir.clone())));
+    }
+    // Drop leaves deepest first when reversed at the caller or popped; keep
+    // children ahead of parents so `remove_dir` removes the empty leaf first.
+    created.reverse();
+    created
+}
 
 /// Reads are allowed everywhere but the credential stores: a file outside
-/// the session and its grants reads, and the user's `~/.ssh` does not.
+/// the session and its grants reads, while the user's `~/.ssh` and
+/// `~/.config/gh` stay unreadable.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sandbox_reads_ordinary_paths_and_not_credential_stores() {
     let session = tempfile::tempdir().expect("session dir");
     let outside = tempfile::tempdir().expect("a directory outside the session");
     let ordinary = outside.path().join("ordinary.txt");
     std::fs::write(&ordinary, "readable").expect("ordinary file");
-    // A CI runner's home has no `~/.ssh`; the policy denies the path whether
-    // or not it holds keys, so an empty one is enough.
-    let ssh = std::env::home_dir().expect("home").join(CREDENTIAL);
-    std::fs::create_dir_all(&ssh).expect("the credential directory exists");
+    let home = std::env::home_dir().expect("home");
+    // A CI runner's home may lack `~/.ssh` or `~/.config/gh`; the policy
+    // denies each path whether or not it holds files.
+    let created_dirs: Vec<CreatedDir> = CREDENTIALS
+        .iter()
+        .flat_map(|rel| ensure_test_dir(&home.join(rel)))
+        .collect();
+    let mut script = format!("cat '{}'; echo\n", ordinary.display());
+    let mut expected = vec!["readable".to_string()];
+    for rel in CREDENTIALS {
+        let cred = home.join(rel);
+        let _ = writeln!(
+            script,
+            "ls '{}' >/dev/null 2>&1 && echo {rel}=readable || echo {rel}=denied",
+            cred.display()
+        );
+        expected.push(format!("{rel}=denied"));
+    }
 
     let terminal = TestTerminal::new(session.path()).await;
-    let script = format!(
-        "cat '{}'; echo\nls '{}' >/dev/null 2>&1 && echo ssh=readable || echo ssh=denied",
-        ordinary.display(),
-        ssh.display()
-    );
     let output = terminal
         .sandbox()
         .run(session.path(), &script)
         .await
         .expect("the script runs");
+    drop(created_dirs);
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        ["readable", "ssh=denied"]
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
     );
 }
 
@@ -179,6 +222,49 @@ async fn cargo_credentials_inside_the_granted_home_stay_unreadable() {
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
         ["home=readable", "credentials=denied"]
+    );
+}
+
+/// Keychain directories and macOS keychain security services stay
+/// unreadable from inside the sandbox.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn macos_keychains_stay_unreadable() {
+    let home = std::env::home_dir().expect("home");
+    let user_keychains = home.join("Library").join("Keychains");
+    let _created = ensure_test_dir(&user_keychains);
+    let system_keychains = Path::new("/Library/Keychains");
+    assert!(
+        system_keychains.exists(),
+        "macOS system keychains directory exists"
+    );
+
+    let session = tempfile::tempdir().expect("session dir");
+    let terminal = TestTerminal::new(session.path()).await;
+    let script = format!(
+        "ls '{}' >/dev/null 2>&1 && echo user_kc=readable || echo user_kc=denied\n\
+         ls '{}' >/dev/null 2>&1 && echo sys_kc=readable || echo sys_kc=denied\n\
+         cat /Library/Keychains/System.keychain >/dev/null 2>&1 && echo sys_file=readable || echo sys_file=denied\n\
+         security list-keychains >/dev/null 2>&1 && echo list_svc=readable || echo list_svc=denied\n\
+         security default-keychain >/dev/null 2>&1 && echo default_svc=readable || echo default_svc=denied",
+        user_keychains.display(),
+        system_keychains.display()
+    );
+    let output = terminal
+        .sandbox()
+        .run(session.path(), &script)
+        .await
+        .expect("the script runs");
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        [
+            "user_kc=denied",
+            "sys_kc=denied",
+            "sys_file=denied",
+            "list_svc=denied",
+            "default_svc=denied",
+        ],
+        "macOS keychain stores and SecurityServer lookups must stay denied: {output}"
     );
 }
 
