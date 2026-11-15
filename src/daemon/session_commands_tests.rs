@@ -305,3 +305,49 @@ async fn the_actions_route_dispatches_and_rejects_unknown_names() {
     assert_eq!(status, StatusCode::OK, "rewind body: {body}");
     assert_eq!(body.as_i64(), Some(i64::from(row.id)));
 }
+
+#[tokio::test]
+async fn patch_memory_off_is_one_way_and_rejects_false() {
+    let state = state().await;
+    seed(&state).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"memoryOff": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"memoryOff": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["runtime"]["memoryOff"].as_bool(), Some(true));
+
+    // Re-applying true stays idempotent; trying to re-enable stays rejected.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"memoryOff": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["runtime"]["memoryOff"].as_bool(), Some(true));
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"memoryOff": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}

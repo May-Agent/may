@@ -38,10 +38,10 @@ use crate::harness::host_load::{
 use crate::model_selector::ModelSelector;
 use crate::session::{SessionId, SessionPlanState};
 
-const SESSION_PROVIDER: &str = "session";
+pub const SESSION_PROVIDER: &str = "session";
 const COMPACTION_PROVIDER: &str = "compaction";
 pub const SESSION_MODEL: &str = "session-model";
-const COMPACTION_MODEL: &str = "compaction-model";
+pub const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
 pub const COMPACTION_MARKER: &str = "Your context window is being compacted";
 
@@ -269,6 +269,10 @@ pub struct SessionParts {
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     /// The SSH servers the session is built with.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
+    /// Extracted profile memories seeded into the agent build.
+    pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Whether memory is disabled for this session from the start.
+    pub memory_off: bool,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -304,6 +308,8 @@ impl SessionParts {
             rules_import: None,
             agent_messaging: None,
             ssh_servers: Vec::new(),
+            profile_memories: None,
+            memory_off: false,
             _queues: (workspace_queue, ask_user_queue),
         }
     }
@@ -334,7 +340,8 @@ impl SessionParts {
             }),
             live_config: None,
             profile_persona: None,
-            profile_memories: None,
+            profile_memories: self.profile_memories.clone(),
+            memory_off: self.memory_off,
             plan_state: SessionPlanState::default(),
             location: None,
             task_broker: None,
@@ -355,6 +362,7 @@ impl SessionParts {
             limits: crate::agent::LiveLimits::of(&MayConfig::default()),
             services: crate::terminal_commands::SharedServices::new(&self.dir.join(".may")),
             model_context_window: None,
+            sleep: None,
         }
     }
 }

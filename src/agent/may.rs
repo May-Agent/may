@@ -1,8 +1,8 @@
 //! May agent wrapper around aither-agent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aither_agent::{
     Agent, AgentBuilder, AgentError, AgentPath, AnyClock, CompactResult, PromptCache,
@@ -210,6 +210,8 @@ pub struct MayAgentConfig {
     pub model_id: String,
     /// Provider ID selected for this request.
     pub provider_id: String,
+    /// Fingerprint of the selected provider instance configuration.
+    pub provider_fingerprint: u64,
     /// Tier-resolved models for the `ask` terminal command.
     pub ask_models: super::provider::AskTierModels,
     /// Model compaction runs on; `None` compacts on the session model.
@@ -257,6 +259,8 @@ pub struct MayAgentConfig {
     pub profile_persona: Option<String>,
     /// Optional profile memories (preference + recency) injected as read-only context.
     pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Whether reading and saving memories are disabled for the rest of this session.
+    pub memory_off: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
     /// Global network restriction policy.
@@ -304,6 +308,8 @@ pub struct MayAgentConfig {
     pub limits: super::LiveLimits,
     /// The repo-search handle and PR land locks the daemon shares.
     pub services: crate::terminal_commands::SharedServices,
+    /// Daemon-wide sleep state observed by the session's sleep context source.
+    pub sleep: Option<Arc<crate::sleep::SleepState>>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -345,6 +351,8 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_persona: Option<String>,
     /// Optional profile memories injected as read-only context.
     pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Whether reading and saving memories are disabled for the rest of this session.
+    pub memory_off: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
     /// Resolved location info, when the profile is location-aware.
@@ -387,6 +395,8 @@ pub struct MayAgentSessionInput<'a> {
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
+    /// Daemon-wide sleep state observed before each request.
+    pub sleep: Option<Arc<crate::sleep::SleepState>>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, MayHooks, ProviderLlm>;
@@ -408,19 +418,29 @@ pub struct MayAgent {
     /// Set when the user stopped the run: facts wait for the user's next
     /// input instead of waking the session.
     interrupted: bool,
+    /// Shared sleep state, when hosted by a daemon.
+    sleep: Option<Arc<crate::sleep::SleepState>>,
+    /// Sleep epoch last observed by the model in this context window (`0` = awake).
+    sleep_seen_epoch: Arc<AtomicU64>,
     /// The live grants of the session's sandbox: an approved workspace
     /// request reaches the shell through them.
     grants: Grants,
+    permissions: TerminalPermissionHandler,
     session_id: SessionId,
+    may_dir: PathBuf,
+    memories_dir: PathBuf,
+    skills_dir: PathBuf,
     sandbox_dir: PathBuf,
     provider_id: String,
     model_id: String,
+    provider_fingerprint: u64,
     model_context_window: Option<u32>,
     /// The thresholds the agent compacts by; `/context` reports them.
     context_policy: aither_agent::ContextPolicy,
     /// The commands registered by name with their descriptions; the command
     /// table lists them and every tool of the registry's command sets.
     command_descriptions: Vec<(String, String)>,
+    core_commands: Vec<crate::terminal_commands::CoreCommandUsage>,
     /// The registry whose command sets (MCP servers) the table reads live.
     commands: CommandRegistry,
     /// The commands registered by name; `/context` counts every other row of
@@ -566,13 +586,7 @@ impl MayAgent {
             session_paths.workspace_config(),
         )?;
 
-        let skills_dir = if let Some(profile_id) = config.profile_id.as_deref() {
-            crate::session::MayHomePaths::new(config.may_dir.clone())
-                .profile_home(profile_id)
-                .skills_dir()
-        } else {
-            crate::session::MayHomePaths::new(config.may_dir.clone()).skills_dir()
-        };
+        let skills_dir = profile_skills_dir(&config.may_dir, config.profile_id.as_deref());
 
         // Mount workspace grants into the sandbox: read-only dirs become
         // readable mounts, read-write dirs writable mounts. The launch
@@ -580,27 +594,17 @@ impl MayAgent {
         // the sandbox dir is the shell's own working directory, so it needs
         // no grant entry of its own.
         let grants = Grants::new();
-        for path in workspace
-            .readable_dirs()
-            .into_iter()
-            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
-        {
-            grants.add_readable(path);
-        }
         // `~/.may/memories` is linked into the session's `~/.may`; it must be
         // writable through the symlink, so it joins the grants.
         let memories_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).memories_dir();
         async_fs::create_dir_all(&memories_dir).await.ok();
-        for path in workspace
-            .writable_dirs()
-            .into_iter()
-            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
-        {
-            grants.add_writable(path);
-        }
-        grants.add_writable(&memories_dir);
-        // The skills the agent loads are read in place.
-        grants.add_readable(&skills_dir);
+        sync_grants_with_workspace(
+            &grants,
+            &workspace,
+            &config.sandbox_dir,
+            (!config.memory_off).then_some(memories_dir.as_path()),
+            &skills_dir,
+        );
 
         // Job ids, stored outputs and subagent ids lease from the session's
         // pool, as its questions, tunnels and tasks do.
@@ -746,14 +750,18 @@ impl MayAgent {
         // Read global memory from the memories directory sessions edit via
         // the `~/.may/memories` link/mount.
         let memory_file = crate::session::MayHomePaths::new(config.may_dir.clone()).memory_file();
-        let memory_content = async_fs::read_to_string(&memory_file)
-            .await
-            .unwrap_or_else(|error| {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::error!(error = %error, "failed to load global memory file");
-                }
-                String::new()
-            });
+        let memory_content = if config.memory_off {
+            String::new()
+        } else {
+            async_fs::read_to_string(&memory_file)
+                .await
+                .unwrap_or_else(|error| {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::error!(error = %error, "failed to load global memory file");
+                    }
+                    String::new()
+                })
+        };
         let harness = build_harness();
         let evidence = build_evidence();
         let environment_block = build_environment(
@@ -785,6 +793,7 @@ impl MayAgent {
             time.clone(),
         ];
         let mut runtime_system_context = RuntimeSystemContext::new(memory_file, memory_content)
+            .with_memory_enabled(!config.memory_off)
             .with_instruction(tag::IDENTITY, build_identity())
             .with_instruction(tag::ENVIRONMENT, environment_block)
             .with_instruction(tag::TERMINAL, terminal)
@@ -993,9 +1002,10 @@ impl MayAgent {
         // The command table, the capabilities and the efficiency rules are
         // rendered from the commands registered above.
         let command_descriptions = shared_terminal_commands.descriptions.clone();
+        let core_commands = shared_terminal_commands.usages.clone();
         let capabilities = build_capabilities(
             &command_descriptions,
-            &shared_terminal_commands.usages,
+            &core_commands,
             &config.request_parameters,
             &skills_dir,
         )
@@ -1120,7 +1130,7 @@ impl MayAgent {
             .context_policy(config.context_policy)
             .max_iterations(effective_max_iterations)
             .connectivity(config.connectivity.clone())
-            .approver(permissions)
+            .approver(permissions.clone())
             .fork_source(shared_terminal_commands.fork_source.clone())
             .subagents(subagent_tracker.runs().clone())
             .context_source(PreCompactionAlert::new(gauge.clone()))
@@ -1169,6 +1179,14 @@ impl MayAgent {
                 ),
             ));
         }
+        let sleep_seen_epoch = Arc::new(AtomicU64::new(0));
+        if let Some(sleep) = config.sleep.clone() {
+            builder = builder.context_source(crate::sleep::SleepConditions::new(
+                sleep,
+                config.session_id.as_str(),
+                sleep_seen_epoch.clone(),
+            ));
+        }
         builder = builder.context_source(document);
         if let Some(compaction) = config.compaction_llm.clone() {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);
@@ -1198,14 +1216,22 @@ impl MayAgent {
             job_facts_tx,
             job_facts,
             interrupted: false,
+            sleep: config.sleep,
+            sleep_seen_epoch,
             shell,
             grants,
+            permissions,
             session_id: config.session_id,
+            may_dir: config.may_dir,
+            memories_dir,
+            skills_dir,
             provider_id: config.provider_id,
             model_id: config.model_id,
+            provider_fingerprint: config.provider_fingerprint,
             model_context_window: config.model_context_window,
             context_policy: config.context_policy,
             command_descriptions,
+            core_commands,
             commands: registry,
             named_commands,
             native_tools,
@@ -1266,6 +1292,7 @@ impl MayAgent {
             agent_messaging,
             profile_persona,
             profile_memories,
+            memory_off,
             plan_state,
             location,
             task_broker,
@@ -1286,6 +1313,7 @@ impl MayAgent {
             limits,
             services,
             model_context_window,
+            sleep,
         } = input;
         let providers = super::Providers::new(may_config, &pushed_providers);
         let selector = super::provider::parse_model_selector(model)?;
@@ -1293,6 +1321,9 @@ impl MayAgent {
         let resolved_provider =
             resolve_provider_runtime(providers, &selector, provider_attempt, &redactor).await?;
         let provider_id = resolved_provider.provider_id;
+        let provider_fingerprint =
+            super::provider::candidate_provider_key(providers, &selector, provider_attempt)
+                .map_or(0, |(_, fingerprint)| fingerprint);
         let llm = resolved_provider
             .llm
             .with_context_window(model_context_window);
@@ -1346,6 +1377,7 @@ impl MayAgent {
             llm,
             model_id: selector.model_id().to_string(),
             provider_id,
+            provider_fingerprint,
             ask_models,
             compaction_llm,
             cache_lifetime,
@@ -1368,6 +1400,7 @@ impl MayAgent {
             environment,
             profile_persona,
             profile_memories,
+            memory_off,
             plan_state,
             network_policy: may_config
                 .preferences
@@ -1393,6 +1426,7 @@ impl MayAgent {
             rules_import,
             limits,
             services,
+            sleep,
         })
     }
 
@@ -1458,9 +1492,14 @@ impl MayAgent {
                 .context_mut()
                 .push_block_alert(&aither_agent::Block::new("system-reminder", alert));
         }
+        let decision =
+            crate::agent::wake::decide(crate::agent::wake::WakeCause::BackgroundCompletion {
+                needs_model: report.needs_model,
+                interrupted: self.interrupted,
+            });
         BackgroundWake {
             pending: report.pending,
-            starts_run: report.needs_model && !self.interrupted,
+            starts_run: decision == crate::agent::wake::WakeDecision::Start,
         }
     }
 
@@ -1702,6 +1741,12 @@ impl MayAgent {
         self.sandbox_dir.clone()
     }
 
+    /// Execution environment of this running agent (`Local` or `Container`).
+    #[must_use]
+    pub(crate) const fn environment(&self) -> &AgentEnvironment {
+        &self.environment
+    }
+
     /// The session's shell: its jobs and events.
     #[must_use]
     pub const fn shell(&self) -> &Arc<SessionShell> {
@@ -1901,9 +1946,20 @@ impl MayAgent {
         self.inner.clear_history();
     }
 
-    /// Tells the agent the user's sleep state changed; one alert per change.
-    pub(crate) fn tell_sleep_notice(&mut self, notice: crate::sleep::SleepNotice) {
-        RuntimeSystemContext::push_sleep_notice(self.inner.context_mut(), notice);
+    /// Synchronizes the sleep source's seen state after restoring a warm
+    /// checkpoint so an already-delivered sleep alert is not repeated until
+    /// sleep ends or cold reassembly clears it.
+    pub(crate) async fn mark_restored_sleep_seen(&self) {
+        let Some(sleep) = &self.sleep else {
+            return;
+        };
+        if sleep.is_told(self.session_id.as_str()).await {
+            let reading = sleep.read().await;
+            if reading.asleep {
+                self.sleep_seen_epoch
+                    .store(reading.epoch.max(1), Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {
@@ -1914,6 +1970,20 @@ impl MayAgent {
         self.runtime_system_context
             .sync_agents_md(handoff.as_deref())
             .await;
+        // A skill may have been added, changed or removed since the last turn.
+        match build_capabilities(
+            &self.command_descriptions,
+            &self.core_commands,
+            self.inner.parameters(),
+            &self.skills_dir,
+        )
+        .await
+        {
+            Ok(capabilities) => self.runtime_system_context.set_capabilities(capabilities),
+            Err(error) => {
+                tracing::warn!(%error, "failed to refresh skill catalog capabilities");
+            }
+        }
         // An MCP server may have added or dropped a tool since the last turn.
         self.runtime_system_context.set_commands(build_commands(
             &self.command_descriptions,
@@ -1933,6 +2003,134 @@ impl MayAgent {
                 tracing::warn!(%error, "could not measure the context window");
             }
         }
+    }
+
+    /// Applies every mid-session input change to this running agent in place
+    /// without rebuilding it or mutating the cached system prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MayAgentError`] when resolving an updated model/provider,
+    /// workspace configuration, network policy, or session secrets fails.
+    pub(crate) async fn sync_for_turn(
+        &mut self,
+        input: TurnSyncInput<'_>,
+    ) -> Result<(), MayAgentError> {
+        let providers = super::Providers::new(input.may_config, input.pushed_providers);
+        let selector = super::provider::parse_model_selector(input.current_model)?;
+        let request_parameters = super::provider::session_request_parameters(
+            providers,
+            &selector,
+            input.reasoning_effort,
+        );
+
+        let candidate_key =
+            super::provider::candidate_provider_key(providers, &selector, input.provider_attempt);
+        let model_changed = match &candidate_key {
+            Some((provider_id, fingerprint)) => {
+                provider_id != &self.provider_id
+                    || selector.model_id() != self.model_id
+                    || *fingerprint != self.provider_fingerprint
+                    || input.model_context_window != self.model_context_window
+            }
+            None => true,
+        };
+        if model_changed {
+            let redactor = crate::secrets::SecretRedactor::for_session(
+                &self.may_dir,
+                self.session_id.as_str(),
+            );
+            let resolved_provider =
+                resolve_provider_runtime(providers, &selector, input.provider_attempt, &redactor)
+                    .await?;
+            let llm = resolved_provider
+                .llm
+                .with_context_window(input.model_context_window);
+            self.inner.set_model(llm.clone());
+            self.provider_id = resolved_provider.provider_id;
+            self.model_id = selector.model_id().to_string();
+            self.provider_fingerprint = candidate_key.map_or(0, |(_, fingerprint)| fingerprint);
+            self.model_context_window = input.model_context_window;
+            self.watch
+                .set_window(input.model_context_window.unwrap_or(0));
+            self.btw_llm = ModelSlot::new(llm, request_parameters.clone());
+        } else if *self.inner.parameters() != request_parameters {
+            self.btw_llm.parameters = request_parameters.clone();
+        }
+        if *self.inner.parameters() != request_parameters {
+            self.inner.set_parameters(request_parameters.clone());
+        }
+
+        let skills_dir = profile_skills_dir(&self.may_dir, input.profile_id);
+        self.skills_dir.clone_from(&skills_dir);
+
+        let session_paths = SessionPaths::new(self.sandbox_dir.clone());
+        let workspace = MayWorkspace::new(
+            self.sandbox_dir.clone(),
+            input.cwd.to_path_buf(),
+            session_paths.workspace_config(),
+        )?;
+        sync_grants_with_workspace(
+            &self.grants,
+            &workspace,
+            &self.sandbox_dir,
+            (!input.memory_off).then_some(self.memories_dir.as_path()),
+            &self.skills_dir,
+        );
+        if !matches!(self.environment, AgentEnvironment::Container { .. }) {
+            self.runtime_system_context
+                .set_workdirs(build_workspace_workdirs_context(&workspace));
+        }
+
+        let network_policy = input
+            .may_config
+            .preferences
+            .network_policy
+            .compile()
+            .map_err(|error| MayAgentError::Sandbox(error.to_string()))?;
+        self.permissions.set_network_policy(network_policy.clone());
+        let secrets = crate::secrets::Secrets::load_for_session(
+            &crate::secrets::SecretStore::new(&self.may_dir),
+            input.may_config,
+            self.session_id.as_str(),
+        )?;
+        self.runtime_system_context.set_instruction_opt(
+            tag::PERMISSIONS,
+            Some(build_permissions(
+                &self.environment,
+                secrets.names(),
+                network_policy.as_ref(),
+            )),
+        );
+        self.runtime_system_context.set_instruction_opt(
+            tag::TIME,
+            Some(build_time(
+                &request_parameters,
+                &input.may_config.time.user_timezone(),
+                input.location,
+            )),
+        );
+        self.runtime_system_context.set_instruction_opt(
+            tag::LANGUAGES,
+            build_languages(&input.may_config.language.languages()),
+        );
+        self.runtime_system_context.set_instruction_opt(
+            tag::PROFILE_PERSONA,
+            input.profile_persona.map(build_profile_persona),
+        );
+        self.runtime_system_context
+            .set_memory_enabled(!input.memory_off);
+        let profile_memories = (!input.memory_off)
+            .then_some(input.profile_memories)
+            .flatten()
+            .and_then(build_profile_memories);
+        self.runtime_system_context
+            .set_profile_memories(profile_memories);
+        self.runtime_system_context
+            .set_instruction_opt(tag::PLAN_MODE, build_plan_mode_context(input.plan_state));
+
+        self.sync_ssh_servers(input.ssh_servers);
+        Ok(())
     }
     /// Synchronizes the session's active SSH servers with the live shell and
     /// `<environment>` context block without breaking the cached system prefix.
@@ -2051,6 +2249,77 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
         .map_or(input, |(idx, _)| &input[..idx])
 }
 
+/// Session inputs synchronized onto a running [`MayAgent`] before each turn.
+pub struct TurnSyncInput<'a> {
+    pub may_config: &'a MayConfig,
+    pub pushed_providers: &'a crate::cloud::access::PushedProviders,
+    pub current_model: &'a str,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub model_context_window: Option<u32>,
+    pub provider_attempt: usize,
+    pub profile_id: Option<&'a str>,
+    pub profile_persona: Option<&'a str>,
+    pub profile_memories: Option<&'a crate::memory::ProfileMemories>,
+    pub memory_off: bool,
+    pub plan_state: SessionPlanState,
+    pub location: Option<&'a crate::location::LocationInfo>,
+    pub cwd: &'a Path,
+    pub ssh_servers: &'a [crate::config::SshServerConfig],
+}
+
+fn profile_skills_dir(may_dir: &Path, profile_id: Option<&str>) -> PathBuf {
+    let home = crate::session::MayHomePaths::new(may_dir.to_path_buf());
+    profile_id.map_or_else(
+        || home.skills_dir(),
+        |id| home.profile_home(id).skills_dir(),
+    )
+}
+
+fn sync_grants_with_workspace(
+    grants: &Grants,
+    workspace: &MayWorkspace,
+    sandbox_dir: &Path,
+    memories_dir: Option<&Path>,
+    skills_dir: &Path,
+) {
+    let mut desired_writable: std::collections::HashSet<PathBuf> = workspace
+        .writable_dirs()
+        .into_iter()
+        .filter(|path| path.as_path() != sandbox_dir)
+        .cloned()
+        .collect();
+    if let Some(memories_dir) = memories_dir {
+        desired_writable.insert(memories_dir.to_path_buf());
+    }
+
+    let mut desired_readable: std::collections::HashSet<PathBuf> = workspace
+        .readable_dirs()
+        .into_iter()
+        .filter(|path| path.as_path() != sandbox_dir)
+        .cloned()
+        .collect();
+    desired_readable.insert(skills_dir.to_path_buf());
+    desired_readable.retain(|path| !desired_writable.contains(path));
+
+    let current = grants.snapshot();
+    for path in &current.writable {
+        if !desired_writable.contains(path) {
+            grants.revoke(path);
+        }
+    }
+    for path in &current.readable {
+        if !desired_readable.contains(path) && !desired_writable.contains(path) {
+            grants.revoke(path);
+        }
+    }
+    for path in &desired_readable {
+        grants.add_readable(path);
+    }
+    for path in &desired_writable {
+        grants.add_writable(path);
+    }
+}
+
 /// Adds the blocks that depend on the session's profile and environment to
 /// `runtime_system_context`, and returns the browser section.
 fn apply_runtime_context(
@@ -2063,12 +2332,14 @@ fn apply_runtime_context(
             .with_instruction(tag::PROFILE_PERSONA, build_profile_persona(persona));
     }
 
-    runtime_system_context = runtime_system_context.with_profile_memories(
-        config
-            .profile_memories
-            .as_ref()
-            .and_then(build_profile_memories),
-    );
+    if !config.memory_off {
+        runtime_system_context = runtime_system_context.with_profile_memories(
+            config
+                .profile_memories
+                .as_ref()
+                .and_then(build_profile_memories),
+        );
+    }
 
     if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
         runtime_system_context = runtime_system_context.with_instruction(tag::PLAN_MODE, plan_mode);

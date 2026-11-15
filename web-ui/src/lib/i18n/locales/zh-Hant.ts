@@ -653,6 +653,12 @@ export const zhHant: Messages = {
     description: '自動允許此對話中的所有核准請求，不再詢問',
     failed: '無法變更 Yolo：{message}',
   },
+  memoryToggle: {
+    label: '記憶',
+    description: '在此對話其餘時間停止讀取與儲存記憶',
+    offDescription: '此對話已關閉記憶',
+    failed: '無法關閉記憶：{message}',
+  },
   plan: {
     approved: '已核准',
     awaiting: '等待你核准',

@@ -264,6 +264,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             &format!("/api/sessions/{}", session_id.as_str()),
             &may_agent::client::UpdateSessionRequest {
                 non_interactive: Some(true),
+                memory_off: Some(true),
                 ..Default::default()
             },
         )

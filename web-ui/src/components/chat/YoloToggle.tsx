@@ -31,7 +31,7 @@ export function YoloToggle({ sessionId, yolo }: YoloToggleProps) {
   };
 
   return (
-    <div className="flex items-center justify-end gap-2 px-4 py-1 text-xs text-muted-foreground sm:px-6">
+    <div className="flex items-center gap-2 text-xs text-muted-foreground">
       <span title={t('yolo.description')}>{t('yolo.label')}</span>
       <Switch
         checked={yolo}

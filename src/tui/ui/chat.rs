@@ -1738,6 +1738,8 @@ pub struct StatusContext<'a> {
     pub open_questions: usize,
     /// The session grants every approval request without asking.
     pub yolo: bool,
+    /// Memory is disabled for the rest of this session.
+    pub memory_off: bool,
     /// Running background terminal jobs (the sidebar lists each command).
     pub shells: usize,
     /// Running subagents (the sidebar lists each one).
@@ -3735,6 +3737,10 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push("yolo on · /yolo".to_string());
     }
 
+    if ctx.memory_off {
+        parts.push("memory off".to_string());
+    }
+
     if ctx.open_questions > 0 {
         parts.push(format!("? {} open · /questions", ctx.open_questions));
     }
@@ -5536,6 +5542,7 @@ mod tests {
                             queue_count: 0,
                             open_questions: 0,
                             yolo: false,
+                            memory_off: false,
                             shells: 0,
                             subagents: 0,
                             decode_rate: None,
@@ -7541,6 +7548,7 @@ mod tests {
                             queue_count: 0,
                             open_questions: 0,
                             yolo: false,
+                            memory_off: false,
                             shells: 0,
                             subagents: 0,
                             decode_rate: None,
@@ -7808,6 +7816,7 @@ mod tests {
             queue_count: 0,
             open_questions: 0,
             yolo: false,
+            memory_off: false,
             shells: 0,
             subagents: 0,
             decode_rate: None,
@@ -7853,6 +7862,7 @@ mod tests {
             queue_count: 0,
             open_questions: 0,
             yolo: false,
+            memory_off: false,
             shells: 0,
             subagents: 0,
             decode_rate: None,

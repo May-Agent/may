@@ -74,6 +74,7 @@ pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
 mod usage;
+pub mod wake;
 mod wall_clock;
 pub(crate) mod webfetch_tool;
 pub mod work_tracker;
@@ -91,11 +92,11 @@ pub use job_events::{BackgroundWake, JobFact};
 pub use live_limits::LiveLimits;
 pub use live_settings::AgentLiveSettings;
 pub use loop_watch::LoopLimits;
-pub(crate) use may::side_slot;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
     generate_session_title,
 };
+pub(crate) use may::{TurnSyncInput, side_slot};
 pub use permission::{
     OnTimeout, PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError,
     PermissionRequest, PermissionRequestMode, PermissionRequestModeParseError,
@@ -109,6 +110,7 @@ pub use runner::{
     AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
     spawn_idle_worker, spawn_worker,
 };
+pub(crate) use runtime_context::{SleepAlert, WakeAlert};
 pub use session_model::{PushedModel, SessionModel};
 pub use subagent_tracker::{RunCard, RunUsage, SubagentRunSnapshot, SubagentTracker, TrackedRun};
 pub use task_tool::{

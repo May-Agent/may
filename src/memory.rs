@@ -121,6 +121,11 @@ impl MemoryProcessor {
         Self { db }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn for_test(db: ChatDb) -> Self {
+        Self { db }
+    }
+
     /// Mark a profile as dirty for background memory processing.
     pub async fn mark_profile_dirty(&self, profile_id: &str) {
         if let Err(error) = self.db.mark_profile_memory_job_dirty(profile_id).await {
@@ -195,16 +200,20 @@ impl MemoryProcessor {
         .await
     }
 
-    async fn build_profile_conversation(
+    pub(crate) async fn build_profile_conversation(
         db: &ChatDb,
         profile_id: &str,
     ) -> Result<String, MemoryProcessingError> {
-        let sessions = db
-            .list_sessions_for_profile(profile_id)
-            .await?
-            .into_iter()
-            .take(MAX_PROFILE_SESSIONS)
-            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        for session in db.list_sessions_for_profile(profile_id).await? {
+            if session.non_interactive || db.session_memory_off(&session.id).await? {
+                continue;
+            }
+            sessions.push(session);
+            if sessions.len() >= MAX_PROFILE_SESSIONS {
+                break;
+            }
+        }
 
         if sessions.is_empty() {
             return Ok(String::new());
@@ -422,5 +431,62 @@ mod context_tests {
             recency: None,
         };
         assert_eq!(none.to_context_string(), "");
+    }
+
+    #[tokio::test]
+    async fn build_profile_conversation_skips_memory_off_and_oneshot_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("open db");
+        db.create_profile(crate::db::CreateProfileParams {
+            id: "p1",
+            name: "Default",
+            environment: crate::db::ProfileEnvironmentKind::Local,
+            slug: None,
+            icon: None,
+            persona: None,
+            preferences: None,
+            location_aware: false,
+        })
+        .await
+        .expect("create profile");
+
+        db.create_session_in_profile("normal", Some("Normal"), None, Some("p1"))
+            .await
+            .expect("normal session");
+        db.append_chat_message("normal", &crate::session::ChatMessage::user("keep-normal"))
+            .await
+            .expect("normal msg");
+
+        db.create_session_in_profile("mem-off", Some("Memory Off"), None, Some("p1"))
+            .await
+            .expect("mem-off session");
+        db.append_chat_message("mem-off", &crate::session::ChatMessage::user("secret-off"))
+            .await
+            .expect("mem-off msg");
+        db.set_session_memory_off("mem-off")
+            .await
+            .expect("set memory off");
+
+        db.create_session_in_profile("oneshot", Some("Oneshot"), None, Some("p1"))
+            .await
+            .expect("oneshot session");
+        db.append_chat_message(
+            "oneshot",
+            &crate::session::ChatMessage::user("secret-oneshot"),
+        )
+        .await
+        .expect("oneshot msg");
+        db.set_session_non_interactive("oneshot")
+            .await
+            .expect("set non_interactive");
+
+        let conversation = super::MemoryProcessor::build_profile_conversation(&db, "p1")
+            .await
+            .expect("build conversation");
+        assert!(conversation.contains("keep-normal"), "{conversation}");
+        assert!(!conversation.contains("secret-off"), "{conversation}");
+        assert!(!conversation.contains("secret-oneshot"), "{conversation}");
     }
 }

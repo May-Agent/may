@@ -27,8 +27,8 @@ use super::common::{
     session_not_found_db_error, storage_error,
 };
 use super::entity::{
-    session_pending_permissions, session_pending_workspace, session_plans, session_runtimes,
-    session_yolo, sessions,
+    session_memory, session_pending_permissions, session_pending_workspace, session_plans,
+    session_runtimes, session_yolo, sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 
@@ -46,6 +46,7 @@ struct PendingAskUserParts {
 struct SessionModeRows<'a> {
     plan: Option<&'a session_plans::Model>,
     yolo: Option<&'a session_yolo::Model>,
+    memory: Option<&'a session_memory::Model>,
 }
 
 impl ChatDb {
@@ -336,6 +337,7 @@ impl ChatDb {
                     }),
             )?,
             yolo: mode_rows.yolo.is_some_and(|row| row.enabled),
+            memory_off: mode_rows.memory.is_some_and(|row| row.disabled),
             interactions: SessionInteractionState {
                 browser: BrowserInteractionState {
                     takeover_active: runtime_row
@@ -472,6 +474,7 @@ impl ChatDb {
         .fetch_optional::<session_plans::Model>()
         .await?;
         let yolo_row = self.session_yolo_row(session_id).await?;
+        let memory_row = self.session_memory_row(session_id).await?;
         Self::build_session_runtime_summary(
             runtime_row,
             message_rows,
@@ -487,6 +490,7 @@ impl ChatDb {
             SessionModeRows {
                 plan: plan_row.as_ref(),
                 yolo: yolo_row.as_ref(),
+                memory: memory_row.as_ref(),
             },
         )
     }
@@ -530,6 +534,51 @@ impl ChatDb {
             "INSERT INTO session_yolo (session_id, enabled, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
             session_id,
             enabled,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    async fn session_memory_row(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<session_memory::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_memory WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_memory::Model>()
+        .await?)
+    }
+
+    /// Whether memory injection and extraction have been turned off for this session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn session_memory_off(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        Ok(self
+            .session_memory_row(session_id)
+            .await?
+            .is_some_and(|row| row.disabled))
+    }
+
+    /// Turn off memory injection and extraction for the rest of this session.
+    /// Once set, this flag cannot be cleared.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn set_session_memory_off(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_memory (session_id, disabled, updated_at) VALUES (?, 1, ?) ON CONFLICT(session_id) DO UPDATE SET disabled = 1, updated_at = excluded.updated_at",
+            session_id,
             now.as_str()
         )
         .execute()
