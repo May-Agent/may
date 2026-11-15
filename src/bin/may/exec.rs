@@ -534,6 +534,9 @@ where
             task_events: may_agent::harness::working_document::WorkEvents::new(),
             // `may exec` runs the user's own script: nobody to ask.
             publish_gate: None,
+            live_config: Some(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                may_config.clone(),
+            ))),
             workspace_config: may_agent::workspace::WorkspaceConfig::load(
                 &session_paths.workspace_config(),
             )

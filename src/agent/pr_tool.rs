@@ -284,7 +284,7 @@ mod tests {
                     scratch_root: tmp.path().join("scratch"),
                     cwd: root,
                     workspace_config: crate::workspace::WorkspaceConfig::default(),
-                    screen: None,
+                    review: None,
                     signing: crate::commit_signing::CommitSigning::new(
                         crate::host_git::HostGit::inherit(),
                         tmp.path(),
@@ -396,7 +396,7 @@ mod tests {
                     scratch_root: tmp.join("staging"),
                     cwd: checkouts[1].clone(),
                     workspace_config: crate::workspace::WorkspaceConfig::default(),
-                    screen: None,
+                    review: None,
                     signing: user.signing(&tmp.join("may-home"), "s1"),
                     github_api: PrContext::default_github_api(),
                     land_locks: LandLocks::default(),

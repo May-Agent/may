@@ -1,0 +1,1 @@
+Refused before publishing: the text carries {% for item in items %}{% if !loop.first %}, {% endif %}{{ item }}{% endfor %}. Remove {% if items.len() == 1 %}it{% else %}them{% endif %} before retrying.

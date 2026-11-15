@@ -980,6 +980,7 @@ impl MayAgent {
                 issue_store: issue_store.clone(),
                 task_events: task_events.clone(),
                 publish_gate,
+                live_config: config.live_config.clone(),
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
                 languages: Some(language_guard.clone()),

@@ -350,6 +350,7 @@ pub struct IssueTool<S, T = GhCliTokenSource> {
     owners: Option<IssueOwners>,
     task_events: Option<crate::harness::working_document::WorkEvents>,
     publish: Option<PublishGate>,
+    publish_review: Option<crate::harness::publish_review::PublishReview>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -460,6 +461,7 @@ impl<S: IssueStore> IssueTool<S> {
             owners: None,
             task_events: None,
             publish: None,
+            publish_review: None,
         }
     }
 }
@@ -478,6 +480,7 @@ impl<S: IssueStore, T> IssueTool<S, T> {
             owners: self.owners,
             task_events: self.task_events,
             publish: self.publish,
+            publish_review: self.publish_review,
         }
     }
 
@@ -496,6 +499,16 @@ impl<S: IssueStore, T> IssueTool<S, T> {
     #[must_use]
     pub fn with_publish_gate(mut self, gate: PublishGate) -> Self {
         self.publish = Some(gate);
+        self
+    }
+
+    /// Review outbound issue and comment text before publishing to GitHub.
+    #[must_use]
+    pub fn with_publish_review(
+        mut self,
+        review: crate::harness::publish_review::PublishReview,
+    ) -> Self {
+        self.publish_review = Some(review);
         self
     }
 
@@ -550,6 +563,27 @@ where
                 guard
                     .check_working(text, crate::harness::language::WorkingText::Public)
                     .map_err(super::notices::language_refused)?;
+            }
+        }
+        if let Some(review) = &self.publish_review
+            && self.store.info().name != "may"
+        {
+            use crate::harness::publish_review::Publication;
+            let publication = match &arguments {
+                IssueArgs::Create { title, body, .. } => {
+                    Some(Publication::issue(title.trim(), body.as_deref()))
+                }
+                IssueArgs::Edit { title, body, .. } if title.is_some() || body.is_some() => {
+                    Some(Publication::issue_edit(title.as_deref(), body.as_deref()))
+                }
+                IssueArgs::Comment { body, .. } => Some(Publication::comment(body)),
+                _ => None,
+            };
+            if let Some(publication) = publication {
+                review
+                    .review(publication)
+                    .await
+                    .map_err(|err| IssueError::PublishReview(err.to_string()))?;
             }
         }
         if let Some(gate) = &self.publish {
@@ -1693,5 +1727,371 @@ created: 2026-01-01T00:00:00Z
 updated: 2026-01-02T00:00:00Z
 "
         );
+    }
+}
+
+#[cfg(test)]
+mod publish_review_tests {
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use aither_core::llm::{
+        Event, LLMRequest, LanguageModel, Tool, ToolContext,
+        model::{Parameters, Profile},
+    };
+    use futures::Stream;
+
+    use crate::agent::ModelSlot;
+    use crate::db::ChatDb;
+    use crate::harness::publish_review::{LocalEnvironment, PublishReview};
+    use crate::issue::{
+        CommentedIssue, IssueBackendInfo, IssueDetail, IssueError, IssueKind, IssueListState,
+        IssueRelationKind, IssueState, IssueStatus, IssueStore, IssueSummary, MayIssueStore,
+        provenance::IssueProvenance,
+    };
+
+    use super::{IssueArgs, IssueTool};
+
+    #[derive(Debug, Clone)]
+    struct MockGitHubStore {
+        inner: MayIssueStore,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl IssueStore for MockGitHubStore {
+        fn info(&self) -> IssueBackendInfo {
+            IssueBackendInfo {
+                name: "github",
+                repository: Some("o/r".to_string()),
+            }
+        }
+
+        fn search_key(&self) -> String {
+            self.inner.search_key()
+        }
+
+        fn owned_by_user(&self) -> impl Future<Output = Result<bool, IssueError>> + Send {
+            std::future::ready(Ok(true))
+        }
+
+        fn opened_by_user(
+            &self,
+            _number: i64,
+        ) -> impl Future<Output = Result<bool, IssueError>> + Send {
+            std::future::ready(Ok(true))
+        }
+
+        fn updated_since(
+            &self,
+            since: Option<&str>,
+            limit: i64,
+        ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send {
+            self.inner.updated_since(since, limit)
+        }
+
+        async fn create(
+            &self,
+            title: &str,
+            body: &str,
+            labels: &[String],
+        ) -> Result<IssueDetail, IssueError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.create(title, body, labels).await
+        }
+
+        fn get(&self, number: i64) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send {
+            self.inner.get(number)
+        }
+
+        fn status(
+            &self,
+            number: i64,
+        ) -> impl Future<Output = Result<IssueStatus, IssueError>> + Send {
+            self.inner.status(number)
+        }
+
+        fn list(
+            &self,
+            state: IssueListState,
+            labels: &[String],
+            limit: i64,
+        ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send {
+            self.inner.list(state, labels, limit)
+        }
+
+        async fn edit(
+            &self,
+            number: i64,
+            title: Option<&str>,
+            body: Option<&str>,
+            state: Option<IssueState>,
+        ) -> Result<IssueDetail, IssueError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.edit(number, title, body, state).await
+        }
+
+        async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.comment(number, body).await
+        }
+
+        fn edit_labels(
+            &self,
+            number: i64,
+            add: &[String],
+            remove: &[String],
+        ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send {
+            self.inner.edit_labels(number, add, remove)
+        }
+
+        fn edit_relation(
+            &self,
+            number: i64,
+            kind: IssueRelationKind,
+            target_number: i64,
+            add: bool,
+        ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send {
+            self.inner.edit_relation(number, kind, target_number, add)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedModel {
+        reply: Arc<str>,
+        calls: Arc<AtomicUsize>,
+        captured: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("mock model error")]
+    struct MockModelError;
+
+    impl aither_core::llm::Classify for MockModelError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
+    impl LanguageModel for ScriptedModel {
+        type Error = MockModelError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.captured.lock().unwrap().push(format!("{request:?}"));
+            let reply = self.reply.to_string();
+            futures_lite::stream::iter([Ok(Event::Text(reply))])
+        }
+
+        fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
+            std::future::ready(Ok(Profile::new(
+                "mock",
+                "test",
+                "fast",
+                "fast mock",
+                100_000,
+            )))
+        }
+    }
+
+    const SECRET: &str = "provider-secret-value-987654";
+
+    fn scripted_review(reply: &str) -> (PublishReview, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            reply: Arc::from(reply),
+            calls: calls.clone(),
+            captured: captured.clone(),
+        };
+        let env = LocalEnvironment {
+            system_hosts: vec!["lexos-workstation.local".to_string()],
+            local_hosts: vec!["Lexos-Workstation".to_string()],
+            tailscale_hosts: vec!["lexo-ts.tail123.ts.net".to_string()],
+            home_dirs: vec![PathBuf::from("/Users/lexotest")],
+        };
+        let review = PublishReview::for_slot(ModelSlot::new(model, Parameters::default()), env)
+            .with_credential("OPENAI_API_KEY", SECRET);
+        (review, calls, captured)
+    }
+
+    #[tokio::test]
+    async fn publish_review_gates_github_issue_create_edit_and_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChatDb::open(&dir.path().join("history.db")).await.unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let store = MockGitHubStore {
+            inner: MayIssueStore::new(db.clone(), "s1".to_string()),
+            writes: writes.clone(),
+        };
+
+        // 1. Passing review publishes create, edit (title/body), and comment.
+        let (pass_review, pass_calls, pass_captured) =
+            scripted_review(r#"{"decision":"publish","findings":[]}"#);
+        let pass_tool = IssueTool::new(
+            store.clone(),
+            IssueProvenance::new(db.clone(), "s1".to_string()),
+        )
+        .with_publish_review(pass_review);
+
+        pass_tool
+            .call(
+                IssueArgs::Create {
+                    kind: IssueKind::Bug,
+                    title: "Fix null deref in parser".to_string(),
+                    body: Some("Check the token slice before indexing.".to_string()),
+                    labels: Vec::new(),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("clean create passes");
+        pass_tool
+            .call(
+                IssueArgs::Edit {
+                    number: 1,
+                    title: Some("Fix empty slice handling in parser".to_string()),
+                    body: None,
+                    state: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("clean edit passes");
+        pass_tool
+            .call(
+                IssueArgs::Comment {
+                    number: 1,
+                    body: "Reproduced with an empty input file.".to_string(),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("clean comment passes");
+        // State-only edit sends no authored text and needs no model call.
+        pass_tool
+            .call(
+                IssueArgs::Edit {
+                    number: 1,
+                    title: None,
+                    body: None,
+                    state: Some(IssueState::Closed),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("state-only edit succeeds");
+        assert_eq!(pass_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+        assert_eq!(pass_captured.lock().unwrap().len(), 3);
+
+        // 2. Model refusal blocks create, edit, and comment with findings.
+        let (refuse_review, refuse_calls, _) = scripted_review(
+            r#"{"decision":"refuse","findings":["remove working-process narration"]}"#,
+        );
+        let refuse_tool = IssueTool::new(
+            store.clone(),
+            IssueProvenance::new(db.clone(), "s1".to_string()),
+        )
+        .with_publish_review(refuse_review);
+
+        for args in [
+            IssueArgs::Create {
+                kind: IssueKind::Bug,
+                title: "Session log".to_string(),
+                body: Some("During the previous turn I noticed this.".to_string()),
+                labels: Vec::new(),
+            },
+            IssueArgs::Edit {
+                number: 1,
+                title: None,
+                body: Some("Updated after running subagent check.".to_string()),
+                state: None,
+            },
+            IssueArgs::Comment {
+                number: 1,
+                body: "Checking from this session now.".to_string(),
+            },
+        ] {
+            let err = refuse_tool
+                .call(args, ToolContext::new())
+                .await
+                .expect_err("model refusal stops publish");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("remove working-process narration"),
+                "missing findings: {msg}"
+            );
+        }
+        assert_eq!(refuse_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+
+        // 3. Credentials, shaped keys, host names, and home dirs refuse before any model call.
+        let (precheck_review, precheck_calls, _) =
+            scripted_review(r#"{"decision":"publish","findings":[]}"#);
+        let precheck_tool =
+            IssueTool::new(store, IssueProvenance::new(db.clone(), "s1".to_string()))
+                .with_publish_review(precheck_review);
+
+        let blocked_payloads = [
+            IssueArgs::Create {
+                kind: IssueKind::Bug,
+                title: "Auth failure".to_string(),
+                body: Some(format!("Using key {SECRET} failed.")),
+                labels: Vec::new(),
+            },
+            IssueArgs::Edit {
+                number: 1,
+                title: Some("Host lexos-workstation.local unreachable".to_string()),
+                body: None,
+                state: None,
+            },
+            IssueArgs::Comment {
+                number: 1,
+                body: "Trace came from /Users/lexotest/src/main.rs and sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+                    .to_string(),
+            },
+        ];
+        for args in blocked_payloads {
+            let err = precheck_tool
+                .call(args, ToolContext::new())
+                .await
+                .expect_err("precheck stops leak");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains(SECRET),
+                "refusal must not repeat raw credential: {msg}"
+            );
+        }
+        assert_eq!(precheck_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+
+        // 4. Local `may` issues bypass publish review even if the fast model refuses everything.
+        let (local_refuse, local_calls, _) =
+            scripted_review(r#"{"decision":"refuse","findings":["blocked"]}"#);
+        let may_tool = IssueTool::new(
+            MayIssueStore::new(db.clone(), "s1".to_string()),
+            IssueProvenance::new(db, "s1".to_string()),
+        )
+        .with_publish_review(local_refuse);
+        may_tool
+            .call(
+                IssueArgs::Create {
+                    kind: IssueKind::Bug,
+                    title: "Local note".to_string(),
+                    body: Some("Runs on lexos-workstation.local under /Users/lexotest".to_string()),
+                    labels: Vec::new(),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("may-local issue skips outbound review");
+        assert_eq!(local_calls.load(Ordering::SeqCst), 0);
     }
 }
