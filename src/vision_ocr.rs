@@ -212,18 +212,32 @@ impl VisionOcr {
             .vision
             .as_ref()
             .ok_or_else(|| "headless vision missing after init".to_owned())?;
-        if vision.capabilities().text.native.is_empty() {
+        let native = vision.capabilities().text.native;
+        if native.is_empty() {
             guard.unavailable = true;
             return Err("native text capabilities empty".to_owned());
         }
         let image = VisionImage::from_encoded(bytes.to_vec().into());
-        // Leave `languages` empty so Apple Vision sets `automaticallyDetectsLanguage = true`;
-        // passing explicit CJK tags sets `automaticallyDetectsLanguage = false` and biases
-        // earlier scripts to corrupt or drop later CJK scripts on mixed-language screens.
+        // Pass 1 leaves `languages` empty so Apple Vision enables automatic
+        // script detection (combining CJK tags in one request biases earlier
+        // tags to corrupt later scripts). On macOS 15, auto-detection can still
+        // silently omit adjacent CJK lines (for example Japanese directly below
+        // Chinese), so run one single-script fallback pass per supported CJK
+        // family and merge only lines that do not overlap an existing box.
         let request = RecognizeText::new().level(RecognitionLevel::Accurate);
-        let result = futures_lite::future::block_on(vision.perform(&image, &request));
+        let mut merged = futures_lite::future::block_on(vision.perform(&image, &request))
+            .map_err(|error| format!("vision.perform failed: {error}"))?;
+        for lang in cjk_fallback_languages(&native) {
+            let fallback = RecognizeText::new()
+                .level(RecognitionLevel::Accurate)
+                .languages([lang.clone()]);
+            if let Ok(extra) = futures_lite::future::block_on(vision.perform(&image, &fallback)) {
+                merge_non_overlapping_lines(&mut merged, extra);
+            }
+        }
+        sort_lines_reading_order(&mut merged);
         drop(guard);
-        result.map_err(|error| format!("vision.perform failed: {error}"))
+        Ok(merged)
     }
 
     async fn attachment_from_bytes(
@@ -504,16 +518,109 @@ pub fn summarize_recognized_lines(lines: &[TextLine]) -> Option<(String, TextDen
     summarize_text_entries(&entries)
 }
 
+/// Overlap threshold above which a fallback OCR line is considered already covered.
+#[cfg(feature = "vision-ocr")]
+const OVERLAP_SKIP_THRESHOLD: f32 = 0.30;
+
+/// Returns whether a line meets the confidence and non-empty text floor.
+#[cfg(feature = "vision-ocr")]
+fn is_kept_line(line: &TextLine) -> bool {
+    !line.text.trim().is_empty() && line.confidence.is_none_or(|c| c >= MIN_LINE_CONFIDENCE)
+}
+
+/// Picks at most one supported tag per CJK family for single-script fallback passes.
+#[cfg(feature = "vision-ocr")]
+fn cjk_fallback_languages<T: ToString>(native: &[T]) -> Vec<&T> {
+    let pick = |matches: fn(&str) -> bool| native.iter().find(|lang| matches(&lang.to_string()));
+    [
+        pick(|tag| tag == "ja" || tag.starts_with("ja-")),
+        pick(|tag| {
+            tag == "zh-Hans" || tag.starts_with("zh-Hans-") || tag == "zh-CN" || tag == "zh-SG"
+        }),
+        pick(|tag| {
+            tag == "zh-Hant" || tag.starts_with("zh-Hant-") || tag == "zh-TW" || tag == "zh-HK"
+        }),
+        pick(|tag| tag == "ko" || tag.starts_with("ko-")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Keeps `base` confident lines and appends non-overlapping confident lines from `extra`.
+#[cfg(feature = "vision-ocr")]
+fn merge_non_overlapping_lines(base: &mut Vec<TextLine>, extra: Vec<TextLine>) {
+    base.retain(is_kept_line);
+    for candidate in extra {
+        if !is_kept_line(&candidate) {
+            continue;
+        }
+        let cand_bounds = quad_bounds(&candidate.bounds);
+        let covered = base.iter().any(|existing| {
+            overlap_over_candidate(quad_bounds(&existing.bounds), cand_bounds)
+                >= OVERLAP_SKIP_THRESHOLD
+        });
+        if !covered {
+            base.push(candidate);
+        }
+    }
+}
+
+/// Sorts recognized lines top-to-bottom, then left-to-right in reading order.
+#[cfg(feature = "vision-ocr")]
+fn sort_lines_reading_order(lines: &mut [TextLine]) {
+    lines.sort_by(|a, b| {
+        let (ax0, _, ay0, _) = quad_bounds(&a.bounds);
+        let (bx0, _, by0, _) = quad_bounds(&b.bounds);
+        ay0.total_cmp(&by0).then_with(|| ax0.total_cmp(&bx0))
+    });
+}
+
+#[cfg(feature = "vision-ocr")]
+fn quad_bounds(quad: &waterkit_vision::Quad) -> (f32, f32, f32, f32) {
+    let min_x = quad
+        .0
+        .iter()
+        .map(|p| p.x)
+        .fold(1.0_f32, f32::min)
+        .clamp(0.0, 1.0);
+    let max_x = quad
+        .0
+        .iter()
+        .map(|p| p.x)
+        .fold(0.0_f32, f32::max)
+        .clamp(0.0, 1.0);
+    let min_y = quad
+        .0
+        .iter()
+        .map(|p| p.y)
+        .fold(1.0_f32, f32::min)
+        .clamp(0.0, 1.0);
+    let max_y = quad
+        .0
+        .iter()
+        .map(|p| p.y)
+        .fold(0.0_f32, f32::max)
+        .clamp(0.0, 1.0);
+    (min_x, max_x.max(min_x), min_y, max_y.max(min_y))
+}
+
+#[cfg(feature = "vision-ocr")]
+fn overlap_over_candidate(existing: (f32, f32, f32, f32), candidate: (f32, f32, f32, f32)) -> f32 {
+    let ix = (existing.1.min(candidate.1) - existing.0.max(candidate.0)).max(0.0);
+    let iy = (existing.3.min(candidate.3) - existing.2.max(candidate.2)).max(0.0);
+    let area = (candidate.1 - candidate.0) * (candidate.3 - candidate.2);
+    if area <= f32::EPSILON {
+        return 0.0;
+    }
+    (ix * iy) / area
+}
+
 /// Computes normalized bounding-box area for a [`waterkit_vision::Quad`].
 #[cfg(feature = "vision-ocr")]
 fn quad_area(quad: &waterkit_vision::Quad) -> f32 {
-    let xs = quad.0.iter().map(|p| p.x);
-    let ys = quad.0.iter().map(|p| p.y);
-    let min_x = xs.clone().fold(1.0_f32, f32::min);
-    let max_x = xs.fold(0.0_f32, f32::max);
-    let min_y = ys.clone().fold(1.0_f32, f32::min);
-    let max_y = ys.fold(0.0_f32, f32::max);
-    (max_x - min_x).clamp(0.0, 1.0) * (max_y - min_y).clamp(0.0, 1.0)
+    let (min_x, max_x, min_y, max_y) = quad_bounds(quad);
+    (max_x - min_x) * (max_y - min_y)
 }
 
 /// Summarizes `(text, normalized_area)` pairs into joined lines and [`TextDensityMetrics`].
@@ -747,6 +854,67 @@ pub(crate) mod tests {
         assert_eq!(
             rendered.trim_end(),
             "<recognized_text source=\"shot.png\">\nhello\n世界\n</recognized_text>"
+        );
+    }
+
+    #[cfg(feature = "vision-ocr")]
+    #[test]
+    fn merge_non_overlapping_lines_recovers_only_uncovered_rows_in_order() {
+        use waterkit_vision::{Point, Quad};
+
+        let box_at = |x0: f32, y0: f32, x1: f32, y1: f32| {
+            Quad([
+                Point { x: x0, y: y0 },
+                Point { x: x1, y: y0 },
+                Point { x: x1, y: y1 },
+                Point { x: x0, y: y1 },
+            ])
+        };
+        let mut lines = vec![
+            TextLine {
+                text: "中文界面状态".to_owned(),
+                confidence: Some(1.0),
+                bounds: box_at(0.04, 0.20, 0.58, 0.28),
+                words: Vec::new(),
+            },
+            TextLine {
+                text: "한국어 확인".to_owned(),
+                confidence: Some(1.0),
+                bounds: box_at(0.04, 0.42, 0.34, 0.48),
+                words: Vec::new(),
+            },
+        ];
+        let ja_pass = vec![
+            TextLine {
+                text: "#사#패".to_owned(),
+                confidence: Some(0.9),
+                bounds: box_at(0.05, 0.20, 0.28, 0.28),
+                words: Vec::new(),
+            },
+            TextLine {
+                text: "日本語確認：ビルド成功しました".to_owned(),
+                confidence: Some(1.0),
+                bounds: box_at(0.04, 0.30, 0.44, 0.38),
+                words: Vec::new(),
+            },
+        ];
+        merge_non_overlapping_lines(&mut lines, ja_pass);
+        sort_lines_reading_order(&mut lines);
+        let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "中文界面状态",
+                "日本語確認：ビルド成功しました",
+                "한국어 확인"
+            ]
+        );
+        assert_eq!(
+            cjk_fallback_languages(&["en-US", "ja-Jpan-JP", "zh-Hans", "zh-Hant", "ko-KR"])
+                .into_iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["ja-Jpan-JP", "zh-Hans", "zh-Hant", "ko-KR"]
         );
     }
 
