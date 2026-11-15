@@ -24,7 +24,8 @@ use super::cli::{
 };
 use super::command_set::{AnyCommandSet, CommandSet};
 use super::payload::{
-    CommandEnvelope, ReservedForMain, ToolUsageError, UnknownCommand, answer, tool_usage_error,
+    CallImageStore, CommandEnvelope, ReservedForMain, ToolUsageError, UnknownCommand,
+    answer_recording_images, tool_usage_error,
 };
 
 /// Which side of the authority boundary a launch is on: the main agent's, or
@@ -392,6 +393,7 @@ pub struct CommandRegistryBuilder {
     sets: Vec<AnyCommandSet>,
     observer: Option<AnyCommandObserver>,
     kept: HashSet<String>,
+    call_images: CallImageStore,
 }
 
 impl CommandRegistryBuilder {
@@ -399,6 +401,12 @@ impl CommandRegistryBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Store collecting image files produced by IPC subcommands per `ToolCallId`.
+    #[must_use]
+    pub fn call_images(&self) -> CallImageStore {
+        self.call_images.clone()
     }
 
     /// Registers a tool both roles call in every mode.
@@ -610,6 +618,7 @@ impl CommandRegistryBuilder {
             kept: Arc::new(self.kept),
             kept_tx,
             kept_rx,
+            call_images: self.call_images,
         }
     }
 }
@@ -624,6 +633,7 @@ pub struct CommandRegistry {
     kept: Arc<HashSet<String>>,
     kept_tx: Sender<ToolCallId>,
     kept_rx: Receiver<ToolCallId>,
+    call_images: CallImageStore,
 }
 
 impl std::fmt::Debug for CommandRegistry {
@@ -642,6 +652,12 @@ impl CommandRegistry {
         KeptExchangeReceiver {
             rx: self.kept_rx.clone(),
         }
+    }
+
+    /// The per-call store collecting image files produced by IPC subcommands.
+    #[must_use]
+    pub fn call_images(&self) -> CallImageStore {
+        self.call_images.clone()
     }
 
     /// The command sets, in registration order.
@@ -812,13 +828,18 @@ impl CommandRegistry {
             call: launch.call.clone(),
             working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
         };
-        let outcome = match handler(caller, args.to_vec()).await {
-            Ok(output) => answer(output, outputs).await,
+        let (outcome, recorded_images) = match handler(caller, args.to_vec()).await {
+            Ok(output) => answer_recording_images(name, output, outputs).await,
             Err(error) => {
                 tracing::warn!(tool = %name, %error, "command failed");
-                CommandEnvelope::failure(error)
+                (CommandEnvelope::failure(error), Vec::new())
             }
         };
+        if !recorded_images.is_empty()
+            && let Some(call) = &launch.call
+        {
+            self.call_images.record(call.call(), recorded_images);
+        }
         if outcome.ok
             && self.kept.contains(name)
             && let Some(call) = &launch.call

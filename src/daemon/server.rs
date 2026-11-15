@@ -339,6 +339,7 @@ pub async fn start(
         job_server,
         services: crate::terminal_commands::SharedServices::new(&may_dir),
         quota_patterns: crate::quota::QuotaPatterns::default(),
+        vision_ocr: crate::vision_ocr::VisionOcr::new(),
         secret_patterns: crate::secrets::SecretPatterns::default(),
         may_dir,
         search_index_wake_tx,
