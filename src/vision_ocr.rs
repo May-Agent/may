@@ -563,7 +563,9 @@ fn cjk_fallback_languages<T: Clone + ToString + std::str::FromStr>(native: &[T])
         .collect()
 }
 
-/// Keeps `base` confident lines and appends non-overlapping confident lines from `extra`.
+/// Keeps `base` confident lines, appends uncovered confident lines from
+/// `extra`, and replaces weaker overlapping misreads when a dedicated pass
+/// achieves strictly higher confidence.
 #[cfg(feature = "vision-ocr")]
 fn merge_non_overlapping_lines(base: &mut Vec<TextLine>, extra: Vec<TextLine>) {
     base.retain(is_kept_line);
@@ -572,11 +574,26 @@ fn merge_non_overlapping_lines(base: &mut Vec<TextLine>, extra: Vec<TextLine>) {
             continue;
         }
         let cand_bounds = quad_bounds(&candidate.bounds);
-        let covered = base.iter().any(|existing| {
+        let cand_conf = candidate.confidence.unwrap_or(0.0);
+        let overlaps = |existing: &TextLine| {
             overlap_over_candidate(quad_bounds(&existing.bounds), cand_bounds)
                 >= OVERLAP_SKIP_THRESHOLD
-        });
-        if !covered {
+        };
+        let mut any_overlap = false;
+        let mut all_weaker = true;
+        for existing in base.iter() {
+            if overlaps(existing) {
+                any_overlap = true;
+                if existing.confidence.unwrap_or(0.0) >= cand_conf {
+                    all_weaker = false;
+                    break;
+                }
+            }
+        }
+        if !any_overlap {
+            base.push(candidate);
+        } else if all_weaker {
+            base.retain(|existing| !overlaps(existing));
             base.push(candidate);
         }
     }
@@ -925,6 +942,21 @@ pub(crate) mod tests {
                 "한국어 확인"
             ]
         );
+        let mut weak_auto = vec![TextLine {
+            text: "#사#패*다: 주E#".to_owned(),
+            confidence: Some(0.3),
+            bounds: box_at(0.04, 0.20, 0.58, 0.28),
+            words: Vec::new(),
+        }];
+        let zh_pass = vec![TextLine {
+            text: "中文确认：构建成功".to_owned(),
+            confidence: Some(0.8),
+            bounds: box_at(0.04, 0.20, 0.58, 0.28),
+            words: Vec::new(),
+        }];
+        merge_non_overlapping_lines(&mut weak_auto, zh_pass);
+        let upgraded: Vec<&str> = weak_auto.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(upgraded, vec!["中文确认：构建成功"]);
         let with_native = [
             "en-US".to_owned(),
             "ja-Jpan-JP".to_owned(),
