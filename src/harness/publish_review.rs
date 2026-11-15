@@ -766,14 +766,19 @@ fn contains_home_dir(text: &str, home: &Path) -> bool {
         return false;
     }
     #[cfg(any(target_os = "macos", windows))]
-    let (haystack, needle) = (text.to_ascii_lowercase(), home.to_ascii_lowercase());
+    let (haystack, needle) = (
+        std::borrow::Cow::Owned(text.to_ascii_lowercase()),
+        std::borrow::Cow::Owned(home.to_ascii_lowercase()),
+    );
     #[cfg(not(any(target_os = "macos", windows)))]
-    let (haystack, needle) = (text, home);
-    let needle: &str = &needle;
+    let (haystack, needle) = (
+        std::borrow::Cow::Borrowed(text),
+        std::borrow::Cow::Borrowed(home),
+    );
 
     let bytes = haystack.as_bytes();
     let mut start = 0;
-    while let Some(offset) = haystack[start..].find(needle) {
+    while let Some(offset) = haystack[start..].find(needle.as_ref()) {
         let match_start = start + offset;
         let match_end = match_start + needle.len();
         let before_ok = match_start == 0 || !bytes[match_start - 1].is_ascii_alphanumeric();
