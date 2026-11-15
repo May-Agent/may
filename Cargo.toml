@@ -156,7 +156,7 @@ arboard = "3"
 base64 = "0.22"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "fix/445-swift-rerun", default-features = false, features = ["text"], optional = true }
+waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "fix/apple-multilang-ocr", default-features = false, features = ["text"], optional = true }
 
 # HTTP client for fetching images
 zenwave = "0.7"
@@ -245,9 +245,9 @@ objc2-foundation = "0.3"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
 objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
-waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "fix/445-swift-rerun", default-features = false, features = ["display-stream"] }
-waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "fix/445-swift-rerun", default-features = false }
-waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "fix/445-swift-rerun", default-features = false }
+waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["display-stream"] }
+waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
+waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 
 [build-dependencies]

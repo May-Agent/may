@@ -159,7 +159,7 @@ impl VisionOcr {
         let lines = match self.recognize_lines(bytes) {
             Ok(lines) => lines,
             Err(reason) => {
-                tracing::debug!(%reason, "native OCR skipped; leaving image unchanged");
+                tracing::warn!(%reason, "native OCR skipped; leaving image unchanged");
                 return OcrOutcome::Unchanged;
             }
         };
@@ -216,6 +216,24 @@ impl VisionOcr {
             return Err("native text capabilities empty".to_owned());
         }
         let image = VisionImage::from_encoded(bytes.to_vec().into());
+        // Apple's `capabilities().text.native` intersects `Fast` and `Accurate`,
+        // omitting CJK scripts only present in `Accurate`; passing all 33 languages
+        // drops CJK lines, while auto-detect can drop Japanese on headless VMs.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let request = RecognizeText::new()
+            .level(RecognitionLevel::Accurate)
+            .languages(
+                [
+                    "en-Latn-US",
+                    "zh-Hans",
+                    "zh-Hant",
+                    "ja-Jpan-JP",
+                    "ko-Kore-KR",
+                ]
+                .into_iter()
+                .filter_map(|tag| tag.parse().ok()),
+            );
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let request = RecognizeText::new().level(RecognitionLevel::Accurate);
         let result = futures_lite::future::block_on(vision.perform(&image, &request));
         drop(guard);
