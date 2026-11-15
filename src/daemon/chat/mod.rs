@@ -1388,12 +1388,15 @@ pub(super) async fn restart_interrupted_sessions(
 ) -> Result<(), crate::db::ChatDbError> {
     let db = state.db();
     for session_id in db.sessions_owed_daemon_exit_alert().await? {
-        let cold = db
+        let cache_cold = db
             .prompt_cache_is_cold(&session_id, jiff::Timestamp::now(), |provider_id| {
                 turn_events::provider_cache_lifetime(state, provider_id)
             })
             .await?;
-        if cold {
+        if crate::agent::wake::decide(crate::agent::wake::WakeCause::InterruptedRecovery {
+            cache_cold,
+        }) != crate::agent::wake::WakeDecision::Start
+        {
             tracing::info!(%session_id, "an interrupted session's cache is cold; it starts with the user's next message");
             continue;
         }
@@ -1763,18 +1766,6 @@ pub(super) async fn start_prompt_turn(
         .await
         .map_err(internal_error)?;
     Ok(runtime.into())
-}
-
-/// Tells `agent` of a change of the user's sleep state it has not heard of:
-/// one alert per change, at the start of the session's next turn.
-async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut MayAgent) {
-    match state.sleep.take_notice(session_id).await {
-        Ok(Some(notice)) => agent.tell_sleep_notice(notice),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::error!(%session_id, %error, "failed to record the sleep state an agent was told");
-        }
-    }
 }
 
 fn parse_action_body<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> SkyResult<T> {
@@ -2384,7 +2375,6 @@ fn run_agent_loop_attempts<'a>(
                 first_text_seen: false,
             };
             agent.sync_runtime_context().await;
-            tell_sleep_state(state, req.session_id.as_str(), &mut agent).await;
             let stopped = drive_turn(
                 &mut turn,
                 &mut agent,
@@ -4428,6 +4418,7 @@ fn build_session_agent<'a>(
                 limits: state.live_limits.clone(),
                 services: state.services.clone(),
                 model_context_window,
+                sleep: Some(state.sleep.clone()),
             },
         )
         .await
@@ -4446,6 +4437,7 @@ fn build_session_agent<'a>(
             agent
                 .restore_checkpoint(snapshot.checkpoint.clone())
                 .map_err(UiChatPreparationError::RestoreCheckpoint)?;
+            agent.mark_restored_sleep_seen().await;
             for (_, message) in ctx
                 .transcript
                 .iter()

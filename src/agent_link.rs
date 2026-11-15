@@ -495,9 +495,12 @@ impl AgentMessaging {
         if recipient.session_id == sender_session_id {
             return Err(AgentLinkError::SendToSelf);
         }
-        if self
+        let recipient_cold = self
             .is_cold(&recipient.session_id, recipient.activity)
-            .await?
+            .await?;
+        if crate::agent::wake::decide(crate::agent::wake::WakeCause::AgentMessage {
+            recipient_cold,
+        }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
         {
             return Err(AgentLinkError::ColdRecipient(recipient.name.clone()));
         }

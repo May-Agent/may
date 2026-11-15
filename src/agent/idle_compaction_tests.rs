@@ -41,7 +41,7 @@ use crate::session::{SessionId, SessionPlanState};
 const SESSION_PROVIDER: &str = "session";
 const COMPACTION_PROVIDER: &str = "compaction";
 pub const SESSION_MODEL: &str = "session-model";
-const COMPACTION_MODEL: &str = "compaction-model";
+pub const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
 pub const COMPACTION_MARKER: &str = "Your context window is being compacted";
 
@@ -355,6 +355,7 @@ impl SessionParts {
             limits: crate::agent::LiveLimits::of(&MayConfig::default()),
             services: crate::terminal_commands::SharedServices::new(&self.dir.join(".may")),
             model_context_window: None,
+            sleep: None,
         }
     }
 }

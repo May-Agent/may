@@ -17,9 +17,11 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
@@ -95,6 +97,10 @@ struct Persisted {
     told: BTreeSet<String>,
     /// How the last sleep ended, told to each session with the wake.
     woke: WakeCause,
+    /// Monotonic sleep-entry counter so a re-sleep in the same session still
+    /// counts as a distinct sleep state even if the wake happened while idle.
+    #[serde(default)]
+    epoch: u64,
     #[serde(skip)]
     reminders: u64,
     /// When the last reminder was raised, Unix milliseconds; kept so the
@@ -111,6 +117,7 @@ impl Default for Persisted {
             since_ms: None,
             told: BTreeSet::new(),
             woke: WakeCause::default(),
+            epoch: 0,
             reminders: 0,
             last_reminded_ms: None,
         }
@@ -219,6 +226,7 @@ impl SleepState {
         inner.asleep = true;
         inner.origin = Some(origin.to_owned());
         inner.since_ms = Some(now.as_millisecond());
+        inner.epoch = inner.epoch.saturating_add(1).max(1);
         // The session that ran the command is told again even if it never
         // heard the previous wake.
         inner.told.remove(origin);
@@ -296,6 +304,39 @@ impl SleepState {
         Ok(Some(notice))
     }
 
+    /// Reads the current sleep state for a [`SleepConditions`] context source.
+    pub(crate) async fn read(&self) -> SleepReading {
+        let inner = self.inner.lock().await;
+        SleepReading {
+            asleep: inner.asleep,
+            epoch: inner.epoch,
+            origin: inner.origin.clone(),
+            woke: inner.woke,
+        }
+    }
+
+    /// Whether `session_id` has been recorded as told about the current sleep.
+    pub(crate) async fn is_told(&self, session_id: &str) -> bool {
+        self.inner.lock().await.told.contains(session_id)
+    }
+
+    /// Updates whether `session_id` has been told about the current sleep.
+    ///
+    /// # Errors
+    /// When the state cannot be persisted.
+    pub(crate) async fn set_told(&self, session_id: &str, told: bool) -> std::io::Result<()> {
+        let mut inner = self.inner.lock().await;
+        let changed = if told {
+            inner.told.insert(session_id.to_owned())
+        } else {
+            inner.told.remove(session_id)
+        };
+        if changed {
+            self.persist(&inner).await?;
+        }
+        Ok(())
+    }
+
     /// Raises the health reminder when `now` is within
     /// [`REMINDER_WINDOW_MINUTES`] after the median time of day of the
     /// recorded sleeps in `zone`, the user is awake, and none was raised in
@@ -369,6 +410,123 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// Current sleep state read by a session's [`SleepConditions`] source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SleepReading {
+    pub asleep: bool,
+    pub epoch: u64,
+    pub origin: Option<String>,
+    pub woke: WakeCause,
+}
+
+/// Sleep mode as state: nothing enters the context while idle, each
+/// transition emits one alert before the next request, and a cold-cache
+/// reassembly repeats the sleep notice only when the user is still asleep.
+#[derive(Debug)]
+pub(crate) struct SleepConditions {
+    sleep: Arc<SleepState>,
+    session_id: String,
+    /// Sleep epoch last seen by the model in this context window (`0` = awake).
+    seen_epoch: Arc<AtomicU64>,
+}
+
+impl SleepConditions {
+    /// Builds the sleep context source for `session_id` alongside a shared
+    /// handle used when restoring a warm checkpoint.
+    #[must_use]
+    pub fn new(
+        sleep: Arc<SleepState>,
+        session_id: impl Into<String>,
+        seen_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            sleep,
+            session_id: session_id.into(),
+            seen_epoch,
+        }
+    }
+
+    fn next_alert(
+        &self,
+        reading: &SleepReading,
+        seen_epoch: u64,
+        reassembled: bool,
+    ) -> Option<(ContextBlock, u64, bool)> {
+        if reading.asleep {
+            let target = reading.epoch.max(1);
+            if seen_epoch != target {
+                let text = crate::agent::SleepAlert {
+                    greet: reading.origin.as_deref() == Some(self.session_id.as_str()),
+                }
+                .render_text();
+                return Some((ContextBlock::stable("system-reminder", text), target, true));
+            }
+            None
+        } else if !reassembled && seen_epoch != 0 {
+            let text = crate::agent::WakeAlert {
+                cause: reading.woke,
+            }
+            .render_text();
+            Some((ContextBlock::stable("system-reminder", text), 0, false))
+        } else {
+            None
+        }
+    }
+}
+
+impl ContextSource for SleepConditions {
+    fn id(&self) -> SourceId {
+        SourceId::new("sleep")
+    }
+
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        let Moment::Request { reassembled } = moment else {
+            return Vec::new();
+        };
+        if reassembled {
+            self.seen_epoch.store(0, Ordering::Relaxed);
+        }
+        let reading = self.sleep.read().await;
+        let seen_epoch = self.seen_epoch.load(Ordering::Relaxed);
+        if let Some((block, next_epoch, told)) = self.next_alert(&reading, seen_epoch, reassembled)
+        {
+            self.seen_epoch.store(next_epoch, Ordering::Relaxed);
+            if let Err(error) = self.sleep.set_told(&self.session_id, told).await {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    %error,
+                    "failed to persist the sleep state an agent was told"
+                );
+            }
+            return vec![block];
+        }
+        if reassembled && let Err(error) = self.sleep.set_told(&self.session_id, false).await {
+            tracing::warn!(
+                session_id = %self.session_id,
+                %error,
+                "failed to clear sleep told state after reassembly"
+            );
+        }
+        Vec::new()
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+        let Moment::Request { reassembled } = moment else {
+            return Vec::new();
+        };
+        let reading = self.sleep.read().await;
+        let seen_epoch = if reassembled {
+            0
+        } else {
+            self.seen_epoch.load(Ordering::Relaxed)
+        };
+        self.next_alert(&reading, seen_epoch, reassembled)
+            .map(|(block, _, _)| block)
+            .into_iter()
+            .collect()
+    }
 }
 
 /// Why a sleep operation failed.
@@ -811,6 +969,54 @@ mod tests {
                 .remind_if_due(at("2026-03-01T23:30:00Z"), &TimeZone::UTC)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_conditions_tracks_transitions_and_cold_reassembly() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sleep, _) = state(dir.path()).await;
+        let sleep = Arc::new(sleep);
+        let seen_epoch = Arc::new(AtomicU64::new(0));
+        let mut source = SleepConditions::new(sleep.clone(), "a", seen_epoch);
+
+        // Sleep then wake before any turn: emits nothing.
+        sleep.sleep("a", at(T0)).await.unwrap();
+        sleep.wake(at(T0)).await.unwrap();
+        assert_eq!(
+            source.blocks(Moment::Request { reassembled: false }).await,
+            Vec::new()
+        );
+
+        // Going asleep while warm emits SleepAlert once; repeat request emits none.
+        sleep.sleep("a", at(T0)).await.unwrap();
+        let blocks = source.blocks(Moment::Request { reassembled: false }).await;
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].block().content().contains("going to sleep"));
+        assert_eq!(
+            source.blocks(Moment::Request { reassembled: false }).await,
+            Vec::new()
+        );
+
+        // Cold reassembly while still asleep repeats SleepAlert cleanly.
+        let blocks = source.blocks(Moment::Request { reassembled: true }).await;
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].block().content().contains("going to sleep"));
+
+        // Waking while warm emits WakeAlert once.
+        sleep.wake(at(T0)).await.unwrap();
+        let blocks = source.blocks(Moment::Request { reassembled: false }).await;
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].block().content().contains("awake again"));
+        assert_eq!(
+            source.blocks(Moment::Request { reassembled: false }).await,
+            Vec::new()
+        );
+
+        // Cold reassembly while awake (normal state) emits nothing.
+        assert_eq!(
+            source.blocks(Moment::Request { reassembled: true }).await,
+            Vec::new()
         );
     }
 }

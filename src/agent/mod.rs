@@ -74,6 +74,7 @@ pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
 mod usage;
+pub mod wake;
 mod wall_clock;
 pub(crate) mod webfetch_tool;
 pub mod work_tracker;
@@ -109,6 +110,7 @@ pub use runner::{
     AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
     spawn_idle_worker, spawn_worker,
 };
+pub(crate) use runtime_context::{SleepAlert, WakeAlert};
 pub use session_model::{PushedModel, SessionModel};
 pub use subagent_tracker::{RunCard, RunUsage, SubagentRunSnapshot, SubagentTracker, TrackedRun};
 pub use task_tool::{
