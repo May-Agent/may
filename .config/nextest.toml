@@ -12,4 +12,3 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = "test(vision_ocr::tests::recognizes_en_zh_ja_ko) | test(vision_ocr::tests::child_hooks_forward_ocr) | test(vision_ocr::tests::augment_tool_outcome_handles) | test(after_tool_attaches_ocr) | test(build_prompt_and_attachments_runs_ocr)"
 test-group = "vision-ocr"
-threads-required = "num-cpus"

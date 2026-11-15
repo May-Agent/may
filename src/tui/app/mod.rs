@@ -4436,7 +4436,8 @@ impl App {
                     tracing::debug!(%error, "sidebar: failed to fetch PRs");
                 }
             }
-        });
+        })
+        .detach();
     }
 
     /// Fetch the current session's `tasks.md` for the sidebar from the
