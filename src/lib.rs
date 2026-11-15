@@ -144,6 +144,8 @@ pub mod ui_event_bus;
 pub mod update;
 
 pub(crate) mod video;
+/// On-device OCR and conditional downscaling for text-dense images.
+pub mod vision_ocr;
 /// HTTP/SSE server backing the web UI.
 /// Workspace request handling.
 pub mod workspace;

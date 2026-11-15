@@ -10,6 +10,7 @@
 //! - the per-run token usage the jobs panel reads.
 
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -29,7 +30,8 @@ use super::finished::Expires;
 use super::report::{HistoryEntry, IdleAlert, JobEnd, JobEnded, render};
 use crate::agent::subagent_tracker::RunUsage;
 use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
-use crate::ipc::SessionShell;
+use crate::ipc::{CallImageStore, SessionShell};
+use crate::vision_ocr::{VisionOcr, augment_tool_outcome};
 
 /// The decisions a child's loop makes at its control points.
 #[derive(Debug)]
@@ -38,17 +40,23 @@ pub struct ChildHooks {
     requested: Arc<AtomicBool>,
     /// Refuses every tool call with this reason when set.
     deny: Option<String>,
+    vision_ocr: VisionOcr,
+    call_images: Option<CallImageStore>,
+    outputs_dir: Option<PathBuf>,
 }
 
 impl ChildHooks {
     /// Hooks that run the `compact` valve `valve` and refuse nothing. The
     /// flag is set when the valve ended a turn for a compaction.
     #[must_use]
-    pub const fn compacting(valve: Option<Arc<CompactSignal>>, requested: Arc<AtomicBool>) -> Self {
+    pub fn compacting(valve: Option<Arc<CompactSignal>>, requested: Arc<AtomicBool>) -> Self {
         Self {
             valve,
             requested,
             deny: None,
+            vision_ocr: VisionOcr::new(),
+            call_images: None,
+            outputs_dir: None,
         }
     }
 
@@ -59,7 +67,24 @@ impl ChildHooks {
             valve: None,
             requested: Arc::default(),
             deny: Some(reason),
+            vision_ocr: VisionOcr::new(),
+            call_images: None,
+            outputs_dir: None,
         }
+    }
+
+    /// Enables OCR + attachment forwarding for command-returned images in this subagent.
+    #[must_use]
+    pub fn with_image_ocr(
+        mut self,
+        vision_ocr: VisionOcr,
+        call_images: CallImageStore,
+        outputs_dir: PathBuf,
+    ) -> Self {
+        self.vision_ocr = vision_ocr;
+        self.call_images = Some(call_images);
+        self.outputs_dir = Some(outputs_dir);
+        self
     }
 }
 
@@ -71,14 +96,28 @@ impl Hooks for ChildHooks {
             .map_or(ToolDecision::Allow, ToolDecision::Deny)
     }
 
-    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
         if let Some(valve) = &self.valve
             && outcome.name != COMPACT_TOOL_NAME
         {
             valve.acted();
         }
-        AfterTool::Keep
+        match augment_tool_outcome(
+            &self.vision_ocr,
+            self.call_images.as_ref(),
+            self.outputs_dir.as_deref(),
+            outcome.call.call(),
+            &outcome.name,
+            outcome.for_model(),
+        )
+        .await
+        {
+            Some((result, attachments)) => AfterTool::ReplaceWithAttachments {
+                result,
+                attachments,
+            },
+            None => AfterTool::Keep,
+        }
     }
 
     #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]

@@ -58,3 +58,9 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 ## Search
 
 - `src/repo_search/`: `RepoSearch` client of the repo-search daemon, `indexer.rs` (outbox-driven indexing of sessions and issues), `auto_index.rs` (frequently searched worktrees).
+
+## Vision OCR and image attachments
+
+- `src/vision_ocr.rs`: `VisionOcr` (gated on Cargo feature `vision-ocr`, enabled by default, using `waterkit-vision` `RecognizeText` via Apple Vision on macOS and `Windows.Media.Ocr` on Windows off the event loop with `blocking::unblock`, and lazy initialization with no global state). Text-dense images are downscaled to cap the longer edge at 768px and paired with Askama-rendered `<recognized_text>` (`templates/recognized_text.txt`); photos and unsupported platforms pass through unchanged.
+- `src/daemon/attachments.rs` (`build_prompt_and_attachments`): applies `VisionOcr` to vision uploads from TUI and Web UI while keeping every image attached.
+- `src/ipc/payload.rs` (`CallImageStore`), `src/ipc/registry.rs`, `src/agent/hooks.rs`, and `src/subagent/child.rs`: collect `computer` screenshots, `browser` screenshots, `CommandStream::Image`, and `ToolResult::Binary`/`Parts` images produced by main-agent and subagent tool calls, run `VisionOcr`, and attach the resulting images (plus `<recognized_text>` when text-dense) back onto `Message::Tool`.

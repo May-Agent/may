@@ -25,7 +25,9 @@ pub type SessionShell = Shell<Arc<AnyExecutor>>;
 pub use bridge::{CommandBridge, ShellSlot};
 pub use cli::{POSITIONAL_KEYWORD, cli_to_json, schema_to_help, validate_positional_layout};
 pub use command_set::{AnyCommandSet, CommandSet};
-pub use payload::{CommandEnvelope, CommandPayload, tool_output_to_payload};
+pub use payload::{
+    CallImageStore, CommandEnvelope, CommandPayload, RecordedCallImage, tool_output_to_payload,
+};
 pub use registry::{
     AnyCommandObserver, Binding, Caller, CommandCall, CommandObserver, CommandRegistry,
     CommandRegistryBuilder, CommandUsage, KeptExchangeReceiver, Role,

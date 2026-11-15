@@ -467,6 +467,8 @@ pub struct DaemonState {
     pub(crate) search_index_status: crate::repo_search::indexer::IndexerStatus,
     /// The compiled quota-reset matchers turns parse upstream errors with.
     pub(crate) quota_patterns: crate::quota::QuotaPatterns,
+    /// Native on-device OCR & token-saving downscaler for text-dense images.
+    pub(crate) vision_ocr: crate::vision_ocr::VisionOcr,
     /// The compiled secret shapes bash-mode output is masked with.
     pub(crate) secret_patterns: crate::secrets::SecretPatterns,
     /// The repo-search handle and PR land locks every session's agent shares.
@@ -1488,6 +1490,7 @@ impl DaemonState {
             may_dir: may_dir.to_path_buf(),
             services: crate::terminal_commands::SharedServices::new(may_dir),
             quota_patterns: crate::quota::QuotaPatterns::default(),
+            vision_ocr: crate::vision_ocr::VisionOcr::new(),
             secret_patterns: crate::secrets::SecretPatterns::default(),
             search_index_wake_tx,
             search_index_wake,

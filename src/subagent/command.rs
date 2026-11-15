@@ -86,6 +86,10 @@ pub struct SubagentSettings<LLM> {
     /// Cache keep-alives, for a provider whose cache is short enough to go
     /// cold while a subagent waits.
     pub keep_alive: Option<KeepAlive>,
+    /// Shared per-call image store so subagent tool hooks attach & OCR command images.
+    pub call_images: Option<crate::ipc::CallImageStore>,
+    /// Shared native OCR runtime so subagents reuse the session's initialized backend.
+    pub vision_ocr: crate::vision_ocr::VisionOcr,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -440,11 +444,17 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let slot = settings.tiers.slot(tier);
         let valve = Arc::new(CompactSignal::default());
         let requested = Arc::new(AtomicBool::new(false));
+        let child_hooks = ChildHooks::compacting(Some(valve.clone()), requested.clone());
+        let child_hooks = match settings.call_images.clone() {
+            Some(call_images) => child_hooks.with_image_ocr(
+                settings.vision_ocr.clone(),
+                call_images,
+                shell.output_store().dir().to_path_buf(),
+            ),
+            None => child_hooks,
+        };
         let mut builder = AgentBuilder::new(slot.llm.clone())
-            .hooks(ChildHooks::compacting(
-                Some(valve.clone()),
-                requested.clone(),
-            ))
+            .hooks(child_hooks)
             .identity(identity);
         let floor = match &source {
             Source::Definition(definition) => {

@@ -57,6 +57,8 @@ pub struct SubagentAssembly {
     /// The instruction blocks, besides its definition's prompt, every
     /// subagent's context starts with.
     pub instructions: Vec<String>,
+    /// Shared native OCR runtime for subagents launched in this session.
+    pub vision_ocr: crate::vision_ocr::VisionOcr,
 }
 
 /// Dependencies every shared terminal IPC command needs from the host runtime.
@@ -569,6 +571,7 @@ where
         cache_lifetime,
         keep_alive,
         instructions,
+        vision_ocr,
     } = config.subagents;
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
@@ -599,6 +602,8 @@ where
         instructions,
         cache_lifetime,
         keep_alive,
+        call_images: Some(builder.call_images()),
+        vision_ocr,
     });
     describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
     usages.push(CoreCommandUsage {
@@ -746,6 +751,7 @@ mod tests {
             cache_lifetime: aither_agent::context::CacheLifetime::Permanent,
             keep_alive: None,
             instructions: Vec::new(),
+            vision_ocr: crate::vision_ocr::VisionOcr::new(),
         }
     }
 

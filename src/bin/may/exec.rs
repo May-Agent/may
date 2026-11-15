@@ -522,6 +522,7 @@ where
                 cache_lifetime: may_agent::cache_lifetime::CacheLifetime::default().into(),
                 keep_alive: None,
                 instructions: Vec::new(),
+                vision_ocr: may_agent::vision_ocr::VisionOcr::new(),
             },
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.

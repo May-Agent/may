@@ -1,0 +1,3 @@
+<recognized_text source="{{ source }}">
+{{ text }}
+</recognized_text>
