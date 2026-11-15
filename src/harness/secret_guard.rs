@@ -61,7 +61,7 @@ pub struct SecretGuard {
 }
 
 struct Shared {
-    shapes: SecretShapes,
+    shapes: Arc<SecretShapes>,
     registry: ArcSwap<Registry>,
 }
 
@@ -204,7 +204,19 @@ impl SecretGuard {
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
-                shapes: SecretShapes::new(),
+                shapes: Arc::new(SecretShapes::new()),
+                registry: ArcSwap::from_pointee(Registry::default()),
+            }),
+        }
+    }
+
+    /// Creates a guard with an empty secret registry sharing `self`'s
+    /// compiled token shapes.
+    #[must_use]
+    pub(crate) fn empty_sharing_shapes(&self) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                shapes: Arc::clone(&self.shared.shapes),
                 registry: ArcSwap::from_pointee(Registry::default()),
             }),
         }

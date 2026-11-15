@@ -1,0 +1,13 @@
+TARGET: {{ target }}
+{%- match title %}{% when Some with (title) %}
+
+TITLE: {{ title }}{% when None %}{% endmatch %}
+{%- match body %}{% when Some with (body) %}
+
+{{ body }}{% when None %}{% endmatch %}
+{%- if !commits.is_empty() %}
+
+COMMIT MESSAGES:{% for commit in commits %}
+
+commit {{ commit.short_sha }}:
+{{ commit.message }}{% endfor %}{% endif %}

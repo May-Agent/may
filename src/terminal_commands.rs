@@ -117,6 +117,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Asks the user before an issue, PR or comment is published, when the
     /// session can ask; `None` publishes without asking.
     pub publish_gate: Option<crate::agent::publish_approval::PublishGate>,
+    /// Live May configuration read during outbound publish review for
+    /// configured provider API keys and remote access settings.
+    pub live_config: Option<Arc<arc_swap::ArcSwap<crate::config::MayConfig>>>,
     /// Per-project workspace config — `pr` reads `[[projects]] checks` off it.
     pub workspace_config: crate::workspace::WorkspaceConfig,
     /// Discovery and messaging between main agents, when the session has a
@@ -245,7 +248,19 @@ where
     let balanced = config.ask_balanced.unwrap_or_else(|| session_model.clone());
     let fast = config.ask_fast.unwrap_or(session_model);
     let fast_llm = fast.llm.clone();
-    let screen_llm = fast_llm.clone();
+    let tailscale_bin = config
+        .live_config
+        .as_ref()
+        .map(|cfg| cfg.load().remote_access.tailscale_binary.clone());
+    let local_env =
+        crate::harness::publish_review::LocalEnvironment::detect(tailscale_bin.as_deref()).await;
+    let publish_review = crate::harness::publish_review::PublishReview::new(
+        fast.clone(),
+        config.may_dir.clone(),
+        config.session_id.clone(),
+        config.live_config.clone(),
+        local_env,
+    );
     let ask_command = AskCommand::new(fast_llm.clone())
         .with_parameters(fast.parameters.clone())
         .with_flagship(flagship.llm, flagship.parameters)
@@ -295,7 +310,8 @@ where
     };
     let mut issue_tool = issue_tool
         .with_targets(issue_targets())
-        .with_task_events(config.task_events.clone());
+        .with_task_events(config.task_events.clone())
+        .with_publish_review(publish_review.clone());
     if let Some(gate) = &config.publish_gate {
         issue_tool = issue_tool.with_publish_gate(gate.clone());
     }
@@ -348,11 +364,6 @@ where
         .await?;
     builder.configure_tool(crate::commit_signing::SignCommitTool::new(signing.clone()));
 
-    let screen: Arc<crate::pr::ScreenFn> = Arc::new(move |title: &str, body: &str| {
-        let llm = screen_llm.clone();
-        let (title, body) = (title.to_string(), body.to_string());
-        Box::pin(async move { crate::pr::screen_with_llm(&llm, &title, &body).await })
-    });
     let pr_context = crate::pr::PrContext {
         db: Some(config.db.clone()),
         session_id: config.session_id.clone(),
@@ -360,7 +371,7 @@ where
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
-        screen: Some(screen),
+        review: Some(publish_review),
         signing,
         github_api: crate::pr::PrContext::default_github_api(),
         land_locks: config.services.land_locks.clone(),
@@ -860,6 +871,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -953,6 +965,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1022,6 +1035,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1085,6 +1099,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1143,6 +1158,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1314,6 +1330,7 @@ mod tests {
                 issue_store,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
                 languages: None,
@@ -1443,6 +1460,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1503,6 +1521,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1567,6 +1586,7 @@ mod tests {
                 issue_store: test_issue_store(temp).await,
                 task_events: crate::harness::working_document::WorkEvents::new(),
                 publish_gate: None,
+                live_config: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,

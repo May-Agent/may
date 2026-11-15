@@ -14,6 +14,7 @@ pub mod fs_util;
 pub mod host_load;
 pub mod language;
 pub mod pressure;
+pub mod publish_review;
 pub mod runaway;
 pub mod secret_guard;
 pub mod subagent_file;

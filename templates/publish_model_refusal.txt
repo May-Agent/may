@@ -1,0 +1,3 @@
+Publish review refused; rewrite and retry after fixing:
+{% for finding in findings %}- {{ finding }}
+{% endfor %}

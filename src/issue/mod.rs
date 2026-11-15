@@ -231,6 +231,9 @@ pub enum IssueError {
     /// The user's approval for publishing was denied or could not be asked.
     #[error("{0}")]
     ApprovalDenied(String),
+    /// Outbound publish review refused the text before it left May.
+    #[error("{0}")]
+    PublishReview(String),
     /// Workspace configuration could not be read.
     #[error(transparent)]
     WorkspaceConfig(#[from] WorkspaceConfigError),
