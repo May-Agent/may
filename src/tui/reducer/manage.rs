@@ -412,6 +412,13 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                     });
                 }
             }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(server) = app.config.ssh_servers.get(app.ssh_selected) {
+                    return Some(SendAction::SshToggleAttachment {
+                        name: server.name.clone(),
+                    });
+                }
+            }
             _ => {}
         },
         SshAddMode::Name => match code {

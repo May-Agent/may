@@ -161,3 +161,62 @@ async fn an_agents_md_change_mid_session_is_one_diff_then_the_clean_version() {
     assert!(after[0].contains("rule one\nrule two"), "{}", after[0]);
     assert_eq!(diff_alerts(after, "agents_md_diff"), Vec::<&String>::new());
 }
+
+#[tokio::test]
+async fn an_ssh_server_change_mid_session_is_one_diff_then_the_clean_version() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let mut session = Box::pin(session_with(&stub, "", "rules\n")).await;
+
+    turn(&mut session).await;
+
+    // Attach an SSH server mid-session on the live session so the warm system
+    // prefix stays byte-identical and the diff is announced once.
+    let ssh_servers = vec![crate::config::SshServerConfig {
+        name: "prod".to_string(),
+        target: "ops@prod.example.com".to_string(),
+        platform: crate::config::SshPlatformConfig {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+        },
+    }];
+    session.agent.sync_ssh_servers(&ssh_servers);
+
+    turn(&mut session).await;
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, third] = requests.as_slice() else {
+        panic!("three turns: {requests:?}");
+    };
+    assert!(!first[0].contains("ops@prod.example.com"), "{}", first[0]);
+    assert_eq!(second[0], first[0], "the cached prefix stays as sent");
+    assert!(!second[0].contains("ops@prod.example.com"), "{}", second[0]);
+    let alerts = diff_alerts(second, "environment_diff");
+    assert_eq!(alerts.len(), 1, "{second:?}");
+    assert!(
+        alerts[0].starts_with("The environment changed."),
+        "{}",
+        alerts[0]
+    );
+    assert!(
+        alerts[0].contains("+- prod (ops@prod.example.com), Linux x86_64"),
+        "{}",
+        alerts[0]
+    );
+    assert_eq!(third[0], first[0]);
+    assert_eq!(diff_alerts(third, "environment_diff").len(), 1, "{third:?}");
+
+    compact(&mut session).await;
+    turn(&mut session).await;
+    let requests = turn_requests(&stub).await;
+    let after = requests.last().expect("the turn after compaction");
+    assert!(
+        after[0].contains("- prod (ops@prod.example.com), Linux"),
+        "{}",
+        after[0]
+    );
+    assert_eq!(
+        diff_alerts(after, "environment_diff"),
+        Vec::<&String>::new()
+    );
+}

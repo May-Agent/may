@@ -4244,7 +4244,17 @@ fn prepare_agent_for_request<'a>(
             None
         };
         let mut agent = match reused {
-            Some(agent) => agent,
+            Some(mut agent) => {
+                let ssh_servers = crate::profile::resolve_attached_ssh_servers(
+                    &state.db(),
+                    ctx.profile_id.as_deref(),
+                    &config.ssh_servers,
+                )
+                .await
+                .map_err(UiChatPreparationError::LoadProfile)?;
+                agent.sync_ssh_servers(&ssh_servers);
+                agent
+            }
             None if kind.is_resume() => return Err(UiChatPreparationError::NothingToResume),
             None => {
                 Box::pin(build_session_agent(
@@ -4456,7 +4466,9 @@ fn agent_build_key(
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::hash::DefaultHasher::new();
-    serde_json::to_string(config)
+    let mut config_for_key = config.clone();
+    config_for_key.ssh_servers.clear();
+    serde_json::to_string(&config_for_key)
         .unwrap_or_default()
         .hash(&mut hasher);
     // The pushed providers' configurations, not their access tokens: the

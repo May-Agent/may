@@ -451,6 +451,7 @@ pub(super) async fn set_profile_remote_servers(
         .await
         .map_err(internal_error)?;
 
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     json_ok_response(&super::types::API_OK)
 }
 

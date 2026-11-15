@@ -319,6 +319,37 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Whether `script` already holds a granted permission record in `mode` for
+    /// `session_id` (such as a session-wide SSH connection grant).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn has_granted_permission(
+        &self,
+        session_id: &str,
+        mode: PermissionHistoryMode,
+        script: &str,
+    ) -> Result<bool, ChatDbError> {
+        let mode_str = mode.as_str();
+        Ok(query!(
+            self.db,
+            "SELECT EXISTS(
+                SELECT 1
+                FROM message_permission_requests req
+                JOIN messages m ON m.id = req.message_id
+                JOIN message_permission_responses resp ON resp.request_id = req.request_id
+                WHERE m.session_id = ? AND req.mode = ? AND req.script = ? AND resp.approved = 1
+            ) AS value",
+            session_id,
+            mode_str,
+            script
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?
+        .value
+            != 0)
+    }
+
     /// Append a permission-response message for a session.
     ///
     /// # Errors

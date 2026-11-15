@@ -312,9 +312,15 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Yellow),
                 )));
             } else {
+                let attached: Option<&[String]> = app
+                    .current_profile()
+                    .map(|profile| profile.remote_attachments.as_slice());
                 for (idx, server) in app.config.ssh_servers.iter().enumerate() {
                     let selected = idx == app.ssh_selected;
                     let prefix = if selected { "> " } else { "  " };
+                    let is_attached =
+                        attached.is_some_and(|list| list.iter().any(|name| name == &server.name));
+                    let checkbox = if is_attached { "[x] " } else { "[ ] " };
                     lines.push(Line::from(vec![
                         Span::styled(
                             prefix,
@@ -322,6 +328,14 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
                                 Style::default().fg(Color::Yellow)
                             } else {
                                 Style::default()
+                            },
+                        ),
+                        Span::styled(
+                            checkbox,
+                            if is_attached {
+                                Style::default().fg(Color::Green)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
                             },
                         ),
                         Span::styled(
@@ -341,6 +355,9 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
+                Span::styled("[Space] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Toggle", Style::default().fg(Color::White)),
+                Span::raw("  "),
                 Span::styled("[a] ", Style::default().fg(Color::Cyan)),
                 Span::styled("Add", Style::default().fg(Color::White)),
                 Span::raw("  "),
