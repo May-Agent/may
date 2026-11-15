@@ -220,17 +220,18 @@ impl VisionOcr {
         let image = VisionImage::from_encoded(bytes.to_vec().into());
         // Pass 1 leaves `languages` empty so Apple Vision enables automatic
         // script detection (combining CJK tags in one request biases earlier
-        // tags to corrupt later scripts). On macOS 15, auto-detection can still
-        // silently omit adjacent CJK lines (for example Japanese directly below
-        // Chinese), so run one single-script fallback pass per supported CJK
-        // family and merge only lines that do not overlap an existing box.
+        // tags to corrupt later scripts). Auto-detection can still silently omit
+        // adjacent CJK lines (for example Japanese directly below Chinese), and
+        // `capabilities().text.native` on Apple intersects `Fast` and `Accurate`
+        // (omitting CJK tags supported only by `Accurate`), so run one
+        // single-script fallback pass per CJK family and merge uncovered lines.
         let request = RecognizeText::new().level(RecognitionLevel::Accurate);
         let mut merged = futures_lite::future::block_on(vision.perform(&image, &request))
             .map_err(|error| format!("vision.perform failed: {error}"))?;
         for lang in cjk_fallback_languages(&native) {
             let fallback = RecognizeText::new()
                 .level(RecognitionLevel::Accurate)
-                .languages([lang.clone()]);
+                .languages([lang]);
             if let Ok(extra) = futures_lite::future::block_on(vision.perform(&image, &fallback)) {
                 merge_non_overlapping_lines(&mut merged, extra);
             }
@@ -528,23 +529,38 @@ fn is_kept_line(line: &TextLine) -> bool {
     !line.text.trim().is_empty() && line.confidence.is_none_or(|c| c >= MIN_LINE_CONFIDENCE)
 }
 
-/// Picks at most one supported tag per CJK family for single-script fallback passes.
+/// Picks at most one tag per CJK family for single-script `Accurate` fallback passes.
+///
+/// Prefers tags advertised by `native` and, on Apple platforms where
+/// `capabilities().text.native` intersects `Fast` and `Accurate` (excluding CJK
+/// tags supported only by `Accurate`), falls back to Apple's `Accurate` CJK tags.
 #[cfg(feature = "vision-ocr")]
-fn cjk_fallback_languages<T: ToString>(native: &[T]) -> Vec<&T> {
-    let pick = |matches: fn(&str) -> bool| native.iter().find(|lang| matches(&lang.to_string()));
-    [
-        pick(|tag| tag == "ja" || tag.starts_with("ja-")),
-        pick(|tag| {
+fn cjk_fallback_languages<T: Clone + ToString + std::str::FromStr>(native: &[T]) -> Vec<T> {
+    type CjkFamily = (&'static str, fn(&str) -> bool);
+    const CJK_FAMILIES: [CjkFamily; 4] = [
+        ("ja-Jpan-JP", |tag| tag == "ja" || tag.starts_with("ja-")),
+        ("zh-Hans", |tag| {
             tag == "zh-Hans" || tag.starts_with("zh-Hans-") || tag == "zh-CN" || tag == "zh-SG"
         }),
-        pick(|tag| {
+        ("zh-Hant", |tag| {
             tag == "zh-Hant" || tag.starts_with("zh-Hant-") || tag == "zh-TW" || tag == "zh-HK"
         }),
-        pick(|tag| tag == "ko" || tag.starts_with("ko-")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+        ("ko-Kore-KR", |tag| tag == "ko" || tag.starts_with("ko-")),
+    ];
+    CJK_FAMILIES
+        .into_iter()
+        .filter_map(|(apple_default, matches)| {
+            native
+                .iter()
+                .find(|lang| matches(&lang.to_string()))
+                .cloned()
+                .or_else(|| {
+                    cfg!(any(target_os = "macos", target_os = "ios"))
+                        .then(|| apple_default.parse().ok())
+                        .flatten()
+                })
+        })
+        .collect()
 }
 
 /// Keeps `base` confident lines and appends non-overlapping confident lines from `extra`.
@@ -909,12 +925,21 @@ pub(crate) mod tests {
                 "한국어 확인"
             ]
         );
+        let with_native = [
+            "en-US".to_owned(),
+            "ja-Jpan-JP".to_owned(),
+            "zh-Hans".to_owned(),
+            "zh-Hant".to_owned(),
+            "ko-KR".to_owned(),
+        ];
         assert_eq!(
-            cjk_fallback_languages(&["en-US", "ja-Jpan-JP", "zh-Hans", "zh-Hant", "ko-KR"])
-                .into_iter()
-                .copied()
-                .collect::<Vec<_>>(),
+            cjk_fallback_languages(&with_native),
             vec!["ja-Jpan-JP", "zh-Hans", "zh-Hant", "ko-KR"]
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert_eq!(
+            cjk_fallback_languages(&["en-US".to_owned()]),
+            vec!["ja-Jpan-JP", "zh-Hans", "zh-Hant", "ko-Kore-KR"]
         );
     }
 
