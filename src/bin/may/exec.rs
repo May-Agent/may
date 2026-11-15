@@ -523,6 +523,7 @@ where
                 cache_lifetime: may_agent::cache_lifetime::CacheLifetime::default().into(),
                 keep_alive: None,
                 instructions: Vec::new(),
+                vision_ocr: may_agent::vision_ocr::VisionOcr::new(),
             },
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.
@@ -534,6 +535,9 @@ where
             task_events: may_agent::harness::working_document::WorkEvents::new(),
             // `may exec` runs the user's own script: nobody to ask.
             publish_gate: None,
+            live_config: Some(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                may_config.clone(),
+            ))),
             workspace_config: may_agent::workspace::WorkspaceConfig::load(
                 &session_paths.workspace_config(),
             )

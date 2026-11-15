@@ -17,6 +17,7 @@
 //! - loop detection feeds every tool turn to the agent's [`LoopWatch`] and
 //!   ends the run once a loop goes on past its alert.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -26,8 +27,10 @@ use aither_sandbox::{JobStatus, Jobs, Refused, UnchangedRead};
 use super::loop_watch::LoopWatch;
 use crate::command_policy::RefusedReads;
 use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
+use crate::ipc::CallImageStore;
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionRuntimeService};
+use crate::vision_ocr::VisionOcr;
 
 /// What a May agent decides at the loop's control points.
 #[derive(Debug, Clone)]
@@ -44,6 +47,12 @@ pub(super) struct MayHooks {
     pub(super) compaction: Arc<AtomicBool>,
     /// The loop detection every tool turn is fed to.
     pub(super) loops: LoopWatch,
+    /// Native on-device OCR + conditional downscaling for command-returned images.
+    pub(super) vision_ocr: VisionOcr,
+    /// Per-tool-call store collecting images produced by IPC subcommands.
+    pub(super) call_images: CallImageStore,
+    /// Session output directory where downscaled image files are persisted.
+    pub(super) outputs_dir: PathBuf,
 }
 
 impl MayHooks {
@@ -99,10 +108,27 @@ impl Hooks for MayHooks {
         let shown = outcome.for_model();
         let mut result = shown.clone();
         redactions.redact_tool_result(&mut result);
-        if result == shown {
-            AfterTool::Keep
-        } else {
+        let redacted = result != shown;
+        if let Some((mut augmented, attachments)) = crate::vision_ocr::augment_tool_outcome(
+            &self.vision_ocr,
+            Some(&self.call_images),
+            Some(self.outputs_dir.as_path()),
+            outcome.call.call(),
+            &outcome.name,
+            result.clone(),
+        )
+        .await
+        {
+            redactions.redact_tool_result(&mut augmented);
+            return AfterTool::ReplaceWithAttachments {
+                result: augmented,
+                attachments,
+            };
+        }
+        if redacted {
             AfterTool::Replace(result)
+        } else {
+            AfterTool::Keep
         }
     }
 
@@ -139,5 +165,199 @@ impl Hooks for MayHooks {
             return TurnBoundaryAction::EndTurn;
         }
         TurnBoundaryAction::Continue
+    }
+}
+
+#[cfg(all(test, feature = "vision-ocr", target_os = "macos"))]
+mod tests {
+    use std::borrow::Cow;
+    use std::collections::VecDeque;
+    use std::ops::ControlFlow;
+    use std::sync::Mutex;
+
+    use aither_agent::Agent;
+    use aither_core::llm::model::Profile;
+    use aither_core::llm::{
+        Classify, Event, Failure, LLMRequest, LanguageModel, Role, Tool, ToolCall, ToolContext,
+        ToolResult,
+    };
+    use futures_lite::Stream;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    use super::*;
+    use crate::ipc::RecordedCallImage;
+    use crate::repo_clone::test_sandbox::TestTerminal;
+
+    #[derive(Debug)]
+    struct StubErr;
+    impl std::fmt::Display for StubErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("stub error")
+        }
+    }
+    impl std::error::Error for StubErr {}
+    impl Classify for StubErr {
+        fn failure(&self) -> Failure {
+            Failure::permanent()
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedModel {
+        script: Arc<Mutex<VecDeque<Vec<Event>>>>,
+        requests: Arc<Mutex<Vec<LLMRequest>>>,
+    }
+
+    impl LanguageModel for ScriptedModel {
+        type Error = StubErr;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests.lock().expect("requests").push(request);
+            let events = self
+                .script
+                .lock()
+                .expect("script")
+                .pop_front()
+                .expect("scripted turn");
+            futures_lite::stream::iter(events.into_iter().map(Ok))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
+            std::future::ready(Ok(Profile::new(
+                "scripted",
+                "test",
+                "scripted",
+                "scripted model",
+                128_000,
+            )))
+        }
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct NoArgs {}
+
+    struct ScreenshotTool {
+        call_images: CallImageStore,
+        image: RecordedCallImage,
+    }
+
+    impl Tool for ScreenshotTool {
+        fn name(&self) -> Cow<'static, str> {
+            Cow::Borrowed("terminal")
+        }
+
+        fn description(&self) -> Cow<'static, str> {
+            Cow::Borrowed("Captures a test screenshot.")
+        }
+
+        type Arguments = NoArgs;
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            cx: ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            if let Some(call) = cx.identity() {
+                self.call_images
+                    .record(call.call(), vec![self.image.clone()]);
+            }
+            std::future::ready(Ok(ToolResult::text("Captured screen")))
+        }
+    }
+
+    #[tokio::test]
+    async fn after_tool_attaches_ocr_and_redacts_secrets_from_recognized_text() {
+        crate::test_support::install_global_executor();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terminal = TestTerminal::new(dir.path()).await;
+        let screenshot_path = dir.path().join("screen.png");
+        let png = crate::vision_ocr::tests::render_multilingual_text_png(
+            &[
+                "Deployment token leak test hunter2-secret-value",
+                "中文状态：运行正常",
+                "日本語ログ：完了",
+                "한국어 상태: 정상",
+            ],
+            1200,
+            600,
+        );
+        async_fs::write(&screenshot_path, &png)
+            .await
+            .expect("write png");
+
+        let call_images = CallImageStore::default();
+        let hooks = MayHooks {
+            runtime: None,
+            session_id: SessionId::from_string("ocr-session"),
+            redactor: SecretRedactor::fixed(&[("DEPLOY_TOKEN", "hunter2-secret-value")]),
+            refused: RefusedReads::default(),
+            jobs: terminal.shell().jobs(),
+            valve: Arc::new(CompactSignal::default()),
+            compaction: Arc::new(AtomicBool::new(false)),
+            loops: LoopWatch::new(crate::agent::LoopLimits::default()),
+            vision_ocr: VisionOcr::new(),
+            call_images: call_images.clone(),
+            outputs_dir: dir.path().join("outputs"),
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let llm = ScriptedModel {
+            script: Arc::new(Mutex::new(VecDeque::from([
+                vec![Event::ToolCall(ToolCall::new(
+                    "call-may-ocr",
+                    "terminal",
+                    serde_json::json!({}),
+                ))],
+                vec![Event::Text("done".to_owned())],
+            ]))),
+            requests: Arc::clone(&requests),
+        };
+        let mut agent = Agent::builder(llm)
+            .tool(ScreenshotTool {
+                call_images,
+                image: RecordedCallImage {
+                    path: screenshot_path,
+                    media_type: "image/png".to_owned(),
+                    source: "computer screenshot".to_owned(),
+                },
+            })
+            .hooks(hooks)
+            .build();
+
+        let _ = agent
+            .run("capture", std::iter::empty())
+            .drive((), std::future::pending::<()>(), |(), _| async {
+                ControlFlow::Continue(())
+            })
+            .await
+            .expect("agent completes");
+
+        let tool_message = {
+            let captured = requests.lock().expect("requests");
+            captured[1]
+                .messages()
+                .iter()
+                .find(|msg| msg.role() == Role::Tool && msg.tool_call_id() == Some("call-may-ocr"))
+                .expect("tool message reaches model")
+                .clone()
+        };
+        assert_eq!(tool_message.attachments().len(), 1);
+        let rendered = tool_message.content();
+        assert!(rendered.contains("Captured screen"), "{rendered}");
+        assert!(rendered.contains("<recognized_text"), "{rendered}");
+        assert!(
+            rendered.contains("DEPLOY_TOKEN"),
+            "redacted token name expected: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hunter2-secret-value"),
+            "OCR text must also be redacted: {rendered}"
+        );
     }
 }

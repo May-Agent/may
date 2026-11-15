@@ -1024,6 +1024,7 @@ impl MayAgent {
             frequent_idle_threshold: FREQUENT_IDLE_THRESHOLD,
         });
 
+        let vision_ocr = crate::vision_ocr::VisionOcr::new();
         let mut commands = CommandRegistryBuilder::new();
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
             &mut commands,
@@ -1056,10 +1057,12 @@ impl MayAgent {
                     cache_lifetime,
                     keep_alive,
                     instructions: subagent_instructions,
+                    vision_ocr: crate::vision_ocr::VisionOcr::new(),
                 },
                 issue_store: issue_store.clone(),
                 task_events: task_events.clone(),
                 publish_gate,
+                live_config: config.live_config.clone(),
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
                 languages: Some(language_guard.clone()),
@@ -1145,6 +1148,9 @@ impl MayAgent {
             valve: valve.clone(),
             compaction: compaction_requested.clone(),
             loops: loops.clone(),
+            vision_ocr,
+            call_images: registry.call_images(),
+            outputs_dir: shell.output_store().dir().to_path_buf(),
         };
         let effective_max_iterations = if config.max_iterations == 0 {
             usize::MAX

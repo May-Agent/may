@@ -22,12 +22,14 @@ members = [".", "tasks", "patch", "sed"]
 default-members = [".", "tasks", "patch", "sed"]
 
 [features]
-default = []
+default = ["vision-ocr"]
 ui = []
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
 # release and updates from GitHub releases instead of CI artifacts.
 release-build = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+# On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
+vision-ocr = ["dep:waterkit-vision"]
 
 [dependencies]
 # The `tasks.md` parser and the `tasks` command; the container image tag is
@@ -153,7 +155,8 @@ ahash = "0.8"
 arboard = "3"
 base64 = "0.22"
 open = "5"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["text"], optional = true }
 
 # HTTP client for fetching images
 zenwave = "0.7"
@@ -243,9 +246,9 @@ objc2-foundation = "0.3"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
 objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
-waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false, features = ["display-stream"] }
-waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false }
-waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false }
+waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["display-stream"] }
+waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
+waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 
 [build-dependencies]
@@ -346,4 +349,24 @@ opt-level = 3
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[patch.crates-io]
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-agent = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-attachments = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-browser = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-claude = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-codex = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-derive = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-gemini = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-models = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-skills = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "main" }
 

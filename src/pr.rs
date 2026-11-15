@@ -96,9 +96,8 @@ pub struct PrContext {
     pub cwd: PathBuf,
     /// Workspace config — `[[projects]]` backends and checks.
     pub workspace_config: crate::workspace::WorkspaceConfig,
-    /// Outbound screen: only `Ok(ScreenVerdict::Pass)` publishes. Wired
-    /// to the fast model by the command registration.
-    pub screen: Option<std::sync::Arc<ScreenFn>>,
+    /// Outbound publish review wired to the fast model and local pre-screen.
+    pub review: Option<crate::harness::publish_review::PublishReview>,
     /// The user's signing configuration: every commit of a PR must carry
     /// a signature valid under its key.
     pub signing: crate::commit_signing::CommitSigning,
@@ -159,66 +158,6 @@ impl PrContext {
     #[must_use]
     pub fn default_github_api() -> GitHubRest<PrTokenSource> {
         GitHubRest::new(PrTokenSource::Gh(GhCliTokenSource))
-    }
-}
-
-/// Screen callback signature: `(title, body)` → publish verdict.
-pub type ScreenFn = dyn Fn(
-        &str,
-        &str,
-    )
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScreenVerdict, String>> + Send>>
-    + Send
-    + Sync;
-
-/// What the outbound screen's reply says, parsed once from the reply text.
-/// Only [`ScreenVerdict::Pass`] publishes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScreenVerdict {
-    /// The reply is exactly the pass token.
-    Pass,
-    /// The reply starts with the block token; the one-line reason follows.
-    Block(String),
-    /// The reply is neither: empty, reasoning only, or a decorated token.
-    Unreadable,
-}
-
-impl ScreenVerdict {
-    /// The pass token the screen prompt asks for.
-    const PASS: &'static str = "ALLOW";
-    /// The block token the screen prompt asks for, followed by `: <reason>`.
-    const BLOCK: &'static str = "BLOCK";
-
-    /// Parse the screen's whole reply. Surrounding whitespace is ignored and
-    /// nothing else: markup around a token or text before it is unreadable.
-    #[must_use]
-    pub fn parse(reply: &str) -> Self {
-        let reply = reply.trim();
-        if reply == Self::PASS {
-            return Self::Pass;
-        }
-        match reply.strip_prefix(Self::BLOCK) {
-            Some("") => Self::Block(String::new()),
-            Some(rest) if rest.starts_with(':') => {
-                Self::Block(rest.trim_start_matches(':').trim().to_string())
-            }
-            _ => Self::Unreadable,
-        }
-    }
-
-    /// Why the text is withheld, `None` when it publishes.
-    #[must_use]
-    pub fn refusal(self) -> Option<String> {
-        match self {
-            Self::Pass => None,
-            Self::Block(reason) if reason.is_empty() => {
-                Some("withheld by the outbound screen".to_string())
-            }
-            Self::Block(reason) => Some(reason),
-            Self::Unreadable => Some(
-                "the outbound screen gave no explicit pass; its reply was unreadable".to_string(),
-            ),
-        }
     }
 }
 
@@ -631,12 +570,19 @@ impl PrStore {
         } else {
             github_branch(&self.context.session_id, &head_sha)
         };
-        // The outbound screen vets every published text before it leaves —
-        // the "PRs only" trust mode's guard.
-        if backend == "github"
-            && let Some(reason) = self.screen_outbound(&resolved.record, title, body).await?
-        {
-            return Err(PrError::Screened(reason));
+        // Review outbound PR title, body, and commit messages before anything
+        // leaves the machine.
+        if backend == "github" {
+            let commits = self
+                .commit_messages(&resolved, &base_sha, &head_sha)
+                .await?;
+            let commit_refs: Vec<_> = commits.iter().map(OwnedCommit::as_ref).collect();
+            self.review_outbound(crate::harness::publish_review::Publication::pull_request(
+                title,
+                body,
+                &commit_refs,
+            ))
+            .await?;
         }
         if backend == "github"
             && let (Some(gate), Some(owner_repo)) = (&self.context.publish, github_repo.as_deref())
@@ -882,6 +828,22 @@ impl PrStore {
         }
         let head_sha = self.head_sha(&resolved).await?;
         if pr.backend == "github" {
+            let since = pr.head_sha.as_deref().unwrap_or(&pr.base_sha);
+            let commits = match self.commit_messages(&resolved, since, &head_sha).await {
+                Ok(commits) => commits,
+                Err(_) if pr.head_sha.is_some() => {
+                    self.commit_messages(&resolved, &pr.base_sha, &head_sha)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            let commit_refs: Vec<_> = commits.iter().map(OwnedCommit::as_ref).collect();
+            if !commit_refs.is_empty() {
+                self.review_outbound(
+                    crate::harness::publish_review::Publication::commit_messages(&commit_refs),
+                )
+                .await?;
+            }
             push_pinned(
                 &self.context.scratch_root,
                 &resolved.dir,
@@ -1106,30 +1068,37 @@ impl PrStore {
         Ok(log.lines().map(str::to_string).collect())
     }
 
-    /// Run the outbound screen when the project enables it. `Some(reason)`
-    /// means the published text was blocked.
-    async fn screen_outbound(
+    /// Commits in `base..head`, oldest first, with abbreviated hash and full message.
+    async fn commit_messages(
         &self,
-        record: &CloneRecord,
-        title: &str,
-        body: &str,
-    ) -> Result<Option<String>, PrError> {
-        if !self
-            .project_for_record(record)
-            .and_then(|p| p.pr.screen)
-            .unwrap_or(false)
-        {
-            return Ok(None);
+        resolved: &Resolved,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<OwnedCommit>, PrError> {
+        let script = CommitMessages {
+            base: ShellWord::new(base).map_err(PrError::State)?,
+            head: ShellWord::new(head).map_err(PrError::State)?,
         }
-        let Some(screen) = self.context.screen.as_ref() else {
-            return Ok(Some(
-                "pr.screen is set but no outbound screen is wired".to_string(),
+        .render()
+        .expect("the commit messages script renders");
+        let log = self.sandbox.run(&resolved.dir, &script).await?;
+        Ok(parse_commit_messages(&log))
+    }
+
+    /// Run outbound publish review for external text before it leaves May.
+    async fn review_outbound(
+        &self,
+        publication: crate::harness::publish_review::Publication<'_>,
+    ) -> Result<(), PrError> {
+        let Some(review) = self.context.review.as_ref() else {
+            return Err(PrError::Screened(
+                "no outbound publish review is wired".to_string(),
             ));
         };
-        Ok(match screen(title, body).await {
-            Ok(verdict) => verdict.refusal(),
-            Err(reason) => Some(reason),
-        })
+        review
+            .review(publication)
+            .await
+            .map_err(|error| PrError::Screened(error.to_string()))
     }
 
     /// Push the session branch to the GitHub remote and open a real PR.
@@ -2026,12 +1995,38 @@ impl std::fmt::Display for ShellWord {
     }
 }
 
-/// The text the screening model reads: the title and body to be published.
-#[derive(Template)]
-#[template(path = "pr_screen_input.txt", escape = "none")]
-struct ScreenInput<'a> {
-    title: &'a str,
-    body: &'a str,
+/// One commit's short hash and raw message parsed from `pr_commit_messages.sh`.
+struct OwnedCommit {
+    short_sha: String,
+    message: String,
+}
+
+impl OwnedCommit {
+    fn as_ref(&self) -> crate::harness::publish_review::CommitMessage<'_> {
+        crate::harness::publish_review::CommitMessage {
+            short_sha: &self.short_sha,
+            message: &self.message,
+        }
+    }
+}
+
+fn parse_commit_messages(output: &str) -> Vec<OwnedCommit> {
+    output
+        .split('\0')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (short_sha, message) = entry
+                .split_once('\n')
+                .map_or((entry, ""), |(sha, msg)| (sha.trim(), msg.trim()));
+            Some(OwnedCommit {
+                short_sha: short_sha.to_string(),
+                message: message.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The body of a PR opened by `pr open`: its commit subjects and, for a
@@ -2124,6 +2119,15 @@ struct CommitSubjects {
     head: ShellWord,
 }
 
+/// Prints the short hashes and raw commit messages `base..head`, oldest first,
+/// NUL-separated; run in the session clone.
+#[derive(Template)]
+#[template(path = "pr_commit_messages.sh", escape = "none")]
+struct CommitMessages {
+    base: ShellWord,
+    head: ShellWord,
+}
+
 /// Removes a check's checkout; run in the session root.
 #[derive(Template)]
 #[template(path = "pr_check_remove.sh", escape = "none")]
@@ -2156,39 +2160,6 @@ fn github_owner_repo(url: &str) -> Option<String> {
     let mut parts = tail.split('/');
     Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
-
-/// Screen published text through the fast model; only an explicit pass
-/// publishes. The
-/// registration site wraps this in the session's screen closure.
-///
-/// # Errors
-/// Returns the model's error as a string when the call fails.
-///
-/// # Panics
-/// Panics if the compiled screening template fails to render.
-pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
-    llm: &LLM,
-    title: &str,
-    body: &str,
-) -> Result<ScreenVerdict, String> {
-    use aither_core::llm::{Event, oneshot};
-    use futures_lite::StreamExt;
-    let input = ScreenInput { title, body }
-        .render()
-        .expect("the screen input template renders");
-    let mut stream = Box::pin(llm.respond(oneshot(SCREEN_PROMPT, &input)));
-    let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(Event::Text(chunk)) => text.push_str(&chunk),
-            Ok(_) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(ScreenVerdict::parse(&text))
-}
-
-const SCREEN_PROMPT: &str = include_str!("../templates/pr_screen_prompt.txt");
 
 /// The `gh pr merge` arguments of a merge that names the commit it checked:
 /// GitHub refuses it when the PR's head is any other commit.
@@ -2359,7 +2330,7 @@ mod tests {
                         workdirs: Vec::new(),
                         projects,
                     },
-                    screen: None,
+                    review: None,
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
                     land_locks: LandLocks::default(),
@@ -2423,7 +2394,7 @@ mod tests {
                         workdirs: Vec::new(),
                         projects: Vec::new(),
                     },
-                    screen: None,
+                    review: None,
                     signing: self.signing(id),
                     github_api: GitHubRest::with_api_base(
                         PrTokenSource::Fixed("test-token".to_string()),
@@ -2877,7 +2848,7 @@ mod tests {
         id: &str,
         workspace_config: WorkspaceConfig,
         github_api: GitHubRest<PrTokenSource>,
-        screen: Option<Arc<super::ScreenFn>>,
+        review: Option<crate::harness::publish_review::PublishReview>,
     ) -> PrStore {
         PrStore::new(
             PrContext {
@@ -2887,7 +2858,7 @@ mod tests {
                 scratch_root: fx.scratch_root(),
                 cwd: fx.checkout.clone(),
                 workspace_config,
-                screen,
+                review,
                 signing: fx.signing(id),
                 github_api,
                 land_locks: LandLocks::default(),
@@ -2959,16 +2930,61 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn prs_only_finds_its_project_and_screens_without_a_github_issue_backend() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prs_only_finds_its_project_and_reviews_without_a_github_issue_backend() {
+        use aither_core::llm::{
+            Event, LLMRequest,
+            model::{Parameters, Profile},
+        };
+        use futures::Stream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct FixedModel {
+            reply: &'static str,
+            captured: Arc<Mutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[derive(Debug, thiserror::Error)]
+        #[error("fixed error")]
+        struct FixedErr;
+        impl aither_core::llm::Classify for FixedErr {
+            fn failure(&self) -> aither_core::llm::Failure {
+                aither_core::llm::Failure::permanent()
+            }
+        }
+        impl aither_core::LanguageModel for FixedModel {
+            type Error = FixedErr;
+            fn respond(
+                &self,
+                request: LLMRequest,
+            ) -> impl Stream<Item = Result<Event, FixedErr>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.captured.lock().unwrap().push(format!("{request:?}"));
+                let reply = self.reply.to_string();
+                futures_lite::stream::iter([Ok(Event::Text(reply))])
+            }
+            fn profile(
+                &self,
+            ) -> impl std::future::Future<Output = Result<Profile, FixedErr>> + Send {
+                std::future::ready(Ok(Profile::new("m", "t", "fast", "fast", 100_000)))
+            }
+        }
+
         let fx = Fixture::new().await;
-        let screened = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = screened.clone();
-        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, body: &str| {
-            seen.lock().unwrap().push(title.to_string());
-            seen.lock().unwrap().push(body.to_string());
-            Box::pin(async { Ok(super::ScreenVerdict::Block("internal".to_string())) })
-        });
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let review = crate::harness::publish_review::PublishReview::for_slot(
+            crate::agent::ModelSlot::new(
+                FixedModel {
+                    reply: r#"{"decision":"refuse","findings":["mentions internal workflow"]}"#,
+                    captured: captured.clone(),
+                    calls: calls.clone(),
+                },
+                Parameters::default(),
+            ),
+            crate::harness::publish_review::LocalEnvironment::empty(),
+        );
         add_github_origin(&fx);
         // A `prs-only` project as existing files carry it: no `repository`
         // key and no GitHub issue backend.
@@ -2991,7 +3007,7 @@ mod tests {
             "s1",
             config,
             PrContext::default_github_api(),
-            Some(screen),
+            Some(review),
         )
         .await;
         // Stand in for the network clone: an existing directory is adopted.
@@ -3011,45 +3027,26 @@ mod tests {
         let project = store.project_for_record(&resolved.record).unwrap();
         assert!(matches!(project.issues, ProjectIssues::May));
         assert_eq!(project.pr.screen, Some(true));
-        let verdict = store
-            .screen_outbound(&resolved.record, "a title", "- a subject\n")
+        let err = store
+            .review_outbound(crate::harness::publish_review::Publication::pull_request(
+                "a title",
+                "- a subject\n",
+                &[],
+            ))
             .await
-            .unwrap();
-        assert!(verdict.is_some(), "the screen ran and withheld the text");
-        assert_eq!(
-            *screened.lock().unwrap(),
-            vec!["a title".to_string(), "- a subject\n".to_string()]
+            .expect_err("the review ran and withheld the text");
+        assert!(
+            err.to_string().contains("mentions internal workflow"),
+            "{err}"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let reqs = captured.lock().unwrap();
+        assert!(reqs[0].contains("a title") && reqs[0].contains("- a subject"));
+        drop(reqs);
     }
 
-    #[test]
-    fn the_screen_publishes_only_on_the_explicit_pass() {
-        use super::ScreenVerdict::{Block, Pass, Unreadable};
-        assert_eq!(super::ScreenVerdict::parse("ALLOW"), Pass);
-        assert_eq!(super::ScreenVerdict::parse("  ALLOW\n"), Pass);
-        assert_eq!(
-            super::ScreenVerdict::parse("BLOCK: names an issue"),
-            Block("names an issue".to_string())
-        );
-        // Anything else refuses: empty, reasoning only, decorated tokens.
-        assert_eq!(super::ScreenVerdict::parse(""), Unreadable);
-        assert_eq!(super::ScreenVerdict::parse("  \n"), Unreadable);
-        assert_eq!(
-            super::ScreenVerdict::parse("The text mentions nothing internal."),
-            Unreadable
-        );
-        assert_eq!(super::ScreenVerdict::parse("**BLOCK**"), Unreadable);
-        assert_eq!(super::ScreenVerdict::parse("**BLOCK: a path**"), Unreadable);
-        assert_eq!(super::ScreenVerdict::parse("**ALLOW**"), Unreadable);
-        assert_eq!(super::ScreenVerdict::parse("BLOCKED"), Unreadable);
-        assert_eq!(super::ScreenVerdict::parse("Looks fine. ALLOW"), Unreadable);
-        assert!(Pass.refusal().is_none());
-        assert!(Unreadable.refusal().is_some());
-        assert!(Block(String::new()).refusal().is_some());
-    }
-
-    #[tokio::test]
-    async fn the_outbound_screen_refuses_an_empty_reply_a_decorated_block_and_no_screen() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_outbound_review_refuses_when_unwired() {
         let fx = Fixture::new().await;
         add_github_origin(&fx);
         let config_path = fx.tmp.path().join("screen-workspace.toml");
@@ -3061,44 +3058,17 @@ mod tests {
             ),
         )
         .unwrap();
-        for reply in ["", "**BLOCK**", "thinking about it", "ALLOW"] {
-            let screen: Arc<super::ScreenFn> = Arc::new(move |_: &str, _: &str| {
-                Box::pin(async move { Ok(super::ScreenVerdict::parse(reply)) })
-            });
-            let config = WorkspaceConfig::load(&config_path).unwrap();
-            let store = trusted_store(
-                &fx,
-                "s1",
-                config,
-                PrContext::default_github_api(),
-                Some(screen),
-            )
-            .await;
-            let seeded = store
-                .repos()
-                .unwrap()
-                .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
-            std::fs::create_dir_all(&seeded).unwrap();
-            let resolved = store.resolve(None).await.unwrap();
-            let verdict = store
-                .screen_outbound(&resolved.record, "a title", "- a subject\n")
-                .await
-                .unwrap();
-            assert_eq!(verdict.is_none(), reply == "ALLOW", "reply {reply:?}");
-        }
         let config = WorkspaceConfig::load(&config_path).unwrap();
         let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
-        let seeded = store
-            .repos()
-            .unwrap()
-            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
-        std::fs::create_dir_all(&seeded).unwrap();
-        let resolved = store.resolve(None).await.unwrap();
-        let verdict = store
-            .screen_outbound(&resolved.record, "a title", "- a subject\n")
+        let err = store
+            .review_outbound(crate::harness::publish_review::Publication::pull_request(
+                "a title",
+                "- a subject\n",
+                &[],
+            ))
             .await
-            .unwrap();
-        assert!(verdict.is_some(), "no wired screen refuses");
+            .expect_err("no wired review refuses");
+        assert!(matches!(err, super::PrError::Screened(_)), "{err}");
     }
 
     #[test]
@@ -3140,7 +3110,7 @@ mod tests {
                 scratch_root: fx.scratch_root(),
                 cwd: elsewhere,
                 workspace_config,
-                screen: None,
+                review: None,
                 signing: fx.signing(id),
                 github_api: PrContext::default_github_api(),
                 land_locks: LandLocks::default(),
@@ -3955,7 +3925,7 @@ mod tests {
                 scratch_root: fx.scratch_root(),
                 cwd: fx.checkout.clone(),
                 workspace_config: config,
-                screen: None,
+                review: None,
                 signing: fx.signing("s1"),
                 github_api: PrContext::default_github_api(),
                 land_locks: LandLocks::default(),
@@ -3991,5 +3961,406 @@ mod tests {
         assert!(fx.checkout.join("two.txt").exists());
         assert!(!fx.checkout.join("one.txt").exists());
         assert!(fx.db.list_repo_clones("s1").await.unwrap().is_empty());
+    }
+
+    fn mock_review(
+        reply: &str,
+        env: crate::harness::publish_review::LocalEnvironment,
+        credential: Option<(&str, &str)>,
+    ) -> (
+        crate::harness::publish_review::PublishReview,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        use aither_core::llm::{
+            Event, LLMRequest,
+            model::{Parameters, Profile},
+        };
+        use futures::Stream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct ScriptedPrModel {
+            reply: Arc<str>,
+            captured: Arc<Mutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[derive(Debug, thiserror::Error)]
+        #[error("scripted error")]
+        struct ScriptedErr;
+        impl aither_core::llm::Classify for ScriptedErr {
+            fn failure(&self) -> aither_core::llm::Failure {
+                aither_core::llm::Failure::permanent()
+            }
+        }
+        impl aither_core::LanguageModel for ScriptedPrModel {
+            type Error = ScriptedErr;
+            fn respond(
+                &self,
+                request: LLMRequest,
+            ) -> impl Stream<Item = Result<Event, ScriptedErr>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.captured.lock().unwrap().push(format!("{request:?}"));
+                let reply = self.reply.to_string();
+                futures_lite::stream::iter([Ok(Event::Text(reply))])
+            }
+            fn profile(
+                &self,
+            ) -> impl std::future::Future<Output = Result<Profile, ScriptedErr>> + Send
+            {
+                std::future::ready(Ok(Profile::new("m", "t", "fast", "fast", 100_000)))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut review = crate::harness::publish_review::PublishReview::for_slot(
+            crate::agent::ModelSlot::new(
+                ScriptedPrModel {
+                    reply: Arc::from(reply),
+                    captured: captured.clone(),
+                    calls: calls.clone(),
+                },
+                Parameters::default(),
+            ),
+            env,
+        );
+        if let Some((name, value)) = credential {
+            review = review.with_credential(name, value);
+        }
+        (review, calls, captured)
+    }
+
+    /// GitHub `pr open` reviews title, body, and commit messages before pushing,
+    /// and `pr update` reviews new commit messages and pushes only when clean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn github_pr_open_and_update_review_outbound_text() {
+        use std::sync::atomic::Ordering;
+
+        let secret = "provider-pr-secret-443322";
+        let fx = Fixture::new().await;
+        add_github_origin(&fx);
+        let config_path = fx.tmp.path().join("pr-review-workspace.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[projects]]\npath = {:?}\n\n[projects.pr]\nbackend = \"github\"\n",
+                fx.checkout
+            ),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        let env = crate::harness::publish_review::LocalEnvironment {
+            system_hosts: vec!["lexo-mbp.local".to_string()],
+            local_hosts: Vec::new(),
+            tailscale_hosts: Vec::new(),
+            home_dirs: vec![PathBuf::from("/Users/lexotest")],
+        };
+
+        // 1. `pr open` model refusal blocks before push and includes commit body.
+        let (refuse_review, refuse_calls, refuse_captured) = mock_review(
+            r#"{"decision":"refuse","findings":["remove session details from commit message"]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let open_store = trusted_store(
+            &fx,
+            "s-open",
+            config.clone(),
+            PrContext::default_github_api(),
+            Some(refuse_review),
+        )
+        .await;
+        let seeded = open_store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(seeded.parent().unwrap()).unwrap();
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                "--origin",
+                "upstream",
+                &fx.checkout.to_string_lossy(),
+                &seeded.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        identify(&seeded);
+        git(Some(&seeded), &["config", "commit.gpgsign", "false"]).unwrap();
+        git(
+            Some(&seeded),
+            &[
+                "update-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/master",
+            ],
+        )
+        .or_else(|_| {
+            git(
+                Some(&seeded),
+                &[
+                    "update-ref",
+                    "refs/remotes/upstream/HEAD",
+                    "refs/remotes/upstream/main",
+                ],
+            )
+        })
+        .unwrap();
+        std::fs::write(seeded.join("fix.txt"), "fix").unwrap();
+        git(Some(&seeded), &["add", "."]).unwrap();
+        git(
+            Some(&seeded),
+            &[
+                "commit",
+                "-m",
+                "Fix decoder bounds check",
+                "-m",
+                "In this session I traced the failure body.",
+            ],
+        )
+        .unwrap();
+
+        let err = open_store
+            .open(None, Some("Fix decoder bounds check"), None, true)
+            .await
+            .expect_err("model refusal stops github pr open");
+        assert!(
+            matches!(err, super::PrError::Screened(_))
+                && err
+                    .to_string()
+                    .contains("remove session details from commit message"),
+            "{err}"
+        );
+        assert_eq!(refuse_calls.load(Ordering::SeqCst), 1);
+        let sent = refuse_captured.lock().unwrap()[0].clone();
+        assert!(
+            sent.contains("In this session I traced the failure body."),
+            "commit body missing from fast-model review input: {sent}"
+        );
+        assert!(fx.db.get_pr("o/r", 1).await.unwrap().is_none());
+
+        // 2. `pr open` refuses home dir / host name / credential with 0 model calls.
+        let (pre_review, pre_calls, _) = mock_review(
+            r#"{"decision":"publish","findings":[]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let pre_store = trusted_store(
+            &fx,
+            "s-open",
+            config,
+            PrContext::default_github_api(),
+            Some(pre_review),
+        )
+        .await;
+        for bad_title in [
+            format!("Token {secret} leaked"),
+            "Crash on lexo-mbp.local".to_string(),
+            "Log from /Users/lexotest/may".to_string(),
+        ] {
+            let err = pre_store
+                .open(None, Some(&bad_title), None, true)
+                .await
+                .expect_err("precheck stops open without model call");
+            let msg = err.to_string();
+            assert!(matches!(err, super::PrError::Screened(_)), "{msg}");
+            assert!(!msg.contains(secret), "refusal echoed secret: {msg}");
+        }
+        assert_eq!(pre_calls.load(Ordering::SeqCst), 0);
+
+        // 3. `pr update` reviews new commits, blocks leaks/refusals, and pushes clean commits.
+        let remote = fx.tmp.path().join("update-remote.git");
+        let base_sha = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        seed_remote(&remote, &fx.checkout, &base_sha);
+        let session_root = fx.session_root("s-upd");
+        let update_clone = session_root.join("repos/r-upd");
+        std::fs::create_dir_all(update_clone.parent().unwrap()).unwrap();
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                &remote.to_string_lossy(),
+                &update_clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        fx.user.identify(&update_clone);
+        let sandbox = fx.signing_sandbox("s-upd").await;
+        std::fs::write(update_clone.join("one.txt"), "one").unwrap();
+        sandbox
+            .run(&update_clone, "git add . && git commit -m 'initial change'")
+            .await
+            .unwrap();
+        let first_sha = git(Some(&update_clone), &["rev-parse", "HEAD"]).unwrap();
+        let branch = "may/s-upd";
+        push_pinned(
+            &fx.scratch_root(),
+            &update_clone,
+            &remote.to_string_lossy(),
+            &first_sha,
+            branch,
+            BranchState::New,
+            range_of(&fx.signing("s-upd"), &base_sha),
+        )
+        .await
+        .unwrap();
+        let remote_url = remote.to_string_lossy().into_owned();
+        fx.db
+            .insert_repo_clone(
+                "s-upd",
+                &crate::db::RepoCloneRow {
+                    repo_key: "https://github.com/o/upd.git".to_string(),
+                    dir: "r-upd".to_string(),
+                    source: remote_url.clone(),
+                    local: false,
+                    base_sha: Some(base_sha.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let pr = fx
+            .db
+            .create_pr(
+                "https://github.com/o/upd.git",
+                "s-upd",
+                "Initial PR",
+                "",
+                branch,
+                &base_sha,
+                "github",
+                true,
+                None,
+                Some(12),
+            )
+            .await
+            .unwrap();
+        fx.db
+            .update_pr(pr.id, PrState::Open, Some(&first_sha), None, None)
+            .await
+            .unwrap();
+
+        let make_update_store = |review| {
+            PrStore::new(
+                PrContext {
+                    db: Some(fx.db.clone()),
+                    session_id: "s-upd".to_string(),
+                    session_root: fx.session_root("s-upd"),
+                    scratch_root: fx.scratch_root(),
+                    cwd: fx.tmp.path().to_path_buf(),
+                    workspace_config: WorkspaceConfig::default(),
+                    review: Some(review),
+                    signing: fx.signing("s-upd"),
+                    github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
+                    checkouts: None,
+                    task_events: None,
+                    ci: None,
+                    publish: None,
+                },
+                sandbox.clone(),
+            )
+        };
+
+        // Add a clean commit -> passes review and pushes to remote.git.
+        std::fs::write(update_clone.join("two.txt"), "two").unwrap();
+        sandbox
+            .run(
+                &update_clone,
+                "git add . && git commit -m 'Handle empty header' -m 'Return explicit error.'",
+            )
+            .await
+            .unwrap();
+        let second_sha = git(Some(&update_clone), &["rev-parse", "HEAD"]).unwrap();
+        let (upd_pass, upd_pass_calls, upd_pass_captured) = mock_review(
+            r#"{"decision":"publish","findings":[]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        make_update_store(upd_pass)
+            .update(pr.number, None)
+            .await
+            .expect("clean commit updates PR");
+        assert_eq!(upd_pass_calls.load(Ordering::SeqCst), 1);
+        let upd_sent = upd_pass_captured.lock().unwrap()[0].clone();
+        assert!(
+            upd_sent.contains("Handle empty header") && upd_sent.contains("Return explicit error.")
+        );
+        assert!(!upd_sent.contains("initial change"));
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .unwrap(),
+            second_sha
+        );
+
+        // Add a commit with internal narration -> model refusal prevents push.
+        std::fs::write(update_clone.join("three.txt"), "three").unwrap();
+        sandbox
+            .run(
+                &update_clone,
+                "git add . && git commit -m 'Fix after agent retry'",
+            )
+            .await
+            .unwrap();
+        let (upd_refuse, upd_refuse_calls, _) = mock_review(
+            r#"{"decision":"refuse","findings":["remove agent retry mention"]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let err = make_update_store(upd_refuse)
+            .update(pr.number, None)
+            .await
+            .expect_err("model refusal stops update push");
+        assert!(
+            err.to_string().contains("remove agent retry mention"),
+            "{err}"
+        );
+        assert_eq!(upd_refuse_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .unwrap(),
+            second_sha
+        );
+
+        // Secret / host name / home dir in commit message stops before any model call.
+        git(
+            Some(&update_clone),
+            &[
+                "commit",
+                "--amend",
+                "-m",
+                &format!("Read {secret} from /Users/lexotest on lexo-mbp.local"),
+            ],
+        )
+        .unwrap();
+        let (upd_pre, upd_pre_calls, _) = mock_review(
+            r#"{"decision":"publish","findings":[]}"#,
+            env,
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let err = make_update_store(upd_pre)
+            .update(pr.number, None)
+            .await
+            .expect_err("precheck stops update before model call");
+        assert!(matches!(err, super::PrError::Screened(_)), "{err}");
+        assert!(!err.to_string().contains(secret), "{err}");
+        assert_eq!(upd_pre_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .unwrap(),
+            second_sha
+        );
     }
 }

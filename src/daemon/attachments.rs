@@ -18,6 +18,7 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::agent::generate_session_title;
 use crate::session::AttachmentKind;
+use crate::vision_ocr::{OcrOutcome, ext_for_mime};
 
 use super::artifacts::{content_type_for_path, session_file_response};
 use super::error::{bad_request_error, internal_error, internal_error_message};
@@ -70,6 +71,7 @@ enum PromptSection {
     PastedText(String),
     OffloadedText(String),
     Attachments(Vec<PromptAttachment>),
+    RecognizedText(String),
     UnsupportedModalityAlert(Vec<OffloadedAttachment>),
 }
 
@@ -87,6 +89,7 @@ impl PromptSection {
             }
             .render(),
             Self::Attachments(attachments) => PromptAttachments { attachments }.render(),
+            Self::RecognizedText(rendered) => return Ok(rendered.clone()),
             Self::UnsupportedModalityAlert(attachments) => {
                 UnsupportedModalityReminder { attachments }.render()
             }
@@ -178,14 +181,21 @@ pub(super) async fn build_prompt_and_attachments(
             xml_items.push(PromptAttachment {
                 name: attachment.name.clone(),
                 kind: attachment.attachment_type,
-                path: source.relative_path,
+                path: source.relative_path.clone(),
             });
-            let url = match (modality, inline_images, source.local_path.as_deref()) {
-                (AttachmentModality::Vision, true, Some(path)) => {
-                    file_to_data_url(path, &media_type).await?
-                }
-                _ => source.url,
-            };
+            let (url, media_type) = prepare_multimodal_attachment(
+                state,
+                &req.session_id,
+                attachment,
+                &source,
+                AttachmentEncoding {
+                    media_type,
+                    modality: *modality,
+                    inline_images,
+                },
+                &mut prompt_sections,
+            )
+            .await?;
             attachments.push(LlmAttachment::new(url, media_type));
             continue;
         }
@@ -586,12 +596,72 @@ fn should_inline_images(
     openai_wire && (ptype != ProviderType::OpenAI || instance.is_generic_model_proxy(provider_id))
 }
 
-/// Read `path` and wrap it in a `data:` URL carrying `media_type`.
-async fn file_to_data_url(path: &Path, media_type: &mime::Mime) -> SkyResult<url::Url> {
-    let bytes = async_fs::read(path).await.map_err(internal_error)?;
+struct AttachmentEncoding {
+    media_type: mime::Mime,
+    modality: AttachmentModality,
+    inline_images: bool,
+}
+
+async fn prepare_multimodal_attachment(
+    state: &DaemonState,
+    session_id: &str,
+    attachment: &ApiAttachment,
+    source: &NativeAttachmentSource,
+    encoding: AttachmentEncoding,
+    prompt_sections: &mut Vec<PromptSection>,
+) -> SkyResult<(url::Url, mime::Mime)> {
+    let AttachmentEncoding {
+        media_type,
+        modality,
+        inline_images,
+    } = encoding;
+    if matches!(modality, AttachmentModality::Vision)
+        && let Some(path) = source.local_path.as_deref()
+        && let OcrOutcome::TextDense {
+            rendered_text,
+            image_bytes,
+            media_type: out_mime,
+        } = state
+            .vision_ocr
+            .process_file(path, media_type.as_ref(), attachment.name.as_str())
+            .await
+    {
+        prompt_sections.push(PromptSection::RecognizedText(rendered_text));
+        let out_media: mime::Mime = out_mime.parse().unwrap_or(media_type);
+        let url = if inline_images {
+            encode_data_url(&image_bytes, &out_media)?
+        } else {
+            let stem = format!("{}-ocr", sanitize_upload_stem(&attachment.name));
+            let (derived_path, _) =
+                allocate_upload_path(state, session_id, &stem, ext_for_mime(&out_mime)).await?;
+            async_fs::write(&derived_path, &image_bytes)
+                .await
+                .map_err(internal_error)?;
+            path_to_file_url(&derived_path)?
+        };
+        return Ok((url, out_media));
+    }
+
+    let url = match (modality, inline_images, source.local_path.as_deref()) {
+        (AttachmentModality::Vision, true, Some(path)) => {
+            file_to_data_url(path, &media_type).await?
+        }
+        _ => source.url.clone(),
+    };
+    Ok((url, media_type))
+}
+
+/// Encode `bytes` in a `data:` URL carrying `media_type`.
+fn encode_data_url(bytes: &[u8], media_type: &mime::Mime) -> SkyResult<url::Url> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     url::Url::parse(&format!("data:{media_type};base64,{encoded}"))
         .map_err(|error| internal_error_message(format!("invalid attachment data URL: {error}")))
+}
+
+/// Read `path` and wrap it in a `data:` URL carrying `media_type`.
+async fn file_to_data_url(path: &Path, media_type: &mime::Mime) -> SkyResult<url::Url> {
+    let bytes = async_fs::read(path).await.map_err(internal_error)?;
+    encode_data_url(&bytes, media_type)
 }
 
 // ── Prompt text rendering ────────────────────────────────────
@@ -997,5 +1067,133 @@ mod file_route_tests {
         .expect("data url");
         assert!(url.as_str().starts_with("data:image/png;base64,"), "{url}");
         drop(dir);
+    }
+
+    #[cfg(all(feature = "vision-ocr", target_os = "macos"))]
+    #[tokio::test]
+    async fn build_prompt_and_attachments_runs_ocr_on_text_dense_images_and_keeps_photos_unchanged()
+    {
+        use image::GenericImageView as _;
+
+        let mut config = MayConfig::default();
+        config.provider.insert(
+            "anthropic".to_string(),
+            ProviderInstance::new(ProviderType::Anthropic).with_api_key("test-key"),
+        );
+        config.provider.insert(
+            "custom".to_string(),
+            ProviderInstance::new(ProviderType::Custom)
+                .with_api_key("test-key")
+                .with_base_url("https://example.invalid/v1"),
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = Arc::new(
+            DaemonState::for_test(dir.path(), config)
+                .await
+                .expect("daemon state"),
+        );
+        state
+            .db()
+            .create_session("s", Some("s"), Some("anthropic::claude-sonnet-4-5"))
+            .await
+            .expect("session");
+        let files_dir = load_session_paths(&state, "s")
+            .await
+            .expect("paths")
+            .files_dir();
+        async_fs::create_dir_all(&files_dir).await.expect("mkdir");
+
+        let shot_bytes = crate::vision_ocr::tests::render_multilingual_text_png(
+            &[
+                "Cargo check failed in workspace",
+                "中文错误日志：配置无效",
+                "日本語エラー：接続タイムアウト",
+                "한국어 로그: 빌드 실패 확인",
+            ],
+            1200,
+            600,
+        );
+        let photo_bytes = crate::vision_ocr::tests::make_photo_png(1200, 800);
+        async_fs::write(files_dir.join("shot.png"), &shot_bytes)
+            .await
+            .expect("write shot");
+        async_fs::write(files_dir.join("photo.png"), &photo_bytes)
+            .await
+            .expect("write photo");
+
+        let req = ChatRequest {
+            session_id: "s".to_string(),
+            content: "Please inspect these images.".to_string(),
+            attachments: vec![
+                ApiAttachment {
+                    id: "att-shot".to_string(),
+                    name: "shot.png".to_string(),
+                    attachment_type: AttachmentKind::Image,
+                    url: session_file_url("s", "shot.png"),
+                    text_content: None,
+                },
+                ApiAttachment {
+                    id: "att-photo".to_string(),
+                    name: "photo.png".to_string(),
+                    attachment_type: AttachmentKind::Image,
+                    url: session_file_url("s", "photo.png"),
+                    text_content: None,
+                },
+            ],
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+
+        let (prompt, llm_attachments) =
+            build_prompt_and_attachments(&state, &req, "anthropic::claude-sonnet-4-5")
+                .await
+                .expect("build anthropic prompt");
+        assert_eq!(llm_attachments.len(), 2);
+        assert!(prompt.contains("<recognized_text source=\"shot.png\">"));
+        assert!(prompt.contains("中文"));
+        assert!(prompt.contains("日本語"));
+        assert!(prompt.contains("한국어"));
+
+        let shot_path = llm_attachments[0].url().to_file_path().expect("shot path");
+        assert_ne!(
+            shot_path,
+            async_fs::canonicalize(files_dir.join("shot.png"))
+                .await
+                .expect("canon")
+        );
+        let downscaled_bytes = async_fs::read(&shot_path).await.expect("read downscaled");
+        let (w, h) = image::load_from_memory(&downscaled_bytes)
+            .expect("decode downscaled")
+            .dimensions();
+        assert!(w <= crate::vision_ocr::OCR_DOWNSCALE_MAX_DIM);
+        assert!(h <= crate::vision_ocr::OCR_DOWNSCALE_MAX_DIM);
+
+        let photo_path = llm_attachments[1].url().to_file_path().expect("photo path");
+        assert_eq!(
+            photo_path,
+            async_fs::canonicalize(files_dir.join("photo.png"))
+                .await
+                .expect("canon photo")
+        );
+
+        let (inline_prompt, inline_attachments) =
+            build_prompt_and_attachments(&state, &req, "custom::gpt-4o")
+                .await
+                .expect("build inline prompt");
+        assert_eq!(inline_attachments.len(), 2);
+        assert!(inline_prompt.contains("<recognized_text source=\"shot.png\">"));
+        assert!(
+            inline_attachments[0]
+                .url()
+                .as_str()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(
+            inline_attachments[1]
+                .url()
+                .as_str()
+                .starts_with("data:image/png;base64,")
+        );
     }
 }

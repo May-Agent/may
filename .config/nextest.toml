@@ -3,3 +3,12 @@
 # the macOS runner (#812), so a test is ended after five slow periods.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Native Apple Vision / GPU OCR tests serialize so they do not contend on
+# Neural Engine / Metal initialization under parallel nextest workers.
+[test-groups.vision-ocr]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "test(vision_ocr::tests::recognizes_en_zh_ja_ko) | test(vision_ocr::tests::child_hooks_forward_ocr) | test(vision_ocr::tests::augment_tool_outcome_handles) | test(after_tool_attaches_ocr) | test(build_prompt_and_attachments_runs_ocr)"
+test-group = "vision-ocr"

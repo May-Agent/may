@@ -204,6 +204,9 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
         valve: Arc::new(CompactSignal::default()),
         compaction: Arc::new(AtomicBool::new(false)),
         loops: crate::agent::loop_watch::LoopWatch::new(crate::agent::LoopLimits::default()),
+        vision_ocr: crate::vision_ocr::VisionOcr::new(),
+        call_images: crate::ipc::CallImageStore::default(),
+        outputs_dir: dir.path().to_path_buf(),
     };
     let mut agent = Agent::builder(model(&base_url, redactor))
         .tool(LeakTool)
@@ -308,6 +311,9 @@ async fn a_broken_secrets_index_ends_the_run_before_the_tool_result_is_shown() {
         valve: Arc::new(CompactSignal::default()),
         compaction: Arc::new(AtomicBool::new(false)),
         loops: crate::agent::loop_watch::LoopWatch::new(crate::agent::LoopLimits::default()),
+        vision_ocr: crate::vision_ocr::VisionOcr::new(),
+        call_images: crate::ipc::CallImageStore::default(),
+        outputs_dir: session.path().to_path_buf(),
     };
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
     let mut agent = Agent::builder(model(&base_url, redactor))
