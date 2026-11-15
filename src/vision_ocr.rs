@@ -29,10 +29,9 @@ use crate::ipc::CallImageStore;
 pub const OCR_DOWNSCALE_MAX_DIM: u32 = 768;
 
 /// Minimum confidence to keep a recognized line when judging text density.
-/// Apple Vision assigns valid secondary CJK script lines confidences around `0.3`
-/// or lower when multiple CJK tags share `recognitionLanguages`.
+/// `0.3` drops low-confidence noise on photos while keeping real text lines.
 #[cfg(feature = "vision-ocr")]
-const MIN_LINE_CONFIDENCE: f32 = 0.1;
+const MIN_LINE_CONFIDENCE: f32 = 0.3;
 
 /// Summary metrics extracted from `RecognizeText` output used to classify text density.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,25 +217,9 @@ impl VisionOcr {
             return Err("native text capabilities empty".to_owned());
         }
         let image = VisionImage::from_encoded(bytes.to_vec().into());
-        // Apple's `capabilities().text.native` intersects `Fast` and `Accurate`,
-        // omitting CJK scripts only present in `Accurate`; passing all 33 languages
-        // drops CJK lines, and placing Chinese before Japanese causes Apple Vision
-        // to down-rank or drop mixed Kanji+Kana lines behind Chinese tags.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let request = RecognizeText::new()
-            .level(RecognitionLevel::Accurate)
-            .languages(
-                [
-                    "en-Latn-US",
-                    "ja-Jpan-JP",
-                    "zh-Hans",
-                    "zh-Hant",
-                    "ko-Kore-KR",
-                ]
-                .into_iter()
-                .filter_map(|tag| tag.parse().ok()),
-            );
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        // Leave `languages` empty so Apple Vision sets `automaticallyDetectsLanguage = true`;
+        // passing explicit CJK tags sets `automaticallyDetectsLanguage = false` and biases
+        // earlier scripts to corrupt or drop later CJK scripts on mixed-language screens.
         let request = RecognizeText::new().level(RecognitionLevel::Accurate);
         let result = futures_lite::future::block_on(vision.perform(&image, &request));
         drop(guard);
