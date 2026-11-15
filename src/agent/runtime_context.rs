@@ -147,6 +147,8 @@ pub struct RuntimeSystemContext {
     /// Instruction blocks fixed when the agent is built.
     instructions: BTreeMap<InstructionSlot, String>,
     profile_memories: Option<ExternalContent>,
+    /// Whether `MEMORY.md` and extracted profile memories are enabled for this session.
+    memory_enabled: bool,
     workdirs: Option<ExternalContent>,
     memory_path: PathBuf,
     /// Snapshot of every file under the memories directory; `None` until the
@@ -167,6 +169,7 @@ impl RuntimeSystemContext {
         Self {
             instructions: BTreeMap::new(),
             profile_memories: None,
+            memory_enabled: true,
             workdirs: None,
             memory_path,
             memories_snapshot: None,
@@ -245,8 +248,24 @@ impl RuntimeSystemContext {
     }
 
     pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
-        self.profile_memories = memories;
+        self.profile_memories = self.memory_enabled.then_some(memories).flatten();
         self
+    }
+
+    pub(crate) const fn with_memory_enabled(mut self, enabled: bool) -> Self {
+        self.memory_enabled = enabled;
+        self
+    }
+
+    /// Enables or disables memory blocks (`MEMORY.md` and profile memories);
+    /// the next [`reconcile`](Self::reconcile) reconciles the live blocks.
+    pub(crate) fn set_memory_enabled(&mut self, enabled: bool) {
+        self.memory_enabled = enabled;
+        if !enabled {
+            self.profile_memories = None;
+            self.last_memory_content.clear();
+            self.memories_snapshot = None;
+        }
     }
 
     pub(crate) fn with_workdirs(mut self, workdirs: Option<ExternalContent>) -> Self {
@@ -280,8 +299,9 @@ impl RuntimeSystemContext {
         &self.agents_root_source
     }
 
-    fn memory_block(&self) -> ExternalContent {
-        ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str())
+    fn memory_block(&self) -> Option<ExternalContent> {
+        self.memory_enabled
+            .then(|| ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str()))
     }
 
     /// Brings the blocks of `context` to this state. A context no request
@@ -308,10 +328,15 @@ impl RuntimeSystemContext {
             });
         }
         context.update_live(&MEMORY_CONTENT, |update| {
-            update.external(&tag::MEMORY, Some(self.memory_block()));
+            update.external(&tag::MEMORY, self.memory_block());
         });
         context.update_live(&PROFILE_MEMORIES_CONTENT, |update| {
-            update.external(&tag::PROFILE_MEMORIES, self.profile_memories.clone());
+            update.external(
+                &tag::PROFILE_MEMORIES,
+                self.memory_enabled
+                    .then(|| self.profile_memories.clone())
+                    .flatten(),
+            );
         });
         context.update_live(&AGENTS_MD_CONTENT, |update| {
             update
@@ -372,6 +397,11 @@ impl RuntimeSystemContext {
     /// Re-read the memory index and watch the whole memories directory,
     /// alerting on changes to files this session has actually seen.
     pub(crate) async fn sync_memory_content(&mut self, context: &mut aither_agent::Context) {
+        if !self.memory_enabled {
+            self.last_memory_content.clear();
+            self.memories_snapshot = None;
+            return;
+        }
         match async_fs::read_to_string(&self.memory_path).await {
             Ok(index_content) => self.last_memory_content = index_content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

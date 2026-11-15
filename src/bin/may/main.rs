@@ -1867,6 +1867,35 @@ where
                             _ => app.chat.push_notice("No session is attached"),
                         }
                     }
+                    Some(SendAction::MemoryOff) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                if app.session_runtime.memory_off {
+                                    app.chat.push_notice(
+                                        "Memory is already off for the rest of this session",
+                                    );
+                                } else {
+                                    let put = client
+                                        .patch::<_, serde_json::Value>(
+                                            &format!("/api/sessions/{session_id}"),
+                                            &serde_json::json!({ "memoryOff": true }),
+                                        )
+                                        .await;
+                                    match put {
+                                        Ok(_) => app.chat.push_notice(
+                                            "Memory off for the rest of this session: it will neither read nor save memories",
+                                        ),
+                                        Err(error) => app.chat.push_error(&error.to_string()),
+                                    }
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
                     Some(action @ (SendAction::Sleep | SendAction::Wake)) => {
                         let session_id = app
                             .session_manager

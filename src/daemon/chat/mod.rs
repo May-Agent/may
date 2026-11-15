@@ -2752,7 +2752,7 @@ fn run_agent_loop_attempts<'a>(
             }
 
             // Post-completion hooks
-            schedule_profile_memory_processing(state, profile_id.as_deref()).await;
+            schedule_profile_memory_processing(state, &session_id, profile_id.as_deref()).await;
             title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
             enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
             // The turn's messages are in the search outbox now.
@@ -3085,10 +3085,26 @@ impl UnannouncedEnd {
     }
 }
 
-async fn schedule_profile_memory_processing(state: &Arc<DaemonState>, profile_id: Option<&str>) {
+pub(super) async fn schedule_profile_memory_processing(
+    state: &Arc<DaemonState>,
+    session_id: &SessionId,
+    profile_id: Option<&str>,
+) {
     let Some(profile_id) = profile_id else {
         return;
     };
+    let db = state.db();
+    if db
+        .session_memory_off(session_id.as_str())
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if matches!(db.get_session(session_id.as_str()).await, Ok(Some(session)) if session.non_interactive)
+    {
+        return;
+    }
     let Some(processor) = state.memory_processor.as_ref() else {
         return;
     };
@@ -3249,7 +3265,7 @@ impl ConsumedAlerts {
     }
 }
 
-struct SessionContext {
+pub(super) struct SessionContext {
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
     /// The pending alerts preparing the turn consumed.
@@ -3279,7 +3295,8 @@ struct SessionContext {
     uncheckpointed_input: Vec<LlmMessage>,
     hidden_context_xml: Option<String>,
     profile_persona: Option<String>,
-    profile_memories: Option<crate::memory::ProfileMemories>,
+    pub(super) profile_memories: Option<crate::memory::ProfileMemories>,
+    pub(super) memory_off: bool,
     profile_model: Option<crate::db::entity::profiles::Model>,
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_id: Option<String>,
@@ -3317,7 +3334,7 @@ struct ToolBrokers {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum UiChatPreparationError {
+pub(super) enum UiChatPreparationError {
     /// The idle agent whose background commands asked for a turn is gone:
     /// a turn of the session took it first.
     #[error("the session's idle agent was taken by another turn")]
@@ -3560,7 +3577,7 @@ impl From<skyzen::Error> for ChatCollectError {
 
 // ── Agent preparation: decomposed steps ───────────────────
 
-async fn resolve_session_context(
+pub(super) async fn resolve_session_context(
     state: &Arc<DaemonState>,
     req: &ChatRequest,
     fence: &RunFence,
@@ -3627,7 +3644,16 @@ async fn resolve_session_context(
         None => None,
     };
 
-    let profile_memories = if let Some(ref profile) = profile_model {
+    let runtime = db
+        .get_session_runtime(session_id.as_str())
+        .await
+        .map_err(UiChatPreparationError::LoadRuntime)?
+        .unwrap_or_default();
+    let memory_off = runtime.memory_off || session.non_interactive;
+
+    let profile_memories = if memory_off {
+        None
+    } else if let Some(ref profile) = profile_model {
         let memories = crate::memory::ProfileMemories::load(&db, &profile.id)
             .await
             .map_err(UiChatPreparationError::LoadProfileMemories)?;
@@ -3639,11 +3665,6 @@ async fn resolve_session_context(
     } else {
         None
     };
-    let runtime = db
-        .get_session_runtime(session_id.as_str())
-        .await
-        .map_err(UiChatPreparationError::LoadRuntime)?
-        .unwrap_or_default();
 
     let mut transcript = Vec::<(i64, LlmMessage)>::new();
     for entry in db
@@ -3882,6 +3903,7 @@ async fn resolve_session_context(
             .then(|| hidden_context_parts.join("\n\n")),
         profile_persona,
         profile_memories,
+        memory_off,
         profile_model,
         profile_environment,
         profile_id: session.profile_id,
@@ -4270,6 +4292,7 @@ fn prepare_agent_for_request<'a>(
                         profile_id: ctx.profile_id.as_deref(),
                         profile_persona: ctx.profile_persona.as_deref(),
                         profile_memories: ctx.profile_memories.as_ref(),
+                        memory_off: ctx.memory_off,
                         plan_state: ctx.plan_state,
                         location: location.as_ref(),
                         cwd: &ctx.cwd,
@@ -4385,6 +4408,7 @@ fn build_session_agent<'a>(
                 agent_messaging: Some(agent_messaging(state)),
                 profile_persona: ctx.profile_persona.clone(),
                 profile_memories: ctx.profile_memories.clone(),
+                memory_off: ctx.memory_off,
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),

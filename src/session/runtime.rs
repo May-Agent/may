@@ -365,6 +365,9 @@ pub struct SessionRuntimeSummary {
     /// Yolo switch: every approval request of the session is granted at once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub yolo: bool,
+    /// Memory switch: once off, the session neither reads nor contributes memories.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub memory_off: bool,
     /// Interactive-resource sub-state (browser, terminal).
     #[serde(default, skip_serializing_if = "SessionInteractionState::is_empty")]
     pub interactions: SessionInteractionState,
@@ -401,6 +404,7 @@ impl Default for SessionRuntimeSummary {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
             yolo: false,
+            memory_off: false,
             interactions: SessionInteractionState::default(),
             queued_count: 0,
             pending_immediate: None,

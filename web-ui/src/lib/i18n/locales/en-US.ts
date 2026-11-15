@@ -651,6 +651,12 @@ export const enUS = {
     description: 'Grant every approval request in this chat without asking',
     failed: 'Couldn’t change yolo: {message}',
   },
+  memoryToggle: {
+    label: 'Memory',
+    description: 'Stop reading and saving memories for the rest of this chat',
+    offDescription: 'Memory is off for the rest of this chat',
+    failed: 'Couldn’t turn memory off: {message}',
+  },
   plan: {
     approved: 'Approved',
     awaiting: 'Waiting for your approval',

@@ -420,6 +420,8 @@ mod tests {
                 "CREATE TABLE repo_usage (worktree varchar(255) NOT NULL PRIMARY KEY, last_used_at bigint NOT NULL DEFAULT 0, use_count bigint NOT NULL, owner_repo varchar(255), legacy_note text, legacy_flag boolean NOT NULL DEFAULT 0)",
                 "DROP TABLE session_yolo",
                 "CREATE TABLE session_yolo (session_id varchar NOT NULL PRIMARY KEY, enabled boolean NOT NULL, updated_at varchar NOT NULL)",
+                "DROP TABLE session_memory",
+                "CREATE TABLE session_memory (session_id varchar NOT NULL PRIMARY KEY, disabled boolean NOT NULL, updated_at varchar NOT NULL)",
                 "CREATE TABLE unrelated_leftover (id integer NOT NULL, note text NOT NULL)",
             ],
         )

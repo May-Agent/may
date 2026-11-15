@@ -259,6 +259,8 @@ pub struct MayAgentConfig {
     pub profile_persona: Option<String>,
     /// Optional profile memories (preference + recency) injected as read-only context.
     pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Whether reading and saving memories are disabled for the rest of this session.
+    pub memory_off: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
     /// Global network restriction policy.
@@ -349,6 +351,8 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_persona: Option<String>,
     /// Optional profile memories injected as read-only context.
     pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Whether reading and saving memories are disabled for the rest of this session.
+    pub memory_off: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
     /// Resolved location info, when the profile is location-aware.
@@ -598,7 +602,7 @@ impl MayAgent {
             &grants,
             &workspace,
             &config.sandbox_dir,
-            &memories_dir,
+            (!config.memory_off).then_some(memories_dir.as_path()),
             &skills_dir,
         );
 
@@ -746,14 +750,18 @@ impl MayAgent {
         // Read global memory from the memories directory sessions edit via
         // the `~/.may/memories` link/mount.
         let memory_file = crate::session::MayHomePaths::new(config.may_dir.clone()).memory_file();
-        let memory_content = async_fs::read_to_string(&memory_file)
-            .await
-            .unwrap_or_else(|error| {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::error!(error = %error, "failed to load global memory file");
-                }
-                String::new()
-            });
+        let memory_content = if config.memory_off {
+            String::new()
+        } else {
+            async_fs::read_to_string(&memory_file)
+                .await
+                .unwrap_or_else(|error| {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::error!(error = %error, "failed to load global memory file");
+                    }
+                    String::new()
+                })
+        };
         let harness = build_harness();
         let evidence = build_evidence();
         let environment_block = build_environment(
@@ -785,6 +793,7 @@ impl MayAgent {
             time.clone(),
         ];
         let mut runtime_system_context = RuntimeSystemContext::new(memory_file, memory_content)
+            .with_memory_enabled(!config.memory_off)
             .with_instruction(tag::IDENTITY, build_identity())
             .with_instruction(tag::ENVIRONMENT, environment_block)
             .with_instruction(tag::TERMINAL, terminal)
@@ -1278,6 +1287,7 @@ impl MayAgent {
             agent_messaging,
             profile_persona,
             profile_memories,
+            memory_off,
             plan_state,
             location,
             task_broker,
@@ -1385,6 +1395,7 @@ impl MayAgent {
             environment,
             profile_persona,
             profile_memories,
+            memory_off,
             plan_state,
             network_policy: may_config
                 .preferences
@@ -2058,7 +2069,7 @@ impl MayAgent {
             &self.grants,
             &workspace,
             &self.sandbox_dir,
-            &self.memories_dir,
+            (!input.memory_off).then_some(self.memories_dir.as_path()),
             &self.skills_dir,
         );
         if !matches!(self.environment, AgentEnvironment::Container { .. }) {
@@ -2103,7 +2114,13 @@ impl MayAgent {
             input.profile_persona.map(build_profile_persona),
         );
         self.runtime_system_context
-            .set_profile_memories(input.profile_memories.and_then(build_profile_memories));
+            .set_memory_enabled(!input.memory_off);
+        let profile_memories = (!input.memory_off)
+            .then_some(input.profile_memories)
+            .flatten()
+            .and_then(build_profile_memories);
+        self.runtime_system_context
+            .set_profile_memories(profile_memories);
         self.runtime_system_context
             .set_instruction_opt(tag::PLAN_MODE, build_plan_mode_context(input.plan_state));
 
@@ -2238,6 +2255,7 @@ pub struct TurnSyncInput<'a> {
     pub profile_id: Option<&'a str>,
     pub profile_persona: Option<&'a str>,
     pub profile_memories: Option<&'a crate::memory::ProfileMemories>,
+    pub memory_off: bool,
     pub plan_state: SessionPlanState,
     pub location: Option<&'a crate::location::LocationInfo>,
     pub cwd: &'a Path,
@@ -2256,7 +2274,7 @@ fn sync_grants_with_workspace(
     grants: &Grants,
     workspace: &MayWorkspace,
     sandbox_dir: &Path,
-    memories_dir: &Path,
+    memories_dir: Option<&Path>,
     skills_dir: &Path,
 ) {
     let mut desired_writable: std::collections::HashSet<PathBuf> = workspace
@@ -2265,7 +2283,9 @@ fn sync_grants_with_workspace(
         .filter(|path| path.as_path() != sandbox_dir)
         .cloned()
         .collect();
-    desired_writable.insert(memories_dir.to_path_buf());
+    if let Some(memories_dir) = memories_dir {
+        desired_writable.insert(memories_dir.to_path_buf());
+    }
 
     let mut desired_readable: std::collections::HashSet<PathBuf> = workspace
         .readable_dirs()
@@ -2307,12 +2327,14 @@ fn apply_runtime_context(
             .with_instruction(tag::PROFILE_PERSONA, build_profile_persona(persona));
     }
 
-    runtime_system_context = runtime_system_context.with_profile_memories(
-        config
-            .profile_memories
-            .as_ref()
-            .and_then(build_profile_memories),
-    );
+    if !config.memory_off {
+        runtime_system_context = runtime_system_context.with_profile_memories(
+            config
+                .profile_memories
+                .as_ref()
+                .and_then(build_profile_memories),
+        );
+    }
 
     if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
         runtime_system_context = runtime_system_context.with_instruction(tag::PLAN_MODE, plan_mode);

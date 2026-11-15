@@ -3877,6 +3877,7 @@ impl App {
             SlashCommand::Compact => Some(SendAction::Compact(None)),
             SlashCommand::Recap => Some(SendAction::Recap),
             SlashCommand::Yolo => Some(SendAction::ToggleYolo),
+            SlashCommand::MemoryOff => Some(SendAction::MemoryOff),
             SlashCommand::Sleep => Some(SendAction::Sleep),
             SlashCommand::SleepOff => Some(SendAction::Wake),
             SlashCommand::Context => Some(SendAction::ContextReport),
@@ -5043,6 +5044,8 @@ pub enum SendAction {
     Recap,
     /// Flip the session's yolo switch.
     ToggleYolo,
+    /// Turn memory off for the rest of this session (`/memory off`).
+    MemoryOff,
     /// Mark the user asleep for every session; this session's agent says
     /// good night.
     Sleep,

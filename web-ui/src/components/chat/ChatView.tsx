@@ -17,6 +17,7 @@ import { BrowserTakeoverBanner } from './BrowserTakeoverBanner';
 import { CloudSessionBanner } from './CloudSessionBanner';
 import { PlanBanner } from './PlanBanner';
 import { WarningMessage } from './WarningMessage';
+import { MemoryToggle } from './MemoryToggle';
 import { YoloToggle } from './YoloToggle';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
@@ -253,7 +254,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         planState={active.runtime?.planState ?? 'disabled'}
       />
       {isDraftSessionId(active.id) ? null : (
-        <YoloToggle sessionId={active.id} yolo={active.runtime?.yolo ?? false} />
+        <div className="flex items-center justify-end gap-4 px-4 py-1 sm:px-6">
+          <MemoryToggle
+            sessionId={active.id}
+            memoryOff={active.runtime?.memoryOff ?? false}
+          />
+          <YoloToggle sessionId={active.id} yolo={active.runtime?.yolo ?? false} />
+        </div>
       )}
       <BrowserTakeoverBanner session={active} />
       <CloudSessionBanner sessionId={active.id} creating={creatingCloud} />
