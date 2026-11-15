@@ -265,6 +265,7 @@ export interface SessionRuntimeSummary {
   state?: SessionRuntimeState;
   planState?: SessionPlanState;
   yolo?: boolean;
+  memoryOff?: boolean;
   interactions?: SessionInteractionState;
   queuedCount?: number;
   pendingImmediate?: PendingUserMessage | null;

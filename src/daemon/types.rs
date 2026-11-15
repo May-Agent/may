@@ -1113,6 +1113,9 @@ pub struct SessionPatch {
     pub(crate) folder_id: Option<NullableStringPatch>,
     #[serde(default)]
     pub(crate) yolo: Option<bool>,
+    /// One-way memory disable toggle (`true` disables memory for the rest of the session).
+    #[serde(default)]
+    pub(crate) memory_off: Option<bool>,
     #[serde(default)]
     pub(crate) plan_state: Option<SessionPlanState>,
 }
@@ -1363,6 +1366,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
             state: summary.state,
             plan_state: summary.plan_state,
             yolo: summary.yolo,
+            memory_off: summary.memory_off,
             interactions: SessionInteractionResponse {
                 browser: BrowserInteractionResponse {
                     takeover_active: summary.interactions.browser.takeover_active,
@@ -1460,6 +1464,7 @@ pub struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
     pub(crate) plan_state: SessionPlanState,
     pub(crate) yolo: bool,
+    pub(crate) memory_off: bool,
     pub(crate) interactions: SessionInteractionResponse,
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1482,6 +1487,7 @@ impl Default for SessionRuntimeResponse {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
             yolo: false,
+            memory_off: false,
             interactions: SessionInteractionResponse::default(),
             queued_count: 0,
             pending_immediate: None,

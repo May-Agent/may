@@ -368,6 +368,9 @@ pub struct SessionRuntimeSnapshot {
     /// Yolo switch: every approval request is granted at once.
     #[serde(default)]
     pub yolo: bool,
+    /// Memory switch: once off, the session neither reads nor contributes memories.
+    #[serde(default)]
+    pub memory_off: bool,
     /// Interactive-resource sub-state (browser, terminal).
     pub interactions: SessionInteractionSnapshot,
     /// Messages waiting to be processed.
@@ -399,6 +402,7 @@ impl Default for SessionRuntimeSnapshot {
             state: crate::session::SessionRuntimeState::Idle,
             plan_state: crate::session::SessionPlanState::Disabled,
             yolo: false,
+            memory_off: false,
             interactions: SessionInteractionSnapshot::default(),
             queued_count: 0,
             pending_immediate: None,
@@ -531,6 +535,9 @@ pub struct UpdateSessionRequest {
     /// One-shot/non-interactive flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_interactive: Option<bool>,
+    /// Turn memory off for the rest of the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_off: Option<bool>,
 }
 
 /// `POST /api/sessions/{id}/rewind` request body.

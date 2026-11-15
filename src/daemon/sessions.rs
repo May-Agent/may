@@ -941,6 +941,11 @@ pub(super) async fn patch_session(
     if let Some(super::types::NullableStringPatch::Set(spec)) = req.repo.as_ref() {
         resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?;
     }
+    if req.memory_off == Some(false) {
+        return Err(bad_request_error(
+            "memory stays off for the rest of the session once turned off",
+        ));
+    }
     let next_pinned = req.pinned.unwrap_or(session.pinned);
     let next_archived = req.archived.unwrap_or(session.archived);
     let next_folder = match req.folder_id.as_ref() {
@@ -1070,6 +1075,13 @@ pub(super) async fn patch_session(
         state
             .runtime_service
             .set_yolo(&id, yolo)
+            .await
+            .map_err(internal_error)?;
+    }
+    if req.memory_off == Some(true) {
+        state
+            .runtime_service
+            .set_memory_off(&id)
             .await
             .map_err(internal_error)?;
     }

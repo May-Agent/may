@@ -26,6 +26,7 @@ pub enum SlashCommand {
     Jobs,
     Questions,
     Yolo,
+    MemoryOff,
     Sleep,
     SleepOff,
     Btw,
@@ -60,7 +61,7 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Help,
         Self::Session,
         Self::Archive,
@@ -78,6 +79,7 @@ impl SlashCommand {
         Self::Jobs,
         Self::Questions,
         Self::Yolo,
+        Self::MemoryOff,
         Self::Sleep,
         Self::SleepOff,
         Self::Btw,
@@ -135,6 +137,11 @@ impl SlashCommand {
                 "/yolo",
                 "",
                 "Toggle granting every approval request in this session",
+            ),
+            Self::MemoryOff => (
+                "/memory off",
+                "",
+                "Turn memory off for the rest of this session (no reading or saving)",
             ),
             Self::Sleep => (
                 "/sleep",

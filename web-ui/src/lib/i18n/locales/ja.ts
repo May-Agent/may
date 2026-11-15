@@ -653,6 +653,12 @@ export const ja: Messages = {
     description: 'このチャットの承認リクエストをすべて確認なしで許可する',
     failed: 'Yoloを変更できませんでした: {message}',
   },
+  memoryToggle: {
+    label: 'メモリ',
+    description: 'このチャットの残りでメモリの読み書きを停止する',
+    offDescription: 'このチャットのメモリは無効です',
+    failed: 'メモリをオフにできませんでした: {message}',
+  },
   plan: {
     approved: '承認済み',
     awaiting: '承認待ち',

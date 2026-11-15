@@ -391,6 +391,19 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Persist turning off memory for the rest of a session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn set_memory_off(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.set_session_memory_off(session_id).await?;
+        self.publish_runtime_change(session_id);
+        Ok(summary)
+    }
+
     /// Append a pending user message to a session's queue.
     ///
     /// # Errors

@@ -284,3 +284,96 @@ async fn a_skill_change_mid_session_is_one_diff_then_the_clean_version() {
     );
     assert_eq!(diff_alerts(after, "skills_diff"), Vec::<&String>::new());
 }
+
+#[tokio::test]
+async fn memory_off_changes_prefix_only_on_reassembly() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start(&config)).await;
+    std::fs::write(memory_file(&session), "global memory note").expect("write MEMORY.md");
+    let memories = crate::memory::ProfileMemories {
+        preference: Some("prefers concise answers".to_string()),
+        recency: Some("testing memory off".to_string()),
+    };
+    session.parts.profile_memories = Some(memories.clone());
+    Box::pin(session.rebuild(&config)).await;
+
+    turn(&mut session).await;
+
+    // Turning memory off mid-session syncs into the live context while keeping
+    // the warm cached system prefix byte-identical until reassembly.
+    let model = format!(
+        "{}::{SESSION_MODEL}",
+        super::idle_compaction_tests::SESSION_PROVIDER
+    );
+    let cwd = session.temp.path().join("cwd");
+    session
+        .agent
+        .sync_for_turn(crate::agent::TurnSyncInput {
+            may_config: &config,
+            pushed_providers: &crate::cloud::access::PushedProviders::default(),
+            current_model: &model,
+            reasoning_effort: None,
+            model_context_window: None,
+            provider_attempt: 0,
+            profile_id: None,
+            profile_persona: None,
+            profile_memories: None,
+            memory_off: true,
+            plan_state: crate::session::SessionPlanState::default(),
+            location: None,
+            cwd: &cwd,
+            ssh_servers: &[],
+        })
+        .await
+        .expect("sync_for_turn");
+    turn(&mut session).await;
+
+    compact(&mut session).await;
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, _] = requests.as_slice() else {
+        panic!("expected three turns before/after compaction: {requests:?}");
+    };
+    let after = requests.last().expect("turn after compaction");
+
+    assert!(first[0].contains("global memory note"), "{}", first[0]);
+    assert!(first[0].contains("prefers concise answers"), "{}", first[0]);
+    assert_eq!(
+        second[0], first[0],
+        "warm cached system prefix stays byte-identical until reassembly"
+    );
+    assert!(!after[0].contains("global memory note"), "{}", after[0]);
+    assert!(
+        !after[0].contains("prefers concise answers"),
+        "{}",
+        after[0]
+    );
+    assert!(!after[0].contains("testing memory off"), "{}", after[0]);
+}
+
+#[tokio::test]
+async fn session_started_with_memory_off_never_injects_memories() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start(&config)).await;
+    std::fs::write(memory_file(&session), "global memory note").expect("write MEMORY.md");
+    session.parts.profile_memories = Some(crate::memory::ProfileMemories {
+        preference: Some("prefers concise answers".to_string()),
+        recency: None,
+    });
+    session.parts.memory_off = true;
+    Box::pin(session.rebuild(&config)).await;
+
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let first = requests.first().expect("first request");
+    assert!(!first[0].contains("global memory note"), "{}", first[0]);
+    assert!(
+        !first[0].contains("prefers concise answers"),
+        "{}",
+        first[0]
+    );
+}

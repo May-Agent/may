@@ -28,4 +28,9 @@ export function putSessionPlanState(
 export function putSessionYolo(sessionId: string, yolo: boolean): Promise<ApiSession> {
   return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { yolo });
 }
+export function putSessionMemoryOff(sessionId: string): Promise<ApiSession> {
+  return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, {
+    memoryOff: true,
+  });
+}
 
