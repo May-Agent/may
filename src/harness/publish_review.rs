@@ -766,12 +766,12 @@ fn contains_home_dir(text: &str, home: &Path) -> bool {
         return false;
     }
     #[cfg(any(target_os = "macos", windows))]
-    let (haystack, needle) = (
+    let (haystack, needle): (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>) = (
         std::borrow::Cow::Owned(text.to_ascii_lowercase()),
         std::borrow::Cow::Owned(home.to_ascii_lowercase()),
     );
     #[cfg(not(any(target_os = "macos", windows)))]
-    let (haystack, needle) = (
+    let (haystack, needle): (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>) = (
         std::borrow::Cow::Borrowed(text),
         std::borrow::Cow::Borrowed(home),
     );
