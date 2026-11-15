@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aither_agent::{
     Agent, AgentBuilder, AgentError, AgentPath, AnyClock, CompactResult, PromptCache,
@@ -306,6 +306,8 @@ pub struct MayAgentConfig {
     pub limits: super::LiveLimits,
     /// The repo-search handle and PR land locks the daemon shares.
     pub services: crate::terminal_commands::SharedServices,
+    /// Daemon-wide sleep state observed by the session's sleep context source.
+    pub sleep: Option<Arc<crate::sleep::SleepState>>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -389,6 +391,8 @@ pub struct MayAgentSessionInput<'a> {
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
+    /// Daemon-wide sleep state observed before each request.
+    pub sleep: Option<Arc<crate::sleep::SleepState>>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, MayHooks, ProviderLlm>;
@@ -410,6 +414,10 @@ pub struct MayAgent {
     /// Set when the user stopped the run: facts wait for the user's next
     /// input instead of waking the session.
     interrupted: bool,
+    /// Shared sleep state, when hosted by a daemon.
+    sleep: Option<Arc<crate::sleep::SleepState>>,
+    /// Sleep epoch last observed by the model in this context window (`0` = awake).
+    sleep_seen_epoch: Arc<AtomicU64>,
     /// The live grants of the session's sandbox: an approved workspace
     /// request reaches the shell through them.
     grants: Grants,
@@ -1157,6 +1165,14 @@ impl MayAgent {
                 ),
             ));
         }
+        let sleep_seen_epoch = Arc::new(AtomicU64::new(0));
+        if let Some(sleep) = config.sleep.clone() {
+            builder = builder.context_source(crate::sleep::SleepConditions::new(
+                sleep,
+                config.session_id.as_str(),
+                sleep_seen_epoch.clone(),
+            ));
+        }
         builder = builder.context_source(document);
         if let Some(compaction) = config.compaction_llm.clone() {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);
@@ -1186,6 +1202,8 @@ impl MayAgent {
             job_facts_tx,
             job_facts,
             interrupted: false,
+            sleep: config.sleep,
+            sleep_seen_epoch,
             shell,
             grants,
             permissions,
@@ -1280,6 +1298,7 @@ impl MayAgent {
             limits,
             services,
             model_context_window,
+            sleep,
         } = input;
         let providers = super::Providers::new(may_config, &pushed_providers);
         let selector = super::provider::parse_model_selector(model)?;
@@ -1391,6 +1410,7 @@ impl MayAgent {
             rules_import,
             limits,
             services,
+            sleep,
         })
     }
 
@@ -1456,9 +1476,14 @@ impl MayAgent {
                 .context_mut()
                 .push_block_alert(&aither_agent::Block::new("system-reminder", alert));
         }
+        let decision =
+            crate::agent::wake::decide(crate::agent::wake::WakeCause::BackgroundCompletion {
+                needs_model: report.needs_model,
+                interrupted: self.interrupted,
+            });
         BackgroundWake {
             pending: report.pending,
-            starts_run: report.needs_model && !self.interrupted,
+            starts_run: decision == crate::agent::wake::WakeDecision::Start,
         }
     }
 
@@ -1905,9 +1930,20 @@ impl MayAgent {
         self.inner.clear_history();
     }
 
-    /// Tells the agent the user's sleep state changed; one alert per change.
-    pub(crate) fn tell_sleep_notice(&mut self, notice: crate::sleep::SleepNotice) {
-        RuntimeSystemContext::push_sleep_notice(self.inner.context_mut(), notice);
+    /// Synchronizes the sleep source's seen state after restoring a warm
+    /// checkpoint so an already-delivered sleep alert is not repeated until
+    /// sleep ends or cold reassembly clears it.
+    pub(crate) async fn mark_restored_sleep_seen(&self) {
+        let Some(sleep) = &self.sleep else {
+            return;
+        };
+        if sleep.is_told(self.session_id.as_str()).await {
+            let reading = sleep.read().await;
+            if reading.asleep {
+                self.sleep_seen_epoch
+                    .store(reading.epoch.max(1), Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {

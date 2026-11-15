@@ -277,9 +277,12 @@ impl AgentMessaging {
         if recipient.session_id == sender_session_id {
             return Err(AgentLinkError::AskSelf);
         }
-        if self
+        let recipient_cold = self
             .is_cold(&recipient.session_id, recipient.activity)
-            .await?
+            .await?;
+        if crate::agent::wake::decide(crate::agent::wake::WakeCause::AgentMessage {
+            recipient_cold,
+        }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
         {
             return Err(AgentLinkError::ColdBtwRecipient(recipient.name.clone()));
         }
@@ -345,7 +348,11 @@ impl AgentMessaging {
         } else {
             Activity::Running
         };
-        if self.is_cold(session_id, activity).await? {
+        let recipient_cold = self.is_cold(session_id, activity).await?;
+        if crate::agent::wake::decide(crate::agent::wake::WakeCause::AgentMessage {
+            recipient_cold,
+        }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
+        {
             return Err(AgentLinkError::ColdBtwRecipient(name));
         }
         if !snapshot.allows_fork() {

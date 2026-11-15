@@ -474,30 +474,29 @@ struct MemoriesChanges {
 #[derive(Template)]
 #[template(path = "alert_sleep.txt", escape = "none")]
 pub struct SleepAlert {
-    greet: bool,
+    pub(crate) greet: bool,
 }
 
 /// Durable alert telling the agent the user woke and how.
 #[derive(Template)]
 #[template(path = "alert_wake.txt", escape = "none")]
 pub struct WakeAlert {
-    cause: crate::sleep::WakeCause,
+    pub(crate) cause: crate::sleep::WakeCause,
 }
 
-impl RuntimeSystemContext {
-    /// Records what the user's sleep state changed to as a durable alert.
-    pub(crate) fn push_sleep_notice(
-        context: &mut aither_agent::Context,
-        notice: crate::sleep::SleepNotice,
-    ) {
-        match notice {
-            crate::sleep::SleepNotice::Asleep { greet } => {
-                context.push_alert(&SleepAlert { greet });
-            }
-            crate::sleep::SleepNotice::Woke(cause) => {
-                context.push_alert(&WakeAlert { cause });
-            }
-        }
+impl SleepAlert {
+    /// Renders the sleep alert text.
+    #[must_use]
+    pub(crate) fn render_text(&self) -> String {
+        self.render().expect("sleep alert template must render")
+    }
+}
+
+impl WakeAlert {
+    /// Renders the wake alert text.
+    #[must_use]
+    pub(crate) fn render_text(&self) -> String {
+        self.render().expect("wake alert template must render")
     }
 }
 
