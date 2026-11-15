@@ -346,3 +346,23 @@ opt-level = 3
 inherits = "release"
 lto = "thin"
 
+[patch.crates-io]
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-agent = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-attachments = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-browser = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-claude = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-codex = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-derive = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-gemini = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-models = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-skills = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "main" }
+
