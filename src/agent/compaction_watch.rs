@@ -174,6 +174,11 @@ impl RunWatch {
         }
     }
 
+    /// Updates the watched model context window size in place.
+    pub fn set_window(&self, window: u32) {
+        self.gauge.set_window(window);
+    }
+
     /// Records that the context holds `tokens` and no compaction is in
     /// flight.
     pub fn measured(&self, tokens: usize) {

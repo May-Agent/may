@@ -201,10 +201,47 @@ impl RuntimeSystemContext {
         self.instructions.insert(tag::COMMANDS, table);
     }
 
+    /// Replaces the capabilities and skill catalog; the next
+    /// [`reconcile`](Self::reconcile) announces any change without breaking the
+    /// warm system prefix.
+    pub(crate) fn set_capabilities(&mut self, capabilities: String) {
+        self.instructions.insert(tag::CAPABILITIES, capabilities);
+    }
+
     /// Replaces the environment block; the next [`reconcile`](Self::reconcile)
     /// announces any change without breaking the warm system prefix.
     pub(crate) fn set_environment(&mut self, environment: String) {
         self.instructions.insert(tag::ENVIRONMENT, environment);
+    }
+
+    /// Replaces or removes an optional instruction block; the next
+    /// [`reconcile`](Self::reconcile) announces any change as live content.
+    pub(crate) fn set_instruction_opt(&mut self, slot: InstructionSlot, text: Option<String>) {
+        assert!(
+            tag::MAY_INSTRUCTIONS.contains(&slot) && slot != tag::PROJECT_RULES,
+            "`{}` is not a May-managed instruction block",
+            slot.name()
+        );
+        match text {
+            Some(value) => {
+                self.instructions.insert(slot, value);
+            }
+            None => {
+                self.instructions.remove(&slot);
+            }
+        }
+    }
+
+    /// Replaces or removes extracted profile memories; the next
+    /// [`reconcile`](Self::reconcile) announces any change as live content.
+    pub(crate) fn set_profile_memories(&mut self, memories: Option<ExternalContent>) {
+        self.profile_memories = memories;
+    }
+
+    /// Replaces or removes approved workspace directories; the next
+    /// [`reconcile`](Self::reconcile) announces any change as live content.
+    pub(crate) fn set_workdirs(&mut self, workdirs: Option<ExternalContent>) {
+        self.workdirs = workdirs;
     }
 
     pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
@@ -251,37 +288,30 @@ impl RuntimeSystemContext {
     /// has carried yet takes them as they are; a later one stages the
     /// difference and announces it once.
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
-        let instructions = context.instructions_mut();
-        for slot in &tag::MAY_INSTRUCTIONS {
-            if *slot == tag::PROJECT_RULES || *slot == tag::COMMANDS || *slot == tag::ENVIRONMENT {
-                continue;
-            }
-            match self.instructions.get(slot) {
-                Some(text) => instructions.insert(slot, text.clone()),
-                None => {
-                    instructions.remove(slot);
+        {
+            let instructions = context.instructions_mut();
+            for slot in &tag::MAY_INSTRUCTIONS {
+                if *slot == tag::PROJECT_RULES || is_live_instruction(slot) {
+                    continue;
+                }
+                match self.instructions.get(slot) {
+                    Some(text) => instructions.insert(slot, text.clone()),
+                    None => {
+                        instructions.remove(slot);
+                    }
                 }
             }
         }
-        // A command added or dropped mid-session is announced once as a
-        // diff; the prompt's table changes only on reassembly.
-        context.update_live(&COMMANDS_CONTENT, |update| {
-            update.instruction(
-                &tag::COMMANDS,
-                self.instructions.get(&tag::COMMANDS).cloned(),
-            );
-        });
-        // SSH servers added or removed mid-session are announced once as a
-        // diff without mutating the warm prefix; the environment block renders
-        // fresh after compaction.
-        context.update_live(&ENVIRONMENT_CONTENT, |update| {
-            update.instruction(
-                &tag::ENVIRONMENT,
-                self.instructions.get(&tag::ENVIRONMENT).cloned(),
-            );
-        });
+        for (content, slot) in LIVE_INSTRUCTIONS {
+            context.update_live(content, |update| {
+                update.instruction(slot, self.instructions.get(slot).cloned());
+            });
+        }
         context.update_live(&MEMORY_CONTENT, |update| {
             update.external(&tag::MEMORY, Some(self.memory_block()));
+        });
+        context.update_live(&PROFILE_MEMORIES_CONTENT, |update| {
+            update.external(&tag::PROFILE_MEMORIES, self.profile_memories.clone());
         });
         context.update_live(&AGENTS_MD_CONTENT, |update| {
             update
@@ -290,18 +320,9 @@ impl RuntimeSystemContext {
                 .external(&tag::AGENTS_MD, self.agents.root.clone())
                 .external(&tag::HANDOFF_AGENTS_MD, self.agents.handoff.clone());
         });
-        let external = context.external_mut();
-        for (slot, block) in [
-            (&tag::PROFILE_MEMORIES, &self.profile_memories),
-            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
-        ] {
-            match block {
-                Some(block) => external.insert(slot, block.clone()),
-                None => {
-                    external.remove(slot);
-                }
-            }
-        }
+        context.update_live(&WORKDIRS_CONTENT, |update| {
+            update.external(&tag::WORKSPACE_WORKDIRS, self.workdirs.clone());
+        });
     }
 
     /// Refreshes the `AGENTS.md` blocks: re-reads the global rules, rescans
@@ -480,16 +501,65 @@ impl RuntimeSystemContext {
     }
 }
 
+/// The profile persona overlay, announced when it changes mid-session.
+const PERSONA_CONTENT: LiveContent = LiveContent::new("The profile persona", "persona_diff");
+
+/// The capabilities block and skill catalog, announced when skills or
+/// hosted tool capabilities change mid-session.
+const CAPABILITIES_CONTENT: LiveContent =
+    LiveContent::new("The skill catalog and capabilities", "skills_diff");
+
 /// The table of the commands a script can call, announced when a command is
 /// added or removed mid-session.
 const COMMANDS_CONTENT: LiveContent = LiveContent::new("The command table", "commands_diff");
 
 /// The execution environment and configured SSH servers, announced when
-/// servers change mid-session.
+/// servers or the model change mid-session.
 const ENVIRONMENT_CONTENT: LiveContent = LiveContent::new("The environment", "environment_diff");
+
+/// The permissions block (secrets and network policy), announced when it
+/// changes mid-session.
+const PERMISSIONS_CONTENT: LiveContent = LiveContent::new("The permissions", "permissions_diff");
+
+/// The time and location block, announced when timezone, location or hosted
+/// search availability changes mid-session.
+const TIME_CONTENT: LiveContent = LiveContent::new("The time and location context", "time_diff");
+
+/// The configured languages block, announced when languages change
+/// mid-session.
+const LANGUAGES_CONTENT: LiveContent =
+    LiveContent::new("The configured languages", "languages_diff");
+
+/// The plan-mode instructions, announced when plan state changes mid-session.
+const PLAN_MODE_CONTENT: LiveContent = LiveContent::new("The plan mode", "plan_mode_diff");
+
+/// All instruction slots synced as live content so mid-session changes keep
+/// the cached prefix warm until reassembly.
+const LIVE_INSTRUCTIONS: &[(&LiveContent, InstructionSlot)] = &[
+    (&PERSONA_CONTENT, tag::PROFILE_PERSONA),
+    (&ENVIRONMENT_CONTENT, tag::ENVIRONMENT),
+    (&CAPABILITIES_CONTENT, tag::CAPABILITIES),
+    (&COMMANDS_CONTENT, tag::COMMANDS),
+    (&PERMISSIONS_CONTENT, tag::PERMISSIONS),
+    (&TIME_CONTENT, tag::TIME),
+    (&LANGUAGES_CONTENT, tag::LANGUAGES),
+    (&PLAN_MODE_CONTENT, tag::PLAN_MODE),
+];
+
+fn is_live_instruction(slot: &InstructionSlot) -> bool {
+    LIVE_INSTRUCTIONS.iter().any(|(_, live)| live == slot)
+}
 
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
+
+/// Extracted profile memories, announced when they change mid-session.
+const PROFILE_MEMORIES_CONTENT: LiveContent =
+    LiveContent::new("The profile memories", "profile_memories_diff");
+
+/// Approved workspace directories, announced when workdirs change mid-session.
+const WORKDIRS_CONTENT: LiveContent =
+    LiveContent::new("The approved workspace directories", "workdirs_diff");
 
 /// The `AGENTS.md` blocks (the rules on how to treat them, the global rules,
 /// the launch directory's own file and the files the handoff linked),

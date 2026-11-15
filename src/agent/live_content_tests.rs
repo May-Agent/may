@@ -220,3 +220,67 @@ async fn an_ssh_server_change_mid_session_is_one_diff_then_the_clean_version() {
         Vec::<&String>::new()
     );
 }
+
+fn write_skill(may_dir: &std::path::Path, dir_name: &str, name: &str, description: &str) {
+    let dir = crate::session::MayHomePaths::new(may_dir.to_path_buf())
+        .skills_dir()
+        .join(dir_name);
+    std::fs::create_dir_all(&dir).expect("skill dir");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n# {name}\n"),
+    )
+    .expect("write SKILL.md");
+}
+
+#[tokio::test]
+async fn a_skill_change_mid_session_is_one_diff_then_the_clean_version() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start(&config)).await;
+    let may_dir = session.temp.path().join(".may");
+    write_skill(&may_dir, "alpha", "alpha", "Initial skill alpha.");
+    Box::pin(session.rebuild(&config)).await;
+
+    turn(&mut session).await;
+    write_skill(&may_dir, "beta", "beta", "Added skill beta.");
+    turn(&mut session).await;
+    // Unchanged skills restate nothing.
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, third] = requests.as_slice() else {
+        panic!("three turns: {requests:?}");
+    };
+    assert!(
+        first[0].contains("- alpha (`skills/alpha/SKILL.md`): Initial skill alpha."),
+        "{}",
+        first[0]
+    );
+    assert!(!first[0].contains("skills/beta/SKILL.md"), "{}", first[0]);
+    assert_eq!(
+        second[0], first[0],
+        "the cached prefix stays byte-identical"
+    );
+    assert!(!second[0].contains("skills/beta/SKILL.md"), "{}", second[0]);
+    let alerts = diff_alerts(second, "skills_diff");
+    assert_eq!(alerts.len(), 1, "{second:?}");
+    assert!(
+        alerts[0].contains("+- beta (`skills/beta/SKILL.md`): Added skill beta."),
+        "{}",
+        alerts[0]
+    );
+    assert_eq!(third[0], first[0]);
+    assert_eq!(diff_alerts(third, "skills_diff").len(), 1, "{third:?}");
+
+    compact(&mut session).await;
+    turn(&mut session).await;
+    let requests = turn_requests(&stub).await;
+    let after = requests.last().expect("the turn after compaction");
+    assert!(
+        after[0].contains("- beta (`skills/beta/SKILL.md`): Added skill beta."),
+        "{}",
+        after[0]
+    );
+    assert_eq!(diff_alerts(after, "skills_diff"), Vec::<&String>::new());
+}

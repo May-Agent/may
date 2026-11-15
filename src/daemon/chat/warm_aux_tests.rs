@@ -47,7 +47,6 @@ pub(super) async fn state_with_idle_agent_on(
         &state,
         SESSION,
         session.agent,
-        0,
         crate::session::RunReleased::already_released(),
     );
     (state, clock, session.temp)
@@ -374,7 +373,6 @@ async fn side_requests_carry_the_session_agents_prompt_cache_key() {
         &state,
         SESSION,
         session.agent,
-        0,
         crate::session::RunReleased::already_released(),
     );
 
