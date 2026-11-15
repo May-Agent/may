@@ -1444,6 +1444,7 @@ impl TaskRuntime {
             policies: crate::command_policy::PolicySet {
                 managed_bash: crate::command_policy::runs_managed_bash(in_container),
                 refused: crate::command_policy::RefusedReads::default(),
+                checkout_reads: None,
             },
             slot: crate::ipc::ShellSlot::new(),
             ssh_servers: Vec::new(),

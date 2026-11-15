@@ -62,6 +62,19 @@ impl RefusedReads {
     }
 }
 
+/// Where successful file reads inside daemon default-branch checkouts are
+/// recorded per session, holding a generation lease for the duration of each
+/// reading script.
+#[derive(Debug, Clone)]
+pub struct CheckoutReadTracker {
+    /// Daemon-held checkouts to resolve paths and pin generation leases.
+    pub checkouts: crate::repo_clone::DaemonCheckouts,
+    /// History DB storing `session_checkout_files`.
+    pub db: crate::db::ChatDb,
+    /// Session owning the shell.
+    pub session_id: String,
+}
+
 /// What May's policies for the shell of one agent are chosen by.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySet {
@@ -69,6 +82,8 @@ pub struct PolicySet {
     pub managed_bash: bool,
     /// The record the agent's turn boundary reads.
     pub refused: RefusedReads,
+    /// Optional tracker recording terminal file reads inside daemon checkouts.
+    pub checkout_reads: Option<CheckoutReadTracker>,
 }
 
 impl PolicySet {
@@ -86,6 +101,11 @@ impl PolicySet {
             })
             .policy(PythonWithUv)
             .policy(WhitespacePatch);
+        let builder = if let Some(tracker) = self.checkout_reads {
+            builder.policy(CheckoutFileReads { tracker })
+        } else {
+            builder
+        };
         if self.managed_bash {
             builder.policy(ManagedShellCommands)
         } else {
@@ -835,6 +855,118 @@ impl ScriptPolicy for ManagedShellCommands {
                 .and_then(host_command)
                 .unwrap_or(ScriptDecision::Pass),
         )
+    }
+}
+
+#[derive(Debug)]
+struct PendingCheckoutRead {
+    leases: Vec<crate::repo_clone::GenerationLease>,
+    reads_by_repo: HashMap<String, Vec<String>>,
+}
+
+/// Active checkout leases and reads keyed by task id.
+#[derive(Debug, Default)]
+pub struct CheckoutReadState {
+    pending: Mutex<HashMap<String, PendingCheckoutRead>>,
+}
+
+/// Observes terminal file reads (`cat`, `head`, `tail`, `sed -n`, `nl`) inside
+/// daemon checkouts, holds a generation lease until the script finishes, and
+/// records successfully read repo-relative paths per session.
+#[derive(Debug, Clone)]
+pub struct CheckoutFileReads {
+    tracker: CheckoutReadTracker,
+}
+
+fn resolve_checkout_read(
+    checkouts: &crate::repo_clone::DaemonCheckouts,
+    start: &Path,
+    path: &str,
+) -> Option<(String, String)> {
+    let candidate = start.join(path);
+    checkouts.identify_path(&candidate).or_else(|| {
+        std::fs::canonicalize(&candidate)
+            .ok()
+            .and_then(|c| checkouts.identify_path(&c))
+    })
+}
+
+impl ScriptPolicy for CheckoutFileReads {
+    type State = CheckoutReadState;
+
+    async fn check(&self, script: &ScriptCheck<'_>, state: &CheckoutReadState) -> ScriptDecision {
+        let Some(start) = script.start.host() else {
+            return ScriptDecision::Pass;
+        };
+        let reading = CommandReading::of(script.script);
+        let mut reads_by_repo: HashMap<String, Vec<String>> = HashMap::new();
+        for step in &reading.steps {
+            if let Intent::Read { path, .. } = &step.intent
+                && let Some((repo_key, rel_path)) =
+                    resolve_checkout_read(&self.tracker.checkouts, start, path)
+            {
+                let entry = reads_by_repo.entry(repo_key).or_default();
+                if !entry.contains(&rel_path) {
+                    entry.push(rel_path);
+                }
+            }
+        }
+        let mut lease_repos: HashSet<String> = reads_by_repo.keys().cloned().collect();
+        if let Some((repo_key, _)) = self.tracker.checkouts.identify_path(start) {
+            lease_repos.insert(repo_key);
+        }
+        if lease_repos.is_empty() && reads_by_repo.is_empty() {
+            return ScriptDecision::Pass;
+        }
+        let mut leases = Vec::with_capacity(lease_repos.len());
+        for repo_key in lease_repos {
+            if let Some(lease) = self.tracker.checkouts.acquire_lease(&repo_key).await {
+                leases.push(lease);
+            }
+        }
+        state
+            .pending
+            .lock()
+            .expect("checkout read state is never poisoned")
+            .insert(
+                script.task_id.to_string(),
+                PendingCheckoutRead {
+                    leases,
+                    reads_by_repo,
+                },
+            );
+        ScriptDecision::Pass
+    }
+
+    async fn ended(&self, end: &ScriptEnd<'_>, state: &CheckoutReadState) {
+        let pending = state
+            .pending
+            .lock()
+            .expect("checkout read state is never poisoned")
+            .remove(end.task_id);
+        let Some(pending) = pending else {
+            return;
+        };
+        if end.outcome == (ScriptOutcome::Exited { code: 0 }) {
+            for (repo_key, paths) in pending.reads_by_repo {
+                if let Err(error) = self
+                    .tracker
+                    .db
+                    .record_checkout_read_files(&self.tracker.session_id, &repo_key, &paths)
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %self.tracker.session_id,
+                        repo = %repo_key,
+                        %error,
+                        "failed to record checkout file reads"
+                    );
+                }
+            }
+        }
+        for lease in pending.leases {
+            lease.release().await;
+        }
     }
 }
 

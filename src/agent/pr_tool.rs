@@ -292,6 +292,7 @@ mod tests {
                     ),
                     github_api: PrContext::default_github_api(),
                     land_locks: LandLocks::default(),
+                    checkouts: None,
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -400,6 +401,7 @@ mod tests {
                     signing: user.signing(&tmp.join("may-home"), "s1"),
                     github_api: PrContext::default_github_api(),
                     land_locks: LandLocks::default(),
+                    checkouts: None,
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -417,7 +419,13 @@ mod tests {
             };
             repo.call(trust, at(checkout)).await.unwrap();
             let report = repo
-                .call(RepoArgs::Clone { path: None }, at(checkout))
+                .call(
+                    RepoArgs::Clone {
+                        path: None,
+                        new: false,
+                    },
+                    at(checkout),
+                )
                 .await
                 .unwrap();
             let report = report.as_text().unwrap();

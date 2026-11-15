@@ -147,7 +147,19 @@ impl MayWorkTracker {
                 }
                 keys
             }
-            None if clones.is_empty() => vec![self.cwd_identity(reference)?],
+            None if clones.is_empty() => {
+                let mut candidates = Vec::new();
+                if let Some(repo) = self.our_repository() {
+                    candidates.push(repo);
+                }
+                if let Ok(id) = self.cwd_identity(reference) {
+                    candidates.push(id);
+                }
+                if candidates.is_empty() {
+                    return Err(unavailable(reference, "not inside a repository"));
+                }
+                candidates
+            }
             None => clones.into_iter().map(|clone| clone.repo_key).collect(),
         };
         let found =
