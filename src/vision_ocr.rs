@@ -29,8 +29,10 @@ use crate::ipc::CallImageStore;
 pub const OCR_DOWNSCALE_MAX_DIM: u32 = 768;
 
 /// Minimum confidence to keep a recognized line when judging text density.
+/// Apple Vision assigns valid secondary CJK script lines confidences around `0.3`
+/// or lower when multiple CJK tags share `recognitionLanguages`.
 #[cfg(feature = "vision-ocr")]
-const MIN_LINE_CONFIDENCE: f32 = 0.3;
+const MIN_LINE_CONFIDENCE: f32 = 0.1;
 
 /// Summary metrics extracted from `RecognizeText` output used to classify text density.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,16 +220,17 @@ impl VisionOcr {
         let image = VisionImage::from_encoded(bytes.to_vec().into());
         // Apple's `capabilities().text.native` intersects `Fast` and `Accurate`,
         // omitting CJK scripts only present in `Accurate`; passing all 33 languages
-        // drops CJK lines, while auto-detect can drop Japanese on headless VMs.
+        // drops CJK lines, and placing Chinese before Japanese causes Apple Vision
+        // to down-rank or drop mixed Kanji+Kana lines behind Chinese tags.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let request = RecognizeText::new()
             .level(RecognitionLevel::Accurate)
             .languages(
                 [
                     "en-Latn-US",
+                    "ja-Jpan-JP",
                     "zh-Hans",
                     "zh-Hant",
-                    "ja-Jpan-JP",
                     "ko-Kore-KR",
                 ]
                 .into_iter()
@@ -1028,9 +1031,22 @@ pub(crate) mod tests {
             rendered.contains("<recognized_text source=\"computer screenshot\">"),
             "{rendered}"
         );
-        assert!(rendered.contains("中文"), "{rendered}");
-        assert!(rendered.contains("日本語"), "{rendered}");
-        assert!(rendered.contains("한국어"), "{rendered}");
+        let raw_lines = || ocr.recognize_lines(&screenshot);
+        assert!(
+            rendered.contains("中文"),
+            "{rendered}; raw={:?}",
+            raw_lines()
+        );
+        assert!(
+            rendered.contains("日本語"),
+            "{rendered}; raw={:?}",
+            raw_lines()
+        );
+        assert!(
+            rendered.contains("한국어"),
+            "{rendered}; raw={:?}",
+            raw_lines()
+        );
 
         let resized_path = attachments[0].url().to_file_path().expect("resized file");
         assert_ne!(
