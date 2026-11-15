@@ -11943,7 +11943,7 @@ dependencies = [
 [[package]]
 name = "waterkit-automation"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=main#2c03330a8f5b47f4189e95f744b9a8f9fbb857c9"
+source = "git+https://github.com/water-rs/waterkit?branch=main#f000eb2a2a8577738b7a138b7dbe0d380e4562e1"
 dependencies = [
  "block2",
  "dispatch2",
@@ -11960,13 +11960,13 @@ dependencies = [
  "objc2-io-kit",
  "thiserror 2.0.21",
  "tracing",
- "waterkit-core 0.2.0 (git+https://github.com/water-rs/waterkit?branch=main)",
+ "waterkit-core",
 ]
 
 [[package]]
 name = "waterkit-build"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=fix%2Fapple-multilang-ocr#f325452e60861229758b55d6e186a7d92eb5d3ac"
+source = "git+https://github.com/water-rs/waterkit?branch=main#f000eb2a2a8577738b7a138b7dbe0d380e4562e1"
 dependencies = [
  "futures-channel",
  "jni",
@@ -11976,36 +11976,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "waterkit-build"
-version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=main#2c03330a8f5b47f4189e95f744b9a8f9fbb857c9"
-dependencies = [
- "futures-channel",
- "jni",
- "ndk-context",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "waterkit-core"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=fix%2Fapple-multilang-ocr#f325452e60861229758b55d6e186a7d92eb5d3ac"
-dependencies = [
- "dispatch2",
- "executor-core",
- "futures",
- "jiff",
- "nami",
- "objc2",
- "objc2-foundation",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "waterkit-core"
-version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=main#2c03330a8f5b47f4189e95f744b9a8f9fbb857c9"
+source = "git+https://github.com/water-rs/waterkit?branch=main#f000eb2a2a8577738b7a138b7dbe0d380e4562e1"
 dependencies = [
  "dispatch2",
  "executor-core",
@@ -12021,7 +11994,7 @@ dependencies = [
 [[package]]
 name = "waterkit-permission"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=main#2c03330a8f5b47f4189e95f744b9a8f9fbb857c9"
+source = "git+https://github.com/water-rs/waterkit?branch=main#f000eb2a2a8577738b7a138b7dbe0d380e4562e1"
 dependencies = [
  "async-channel",
  "async-io",
@@ -12049,8 +12022,8 @@ dependencies = [
  "tempfile",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "waterkit-build 0.2.0 (git+https://github.com/water-rs/waterkit?branch=main)",
- "waterkit-core 0.2.0 (git+https://github.com/water-rs/waterkit?branch=main)",
+ "waterkit-build",
+ "waterkit-core",
  "web-sys",
  "windows 0.62.2",
  "zbus",
@@ -12059,7 +12032,7 @@ dependencies = [
 [[package]]
 name = "waterkit-screen"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=main#2c03330a8f5b47f4189e95f744b9a8f9fbb857c9"
+source = "git+https://github.com/water-rs/waterkit?branch=main#f000eb2a2a8577738b7a138b7dbe0d380e4562e1"
 dependencies = [
  "async-channel",
  "block2",
@@ -12078,14 +12051,14 @@ dependencies = [
  "objc2-screen-capture-kit",
  "thiserror 2.0.21",
  "tracing",
- "waterkit-build 0.2.0 (git+https://github.com/water-rs/waterkit?branch=main)",
- "waterkit-core 0.2.0 (git+https://github.com/water-rs/waterkit?branch=main)",
+ "waterkit-build",
+ "waterkit-core",
 ]
 
 [[package]]
 name = "waterkit-vision"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=fix%2Fapple-multilang-ocr#f325452e60861229758b55d6e186a7d92eb5d3ac"
+source = "git+https://github.com/water-rs/waterkit?branch=main#f000eb2a2a8577738b7a138b7dbe0d380e4562e1"
 dependencies = [
  "bytes",
  "enumset",
@@ -12103,8 +12076,8 @@ dependencies = [
  "swift-bridge",
  "thiserror 2.0.21",
  "tracing",
- "waterkit-build 0.2.0 (git+https://github.com/water-rs/waterkit?branch=fix%2Fapple-multilang-ocr)",
- "waterkit-core 0.2.0 (git+https://github.com/water-rs/waterkit?branch=fix%2Fapple-multilang-ocr)",
+ "waterkit-build",
+ "waterkit-core",
  "wgpu",
  "wgpu-hal",
  "windows 0.62.2",

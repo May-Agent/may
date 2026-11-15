@@ -156,7 +156,7 @@ arboard = "3"
 base64 = "0.22"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "fix/apple-multilang-ocr", default-features = false, features = ["text"], optional = true }
+waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["text"], optional = true }
 
 # HTTP client for fetching images
 zenwave = "0.7"
