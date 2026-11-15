@@ -1545,7 +1545,7 @@ mod tests {
     use crate::trust::TrustLevel;
 
     fn init_repo(dir: &Path) {
-        git(None, &["init", &dir.to_string_lossy()]).unwrap();
+        git(None, &["init", "-b", "main", &dir.to_string_lossy()]).unwrap();
         git(Some(dir), &["config", "user.email", "t@t"]).unwrap();
         git(Some(dir), &["config", "user.name", "t"]).unwrap();
         std::fs::write(dir.join("file.txt"), "hello").unwrap();
