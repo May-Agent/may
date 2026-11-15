@@ -91,11 +91,11 @@ pub use job_events::{BackgroundWake, JobFact};
 pub use live_limits::LiveLimits;
 pub use live_settings::AgentLiveSettings;
 pub use loop_watch::LoopLimits;
-pub(crate) use may::side_slot;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
     generate_session_title,
 };
+pub(crate) use may::{TurnSyncInput, side_slot};
 pub use permission::{
     OnTimeout, PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError,
     PermissionRequest, PermissionRequestMode, PermissionRequestModeParseError,

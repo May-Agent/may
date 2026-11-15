@@ -457,6 +457,26 @@ fn provider_candidates(
     candidates
 }
 
+/// Candidate provider id and instance configuration fingerprint at
+/// `provider_attempt` for `selector`, used to skip `set_model` when only
+/// request parameters or context blocks changed.
+pub(super) fn candidate_provider_key(
+    providers: Providers<'_>,
+    selector: &ModelSelector,
+    provider_attempt: usize,
+) -> Option<(String, u64)> {
+    use std::hash::{Hash, Hasher};
+
+    let (provider_id, provider) = provider_candidates(providers, selector)
+        .into_iter()
+        .nth(provider_attempt)?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    serde_json::to_string(&provider.instance)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    Some((provider_id, hasher.finish()))
+}
+
 /// Number of runnable provider candidates for `selector`.
 #[must_use]
 pub fn provider_candidate_count(providers: Providers<'_>, selector: &str) -> usize {

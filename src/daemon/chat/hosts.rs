@@ -44,14 +44,7 @@ pub(super) fn publish_compaction(
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
 pub struct ParkedAgents {
-    workers: Mutex<HashMap<String, Parked>>,
-}
-
-/// One idle agent and what it was built from.
-struct Parked {
-    worker: Arc<AgentWorker>,
-    /// [`super::agent_build_key`] of the inputs the agent was built from.
-    build_key: u64,
+    workers: Mutex<HashMap<String, Arc<AgentWorker>>>,
 }
 
 impl std::fmt::Debug for ParkedAgents {
@@ -61,20 +54,18 @@ impl std::fmt::Debug for ParkedAgents {
 }
 
 impl ParkedAgents {
-    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Parked>> {
+    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AgentWorker>>> {
         self.workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Keeps `agent`, built from inputs with `build_key`, as `session_id`'s
-    /// idle agent.
+    /// Keeps `agent` as `session_id`'s idle agent.
     pub(crate) fn park(
         &self,
         state: &Arc<DaemonState>,
         session_id: &str,
         agent: MayAgent,
-        build_key: u64,
         released: crate::session::RunReleased,
     ) {
         // One pending wake is enough: the agent's context holds every event
@@ -98,15 +89,11 @@ impl ParkedAgents {
                 publish_compaction(&hub, &compaction_session, phase);
             }
         });
-        let previous = self.workers().insert(
-            session_id.to_string(),
-            Parked {
-                worker: Arc::new(worker),
-                build_key,
-            },
-        );
+        let previous = self
+            .workers()
+            .insert(session_id.to_string(), Arc::new(worker));
         if let Some(previous) = previous {
-            previous.worker.shutdown();
+            previous.shutdown();
         }
         // Ends with the worker, which drops the sending half.
         let wake_state = state.clone();
@@ -130,11 +117,11 @@ impl ParkedAgents {
     /// and their completions wait for the user's next input instead of
     /// starting a turn. The agent stays parked, its prompt cache warm.
     pub(crate) async fn stop_background(&self, state: &Arc<DaemonState>, session_id: &str) {
-        let Some(parked) = self.workers().remove(session_id) else {
+        let Some(worker) = self.workers().remove(session_id) else {
             return;
         };
         let (reply, agent) = async_channel::bounded(1);
-        parked.worker.release(reply);
+        worker.release(reply);
         let Ok(mut agent) = agent.recv().await else {
             return;
         };
@@ -146,30 +133,23 @@ impl ParkedAgents {
             state,
             session_id,
             agent,
-            parked.build_key,
             crate::session::RunReleased::already_released(),
         );
     }
 
     /// Stops `session_id`'s idle agent, if any.
     pub(crate) fn evict(&self, session_id: &str) {
-        let parked = self.workers().remove(session_id);
-        if let Some(parked) = parked {
-            parked.worker.shutdown();
+        let worker = self.workers().remove(session_id);
+        if let Some(worker) = worker {
+            worker.shutdown();
         }
     }
 
-    /// Takes `session_id`'s idle agent for a turn. With `build_key`, an agent
-    /// built from other inputs is stopped instead and `None` returned, so the
-    /// turn builds a fresh one.
-    pub(crate) async fn take(&self, session_id: &str, build_key: Option<u64>) -> Option<MayAgent> {
-        let parked = self.workers().remove(session_id)?;
-        if build_key.is_some_and(|key| key != parked.build_key) {
-            parked.worker.shutdown();
-            return None;
-        }
+    /// Takes `session_id`'s idle agent for a turn.
+    pub(crate) async fn take(&self, session_id: &str) -> Option<MayAgent> {
+        let worker = self.workers().remove(session_id)?;
         let (reply, agent) = async_channel::bounded(1);
-        parked.worker.release(reply);
+        worker.release(reply);
         agent.recv().await.ok()
     }
 
@@ -184,9 +164,7 @@ impl ParkedAgents {
     }
 
     pub(super) fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
-        self.workers()
-            .get(session_id)
-            .map(|parked| parked.worker.clone())
+        self.workers().get(session_id).cloned()
     }
 }
 
@@ -244,7 +222,6 @@ pub(super) async fn idle_agent(
         state,
         session_id,
         prepared.agent,
-        prepared.build_key,
         crate::session::RunReleased::already_released(),
     );
     state

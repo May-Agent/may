@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
 use aither_sandbox::{DomainApprover, DomainRequest};
+use arc_swap::ArcSwap;
 
 use crate::agent::PermissionApprover;
 use crate::agent::permission::{PermissionError, SSH_KIND, UNSANDBOXED_KIND};
@@ -35,7 +36,7 @@ pub struct TerminalPermissionHandler {
     approver: Option<PermissionApprover>,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
-    network_policy: Option<CompiledNetworkPolicy>,
+    network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     profile_id: Option<String>,
     source: NetworkAccessSource,
 }
@@ -60,7 +61,7 @@ impl TerminalPermissionHandler {
             approver,
             runtime_service,
             session_id,
-            network_policy,
+            network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
             profile_id,
             source: NetworkAccessSource::Chat,
         }
@@ -76,7 +77,7 @@ impl TerminalPermissionHandler {
 
     /// Create the handler used for one-shot `may exec` runs.
     #[must_use]
-    pub const fn for_exec(
+    pub fn for_exec(
         session_id: String,
         runtime_service: Arc<SessionRuntimeService>,
         network_policy: Option<CompiledNetworkPolicy>,
@@ -87,10 +88,15 @@ impl TerminalPermissionHandler {
             approver: None,
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
-            network_policy,
+            network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
             profile_id,
             source: NetworkAccessSource::Exec,
         }
+    }
+
+    /// Replaces the live outbound network policy used by subsequent requests.
+    pub fn set_network_policy(&self, policy: Option<CompiledNetworkPolicy>) {
+        self.network_policy.store(Arc::new(policy));
     }
 
     /// The handler a subagent's approvals go through: the same session's
@@ -205,7 +211,8 @@ impl DomainApprover for TerminalPermissionHandler {
     fn approve(&self, request: &DomainRequest) -> impl Future<Output = bool> + Send {
         let (domain, port) = (request.host.clone(), request.port);
         async move {
-            if let Some(policy) = &self.network_policy {
+            let network_policy = self.network_policy.load();
+            if let Some(policy) = network_policy.as_ref().as_ref() {
                 let allowed_by_policy = policy.allows_domain(&domain);
                 tracing::info!(
                     domain,

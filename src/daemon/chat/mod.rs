@@ -2246,7 +2246,6 @@ fn run_agent_loop_attempts<'a>(
                 prompt,
                 attachments,
                 provider_candidate_count,
-                build_key,
                 user_message_id,
                 consumed_alerts,
                 reasoning_effort,
@@ -2771,13 +2770,9 @@ fn run_agent_loop_attempts<'a>(
             // The agent stays as the session's idle agent until the next turn;
             // it waits on background commands once this run releases the
             // session.
-            state.parked_agents.park(
-                state,
-                session_id.as_str(),
-                agent,
-                build_key,
-                guard.released(),
-            );
+            state
+                .parked_agents
+                .park(state, session_id.as_str(), agent, guard.released());
 
             return Ok(AgentRunResult {
                 user_message_id: turn_user_message_id,
@@ -3312,8 +3307,6 @@ struct PreparedAgent {
     prompt: String,
     attachments: Vec<LlmAttachment>,
     provider_candidate_count: usize,
-    /// [`agent_build_key`] of the inputs the agent was built from.
-    build_key: u64,
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
     /// The pending alerts preparing the turn consumed.
@@ -4086,19 +4079,37 @@ async fn setup_agent_environment(
         _ => crate::agent::AgentEnvironment::Local,
     };
 
-    let location = if ctx.profile_model.as_ref().is_some_and(|p| p.location_aware) {
-        Some(
+    let location = resolve_profile_location(state, ctx).await?;
+
+    Ok((environment, location))
+}
+
+async fn resolve_profile_location(
+    state: &Arc<DaemonState>,
+    ctx: &SessionContext,
+) -> Result<Option<crate::location::LocationInfo>, UiChatPreparationError> {
+    if ctx.profile_model.as_ref().is_some_and(|p| p.location_aware) {
+        Ok(Some(
             state
                 .location_provider
                 .get()
                 .await
                 .map_err(UiChatPreparationError::LoadLocation)?,
-        )
+        ))
     } else {
-        None
-    };
+        Ok(None)
+    }
+}
 
-    Ok((environment, location))
+async fn resolve_model_context_window(
+    state: &Arc<DaemonState>,
+    current_model: &str,
+) -> Option<u32> {
+    match current_model.parse::<crate::ModelSelector>() {
+        Ok(selector) => state.model_context_window(&selector).await,
+        // The build or sync reports the invalid selector.
+        Err(_) => None,
+    }
 }
 
 fn spawn_ask_user_forwarder(
@@ -4221,25 +4232,28 @@ fn prepare_agent_for_request<'a>(
         ))
         .await?;
         let config = state.config_snapshot();
-        let workspace_config = {
-            let path =
-                crate::session::SessionPaths::new(ctx.sandbox_dir.clone()).workspace_config();
-            blocking::unblock(move || crate::workspace::WorkspaceConfig::load(&path))
-                .await
-                .map_err(|error| UiChatPreparationError::BuildAgent(error.into()))?
-        };
-        let build_key = agent_build_key(&config, &state.pushed_providers, &workspace_config, &ctx);
-        // The session's idle agent continues the conversation when it was
-        // built from the same inputs; a resumed turn exists only for what
-        // that agent collected, so it takes the agent whatever changed.
+        let wants_container = matches!(
+            ctx.profile_environment.as_ref(),
+            Some(crate::profile::ProfileEnvironment::Container { .. })
+        );
         let reused = if let Some(agent) = attempt.retained_agent {
             Some(agent)
         } else if attempt.provider_attempt == 0 {
-            let fits = (!kind.is_resume()).then_some(build_key);
             state
                 .parked_agents
-                .take(ctx.session_id.as_str(), fits)
+                .take(ctx.session_id.as_str())
                 .await
+                .filter(|agent| {
+                    let is_container = matches!(
+                        agent.environment(),
+                        crate::agent::AgentEnvironment::Container { .. }
+                    );
+                    // Moving the home environment between host and container
+                    // cannot apply in place, so wait until the cache goes cold.
+                    !(!kind.is_resume()
+                        && wants_container != is_container
+                        && !agent.cache_warmth().is_warm())
+                })
         } else {
             None
         };
@@ -4252,7 +4266,27 @@ fn prepare_agent_for_request<'a>(
                 )
                 .await
                 .map_err(UiChatPreparationError::LoadProfile)?;
-                agent.sync_ssh_servers(&ssh_servers);
+                let location = resolve_profile_location(state, &ctx).await?;
+                let model_context_window =
+                    resolve_model_context_window(state, &ctx.current_model).await;
+                agent
+                    .sync_for_turn(crate::agent::TurnSyncInput {
+                        may_config: &config,
+                        pushed_providers: &state.pushed_providers,
+                        current_model: &ctx.current_model,
+                        reasoning_effort: ctx.reasoning_effort,
+                        model_context_window,
+                        provider_attempt: attempt.provider_attempt,
+                        profile_id: ctx.profile_id.as_deref(),
+                        profile_persona: ctx.profile_persona.as_deref(),
+                        profile_memories: ctx.profile_memories.as_ref(),
+                        plan_state: ctx.plan_state,
+                        location: location.as_ref(),
+                        cwd: &ctx.cwd,
+                        ssh_servers: &ssh_servers,
+                    })
+                    .await
+                    .map_err(UiChatPreparationError::BuildAgent)?;
                 agent
             }
             None if kind.is_resume() => return Err(UiChatPreparationError::NothingToResume),
@@ -4309,7 +4343,6 @@ fn prepare_agent_for_request<'a>(
             prompt,
             attachments,
             provider_candidate_count: ctx.provider_candidate_count,
-            build_key,
             user_message_id: ctx.user_message_id,
             consumed_alerts: ctx.consumed_alerts,
             reasoning_effort: ctx.reasoning_effort,
@@ -4330,11 +4363,7 @@ fn build_session_agent<'a>(
     Box::pin(async move {
         let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
-        let model_context_window = match ctx.current_model.parse::<crate::ModelSelector>() {
-            Ok(selector) => state.model_context_window(&selector).await,
-            // The build reports the invalid selector.
-            Err(_) => None,
-        };
+        let model_context_window = resolve_model_context_window(state, &ctx.current_model).await;
 
         let subagents = state.session_background.subagents(ctx.session_id.as_str());
         cards::forward_updates(state, ctx.session_id.as_str(), subagents.cards());
@@ -4449,46 +4478,6 @@ fn build_session_agent<'a>(
 
         Ok(agent)
     })
-}
-
-/// A fingerprint of everything `ctx`'s agent is built from, so a turn can
-/// tell whether the session's idle agent still fits: the configuration and
-/// the providers a fronting daemon pushed, the
-/// model and its reasoning effort, the profile, its persona and memories,
-/// the plan state, where the session works and the workspace configuration
-/// (trust, workdirs) its grants, mounts, clone and PR contexts come from.
-fn agent_build_key(
-    config: &crate::config::MayConfig,
-    pushed: &crate::cloud::access::PushedProviders,
-    workspace: &crate::workspace::WorkspaceConfig,
-    ctx: &SessionContext,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::hash::DefaultHasher::new();
-    let mut config_for_key = config.clone();
-    config_for_key.ssh_servers.clear();
-    serde_json::to_string(&config_for_key)
-        .unwrap_or_default()
-        .hash(&mut hasher);
-    // The pushed providers' configurations, not their access tokens: the
-    // agent's models read a new token for each request.
-    pushed.fingerprint().hash(&mut hasher);
-    toml::to_string(workspace)
-        .expect("a parsed workspace configuration serializes")
-        .hash(&mut hasher);
-    ctx.current_model.hash(&mut hasher);
-    format!("{:?}", ctx.reasoning_effort).hash(&mut hasher);
-    ctx.profile_id.hash(&mut hasher);
-    format!("{:?}", ctx.profile_model).hash(&mut hasher);
-    format!("{:?}", ctx.profile_environment).hash(&mut hasher);
-    ctx.profile_persona.hash(&mut hasher);
-    format!("{:?}", ctx.profile_memories).hash(&mut hasher);
-    format!("{:?}", ctx.plan_state).hash(&mut hasher);
-    ctx.cwd.hash(&mut hasher);
-    ctx.non_interactive.hash(&mut hasher);
-    ctx.rules_import.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// What a turn starts from.
@@ -5875,16 +5864,57 @@ mod tests {
         assert!(body.contains("finished"), "the resume sees the result");
     }
 
-    /// Lowering a project's trust in `workspace.toml` retires the session's
-    /// idle agent: the next turn builds from the new level instead of
-    /// continuing with the grants captured at build.
+    /// Parses the next request body received by `stub` as `OpenAI` JSON,
+    /// skipping auxiliary requests if any arrived first.
+    async fn next_turn_request_json(stub: &StubProvider) -> serde_json::Value {
+        loop {
+            let body = last_body(stub, 1).await;
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("valid OpenAI request JSON");
+            if parsed
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|msgs| {
+                    msgs.iter().any(|msg| {
+                        msg.get("role").and_then(|r| r.as_str()) == Some("user")
+                            && msg
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|s| s.contains("hello"))
+                    })
+                })
+            {
+                return parsed;
+            }
+        }
+    }
+
+    fn request_messages_text(req: &serde_json::Value) -> Vec<String> {
+        req["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Trust, workdir, and `config.toml` changes apply to the idle agent in
+    /// place without rebuilding it or perturbing earlier messages or system prefix.
     #[tokio::test]
-    async fn a_trust_change_retires_the_idle_agent() {
-        let provider = stub_provider(vec![sse_text("first")]).await;
+    async fn mid_session_trust_workdir_and_config_changes_apply_in_place() {
+        let provider = stub_provider(vec![
+            sse_text("first"),
+            sse_text("second"),
+            sse_text("third"),
+        ])
+        .await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let cwd = tempfile::tempdir().expect("cwd");
+        let extra_dir = tempfile::tempdir().expect("extra dir");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
+        state.update_config(|config| config.suggestions.enabled = false);
         let checkout = cwd.path().canonicalize().expect("canonical checkout");
+        let extra = extra_dir.path().canonicalize().expect("canonical extra");
         state
             .db()
             .set_session_cwd("session", &checkout.to_string_lossy())
@@ -5893,39 +5923,349 @@ mod tests {
         let config_path =
             crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
         let set_level = |level| {
+            let mut ws = crate::WorkspaceConfig::load(&config_path).expect("load ws");
+            ws.projects
+                .retain(|p| p.path.as_deref() != Some(checkout.as_path()));
+            ws.save(&config_path).expect("save ws");
             crate::trust::persist(&config_path, &checkout, None, level).expect("persist trust");
         };
-        let writable_checkout = |agent: &crate::agent::MayAgent| {
-            agent
-                .grants()
-                .snapshot()
-                .writable
-                .iter()
-                .any(|path| path == &checkout)
-        };
 
-        // The first turn runs at the local level and leaves its agent idle.
+        // Turn 1 runs at local trust and parks the live agent.
         set_level(crate::trust::TrustLevel::Local);
-        let mut sink = TestSink::default();
-        run_prompt_turn(&state, &mut sink)
+        run_prompt_turn(&state, &mut TestSink::default())
             .await
-            .expect("the first turn completes");
+            .expect("first turn");
         assert!(state.parked_agents.contains("session"));
         let grants = state
             .runtime_service
             .terminal_grants("session")
-            .expect("the built agent's grants");
+            .expect("agent grants handle");
         assert!(
             grants.snapshot().writable.iter().any(|p| p == &checkout),
             "local trust makes the checkout writable"
         );
+        let req1 = next_turn_request_json(&provider).await;
 
-        // Trust lowered while the agent idles: the next turn's preparation
-        // builds a fresh agent without the checkout grant.
+        // Mid-session: downgrade trust, grant an extra workdir, and change timezone.
         set_level(crate::trust::TrustLevel::LocalBranch);
+        let mut ws = crate::WorkspaceConfig::load(&config_path).expect("load ws");
+        ws.add_workdir(extra.clone(), Some("scratch".to_string()));
+        ws.save(&config_path).expect("save ws");
+        state.update_config(|config| {
+            config.time.timezone = Some("Asia/Tokyo".parse().expect("valid timezone"));
+        });
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("second turn");
+        assert!(
+            !grants.snapshot().writable.iter().any(|p| p == &checkout),
+            "trust downgrade revoked writable access on the existing agent handle"
+        );
+        assert!(
+            grants.snapshot().writable.iter().any(|p| p == &extra),
+            "added workdir granted on the existing agent handle"
+        );
+        let req2 = next_turn_request_json(&provider).await;
+        let msgs1 = request_messages_text(&req1);
+        let msgs2 = request_messages_text(&req2);
+        assert_eq!(msgs2[0], msgs1[0], "system prefix stayed byte-identical");
+        assert_eq!(
+            msgs2[1], msgs1[1],
+            "earlier user message stayed byte-identical"
+        );
+        let joined2 = msgs2[2..].join("\n");
+        assert!(
+            joined2.contains("<workdirs_diff "),
+            "workdirs change arrived via live diff: {joined2}"
+        );
+        assert!(
+            joined2.contains("<time_diff ") && joined2.contains("Asia/Tokyo"),
+            "timezone change arrived via live diff: {joined2}"
+        );
+
+        // Remove the extra workdir and verify revocation on the next turn.
+        let mut ws = crate::WorkspaceConfig::load(&config_path).expect("load ws");
+        ws.remove_workdir(&extra);
+        ws.save(&config_path).expect("save ws");
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("third turn");
+        assert!(
+            !grants.snapshot().writable.iter().any(|p| p == &extra),
+            "removed workdir revoked in place"
+        );
+    }
+
+    /// Model and reasoning-effort changes update the parked agent in place
+    /// without rebuilding or perturbing history.
+    #[tokio::test]
+    async fn mid_session_model_and_reasoning_effort_update_in_place() {
+        let provider_a = stub_provider(vec![sse_text("from-a")]).await;
+        let provider_b = stub_provider(vec![sse_text("from-b")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+        state.update_config(|config| config.suggestions.enabled = false);
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 1");
+        let req1 = next_turn_request_json(&provider_a).await;
+        assert_eq!(req1["model"].as_str(), Some("gpt-4o"));
+
+        state
+            .db()
+            .update_session("session", None, Some("b::o3"), Some(Some("high")))
+            .await
+            .expect("update session model and reasoning effort");
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 2");
+        let req2 = next_turn_request_json(&provider_b).await;
+        assert_eq!(req2["model"].as_str(), Some("o3"));
+        assert_eq!(req2["reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(
+            request_messages_text(&req2)[0],
+            request_messages_text(&req1)[0],
+            "model/effort swap kept the existing agent and system prefix"
+        );
+    }
+
+    /// Profile persona edits reach the live agent via a `<persona_diff>` note
+    /// without changing the system prefix or rebuilding.
+    #[tokio::test]
+    async fn mid_session_persona_change_reaches_turn_in_place() {
+        let provider = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        state.update_config(|config| config.suggestions.enabled = false);
+
+        let profile_id = state
+            .db()
+            .ensure_default_profiles()
+            .await
+            .expect("default profile");
+        state
+            .db()
+            .delete_session("session")
+            .await
+            .expect("drop default session");
+        state
+            .db()
+            .create_session_in_profile(
+                "session",
+                Some("test"),
+                Some("a::gpt-4o"),
+                Some(&profile_id),
+            )
+            .await
+            .expect("profile session");
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 1");
+        let grants_before = state
+            .runtime_service
+            .terminal_grants("session")
+            .expect("grants handle");
+        let cwd_temp = tempfile::tempdir().expect("temp grant");
+        let canonical = cwd_temp.path().canonicalize().expect("canonical");
+        let req1 = next_turn_request_json(&provider).await;
+
+        state
+            .db()
+            .update_profile(
+                &profile_id,
+                crate::db::UpdateProfileParams {
+                    name: None,
+                    icon: None,
+                    environment: None,
+                    container_id: None,
+                    sort_order: None,
+                    persona: Some(Some("Reply strictly as a concise compiler.")),
+                    preferences: None,
+                    location_aware: None,
+                },
+            )
+            .await
+            .expect("update persona");
+        // Mutating the workspace simultaneously proves the old grants handle is
+        // still the live one backing the agent after turn 2.
+        let sandbox = crate::session::SessionStore::new(crate::session::MayHomePaths::new(
+            may_dir.path().to_path_buf(),
+        ))
+        .sandbox_dir("session", Some(&profile_id));
+        let config_path = crate::session::SessionPaths::new(sandbox).workspace_config();
+        let mut ws = crate::WorkspaceConfig::load(&config_path).expect("load ws");
+        ws.add_workdir(canonical.clone(), None);
+        ws.save(&config_path).expect("save ws");
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 2");
+        assert!(
+            grants_before
+                .snapshot()
+                .writable
+                .iter()
+                .any(|p| p == &canonical),
+            "the original agent grants handle stayed live across persona edit"
+        );
+        let req2 = next_turn_request_json(&provider).await;
+        let msgs1 = request_messages_text(&req1);
+        let msgs2 = request_messages_text(&req2);
+        assert_eq!(msgs2[0], msgs1[0]);
+        assert!(
+            msgs2[2..].join("\n").contains("<persona_diff "),
+            "persona update delivered as live diff: {:?}",
+            &msgs2[2..]
+        );
+    }
+
+    /// Archiving a session drops its parked agent immediately; unarchiving
+    /// starts a freshly built agent on the next turn.
+    #[tokio::test]
+    async fn archiving_retires_the_parked_agent_and_unarchiving_rebuilds_fresh() {
+        let provider = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        state.update_config(|config| config.suggestions.enabled = false);
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 1");
+        assert!(state.parked_agents.contains("session"));
+        let grants_before = state
+            .runtime_service
+            .terminal_grants("session")
+            .expect("turn 1 grants handle");
+        let _ = next_turn_request_json(&provider).await;
+
+        let router = super::super::server::build_router(
+            state.clone(),
+            super::super::server::DaemonMode::Rest,
+            super::super::auth::SocketOwner,
+        );
+        let archive_req = hyper::Request::builder()
+            .method("PATCH")
+            .uri("/api/sessions/session")
+            .header("content-type", "application/json")
+            .body(skyzen::Body::from(r#"{"archived":true}"#))
+            .expect("archive request");
+        let resp = router.go(archive_req).await.expect("archive response");
+        assert_eq!(resp.status(), skyzen::StatusCode::OK);
+        assert!(
+            !state.parked_agents.contains("session"),
+            "archiving evicts the parked agent immediately"
+        );
+
+        // Update timezone while archived: a rebuilt agent folds it into the
+        // system prompt directly with no live diff.
+        state.update_config(|config| {
+            config.time.timezone = Some("Europe/London".parse().expect("valid timezone"));
+        });
+        let unarchive_req = hyper::Request::builder()
+            .method("PATCH")
+            .uri("/api/sessions/session")
+            .header("content-type", "application/json")
+            .body(skyzen::Body::from(r#"{"archived":false}"#))
+            .expect("unarchive request");
+        let resp = router.go(unarchive_req).await.expect("unarchive response");
+        assert_eq!(resp.status(), skyzen::StatusCode::OK);
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 2");
+        let req2 = next_turn_request_json(&provider).await;
+        let msgs2 = request_messages_text(&req2);
+        assert!(
+            msgs2[0].contains("Europe/London"),
+            "fresh agent rendered new timezone in system prompt: {}",
+            msgs2[0]
+        );
+        assert!(
+            !msgs2.join("\n").contains("<time_diff "),
+            "rebuilt agent emitted no live time diff"
+        );
+        // The old pre-archive grants handle was orphaned when the agent rebuilt.
+        let extra = tempfile::tempdir().expect("extra");
+        let canonical = extra.path().canonicalize().expect("canonical");
+        let sandbox = crate::session::SessionStore::new(crate::session::MayHomePaths::new(
+            may_dir.path().to_path_buf(),
+        ))
+        .sandbox_dir("session", None);
+        let config_path = crate::session::SessionPaths::new(sandbox).workspace_config();
+        let mut ws = crate::WorkspaceConfig::load(&config_path).expect("load ws");
+        ws.add_workdir(canonical.clone(), None);
+        ws.save(&config_path).expect("save ws");
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("turn 3");
+        assert!(
+            !grants_before
+                .snapshot()
+                .writable
+                .iter()
+                .any(|p| p == &canonical),
+            "pre-archive grants handle no longer belongs to the rebuilt agent"
+        );
+        let rebuilt_grants = state
+            .runtime_service
+            .terminal_grants("session")
+            .expect("rebuilt grants handle");
+        assert!(
+            rebuilt_grants
+                .snapshot()
+                .writable
+                .iter()
+                .any(|p| p == &canonical),
+            "rebuilt agent owns the active grants handle"
+        );
+    }
+
+    /// Changing a profile's home environment keeps a warm parked agent until
+    /// its prompt cache goes cold, then rebuilds on the next turn.
+    #[tokio::test]
+    async fn home_environment_change_waits_for_cold_cache_before_rebuilding() {
+        use crate::agent::idle_compaction_tests::{SESSION_MODEL, StubModel};
+
+        let dir = tempfile::tempdir().expect("dir");
+        let stub = StubModel::spawn(SESSION_MODEL).await;
+        let (state, clock, _scratch) =
+            super::warm_aux_tests::state_with_idle_agent_on(dir.path(), true, &stub).await;
+        let profile_id = state
+            .db()
+            .ensure_default_profiles()
+            .await
+            .expect("default profile");
+        let selector = format!("session::{SESSION_MODEL}");
+        state
+            .db()
+            .create_session_in_profile("session", Some("test"), Some(&selector), Some(&profile_id))
+            .await
+            .expect("profile session");
+        state
+            .db()
+            .update_profile(
+                &profile_id,
+                crate::db::UpdateProfileParams {
+                    name: None,
+                    icon: None,
+                    environment: Some(crate::db::ProfileEnvironmentKind::Container),
+                    container_id: Some(Some("missing-container")),
+                    sort_order: None,
+                    persona: None,
+                    preferences: None,
+                    location_aware: Some(false),
+                },
+            )
+            .await
+            .expect("switch profile to container");
+
         let req = ChatRequest {
             session_id: "session".to_string(),
-            content: "again".to_string(),
+            content: "hello".to_string(),
             attachments: Vec::new(),
             hidden_context_xml: None,
             delivery_mode: crate::session::PendingUserMessageMode::default(),
@@ -5936,8 +6276,8 @@ mod tests {
             .runs()
             .acquire("session")
             .await
-            .expect("acquire run");
-        let prepared = super::prepare_agent_for_request(
+            .expect("acquire warm");
+        let prepared = Box::pin(super::prepare_agent_for_request(
             &state,
             &req,
             guard.fence(),
@@ -5949,17 +6289,58 @@ mod tests {
                 retained_agent: None,
             },
             &TurnKind::Prompt,
-        )
+        ))
         .await
-        .unwrap_or_else(|error| panic!("the next turn prepares: {error}"));
-        assert!(
-            !writable_checkout(&prepared.agent),
-            "the rebuilt agent no longer writes the checkout"
+        .expect("warm host agent is reused despite container switch");
+        assert!(matches!(
+            prepared.agent.environment(),
+            crate::agent::AgentEnvironment::Local
+        ));
+        state.parked_agents.park(
+            &state,
+            "session",
+            prepared.agent,
+            crate::session::RunReleased::already_released(),
         );
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("finish warm");
+
+        // Advance past the cache window so the parked agent goes cold.
+        clock.advance(std::time::Duration::from_hours(1));
         assert!(
-            !state.parked_agents.contains("session"),
-            "the old idle agent was retired, not reused"
+            state
+                .parked_agents
+                .cache_warmth("session")
+                .is_some_and(|warmth| !warmth.is_warm())
         );
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire cold");
+        let result = Box::pin(super::prepare_agent_for_request(
+            &state,
+            &req,
+            guard.fence(),
+            true,
+            true,
+            super::TurnAttempt {
+                provider_attempt: 0,
+                turn_boundary: None,
+                retained_agent: None,
+            },
+            &TurnKind::Prompt,
+        ))
+        .await;
+        assert!(
+            result.is_err(),
+            "cold agent drops instead of reusing host environment and attempts container build"
+        );
+        assert!(!state.parked_agents.contains("session"));
     }
 
     /// The three things the sleep alert requires of the session `/sleep` ran in.

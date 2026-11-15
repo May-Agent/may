@@ -1060,6 +1060,7 @@ pub(super) async fn patch_session(
         {
             if archived {
                 db.archive_session(&id).await.map_err(internal_error)?;
+                state.parked_agents.evict(&id);
             } else {
                 db.unarchive_session(&id).await.map_err(internal_error)?;
             }
