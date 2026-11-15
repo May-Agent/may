@@ -425,6 +425,9 @@ pub struct MayAgent {
     /// The live grants of the session's sandbox: an approved workspace
     /// request reaches the shell through them.
     grants: Grants,
+    /// Daemon-held default-branch checkout roots granted read-only to this
+    /// session; preserved across workspace grant refreshes.
+    readonly_checkouts: Vec<PathBuf>,
     permissions: TerminalPermissionHandler,
     session_id: SessionId,
     may_dir: PathBuf,
@@ -604,6 +607,7 @@ impl MayAgent {
             &config.sandbox_dir,
             (!config.memory_off).then_some(memories_dir.as_path()),
             &skills_dir,
+            &[],
         );
 
         // Job ids, stored outputs and subagent ids lease from the session's
@@ -704,6 +708,11 @@ impl MayAgent {
             policies: PolicySet {
                 managed_bash: crate::command_policy::runs_managed_bash(is_container),
                 refused: refused_reads.clone(),
+                checkout_reads: Some(crate::command_policy::CheckoutReadTracker {
+                    checkouts: config.services.checkouts.clone(),
+                    db: config.db.clone(),
+                    session_id: config.session_id.as_str().to_string(),
+                }),
             },
             slot: ShellSlot::new(),
             ssh_servers,
@@ -807,19 +816,27 @@ impl MayAgent {
                 runtime_system_context.with_instruction(tag::LANGUAGES, languages);
         }
 
-        // Session repo clones: the writable working copy of each repository
-        // the session touches lives under the sandbox; checkouts stay read
-        // mounts. The launch directory's repo is cloned eagerly.
+        // Session repo workspaces: writable working copies live under
+        // `<session>/repos/<dir>`, derived lazily on `repo clone` rather than
+        // eagerly at session creation. Existing workspaces from earlier turns
+        // remain listed in `<repo_clones>`, while GitHub repositories mount
+        // the daemon's read-only default-branch checkout.
         let session_repos = crate::repo_clone::SessionRepos::new(
             session_paths.root(),
             config.session_id.as_str(),
             config.db.clone(),
-        );
-        let mut repo_clones = Vec::new();
-        let staging = crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir();
-        // The session's repository binding names the clone; a GitHub binding
-        // needs no checkout at all. Without one, the launch directory's
-        // repository decides.
+        )
+        .with_checkouts(config.services.checkouts.clone());
+        let repo_clones: Vec<RepoCloneEntry> = session_repos
+            .clones()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| RepoCloneEntry {
+                clone_path: session_repos.path(&record.dir),
+                source: record.source,
+            })
+            .collect();
         let binding = config
             .db
             .get_session(config.session_id.as_str())
@@ -828,38 +845,103 @@ impl MayAgent {
             .map(|stored| crate::session::RepoBinding::parse(&stored))
             .transpose()?;
         let worktree = crate::repo_search::worktree_root(&config.cwd);
-        // The first-contact trust decision picks the clone: full and
-        // prs-only clone the GitHub remote, local-branch clones the checkout
-        // locally; `local` writes the checkout; undecided binds nothing — the
-        // session gate asks before the first turn.
-        let made = match (&binding, &worktree) {
-            (Some(binding), _) => {
-                session_repos
-                    .ensure_clone_of_binding(binding, &workspace.config, &staging)
-                    .await
+        let github_target = match (&binding, &worktree) {
+            (Some(crate::session::RepoBinding::Github(repo)), _) => {
+                let owner_repo = repo.to_string();
+                let cfg = workspace.config.clone();
+                let key = owner_repo.clone();
+                let publishes =
+                    blocking::unblock(move || crate::trust::trust_for_github(&cfg, &key))
+                        .await
+                        .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                publishes.then(|| {
+                    (
+                        owner_repo.clone(),
+                        format!("https://github.com/{owner_repo}.git"),
+                    )
+                })
             }
             (None, Some(worktree)) => {
-                session_repos
-                    .ensure_clone_of(worktree, &workspace.config, &staging)
-                    .await
+                match crate::repo_clone::CloneSource::of(worktree, &workspace.config) {
+                    Ok(Some(crate::repo_clone::CloneSource::Remote { url, owner_repo })) => {
+                        Some((owner_repo, url))
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to resolve repository clone source");
+                        None
+                    }
+                }
             }
-            (None, None) => Ok(None),
+            (Some(crate::session::RepoBinding::Local(_)), _) | (None, None) => None,
         };
-        match made {
-            Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
-                clone_path,
-                source: match (&binding, &worktree) {
-                    (_, Some(worktree)) => crate::fs_utils::display_path(worktree),
-                    (Some(binding), None) => binding.clone_key(),
-                    (None, None) => unreachable!("a clone needs a binding or a checkout"),
-                },
-            }),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, "failed to create session repo clone");
+        let mut readonly_checkouts = Vec::new();
+        let mut readonly_checkout = None;
+        let mut clones_work = match (&binding, &worktree) {
+            (Some(crate::session::RepoBinding::Local(id)), _) => {
+                let cfg = workspace.config.clone();
+                let id = id.clone();
+                let checkout = binding
+                    .as_ref()
+                    .and_then(crate::session::RepoBinding::checkout)
+                    .as_deref()
+                    .map(Path::to_path_buf);
+                checkout
+                    .map_or_else(
+                        || blocking::unblock(|| None),
+                        |c| blocking::unblock(move || crate::trust::trust_for(&cfg, &id, &c)),
+                    )
+                    .await
+                    .is_some_and(crate::trust::TrustLevel::clones_work)
+            }
+            (Some(crate::session::RepoBinding::Github(_)), _) => github_target.is_some(),
+            (None, Some(worktree)) => matches!(
+                crate::repo_clone::CloneSource::of(worktree, &workspace.config),
+                Ok(Some(_))
+            ),
+            (None, None) => false,
+        };
+        if let Some((owner_repo, remote_url)) = github_target {
+            clones_work = true;
+            match config
+                .services
+                .checkouts
+                .ensure_present(&owner_repo, &remote_url)
+                .await
+            {
+                Ok(snapshot) => {
+                    grants.add_readable(&snapshot.root_dir);
+                    readonly_checkouts.push(snapshot.root_dir);
+                    if let Err(error) = config
+                        .db
+                        .seed_seen_checkout_commit(
+                            config.session_id.as_str(),
+                            &owner_repo,
+                            &snapshot.head_sha,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %config.session_id,
+                            repo = %owner_repo,
+                            %error,
+                            "failed to record initial checkout commit"
+                        );
+                    }
+                    if !is_container {
+                        readonly_checkout = Some(snapshot.current_dir.display().to_string());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        repo = %owner_repo,
+                        %error,
+                        "failed to prepare daemon default-branch checkout"
+                    );
+                }
             }
         }
-        let works_in_clone = !repo_clones.is_empty();
+        let works_in_clone = !repo_clones.is_empty() || clones_work;
         if let Some(repo_clones) =
             build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
         {
@@ -1031,6 +1113,7 @@ impl MayAgent {
                     &config.environment,
                     &session_paths,
                     (!is_container).then(|| config.cwd.display().to_string()),
+                    readonly_checkout,
                     &crate::issue::IssueStore::info(&issue_store),
                 ),
             );
@@ -1138,6 +1221,11 @@ impl MayAgent {
             .context_source(loops.alerts())
             .context_source(conditions)
             .context_source(events)
+            .context_source(super::checkout_updates::CheckoutUpdates::new(
+                config.db.clone(),
+                config.services.checkouts.clone(),
+                config.session_id.as_str(),
+            ))
             .context_source(JobReports::new(shell.jobs().events(), job_facts_tx.clone()));
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
@@ -1221,6 +1309,7 @@ impl MayAgent {
             sleep_seen_epoch,
             shell,
             grants,
+            readonly_checkouts,
             permissions,
             session_id: config.session_id,
             may_dir: config.may_dir,
@@ -2077,6 +2166,7 @@ impl MayAgent {
             &self.sandbox_dir,
             (!input.memory_off).then_some(self.memories_dir.as_path()),
             &self.skills_dir,
+            &self.readonly_checkouts,
         );
         if !matches!(self.environment, AgentEnvironment::Container { .. }) {
             self.runtime_system_context
@@ -2282,6 +2372,7 @@ fn sync_grants_with_workspace(
     sandbox_dir: &Path,
     memories_dir: Option<&Path>,
     skills_dir: &Path,
+    readonly_checkouts: &[PathBuf],
 ) {
     let mut desired_writable: std::collections::HashSet<PathBuf> = workspace
         .writable_dirs()
@@ -2300,6 +2391,9 @@ fn sync_grants_with_workspace(
         .cloned()
         .collect();
     desired_readable.insert(skills_dir.to_path_buf());
+    for checkout in readonly_checkouts {
+        desired_readable.insert(checkout.clone());
+    }
     desired_readable.retain(|path| !desired_writable.contains(path));
 
     let current = grants.snapshot();

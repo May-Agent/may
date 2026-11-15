@@ -28,6 +28,8 @@ pub struct RepoContext {
     pub scratch_root: PathBuf,
     /// The git that makes clones.
     pub host: crate::host_git::HostGit,
+    /// Daemon-held default-branch checkouts used to derive GitHub workspaces.
+    pub checkouts: Option<crate::repo_clone::DaemonCheckouts>,
     /// Whether the directory a command runs in is a host path. A container
     /// session's commands run under the container's paths, so its `repo`
     /// acts on the launch repository alone.
@@ -50,11 +52,16 @@ pub enum RepoArgs {
         #[serde(default)]
         set: Option<String>,
     },
-    /// Clone the repository into the session, or name its existing clone.
+    /// Derive a fresh workspace copy-on-write for this repository, or name an
+    /// existing clean workspace when `--new` is omitted.
     Clone {
         /// A directory inside the repository; default where the command runs.
         #[serde(default)]
         path: Option<String>,
+        /// Derive a fresh independent workspace even when another workspace on
+        /// the same repository already exists (for concurrent changes/PRs).
+        #[serde(default)]
+        new: bool,
     },
 }
 
@@ -92,40 +99,71 @@ fn target_dir(context: &RepoContext, cx: &ToolContext, path: Option<&str>) -> Pa
     }
 }
 
-/// `repo clone` for the repository containing `dir`.
-async fn clone_repository(context: &RepoContext, dir: &Path) -> String {
-    let (worktree, key) = match worktree_and_key(dir) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    // Read the decision as it stands now: a `repo trust set` earlier in the
-    // session applies at once.
+/// `repo clone` for the repository containing `dir`, falling back to the
+/// session's repository binding when no checkout sits at `dir`.
+async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -> String {
     let config = match crate::workspace::WorkspaceConfig::load(&config_path(context)) {
         Ok(config) => config,
         Err(e) => return format!("failed to read the workspace config: {e}"),
     };
-    let outcome = match trust::trust_for(&config, &key, &worktree) {
-        None => CloneOutcome::Undecided,
-        Some(level) if !level.clones_work() => CloneOutcome::WritesCheckout,
-        Some(_) => {
-            let repos = crate::repo_clone::SessionRepos::new(
-                &context.session_root,
-                context.session_id.clone(),
-                context.db.clone(),
-            )
-            .with_host(context.host.clone());
-            match repos
-                .ensure_clone_of(&worktree, &config, &context.scratch_root)
+    let mut repos = crate::repo_clone::SessionRepos::new(
+        &context.session_root,
+        context.session_id.clone(),
+        context.db.clone(),
+    )
+    .with_host(context.host.clone());
+    if let Some(checkouts) = &context.checkouts {
+        repos = repos.with_checkouts(checkouts.clone());
+    }
+    let (worktree_display, outcome) = match worktree_and_key(dir) {
+        Ok((worktree, key)) => {
+            let display = worktree.to_string_lossy().into_owned();
+            let outcome = match trust::trust_for(&config, &key, &worktree) {
+                None => CloneOutcome::Undecided,
+                Some(level) if !level.clones_work() => CloneOutcome::WritesCheckout,
+                Some(_) => {
+                    match repos
+                        .request_clone_of(&worktree, &config, &context.scratch_root, create_new)
+                        .await
+                    {
+                        Ok(Some(clone)) => {
+                            CloneOutcome::Cloned(clone.to_string_lossy().into_owned())
+                        }
+                        Ok(None) => CloneOutcome::WritesCheckout,
+                        Err(e) => {
+                            return format!("failed to clone {}: {e}", worktree.display());
+                        }
+                    }
+                }
+            };
+            (display, outcome)
+        }
+        Err(err) => {
+            let binding = context
+                .db
+                .get_session(&context.session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.repo)
+                .and_then(|stored| crate::session::RepoBinding::parse(&stored).ok());
+            let Some(binding) = binding else {
+                return err;
+            };
+            let display = binding.clone_key();
+            let outcome = match repos
+                .request_clone_of_binding(&binding, &config, &context.scratch_root, create_new)
                 .await
             {
                 Ok(Some(clone)) => CloneOutcome::Cloned(clone.to_string_lossy().into_owned()),
                 Ok(None) => CloneOutcome::WritesCheckout,
-                Err(e) => return format!("failed to clone {}: {e}", worktree.display()),
-            }
+                Err(e) => return format!("failed to clone {display}: {e}"),
+            };
+            (display, outcome)
         }
     };
     RepoCloneReport {
-        worktree: &worktree.to_string_lossy(),
+        worktree: &worktree_display,
         outcome,
     }
     .render()
@@ -203,10 +241,11 @@ impl Tool for RepoTool {
 
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         Ok(ToolResult::text(match args {
-            RepoArgs::Clone { path } => {
+            RepoArgs::Clone { path, new } => {
                 clone_repository(
                     &self.context,
                     &target_dir(&self.context, &cx, path.as_deref()),
+                    new,
                 )
                 .await
             }
@@ -305,6 +344,7 @@ pub mod tests {
             session_id: "s1".to_string(),
             scratch_root: scratch.join("staging"),
             host: crate::host_git::HostGit::inherit(),
+            checkouts: None,
             host_paths: true,
         }
     }
@@ -344,7 +384,10 @@ pub mod tests {
         init_repo(&other);
         let session_root = tmp.join("profile/sessions/s1");
         let tool = RepoTool::new(context(&launch, &session_root, &tmp).await);
-        let clone = || RepoArgs::Clone { path: None };
+        let clone = || RepoArgs::Clone {
+            path: None,
+            new: false,
+        };
 
         let undecided = tool.call(clone(), at(&other)).await.expect("call");
         assert!(
@@ -359,7 +402,10 @@ pub mod tests {
         tool.call(set, at(&other)).await.expect("set");
         let first = tool.call(clone(), at(&other)).await.expect("clone");
         let text = first.as_text().unwrap().to_string();
-        assert!(text.contains("is this session's clone"), "{text}");
+        assert!(
+            text.contains("is this session's writable workspace"),
+            "{text}"
+        );
         let clones: Vec<_> = std::fs::read_dir(session_root.join("repos"))
             .expect("repos")
             .map(|e| e.expect("entry").path())
@@ -398,7 +444,13 @@ pub mod tests {
         trust::persist(&config_path(&context), &repo, None, TrustLevel::Local).expect("persist");
         let tool = RepoTool::new(context);
         let result = tool
-            .call(RepoArgs::Clone { path: None }, at(&repo))
+            .call(
+                RepoArgs::Clone {
+                    path: None,
+                    new: false,
+                },
+                at(&repo),
+            )
             .await
             .expect("call");
         assert!(
@@ -418,7 +470,13 @@ pub mod tests {
         let session_root = tmp.join("profile/sessions/s1");
         let tool = SubagentRepoTool::new(context(&repo, &session_root, &tmp).await);
         let result = tool
-            .call(RepoArgs::Clone { path: None }, at(&repo))
+            .call(
+                RepoArgs::Clone {
+                    path: None,
+                    new: false,
+                },
+                at(&repo),
+            )
             .await
             .expect("call");
         assert!(

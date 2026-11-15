@@ -122,6 +122,13 @@ impl MayHomePaths {
         self.root.join("task-validation")
     }
 
+    /// Host directory holding each GitHub repository's daemon-maintained
+    /// read-only default-branch checkout and its active `CoW` generations.
+    #[must_use]
+    pub fn checkouts_dir(&self) -> PathBuf {
+        self.root.join("checkouts")
+    }
+
     /// Host scratch space outside every sandbox: session repository clones
     /// are made and their pushes staged here before anything reaches or
     /// leaves agent-writable space.

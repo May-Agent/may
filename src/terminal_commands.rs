@@ -160,6 +160,8 @@ pub struct SharedServices {
     pub repo_search: RepoSearch,
     /// The per-repository locks serializing `pr` lands.
     pub land_locks: crate::pr::LandLocks,
+    /// Daemon-held per-repo default-branch checkouts.
+    pub checkouts: crate::repo_clone::DaemonCheckouts,
 }
 
 impl SharedServices {
@@ -169,6 +171,9 @@ impl SharedServices {
         Self {
             repo_search: RepoSearch::new(may_dir),
             land_locks: crate::pr::LandLocks::default(),
+            checkouts: crate::repo_clone::DaemonCheckouts::new(
+                crate::session::MayHomePaths::new(may_dir.to_path_buf()).checkouts_dir(),
+            ),
         }
     }
 }
@@ -287,13 +292,17 @@ where
             config.services.repo_search.clone(),
             config.cwd.clone(),
             Some(config.db.clone()),
-            Some(crate::repo_clone::SessionRepos::new(
-                &config.sandbox_dir,
-                config.session_id.clone(),
-                config.db.clone(),
-            )),
+            Some(
+                crate::repo_clone::SessionRepos::new(
+                    &config.sandbox_dir,
+                    config.session_id.clone(),
+                    config.db.clone(),
+                )
+                .with_checkouts(config.services.checkouts.clone()),
+            ),
             config.workspace_config.clone(),
-        ),
+        )
+        .with_checkouts(config.services.checkouts.clone()),
     );
     let issue_search = IssueSearch::new(
         config.db.clone(),
@@ -377,6 +386,7 @@ where
         signing,
         github_api: crate::pr::PrContext::default_github_api(),
         land_locks: config.services.land_locks.clone(),
+        checkouts: Some(config.services.checkouts.clone()),
         task_events: Some(config.task_events.clone()),
         publish: config.publish_gate.clone(),
         ci: config.ask_user.as_ref().map(|runtime| crate::pr::CiWatch {
@@ -408,6 +418,7 @@ where
         session_id: config.session_id.clone(),
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         host: config.git.clone(),
+        checkouts: Some(config.services.checkouts.clone()),
         host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());

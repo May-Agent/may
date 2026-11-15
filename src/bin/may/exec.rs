@@ -453,6 +453,7 @@ async fn build_exec_shell(
                 may_agent::AgentEnvironment::Container { .. }
             )),
             refused: may_agent::command_policy::RefusedReads::default(),
+            checkout_reads: None,
         },
         slot: ShellSlot::new(),
         ssh_servers: ssh_server.into_iter().collect(),

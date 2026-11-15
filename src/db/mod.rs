@@ -3,6 +3,7 @@
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 mod cache_misses;
+mod checkout_state;
 mod ci;
 mod cloud_session;
 mod common;
@@ -135,6 +136,7 @@ impl ChatDb {
 
     async fn apply_schema(db: &SkyDb) -> Result<(), ChatDbError> {
         Self::initialize_schema(db).await?;
+        Self::migrate_session_repo_clones(db).await?;
         Self::ensure_session_context_snapshot_table(db).await?;
         Self::ensure_search_outbox(db).await?;
         Self::ensure_session_interval_triggers(db).await

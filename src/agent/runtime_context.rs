@@ -835,20 +835,24 @@ pub fn build_environment(
 struct SessionTemplate<'a> {
     session_dir: String,
     launch_dir: Option<String>,
+    readonly_checkout: Option<String>,
     issue_repository: Option<&'a str>,
 }
 
 /// The session section, where the values only this session has are stated:
-/// its directory, the launch directory and the issue repository.
+/// its directory, the launch directory, the optional read-only daemon checkout,
+/// and the issue repository.
 pub fn build_session(
     environment: &AgentEnvironment,
     session_paths: &SessionPaths,
     launch_dir: Option<String>,
+    readonly_checkout: Option<String>,
     issue_backend: &crate::issue::IssueBackendInfo,
 ) -> String {
     SessionTemplate {
         session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
         launch_dir,
+        readonly_checkout,
         issue_repository: issue_backend.repository.as_deref(),
     }
     .render()

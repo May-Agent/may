@@ -43,8 +43,8 @@ impl ChatDb {
     /// Record a clone of `session_id`.
     ///
     /// # Errors
-    /// Fails on database errors, including a second clone for the same
-    /// repository identity.
+    /// Fails on database errors, including a second clone in the same
+    /// directory.
     pub async fn insert_repo_clone(
         &self,
         session_id: &str,

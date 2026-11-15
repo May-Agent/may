@@ -7,6 +7,7 @@ mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 pub mod cache_miss;
+pub mod checkout_updates;
 pub(crate) mod ci_alert;
 pub(crate) mod ci_tool;
 pub mod command_cards;

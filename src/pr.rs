@@ -105,6 +105,8 @@ pub struct PrContext {
     pub github_api: GitHubRest<PrTokenSource>,
     /// The per-repository land locks every session of the daemon shares.
     pub land_locks: LandLocks,
+    /// Daemon-held per-repo default-branch checkouts updated when GitHub PRs merge.
+    pub checkouts: Option<crate::repo_clone::DaemonCheckouts>,
     /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
     /// rejected or closes.
     pub task_events: Option<crate::harness::working_document::WorkEvents>,
@@ -225,8 +227,13 @@ impl PrStore {
     #[must_use]
     pub fn new(context: PrContext, sandbox: CloneSandbox) -> Self {
         let repos = context.db.clone().map(|db| {
-            SessionRepos::new(&context.session_root, context.session_id.clone(), db)
-                .with_host(context.signing.host().clone())
+            let mut repos =
+                SessionRepos::new(&context.session_root, context.session_id.clone(), db)
+                    .with_host(context.signing.host().clone());
+            if let Some(checkouts) = context.checkouts.clone() {
+                repos = repos.with_checkouts(checkouts);
+            }
+            repos
         });
         Self {
             context,
@@ -248,24 +255,32 @@ impl PrStore {
             .ok_or_else(|| PrError::Resolve("pr requires the history database".to_string()))
     }
 
-    /// Which repo does `pr` mean: `--repo` wins, then the session's only
-    /// clone, then the cwd's repository (cloned on demand).
+    /// Which repo does `pr` mean: `--repo` wins (preferring an exact workspace
+    /// directory name), then the session's unique workspace matching `cwd` or
+    /// binding, then cloning on demand when none exists yet.
     async fn resolve(&self, repo: Option<&str>) -> Result<Resolved, PrError> {
         let repos = self.repos()?;
         let clones = repos.clones().await?;
         if let Some(name) = repo {
-            if let Some(record) = clones
-                .into_iter()
-                .find(|c| c.repo_key == name || c.dir.as_str() == name)
-            {
+            if let Some(record) = clones.iter().find(|c| c.dir.as_str() == name) {
                 return Ok(Resolved {
                     dir: repos.path(&record.dir),
-                    record,
+                    record: record.clone(),
                 });
             }
-            return Err(PrError::Resolve(format!("no session clone named {name}")));
+            let by_key: Vec<_> = clones.iter().filter(|c| c.repo_key == name).collect();
+            return match by_key.as_slice() {
+                [record] => Ok(Resolved {
+                    dir: repos.path(&record.dir),
+                    record: (*record).clone(),
+                }),
+                [] => Err(PrError::Resolve(format!("no session clone named {name}"))),
+                _ => Err(PrError::Resolve(format!(
+                    "several session workspaces exist for {name}; run inside one or pass its workspace directory name"
+                ))),
+            };
         }
-        // The repository the cwd sits in, when it has a clone.
+        // The repository the cwd sits in, when it has one unambiguous workspace.
         let cwd_key = crate::repo_search::worktree_root(&self.context.cwd)
             .and_then(|worktree| {
                 crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
@@ -273,22 +288,42 @@ impl PrStore {
                     .flatten()
             })
             .map(|source| source.key());
-        if let Some(record) = cwd_key
-            .as_deref()
-            .and_then(|key| clones.iter().find(|c| c.repo_key == key))
-        {
-            return Ok(Resolved {
-                dir: repos.path(&record.dir),
-                record: record.clone(),
-            });
+        if let Some(key) = cwd_key.as_deref() {
+            let matching: Vec<_> = clones.iter().filter(|c| c.repo_key == key).collect();
+            match matching.as_slice() {
+                [record] => {
+                    return Ok(Resolved {
+                        dir: repos.path(&record.dir),
+                        record: (*record).clone(),
+                    });
+                }
+                [] => {}
+                _ => {
+                    return Err(PrError::Resolve(
+                        "several session clones exist; run inside one or pass --repo".to_string(),
+                    ));
+                }
+            }
         }
         // The session's own binding names its repository, checkout or not.
         if let Some(binding) = self.session_binding().await? {
-            if let Some(record) = clones.iter().find(|c| c.repo_key == binding.clone_key()) {
-                return Ok(Resolved {
-                    dir: repos.path(&record.dir),
-                    record: record.clone(),
-                });
+            let matching: Vec<_> = clones
+                .iter()
+                .filter(|c| c.repo_key == binding.clone_key())
+                .collect();
+            match matching.as_slice() {
+                [record] => {
+                    return Ok(Resolved {
+                        dir: repos.path(&record.dir),
+                        record: (*record).clone(),
+                    });
+                }
+                [] => {}
+                _ => {
+                    return Err(PrError::Resolve(
+                        "several session clones exist; run inside one or pass --repo".to_string(),
+                    ));
+                }
             }
             let dir = repos
                 .ensure_clone_of_binding(
@@ -349,6 +384,103 @@ impl PrStore {
         Self::registered(repos, dir).await
     }
 
+    /// Resolve the workspace for an existing PR `#number`, consulting
+    /// `pr_workspaces` when `repo` leaves ambiguity between multiple concurrent
+    /// workspaces on the same repository.
+    async fn resolve_for_pr(
+        &self,
+        repo: Option<&str>,
+        number: i64,
+    ) -> Result<(Resolved, crate::db::PrRow), PrError> {
+        let repos = self.repos()?;
+        let clones = repos.clones().await?;
+        let db = self.db()?;
+        // Exact workspace directory always wins.
+        if let Some(name) = repo
+            && let Some(record) = clones.iter().find(|c| c.dir.as_str() == name)
+        {
+            let pr = db
+                .get_pr(&record.repo_key, number)
+                .await?
+                .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+            return Ok((
+                Resolved {
+                    dir: repos.path(&record.dir),
+                    record: record.clone(),
+                },
+                pr,
+            ));
+        }
+        let candidate_key = if let Some(name) = repo {
+            Some(name.to_string())
+        } else if let Some(key) = crate::repo_search::worktree_root(&self.context.cwd)
+            .and_then(|w| {
+                crate::repo_clone::CloneSource::of(&w, &self.context.workspace_config)
+                    .ok()
+                    .flatten()
+            })
+            .map(|s| s.key())
+        {
+            Some(key)
+        } else if let Some(binding) = self.session_binding().await? {
+            Some(binding.clone_key())
+        } else {
+            let mut keys: Vec<String> = clones.iter().map(|c| c.repo_key.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            if keys.len() == 1 { keys.pop() } else { None }
+        };
+        if let Some(key) = candidate_key
+            && let Some(pr) = db.get_pr(&key, number).await?
+            && let Some(bound_dir) = db.pr_workspace(pr.id).await?
+            && let Some(record) = clones
+                .iter()
+                .find(|c| c.repo_key == key && c.dir.as_str() == bound_dir)
+        {
+            return Ok((
+                Resolved {
+                    dir: repos.path(&record.dir),
+                    record: record.clone(),
+                },
+                pr,
+            ));
+        }
+        let resolved = self.resolve(repo).await?;
+        let pr = db
+            .get_pr(&resolved.record.repo_key, number)
+            .await?
+            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        Ok((resolved, pr))
+    }
+
+    /// Resolve only the repository identity for read-only queries (`list`, `show`).
+    async fn resolve_repo_key(&self, repo: Option<&str>) -> Result<String, PrError> {
+        let clones = self.repos()?.clones().await?;
+        if let Some(name) = repo {
+            if let Some(record) = clones
+                .iter()
+                .find(|c| c.dir.as_str() == name || c.repo_key == name)
+            {
+                return Ok(record.repo_key.clone());
+            }
+            return Err(PrError::Resolve(format!("no session clone named {name}")));
+        }
+        let resolved = self.resolve(None).await.or_else(|err| {
+            let mut keys: Vec<String> = clones.iter().map(|c| c.repo_key.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            if let [only] = keys.as_slice() {
+                Ok(Resolved {
+                    dir: PathBuf::new(),
+                    record: clones.iter().find(|c| &c.repo_key == only).unwrap().clone(),
+                })
+            } else {
+                Err(err)
+            }
+        })?;
+        Ok(resolved.record.repo_key)
+    }
+
     /// The repository the session is bound to, when it has a binding.
     async fn session_binding(&self) -> Result<Option<crate::session::RepoBinding>, PrError> {
         let row = self.db()?.get_session(&self.context.session_id).await?;
@@ -383,15 +515,31 @@ impl PrStore {
         hold: bool,
     ) -> Result<String, PrError> {
         let resolved = self.resolve(repo).await?;
-        if self
+        let has_workspace_pr = self
+            .db()?
+            .open_pr_for_workspace(
+                &resolved.record.repo_key,
+                &self.context.session_id,
+                resolved.record.dir.as_str(),
+            )
+            .await?
+            .is_some();
+        let has_legacy_pr = if has_workspace_pr {
+            false
+        } else if let Some(existing) = self
             .db()?
             .open_pr_for(&resolved.record.repo_key, &self.context.session_id)
             .await?
-            .is_some()
         {
+            // Only treat a live PR on the same repo as belonging to this
+            // workspace when it has no bound workspace of its own.
+            self.db()?.pr_workspace(existing.id).await?.is_none()
+        } else {
+            false
+        };
+        if has_workspace_pr || has_legacy_pr {
             return Err(PrError::State(
-                "this session already has an open PR on this repo — merge or close it first"
-                    .to_string(),
+                "this workspace already has an open PR — merge or close it first".to_string(),
             ));
         }
         let dirty = uncommitted_changes(&self.sandbox, &resolved.dir).await?;
@@ -476,6 +624,8 @@ impl PrStore {
             .await?;
         // The PR owns its commit from here on: pin it once, land only it.
         let db = self.db()?;
+        db.set_pr_workspace(pr.id, resolved.record.dir.as_str())
+            .await?;
         if resolved.record.local {
             db.set_pr_branch(pr.id, &pin_ref(pr.number)).await?;
             self.pin(&resolved, pr.number, &head_sha).await?;
@@ -500,7 +650,8 @@ impl PrStore {
         if hold {
             return Ok(format!("opened PR #{} (hold)", pr.number));
         }
-        self.merge(pr.number, repo).await
+        self.merge(pr.number, Some(resolved.record.dir.as_str()))
+            .await
     }
 
     /// `pr merge <n>` — checks, preflight, serialized land, cleanup. Also
@@ -512,12 +663,7 @@ impl PrStore {
     /// # Panics
     /// Never: the merge report renders for every input.
     pub async fn merge(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
@@ -618,12 +764,7 @@ impl PrStore {
     /// # Errors
     /// Fails on ownership or a terminal state.
     pub async fn close(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
@@ -661,6 +802,8 @@ impl PrStore {
             )
             .await;
         }
+        self.retire_closed_clone(&resolved, pr.head_sha.as_deref())
+            .await?;
         Ok(format!("closed PR #{number}"))
     }
 
@@ -670,12 +813,7 @@ impl PrStore {
     /// # Errors
     /// Fails on ownership, a terminal state, or a dirty clone.
     pub async fn update(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
@@ -738,12 +876,7 @@ impl PrStore {
     /// # Errors
     /// Fails when the PR does not exist.
     pub async fn adopt(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (_resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id == self.context.session_id {
             return Ok(format!("PR #{number} is already this session's"));
         }
@@ -761,15 +894,13 @@ impl PrStore {
     /// Fails on database errors.
     pub async fn list(&self, repo: Option<&str>, filter: PrFilter) -> Result<String, PrError> {
         let key = if let Some(name) = repo {
-            let resolved = self.resolve(Some(name)).await?;
-            Some(resolved.record.repo_key)
+            Some(self.resolve_repo_key(Some(name)).await?)
         } else {
             let clones = self.repos()?.clones().await?;
-            if clones.len() == 1 {
-                Some(clones[0].repo_key.clone())
-            } else {
-                None
-            }
+            let mut keys: Vec<String> = clones.into_iter().map(|c| c.repo_key).collect();
+            keys.sort();
+            keys.dedup();
+            if keys.len() == 1 { keys.pop() } else { None }
         };
         let rows = self.db()?.list_prs(key.as_deref(), filter).await?;
         if rows.is_empty() {
@@ -815,12 +946,7 @@ impl PrStore {
     /// # Errors
     /// Fails when the PR does not exist.
     pub async fn show(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         let events = self.db()?.pr_events(pr.id).await?;
         let orphaned = self.db()?.get_session(&pr.session_id).await?.is_none();
         let mut out = format!(
@@ -1101,6 +1227,15 @@ impl PrStore {
                     crate::harness::working_document::WorkEvent::PullRequestMerged,
                 );
                 let pull_sync = self.pull_sync(&resolved.record, &owner_repo).await;
+                if let Some(checkouts) = &self.context.checkouts
+                    && let Err(error) = checkouts.refresh_existing(&resolved.record.repo_key).await
+                {
+                    tracing::warn!(
+                        %error,
+                        repo = %resolved.record.repo_key,
+                        "failed to refresh daemon checkout after GitHub PR merged"
+                    );
+                }
                 let clone = self.retire_clone(resolved, head_sha).await?;
                 let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
                 Ok(PrMerged {
@@ -1129,6 +1264,7 @@ impl PrStore {
                             pr,
                             crate::harness::working_document::WorkEvent::PullRequestClosed,
                         );
+                        let _ = self.retire_closed_clone(resolved, Some(head_sha)).await;
                         Err(PrError::State(report))
                     }
                     merge_watch::Stopped::CheckFailed(_) => {
@@ -1393,6 +1529,32 @@ impl PrStore {
             .await?
             .is_empty();
         let same = self.head_sha(resolved).await? == landed;
+        if clean && same {
+            self.repos()?.delete_clone(&resolved.record.dir).await?;
+            Ok(CloneFate::Deleted)
+        } else {
+            Ok(CloneFate::Kept)
+        }
+    }
+
+    /// After closing a PR, delete its workspace when the directory is missing
+    /// or holds no uncommitted work beyond the PR commit.
+    async fn retire_closed_clone(
+        &self,
+        resolved: &Resolved,
+        pinned: Option<&str>,
+    ) -> Result<CloneFate, PrError> {
+        if !resolved.dir.exists() {
+            self.repos()?.delete_clone(&resolved.record.dir).await?;
+            return Ok(CloneFate::Deleted);
+        }
+        let clean = uncommitted_changes(&self.sandbox, &resolved.dir)
+            .await?
+            .is_empty();
+        let same = match pinned {
+            Some(sha) if sha != "base" => self.head_sha(resolved).await? == sha,
+            _ => true,
+        };
         if clean && same {
             self.repos()?.delete_clone(&resolved.record.dir).await?;
             Ok(CloneFate::Deleted)
@@ -2172,6 +2334,7 @@ mod tests {
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
                     land_locks: LandLocks::default(),
+                    checkouts: None,
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -2238,6 +2401,7 @@ mod tests {
                         base,
                     ),
                     land_locks: LandLocks::default(),
+                    checkouts: None,
                     task_events: None,
                     ci: None,
                     publish: None,
@@ -2698,6 +2862,7 @@ mod tests {
                 signing: fx.signing(id),
                 github_api,
                 land_locks: LandLocks::default(),
+                checkouts: None,
                 task_events: None,
                 ci: None,
                 publish: None,
@@ -2949,6 +3114,7 @@ mod tests {
                 signing: fx.signing(id),
                 github_api: PrContext::default_github_api(),
                 land_locks: LandLocks::default(),
+                checkouts: None,
                 task_events: None,
                 ci: None,
                 publish: None,
@@ -3717,6 +3883,86 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_prs_on_same_repo_open_land_and_retire_own_workspace() {
+        let fx = Fixture::new().await;
+        let config_file = fx.tmp.path().join("workspace.toml");
+        crate::trust::persist(
+            &config_file,
+            &fx.checkout,
+            None,
+            crate::trust::TrustLevel::LocalBranch,
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_file).unwrap();
+        let repos = SessionRepos::new(&fx.session_root("s1"), "s1", fx.db.clone());
+        let ws1 = repos
+            .request_clone_of(&fx.checkout, &config, &fx.scratch_root(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let ws2 = repos
+            .request_clone_of(&fx.checkout, &config, &fx.scratch_root(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ws1, ws2);
+        assert_eq!(fx.db.list_repo_clones("s1").await.unwrap().len(), 2);
+
+        fx.user.identify(&ws1);
+        fx.user.identify(&ws2);
+        commit_file(&ws1, "one.txt");
+        commit_file(&ws2, "two.txt");
+
+        let dir1 = ws1.file_name().unwrap().to_str().unwrap().to_string();
+        let dir2 = ws2.file_name().unwrap().to_str().unwrap().to_string();
+
+        let store = PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: "s1".to_string(),
+                session_root: fx.session_root("s1"),
+                scratch_root: fx.scratch_root(),
+                cwd: fx.checkout.clone(),
+                workspace_config: config,
+                review: None,
+                signing: fx.signing("s1"),
+                github_api: PrContext::default_github_api(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+            },
+            fx.sandbox("s1").await,
+        );
+
+        let r1 = store
+            .open(Some(&dir1), Some("pr one"), None, true)
+            .await
+            .unwrap();
+        assert!(r1.contains("PR #1"), "{r1}");
+        let r2 = store
+            .open(Some(&dir2), Some("pr two"), None, true)
+            .await
+            .unwrap();
+        assert!(r2.contains("PR #2"), "{r2}");
+
+        // Closing PR #1 deletes only ws1, leaving ws2 intact.
+        store.close(1, None).await.unwrap();
+        assert!(!ws1.exists());
+        assert!(ws2.exists());
+        assert_eq!(fx.db.list_repo_clones("s1").await.unwrap().len(), 1);
+
+        // Merging PR #2 lands two.txt and deletes ws2.
+        let merged = store.merge(2, None).await.unwrap();
+        assert!(merged.contains("merged PR #2"), "{merged}");
+        assert!(!ws2.exists());
+        assert!(fx.checkout.join("two.txt").exists());
+        assert!(!fx.checkout.join("one.txt").exists());
+        assert!(fx.db.list_repo_clones("s1").await.unwrap().is_empty());
+    }
+
     fn mock_review(
         reply: &str,
         env: crate::harness::publish_review::LocalEnvironment,
@@ -4010,6 +4256,7 @@ mod tests {
                     signing: fx.signing("s-upd"),
                     github_api: PrContext::default_github_api(),
                     land_locks: LandLocks::default(),
+                    checkouts: None,
                     task_events: None,
                     ci: None,
                     publish: None,

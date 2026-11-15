@@ -272,6 +272,68 @@ impl ChatDb {
         .await?)
     }
 
+    /// The session's open PR in workspace `dir` on `repo_key`, when one exists.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn open_pr_for_workspace(
+        &self,
+        repo_key: &str,
+        session_id: &str,
+        dir: &str,
+    ) -> Result<Option<PrRow>, ChatDbError> {
+        let Some(project_id) = self.find_project(repo_key).await? else {
+            return Ok(None);
+        };
+        Ok(query!(
+            self.db,
+            "SELECT p.* FROM prs AS p INNER JOIN pr_workspaces AS w ON w.pr_id = p.id WHERE p.project_id = ? AND p.session_id = ? AND w.dir = ?",
+            project_id,
+            session_id,
+            dir
+        )
+        .fetch_all::<PrRow>()
+        .await?
+        .into_iter()
+        .find(|row| row.state.is_live()))
+    }
+
+    /// Record the clone directory name under `<session>/repos/` bound to `pr_id`.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn set_pr_workspace(&self, pr_id: i64, dir: &str) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "INSERT INTO pr_workspaces (pr_id, dir) VALUES (?, ?) ON CONFLICT (pr_id) DO UPDATE SET dir = excluded.dir",
+            pr_id,
+            dir
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// The clone directory name under `<session>/repos/` bound to `pr_id`, if
+    /// recorded.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn pr_workspace(&self, pr_id: i64) -> Result<Option<String>, ChatDbError> {
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct DirRow {
+            dir: String,
+        }
+        let row = query!(
+            self.db,
+            "SELECT dir FROM pr_workspaces WHERE pr_id = ?",
+            pr_id
+        )
+        .fetch_optional::<DirRow>()
+        .await?;
+        Ok(row.map(|r| r.dir))
+    }
+
     /// The session's open PR on a project, when one exists.
     ///
     /// # Errors

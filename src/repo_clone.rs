@@ -21,6 +21,11 @@
 //! Subagents get child clones of a session clone via [`SessionRepos::child_clone`];
 //! their base is always a commit, so a run's work is `git diff base..head`.
 
+mod checkouts;
+pub use checkouts::{
+    CheckoutRefresh, CheckoutSnapshot, DaemonCheckouts, GenerationLease, cow_copy_dir,
+};
+
 use std::path::{Path, PathBuf};
 
 use aither_core::llm::CommandStream;
@@ -329,6 +334,9 @@ pub struct SessionRepos {
     db: ChatDb,
     /// The git that makes clones.
     host: HostGit,
+    /// Daemon-held default-branch checkouts used to derive GitHub workspaces
+    /// copy-on-write without re-cloning over the network.
+    checkouts: Option<DaemonCheckouts>,
 }
 
 impl SessionRepos {
@@ -341,6 +349,7 @@ impl SessionRepos {
             session_id: session_id.into(),
             db,
             host: HostGit::inherit(),
+            checkouts: None,
         }
     }
 
@@ -348,6 +357,13 @@ impl SessionRepos {
     #[must_use]
     pub fn with_host(mut self, host: HostGit) -> Self {
         self.host = host;
+        self
+    }
+
+    /// Derive GitHub workspaces copy-on-write from `checkouts`.
+    #[must_use]
+    pub fn with_checkouts(mut self, checkouts: DaemonCheckouts) -> Self {
+        self.checkouts = Some(checkouts);
         self
     }
 
@@ -405,6 +421,188 @@ impl SessionRepos {
                 local: c.local,
             })
             .collect())
+    }
+
+    /// Every clone serving `repo_key`.
+    ///
+    /// # Errors
+    /// Fails when the registry cannot be read.
+    pub async fn clones_for(&self, repo_key: &str) -> Result<Vec<CloneRecord>, RepoCloneError> {
+        Ok(self
+            .clones()
+            .await?
+            .into_iter()
+            .filter(|c| c.repo_key == repo_key)
+            .collect())
+    }
+
+    /// Pick the next unused single-component directory name for `repo_key`:
+    /// `<base>-<8hex>` when free, otherwise `-2`, `-3`, ...
+    async fn next_clone_dir(&self, repo_key: &str) -> Result<CloneDir, RepoCloneError> {
+        let base = CloneDir::for_repo_key(repo_key);
+        let existing: std::collections::HashSet<String> =
+            self.clones().await?.into_iter().map(|c| c.dir.0).collect();
+        if !existing.contains(base.as_str()) && !real_dir_exists(&self.path(&base))? {
+            return Ok(base);
+        }
+        let mut suffix = 2usize;
+        loop {
+            let candidate = CloneDir(format!("{}-{suffix}", base.as_str()));
+            if !existing.contains(candidate.as_str()) && !real_dir_exists(&self.path(&candidate))? {
+                return Ok(candidate);
+            }
+            suffix += 1;
+        }
+    }
+
+    /// Derive a fresh independent workspace for `checkout` when `create_new` is
+    /// true or existing workspaces already carry local changes/commits, live PRs,
+    /// or are behind the refreshed daemon checkout; otherwise reuse an untouched
+    /// clean workspace.
+    ///
+    /// # Errors
+    /// Fails when the checkout's identity cannot be read, git fails, or the
+    /// registry cannot be read or written.
+    pub async fn request_clone_of(
+        &self,
+        checkout: &Path,
+        config: &crate::workspace::WorkspaceConfig,
+        staging: &Path,
+        create_new: bool,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        let Some(source) = CloneSource::of(checkout, config)? else {
+            return Ok(None);
+        };
+        if !create_new && let Some(reusable) = self.reusable_untouched_clone(&source).await? {
+            return Ok(Some(reusable));
+        }
+        Ok(Some(match source {
+            CloneSource::Remote { url, owner_repo } => {
+                self.create_remote_clone(&url, &owner_repo, staging, None)
+                    .await?
+            }
+            CloneSource::Local { identity } => {
+                self.create_local_clone(checkout, &identity, staging, false)
+                    .await?
+            }
+        }))
+    }
+
+    /// Derive a fresh independent workspace from a session binding.
+    ///
+    /// # Errors
+    /// Fails when git fails or the registry cannot be written.
+    pub async fn request_clone_of_binding(
+        &self,
+        binding: &crate::session::RepoBinding,
+        config: &crate::workspace::WorkspaceConfig,
+        staging: &Path,
+        create_new: bool,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        match binding {
+            crate::session::RepoBinding::Github(repository) => {
+                let owner_repo = repository.to_string();
+                let publishes = {
+                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
+                        .await
+                }
+                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                if !publishes {
+                    return Ok(None);
+                }
+                let url = format!("https://github.com/{owner_repo}.git");
+                let source = CloneSource::Remote {
+                    url: url.clone(),
+                    owner_repo: owner_repo.clone(),
+                };
+                if !create_new
+                    && let Some(reusable) = self.reusable_untouched_clone(&source).await?
+                {
+                    return Ok(Some(reusable));
+                }
+                Ok(Some(
+                    self.create_remote_clone(&url, &owner_repo, staging, None)
+                        .await?,
+                ))
+            }
+            crate::session::RepoBinding::Local(_) => {
+                if !create_new && let Some(existing) = self.clone_for(&binding.clone_key()).await? {
+                    return Ok(Some(existing));
+                }
+                self.ensure_clone_of_binding(binding, config, staging).await
+            }
+        }
+    }
+
+    async fn reusable_untouched_clone(
+        &self,
+        source: &CloneSource,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        let key = source.key();
+        let existing = self.clones_for(&key).await?;
+        let Some(first) = existing.first() else {
+            return Ok(None);
+        };
+        if existing.len() > 1 {
+            return Ok(None);
+        }
+        let dir = self.path(&first.dir);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        // A workspace with a live PR stays dedicated to that PR.
+        if self
+            .db
+            .open_pr_for_workspace(&key, &self.session_id, first.dir.as_str())
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        // For GitHub workspaces backed by `DaemonCheckouts`, refresh the daemon
+        // checkout first and only reuse an untouched workspace if it already
+        // matches the remote HEAD.
+        let expected_head = match (source, &self.checkouts) {
+            (CloneSource::Remote { url, owner_repo }, Some(checkouts)) => {
+                Some(checkouts.refresh(owner_repo, url).await?.snapshot.head_sha)
+            }
+            _ => None,
+        };
+        let host = self.host.clone();
+        let dir_check = dir.clone();
+        let clean_and_current = blocking::unblock(move || -> bool {
+            let Ok(status) = host.output(Some(&dir_check), &["status", "--porcelain"]) else {
+                return false;
+            };
+            if !status.trim().is_empty() {
+                return false;
+            }
+            let Ok(head) = host.output(Some(&dir_check), &["rev-parse", "HEAD"]) else {
+                return false;
+            };
+            let head = head.trim();
+            if let Some(expected) = expected_head {
+                return head == expected;
+            }
+            let upstream_ref = if host
+                .output(
+                    Some(&dir_check),
+                    &["rev-parse", "--verify", "upstream/HEAD"],
+                )
+                .is_ok()
+            {
+                "upstream/HEAD"
+            } else {
+                "origin/HEAD"
+            };
+            if let Ok(upstream_head) = host.output(Some(&dir_check), &["rev-parse", upstream_ref]) {
+                return head == upstream_head.trim();
+            }
+            true
+        })
+        .await;
+        Ok(clean_and_current.then_some(dir))
     }
 
     /// The clone directory serving `repo_key`, when one exists.
@@ -629,6 +827,39 @@ impl SessionRepos {
         self.local_clone(checkout, repo_key, staging, true).await
     }
 
+    async fn create_local_clone(
+        &self,
+        checkout: &Path,
+        repo_key: &Path,
+        staging: &Path,
+        with_wip: bool,
+    ) -> Result<PathBuf, RepoCloneError> {
+        let key = repo_key.to_string_lossy().into_owned();
+        let clone_dir = self.next_clone_dir(&key).await?;
+        let dir = self.path(&clone_dir);
+        let base = self
+            .clone_staged(
+                vec![
+                    "--local".to_string(),
+                    "--no-hardlinks".to_string(),
+                    checkout.to_string_lossy().into_owned(),
+                ],
+                staging,
+                &clone_dir,
+                with_wip.then_some(checkout),
+            )
+            .await?;
+        self.register(
+            key,
+            &clone_dir,
+            checkout.to_string_lossy().into_owned(),
+            true,
+            base,
+        )
+        .await?;
+        Ok(dir)
+    }
+
     async fn local_clone(
         &self,
         checkout: &Path,
@@ -715,6 +946,76 @@ impl SessionRepos {
             .await
     }
 
+    async fn create_remote_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        wip_of: Option<&Path>,
+    ) -> Result<PathBuf, RepoCloneError> {
+        let clone_dir = self.next_clone_dir(repo_key).await?;
+        let dir = self.path(&clone_dir);
+        let base = self
+            .remote_clone_into_dir(url, repo_key, staging, &clone_dir, wip_of)
+            .await?;
+        self.register(
+            repo_key.to_string(),
+            &clone_dir,
+            url.to_string(),
+            false,
+            base,
+        )
+        .await?;
+        Ok(dir)
+    }
+
+    async fn remote_clone_into_dir(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        clone_dir: &CloneDir,
+        wip_of: Option<&Path>,
+    ) -> Result<Option<String>, RepoCloneError> {
+        if let Some(checkouts) = &self.checkouts {
+            let staging_buf = staging.to_path_buf();
+            let scratch = blocking::unblock(move || {
+                std::fs::create_dir_all(&staging_buf)?;
+                tempfile::Builder::new()
+                    .prefix("cow-")
+                    .tempdir_in(&staging_buf)
+            })
+            .await?;
+            let staged = scratch.path().join("repo");
+            checkouts.derive_workspace(repo_key, url, &staged).await?;
+            let wip_of_buf = wip_of.map(Path::to_path_buf);
+            let session_root = self.session_root.clone();
+            let dir_owned = clone_dir.clone();
+            let host = self.host.clone();
+            return blocking::unblock(move || {
+                let base = wip_of_buf
+                    .map(|checkout| wip::commit_onto(&host, &checkout, &staged))
+                    .transpose()?
+                    .flatten();
+                std::fs::create_dir_all(&session_root)?;
+                confined::install_clone(&session_root, &staged, &dir_owned)?;
+                Ok(base)
+            })
+            .await;
+        }
+        self.clone_staged(
+            vec![
+                "--origin".to_string(),
+                "upstream".to_string(),
+                url.to_string(),
+            ],
+            staging,
+            clone_dir,
+            wip_of,
+        )
+        .await
+    }
+
     async fn remote_clone(
         &self,
         url: &str,
@@ -739,16 +1040,7 @@ impl SessionRepos {
             return Ok(dir);
         }
         let base = self
-            .clone_staged(
-                vec![
-                    "--origin".to_string(),
-                    "upstream".to_string(),
-                    url.to_string(),
-                ],
-                staging,
-                &clone_dir,
-                wip_of,
-            )
+            .remote_clone_into_dir(url, repo_key, staging, &clone_dir, wip_of)
             .await?;
         self.register(
             repo_key.to_string(),
@@ -1106,6 +1398,7 @@ pub(crate) mod test_sandbox {
                 policies: crate::command_policy::PolicySet {
                     managed_bash: crate::command_policy::runs_managed_bash(false),
                     refused: crate::command_policy::RefusedReads::default(),
+                    checkout_reads: None,
                 },
                 slot: crate::ipc::ShellSlot::new(),
                 ssh_servers: Vec::new(),
@@ -1252,7 +1545,7 @@ mod tests {
     use crate::trust::TrustLevel;
 
     fn init_repo(dir: &Path) {
-        git(None, &["init", &dir.to_string_lossy()]).unwrap();
+        git(None, &["init", "-b", "main", &dir.to_string_lossy()]).unwrap();
         git(Some(dir), &["config", "user.email", "t@t"]).unwrap();
         git(Some(dir), &["config", "user.name", "t"]).unwrap();
         std::fs::write(dir.join("file.txt"), "hello").unwrap();
@@ -1664,5 +1957,116 @@ mod tests {
             repos.clones().await,
             Err(RepoCloneError::InvalidDir(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn daemon_checkout_atomic_swap_leases_and_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostGit::from_file("/dev/null");
+        let remote = tmp.path().join("remote.git");
+        host.output(
+            None,
+            &["init", "--bare", "-b", "main", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        let work = tmp.path().join("work");
+        init_repo(&work);
+        git(
+            Some(&work),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        git(Some(&work), &["push", "-u", "origin", "main"]).unwrap();
+        let c1 = git(Some(&work), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let checkouts = DaemonCheckouts::new(tmp.path().join("checkouts")).with_host(host.clone());
+        let remote_url = format!("file://{}", remote.display());
+        let snap1 = checkouts.ensure_present("o/r", &remote_url).await.unwrap();
+        assert_eq!(snap1.head_sha, c1);
+        assert_eq!(checkouts.generation_numbers("o/r").unwrap(), vec![1]);
+
+        let lease1 = checkouts.acquire_lease("o/r").await.unwrap();
+        assert_eq!(lease1.generation(), 1);
+
+        // Push a new commit upstream, then refresh daemon checkout.
+        std::fs::write(work.join("next.txt"), "v2\n").unwrap();
+        git(Some(&work), &["add", "."]).unwrap();
+        git(Some(&work), &["commit", "-m", "v2"]).unwrap();
+        git(Some(&work), &["push", "origin", "main"]).unwrap();
+        let c2 = git(Some(&work), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let refresh = checkouts.refresh("o/r", &remote_url).await.unwrap();
+        assert!(refresh.updated);
+        assert_eq!(refresh.previous_sha.as_deref(), Some(c1.as_str()));
+        assert_eq!(refresh.snapshot.head_sha, c2);
+        assert_eq!(refresh.snapshot.generation, 2);
+        // Generation 1 stays while leased by an active reader.
+        assert_eq!(checkouts.generation_numbers("o/r").unwrap(), vec![1, 2]);
+
+        lease1.release().await;
+        assert_eq!(checkouts.generation_numbers("o/r").unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn cow_derive_updates_to_new_commit_and_keeps_multiple_workspaces_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostGit::from_file("/dev/null");
+        let remote = tmp.path().join("remote.git");
+        host.output(
+            None,
+            &["init", "--bare", "-b", "main", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        let work = tmp.path().join("work");
+        init_repo(&work);
+        git(
+            Some(&work),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        git(Some(&work), &["push", "-u", "origin", "main"]).unwrap();
+
+        let checkouts = DaemonCheckouts::new(tmp.path().join("checkouts")).with_host(host.clone());
+        let remote_url = format!("file://{}", remote.display());
+        checkouts.ensure_present("o/r", &remote_url).await.unwrap();
+
+        // Push a new commit from elsewhere before session requests a workspace.
+        std::fs::write(work.join("pushed.txt"), "from elsewhere\n").unwrap();
+        git(Some(&work), &["add", "."]).unwrap();
+        git(Some(&work), &["commit", "-m", "elsewhere"]).unwrap();
+        git(Some(&work), &["push", "origin", "main"]).unwrap();
+        let c2 = git(Some(&work), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let repos = session_repos(tmp.path())
+            .await
+            .with_host(host.clone())
+            .with_checkouts(checkouts.clone());
+        assert!(repos.clones().await.unwrap().is_empty());
+
+        let ws1 = repos
+            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()), None)
+            .await
+            .unwrap();
+        assert_eq!(git(Some(&ws1), &["rev-parse", "HEAD"]).unwrap().trim(), c2);
+        assert!(ws1.join("pushed.txt").exists());
+
+        // Derive a second independent workspace on the same repo.
+        std::fs::write(ws1.join("ws1_only.txt"), "one\n").unwrap();
+        let ws2 = repos
+            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()), None)
+            .await
+            .unwrap();
+        assert_ne!(ws1, ws2);
+        assert!(!ws2.join("ws1_only.txt").exists());
+        assert_eq!(repos.clones_for("o/r").await.unwrap().len(), 2);
     }
 }

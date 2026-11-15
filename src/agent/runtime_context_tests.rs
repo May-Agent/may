@@ -324,6 +324,7 @@ fn the_work_section_names_the_issue_backend() {
         &AgentEnvironment::Local,
         &session_paths(&dir),
         None,
+        None,
         &github,
     );
     assert!(
@@ -670,6 +671,7 @@ fn rendered_instructions(
                 &AgentEnvironment::Local,
                 &paths,
                 Some(launch_dir.to_string()),
+                None,
                 &issues,
             ),
         )
