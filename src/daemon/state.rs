@@ -778,6 +778,19 @@ fn answers_allow(request: &PersistedAskUserRequest, answers: &[QuestionAnswer]) 
         .is_some_and(|choice| choice.allows(answers))
 }
 
+/// If `answers` selected `"Always allow for session"`, returns the question
+/// prompt text so a resumed run records the session-wide SSH grant.
+fn session_allow_question<'a>(
+    request: &'a PersistedAskUserRequest,
+    answers: &[QuestionAnswer],
+) -> Option<&'a str> {
+    let question = request.questions.first()?;
+    let choice = PermissionChoice::from_options(&question.option)?;
+    choice
+        .allows_for_session(answers)
+        .then_some(question.question.as_str())
+}
+
 #[derive(Debug, Clone)]
 pub struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
@@ -1055,6 +1068,17 @@ impl AskUserApprover {
         } else if waiter.is_some_and(|waiter| waiter.try_send(answers.clone()).is_ok()) {
             AskUserOutcome::Woke
         } else {
+            if let Some(question) = session_allow_question(&committed.request, &answers) {
+                runtime
+                    .db()
+                    .append_granted_permission(
+                        &committed.session_id,
+                        crate::PermissionHistoryMode::Ssh,
+                        question,
+                        None,
+                    )
+                    .await?;
+            }
             AskUserOutcome::Resume {
                 approved: answers_allow(&committed.request, &answers),
             }

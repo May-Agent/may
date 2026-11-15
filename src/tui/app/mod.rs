@@ -808,8 +808,43 @@ impl App {
 
     /// The profile the TUI is on, as last loaded.
     pub fn current_profile(&self) -> Option<&ProfileInfo> {
-        let id = self.session_manager.current_profile_id()?;
+        let id = self
+            .current_profile_id
+            .as_deref()
+            .or_else(|| self.session_manager.current_profile_id())?;
         self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    /// Toggles `name` in the active profile's attached SSH servers and returns
+    /// `(profile_id, updated_server_names, attached_now)`.
+    pub fn toggle_ssh_attachment(&mut self, name: &str) -> Option<(String, Vec<String>, bool)> {
+        let id = self
+            .current_profile_id
+            .as_deref()
+            .or_else(|| self.session_manager.current_profile_id())?
+            .to_owned();
+        let profile = self.profiles.iter_mut().find(|profile| profile.id == id)?;
+        let attached_now = if let Some(pos) = profile
+            .remote_attachments
+            .iter()
+            .position(|existing| existing == name)
+        {
+            profile.remote_attachments.remove(pos);
+            false
+        } else {
+            profile.remote_attachments.push(name.to_string());
+            true
+        };
+        Some((id, profile.remote_attachments.clone(), attached_now))
+    }
+
+    /// Removes `name` from every cached profile's attached SSH servers.
+    pub fn prune_ssh_attachment(&mut self, name: &str) {
+        for profile in &mut self.profiles {
+            profile
+                .remote_attachments
+                .retain(|existing| existing != name);
+        }
     }
 
     /// Set up GitHub Codespaces for the current profile as `login`, or the
@@ -5114,6 +5149,11 @@ pub enum SendAction {
         /// Name of the SSH server to remove.
         name: String,
     },
+    /// Toggle an SSH server attachment on the active profile.
+    SshToggleAttachment {
+        /// Name of the SSH server to attach or detach.
+        name: String,
+    },
     /// Answer the launch-directory grant prompt.
     RespondLaunchGrant {
         /// The directory being decided.
@@ -5867,6 +5907,80 @@ mod tests {
         assert_eq!(
             last_error(&app),
             Some("Failed to add SSH server down: connection timed out")
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_popup_toggles_per_profile_attachment_and_renders_checkboxes() {
+        use crossterm::event::KeyCode;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.config.upsert_ssh_server(probed_server("prod"));
+        app.config.upsert_ssh_server(probed_server("staging"));
+        app.profiles = vec![
+            crate::ProfileInfo::from_db_parts(
+                crate::db::entity::profiles::Model {
+                    id: "prof-1".to_string(),
+                    slug: Some("default".to_string()),
+                    name: "Default".to_string(),
+                    icon: None,
+                    environment: "local".to_string(),
+                    container_id: None,
+                    persona: None,
+                    location_aware: false,
+                    pinned_limit: 10,
+                    sort_order: 0,
+                    created_at: "2026-03-24T00:00:00Z".to_string(),
+                    updated_at: "2026-03-24T00:00:00Z".to_string(),
+                },
+                None,
+                vec!["prod".to_string()],
+                crate::cloud::ProfileCloud::default(),
+            )
+            .expect("profile"),
+        ];
+        app.current_profile_id = Some("prof-1".to_string());
+        app.mode = AppMode::SshManage;
+        app.ssh_selected = 1;
+
+        let render_popup = |app: &mut App| -> String {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("term");
+            terminal
+                .draw(|frame| crate::tui::ui::render(frame, app))
+                .expect("draw");
+            let buf = terminal.backend().buffer();
+            (0..20)
+                .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let before = render_popup(&mut app);
+        assert!(before.contains("[x] prod"), "{before}");
+        assert!(before.contains("[ ] staging"), "{before}");
+        assert!(before.contains("[Space] Toggle"), "{before}");
+
+        let action = crate::tui::reducer::manage::handle_ssh_key(&mut app, KeyCode::Char(' '));
+        assert!(matches!(
+            action,
+            Some(SendAction::SshToggleAttachment { ref name }) if name == "staging"
+        ));
+        let (profile_id, updated, attached) =
+            app.toggle_ssh_attachment("staging").expect("toggled");
+        assert_eq!(profile_id, "prof-1");
+        assert!(attached);
+        assert_eq!(updated, vec!["prod".to_string(), "staging".to_string()]);
+
+        let after_attach = render_popup(&mut app);
+        assert!(after_attach.contains("[x] prod"), "{after_attach}");
+        assert!(after_attach.contains("[x] staging"), "{after_attach}");
+
+        app.prune_ssh_attachment("prod");
+        assert_eq!(
+            app.current_profile().expect("profile").remote_attachments,
+            vec!["staging".to_string()]
         );
     }
 

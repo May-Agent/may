@@ -201,6 +201,12 @@ impl RuntimeSystemContext {
         self.instructions.insert(tag::COMMANDS, table);
     }
 
+    /// Replaces the environment block; the next [`reconcile`](Self::reconcile)
+    /// announces any change without breaking the warm system prefix.
+    pub(crate) fn set_environment(&mut self, environment: String) {
+        self.instructions.insert(tag::ENVIRONMENT, environment);
+    }
+
     pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
         self.profile_memories = memories;
         self
@@ -247,7 +253,7 @@ impl RuntimeSystemContext {
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         let instructions = context.instructions_mut();
         for slot in &tag::MAY_INSTRUCTIONS {
-            if *slot == tag::PROJECT_RULES || *slot == tag::COMMANDS {
+            if *slot == tag::PROJECT_RULES || *slot == tag::COMMANDS || *slot == tag::ENVIRONMENT {
                 continue;
             }
             match self.instructions.get(slot) {
@@ -263,6 +269,15 @@ impl RuntimeSystemContext {
             update.instruction(
                 &tag::COMMANDS,
                 self.instructions.get(&tag::COMMANDS).cloned(),
+            );
+        });
+        // SSH servers added or removed mid-session are announced once as a
+        // diff without mutating the warm prefix; the environment block renders
+        // fresh after compaction.
+        context.update_live(&ENVIRONMENT_CONTENT, |update| {
+            update.instruction(
+                &tag::ENVIRONMENT,
+                self.instructions.get(&tag::ENVIRONMENT).cloned(),
             );
         });
         context.update_live(&MEMORY_CONTENT, |update| {
@@ -468,6 +483,10 @@ impl RuntimeSystemContext {
 /// The table of the commands a script can call, announced when a command is
 /// added or removed mid-session.
 const COMMANDS_CONTENT: LiveContent = LiveContent::new("The command table", "commands_diff");
+
+/// The execution environment and configured SSH servers, announced when
+/// servers change mid-session.
+const ENVIRONMENT_CONTENT: LiveContent = LiveContent::new("The environment", "environment_diff");
 
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");

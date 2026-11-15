@@ -399,6 +399,8 @@ pub struct MayAgent {
     /// The facts the shell raises about its jobs, which the idle agent waits
     /// on.
     job_events: ShellEvents,
+    tools: ToolEnvironments,
+    environment: AgentEnvironment,
     /// Where a fact of a main-agent job is told to the clients that show it.
     job_facts_tx: async_channel::Sender<JobFact>,
     /// The other end of [`Self::job_facts_tx`].
@@ -653,7 +655,7 @@ impl MayAgent {
         let refused_reads = RefusedReads::default();
         let budgets = config.limits.shell();
         let assembly = ShellAssembly {
-            tools,
+            tools: tools.clone(),
             container: match &config.environment {
                 AgentEnvironment::Local => None,
                 AgentEnvironment::Container {
@@ -1186,6 +1188,8 @@ impl MayAgent {
             inner: agent,
             sandbox_dir: shell.working_dir().clone(),
             job_events: shell.jobs().events(),
+            tools,
+            environment: config.environment,
             job_facts_tx,
             job_facts,
             interrupted: false,
@@ -1924,6 +1928,48 @@ impl MayAgent {
                 tracing::warn!(%error, "could not measure the context window");
             }
         }
+    }
+    /// Synchronizes the session's active SSH servers with the live shell and
+    /// `<environment>` context block without breaking the cached system prefix.
+    pub(crate) fn sync_ssh_servers(&mut self, servers: &[crate::config::SshServerConfig]) {
+        let sessions = self.shell.shell_sessions();
+        let existing = sessions.ssh_servers();
+        for current in &existing {
+            let matches_desired = servers.iter().any(|desired| {
+                desired.name.trim() == current.name && desired.target.trim() == current.target
+            });
+            if !matches_desired {
+                let _ = sessions.remove_ssh_server(&current.name);
+            }
+        }
+        let remaining = sessions.ssh_servers();
+        for server in servers {
+            if remaining
+                .iter()
+                .any(|current| current.name == server.name.trim())
+            {
+                continue;
+            }
+            if let Err(error) = sessions.add_ssh_server(
+                SshServer {
+                    name: server.name.clone(),
+                    target: server.target.clone(),
+                },
+                self.tools.clone(),
+            ) {
+                tracing::warn!(ssh_server = %server.name, %error, "failed to add SSH server to shell");
+            }
+        }
+        let environment_block = build_environment(
+            &self.model_id,
+            &self.environment,
+            aither_models::lookup(self.model_id.as_str()),
+            servers.to_vec(),
+        );
+        self.runtime_system_context
+            .set_environment(environment_block);
+        self.runtime_system_context
+            .reconcile(self.inner.context_mut());
     }
 }
 

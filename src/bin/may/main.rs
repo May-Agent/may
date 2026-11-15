@@ -2088,6 +2088,7 @@ where
                     }
                     Some(SendAction::SshRemove { name }) => {
                         if app.config.remove_ssh_server(&name) {
+                            app.prune_ssh_attachment(&name);
                             if let Err(e) = app.config.clone().save().await {
                                 let err_msg = format!("Failed to save SSH config: {e}");
                                 app.chat.push_error(&err_msg);
@@ -2099,6 +2100,42 @@ where
                                     app.ssh_selected = app.config.ssh_servers.len() - 1;
                                 }
                             }
+                        }
+                    }
+                    Some(SendAction::SshToggleAttachment { name }) => {
+                        if let Some((profile_id, updated, attached_now)) =
+                            app.toggle_ssh_attachment(&name)
+                        {
+                            let result = match app.session_manager.daemon_handle() {
+                                Ok(client) => {
+                                    let body = serde_json::json!({ "serverNames": updated });
+                                    client
+                                        .put::<_, serde_json::Value>(
+                                            &format!("/api/profiles/{profile_id}/remotes"),
+                                            &body,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|error| error.to_string())
+                                }
+                                Err(error) => Err(error.to_string()),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    let verb = if attached_now { "Attached" } else { "Detached" };
+                                    app.set_status(format!(
+                                        "{verb} SSH server {name} for current profile"
+                                    ));
+                                }
+                                Err(error) => {
+                                    let _ = app.toggle_ssh_attachment(&name);
+                                    app.chat.push_error(&format!(
+                                        "Failed to update profile SSH servers: {error}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            app.chat.push_error("No active profile selected");
                         }
                     }
                     Some(SendAction::RespondLaunchGrant {
