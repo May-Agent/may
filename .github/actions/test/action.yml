@@ -88,6 +88,10 @@ runs:
       with:
         name: cargo-timings-${{ github.job }}
         path: target/cargo-timings/
+    - name: Drop test-written shims before saving cache
+      if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+      shell: bash
+      run: rm -rf "${{ steps.downloads.outputs.tools-path }}"/runtimes/*/shims
     - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v4
       with:
