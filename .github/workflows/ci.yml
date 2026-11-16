@@ -138,9 +138,7 @@ jobs:
 
   test-ubuntu:
     name: test (ubuntu-latest)
-    # Not gated on the image's result: a failed image fails the run on its own,
-    # and a skipped required check would report success.
-    needs: [scope, container-image]
+    needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
