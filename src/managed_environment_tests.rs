@@ -177,10 +177,8 @@ async fn the_host_rust_toolchain_builds_and_tests_a_crate() {
 }
 
 /// Removes a credentials file this test created when the host had none.
-#[cfg(target_os = "macos")]
 struct CreatedFile(Option<PathBuf>);
 
-#[cfg(target_os = "macos")]
 impl Drop for CreatedFile {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
@@ -191,7 +189,6 @@ impl Drop for CreatedFile {
 
 /// Credential files inside the granted toolchain homes stay unreadable, while
 /// the home itself is readable.
-#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn cargo_credentials_inside_the_granted_home_stay_unreadable() {
     let cargo_home = std::env::var_os("CARGO_HOME")
@@ -265,6 +262,99 @@ async fn macos_keychains_stay_unreadable() {
             "default_svc=denied",
         ],
         "macOS keychain stores and SecurityServer lookups must stay denied: {output}"
+    );
+}
+
+/// The managed base commands (GNU coreutils, rg, ast-grep, jq, fd, xargs, uv)
+/// and managed Python execute inside the sandbox on both macOS and Linux.
+#[tokio::test(flavor = "multi_thread")]
+async fn base_commands_and_python_run_inside_the_sandbox() {
+    let session = tempfile::tempdir().expect("session dir");
+    let terminal = TestTerminal::new(session.path()).await;
+    let script = "\
+        bash --version >/dev/null\n\
+        date --version >/dev/null\n\
+        stat --version >/dev/null\n\
+        timeout --version >/dev/null\n\
+        rg --version >/dev/null\n\
+        ast-grep --version >/dev/null\n\
+        jq --version >/dev/null\n\
+        fd --version >/dev/null\n\
+        xargs --version >/dev/null\n\
+        uv --version >/dev/null\n\
+        python3 -c 'import sys; assert sys.version_info >= (3, 10); print(\"python-ok\")'\n\
+    ";
+    let output = terminal
+        .sandbox()
+        .run(session.path(), script)
+        .await
+        .expect("managed base commands and python run");
+    assert_eq!(output.trim(), "python-ok");
+}
+
+/// Writes succeed inside the granted session directory and are denied outside
+/// it (including the managed tools directory).
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_outside_granted_paths_are_denied() {
+    let session = tempfile::tempdir().expect("session dir");
+    let outside = tempfile::tempdir().expect("outside dir");
+    let terminal = TestTerminal::new(session.path()).await;
+    let denied_outside = outside.path().join("denied.txt");
+    let script = format!(
+        "echo ok > '{}/ok.txt' && echo session=writable || echo session=denied\n\
+         (echo no > '{}' ) 2>/dev/null && echo outside=writable || echo outside=denied\n\
+         bin_dir=$(dirname \"$(command -v rg)\")\n\
+         (echo no > \"$bin_dir/denied.txt\" ) 2>/dev/null && echo bin=writable || echo bin=denied",
+        session.path().display(),
+        denied_outside.display(),
+    );
+    let output = terminal
+        .sandbox()
+        .run(session.path(), &script)
+        .await
+        .expect("the write probe script runs");
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        ["session=writable", "outside=denied", "bin=denied"],
+        "unexpected write permissions: {output}"
+    );
+    assert!(!denied_outside.exists(), "outside file must not exist");
+}
+
+/// Linux credential and keyring stores stay unreadable from inside the sandbox.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn linux_credential_stores_stay_unreadable() {
+    const LINUX_CREDENTIALS: &[&str] =
+        &[".gnupg", ".local/share/keyrings", ".local/share/kwalletd"];
+    let home = std::env::home_dir().expect("home");
+    let created_dirs: Vec<CreatedDir> = LINUX_CREDENTIALS
+        .iter()
+        .flat_map(|rel| ensure_test_dir(&home.join(rel)))
+        .collect();
+    let mut script = String::new();
+    let mut expected = Vec::with_capacity(LINUX_CREDENTIALS.len());
+    for rel in LINUX_CREDENTIALS {
+        let cred = home.join(rel);
+        let _ = writeln!(
+            script,
+            "ls '{}' >/dev/null 2>&1 && echo {rel}=readable || echo {rel}=denied",
+            cred.display()
+        );
+        expected.push(format!("{rel}=denied"));
+    }
+
+    let session = tempfile::tempdir().expect("session dir");
+    let terminal = TestTerminal::new(session.path()).await;
+    let output = terminal
+        .sandbox()
+        .run(session.path(), &script)
+        .await
+        .expect("the script runs");
+    drop(created_dirs);
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
     );
 }
 
