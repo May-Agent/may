@@ -1,5 +1,14 @@
 name: Test
 description: Build and test the workspace on the runner it runs on. The check job names are fixed by the ruleset, so each runner has a job of its own around these steps.
+inputs:
+  cargo-flags:
+    description: Target selection flags passed to cargo build and cargo nextest run.
+    required: false
+    default: '--all-targets'
+  upload-may:
+    description: Whether to pack and upload target/debug/may as an artifact.
+    required: false
+    default: 'true'
 runs:
   using: composite
   steps:
@@ -44,14 +53,16 @@ runs:
       uses: ./.github/actions/install-nasm
     - name: cargo build
       shell: bash
-      run: cargo build --locked --all-targets --timings
+      run: cargo build --locked ${{ inputs.cargo-flags }} --timings
     # Every run keeps the debug may it built, so a commit can be tested on
     # another machine without building it there. It is packed as a tarball
     # because artifacts drop the executable bit.
     - name: Pack the debug may
+      if: inputs.upload-may == 'true'
       shell: bash
       run: tar -czf may-debug.tar.gz -C target/debug may
     - name: Upload the debug may
+      if: inputs.upload-may == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
@@ -70,7 +81,7 @@ runs:
     - name: cargo nextest
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
-      run: cargo nextest run --locked --all-targets --timings
+      run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
     - name: Upload cargo timings
       if: always()
       uses: actions/upload-artifact@v4
