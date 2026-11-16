@@ -245,20 +245,28 @@ impl<A: Actions> Recorder<'_, A> {
     }
 
     /// Recomputes the baseline of every job of the workflows in `runs` from
-    /// their last successful runs on `base`. A workflow whose history cannot
-    /// be read keeps the baseline it had.
+    /// their last successful runs for the same trigger event (and `base` for
+    /// branch-push runs). A workflow whose history cannot be read keeps the
+    /// baseline it had.
     async fn refresh_baselines(&self, project_id: i64, runs: &[Run], base: &str) {
-        let mut workflows: Vec<(u64, String)> = runs
+        let mut workflows: Vec<(u64, String, &str)> = runs
             .iter()
-            .map(|run| (run.workflow_id, workflow_name(run)))
+            .map(|run| {
+                let event = if run.event.is_empty() {
+                    "pull_request"
+                } else {
+                    run.event.as_str()
+                };
+                (run.workflow_id, workflow_name(run), event)
+            })
             .collect();
         workflows.sort();
         workflows.dedup();
-        for (workflow_id, workflow) in workflows {
+        for (workflow_id, workflow, event) in workflows {
             let samples = async {
                 let history = self
                     .actions
-                    .successful_runs(workflow_id, base, BASELINE_RUNS)
+                    .successful_runs(workflow_id, base, event, BASELINE_RUNS)
                     .await?;
                 self.jobs_of(&history).await
             }
@@ -389,6 +397,7 @@ mod tests {
         jobs: HashMap<u64, Vec<Job>>,
         history: Vec<Run>,
         log: String,
+        seen_events: std::sync::Mutex<Vec<String>>,
     }
 
     #[allow(clippy::unused_async_trait_impl)]
@@ -402,7 +411,14 @@ mod tests {
         async fn jobs(&self, run_id: u64) -> Result<Vec<Job>, CiError> {
             Ok(self.jobs.get(&run_id).cloned().unwrap_or_default())
         }
-        async fn successful_runs(&self, _: u64, _: &str, _: usize) -> Result<Vec<Run>, CiError> {
+        async fn successful_runs(
+            &self,
+            _: u64,
+            _: &str,
+            event: &str,
+            _: usize,
+        ) -> Result<Vec<Run>, CiError> {
+            self.seen_events.lock().unwrap().push(event.to_string());
             Ok(self.history.clone())
         }
         async fn log(&self, _: u64) -> Result<String, CiError> {
@@ -416,6 +432,7 @@ mod tests {
             workflow_id: 1,
             name: Some("CI".into()),
             status: "completed".into(),
+            event: "pull_request".into(),
         }
     }
 
@@ -443,6 +460,7 @@ mod tests {
             jobs: HashMap::from([(100, vec![job(1, pr_secs)])]),
             history: (200..205).map(run).collect(),
             log: include_str!("../../tests/fixtures/ci/nextest.log").to_string(),
+            seen_events: std::sync::Mutex::new(Vec::new()),
         }
         .with_history_jobs()
     }
@@ -598,5 +616,19 @@ mod tests {
             "{}",
             found.warning
         );
+    }
+
+    #[tokio::test]
+    async fn baselines_scope_history_by_run_event() {
+        let (_dir, db, pr) = setup().await;
+        let actions = fake(1200);
+        let recorder = Recorder {
+            db: &db,
+            actions: &actions,
+            limits: limits(),
+        };
+        let finding = recorder.observe_github(&pr, "sha1").await.unwrap();
+        assert!(finding.is_some());
+        assert_eq!(*actions.seen_events.lock().unwrap(), vec!["pull_request"]);
     }
 }
