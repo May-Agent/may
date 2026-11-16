@@ -50,6 +50,7 @@ use async_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -92,14 +93,15 @@ pub enum ConfigError {
     /// Failed to serialize config.
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
-    /// Legacy `[playwright]` config section found; it must be renamed to `[browser]`.
-    #[error(
-        "legacy config section `[playwright]` is no longer supported; rename it to `[browser]`"
-    )]
-    LegacyPlaywrightSection,
     /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
+    /// Invalid `[ci]` config.
+    #[error("invalid ci config: {0}")]
+    InvalidCiConfig(String),
+    /// Invalid `[update]` config.
+    #[error("invalid update config: {0}")]
+    InvalidUpdateConfig(String),
     /// A provider instance already exists under the ID with a different type.
     #[error(
         "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
@@ -204,6 +206,32 @@ impl ProviderType {
             | Self::Custom
             | Self::Copilot
             | Self::Chatgpt => None,
+        }
+    }
+
+    /// The prompt-cache block size the provider publishes, in tokens: it
+    /// caches and serves whole blocks only. `None` where no size is
+    /// published.
+    #[must_use]
+    pub const fn cache_block_tokens(self) -> Option<NonZeroU64> {
+        match self {
+            // OpenAI's prompt caching guide: cache hits grow in 128-token
+            // increments past the first 1024 tokens.
+            Self::OpenAI => NonZeroU64::new(128),
+            Self::Anthropic
+            | Self::Google
+            | Self::Copilot
+            | Self::Chatgpt
+            | Self::OpenRouter
+            | Self::DeepSeek
+            | Self::Ollama
+            | Self::LMStudio
+            | Self::Groq
+            | Self::Together
+            | Self::Mistral
+            | Self::XAI
+            | Self::Grok
+            | Self::Custom => None,
         }
     }
 
@@ -745,6 +773,50 @@ pub struct SshServerConfig {
     pub name: String,
     /// SSH target (`user@host[:port]`).
     pub target: String,
+    /// The platform the server reported when it was added.
+    pub platform: SshPlatformConfig,
+}
+
+/// The operating system and architecture an SSH server reported, as
+/// `uname -s` and `uname -m` print them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
+pub struct SshPlatformConfig {
+    /// The kernel name (`Linux`, `Darwin`).
+    pub os: String,
+    /// The machine hardware name (`x86_64`, `arm64`).
+    pub arch: String,
+}
+
+impl fmt::Display for SshPlatformConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.os, self.arch)
+    }
+}
+
+impl SshServerConfig {
+    /// A server named `name` at `target`, with the platform it reports.
+    ///
+    /// # Errors
+    /// Fails when the server cannot be reached or does not answer
+    /// `uname -s -m`, so a server that cannot run commands is never saved.
+    pub async fn probe(
+        name: String,
+        target: String,
+    ) -> Result<Self, aither_sandbox::SshProbeError> {
+        let platform = aither_sandbox::probe_ssh_os(&aither_sandbox::SshServer {
+            name: name.clone(),
+            target: target.clone(),
+        })
+        .await?;
+        Ok(Self {
+            name,
+            target,
+            platform: SshPlatformConfig {
+                os: platform.os,
+                arch: platform.arch,
+            },
+        })
+    }
 }
 
 /// An installed ACP agent connected as a subagent type (`/connect`).
@@ -804,14 +876,14 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
             reason: reason.to_string(),
         })
     };
-    match aither_agent::validate_subagent_name(name) {
-        Err(aither_agent::DefinitionError::Reserved(_)) => {
+    match crate::harness::subagent_file::validate_subagent_name(name) {
+        Err(crate::harness::subagent_file::DefinitionError::Reserved(_)) => {
             return reject("the name belongs to a built-in subagent type");
         }
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
         Ok(()) => {}
     }
-    if aither_agent::BUNDLED_SUBAGENTS
+    if crate::bundle::Bundle::subagent_definitions()
         .iter()
         .any(|bundled| bundled.name == name)
     {
@@ -1212,6 +1284,20 @@ pub struct SandboxConfig {
     /// Priority commands run at.
     #[serde(default)]
     pub command_priority: CommandPriority,
+    /// Jobserver tokens shared by every terminal on the machine; unset uses
+    /// the host's available parallelism. A change applies to the running
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_pool_size: Option<std::num::NonZeroUsize>,
+}
+
+impl SandboxConfig {
+    /// The size of the machine-wide jobserver pool.
+    #[must_use]
+    pub fn job_pool_size(&self) -> std::num::NonZeroUsize {
+        self.job_pool_size
+            .unwrap_or_else(crate::jobserver::default_pool_size)
+    }
 }
 
 /// May agent configuration.
@@ -1262,6 +1348,12 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// CI duration thresholds.
+    #[serde(default)]
+    pub ci: CiConfig,
+    /// Self-update of release builds.
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// Session list settings.
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -1277,6 +1369,18 @@ pub struct MayConfig {
     /// When host memory pressure and machine load count as high.
     #[serde(default)]
     pub host_load: HostLoadSettings,
+    /// When free disk space counts as low.
+    #[serde(default)]
+    pub disk: DiskSettings,
+    /// How long an agent's `tasks.md` may grow.
+    #[serde(default)]
+    pub tasks: TasksSettings,
+    /// When the repeated calls of a turn count as a loop.
+    #[serde(default)]
+    pub loop_detection: LoopDetectionSettings,
+    /// The shell's time bounds and output budgets.
+    #[serde(default)]
+    pub shell: ShellSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1396,6 +1500,97 @@ impl Default for RecapConfig {
     }
 }
 
+/// `[ci]` section: when a CI job counts as abnormally long. Read when a PR's
+/// checks finish, so a change applies to the next run without a restart.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CiConfig {
+    /// Minutes after which any job is abnormally long: the point where a
+    /// waiting agent's prompt cache goes cold.
+    pub max_job_minutes: u64,
+    /// A job is abnormally long when it runs past this multiple of its
+    /// baseline, the median of its last successful runs on the base branch.
+    pub baseline_multiple: f64,
+    /// Seconds between two reads of the checks of each in-flight GitHub PR
+    /// (the alerts and the sidebars' per-check view). Read on every tick.
+    pub pr_poll_seconds: u64,
+}
+
+impl CiConfig {
+    /// Check both thresholds can be exceeded.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidCiConfig`] when the limit is zero or the
+    /// multiple is not a finite number above 1.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_job_minutes == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.max_job_minutes must be above 0".to_string(),
+            ));
+        }
+        if !self.baseline_multiple.is_finite() || self.baseline_multiple <= 1.0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.baseline_multiple must be a number above 1".to_string(),
+            ));
+        }
+        if self.pr_poll_seconds == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.pr_poll_seconds must be above 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CiConfig {
+    fn default() -> Self {
+        Self {
+            max_job_minutes: 40,
+            baseline_multiple: 2.0,
+            pr_poll_seconds: 60,
+        }
+    }
+}
+
+/// `[update]` section: whether a release build updates itself.
+///
+/// Read by the daemon on every check, so a change applies without a restart.
+/// A dev build never updates on its own, whatever this says; it updates on
+/// `may update`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Whether a release build checks GitHub releases and installs a newer
+    /// one in the background.
+    pub auto: bool,
+    /// Hours between two automatic checks.
+    pub check_interval_hours: u64,
+}
+
+impl UpdateConfig {
+    /// Check the interval can elapse.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidUpdateConfig`] when the interval is zero.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.check_interval_hours == 0 {
+            return Err(ConfigError::InvalidUpdateConfig(
+                "update.check_interval_hours must be above 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            check_interval_hours: 6,
+        }
+    }
+}
+
 /// `[sessions]` section: which sessions the session lists show.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1415,13 +1610,13 @@ impl Default for SessionsConfig {
 /// name or an ISO 639-3 code, rejected at load when unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct ConfiguredLanguage(pub aither_agent::Language);
+pub struct ConfiguredLanguage(pub crate::harness::language::Language);
 
 impl TryFrom<String> for ConfiguredLanguage {
     type Error = String;
 
     fn try_from(name: String) -> Result<Self, String> {
-        name.parse::<aither_agent::Language>()
+        name.parse::<crate::harness::language::Language>()
             .map(Self)
             .map_err(|error| error.to_string())
     }
@@ -1450,11 +1645,11 @@ pub struct LanguageConfig {
 impl LanguageConfig {
     /// The languages the session's agent is held to.
     #[must_use]
-    pub fn languages(&self) -> aither_agent::Languages {
+    pub fn languages(&self) -> crate::harness::language::Languages {
         let languages = self
             .communication
-            .map_or_else(aither_agent::Languages::unset, |language| {
-                aither_agent::Languages::new(language.0)
+            .map_or_else(crate::harness::language::Languages::unset, |language| {
+                crate::harness::language::Languages::new(language.0)
             });
         self.working
             .map_or(languages, |working| languages.with_working(working.0))
@@ -1463,37 +1658,38 @@ impl LanguageConfig {
 
 /// `[context]` section: when a session's conversation is compacted.
 ///
-/// The auto-compact point is `min(window * compact_at, compact_ceiling)`
+/// The pause point is `min(window - handoff_reserve, compact_ceiling)`
 /// tokens; the distances are token counts before it. aither applies them, and
 /// a change reaches running sessions at their next turn.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextConfig {
-    /// Fraction of the model window at which the conversation is compacted.
-    pub compact_at: f32,
+    /// Tokens kept free below the window for the compaction request and the
+    /// handoff the model writes; it does not grow with the window.
+    pub handoff_reserve: usize,
     /// Most tokens the conversation may hold before it is compacted,
     /// whatever the window.
     pub compact_ceiling: usize,
-    /// Tokens before the auto-compact point at which compaction starts in
-    /// the background while the run keeps streaming.
+    /// Tokens before the pause point at which compaction starts in the
+    /// background while the run keeps streaming.
     pub start_distance: usize,
-    /// Tokens before the auto-compact point at which the agent pauses to
-    /// finish compaction.
-    pub safe_buffer: usize,
-    /// Tokens before the auto-compact point at which the agent is told once
-    /// to save its work and call `compact` itself.
+    /// Tokens before the pause point at which the agent is told once to save
+    /// its work and call `compact` itself.
     pub warn_distance: usize,
+    /// Tokens before the warn point from which a model that counts through a
+    /// provider endpoint is asked for an exact count.
+    pub count_distance: usize,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         let policy = aither_agent::ContextPolicy::default();
         Self {
-            compact_at: policy.compact_at,
+            handoff_reserve: policy.handoff_reserve,
             compact_ceiling: policy.compact_ceiling,
             start_distance: policy.start_distance,
-            safe_buffer: policy.safe_buffer,
             warn_distance: policy.warn_distance,
+            count_distance: policy.count_distance,
         }
     }
 }
@@ -1504,11 +1700,11 @@ impl ContextConfig {
     #[must_use]
     pub fn policy(&self) -> aither_agent::ContextPolicy {
         aither_agent::ContextPolicy {
-            compact_at: self.compact_at,
+            handoff_reserve: self.handoff_reserve,
             compact_ceiling: self.compact_ceiling,
             start_distance: self.start_distance,
-            safe_buffer: self.safe_buffer,
             warn_distance: self.warn_distance,
+            count_distance: self.count_distance,
             ..aither_agent::ContextPolicy::default()
         }
     }
@@ -1589,18 +1785,6 @@ impl fmt::Display for TimeZoneName {
     }
 }
 
-/// Memory pressure at which the host counts as pressed.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryPressureThreshold {
-    /// The host is reclaiming memory (`kern.memorystatus_vm_pressure_level`
-    /// warn on macOS).
-    #[default]
-    Warning,
-    /// The host is thrashing.
-    Critical,
-}
-
 /// `[acp]` section: the bounds `/connect` puts on a candidate ACP agent.
 /// Durations are written as `"30s"`, `"1m"`. A change applies to the next
 /// `/connect`.
@@ -1623,15 +1807,16 @@ impl Default for AcpSettings {
 }
 
 /// `[host_load]` section: when the session agent is told the host is under
-/// memory pressure or high load, and how long the terminal's foreground
-/// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
+/// high load.
+///
+/// The terminal's foreground window grows meanwhile. Memory pressure is not
+/// configured here: aither's memory guard warns on the platform's own
+/// pressure levels. Durations are written as `"30s"`, `"1m"`.
 ///
 /// A change reaches a running session at its next turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HostLoadSettings {
-    /// Memory pressure at or above which the host counts as pressed.
-    pub memory_threshold: MemoryPressureThreshold,
     /// Machine load at or above which the host counts as loaded: on macOS
     /// the load average per core, on Linux the share of the last ten
     /// seconds runnable tasks waited for a CPU.
@@ -1652,9 +1837,8 @@ pub struct HostLoadSettings {
 
 impl Default for HostLoadSettings {
     fn default() -> Self {
-        let defaults = aither_agent::HostLoadConfig::new();
+        let defaults = crate::harness::host_load::HostLoadConfig::new();
         Self {
-            memory_threshold: MemoryPressureThreshold::Warning,
             load_threshold: defaults.load_threshold.0,
             start_after: defaults.start_after,
             end_after: defaults.end_after,
@@ -1667,17 +1851,170 @@ impl Default for HostLoadSettings {
 impl HostLoadSettings {
     /// The aither monitor configuration these settings describe.
     #[must_use]
-    pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
-        aither_agent::HostLoadConfig::new()
-            .memory_threshold(match self.memory_threshold {
-                MemoryPressureThreshold::Warning => aither_agent::MemoryPressure::Warning,
-                MemoryPressureThreshold::Critical => aither_agent::MemoryPressure::Critical,
-            })
-            .load_threshold(aither_agent::MachineLoad(self.load_threshold))
+    pub const fn monitor_config(&self) -> crate::harness::host_load::HostLoadConfig {
+        crate::harness::host_load::HostLoadConfig::new()
+            .load_threshold(crate::harness::host_load::MachineLoad(self.load_threshold))
             .start_after(self.start_after)
             .end_after(self.end_after)
             .poll_interval(self.poll_interval)
             .high_load_foreground_wait(self.high_load_foreground_wait)
+    }
+}
+
+/// `[disk]` section: how little free space the home environment's volume may
+/// have before the agent is told, in bytes.
+///
+/// The defaults are aither's: yellow below 10 GiB free, red below 5 GiB and
+/// final below 3 GiB. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiskSettings {
+    /// Free bytes below which the disk is at the yellow level.
+    pub yellow_free_bytes: u64,
+    /// Free bytes below which the disk is at the red level.
+    pub red_free_bytes: u64,
+    /// Free bytes below which the disk is at the final level.
+    pub final_free_bytes: u64,
+}
+
+impl DiskSettings {
+    const GIB: u64 = 1024 * 1024 * 1024;
+}
+
+impl Default for DiskSettings {
+    fn default() -> Self {
+        Self {
+            yellow_free_bytes: 10 * Self::GIB,
+            red_free_bytes: 5 * Self::GIB,
+            final_free_bytes: 3 * Self::GIB,
+        }
+    }
+}
+
+/// `[tasks]` section: the `tasks.md` every agent keeps, a subagent's in its
+/// own space. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TasksSettings {
+    /// Lines `tasks.md` may hold before the agent is asked to rewrite it.
+    pub line_limit: usize,
+}
+
+impl Default for TasksSettings {
+    fn default() -> Self {
+        Self {
+            line_limit: crate::tasks_md::schema::DEFAULT_LINE_LIMIT,
+        }
+    }
+}
+
+/// `[loop_detection]` section: when a turn's tool calls count as a loop.
+///
+/// Each value is a number of repetitions in a row: at the alert threshold the
+/// agent is told once, at the end threshold the turn ends and the user is told
+/// why. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LoopDetectionSettings {
+    /// Repetitions of one group of calls (same tools, same arguments) at
+    /// which the agent is alerted.
+    pub cycle_alert: usize,
+    /// Repetitions of one group of calls at which the turn ends.
+    pub cycle_end: usize,
+    /// Calls in a row failing with the same error at which the agent is
+    /// alerted.
+    pub failure_alert: usize,
+    /// Calls in a row failing with the same error at which the turn ends.
+    pub failure_end: usize,
+}
+
+impl Default for LoopDetectionSettings {
+    fn default() -> Self {
+        Self {
+            // Gemini CLI's loop detection service alerts at 5 identical
+            // calls in a row (`TOOL_CALL_LOOP_THRESHOLD`).
+            cycle_alert: 5,
+            // Twice the alert: after the alert the agent gets as many calls
+            // again as it took to raise it, while one that heeds the alert
+            // breaks the cycle with its next call.
+            cycle_end: 10,
+            // The cycle's value: a run of identical failures is at least as
+            // strong a sign of a loop as a run of identical calls, so it is
+            // raised no later.
+            failure_alert: 5,
+            // Twice the alert, as for the cycle.
+            failure_end: 10,
+        }
+    }
+}
+
+/// `[shell]` section: how long a script may run and how much of its output
+/// reaches the model. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ShellSettings {
+    /// How long a `terminal` call waits before its script becomes a
+    /// background task.
+    #[serde(with = "duration_text")]
+    pub foreground_wait: Duration,
+    /// The longest `timeout` a script may ask for.
+    #[serde(with = "duration_text")]
+    pub timeout_cap: Duration,
+    /// How long a background task runs before the agent is told it is
+    /// still running.
+    #[serde(with = "duration_text")]
+    pub long_job_alert: Duration,
+    /// The longest a `monitor` may run.
+    #[serde(with = "duration_text")]
+    pub monitor_max_timeout: Duration,
+    /// Seconds between a `monitor`'s deliveries when its call states none.
+    #[serde(with = "duration_text")]
+    pub monitor_default_interval: Duration,
+    /// How long the agent has to act on a final memory warning.
+    #[serde(with = "duration_text")]
+    pub response_window: Duration,
+    /// Bytes a subagent's sandbox may send while its commits are imported.
+    pub subagent_import_bytes: u64,
+    /// Output bytes returned inline before the rest is saved to a file.
+    pub inline_output_bytes: usize,
+    /// Bytes of a saved output kept as its preview.
+    pub preview_bytes: usize,
+    /// Output lines returned inline when a call states no `max_lines`.
+    pub default_lines: u32,
+    /// The most output lines a call may ask for.
+    pub ceiling_lines: u32,
+    /// Bytes a `terminal_read` returns when its call states no `max_bytes`.
+    pub read_bytes: usize,
+    /// Pixels of the longer side of media delivered at `low` resolution.
+    pub media_low: u32,
+    /// Pixels of the longer side of media delivered at `medium` resolution.
+    pub media_medium: u32,
+    /// Pixels of the longer side of media delivered at `high` resolution.
+    pub media_high: u32,
+    /// Characters of a job's script shown in the job list.
+    pub job_preview_bytes: usize,
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            foreground_wait: Duration::from_secs(10),
+            timeout_cap: Duration::from_mins(120),
+            long_job_alert: Duration::from_mins(40),
+            monitor_max_timeout: Duration::from_secs(7200),
+            monitor_default_interval: Duration::from_secs(10),
+            response_window: Duration::from_secs(120),
+            subagent_import_bytes: 1024 * 1024 * 1024,
+            inline_output_bytes: 16_000,
+            preview_bytes: 16_000,
+            default_lines: 200,
+            ceiling_lines: 800,
+            read_bytes: 32 * 1024,
+            media_low: 512,
+            media_medium: 1024,
+            media_high: 2048,
+            job_preview_bytes: 50,
+        }
     }
 }
 
@@ -1732,11 +2069,17 @@ impl Default for MayConfig {
             suggestions: SuggestionsConfig::default(),
             sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
+            ci: CiConfig::default(),
+            update: UpdateConfig::default(),
             sessions: SessionsConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
             time: TimeConfig::default(),
             host_load: HostLoadSettings::default(),
+            disk: DiskSettings::default(),
+            tasks: TasksSettings::default(),
+            loop_detection: LoopDetectionSettings::default(),
+            shell: ShellSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
@@ -1798,7 +2141,6 @@ impl MayConfig {
     pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match async_fs::read_to_string(path).await {
             Ok(content) => {
-                reject_legacy_config_sections(&content)?;
                 let config: Self = toml::from_str(&content)?;
                 config.validate()?;
                 Ok(config)
@@ -1837,6 +2179,8 @@ impl MayConfig {
     /// Returns [`ConfigError`] when any section contains an invalid value.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.browser.validate()?;
+        self.ci.validate()?;
+        self.update.validate()?;
         for (id, instance) in &self.provider {
             instance.validate(id)?;
         }
@@ -2045,14 +2389,6 @@ impl MayConfig {
     }
 }
 
-fn reject_legacy_config_sections(content: &str) -> Result<(), ConfigError> {
-    let document = toml::from_str::<toml::Value>(content).map_err(ConfigError::Parse)?;
-    if document.get("playwright").is_some() {
-        return Err(ConfigError::LegacyPlaywrightSection);
-    }
-    Ok(())
-}
-
 /// An available model from a configured provider.
 #[derive(Debug, Clone)]
 pub struct AvailableModel {
@@ -2081,6 +2417,46 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         assert!(saved.contains("communication = \"Chinese\""), "{saved}");
         assert!(!MayConfig::default().language.languages().enforced());
+    }
+
+    #[test]
+    fn only_openai_publishes_a_cache_block_size() {
+        assert_eq!(
+            ProviderType::OpenAI.cache_block_tokens(),
+            NonZeroU64::new(128)
+        );
+        assert_eq!(ProviderType::Custom.cache_block_tokens(), None);
+        assert_eq!(
+            ProviderType::from_id("openai").cache_block_tokens(),
+            NonZeroU64::new(128)
+        );
+    }
+
+    #[test]
+    fn an_ssh_server_keeps_the_platform_it_reported() {
+        let config: MayConfig = toml::from_str(
+            "[[ssh_servers]]\nname = \"box\"\ntarget = \"me@box\"\n[ssh_servers.platform]\nos = \"Linux\"\narch = \"x86_64\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.ssh_servers()[0].platform.to_string(), "Linux x86_64");
+        let saved = toml::to_string(&config).unwrap();
+        let reloaded: MayConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.ssh_servers(), config.ssh_servers());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_be_probed_is_not_added() {
+        let error = SshServerConfig::probe("gone".into(), "nobody@host.invalid".into())
+            .await
+            .expect_err("an unresolvable host has no platform");
+        assert!(
+            matches!(
+                error,
+                aither_sandbox::SshProbeError::Upload(_)
+                    | aither_sandbox::SshProbeError::Failed { .. }
+            ),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2301,6 +2677,27 @@ mod tests {
             toml::from_str::<MayConfig>(&document).is_err(),
             "an unknown priority must be rejected"
         );
+    }
+
+    #[test]
+    fn job_pool_size_defaults_to_available_parallelism_and_roundtrips() {
+        let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
+        assert_eq!(config.sandbox.job_pool_size, None);
+        assert_eq!(
+            config.sandbox.job_pool_size(),
+            std::thread::available_parallelism().expect("host reports its parallelism")
+        );
+
+        let config: MayConfig =
+            toml::from_str("[sandbox]\njob_pool_size = 6\n").expect("size parses");
+        assert_eq!(config.sandbox.job_pool_size().get(), 6);
+        let saved = toml::to_string(&config).expect("config serializes");
+        let reloaded: MayConfig = toml::from_str(&saved).expect("saved config parses");
+        assert_eq!(reloaded.sandbox.job_pool_size().get(), 6);
+
+        let unset = toml::to_string(&MayConfig::default()).expect("config serializes");
+        assert!(!unset.contains("job_pool_size"));
+        assert!(toml::from_str::<MayConfig>("[sandbox]\njob_pool_size = 0\n").is_err());
     }
 
     #[test]

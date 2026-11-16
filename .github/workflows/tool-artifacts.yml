@@ -1,0 +1,337 @@
+name: Tool Artifacts
+
+# Builds the prebuilt `apply_patch` (may-patch) and `aither-sed` (may-sed)
+# executables listed in .github/scripts/built-tools.json, and GNU bash
+# (patch/bash), and attaches them to the `patch/v<version>` (apply_patch and
+# bash) and `sed/v<version>` releases. release-plz creates
+# those tags with GITHUB_TOKEN, which starts no workflow, so release.yml calls
+# this one with the tags its run released.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The tag to build from; empty builds the triggering commit.
+        type: string
+        required: false
+        default: ''
+      tags:
+        description: JSON array of the release tags to attach the archives to.
+        type: string
+        required: false
+        default: '[]'
+  pull_request:
+    paths:
+      - patch/**
+      - sed/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/scripts/build-artifact.sh
+      - .github/scripts/built-tools.json
+      - .github/scripts/verify-sandbox.sh
+      - .github/workflows/tool-artifacts.yml
+  push:
+    branches: [main]
+    paths:
+      - patch/**
+      - sed/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/scripts/build-artifact.sh
+      - .github/scripts/built-tools.json
+      - .github/scripts/verify-sandbox.sh
+      - .github/workflows/tool-artifacts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Whether the bash job's inputs changed. A release (tags to attach) and a
+  # manual run always build it; a pull request measures from the merge base
+  # with its base branch, a push from the commit main pointed at before, and a
+  # push with no previous commit selects it. Should this job fail, bash builds,
+  # so a broken scope never skips it.
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      bash: ${{ steps.scope.outputs.bash }}
+    steps:
+      # The diff needs the base commit, which a shallow clone lacks.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          TAGS: ${{ inputs.tags }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TAGS}" ] && [ "${TAGS}" != '[]' ]; then
+            echo bash=true | tee -a "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          case "${EVENT}" in
+            pull_request) range="${PR_BASE}...${PR_HEAD}" ;;
+            push) range="${PUSH_BEFORE}..${PUSH_AFTER}" ;;
+            workflow_dispatch) echo bash=true | tee -a "${GITHUB_OUTPUT}"; exit 0 ;;
+            *) echo "::error::unexpected event ${EVENT}"; exit 1 ;;
+          esac
+          if [ "${EVENT}" = push ] && [ "${PUSH_BEFORE}" = 0000000000000000000000000000000000000000 ]; then
+            echo bash=true | tee -a "${GITHUB_OUTPUT}"
+          elif git diff --name-only "${range}" | tee /dev/stderr \
+              | grep -q -e '^patch/bash/' -e '^\.github/workflows/tool-artifacts\.yml$'; then
+            echo bash=true | tee -a "${GITHUB_OUTPUT}"
+          else
+            echo bash=false | tee -a "${GITHUB_OUTPUT}"
+          fi
+
+  # GNU bash for the platforms that run terminal scripts through it; Windows
+  # has none. Each target builds on a runner of its own architecture.
+  bash:
+    name: bash / ${{ matrix.target }}
+    needs: scope
+    if: always() && !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.bash == 'true')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Build bash
+        timeout-minutes: 20
+        run: patch/bash/build-bash.sh "${{ matrix.target }}" "${{ runner.temp }}/bash-artifacts"
+      - name: Verify archive checksum
+        working-directory: ${{ runner.temp }}/bash-artifacts
+        run: |
+          if [[ "${RUNNER_OS}" == Linux ]]; then
+            sha256sum -c ./*.sha256
+          else
+            shasum -a 256 -c ./*.sha256
+          fi
+      - name: Verify the packaged executable runs
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bash-check"
+          tar -xzf "${RUNNER_TEMP}"/bash-artifacts/bash-*.tar.gz -C "${RUNNER_TEMP}/bash-check"
+          "${RUNNER_TEMP}/bash-check/bash" --noprofile --norc -c '[[ "$BASH_VERSION" == 5.3.* ]] && echo "$BASH_VERSION"'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bash-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/bash-artifacts/*.tar.gz
+            ${{ runner.temp }}/bash-artifacts/*.sha256
+            ${{ runner.temp }}/bash-artifacts/*.json
+
+  artifact:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            heel_os: linux
+            heel_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            heel_os: linux
+            heel_arch: aarch64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            heel_os: macos
+            heel_arch: aarch64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            heel_os: windows
+            heel_arch: x86_64
+            suffix: .exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            heel_os: windows
+            heel_arch: aarch64
+            suffix: .exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+          components: rust-src
+          targets: ${{ matrix.target }}
+      # Only main saves: a PR cache lives in a scope nothing else restores,
+      # and its size evicts main's under the cache limit.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: tool-artifacts-${{ matrix.target }}
+      # The tools .github/scripts/built-tools.json lists for this target, as a JSON array.
+      - name: Select the tools of this target
+        id: tools
+        run: |
+          echo "tools=$(jq -c --arg target "${{ matrix.target }}" '[.tools[] | select(.targets | index($target)) | .tool]' .github/scripts/built-tools.json)" >> "${GITHUB_OUTPUT}"
+      - name: Build rebuilt-std executables
+        timeout-minutes: 20
+        env:
+          ARTIFACT_ABORT: immediate
+          ARTIFACT_NIGHTLY: nightly-2026-10-01
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: .github/scripts/build-artifact.sh "${{ matrix.target }}" "${{ runner.temp }}/tool-artifacts"
+      - name: Verify the exact apply_patch artifact
+        timeout-minutes: 5
+        env:
+          APPLY_PATCH_TEST_BIN: ${{ runner.temp }}/tool-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}
+        run: cargo +stable test --locked -p may-patch --test e2e
+      - name: Verify the packaged aither-sed
+        if: contains(fromJSON(steps.tools.outputs.tools), 'aither-sed')
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          check="${RUNNER_TEMP}/aither-sed-check"
+          mkdir -p "${check}"
+          tar -xzf "${RUNNER_TEMP}"/tool-artifacts/aither-sed-*-"${{ matrix.target }}".tar.gz -C "${check}"
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "may-sed") | .version')"
+          [ "$("${check}/aither-sed" --version)" = "aither-sed ${version}" ]
+          [ "$(printf 'a\nb\nc\nd\n' | "${check}/aither-sed" -n '2,3p;$p')" = "$(printf 'b\nc\nd')" ]
+          status=0
+          [ "$(printf 'a\n' | "${check}/aither-sed" 's/a/b/')" = b ]
+          "${check}/aither-sed" 'w out' </dev/null 2>/dev/null || status=$?
+          [ "${status}" = 1 ]
+      # The heel executable the tool distribution pins for this runner
+      # (src/tools/host-programs.json), as HEEL_BIN.
+      - name: Install heel
+        run: |
+          set -euo pipefail
+          pin="$(jq -c --arg os "${{ matrix.heel_os }}" --arg arch "${{ matrix.heel_arch }}" \
+            '[.host_programs[] | select(.tool == "heel" and .target.os == $os and .target.arch == $arch)]
+             | if length == 1 then .[0] else error("expected one heel pin") end' \
+            src/tools/host-programs.json)"
+          executable="${RUNNER_TEMP}/heel-runtime/heel${{ matrix.suffix }}"
+          mkdir -p "${RUNNER_TEMP}/heel-runtime"
+          curl -fsSL "$(jq -r .url <<<"${pin}")" -o "${executable}"
+          echo "$(jq -r .sha256 <<<"${pin}")  ${executable}" | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -)
+          chmod +x "${executable}"
+          "${executable}" --version
+          echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"
+      - name: Verify Windows native sandbox launch
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & "$env:HEEL_BIN" run --network deny --keep-working-dir --working-dir "$env:RUNNER_TEMP" -- cmd.exe /D /S /C "echo native-sandbox-ready"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify sandbox file permissions
+        timeout-minutes: 5
+        run: bash .github/scripts/verify-sandbox.sh "${{ runner.temp }}/tool-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}"
+      - name: Verify archive checksum
+        working-directory: ${{ runner.temp }}/tool-artifacts
+        run: |
+          if [[ "${RUNNER_OS}" == Windows ]]; then
+            sha256sum -c ./*.sha256
+          else
+            shasum -a 256 -c ./*.sha256
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tools-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/tool-artifacts/*.tar.gz
+            ${{ runner.temp }}/tool-artifacts/*.sha256
+            ${{ runner.temp }}/tool-artifacts/*.json
+
+  # A `patch/v<version>` tag attaches the apply_patch and bash archives, a
+  # `sed/v<version>` tag the aither-sed archives, to the release of that tag.
+  release:
+    name: Attach to the release
+    needs: [artifact, bash]
+    if: inputs.tags != '' && inputs.tags != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAGS: ${{ inputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tools-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bash-*
+          path: artifacts
+          merge-multiple: true
+      - name: Check each tag's version and attach its archives
+        run: |
+          set -euo pipefail
+          for TAG in $(jq -r '.[]' <<<"${TAGS}"); do
+            crate="${TAG%%/*}"
+            version="${TAG#*/v}"
+            case "${crate}" in
+              patch) tool=apply_patch; package=may-patch ;;
+              sed) tool=aither-sed; package=may-sed ;;
+              *) echo "::error::${TAG} is not a patch/v or sed/v tag"; exit 1 ;;
+            esac
+            [ "$(cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r --arg package "${package}" '.packages[] | select(.name == $package) | .version')" = "${version}" ] \
+              || { echo "::error::${TAG} does not name the version of ${package}"; exit 1; }
+            # Every listed target has its archive and checksum.
+            for target in $(jq -r --arg tool "${tool}" '.tools[] | select(.tool == $tool) | .targets[]' .github/scripts/built-tools.json); do
+              for file in "${tool}-${version}-${target}.tar.gz" "${tool}-${version}-${target}.tar.gz.sha256"; do
+                [ -f "artifacts/${file}" ] || { echo "::error::missing ${file}"; exit 1; }
+              done
+            done
+            # release-plz creates the release with the tag; create it only if absent.
+            gh release view "${TAG}" >/dev/null 2>&1 \
+              || gh release create "${TAG}" --verify-tag --title "${TAG}" --notes ""
+            gh release upload "${TAG}" --clobber \
+              artifacts/"${tool}-${version}"-*.tar.gz artifacts/"${tool}-${version}"-*.tar.gz.sha256
+            # The bash archives ride the patch release: patch/bash is part of
+            # may-patch, and bash's own version is 5.3.<number of pinned patches>.
+            if [ "${crate}" = patch ]; then
+              bash_version="5.3.$(grep -c ' bash53-' patch/bash/bash-sources.sha256)"
+              for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin; do
+                for file in "bash-${bash_version}-${target}.tar.gz" "bash-${bash_version}-${target}.tar.gz.sha256"; do
+                  [ -f "artifacts/${file}" ] || { echo "::error::missing ${file}"; exit 1; }
+                done
+              done
+              gh release upload "${TAG}" --clobber \
+                artifacts/"bash-${bash_version}"-*.tar.gz artifacts/"bash-${bash_version}"-*.tar.gz.sha256
+            fi
+          done

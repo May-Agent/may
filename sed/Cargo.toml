@@ -1,0 +1,29 @@
+[package]
+name = "may-sed"
+version = "0.3.0"
+edition = "2024"
+authors = ["Lexo Liu <me@lexo.cool>"]
+description = "The sed of sandboxed agent scripts: uutils sed that writes no file"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+readme = "README.md"
+keywords = ["sed", "sandbox", "agent", "tooling"]
+categories = ["command-line-utilities"]
+publish = false
+
+[dependencies]
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+clap = { version = "4", default-features = false, features = ["std"] }
+# `--sandbox` refuses the `w`/`W`/`r`/`R`/`e` commands and the `s///w` and
+# `s///e` flags while the script compiles, before any file is opened.
+sed = { version = "0.3.0", default-features = false }
+
+[[bin]]
+name = "aither-sed"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

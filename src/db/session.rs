@@ -27,8 +27,8 @@ use super::common::{
     session_not_found_db_error, storage_error,
 };
 use super::entity::{
-    session_pending_permissions, session_pending_workspace, session_plans, session_runtimes,
-    session_yolo, sessions,
+    session_memory, session_pending_permissions, session_pending_workspace, session_plans,
+    session_runtimes, session_yolo, sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 
@@ -46,6 +46,7 @@ struct PendingAskUserParts {
 struct SessionModeRows<'a> {
     plan: Option<&'a session_plans::Model>,
     yolo: Option<&'a session_yolo::Model>,
+    memory: Option<&'a session_memory::Model>,
 }
 
 impl ChatDb {
@@ -74,8 +75,17 @@ impl ChatDb {
         profile_id: Option<&str>,
     ) -> Result<sessions::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        // Every session's name is recorded, so the generator never issues it.
         query!(
-            self.db,
+            tx,
+            "INSERT INTO session_names (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
+            id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
             "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id,
             title,
@@ -93,6 +103,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         self.get_session(id)
             .await?
             .ok_or_else(|| session_not_found_db_error(id))
@@ -186,7 +197,7 @@ impl ChatDb {
                         name: attachment.name,
                         attachment_type: parse_attachment_kind(&attachment.attachment_type)?,
                         url: attachment.url,
-                        upload_data_url: attachment.upload_data_url,
+
                         text_content: attachment.text_content,
                     })
                 })
@@ -205,17 +216,17 @@ impl ChatDb {
     ) -> Result<PersistedPermissionRequest, ChatDbError> {
         Ok(PersistedPermissionRequest {
             id: row.request_id,
-            request: crate::session::PersistedPermissionRequestPayload {
-                mode: row.mode.parse().map_err(|error| {
+            request: crate::session::PersistedPermissionRequestPayload::new(
+                row.mode.parse().map_err(|error| {
                     storage_error(db_custom_error(
                         "invalid persisted permission request mode: ",
                         &error,
                     ))
                 })?,
-                script: row.script,
-                session_id: Some(row.session_id),
-                agent_id: row.agent_id,
-            },
+                row.script,
+                Some(row.session_id),
+                row.agent_id,
+            ),
         })
     }
 
@@ -326,6 +337,7 @@ impl ChatDb {
                     }),
             )?,
             yolo: mode_rows.yolo.is_some_and(|row| row.enabled),
+            memory_off: mode_rows.memory.is_some_and(|row| row.disabled),
             interactions: SessionInteractionState {
                 browser: BrowserInteractionState {
                     takeover_active: runtime_row
@@ -462,6 +474,7 @@ impl ChatDb {
         .fetch_optional::<session_plans::Model>()
         .await?;
         let yolo_row = self.session_yolo_row(session_id).await?;
+        let memory_row = self.session_memory_row(session_id).await?;
         Self::build_session_runtime_summary(
             runtime_row,
             message_rows,
@@ -477,6 +490,7 @@ impl ChatDb {
             SessionModeRows {
                 plan: plan_row.as_ref(),
                 yolo: yolo_row.as_ref(),
+                memory: memory_row.as_ref(),
             },
         )
     }
@@ -520,6 +534,51 @@ impl ChatDb {
             "INSERT INTO session_yolo (session_id, enabled, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
             session_id,
             enabled,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    async fn session_memory_row(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<session_memory::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_memory WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_memory::Model>()
+        .await?)
+    }
+
+    /// Whether memory injection and extraction have been turned off for this session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn session_memory_off(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        Ok(self
+            .session_memory_row(session_id)
+            .await?
+            .is_some_and(|row| row.disabled))
+    }
+
+    /// Turn off memory injection and extraction for the rest of this session.
+    /// Once set, this flag cannot be cleared.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn set_session_memory_off(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_memory (session_id, disabled, updated_at) VALUES (?, 1, ?) ON CONFLICT(session_id) DO UPDATE SET disabled = 1, updated_at = excluded.updated_at",
+            session_id,
             now.as_str()
         )
         .execute()
@@ -690,14 +749,13 @@ impl ChatDb {
         for (ordinal, attachment) in message.attachments.iter().enumerate() {
             query!(
                 tx,
-                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 message_id,
                 i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
                 attachment.id.as_str(),
                 attachment.name.as_str(),
                 attachment.attachment_type.as_str(),
                 attachment.url.as_str(),
-                attachment.upload_data_url.as_deref(),
                 attachment.text_content.as_deref()
             )
             .execute()
@@ -861,6 +919,47 @@ impl ChatDb {
         query!(
             tx,
             "DELETE FROM session_pending_message_entries WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    /// Remove the pending entry whose row id is `entry_id`, whichever
+    /// delivery mode it was stored under.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or a missing entry.
+    pub async fn remove_pending_message_by_id(
+        &self,
+        session_id: &str,
+        entry_id: i64,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let runtime = self.load_session_runtime_summary(session_id).await?;
+        let found = runtime
+            .pending_immediate
+            .iter()
+            .chain(runtime.queued_messages.iter())
+            .any(|message| message.id == Some(entry_id));
+        if !found {
+            return Err(row_not_found(format!(
+                "pending entry {entry_id} not found for session {session_id}"
+            )));
+        }
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+            entry_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE id = ? AND session_id = ? AND state != 'committed'",
+            entry_id,
             session_id
         )
         .execute()
@@ -1211,6 +1310,27 @@ impl ChatDb {
         Ok(result.rows_written > 0)
     }
 
+    /// Mark the browser takeover alert pending again: the turn that
+    /// consumed it was withdrawn before the model saw it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn restore_browser_takeover_alert_pending(
+        &self,
+        session_id: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'idle', 0, 1, ?) ON CONFLICT(session_id) DO UPDATE SET browser_takeover_alert_pending = 1, updated_at = excluded.updated_at",
+            session_id,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Session has browser takeover.
     ///
     /// # Errors
@@ -1222,10 +1342,14 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<bool, ChatDbError> {
-        let Some(summary) = self.get_session_runtime(session_id).await? else {
-            return Ok(false);
-        };
-        Ok(summary.interactions.browser.takeover_active)
+        Ok(query!(
+            self.db,
+            "SELECT 1 AS value FROM session_runtimes WHERE session_id = ? AND browser_takeover_active = 1",
+            session_id
+        )
+        .fetch_optional::<crate::db::common::OptionalI64ValueRow>()
+        .await?
+        .is_some())
     }
 
     /// Find browser takeover session.
@@ -1337,6 +1461,7 @@ impl ChatDb {
             sessions = query!(tx, statement, id, id).execute().await?.rows_written;
         }
         tx.commit().await?;
+        self.forget_session_ids(id);
         Ok(sessions)
     }
 
@@ -1363,11 +1488,30 @@ impl ChatDb {
     /// so anything still marked owned or running belongs to a process that
     /// is gone.
     ///
+    /// After an unexpected exit (`previous`), every session it interrupted —
+    /// a run still owned, or background work alive — is owed the alert that
+    /// the daemon exited. Background work dies with its daemon either way,
+    /// so its record is cleared.
+    ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
-    pub async fn recover_session_runtimes_after_restart(&self) -> Result<(), ChatDbError> {
+    pub async fn recover_session_runtimes_after_restart(
+        &self,
+        previous: super::PreviousDaemon,
+    ) -> Result<(), ChatDbError> {
         const STALE: &str = "(SELECT session_id FROM session_runtimes WHERE run_id IS NOT NULL OR state = 'running')";
         let mut tx = self.db.begin().await?;
+        if let super::PreviousDaemon::Exited { .. } = previous {
+            let sql = "INSERT OR IGNORE INTO session_daemon_exit_alerts (session_id, created_at) SELECT session_id, ? FROM {STALE} UNION SELECT session_id, ? FROM session_background_live"
+                .replace("{STALE}", STALE);
+            let now = jiff::Timestamp::now().to_string();
+            query!(tx, sql.as_str(), now.as_str(), now.as_str())
+                .execute()
+                .await?;
+        }
+        query!(tx, "DELETE FROM session_background_live")
+            .execute()
+            .await?;
         for sql in [
             "DELETE FROM session_pending_permissions WHERE session_id IN {STALE}",
             "DELETE FROM session_pending_workspace WHERE session_id IN {STALE}",
@@ -1497,10 +1641,11 @@ mod tests {
 
     /// Audit and history tables that name a session but outlive it, and the
     /// search outbox, whose triggers queue index removals for deleted messages.
-    const RETAINED_ON_DELETE: [&str; 10] = [
+    const RETAINED_ON_DELETE: [&str; 11] = [
         "search_outbox",
         "prs",
         "pr_events",
+        "ci_jobs",
         "issue_provenance",
         "request_logs",
         "cache_misses",
@@ -1691,82 +1836,6 @@ mod tests {
         for table in &deleted {
             assert_eq!(count(&db, table).await, 0, "`{table}` after delete all");
         }
-        assert_eq!(count(&db, "sessions").await, 0);
-    }
-
-    /// A long-lived database made by an older build keeps its tables with
-    /// foreign keys onto `sessions` (`legacy_session_fk_schema.sql`, read from
-    /// a real history database). Opening it drops the two tables current code
-    /// no longer reads, and sessions that ran a turn then delete.
-    #[tokio::test]
-    async fn legacy_foreign_keys_do_not_block_session_delete() {
-        const LEGACY_SCHEMA: &str = include_str!("testdata/legacy_session_fk_schema.sql");
-        let dir = tempdir().expect("temp dir should be created");
-        let path = dir.path().join("history.db");
-        let raw = ChatDb::connect(&path).await.expect("raw db should connect");
-        // The legacy definitions come first, so the current schema's
-        // `CREATE TABLE IF NOT EXISTS` leaves them as they are.
-        for statement in super::super::db_sql::statements(LEGACY_SCHEMA) {
-            query!(raw, statement)
-                .execute()
-                .await
-                .expect("legacy statement should run");
-        }
-        ChatDb::initialize_schema(&raw)
-            .await
-            .expect("schema should initialize");
-        for id in ["session-a", "session-b"] {
-            for sql in [
-                "INSERT INTO sessions (id, message_count, pinned, archived, created_at, updated_at) VALUES (?, 0, 0, 0, 't', 't')",
-                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, created_at) VALUES (?, 'queue', 'c', '[]', 't')",
-                "INSERT INTO session_pending_ask_user (request_id, session_id, questions_json, created_at) VALUES (?, ?, '[]', 't')",
-                "INSERT INTO messages (session_id, role, content) VALUES (?, 'user', 'c')",
-                "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'idle', 0, 0, 't')",
-                "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, 'none', 't')",
-                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, 'm', 's', '2026-01-01T00:00:00Z')",
-                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, 'p', 'r', '2026-01-01T00:00:00Z')",
-            ] {
-                if sql.matches('?').count() == 2 {
-                    query!(raw, sql, id, id).execute().await
-                } else {
-                    query!(raw, sql, id).execute().await
-                }
-                .expect("legacy row should insert");
-            }
-        }
-        // The constraint is enforced: deleting the row alone is the reported 787.
-        query!(raw, "DELETE FROM sessions WHERE id = 'session-b'")
-            .execute()
-            .await
-            .expect_err("a bare sessions delete must hit the foreign key");
-        drop(raw);
-
-        let db = ChatDb::open(&path).await.expect("legacy db should open");
-        for table in ["session_pending_messages", "session_pending_ask_user"] {
-            let tables = query!(
-                db.db,
-                "SELECT name AS tbl FROM sqlite_master WHERE type = 'table' AND name = ?",
-                table
-            )
-            .fetch_all::<TableRow>()
-            .await
-            .expect("tables should list");
-            assert!(tables.is_empty(), "`{table}` should be dropped on open");
-            assert!(!deleted_tables().contains(&table));
-            assert!(!RETAINED_ON_DELETE.contains(&table));
-        }
-
-        db.delete_session("session-a")
-            .await
-            .expect("delete should succeed");
-        assert_eq!(count(&db, "session_runtimes").await, 1);
-        assert_eq!(count(&db, "messages").await, 1);
-        let removed = db
-            .delete_all_sessions()
-            .await
-            .expect("delete all should succeed");
-        assert_eq!(removed, 1);
-        assert_eq!(count(&db, "session_runtimes").await, 0);
         assert_eq!(count(&db, "sessions").await, 0);
     }
 

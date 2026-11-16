@@ -12,6 +12,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use skyzen::StatusCode;
 
+use super::auth::SocketOwner;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use super::types::{ApiGithubRepo, ApiGithubRepos};
@@ -93,7 +94,7 @@ async fn state(home: &Path, api_base: &str) -> Arc<DaemonState> {
 }
 
 async fn fetch(state: &Arc<DaemonState>) -> skyzen::Response {
-    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
     let request = hyper::Request::builder()
         .method("GET")
         .uri("/api/github/repos")

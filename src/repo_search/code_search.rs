@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use super::{RepoSearch, RepoSearchError, worktree_root};
 use crate::db::ChatDb;
-use crate::repo_clone::SessionRepos;
+use crate::repo_clone::{CloneSource, DaemonCheckouts, SessionRepos};
 use crate::workspace::WorkspaceConfig;
 
 /// Default answer budget, matching the repo-search CLI.
@@ -112,6 +112,7 @@ pub struct CodeSearchTool<B = RepoSearch> {
     cwd: PathBuf,
     db: Option<ChatDb>,
     clones: Option<SessionRepos>,
+    checkouts: Option<DaemonCheckouts>,
     workspace: WorkspaceConfig,
 }
 
@@ -135,29 +136,46 @@ impl<B: SearchBackend> CodeSearchTool<B> {
             cwd,
             db,
             clones,
+            checkouts: None,
             workspace,
         }
     }
 
+    /// Use `checkouts` to search a GitHub repo's daemon default-branch checkout
+    /// when the session has not created a workspace clone yet.
+    #[must_use]
+    pub fn with_checkouts(mut self, checkouts: DaemonCheckouts) -> Self {
+        self.checkouts = Some(checkouts);
+        self
+    }
+
     /// The directory repo-search is asked about: the session's clone of
-    /// `worktree`, else `worktree` itself.
+    /// `worktree` if one exists, else the daemon's default-branch checkout
+    /// when present, else `worktree` itself.
     async fn search_root(&self, worktree: PathBuf) -> Result<PathBuf, RepoSearchError> {
-        let Some(clones) = &self.clones else {
-            return Ok(worktree);
-        };
-        let Some(clone) = clones
-            .clone_of_checkout(&worktree, &self.workspace)
-            .await
-            .map_err(|error| RepoSearchError::Io(std::io::Error::other(error)))?
-        else {
-            return Ok(worktree);
-        };
-        worktree_root(&clone).ok_or_else(|| {
-            RepoSearchError::Io(std::io::Error::other(format!(
-                "session clone {} is not a git worktree",
-                clone.display()
-            )))
-        })
+        if let Some(clones) = &self.clones
+            && let Some(clone) = clones
+                .clone_of_checkout(&worktree, &self.workspace)
+                .await
+                .map_err(|error| RepoSearchError::Io(std::io::Error::other(error)))?
+        {
+            return worktree_root(&clone).ok_or_else(|| {
+                RepoSearchError::Io(std::io::Error::other(format!(
+                    "session clone {} is not a git worktree",
+                    clone.display()
+                )))
+            });
+        }
+        if let Some(checkouts) = &self.checkouts
+            && let Ok(Some(CloneSource::Remote { owner_repo, .. })) =
+                CloneSource::of(&worktree, &self.workspace)
+        {
+            let link = checkouts.current_link(&owner_repo);
+            if let Some(root) = worktree_root(&link) {
+                return Ok(root);
+            }
+        }
+        Ok(worktree)
     }
 
     async fn run(&self, args: CodeSearchArgs) -> Result<String, RepoSearchError> {

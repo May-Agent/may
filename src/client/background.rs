@@ -9,7 +9,10 @@
 
 use std::time::{Duration, Instant};
 
-use aither_sandbox::{Delivery, JobInfo, JobStatus, TerminalMode};
+use aither_sandbox::{
+    Delivery, Interpreter, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, SandboxMode,
+    TimeoutKill,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::SubagentRunSnapshot;
@@ -34,11 +37,140 @@ pub enum WireJobStatus {
         /// Whether the agent has taken the completion.
         delivery: WireDelivery,
     },
-    /// Killed by the user.
+    /// Killed.
     Killed {
+        /// Why it was killed.
+        cause: WireKillCause,
         /// Whether the agent has taken the completion.
         delivery: WireDelivery,
     },
+}
+
+/// Why a job was killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireKillCause {
+    /// A request ended it: `terminal_kill` or the shutdown of its terminal.
+    User,
+    /// Its `timeout` passed.
+    #[serde(rename_all = "camelCase")]
+    Timeout {
+        /// The bound it ran under, in milliseconds.
+        timeout_ms: u64,
+        /// When it started, RFC 3339.
+        #[schema(value_type = String)]
+        started: jiff::Timestamp,
+        /// When it was killed, RFC 3339.
+        #[schema(value_type = String)]
+        killed: jiff::Timestamp,
+    },
+    /// Its home environment ran out of memory and it ignored the final
+    /// warning.
+    #[serde(rename_all = "camelCase")]
+    MemoryRunaway {
+        /// The tree's physical footprint when it was killed.
+        footprint_bytes: u64,
+        /// The memory of the domain it ran in.
+        capacity_bytes: u64,
+        /// The domain it ran in.
+        domain: WireMemoryDomain,
+    },
+}
+
+/// Which memory a job competes for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMemoryDomain {
+    /// The machine the daemon runs on.
+    Machine,
+    /// The container the agent works in.
+    Container,
+}
+
+/// Where a job runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WirePlace {
+    /// The machine the daemon runs on.
+    Host,
+    /// The container the agent works in.
+    Container,
+    /// A remote host over SSH.
+    Remote,
+}
+
+impl From<KillCause> for WireKillCause {
+    fn from(cause: KillCause) -> Self {
+        match cause {
+            KillCause::User => Self::User,
+            KillCause::Timeout(kill) => Self::Timeout {
+                timeout_ms: u64::try_from(kill.timeout.as_millis()).unwrap_or(u64::MAX),
+                started: kill.started,
+                killed: kill.killed,
+            },
+            KillCause::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain,
+            } => Self::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain: match domain {
+                    MemoryDomain::Machine => WireMemoryDomain::Machine,
+                    MemoryDomain::Container => WireMemoryDomain::Container,
+                },
+            },
+        }
+    }
+}
+
+impl From<WireKillCause> for KillCause {
+    fn from(cause: WireKillCause) -> Self {
+        match cause {
+            WireKillCause::User => Self::User,
+            WireKillCause::Timeout {
+                timeout_ms,
+                started,
+                killed,
+            } => Self::Timeout(TimeoutKill {
+                timeout: Duration::from_millis(timeout_ms),
+                started,
+                killed,
+            }),
+            WireKillCause::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain,
+            } => Self::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain: match domain {
+                    WireMemoryDomain::Machine => MemoryDomain::Machine,
+                    WireMemoryDomain::Container => MemoryDomain::Container,
+                },
+            },
+        }
+    }
+}
+
+impl From<JobPlace> for WirePlace {
+    fn from(place: JobPlace) -> Self {
+        match place {
+            JobPlace::Host => Self::Host,
+            JobPlace::Container => Self::Container,
+            JobPlace::Remote => Self::Remote,
+        }
+    }
+}
+
+impl From<WirePlace> for JobPlace {
+    fn from(place: WirePlace) -> Self {
+        match place {
+            WirePlace::Host => Self::Host,
+            WirePlace::Container => Self::Container,
+            WirePlace::Remote => Self::Remote,
+        }
+    }
 }
 
 /// Whether a finished job's completion has reached its agent.
@@ -84,7 +216,8 @@ impl From<&JobStatus> for WireJobStatus {
                 error: error.clone(),
                 delivery: (*delivery).into(),
             },
-            JobStatus::Killed { delivery } => Self::Killed {
+            JobStatus::Killed { cause, delivery } => Self::Killed {
+                cause: (*cause).into(),
                 delivery: (*delivery).into(),
             },
         }
@@ -106,7 +239,8 @@ impl From<WireJobStatus> for JobStatus {
                 error,
                 delivery: delivery.into(),
             },
-            WireJobStatus::Killed { delivery } => Self::Killed {
+            WireJobStatus::Killed { cause, delivery } => Self::Killed {
+                cause: cause.into(),
                 delivery: delivery.into(),
             },
         }
@@ -125,9 +259,12 @@ pub struct WireJob {
     pub execution_key: String,
     /// The script it runs.
     pub script: String,
+    /// The interpreter of the script.
+    #[schema(value_type = String)]
+    pub interpreter: Interpreter,
     /// Permission mode.
     #[schema(value_type = String)]
-    pub mode: TerminalMode,
+    pub mode: SandboxMode,
     /// Milliseconds since it started.
     pub elapsed_ms: u64,
     /// Its state.
@@ -136,6 +273,12 @@ pub struct WireJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub output_path: Option<std::path::PathBuf>,
+    /// Where it runs.
+    pub place: WirePlace,
+    /// The bound it was started under, in milliseconds; absent when nothing
+    /// bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -156,10 +299,15 @@ impl From<&JobInfo> for WireJob {
             task_id: job.task_id.clone(),
             execution_key: job.execution_key.clone(),
             script: job.script.clone(),
+            interpreter: job.interpreter,
             mode: job.mode,
             elapsed_ms: elapsed_ms(job.started_at),
             status: (&job.status).into(),
             output_path: job.output_path.clone(),
+            place: job.place.into(),
+            timeout_ms: job
+                .timeout
+                .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         }
     }
 }
@@ -171,10 +319,13 @@ impl From<WireJob> for JobInfo {
             task_id: job.task_id,
             execution_key: job.execution_key,
             script: job.script,
+            interpreter: job.interpreter,
             mode: job.mode,
             started_at: started_at(job.elapsed_ms),
             status: job.status.into(),
             output_path: job.output_path,
+            place: job.place.into(),
+            timeout: job.timeout_ms.map(Duration::from_millis),
         }
     }
 }
@@ -276,14 +427,11 @@ pub mod base64_bytes {
 pub struct WireJobDetail {
     /// The job, while it is known.
     pub job: Option<WireJob>,
-    /// Its buffered stdout, while the registry serves it.
+    /// Its buffered output, stdout and stderr interleaved as they arrived,
+    /// while the registry serves it.
     #[serde(default, with = "base64_opt")]
     #[schema(value_type = Option<String>)]
-    pub stdout: Option<Vec<u8>>,
-    /// Its buffered stderr, while the registry serves it.
-    #[serde(default, with = "base64_opt")]
-    #[schema(value_type = Option<String>)]
-    pub stderr: Option<Vec<u8>>,
+    pub output: Option<Vec<u8>>,
 }
 
 /// New terminal output of a job: answer of
@@ -333,8 +481,8 @@ pub struct RemoteBackground {
     session_id: String,
 }
 
-/// A job and its buffered `(stdout, stderr)`.
-pub type JobDetail = (Option<JobInfo>, Option<(Vec<u8>, Vec<u8>)>);
+/// A job and its buffered output.
+pub type JobDetail = (Option<JobInfo>, Option<Vec<u8>>);
 
 #[derive(Debug, Deserialize)]
 struct KillAnswer {
@@ -385,8 +533,7 @@ impl RemoteBackground {
     /// Fails when the daemon is unreachable or refuses.
     pub async fn job(&self, pid: u32) -> Result<JobDetail, super::DaemonClientError> {
         let detail: WireJobDetail = self.client.get(&self.path(&format!("/jobs/{pid}"))).await?;
-        let output = detail.stdout.zip(detail.stderr);
-        Ok((detail.job.map(JobInfo::from), output))
+        Ok((detail.job.map(JobInfo::from), detail.output))
     }
 
     /// Kills job `pid`; `true` when it was running.
@@ -481,10 +628,13 @@ mod tests {
             task_id: "t".into(),
             execution_key: "k".into(),
             script: "sleep 1".into(),
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             elapsed_ms: 0,
             status,
             output_path: None,
+            place: WirePlace::Host,
+            timeout_ms: None,
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
@@ -507,7 +657,8 @@ mod tests {
             task_id: "t1".into(),
             execution_key: "k".into(),
             script: "sleep 30".into(),
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             started_at: Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .expect("clock"),
@@ -516,6 +667,8 @@ mod tests {
                 delivery: Delivery::Pending,
             },
             output_path: None,
+            place: JobPlace::Host,
+            timeout: Some(Duration::from_secs(60)),
         };
         let wire: WireJob =
             serde_json::from_str(&serde_json::to_string(&WireJob::from(&job)).expect("serializes"))
@@ -523,6 +676,7 @@ mod tests {
         let back = JobInfo::from(wire);
         assert_eq!(back.pid, 7);
         assert_eq!(back.status, job.status);
+        assert_eq!(back.timeout, job.timeout);
         let age = back.started_at.elapsed().as_secs();
         assert!((5..7).contains(&age), "age {age}");
     }
@@ -542,8 +696,7 @@ mod tests {
         );
         let detail = WireJobDetail {
             job: None,
-            stdout: Some(b"out".to_vec()),
-            stderr: None,
+            output: Some(b"out".to_vec()),
         };
         let back: WireJobDetail =
             serde_json::from_str(&serde_json::to_string(&detail).expect("serializes"))

@@ -1,5 +1,17 @@
 import { describe, expect, test } from 'bun:test';
-import { extractTerminalResult } from './terminalResult';
+import { extractTerminalResult, terminalLocation } from './terminalResult';
+
+describe('terminalLocation', () => {
+  test('names the SSH server a call runs on', () => {
+    expect(terminalLocation('{"script":"ls","location":"build-box"}')).toBe('build-box');
+  });
+
+  test('is null for the home environment', () => {
+    expect(terminalLocation('{"script":"ls"}')).toBeNull();
+    expect(terminalLocation('{"script":"ls","location":""}')).toBeNull();
+    expect(terminalLocation('{"script":"ls","location":"  "}')).toBeNull();
+  });
+});
 
 describe('extractTerminalResult', () => {
   test('reads inline stdout and the exit code of a command result', () => {

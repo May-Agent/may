@@ -2,6 +2,8 @@
 //! `computer-agent.sock` unix socket. One request per connection.
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use waterkit_automation::{Element, ElementRef, Elements};
 
 use crate::config::StreamCodec;
 
@@ -42,6 +44,146 @@ pub enum AgentRequest {
         session_id: String,
         message: InputMessage,
     },
+    /// Launch an application in the background onto the session's display
+    /// and open `items` (URLs, or file paths) in it.
+    Launch {
+        session_id: String,
+        /// An application name, a bundle id or an `.app` path.
+        app: String,
+        items: Vec<String>,
+    },
+    /// List the actionable elements of the windows on the session's display;
+    /// the references of the previous listing stop resolving.
+    #[cfg(target_os = "macos")]
+    Elements { session_id: String },
+    /// Press the element `element` names.
+    #[cfg(target_os = "macos")]
+    Press {
+        session_id: String,
+        #[serde(with = "element_ref")]
+        element: ElementRef,
+    },
+    /// Give the element `element` names keyboard focus, then type `text`.
+    #[cfg(target_os = "macos")]
+    TypeInto {
+        session_id: String,
+        #[serde(with = "element_ref")]
+        element: ElementRef,
+        text: String,
+    },
+}
+
+/// An [`ElementRef`] on the wire: its text form.
+#[cfg(target_os = "macos")]
+mod element_ref {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+    use waterkit_automation::ElementRef;
+
+    pub fn serialize<S: Serializer>(
+        element: &ElementRef,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(element)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ElementRef, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+/// The actionable elements on a session's display, front window first.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ElementListing {
+    pub elements: Vec<ListedElement>,
+    /// The listing left out the rest of an application or of the display.
+    pub truncated: bool,
+    /// How many reads of single elements failed, each leaving its element
+    /// out or read as empty.
+    pub skipped: usize,
+}
+
+/// One element of an [`ElementListing`], as its application reported it.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListedElement {
+    #[serde(with = "element_ref")]
+    pub reference: ElementRef,
+    /// The Accessibility role, such as `AXButton`.
+    pub role: String,
+    /// The Accessibility subrole, such as `AXSecureTextField`.
+    pub subrole: Option<String>,
+    pub title: Option<String>,
+    pub label: Option<String>,
+    pub value: Option<String>,
+    pub placeholder: Option<String>,
+    pub enabled: bool,
+    /// The centre of its frame in the display's points, when it reports one.
+    pub center: Option<ElementPoint>,
+}
+
+/// A point on the session display, in the space `click X Y` takes.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ElementPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[cfg(target_os = "macos")]
+impl From<&Elements> for ElementListing {
+    fn from(listed: &Elements) -> Self {
+        Self {
+            elements: listed.elements().iter().map(ListedElement::from).collect(),
+            truncated: listed.truncated(),
+            skipped: listed.skipped().len(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<&Element> for ListedElement {
+    fn from(element: &Element) -> Self {
+        Self {
+            reference: element.reference(),
+            role: element.role().to_owned(),
+            subrole: element.subrole().map(str::to_owned),
+            title: element.title().map(str::to_owned),
+            label: element.label().map(str::to_owned),
+            value: element.value().map(str::to_owned),
+            placeholder: element.placeholder().map(str::to_owned),
+            enabled: element.enabled(),
+            center: element.frame().map(|frame| {
+                let center = frame.center();
+                ElementPoint {
+                    x: center.x(),
+                    y: center.y(),
+                }
+            }),
+        }
+    }
+}
+
+/// An application launched onto the session's display.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaunchedApp {
+    pub bundle_id: String,
+    pub pid: i32,
+    /// The windows the launch opened and placed on the display.
+    pub windows: Vec<LaunchedWindow>,
+}
+
+/// A window the launch placed, in the session display's own points: the
+/// space `click X Y` takes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaunchedWindow {
+    pub id: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// What the agent answers.
@@ -72,6 +214,14 @@ pub enum AgentResponse {
     OfferRefused { error: String },
     /// Boolean-bearing replies (`stream_running`, `takeover_active`).
     Flag { value: bool },
+    /// `launch` result.
+    Launched { app: LaunchedApp },
+    /// `elements` result.
+    #[cfg(target_os = "macos")]
+    Elements { listing: ElementListing },
+    /// An element request refused because its reference no longer names an
+    /// element of the latest listing; `error` is human-readable.
+    StaleElement { error: String },
 }
 
 // ── Wire input messages (the same shape the browser input uses) ────────────────
@@ -120,6 +270,21 @@ pub enum MouseButtonInput {
     Left,
     Right,
     Middle,
+}
+
+/// Bits of the `modifiers` field of [`MouseInput`] and [`KeyboardInput`], in
+/// the web client's CDP order. Only the macOS input path reads them; the web
+/// client sends them as numbers.
+#[cfg(target_os = "macos")]
+pub mod modifier_bits {
+    /// Alt / Option.
+    pub const ALT: u64 = 1;
+    /// Control.
+    pub const CTRL: u64 = 2;
+    /// Meta / Command.
+    pub const META: u64 = 4;
+    /// Shift.
+    pub const SHIFT: u64 = 8;
 }
 
 #[derive(Debug, Deserialize, Serialize)]

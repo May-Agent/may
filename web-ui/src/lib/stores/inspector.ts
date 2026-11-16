@@ -6,19 +6,20 @@ import {
   type SessionBackground,
 } from '../api/background';
 import { getSessionTasks } from '../api/tasks';
+import { closePr, listPrs, mergePr, type ApiPr } from '../api/prs';
 import { isDraftSessionId, useSessionsStore } from './sessions';
-import { parseTaskTree, type TaskTree } from '../tasks/taskTree';
 import {
   NO_STOP_REQUESTS,
   settleStopRequests,
   type StopRequests,
 } from '../inspector/model';
-import type { SessionPlanState } from '../types';
+import type { SessionPlanState, TaskRow } from '../types';
 
 export interface SessionTasks {
-  /** Raw `tasks.md`, kept for the editor; the inspector renders `tree`. */
+  /** Raw `tasks.md`, kept for the editor; the inspector renders `rows`. */
   content: string;
-  tree: TaskTree;
+  /** The daemon's parse of `content`. */
+  rows: TaskRow[];
   planState: SessionPlanState;
 }
 
@@ -29,6 +30,8 @@ export interface InspectorEntry {
   tasksError: string | null;
   background: SessionBackground | null;
   backgroundError: string | null;
+  /** The session's PRs with their live checks; `null` until loaded. */
+  prs: ApiPr[] | null;
   stopping: StopRequests;
 }
 
@@ -38,6 +41,7 @@ export const EMPTY_INSPECTOR_ENTRY: InspectorEntry = {
   tasksError: null,
   background: null,
   backgroundError: null,
+  prs: null,
   stopping: NO_STOP_REQUESTS,
 };
 
@@ -46,11 +50,25 @@ interface InspectorState {
 
   /** Fetch tasks.md; overlapping calls coalesce into one follow-up fetch. */
   loadTasks: (sessionId: string) => Promise<void>;
-  /** Store a tasks document the client itself just saved. */
-  setTasks: (sessionId: string, content: string, planState: SessionPlanState) => void;
+  /**
+   * Store a tasks document the client itself just saved. `rows` are the
+   * daemon's parse of it; a draft session has no daemon yet, so none.
+   */
+  setTasks: (
+    sessionId: string,
+    document: { content: string; rows?: TaskRow[] },
+    planState: SessionPlanState,
+  ) => void;
   loadBackground: (sessionId: string) => Promise<void>;
-  /** Apply a `session_background` snapshot. */
+  /** Apply a session background snapshot. */
   applyBackground: (snapshot: SessionBackground) => void;
+  loadPrs: (sessionId: string) => Promise<void>;
+  /** Replace the session's PR list. */
+  applyPrs: (sessionId: string, prs: ApiPr[]) => void;
+  /** Merge an orphaned or review-required PR as user. */
+  mergePr: (prId: number, sessionId?: string) => Promise<void>;
+  /** Close an orphaned or review-required PR as user. */
+  closePr: (prId: number, sessionId?: string) => Promise<void>;
   killJob: (sessionId: string, pid: number) => Promise<void>;
   stopSubagent: (sessionId: string, runId: number) => Promise<void>;
 }
@@ -70,10 +88,14 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
   /** Sessions with a tasks fetch in flight, and whether another is owed. */
   const inflight = new Map<string, { again: boolean }>();
 
-  const tasksOf = (content: string, planState: SessionPlanState): SessionTasks => ({
+  const tasksOf = (
+    content: string,
+    rows: TaskRow[] | undefined,
+    planState: SessionPlanState,
+  ): SessionTasks => ({
     content,
     planState,
-    tree: parseTaskTree(content),
+    rows: rows ?? [],
   });
 
   return {
@@ -86,6 +108,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
         patch(sessionId, () => ({
           tasks: tasksOf(
             record?.planContent ?? '',
+            undefined,
             record?.session.runtime?.planState ?? 'disabled',
           ),
           tasksError: null,
@@ -106,7 +129,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
           try {
             const res = await getSessionTasks(sessionId);
             patch(sessionId, () => ({
-              tasks: tasksOf(res.content ?? '', res.planState),
+              tasks: tasksOf(res.content ?? '', res.rows, res.planState),
               tasksError: null,
             }));
           } catch (err) {
@@ -119,8 +142,11 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
       }
     },
 
-    setTasks(sessionId, content, planState) {
-      patch(sessionId, () => ({ tasks: tasksOf(content, planState), tasksError: null }));
+    setTasks(sessionId, document, planState) {
+      patch(sessionId, () => ({
+        tasks: tasksOf(document.content, document.rows, planState),
+        tasksError: null,
+      }));
     },
 
     async loadBackground(sessionId) {
@@ -139,6 +165,33 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
         backgroundError: null,
         stopping: settleStopRequests(prev.stopping, snapshot),
       }));
+    },
+
+    async loadPrs(sessionId) {
+      if (isDraftSessionId(sessionId)) return;
+      try {
+        get().applyPrs(sessionId, await listPrs({ forSession: sessionId }));
+      } catch (err) {
+        console.warn('session PRs failed to load', message(err));
+      }
+    },
+
+    applyPrs(sessionId, prs) {
+      patch(sessionId, () => ({ prs }));
+    },
+
+    async mergePr(prId, sessionId) {
+      await mergePr(prId);
+      if (sessionId) {
+        await get().loadPrs(sessionId);
+      }
+    },
+
+    async closePr(prId, sessionId) {
+      await closePr(prId);
+      if (sessionId) {
+        await get().loadPrs(sessionId);
+      }
     },
 
     async killJob(sessionId, pid) {

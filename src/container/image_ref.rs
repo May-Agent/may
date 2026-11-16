@@ -19,9 +19,40 @@ pub const WORKSPACE_IMAGE_REPOSITORY: &str = "ghcr.io/may-agent/may-workspace";
 
 /// Top-level context entries CI generates for the workspace build. Their
 /// content is identified by the hash's other inputs (the pinned tool
-/// distribution and the heel library version), so staging rewrites must not
-/// move the reference.
-const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "tools"];
+/// distribution, the `tasks` sources, the Python shim template and the heel
+/// library version), so staging rewrites must not move the reference.
+const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "python_shim", "tasks", "tools"];
+
+/// The `python3`, `python` and `uv` shim template, relative to the
+/// repository. The workspace image carries it as those three commands, so a
+/// change to it moves the workspace reference.
+pub const PYTHON_SHIM_TEMPLATE: &str = "templates/python_shim";
+
+/// The directory, relative to the repository, of the `tasks` crate.
+///
+/// The crate depends on no path outside it, so its directory and the lockfile
+/// are everything the binary the workspace image carries is built from.
+pub const TASKS_CRATE: &str = "tasks";
+
+/// The lockfile, relative to the repository, that pins the crate's
+/// dependencies.
+pub const TASKS_LOCKFILE: &str = "Cargo.lock";
+
+/// The files, relative to the repository, the `tasks` binary is built from.
+///
+/// Every file under [`TASKS_CRATE`] and the lockfile, sorted; a change to one
+/// moves the workspace reference.
+///
+/// # Errors
+/// Returns an IO error when the crate cannot be read.
+pub fn tasks_sources(repository: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut sources: Vec<PathBuf> = context_files(&repository.join(TASKS_CRATE))?
+        .into_iter()
+        .map(|relative| Path::new(TASKS_CRATE).join(relative))
+        .collect();
+    sources.push(PathBuf::from(TASKS_LOCKFILE));
+    Ok(sources)
+}
 
 /// The `<repository>:<content tag>` reference of the base image whose build
 /// context is `context_dir`: every file under the context, by sorted
@@ -40,8 +71,10 @@ pub fn base_image_ref(context_dir: &Path) -> io::Result<String> {
 /// The `<repository>:<content tag>` reference of the workspace image.
 ///
 /// Named by the base reference it layers on, the `context_dir` files minus
-/// the generated `heel`/`tools` entries, the tool distribution manifest
-/// bytes and the heel library version pinning the staged binary.
+/// the generated `heel`/`tools`/`tasks`/`python_shim` entries, the tool
+/// distribution manifest bytes, the sources the `tasks` binary is built from,
+/// the Python shim template and the heel library version pinning the staged
+/// binary.
 ///
 /// # Errors
 /// Returns an IO error when the context cannot be read.
@@ -49,6 +82,7 @@ pub fn workspace_image_ref(
     context_dir: &Path,
     base_ref: &str,
     tool_distribution: &[u8],
+    repository: &Path,
     heel_lib_version: &str,
 ) -> io::Result<String> {
     let mut hasher = Sha256::new();
@@ -62,6 +96,12 @@ pub fn workspace_image_ref(
     }
     feed(&mut hasher, b"tool-distribution");
     feed(&mut hasher, tool_distribution);
+    feed(&mut hasher, b"tasks-sources");
+    for relative in tasks_sources(repository)? {
+        feed_file(&mut hasher, repository, &relative)?;
+    }
+    feed(&mut hasher, b"python-shim");
+    feed_file(&mut hasher, repository, Path::new(PYTHON_SHIM_TEMPLATE))?;
     feed(&mut hasher, b"heel-lib-version");
     feed(&mut hasher, heel_lib_version.as_bytes());
     Ok(format!(
@@ -173,8 +213,27 @@ mod tests {
     fn workspace_ref_follows_every_input_but_the_generated_entries() {
         let context = tempfile::tempdir().expect("context");
         write_context(context.path());
-        let fixture =
-            || workspace_image_ref(context.path(), "base:ref", b"manifest", "1.0.0").unwrap();
+        let repository = tempfile::tempdir().expect("repository");
+        fs::create_dir_all(repository.path().join("tasks").join("src")).unwrap();
+        fs::write(repository.path().join("tasks").join("Cargo.toml"), "source").unwrap();
+        fs::write(
+            repository.path().join("tasks").join("src").join("lib.rs"),
+            "source",
+        )
+        .unwrap();
+        fs::write(repository.path().join("Cargo.lock"), "source").unwrap();
+        fs::create_dir_all(repository.path().join("templates")).unwrap();
+        fs::write(repository.path().join(PYTHON_SHIM_TEMPLATE), "shim").unwrap();
+        let fixture = || {
+            workspace_image_ref(
+                context.path(),
+                "base:ref",
+                b"manifest",
+                repository.path(),
+                "1.0.0",
+            )
+            .unwrap()
+        };
         let before = fixture();
         assert!(before.starts_with(&format!("{WORKSPACE_IMAGE_REPOSITORY}:")));
 
@@ -184,10 +243,35 @@ mod tests {
             ("base:ref", b"manifest".as_slice(), "1.0.1"),
         ] {
             assert_ne!(
-                workspace_image_ref(context.path(), base, manifest, version).unwrap(),
+                workspace_image_ref(context.path(), base, manifest, repository.path(), version)
+                    .unwrap(),
                 before,
             );
         }
+
+        // The sources of the `tasks` binary are inputs too.
+        for source in [
+            repository.path().join("tasks").join("src").join("lib.rs"),
+            repository.path().join("Cargo.lock"),
+        ] {
+            fs::write(&source, "edited").unwrap();
+            assert_ne!(fixture(), before);
+            fs::write(&source, "source").unwrap();
+            assert_eq!(fixture(), before);
+        }
+        // So is the Python shim template the image installs.
+        let shim = repository.path().join(PYTHON_SHIM_TEMPLATE);
+        fs::write(&shim, "edited").unwrap();
+        assert_ne!(fixture(), before);
+        fs::write(&shim, "shim").unwrap();
+        assert_eq!(fixture(), before);
+        // A file added to the crate is an input too.
+        let added = repository.path().join("tasks").join("templates");
+        fs::create_dir_all(&added).unwrap();
+        fs::write(added.join("new.txt"), "source").unwrap();
+        assert_ne!(fixture(), before);
+        fs::remove_dir_all(&added).unwrap();
+        assert_eq!(fixture(), before);
 
         fs::write(context.path().join("Dockerfile"), "FROM scratch\nRUN x\n").unwrap();
         assert_ne!(fixture(), before);
@@ -196,11 +280,87 @@ mod tests {
         // Generated staging output never moves the reference.
         fs::create_dir_all(context.path().join("tools").join("key")).unwrap();
         fs::write(context.path().join("heel"), "binary").unwrap();
+        fs::write(context.path().join("tasks"), "binary").unwrap();
+        fs::write(context.path().join("python_shim"), "staged").unwrap();
         fs::write(context.path().join("tools").join("key").join("rg"), "tool").unwrap();
         assert_eq!(fixture(), before);
         assert_eq!(
             workspace_hash_inputs(context.path()).unwrap(),
             vec![PathBuf::from("Dockerfile"), PathBuf::from("entrypoint.sh")]
         );
+    }
+
+    /// The tag inputs are the `tasks` crate's whole directory plus the
+    /// lockfile, and the crate reaches no path outside its directory, so the
+    /// tag moves with anything the binary is built from.
+    #[test]
+    fn tasks_tag_inputs_cover_the_binarys_sources() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = tasks_sources(repository).unwrap();
+
+        let mut on_disk = Vec::new();
+        collect(
+            &repository.join(TASKS_CRATE),
+            &repository.join(TASKS_CRATE),
+            &mut on_disk,
+        )
+        .unwrap();
+        assert!(on_disk.len() > 1);
+        for file in on_disk {
+            assert!(
+                sources.contains(&Path::new(TASKS_CRATE).join(&file)),
+                "{file:?}"
+            );
+        }
+        assert!(sources.contains(&PathBuf::from(TASKS_LOCKFILE)));
+        assert!(repository.join(TASKS_LOCKFILE).is_file());
+
+        let manifest = fs::read_to_string(repository.join(TASKS_CRATE).join("Cargo.toml")).unwrap();
+        let manifest: toml::Table = manifest.parse().unwrap();
+        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            for (name, dependency) in manifest
+                .get(table)
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flatten()
+            {
+                let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                assert!(
+                    !path.starts_with("..") && !Path::new(path).is_absolute(),
+                    "{name} reaches {path}, outside {TASKS_CRATE}/, so the tag would not cover it"
+                );
+            }
+        }
+        assert!(
+            manifest.get("target").is_none(),
+            "target tables are not scanned"
+        );
+        assert!(manifest.get("workspace").is_none());
+    }
+
+    /// The workspace image installs the staged shim as the three commands in
+    /// a directory that leads its `PATH`, ahead of the base image's
+    /// `/root/.local/bin/uv` and `/usr/bin/python3` the shim then finds.
+    #[test]
+    fn the_workspace_image_installs_the_python_shim_first_on_the_path() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dockerfile = fs::read_to_string(repository.join("container/workspace/Dockerfile"))
+            .expect("workspace Dockerfile");
+        for command in ["python3", "python", "uv"] {
+            assert!(
+                dockerfile.contains(&format!(
+                    "COPY --chmod=0755 python_shim /opt/may/shims/{command}\n"
+                )),
+                "{command} is not installed from the staged shim"
+            );
+        }
+        assert!(dockerfile.contains("ENV PATH=\"/opt/may/shims:${PATH}\"\n"));
+        assert!(
+            GENERATED_WORKSPACE_ENTRIES.contains(&"python_shim"),
+            "the staged shim must not move the tag by its staging"
+        );
+        assert!(repository.join(PYTHON_SHIM_TEMPLATE).is_file());
     }
 }

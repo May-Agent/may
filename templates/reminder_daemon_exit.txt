@@ -1,0 +1,3 @@
+<system-reminder>
+The May daemon exited unexpectedly and has restarted. A turn that was in progress was cut off, and every background command and subagent run this session had is gone; none of them is still running. Check what they left behind before relying on their results.
+</system-reminder>

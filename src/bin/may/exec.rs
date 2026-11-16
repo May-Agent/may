@@ -9,11 +9,11 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use aither_core::llm::{CommandOutcome, CommandResult, ToolResult};
 use aither_sandbox::{
-    ContainerShellRuntime, OutputFormat, ShellRuntimeAvailability, SshServer, TerminalArgs,
-    TerminalExecutionMode, TerminalTool,
+    ContainerShellRuntime, Grants, Interpreter, MediaResolution, RunOutcome, SandboxMode,
+    ScriptResult, ShellArgs, SshServer,
 };
+use may_agent::ipc::{CommandRegistryBuilder, SessionShell, ShellSlot};
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::{
     ChatDb, MayConfig, ProfileEnvironment, ProfileInfo, SessionId, SessionStore,
@@ -60,18 +60,24 @@ pub enum ExecError {
     CompileNetworkPolicy(aither_sandbox::NetworkPolicyError),
     #[error("failed to create terminal tool: {0}")]
     CreateTerminalTool(aither_sandbox::TerminalError),
+    #[error("failed to restore the session's model-facing ids: {0}")]
+    SessionIds(may_agent::db::ChatDbError),
+    #[error("failed to start the May daemon: {0}")]
+    StartDaemon(may_agent::daemon::lifecycle::LifecycleError),
+    #[error("failed to connect to the daemon for the session's ids: {0}")]
+    ConnectDaemonIds(std::io::Error),
+    #[error("failed to connect to the daemon's jobserver pool: {0}")]
+    ConnectJobserver(aither_sandbox::JobserverError),
     #[error("failed to initialize baseline tools: {0}")]
-    InitializeBaselineTools(#[from] aither_sandbox::ToolRuntimeError),
+    InitializeBaselineTools(#[from] may_agent::tools::ToolRuntimeError),
     #[error("failed to initialize tool dispatch runtime: {0}")]
     InitializeToolDispatch(may_agent::tool_dispatch::ToolDispatchError),
-    #[error("failed to configure ssh servers: {0}")]
-    ConfigureSshServers(String),
     #[error("ssh server '{0}' is not attached to the session's profile")]
     SshServerNotAttached(String),
     #[error("terminal execution failed: {0}")]
     TerminalCall(aither_core::Error),
-    #[error("terminal tool did not return a command result")]
-    NotACommandResult,
+    #[error("failed to build the shell: {0}")]
+    BuildShell(may_agent::shell::ShellAssemblyError),
     #[error("failed to write stdout: {0}")]
     WriteStdout(std::io::Error),
     #[error("failed to write stderr: {0}")]
@@ -89,33 +95,7 @@ struct ExecSessionContext {
     profile_container_preferences: Option<may_agent::profile::ContainerProfilePreferences>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ExecSshAuthorizer {
-    allow_runtime_install: bool,
-}
-
-impl aither_sandbox::SshSessionAuthorizer for ExecSshAuthorizer {
-    fn authorize_connect(
-        &self,
-        _target: &str,
-    ) -> impl std::future::Future<Output = Result<bool, aither_sandbox::SshAuthorizationError>> + Send
-    {
-        std::future::ready(Ok(true))
-    }
-
-    fn authorize_runtime_install(
-        &self,
-        _target: &str,
-        _details: &str,
-    ) -> impl std::future::Future<Output = Result<bool, aither_sandbox::SshAuthorizationError>> + Send
-    {
-        std::future::ready(Ok(self.allow_runtime_install))
-    }
-}
-
 pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
-    // `exec` runs a sandbox in-process; the daemon configures its own heel.
-    may_agent::configure_heel_binary().await;
     let context = load_exec_session_context(&args.session_id).await?;
     let config_path = context.may_dir.join("config.toml");
     let may_config = MayConfig::load_from(&config_path)
@@ -135,97 +115,70 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
     .map_err(ExecError::ResolveEnvironment)?;
 
     let model = select_exec_model(&may_config);
-    let shell_mode = select_exec_mode(&args, &environment);
-    let terminal_tool = Box::pin(build_exec_terminal_tool(
+    let sandbox = select_exec_mode(&args, &environment);
+    let shell = Box::pin(build_exec_shell(
         &context,
         &environment,
         &may_config,
         &model,
         args.ssh_server_id.as_deref(),
-        args.allow_runtime_install,
         tool_distribution,
     ))
     .await?;
 
     // `may exec` reports the final result, so the command runs detached
     // under its `--timeout` kill bound and the call waits for completion.
-    let started = terminal_tool
-        .run_background(TerminalArgs {
+    let job = shell
+        .run_background(ShellArgs {
             description: "execute the requested shell command".to_string(),
             script: args.script,
-            mode: shell_mode,
-            ssh_server_id: args.ssh_server_id,
-            expect: OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: args.max_lines,
+            interpreter: Interpreter::Shell,
+            sandbox,
+            location: args.ssh_server_id,
+            resolution: MediaResolution::Auto,
+            max_lines: Some(args.max_lines),
             raw: args.raw,
             timeout: args.timeout,
             background: true,
         })
         .await
         .map_err(ExecError::TerminalCall)?;
-    if started.is_error() {
-        return Err(ExecError::TerminalCall(anyhow::anyhow!(
-            started
-                .error_message()
-                .unwrap_or("terminal tool returned an error")
-                .to_string()
-        )));
-    }
-    let ToolResult::Command(started) = started else {
-        return Err(ExecError::NotACommandResult);
-    };
-    let result = match started.outcome.clone() {
-        CommandOutcome::Running { task_id, .. } => {
-            let receiver = terminal_tool.background_receiver();
-            let completed = loop {
-                let Some(completed) = receiver.recv().await else {
-                    return Err(ExecError::TerminalCall(anyhow::anyhow!(
-                        "the terminal job channel closed before the command finished"
-                    )));
-                };
-                if completed.task_id == task_id {
-                    break completed;
-                }
-            };
-            let killed = terminal_tool
-                .job_registry()
-                .get_by_task_id(&task_id)
-                .await
-                .is_some_and(|job| {
-                    matches!(
-                        job.status,
-                        aither_sandbox::job_registry::JobStatus::Killed { .. }
-                    )
-                });
-            let mut result: CommandResult = completed
-                .result
-                .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?
-                .into();
-            if killed {
-                result.outcome = CommandOutcome::Killed {
-                    task_id,
-                    notice: format!("killed after its {}s timeout", args.timeout),
-                };
-            }
-            result
-        }
-        _ => *started,
-    };
-    render_exec_result(&result)?;
+    let task_id = job.task_id().to_owned();
+    let result = job
+        .wait()
+        .await
+        .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?;
+    render_exec_result(&task_id, &result)?;
     Ok(exit_code(&result.outcome))
 }
 
 async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContext, ExecError> {
     let may_dir = MayConfig::may_dir().map_err(ExecError::MissingHomeDirectory)?;
+    // The daemon owns the session's model-facing ids and the machine's job
+    // pool, so it is started on demand; every id exec leases comes from the
+    // daemon's pool of the session.
+    let daemon = may_agent::daemon::DaemonPaths::new(may_dir.clone());
+    // Persistence comes first, as for every client, so the daemon a run
+    // starts never migrates the database alongside it.
     let (store, db, _default_profile_id) = initialize_session_persistence(&may_dir)
         .await
         .map_err(ExecError::InitializeSession)?;
+    // A missing session fails before anything starts a daemon for it.
     let session_row = db
         .get_session(session_id)
         .await
         .map_err(|error| ExecError::InitializeSession(error.into()))?
         .ok_or_else(|| ExecError::SessionNotFound(session_id.to_string()))?;
+    may_agent::daemon::lifecycle::ensure_running(&daemon, |line| {
+        let _ = writeln!(io::stderr(), "[may] {line}");
+    })
+    .await
+    .map_err(ExecError::StartDaemon)?;
+    let db = db.lease_ids_from(
+        may_agent::client::ids::DaemonIds::connect(&daemon.socket())
+            .await
+            .map_err(ExecError::ConnectDaemonIds)?,
+    );
     let profile_id = session_row.profile_id.clone();
     let profile_model = match profile_id {
         Some(ref profile_id) => Some(
@@ -258,17 +211,19 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
     };
     let profile_environment = match (profile_model.clone(), profile_preferences.as_ref()) {
         (Some(model), Some(preferences)) => {
-            let attachments =
-                db.list_profile_remote_servers(&model.id)
-                    .await
-                    .map_err(|source| ExecError::LoadProfile {
-                        profile_id: profile_id
-                            .clone()
-                            .expect("profile id present when model exists"),
-                        source,
-                    })?;
+            let (attachments, cloud) = futures_lite::future::try_zip(
+                db.list_profile_remote_servers(&model.id),
+                db.profile_cloud(&model.id),
+            )
+            .await
+            .map_err(|source| ExecError::LoadProfile {
+                profile_id: profile_id
+                    .clone()
+                    .expect("profile id present when model exists"),
+                source,
+            })?;
             Some(
-                ProfileInfo::from_db_parts(model, preferences.clone(), attachments)
+                ProfileInfo::from_db_parts(model, preferences.clone(), attachments, cloud)
                     .map_err(|source| ExecError::InvalidProfile {
                         profile_id: profile_id
                             .clone()
@@ -337,22 +292,14 @@ async fn ensure_exec_session_layout(
     Ok(())
 }
 
-async fn build_exec_terminal_tool(
+async fn build_exec_shell(
     context: &ExecSessionContext,
     environment: &may_agent::AgentEnvironment,
     may_config: &MayConfig,
     model: &may_agent::ModelSelector,
     ssh_server_id: Option<&str>,
-    allow_runtime_install: bool,
-    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
-) -> Result<
-    TerminalTool<
-        TerminalPermissionHandler,
-        executor_core::DefaultExecutor,
-        aither_sandbox::Configured,
-    >,
-    ExecError,
-> {
+    tool_distribution: Arc<may_agent::tools::ToolDistribution>,
+) -> Result<Arc<SessionShell>, ExecError> {
     // Only the targeted server is registered, so a local exec never depends
     // on the state of the profile's other attached servers.
     let ssh_server = match ssh_server_id {
@@ -360,31 +307,11 @@ async fn build_exec_terminal_tool(
         None => None,
     };
     let ssh_available = ssh_server.is_some();
-    let mut shell_sessions = aither_sandbox::ShellSessionRegistry::new(match environment {
-        may_agent::AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
-            local: false,
-            container: true,
-            ssh: ssh_available,
-        },
-        may_agent::AgentEnvironment::Local => ShellRuntimeAvailability {
-            local: true,
-            container: false,
-            ssh: ssh_available,
-        },
-    });
-
-    if let Some(ssh_server) = ssh_server {
-        shell_sessions = shell_sessions
-            .with_ssh_servers(vec![ssh_server])
-            .map_err(ExecError::ConfigureSshServers)?
-            .with_ssh_authorizer(Arc::new(ExecSshAuthorizer {
-                allow_runtime_install,
-            }));
-    }
 
     let runtime_service = std::sync::Arc::new(may_agent::session::SessionRuntimeService::new(
         context.db.clone(),
         may_agent::ui_event_bus::UiEventBus::new(),
+        may_agent::MayHomePaths::new(context.may_dir.clone()),
     ));
     let network_policy = may_config
         .preferences
@@ -392,67 +319,86 @@ async fn build_exec_terminal_tool(
         .compile()
         .map_err(ExecError::CompileNetworkPolicy)?;
 
-    let terminal_tool: TerminalTool<TerminalPermissionHandler, executor_core::DefaultExecutor> =
-        TerminalTool::new_exact(
-            &context.sandbox_dir,
-            TerminalPermissionHandler::for_exec(
-                context.session_id.as_str().to_string(),
-                runtime_service,
-                network_policy,
-                context
-                    .profile_model
-                    .as_ref()
-                    .map(|profile| profile.id.clone()),
-            ),
-            executor_core::DefaultExecutor,
-        )
+    let session_ids = context
+        .db
+        .session_ids(context.session_id.as_str())
         .await
-        .map_err(ExecError::CreateTerminalTool)?
-        .with_network_audit_log(
-            aither_sandbox::open_network_audit_log(
-                context
-                    .may_dir
-                    .join(may_agent::config::NETWORK_AUDIT_LOG_SUBDIR),
-                may_agent::config::NETWORK_AUDIT_MAX_FILES,
-            )
-            .await
-            .map_err(ExecError::CreateTerminalTool)?,
-        );
-
-    let terminal_tool = match environment {
+        .map_err(ExecError::SessionIds)?;
+    let permissions = TerminalPermissionHandler::for_exec(
+        context.session_id.as_str().to_string(),
+        runtime_service,
+        network_policy,
+        context
+            .profile_model
+            .as_ref()
+            .map(|profile| profile.id.clone()),
+    );
+    let audit_log = aither_sandbox::open_network_audit_log(
+        context
+            .may_dir
+            .join(may_agent::config::NETWORK_AUDIT_LOG_SUBDIR),
+        may_agent::config::NETWORK_AUDIT_MAX_FILES,
+    )
+    .await
+    .map_err(ExecError::CreateTerminalTool)?;
+    // Local commands draw their jobs from the daemon's machine-wide pool, as
+    // the daemon's own sessions do; a container or an SSH server has none.
+    let pool = match environment {
+        may_agent::AgentEnvironment::Local if !ssh_available => Some(
+            may_agent::jobserver::connect_running(&context.may_dir)
+                .map_err(ExecError::ConnectJobserver)?,
+        ),
+        _ => None,
+    };
+    let container = match environment {
         may_agent::AgentEnvironment::Container {
             container_id,
             container_ipc_route,
             container_exec,
             ..
-        } => terminal_tool
-            .with_shell_sessions(shell_sessions)
-            .with_container_runtime(
-                ContainerShellRuntime::new(
-                    container_id.clone(),
-                    container_ipc_route.clone(),
-                    container_exec.clone(),
-                )
-                .with_workspace_mount(
-                    may_agent::container::lifecycle::workspace_mount(&context.sandbox_dir),
-                ),
-            ),
-        may_agent::AgentEnvironment::Local => terminal_tool.with_shell_sessions(shell_sessions),
+        } => Some(
+            ContainerShellRuntime::new(
+                container_id.clone(),
+                container_ipc_route.clone(),
+                container_exec.clone(),
+            )
+            .with_workspace_mount(may_agent::container::lifecycle::workspace_mount(
+                &context.sandbox_dir,
+            )),
+        ),
+        may_agent::AgentEnvironment::Local => None,
     };
 
     let tools_dir = may_agent::MayHomePaths::new(context.may_dir.clone()).tools_dir();
-    let (terminal_tool, (resolved_provider, tool_dispatchers)) = futures_lite::future::try_zip(
+    let (tools, (resolved_provider, tool_dispatchers)) = futures_lite::future::try_zip(
         async {
-            terminal_tool
-                .with_process_priority(may_config.sandbox.command_priority.process_priority())
-                .initialize_tools(&tool_distribution, &tools_dir)
-                .await
-                .map_err(ExecError::InitializeBaselineTools)
+            match environment {
+                may_agent::AgentEnvironment::Container {
+                    container_id,
+                    container_exec,
+                    ..
+                } => {
+                    may_agent::tools::ToolEnvironments::prepare_container(
+                        container_exec.clone(),
+                        container_id,
+                        &tool_distribution,
+                        &tools_dir,
+                    )
+                    .await
+                }
+                may_agent::AgentEnvironment::Local => {
+                    may_agent::tools::ToolEnvironments::prepare_host(&tool_distribution, &tools_dir)
+                        .await
+                }
+            }
+            .map_err(ExecError::InitializeBaselineTools)
         },
         futures_lite::future::try_zip(
             async {
+                // A one-shot run is never a cloud home: nothing is pushed to it.
+                let pushed = may_agent::cloud::access::PushedProviders::default();
                 resolve_provider_runtime(
-                    may_config,
+                    may_agent::agent::Providers::new(may_config, &pushed),
                     model,
                     0,
                     &may_agent::secrets::SecretRedactor::new(&context.may_dir),
@@ -478,29 +424,61 @@ async fn build_exec_terminal_tool(
         ),
     )
     .await?;
-    let registry = Box::pin(build_exec_registry(
+    let budgets = may_agent::shell::ShellBudgets::of(&may_config.shell);
+    let commands = Box::pin(build_exec_commands(
         context,
         may_config,
+        &budgets,
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
     ))
     .await?;
-    let terminal_tool = terminal_tool.with_registry(registry);
-    Ok(terminal_tool)
+    let grants = Grants::new();
+    grants.add_writable(&context.sandbox_dir);
+    may_agent::shell::ShellAssembly {
+        tools,
+        container,
+        working_dir: context.sandbox_dir.clone(),
+        grants,
+        priority: may_config.sandbox.command_priority.process_priority(),
+        audit_log,
+        permissions,
+        env_source: None,
+        budgets,
+        interpreters: vec![Interpreter::Shell],
+        policies: may_agent::command_policy::PolicySet {
+            managed_bash: may_agent::command_policy::runs_managed_bash(matches!(
+                environment,
+                may_agent::AgentEnvironment::Container { .. }
+            )),
+            refused: may_agent::command_policy::RefusedReads::default(),
+            checkout_reads: None,
+        },
+        slot: ShellSlot::new(),
+        ssh_servers: ssh_server.into_iter().collect(),
+        ids: Some(session_ids.allocator().clone()),
+        spaces: may_agent::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
+        pool,
+        connectivity: None,
+    }
+    .build(commands)
+    .await
+    .map_err(ExecError::BuildShell)
 }
 
-async fn build_exec_registry<LLM>(
+async fn build_exec_commands<LLM>(
     context: &ExecSessionContext,
-    _may_config: &MayConfig,
+    may_config: &MayConfig,
+    budgets: &may_agent::shell::ShellBudgets,
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
-) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
+) -> Result<may_agent::ipc::CommandRegistry, ExecError>
 where
-    LLM: aither_core::LanguageModel + Clone + 'static,
+    LLM: aither_core::LanguageModel + Clone + Sync + 'static,
 {
-    let mut builder = aither_sandbox::ToolRegistryBuilder::new();
+    let mut builder = CommandRegistryBuilder::new();
     let session_paths = SessionPaths::new(context.sandbox_dir.clone());
     // Issues belong to the project `may exec` runs in, as for the TUI and
     // UI server, never to the session sandbox.
@@ -517,6 +495,7 @@ where
             #[cfg(target_os = "macos")]
             computer: None,
             rules_import: None,
+            services: may_agent::SharedServices::new(&context.may_dir),
             llm,
             ask_flagship: None,
             ask_balanced: None,
@@ -533,20 +512,32 @@ where
                 may_agent::AgentEnvironment::Local => TaskRuntimeKind::Local,
             },
             task_broker: Some(tool_dispatchers.task.clone()),
-            notify_broker: Some(tool_dispatchers.notify.clone()),
             tunnel_broker: Some(tool_dispatchers.tunnel.clone()),
             browser_broker: tool_dispatchers.browser.clone(),
             register_skills_broker: None,
             workspace_request_broker: None,
-            subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+            // exec launches no subagent of its own; the assembly is only
+            // what the `subagent` command names.
+            subagents: may_agent::terminal_commands::SubagentAssembly {
+                toolkit: may_agent::shell::ShellToolkit::of(budgets),
+                cache_lifetime: may_agent::cache_lifetime::CacheLifetime::default().into(),
+                keep_alive: None,
+                instructions: Vec::new(),
+                vision_ocr: may_agent::vision_ocr::VisionOcr::new(),
+            },
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.
             request_parameters: aither_core::llm::model::Parameters::default(),
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
+            // exec has no agent and so no `tasks.md` to follow its changes.
+            task_events: may_agent::harness::working_document::WorkEvents::new(),
             // `may exec` runs the user's own script: nobody to ask.
             publish_gate: None,
+            live_config: Some(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                may_config.clone(),
+            ))),
             workspace_config: may_agent::workspace::WorkspaceConfig::load(
                 &session_paths.workspace_config(),
             )
@@ -556,13 +547,15 @@ where
             languages: None,
             acp: None,
             git: may_agent::host_git::HostGit::inherit(),
+            timeout_cap: budgets.limits().timeout_cap,
+            tasks_line_limit: may_agent::tasks_md::schema::LineLimit::new(
+                may_config.tasks.line_limit,
+            ),
         },
     )
     .await
     .map_err(ExecError::RegisterCommands)?;
-    Ok(Arc::new(builder.build(
-        SessionPaths::new(context.sandbox_dir.clone()).outputs_dir(),
-    )))
+    Ok(builder.build())
 }
 
 /// Resolves `server_id` among the SSH servers attached to the session's profile.
@@ -600,31 +593,20 @@ fn select_exec_model(config: &MayConfig) -> may_agent::ModelSelector {
         .unwrap_or_else(|| panic!("may exec requires at least one configured model"))
 }
 
-const fn select_exec_mode(
-    args: &ExecArgs,
-    _environment: &may_agent::AgentEnvironment,
-) -> TerminalExecutionMode {
-    if let Some(mode) = args.mode {
-        return mode;
-    }
-    if args.ssh_server_id.is_some() {
-        return TerminalExecutionMode::Ssh;
-    }
-    TerminalExecutionMode::Default
+fn select_exec_mode(args: &ExecArgs, _environment: &may_agent::AgentEnvironment) -> SandboxMode {
+    args.mode.unwrap_or_default()
 }
 
-/// Process exit code reported for a command outcome. A background task has
-/// not finished, so it reports success; a run killed at its time bound reports
-/// `-1`.
-const fn exit_code(outcome: &CommandOutcome) -> i32 {
+/// Process exit code reported for a command outcome: a run killed at its
+/// time bound reports `-1`.
+const fn exit_code(outcome: &RunOutcome) -> i32 {
     match outcome {
-        CommandOutcome::Exited { code } => *code,
-        CommandOutcome::Running { .. } => 0,
-        CommandOutcome::Killed { .. } => -1,
+        RunOutcome::Exited { code } => *code,
+        RunOutcome::Killed(_) => -1,
     }
 }
 
-fn render_exec_result(result: &CommandResult) -> Result<(), ExecError> {
+fn render_exec_result(task_id: &str, result: &ScriptResult) -> Result<(), ExecError> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
@@ -652,11 +634,8 @@ fn render_exec_result(result: &CommandResult) -> Result<(), ExecError> {
     }
 
     match &result.outcome {
-        CommandOutcome::Exited { .. } => {}
-        CommandOutcome::Running { task_id, .. } => stderr
-            .write_all(format!("background task: {task_id} (running)\n").as_bytes())
-            .map_err(ExecError::WriteStderr)?,
-        CommandOutcome::Killed { task_id, .. } => stderr
+        RunOutcome::Exited { .. } => {}
+        RunOutcome::Killed(_) => stderr
             .write_all(format!("background task: {task_id} (killed)\n").as_bytes())
             .map_err(ExecError::WriteStderr)?,
     }

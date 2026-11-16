@@ -7,8 +7,8 @@
 use skyzen_services::Db as SkyDb;
 
 use super::{
-    ChatDb, ChatDbError, SqliteTableInfoRow,
-    db_sql::{self, SEARCH_OUTBOX_BACKFILL, SEARCH_OUTBOX_SCHEMA},
+    ChatDb, ChatDbError,
+    db_sql::{self, SEARCH_OUTBOX_SCHEMA},
     query,
 };
 
@@ -64,18 +64,10 @@ pub struct IndexedMessageRow {
 }
 
 impl ChatDb {
-    /// Creates the outbox and its triggers. On the first run it also queues
-    /// every existing message, so the collection starts complete.
+    /// Creates the outbox and its triggers.
     pub(super) async fn ensure_search_outbox(db: &SkyDb) -> Result<(), ChatDbError> {
-        let existed = !query!(db, "PRAGMA table_info(search_outbox)")
-            .fetch_all::<SqliteTableInfoRow>()
-            .await?
-            .is_empty();
         for statement in db_sql::blocks(SEARCH_OUTBOX_SCHEMA) {
             query!(db, statement).execute().await?;
-        }
-        if !existed {
-            query!(db, SEARCH_OUTBOX_BACKFILL).execute().await?;
         }
         Ok(())
     }
@@ -149,15 +141,8 @@ impl ChatDb {
         let ids = serde_json::to_string(ids).map_err(|error| {
             ChatDbError::Storage(super::db_custom_error("encode message ids: ", &error))
         })?;
-        Ok(query!(
-            self.db,
-            "SELECT m.id AS message_id, m.session_id, m.role, m.content, m.timestamp, \
-             s.title, s.model, s.profile_id, s.archived, s.preview, s.updated_at, s.message_count \
-             FROM messages m JOIN sessions s ON s.id = m.session_id \
-             WHERE m.id IN (SELECT value FROM json_each(?))",
-            ids
-        )
-        .fetch_all::<IndexedMessageRow>()
-        .await?)
+        Ok(query!(self.db, db_sql::INDEXED_MESSAGES, ids)
+            .fetch_all::<IndexedMessageRow>()
+            .await?)
     }
 }

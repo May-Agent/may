@@ -24,17 +24,27 @@ use crate::daemon::error::{
 };
 use crate::daemon::state::DaemonState;
 
+/// Tells every client of `session_id` how its compaction stands, on the
+/// `session_compaction` frame kind.
+pub(super) fn publish_compaction(
+    hub: &super::hub::TurnHub,
+    session_id: &str,
+    phase: crate::client::CompactionPhase,
+) {
+    let frame = crate::client::SessionCompactionFrame {
+        session_id: session_id.to_string(),
+        phase,
+    };
+    match serde_json::to_string(&frame) {
+        Ok(json) => hub.publish(session_id, "session_compaction", json.into()),
+        Err(error) => tracing::error!(%error, "failed to encode a compaction frame"),
+    }
+}
+
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
 pub struct ParkedAgents {
-    workers: Mutex<HashMap<String, Parked>>,
-}
-
-/// One idle agent and what it was built from.
-struct Parked {
-    worker: Arc<AgentWorker>,
-    /// [`super::agent_build_key`] of the inputs the agent was built from.
-    build_key: u64,
+    workers: Mutex<HashMap<String, Arc<AgentWorker>>>,
 }
 
 impl std::fmt::Debug for ParkedAgents {
@@ -44,75 +54,102 @@ impl std::fmt::Debug for ParkedAgents {
 }
 
 impl ParkedAgents {
-    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Parked>> {
+    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AgentWorker>>> {
         self.workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Keeps `agent`, built from inputs with `build_key`, as `session_id`'s
-    /// idle agent.
+    /// Keeps `agent` as `session_id`'s idle agent.
     pub(crate) fn park(
         &self,
         state: &Arc<DaemonState>,
         session_id: &str,
         agent: MayAgent,
-        build_key: u64,
         released: crate::session::RunReleased,
     ) {
         // One pending wake is enough: the agent's context holds every event
         // a later wake would add, and the run it starts sees them all.
         let (wakes, wake_rx) = async_channel::bounded(1);
+        let (compactions, compaction_rx) = async_channel::unbounded();
         let worker = spawn_idle_worker(
             executor_core::DefaultExecutor,
             agent,
             state.db(),
             state.runtime_service.runs().clone(),
             Some(crate::agent::BackgroundWakes { wakes, released }),
+            Some(compactions),
         );
-        let previous = self.workers().insert(
-            session_id.to_string(),
-            Parked {
-                worker: Arc::new(worker),
-                build_key,
-            },
-        );
+        // The compactions the worker runs on its own and on request reach
+        // the session's clients; ends with the worker like the wake task.
+        let hub = state.turn_hub.clone();
+        let compaction_session = session_id.to_string();
+        state.tokio_handle.spawn(async move {
+            while let Ok(phase) = compaction_rx.recv().await {
+                publish_compaction(&hub, &compaction_session, phase);
+            }
+        });
+        let previous = self
+            .workers()
+            .insert(session_id.to_string(), Arc::new(worker));
         if let Some(previous) = previous {
-            previous.worker.shutdown();
+            previous.shutdown();
         }
         // Ends with the worker, which drops the sending half.
         let wake_state = state.clone();
         let session_id = session_id.to_string();
         state.tokio_handle.spawn(async move {
             while let Ok(wake) = wake_rx.recv().await {
-                // The session reads as resuming through the whole turn, so a
-                // client never sees the gap between the command finishing
-                // and the turn it starts.
-                let _resuming = wake_state.session_background.resume_pending(&session_id);
-                super::start_background_turn(&wake_state, &session_id, wake).await;
+                // The session reads as resuming, and the wake's jobs as owed
+                // a turn, through the whole turn, so a client never sees the
+                // gap between the command finishing and the turn it starts;
+                // the turn settles both when it releases the session.
+                let resuming = wake_state
+                    .session_background
+                    .resume_pending(&session_id, wake.pending);
+                super::start_background_turn(&wake_state, &session_id, resuming).await;
             }
         });
     }
 
+    /// Stops the background work of `session_id`'s idle agent, if it has
+    /// one: its terminal jobs are killed and its subagent runs cancelled,
+    /// and their completions wait for the user's next input instead of
+    /// starting a turn. The agent stays parked, its prompt cache warm.
+    pub(crate) async fn stop_background(&self, state: &Arc<DaemonState>, session_id: &str) {
+        let Some(worker) = self.workers().remove(session_id) else {
+            return;
+        };
+        let (reply, agent) = async_channel::bounded(1);
+        worker.release(reply);
+        let Ok(mut agent) = agent.recv().await else {
+            return;
+        };
+        agent.interrupt();
+        let killed = agent.kill_running_terminal_jobs().await;
+        let cancelled = agent.subagent_runs().cancel_all();
+        tracing::info!(%session_id, killed, cancelled, "stopped the idle agent's background work");
+        self.park(
+            state,
+            session_id,
+            agent,
+            crate::session::RunReleased::already_released(),
+        );
+    }
+
     /// Stops `session_id`'s idle agent, if any.
     pub(crate) fn evict(&self, session_id: &str) {
-        let parked = self.workers().remove(session_id);
-        if let Some(parked) = parked {
-            parked.worker.shutdown();
+        let worker = self.workers().remove(session_id);
+        if let Some(worker) = worker {
+            worker.shutdown();
         }
     }
 
-    /// Takes `session_id`'s idle agent for a turn. With `build_key`, an agent
-    /// built from other inputs is stopped instead and `None` returned, so the
-    /// turn builds a fresh one.
-    pub(crate) async fn take(&self, session_id: &str, build_key: Option<u64>) -> Option<MayAgent> {
-        let parked = self.workers().remove(session_id)?;
-        if build_key.is_some_and(|key| key != parked.build_key) {
-            parked.worker.shutdown();
-            return None;
-        }
+    /// Takes `session_id`'s idle agent for a turn.
+    pub(crate) async fn take(&self, session_id: &str) -> Option<MayAgent> {
+        let worker = self.workers().remove(session_id)?;
         let (reply, agent) = async_channel::bounded(1);
-        parked.worker.release(reply);
+        worker.release(reply);
         agent.recv().await.ok()
     }
 
@@ -127,9 +164,7 @@ impl ParkedAgents {
     }
 
     pub(super) fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
-        self.workers()
-            .get(session_id)
-            .map(|parked| parked.worker.clone())
+        self.workers().get(session_id).cloned()
     }
 }
 
@@ -187,7 +222,6 @@ pub(super) async fn idle_agent(
         state,
         session_id,
         prepared.agent,
-        prepared.build_key,
         crate::session::RunReleased::already_released(),
     );
     state
@@ -229,13 +263,12 @@ pub struct CompactResponse {
 }
 
 /// `POST /api/sessions/{id}/compact`.
-pub async fn compact_session(
-    params: Params,
-    Json(req): Json<CompactRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub async fn compact_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: CompactRequest,
 ) -> SkyResult<Json<CompactResponse>> {
-    let session_id = session_id_param(&params)?;
-    let worker = idle_agent(&state, &session_id).await?;
+    let worker = idle_agent(state, session_id).await?;
     match answer(worker.compact(req.focus)).await {
         Some(TuiEvent::Compacted(Ok(result))) => Ok(Json(CompactResponse {
             compacted: result.is_some(),
@@ -331,19 +364,18 @@ pub struct ContextDumpResponse {
 
 /// `POST /api/sessions/{id}/context-dump`: writes the assembled context to
 /// the session's `outputs/context-dump.md`.
-pub async fn context_dump(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
+pub async fn context_dump_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
 ) -> SkyResult<Json<ContextDumpResponse>> {
-    let session_id = session_id_param(&params)?;
-    let worker = idle_agent(&state, &session_id).await?;
+    let worker = idle_agent(state, session_id).await?;
     let dump = match answer(worker.context_dump()).await {
         Some(TuiEvent::ContextDump(Ok(dump))) => dump,
         Some(TuiEvent::ContextDump(Err(error))) => return Err(internal_error(error)),
         _ => return Err(internal_error_message("the agent gave no context dump")),
     };
     let text = dump.render();
-    let paths = crate::daemon::helpers::load_session_paths(&state, &session_id).await?;
+    let paths = crate::daemon::helpers::load_session_paths(state, session_id).await?;
     let dir = paths.outputs_dir();
     async_fs::create_dir_all(&dir)
         .await
@@ -384,17 +416,15 @@ pub struct BtwResponse {
 
 /// `POST /api/sessions/{id}/btw`: answers a side question with the
 /// session's model, outside the conversation.
-pub async fn btw(
-    params: Params,
-    Json(req): Json<BtwRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub async fn btw_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: BtwRequest,
 ) -> SkyResult<Json<BtwResponse>> {
     use aither_core::llm::Message;
     use futures_lite::StreamExt as _;
 
-    let session_id = session_id_param(&params)?;
-    let worker = idle_agent(&state, &session_id).await?;
-    let messages = req
+    let mut messages = req
         .messages
         .into_iter()
         .map(|message| match message.role.as_str() {
@@ -403,7 +433,26 @@ pub async fn btw(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let llm = worker.side_model().await.map_err(internal_error_message)?;
+    let side = super::sidecar::side_context(state, session_id)
+        .await
+        .map_err(internal_error)?;
+    let llm = if let Some(side) = side {
+        // The agent's own context replaces the client's rendering of the
+        // chat: only the contract (first, when it is a system message) and
+        // the question (last) are kept.
+        let question = messages.pop();
+        let contract = messages
+            .into_iter()
+            .next()
+            .filter(|message| message.role() == aither_core::llm::Role::System);
+        messages = side.messages;
+        messages.extend(contract);
+        messages.extend(question);
+        side.model
+    } else {
+        let worker = idle_agent(state, session_id).await?;
+        worker.side_model().await.map_err(internal_error_message)?
+    };
     let mut answer = String::new();
     let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(event) = stream.next().await {

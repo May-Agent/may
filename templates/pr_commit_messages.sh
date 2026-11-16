@@ -1,0 +1,1 @@
+git log --reverse -z --format=%h%n%B {{ base }}..{{ head }}

@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type {
   BrowserLifecycleEvent,
   BrowserStatusPayload,
+  CloudSessionEvent,
   NetworkAccessLogsResponse,
   ProfileSessions,
   RemoteAccessStatusResponse,
@@ -16,7 +17,9 @@ import { useSessionsStore } from './sessions';
 import { useModelsStore } from './models';
 import { useConfigStore } from './config';
 import { useBrowserViewStore } from './browserView';
+import { useInspectorStore } from './inspector';
 import type { NotificationMailboxEntry } from '../api/notifications';
+import type { ApiPr } from '../api/prs';
 
 /// Aggregated browser lifecycle snapshot: the runtime store keeps the
 /// most recent lifecycle event plus a few derived counters so consumers
@@ -48,6 +51,8 @@ interface RuntimeState {
   activeProfileId: string | null;
   browser: BrowserStatusPayload | null;
   browserLifecycle: BrowserLifecycleSnapshot;
+  /** The last step of each cloud session's machine coming up. */
+  cloudSessions: Record<string, CloudSessionEvent>;
   runtimes: Record<string, SessionRuntimeSummary>;
   profileSessions: ProfileSessions | null;
   mailbox: NotificationMailboxEntry[];
@@ -58,6 +63,10 @@ interface RuntimeState {
   sleep: SleepStatus | null;
   /** Health reminders to show, counted since this client attached. */
   sleepReminders: number;
+  /** All tracked PRs pushed over `/api/events` (`topic = "prs"`). */
+  prs: ApiPr[];
+  /** Open PRs whose owning session was deleted. */
+  orphanedPrs: ApiPr[];
   abort: (() => void) | null;
 
   connect: (profileId?: string | null) => Promise<void>;
@@ -70,14 +79,15 @@ const SUBSCRIBED_TOPICS = [
   'config',
   'browser_status',
   'browser_lifecycle',
+  'cloud_session',
   'profile_sessions',
-  'session_runtime',
   'session_runtimes',
   'remote_access',
   'sleep',
   'notification_mailbox',
   'network_access_logs',
   'request_logs',
+  'prs',
 ];
 
 function updateProfileSessionRuntimes(
@@ -161,6 +171,7 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   activeProfileId: null,
   browser: null,
   browserLifecycle: EMPTY_LIFECYCLE,
+  cloudSessions: {},
   runtimes: {},
   profileSessions: null,
   mailbox: [],
@@ -169,6 +180,8 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   remoteAccess: null,
   sleep: null,
   sleepReminders: 0,
+  prs: [],
+  orphanedPrs: [],
   abort: null,
 
   async connect(profileId = null) {
@@ -204,22 +217,26 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               }
               break;
             }
+            case 'cloud_session': {
+              const step = evt.payload;
+              set((prev) => ({
+                cloudSessions: { ...prev.cloudSessions, [step.sessionId]: step },
+              }));
+              // A suspended session read nothing; once its codespace serves
+              // it again, its history and state are there to read.
+              if (
+                step.phase === 'ready' &&
+                useSessionsStore.getState().suspended[step.sessionId] &&
+                useSessionsStore.getState().active?.id === step.sessionId
+              ) {
+                void useSessionsStore.getState().refreshActive(step.sessionId);
+              }
+              break;
+            }
             case 'profile_sessions': {
               const profileSessions = evt.payload.profileSessions;
               set({ profileSessions });
               refreshChangedActiveSession(profileSessions);
-              break;
-            }
-            case 'session_runtime': {
-              const { sessionId, runtime } = evt.payload;
-              set((prev) => {
-                const runtimes = { ...prev.runtimes, [sessionId]: runtime };
-                return {
-                  runtimes,
-                  profileSessions: updateProfileSessionRuntimes(prev.profileSessions, runtimes),
-                };
-              });
-              useSessionsStore.getState().updateRuntime(sessionId, runtime);
               break;
             }
             case 'session_runtimes': {
@@ -261,6 +278,16 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
                 sleep: evt.payload,
                 sleepReminders: state.sleepReminders + (remind ? 1 : 0),
               }));
+              break;
+            }
+            case 'prs': {
+              const prs = evt.payload.prs ?? [];
+              const orphanedPrs = prs.filter((pr) => pr.orphaned && pr.state === 'open');
+              set({ prs, orphanedPrs });
+              const activeId = useSessionsStore.getState().active?.id;
+              if (activeId) {
+                void useInspectorStore.getState().loadPrs(activeId);
+              }
               break;
             }
             default:

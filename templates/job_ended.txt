@@ -1,0 +1,3 @@
+Background task '{{ task_id }}' (`{{ script }}`) {% match outcome %}{% when JobOutcome::Finished { code } %}finished with exit code {{ code }}.{% when JobOutcome::Killed { notice } %}was killed.{% if let Some(notice) = notice %} {{ notice }}{% endif %}{% when JobOutcome::Failed { error } %}failed: {{ error }}{% endmatch %}
+{% if let Some(output) = output %}{{ output }}{% endif %}{% if let Some(stderr) = stderr %}stderr:
+{{ stderr }}{% endif %}{{ interruptions }}

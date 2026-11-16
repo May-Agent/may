@@ -1,0 +1,1 @@
+Terminate a background terminal task by its task id.

@@ -1,0 +1,2 @@
+{% match outcome %}{% when Outcome::Added(row) %}Added row {{ row }}.{% when Outcome::Started(row) %}Row {{ row }} is now under Doing.{% when Outcome::Finished(row) %}Deleted row {{ row }}; the rows after it moved up by one.{% when Outcome::Blocked(row) %}Marked row {{ row }} blocked.{% when Outcome::Unblocked(row) %}Removed the mark from row {{ row }}.{% when Outcome::Edited(row) %}Rewrote row {{ row }}.{% when Outcome::Noted %}Added to Notes.{% when Outcome::Decided %}Added to Decisions.{% when Outcome::Listed %}tasks.md:{% endmatch %}
+{{ document }}

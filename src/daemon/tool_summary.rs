@@ -10,9 +10,11 @@
 //! variant cares about. Each projection is `Option<String>` — `None` when
 //! the field hasn't streamed in yet, `Some(value)` once readable.
 
+use aither_sandbox::{JobInputArgs, JobKillArgs, JobReadArgs, ShellArgs};
 use partial_json_fixer::fix_json;
 use serde_json::Value;
 
+use crate::command_reading::CommandReading;
 use crate::daemon::types::ToolVariant;
 
 /// Per-variant subset of tool arguments shown in the UI summary chip.
@@ -22,7 +24,7 @@ use crate::daemon::types::ToolVariant;
 /// - `web_search` → `query`
 /// - `web_fetch` → `url`
 /// - browser → `action`, `target`
-/// - task / ask / session / notify / generic → `description`, `prompt` where applicable
+/// - task / ask / session / generic → `description`, `prompt` where applicable
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolSummary {
@@ -40,13 +42,24 @@ pub struct ToolSummary {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// How May reads a `terminal` call's script. Present once the call's
+    /// arguments are complete, so a half-streamed script is never read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reading: Option<CommandReading>,
+    /// Why a `terminal`, `terminal_input`, `terminal_kill` or `terminal_read`
+    /// call's complete arguments do not deserialize into the tool's argument
+    /// type. Present only once the arguments are complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments_error: Option<String>,
 }
 
 impl ToolSummary {
     /// Returns `true` iff at least one field is populated.
     #[must_use]
     pub const fn has_any(&self) -> bool {
-        self.description.is_some()
+        self.reading.is_some()
+            || self.arguments_error.is_some()
+            || self.description.is_some()
             || self.script.is_some()
             || self.query.is_some()
             || self.url.is_some()
@@ -71,6 +84,36 @@ fn pick(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Why `arguments` do not deserialize into the argument type of a native
+/// terminal tool, or `None` for a match and for any other tool.
+fn arguments_error(arguments: &str, variant: ToolVariant) -> Option<String> {
+    fn check<T: serde::de::DeserializeOwned>(arguments: &str) -> Option<String> {
+        serde_json::from_str::<T>(arguments)
+            .err()
+            .map(|error| error.to_string())
+    }
+    match variant {
+        ToolVariant::Terminal => check::<ShellArgs>(arguments),
+        ToolVariant::TerminalInput => check::<JobInputArgs>(arguments),
+        ToolVariant::TerminalKill => check::<JobKillArgs>(arguments),
+        ToolVariant::TerminalRead => check::<JobReadArgs>(arguments),
+        _ => None,
+    }
+}
+
+/// Like [`project_tool_summary`] for arguments known to be complete (the
+/// call has ended), so arguments that are not JSON at all, which in a
+/// stream are only an unfinished fragment, also report their
+/// `arguments_error`.
+#[must_use]
+pub fn project_final_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSummary {
+    let mut summary = project_tool_summary(arguments_raw, variant);
+    if summary.arguments_error.is_none() && !arguments_raw.trim().is_empty() {
+        summary.arguments_error = arguments_error(arguments_raw, variant);
+    }
+    summary
+}
+
 /// Project a `ToolSummary` from cumulative arguments JSON for the given
 /// variant. Empty / unparseable input returns an all-`None` summary.
 #[must_use]
@@ -83,45 +126,71 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
     // tree); the single serde parse then performs JSON unescaping. This
     // replaces the previous repair-parse → re-serialize → re-parse round
     // trip, which did three full passes per streamed delta.
-    let value: Value = match serde_json::from_str(&fix_json(trimmed)) {
-        Ok(v) => v,
-        Err(_) => return ToolSummary::default(),
+    let (value, complete): (Value, bool) = match serde_json::from_str(trimmed) {
+        Ok(v) => (v, true),
+        Err(_) => match serde_json::from_str(&fix_json(trimmed)) {
+            Ok(v) => (v, false),
+            Err(_) => return ToolSummary::default(),
+        },
     };
     if !value.is_object() {
         return ToolSummary::default();
     }
 
+    // A document that parses whole is complete, so its type error is final.
+    let arguments_error = if complete {
+        arguments_error(trimmed, variant)
+    } else {
+        None
+    };
+    ToolSummary {
+        arguments_error,
+        ..project_fields(&value, variant, complete)
+    }
+}
+
+fn project_fields(fields: &Value, variant: ToolVariant, complete: bool) -> ToolSummary {
+    let pick = |key: &str| pick(fields, key);
     match variant {
-        ToolVariant::Terminal
-        | ToolVariant::TerminalInput
-        | ToolVariant::TerminalRead
-        | ToolVariant::TerminalKill => ToolSummary {
-            description: pick(&value, "description"),
-            script: pick(&value, "script"),
-            ..ToolSummary::default()
-        },
+        ToolVariant::Terminal => {
+            let script = pick("script");
+            let reading = script
+                .as_deref()
+                .filter(|_| complete)
+                .map(CommandReading::of);
+            ToolSummary {
+                description: pick("description"),
+                script,
+                reading,
+                ..ToolSummary::default()
+            }
+        }
+        ToolVariant::TerminalInput | ToolVariant::TerminalRead | ToolVariant::TerminalKill => {
+            ToolSummary {
+                description: pick("description"),
+                script: pick("script"),
+                ..ToolSummary::default()
+            }
+        }
         ToolVariant::WebSearch => ToolSummary {
-            query: pick(&value, "query"),
+            query: pick("query"),
             ..ToolSummary::default()
         },
         ToolVariant::WebFetch => ToolSummary {
-            url: pick(&value, "url"),
+            url: pick("url"),
             ..ToolSummary::default()
         },
         ToolVariant::Browser => ToolSummary {
-            action: pick(&value, "action"),
-            target: pick(&value, "target").or_else(|| pick(&value, "url")),
+            action: pick("action"),
+            target: pick("target").or_else(|| pick("url")),
             ..ToolSummary::default()
         },
-        ToolVariant::Task => ToolSummary {
-            description: pick(&value, "description"),
-            prompt: pick(&value, "prompt"),
-            ..ToolSummary::default()
-        },
-        ToolVariant::Ask | ToolVariant::Session | ToolVariant::Notify | ToolVariant::Generic => {
+        // A compaction takes no arguments.
+        ToolVariant::Compact => ToolSummary::default(),
+        ToolVariant::Task | ToolVariant::Ask | ToolVariant::Session | ToolVariant::Generic => {
             ToolSummary {
-                description: pick(&value, "description"),
-                prompt: pick(&value, "prompt"),
+                description: pick("description"),
+                prompt: pick("prompt"),
                 ..ToolSummary::default()
             }
         }
@@ -170,6 +239,84 @@ mod tests {
             Some("Get current local time")
         );
         assert_eq!(final_summary.script.as_deref(), Some("date +%s"));
+    }
+
+    #[test]
+    fn a_terminal_call_is_read_only_once_its_arguments_are_complete() {
+        let streaming = "{\"description\":\"x\",\"script\":\"cat a.rs";
+        assert!(
+            project_tool_summary(streaming, ToolVariant::Terminal)
+                .reading
+                .is_none()
+        );
+        let complete = "{\"description\":\"x\",\"script\":\"cat a.rs\"}";
+        let summary = project_tool_summary(complete, ToolVariant::Terminal);
+        let reading = summary.reading.expect("complete arguments are read");
+        assert_eq!(reading.steps[0].line, "Read a.rs");
+        let other = project_tool_summary(complete, ToolVariant::TerminalInput);
+        assert!(other.reading.is_none());
+    }
+
+    /// `terminal` arguments carrying every field `TerminalArgs` requires.
+    const VALID_TERMINAL_ARGUMENTS: &str =
+        "{\"description\":\"List files\",\"script\":\"ls\",\"timeout\":10}";
+
+    #[test]
+    fn complete_arguments_that_miss_the_tool_schema_report_the_error() {
+        let missing = "{\"command\":\"ls\"}";
+        let summary = project_tool_summary(missing, ToolVariant::Terminal);
+        let error = summary.arguments_error.expect("script is missing");
+        assert!(error.contains("script"), "{error}");
+        for variant in [
+            ToolVariant::TerminalInput,
+            ToolVariant::TerminalKill,
+            ToolVariant::TerminalRead,
+        ] {
+            assert!(
+                project_tool_summary("{}", variant)
+                    .arguments_error
+                    .is_some(),
+                "{variant:?}"
+            );
+        }
+        let valid = project_tool_summary(VALID_TERMINAL_ARGUMENTS, ToolVariant::Terminal);
+        assert!(valid.arguments_error.is_none());
+        assert!(
+            project_tool_summary(missing, ToolVariant::WebSearch)
+                .arguments_error
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_streaming_fragment_reports_no_argument_error() {
+        let fragment = "{\"description\":\"x\"";
+        assert!(
+            project_tool_summary(fragment, ToolVariant::Terminal)
+                .arguments_error
+                .is_none()
+        );
+        assert!(
+            project_tool_summary("not json", ToolVariant::Terminal)
+                .arguments_error
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_finished_call_with_non_json_arguments_reports_the_error() {
+        let summary = project_final_tool_summary("not json", ToolVariant::Terminal);
+        assert!(summary.arguments_error.is_some());
+        assert!(
+            project_final_tool_summary(VALID_TERMINAL_ARGUMENTS, ToolVariant::Terminal)
+                .arguments_error
+                .is_none()
+        );
+        assert!(
+            project_final_tool_summary("", ToolVariant::Terminal)
+                .arguments_error
+                .is_none()
+        );
     }
 
     #[test]

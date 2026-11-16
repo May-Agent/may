@@ -1,38 +1,22 @@
-import { CheckSquare, Square } from 'lucide-react';
-import type { SseTodoItem } from '@/lib/types';
+import type { TaskRow } from '@/lib/types';
+import { openCount } from '@/lib/tasks/rows';
 import { useTranslation } from '@/lib/i18n';
+import { TaskRowsView } from '@/components/inspector/TaskRowsView';
 
 interface TodoBlockProps {
-  items: SseTodoItem[];
-  total: number;
-  completed: number;
+  rows: TaskRow[];
 }
 
-export function TodoBlock({ items, total, completed }: TodoBlockProps) {
+/** The turn's open work: Doing and Queued rows, nothing once all are deleted. */
+export function TodoBlock({ rows }: TodoBlockProps) {
   const { t } = useTranslation();
-  if (items.length === 0) return null;
+  if (openCount(rows) === 0) return null;
   return (
     <div className="rounded-lg border border-border px-3 py-2">
-      <div className="flex items-center justify-between text-xs">
-        <span className="font-medium">{t('chat.plan')}</span>
-        <span className="text-muted-foreground">
-          {completed}/{total}
-        </span>
+      <div className="text-xs font-medium">{t('chat.plan')}</div>
+      <div className="mt-1.5">
+        <TaskRowsView rows={rows} />
       </div>
-      <ul className="mt-1.5 space-y-1">
-        {items.map((item, i) => (
-          <li key={i} className="flex items-start gap-2 text-[13px]">
-            {item.checked ? (
-              <CheckSquare className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-            ) : (
-              <Square className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-            )}
-            <span className={item.checked ? 'text-muted-foreground' : ''}>
-              {item.text}
-            </span>
-          </li>
-        ))}
-      </ul>
     </div>
   );
 }

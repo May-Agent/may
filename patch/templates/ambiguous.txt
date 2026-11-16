@@ -1,0 +1,5 @@
+Ambiguous patch: in {{ path }}: hunk {{ hunk }} matches at {{ matches.len() }} places; add surrounding context or an `@@ anchor` line to select one. Lines marked `>` are the matched ones:
+{% for found in matches %}
+match {{ loop.index }}, file lines {{ found.first }}-{{ found.last }}:
+{% for line in found.lines %}{{ line.marker() }} {{ line.number }}| {{ line.text }}
+{% endfor %}{% endfor %}

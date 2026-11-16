@@ -273,7 +273,7 @@ async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
         ("GET", "/api/config"),
         ("GET", "/api/tasks"),
         ("POST", "/api/tasks"),
-        ("POST", "/api/chat/enqueue"),
+        ("POST", "/api/interactions/some-id"),
         ("GET", "/api/events"),
         ("GET", "/"),
     ] {

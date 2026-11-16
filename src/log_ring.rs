@@ -9,6 +9,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use askama::Template as _;
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Default byte capacity of the ring.
@@ -149,8 +150,22 @@ impl LogRingHandle {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, format!("{header}\n\n{}", self.snapshot()))
+        let dump = LogDump {
+            header,
+            snapshot: &self.snapshot(),
+        }
+        .render()
+        .map_err(io::Error::other)?;
+        std::fs::write(path, dump)
     }
+}
+
+/// A log dump file: its header, then the ring snapshot.
+#[derive(askama::Template)]
+#[template(path = "log_dump.txt", escape = "none")]
+struct LogDump<'a> {
+    header: &'a str,
+    snapshot: &'a str,
 }
 
 #[cfg(test)]

@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use aither_core::llm::{Tool, ToolContext};
-use aither_sandbox::TerminalEnvSource as _;
 use tempfile::TempDir;
 
 use super::state::{
@@ -30,7 +29,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
@@ -40,7 +39,11 @@ impl Fixture {
                 .await
                 .expect("create session");
         }
-        let runtime = Arc::new(SessionRuntimeService::new(db, UiEventBus::new()));
+        let runtime = Arc::new(SessionRuntimeService::new(
+            db,
+            UiEventBus::new(),
+            crate::session::MayHomePaths::new(dir.path().join("home")),
+        ));
         let store = SecretStore::in_memory(dir.path());
         let approver = AskUserApprover::new()
             .with_runtime_service(runtime.clone())
@@ -57,7 +60,7 @@ impl Fixture {
     async fn ask(&self, session: &str, name: &str, scope: SecretScope) -> Result<String, String> {
         let args = AskUserArgs {
             question: None,
-            positional_question: None,
+            question_text: None,
             option: Vec::new(),
             multi_select: false,
             secret: None,
@@ -110,7 +113,9 @@ impl Fixture {
     }
 
     fn env(&self, session: &str) -> Vec<(String, String)> {
-        SessionEnv::new(self.store.clone(), session).env()
+        SessionEnv::new(self.store.clone(), session)
+            .env()
+            .expect("the stored secrets read")
     }
 
     /// Every byte the database files hold.
@@ -203,7 +208,8 @@ async fn a_secret_answer_is_stored_and_only_its_name_travels() {
     // does reach a tool result is replaced by the name for this session.
     let redactions = SecretRedactor::over(fixture.store.clone(), Some("session".to_string()))
         .current()
-        .await;
+        .await
+        .expect("the stored secrets read");
     assert_eq!(
         redactions.redact(&format!("echo {VALUE}")),
         format!("echo {NAME}")
@@ -262,7 +268,8 @@ async fn a_session_secret_stays_in_its_session_and_goes_with_it() {
 
     let other_redactions = SecretRedactor::over(fixture.store.clone(), Some("other".to_string()))
         .current()
-        .await;
+        .await
+        .expect("the stored secrets read");
     assert_eq!(
         other_redactions.redact(VALUE),
         VALUE,

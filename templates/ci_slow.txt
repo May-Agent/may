@@ -1,0 +1,16 @@
+{% if jobs.is_empty() -%}
+No jobs are recorded for {{ label }}.
+{%- else -%}
+{{ label }}, by job, slowest first:
+{% for job in jobs -%}
+- {{ job.workflow }} / {{ job.name }} ({{ job.conclusion }}): {{ job.duration }}
+{%- if let Some(baseline) = job.baseline %}, baseline {{ baseline }}{% else %}, no baseline{% endif %}
+{%- if !job.exceeded.is_empty() %}; abnormal: {% for reason in job.exceeded %}{{ reason }}{% if !loop.last %}; {% endif %}{% endfor %}{% endif %}.
+{%- if !job.steps.is_empty() %}
+  Slowest steps: {% for step in job.steps %}{{ step.name }} ({{ step.duration }}){% if !loop.last %}, {% endif %}{% endfor %}.
+{%- endif %}
+{%- if !job.tests.is_empty() %}
+  Slowest tests: {% for test in job.tests %}{{ test.name }} ({{ test.duration }}){% if !loop.last %}, {% endif %}{% endfor %}.
+{%- endif %}
+{% endfor -%}
+{%- endif %}

@@ -1,6 +1,6 @@
 {% match outcome -%}
 {% when CloneOutcome::Cloned with (clone) -%}
-{{ clone }} is this session's clone of the repository at {{ worktree }}. Edit and commit there; `pr open` run inside it lands the work, and the merge deletes the clone.
+{{ clone }} is this session's writable workspace of the repository at {{ worktree }}. Edit, commit, and land one PR from there (`pr open`); merging or closing that PR deletes the workspace. Pass `--new` for another concurrent PR.
 {% when CloneOutcome::Undecided -%}
 {{ worktree }} has no trust decision yet: run `repo trust set <full|prs-only|local-branch|local>` in it first.
 {% when CloneOutcome::WritesCheckout -%}

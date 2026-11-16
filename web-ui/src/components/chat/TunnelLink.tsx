@@ -3,20 +3,21 @@ import { ExternalLink } from 'lucide-react';
 import { fetchTunnel } from '@/lib/api/tunnels';
 
 interface TunnelLinkProps {
+  sessionId: string;
   id: string;
 }
 
 /**
- * Renders `<tunnel id="…"/>` as a link to `/tunnel/<id>/`, resolved relative
- * to the current origin — so it works however the user reaches May
+ * Renders `<tunnel id="…"/>` as a link to `/tunnel/<session>/<id>/`, resolved
+ * relative to the current origin — so it works however the user reaches May
  * (localhost, tailnet, LAN).
  */
-export function TunnelLink({ id }: TunnelLinkProps) {
+export function TunnelLink({ sessionId, id }: TunnelLinkProps) {
   const [target, setTarget] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    fetchTunnel(id)
+    fetchTunnel(sessionId, id)
       .then((info) => {
         if (!cancelled) setTarget(info.target);
       })
@@ -26,9 +27,9 @@ export function TunnelLink({ id }: TunnelLinkProps) {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [sessionId, id]);
 
-  const href = `/tunnel/${encodeURIComponent(id)}/`;
+  const href = `/tunnel/${encodeURIComponent(sessionId)}/${encodeURIComponent(id)}/`;
   return (
     <a
       href={href}

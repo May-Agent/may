@@ -15,6 +15,10 @@ use super::state::{AppMode, StatusNotice};
 ///
 /// Returns [`TuiError`](crate::tui::error::TuiError) when the underlying
 /// handler fails — e.g. a database write for a UI action errors.
+///
+/// # Panics
+///
+/// Panics if a compiled message template fails to render.
 pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendAction>> {
     match event {
         AppEvent::Key(code, modifiers) => {
@@ -27,7 +31,13 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
+            app.compaction.clear_expired(std::time::Instant::now());
             app.sync_profile_follow();
+            if app.new_year.check_due(std::time::Instant::now()) {
+                let zone = crate::tui::new_year::user_zone(&app.config.time);
+                app.new_year.set_date(jiff::Timestamp::now(), &zone);
+            }
+            app.new_year.tick();
             if app.processing
                 || app.index_loading
                 || (matches!(app.mode, AppMode::SessionSelect)
@@ -43,7 +53,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 // output + file-diff previews.
                 app.poll_live_output();
             }
-            // The jobs list and subagent runs arrive as `session_background`
+            // The jobs list and subagent runs arrive as `BackgroundLoaded`
             // events while anything runs; nothing to poll for them here.
             // Same cadence for an open job/subagent detail view.
             if let AppMode::JobDetail(state) = &app.mode
@@ -229,6 +239,24 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::SshProbed { name, result } => {
+            if app.ssh_probed(&name, result) {
+                app.persist_config_background();
+            }
+            Ok(None)
+        }
+        AppEvent::CloudConfigured(result) => {
+            app.cloud_configured(result);
+            Ok(None)
+        }
+        AppEvent::CloudCatalog(result) => {
+            app.cloud_catalog_loaded(result);
+            Ok(None)
+        }
+        AppEvent::CloudSession(event) => {
+            app.cloud_session_step(&event);
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat
@@ -266,6 +294,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.sidebar.set_prs(&session_id, prs);
             Ok(None)
         }
+        AppEvent::PrsInvalidated => {
+            app.request_sidebar_prs();
+            Ok(None)
+        }
         AppEvent::BackgroundLoaded { jobs, subagents } => {
             app.jobs = jobs;
             app.subagents = subagents;
@@ -293,7 +325,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.request_prompt_mark(i64::from(message_id));
             Ok(None)
         }
+        AppEvent::TurnWithdrawn { content, own } => {
+            app.withdraw_turn(content, own);
+            Ok(Some(SendAction::ReloadHistory))
+        }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::UserNotification(notification) => {
+            Ok(Some(SendAction::DesktopNotification(notification)))
+        }
         AppEvent::Sleep(status) => {
             if status.asleep != app.asleep {
                 app.asleep = status.asleep;
@@ -339,6 +378,44 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 } else {
                     app.chat.push_notice("Recap failed — try again");
                 }
+            }
+            Ok(None)
+        }
+        AppEvent::ToolCard { call_id, card } => {
+            app.chat.set_tool_card(&call_id, card);
+            Ok(None)
+        }
+        AppEvent::Warning {
+            session_id,
+            message,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.chat.push_warning(&message);
+                app.scroll = usize::MAX;
+            }
+            Ok(None)
+        }
+        AppEvent::ContextWindow { session_id, window } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.context_window = Some(window);
+            }
+            Ok(None)
+        }
+        AppEvent::Compaction { session_id, phase } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.compaction.apply(phase, std::time::Instant::now());
             }
             Ok(None)
         }
@@ -407,9 +484,21 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ProgressLoaded(report) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.report = Some(report);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressFailed(error) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
         AppEvent::BashFinished(outcome) => {
-            use std::fmt::Write as _;
-
             let outcome = *outcome;
             let mut output = outcome.stdout.clone();
             if !outcome.stderr.is_empty() {
@@ -434,21 +523,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.scroll = usize::MAX;
 
             // The agent sees the same masked transcript the TUI shows.
-            let (masked_command, _) = app.secrets.mask(&outcome.command);
-            let mut content = format!("! {masked_command}\n");
-            if let Some(error) = &outcome.error {
-                let _ = write!(content, "\n<error>{error}</error>");
-            } else {
-                if !outcome.stdout.is_empty() {
-                    let _ = write!(content, "\n<stdout>\n{}\n</stdout>", outcome.stdout);
+            // When the stored secrets cannot be read the transcript cannot be
+            // masked, so nothing is sent to the agent.
+            let masked_command = match &app.secrets {
+                Ok(secrets) => secrets.mask(&app.secret_patterns, &outcome.command).0,
+                Err(error) => {
+                    app.chat.push_error(&error.to_string());
+                    return Ok(None);
                 }
-                if !outcome.stderr.is_empty() {
-                    let _ = write!(content, "\n<stderr>\n{}\n</stderr>", outcome.stderr);
-                }
-                if outcome.exit_code != 0 {
-                    let _ = write!(content, "\n<exit>{}</exit>", outcome.exit_code);
-                }
-            }
+            };
+            let content = askama::Template::render(&crate::bash::BashOutcomeMessage::new(
+                &masked_command,
+                &outcome,
+            ))
+            .expect("the bash outcome template renders");
             let msg = super::queue::PendingMessage {
                 content,
                 hidden_context_xml: None,
@@ -472,6 +560,9 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                         &crate::secrets::SecretStore::new(app.session_manager.may_dir()),
                         &app.config,
                     );
+                    if let Err(error) = &app.secrets {
+                        app.chat.push_error(&error.to_string());
+                    }
                     app.chat.push_notice(&format!(
                         "Secret {key} stored in the OS keychain — injected into shell environments"
                     ));
@@ -495,7 +586,7 @@ pub fn jobs_rows(app: &App) -> Vec<JobRow> {
         .map(JobRow::Subagent)
         .collect();
     let mut jobs: Vec<aither_sandbox::JobInfo> = app.jobs.clone();
-    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::job_registry::JobStatus::Running));
+    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::JobStatus::Running));
     rows.extend(jobs.into_iter().map(JobRow::Job));
     rows
 }

@@ -9,7 +9,7 @@
 
 use std::io::{self, Write};
 
-use aither_agent::{AgentEvent, TimedEvent};
+use aither_agent::{AgentEvent, OutputKind, TimedEvent};
 use jiff::Timestamp;
 
 use may_agent::agent::{AgentWorker, TuiEvent};
@@ -185,6 +185,10 @@ async fn next_resumed_turn(
 }
 
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
+    #[allow(
+        clippy::large_enum_variant,
+        reason = "one event is held at a time, and boxing it only moves it"
+    )]
     enum Event {
         Agent(TuiEvent),
         /// Time to look for prompts the daemon's run waits on.
@@ -256,10 +260,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     runtime_deps
         .daemon()
         .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
-        .put::<_, serde_json::Value>(
+        .patch::<_, serde_json::Value>(
             &format!("/api/sessions/{}", session_id.as_str()),
             &may_agent::client::UpdateSessionRequest {
                 non_interactive: Some(true),
+                memory_off: Some(true),
                 ..Default::default()
             },
         )
@@ -304,19 +309,21 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         anyhow::bail!("the session is already running in another May process");
     }
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
-    let handle = runtime_deps.start_agent_task(
-        &mut app,
-        worker,
-        PendingMessage {
-            content: prompt.content,
-            hidden_context_xml: prompt.hidden_context_xml,
-            attachments: Vec::new(),
-            queued_at: Timestamp::now(),
-            delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
-            display: None,
-        },
-        &mut pending_title_gen,
-    )?;
+    let handle = runtime_deps
+        .start_agent_task(
+            &mut app,
+            worker,
+            PendingMessage {
+                content: prompt.content,
+                hidden_context_xml: prompt.hidden_context_xml,
+                attachments: Vec::new(),
+                queued_at: Timestamp::now(),
+                delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
+                display: None,
+            },
+            &mut pending_title_gen,
+        )
+        .await?;
     let mut agent_handle = Some(handle);
 
     while let Some(handle) = agent_handle.as_ref() {
@@ -432,8 +439,16 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             Event::Agent(TuiEvent::Agent(result)) => {
                 if let Ok(TimedEvent {
                     at,
-                    event: AgentEvent::Text(ref text),
+                    event:
+                        AgentEvent::BlockDelta {
+                            kind: OutputKind::Text,
+                            ref text,
+                            ..
+                        },
+                    ref agent,
+                    ..
                 }) = result
+                    && agent.is_main()
                 {
                     assistant_response.push(text, at);
                     output.text(text)?;
@@ -503,7 +518,12 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::ContextDump(_)
                 | TuiEvent::ContextMessages(_)
                 | TuiEvent::SideModel(_)
-                | TuiEvent::ContextDumpSaved { .. },
+                | TuiEvent::ContextDumpSaved { .. }
+                // A one-shot run prints no tool cards.
+                | TuiEvent::ToolReading { .. }
+                | TuiEvent::ToolCard { .. }
+                // It prints the reply as it streamed, not its translation.
+                | TuiEvent::ReplyTranslated { .. },
             ) => {}
             Event::Agent(TuiEvent::Hold {
                 reason: HoldReason::Retry { until, retry },
@@ -543,6 +563,37 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     output.stderr()?,
                     "[retrying] the response was cut off; the text above is discarded"
                 )?;
+            }
+            Event::Agent(TuiEvent::Withdrawn { .. }) => {
+                writeln!(output.stderr()?, "[stopped] the message was withdrawn")?;
+            }
+            Event::Agent(TuiEvent::Declined(message)) => {
+                writeln!(output.stderr()?, "[stopped] {message}")?;
+                runtime_deps
+                    .finish_agent_task(
+                        &mut app,
+                        &mut None,
+                        &mut pending_title_gen,
+                        &assistant_response,
+                        RunOutcome::Cancelled,
+                    )
+                    .await;
+                return Ok(());
+            }
+            // A run whose agent looped did not do what it was asked: the
+            // caller of a one-shot run learns that from its exit status.
+            Event::Agent(TuiEvent::LoopStopped(message)) => {
+                writeln!(output.stderr()?, "[stopped] {message}")?;
+                runtime_deps
+                    .finish_agent_task(
+                        &mut app,
+                        &mut None,
+                        &mut pending_title_gen,
+                        &assistant_response,
+                        RunOutcome::Cancelled,
+                    )
+                    .await;
+                anyhow::bail!(message);
             }
             Event::Agent(TuiEvent::Error(error)) => {
                 writeln!(output.stderr()?, "[error] {error}")?;
@@ -753,7 +804,8 @@ fn parse_oneshot_selection(
 
 #[cfg(test)]
 mod tests {
-    use aither_agent::{AgentEvent, TimedEvent};
+    use aither_agent::{AgentEvent, AgentPath, RunId, TimedEvent, ToolOrigin};
+    use aither_core::llm::ToolCallId;
     use aither_core::llm::tool::{
         CommandOutcome, CommandResult, CommandStream, StoredFile, ToolResult,
     };
@@ -769,10 +821,28 @@ mod tests {
     }
 
     fn timed(at: &str, event: AgentEvent) -> TimedEvent {
-        TimedEvent {
-            at: at.parse().expect("valid time"),
-            event,
-        }
+        let mut timed = TimedEvent::now(AgentPath::main(), event);
+        timed.at = at.parse().expect("valid time");
+        timed
+    }
+
+    fn run_started() -> AgentEvent {
+        AgentEvent::run_started(RunId::new("run"), AgentPath::main())
+    }
+
+    fn tool_started(call: &str, name: &str, arguments: &str) -> AgentEvent {
+        AgentEvent::tool_call_started(
+            ToolCallId::new(call),
+            name.to_string(),
+            serde_json::from_str(arguments).expect("arguments are JSON"),
+            ToolOrigin::Local,
+        )
+    }
+
+    /// An event of the kind only aither emits, built from its serde form.
+    fn emitted(at: &str, event: &serde_json::Value) -> TimedEvent {
+        serde_json::from_value(serde_json::json!({ "at": at, "agent": [], "event": event }))
+            .expect("a timed event")
     }
 
     fn stderr(output: &Output) -> String {
@@ -794,17 +864,13 @@ mod tests {
         output
             .event(&Ok(timed(
                 "2024-03-01T10:00:01Z",
-                AgentEvent::tool_start("c1", "terminal", arguments),
+                tool_started("c1", "terminal", arguments),
             )))
             .expect("start renders");
         output
             .event(&Ok(timed(
                 "2024-03-01T10:00:02.250Z",
-                AgentEvent::ToolCallEnd {
-                    id: "c1".to_string(),
-                    name: "terminal".to_string(),
-                    result,
-                },
+                AgentEvent::tool_call_ended(ToolCallId::new("c1"), result),
             )))
             .expect("end renders");
     }
@@ -814,10 +880,7 @@ mod tests {
         let mut output = output();
         let at: Timestamp = "2024-03-01T10:00:01.250Z".parse().expect("valid time");
         output
-            .event(&Ok(TimedEvent {
-                at,
-                event: AgentEvent::run_start("run", 1),
-            }))
+            .event(&Ok(timed("2024-03-01T10:00:01.250Z", run_started())))
             .expect("render must succeed");
         let line = stderr(&output);
         let (stamp, rest) = line.split_once(' ').expect("line has a timestamp prefix");
@@ -847,13 +910,16 @@ mod tests {
     fn a_compaction_recovery_line_reports_the_failure_and_the_cleanup() {
         let mut output = output();
         output
-            .event(&Ok(timed(
+            .event(&Ok(emitted(
                 "2024-03-01T10:00:01Z",
-                AgentEvent::CompactionRecovery {
-                    error: aither_agent::AgentError::llm_local("no handoff"),
-                    alerts_removed: 3,
-                    outputs_spilled: 2,
-                },
+                &serde_json::json!({
+                    "CompactionRecovery": {
+                        "error": serde_json::to_value(aither_agent::AgentError::llm_local("no handoff"))
+                            .expect("error"),
+                        "alerts_removed": 3,
+                        "outputs_spilled": 2,
+                    },
+                }),
             )))
             .expect("render must succeed");
         let line = stderr(&output);
@@ -869,10 +935,16 @@ mod tests {
     fn usage_line(usage: aither_core::llm::Usage) -> String {
         let mut output = output();
         output
-            .event(&Ok(TimedEvent {
-                at: Timestamp::UNIX_EPOCH,
-                event: AgentEvent::Usage(usage),
-            }))
+            .event(&Ok(emitted(
+                "1970-01-01T00:00:00Z",
+                &serde_json::json!({
+                    "RequestEnded": {
+                        "request": 1,
+                        "usage": serde_json::to_value(usage).expect("usage"),
+                        "outcome": "Completed",
+                    },
+                }),
+            )))
             .expect("usage renders");
         stderr(&output)
             .split_once(' ')
@@ -990,7 +1062,7 @@ mod tests {
         output
             .event(&Ok(timed(
                 "2024-03-01T10:00:01Z",
-                AgentEvent::tool_start("c2", "read_page", r#"{"url":"https://example.com"}"#),
+                tool_started("c2", "read_page", r#"{"url":"https://example.com"}"#),
             )))
             .expect("start renders");
         assert_eq!(
@@ -1004,17 +1076,11 @@ mod tests {
         let mut output = output();
         output.text("for arrays and strings:").expect("text writes");
         output
-            .event(&Ok(timed(
-                "2024-03-01T10:00:01Z",
-                AgentEvent::run_start("run", 1),
-            )))
+            .event(&Ok(timed("2024-03-01T10:00:01Z", run_started())))
             .expect("event renders");
         output.text("done.\n").expect("text writes");
         output
-            .event(&Ok(timed(
-                "2024-03-01T10:00:02Z",
-                AgentEvent::run_start("run", 2),
-            )))
+            .event(&Ok(timed("2024-03-01T10:00:02Z", run_started())))
             .expect("event renders");
         output.end_text_line().expect("nothing is open");
         assert_eq!(

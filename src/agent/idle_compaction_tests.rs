@@ -32,13 +32,16 @@ use super::may::{
 };
 use super::tool_environment_cache::ToolEnvironmentCache;
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
+use crate::harness::host_load::{
+    AnyHostReader, HostReader, MachineLoad, MemoryPressure, ReadError,
+};
 use crate::model_selector::ModelSelector;
 use crate::session::{SessionId, SessionPlanState};
 
-const SESSION_PROVIDER: &str = "session";
+pub const SESSION_PROVIDER: &str = "session";
 const COMPACTION_PROVIDER: &str = "compaction";
 pub const SESSION_MODEL: &str = "session-model";
-const COMPACTION_MODEL: &str = "compaction-model";
+pub const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
 pub const COMPACTION_MARKER: &str = "Your context window is being compacted";
 
@@ -63,6 +66,16 @@ impl StubModel {
     /// Like [`Self::spawn`], but `reply` may answer a request body with its
     /// own text; `None` leaves the default.
     pub async fn spawn_replying(model: &'static str, reply: fn(&str) -> Option<String>) -> Self {
+        Self::spawn_scripted(model, move |body| reply(body).map(StubReply::Text)).await
+    }
+
+    /// Like [`Self::spawn`], but `reply` may answer a request body with text
+    /// or a tool call; `None` leaves the default text.
+    pub async fn spawn_scripted(
+        model: &'static str,
+        reply: impl Fn(&str) -> Option<StubReply> + Send + Sync + 'static,
+    ) -> Self {
+        let reply: ReplyScript = Arc::new(reply);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub model server");
@@ -72,9 +85,11 @@ impl StubModel {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let served = served.clone();
+                let reply = reply.clone();
                 tokio::spawn(async move {
-                    let service =
-                        service_fn(move |request| answer(request, model, reply, served.clone()));
+                    let service = service_fn(move |request| {
+                        answer(request, model, reply.clone(), served.clone())
+                    });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -100,10 +115,25 @@ impl StubModel {
     }
 }
 
+/// What a scripted stub model answers each request body with; `None` is the
+/// default text.
+type ReplyScript = Arc<dyn Fn(&str) -> Option<StubReply> + Send + Sync>;
+
+/// What a scripted stub model answers one request with.
+pub enum StubReply {
+    /// Plain text.
+    Text(String),
+    /// One call of the tool `name` with JSON `arguments`.
+    ToolCall {
+        name: &'static str,
+        arguments: serde_json::Value,
+    },
+}
+
 async fn answer(
     request: Request<Incoming>,
     model: &'static str,
-    reply_to: fn(&str) -> Option<String>,
+    reply_to: ReplyScript,
     requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() == Method::GET && request.uri().path().ends_with("/models") {
@@ -127,31 +157,45 @@ async fn answer(
         .expect("stub model request body")
         .to_bytes();
     let text = String::from_utf8(body.to_vec()).expect("stub model request is UTF-8");
-    let content = if text.contains(COMPACTION_MARKER) {
-        serde_json::json!({
-            "current_task": "Greet the user.",
-            "key_decisions": [],
-            "errors_fixes": [],
-            "pending_work": [],
-            "recovery_hints": [],
-        })
-        .to_string()
+    let scripted = if text.contains(COMPACTION_MARKER) {
+        StubReply::Text(
+            serde_json::json!({
+                "current_task": "Greet the user.",
+                "key_decisions": [],
+                "errors_fixes": [],
+                "pending_work": [],
+                "recovery_hints": [],
+            })
+            .to_string(),
+        )
     } else {
-        reply_to(&text).unwrap_or_else(|| "Hello there.".to_string())
+        reply_to(&text).unwrap_or_else(|| StubReply::Text("Hello there.".to_string()))
     };
-    requests.lock().await.push(text);
+    let mut served = requests.lock().await;
+    let call = served.len();
+    served.push(text);
+    drop(served);
     let chunk = |delta: &serde_json::Value, finish: serde_json::Value| {
         format!(
             "data: {}\n\n",
             serde_json::json!({"choices": [{"delta": delta, "finish_reason": finish}]})
         )
     };
-    let stream = [
-        chunk(
-            &serde_json::json!({"content": content}),
-            serde_json::Value::Null,
+    let (delta, finish) = match scripted {
+        StubReply::Text(content) => (serde_json::json!({"content": content}), "stop"),
+        StubReply::ToolCall { name, arguments } => (
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": format!("call-{call}"),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()},
+            }]}),
+            "tool_calls",
         ),
-        chunk(&serde_json::json!({}), serde_json::Value::from("stop")),
+    };
+    let stream = [
+        chunk(&delta, serde_json::Value::Null),
+        chunk(&serde_json::json!({}), serde_json::Value::from(finish)),
         "data: [DONE]\n\n".to_string(),
     ]
     .concat();
@@ -189,18 +233,18 @@ impl ScriptedHost {
 
     fn source(&self) -> HostReaderSource {
         let host = self.clone();
-        HostReaderSource::new(move || aither_agent::AnyHostReader::new(host.clone()))
+        HostReaderSource::new(move || AnyHostReader::new(host.clone()))
     }
 }
 
-impl aither_agent::HostReader for ScriptedHost {
-    fn memory_pressure(&mut self) -> Result<aither_agent::MemoryPressure, aither_agent::ReadError> {
-        Ok(aither_agent::MemoryPressure::Normal)
+impl HostReader for ScriptedHost {
+    fn memory_pressure(&mut self) -> Result<MemoryPressure, ReadError> {
+        Ok(MemoryPressure::Normal)
     }
 
-    fn machine_load(&mut self) -> Result<aither_agent::MachineLoad, aither_agent::ReadError> {
+    fn machine_load(&mut self) -> Result<MachineLoad, ReadError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        Ok(aither_agent::MachineLoad(f64::from_bits(
+        Ok(MachineLoad(f64::from_bits(
             self.load_bits.load(Ordering::SeqCst),
         )))
     }
@@ -210,16 +254,25 @@ impl aither_agent::HostReader for ScriptedHost {
 pub struct SessionParts {
     dir: std::path::PathBuf,
     pub db: crate::db::ChatDb,
-    pub(super) session_id: SessionId,
+    pub(crate) session_id: SessionId,
     /// The runtime the session persists its interactions through, when it has one.
     pub runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
     ask_user_broker: crate::ask_user::AskUserBroker,
     tool_environments: ToolEnvironmentCache,
+    job_server: crate::jobserver::JobServer,
     /// The host the session's load monitor reads: calm unless a test loads it.
     pub host: ScriptedHost,
     /// The rules the session imports, when a test makes it an import session.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// Messaging between main agents, when a test hosts several.
+    pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// The SSH servers the session is built with.
+    pub ssh_servers: Vec<crate::config::SshServerConfig>,
+    /// Extracted profile memories seeded into the agent build.
+    pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Whether memory is disabled for this session from the start.
+    pub memory_off: bool,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -229,27 +282,39 @@ pub struct SessionParts {
 
 impl SessionParts {
     pub(super) async fn new(dir: std::path::PathBuf) -> Self {
-        std::fs::create_dir_all(dir.join(".may")).expect("create the may dir");
+        crate::test_support::install_global_executor();
+        std::fs::create_dir_all(dir.join(".may/skills")).expect("create the may dir");
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
             .expect("open test db");
         let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
         let (ask_user_broker, ask_user_queue) = crate::ask_user::channel();
+        let job_server = crate::jobserver::JobServer::start(
+            &dir.join(".may"),
+            crate::jobserver::default_pool_size(),
+        )
+        .await
+        .expect("test jobserver starts");
         Self {
             dir,
             db,
-            session_id: SessionId::new(),
+            session_id: SessionId::from_string("amber-river"),
             runtime: None,
             workspace_broker,
             ask_user_broker,
             tool_environments: ToolEnvironmentCache::spawn(),
+            job_server,
             host: ScriptedHost::default(),
             rules_import: None,
+            agent_messaging: None,
+            ssh_servers: Vec::new(),
+            profile_memories: None,
+            memory_off: false,
             _queues: (workspace_queue, ask_user_queue),
         }
     }
 
-    pub(super) fn input(&self) -> MayAgentSessionInput<'static> {
+    pub(super) async fn input(&self) -> MayAgentSessionInput<'static> {
         let cwd = self.dir.join("cwd");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         MayAgentSessionInput {
@@ -258,9 +323,10 @@ impl SessionParts {
             sandbox_dir: self.dir.join("sandbox"),
             may_dir: self.dir.join(".may"),
             cwd,
+            pushed_providers: crate::cloud::access::PushedProviders::default(),
             session_id: self.session_id.clone(),
             workspace_request_broker: self.workspace_broker.clone(),
-            agent_messaging: None,
+            agent_messaging: self.agent_messaging.clone(),
             ask_user_broker: self.ask_user_broker.clone(),
             db: self.db.clone(),
             model: "session::session-model",
@@ -274,25 +340,29 @@ impl SessionParts {
             }),
             live_config: None,
             profile_persona: None,
-            profile_memories: None,
+            profile_memories: self.profile_memories.clone(),
+            memory_off: self.memory_off,
             plan_state: SessionPlanState::default(),
             location: None,
             task_broker: None,
-            notify_broker: None,
             tunnel_broker: None,
             browser_broker: None,
             acp_host: None,
             register_skills_broker: None,
             environment: AgentEnvironment::Local,
-            tool_distribution: Arc::new(crate::tools::fixture_distribution(
-                &self.dir.join(".may/tool-fixtures"),
-            )),
+            tool_distribution: Arc::new(
+                crate::tools::fixture_distribution(&self.dir.join(".may/tool-fixtures")).await,
+            ),
             tool_environments: self.tool_environments.clone(),
+            job_server: self.job_server.clone(),
             provider_attempt: 0,
-            subagents: None,
-            background_jobs: aither_agent::BackgroundJobPolicy::Await,
+            subagent_tracker: None,
             connectivity: aither_connectivity::Connectivity::manual(true).0,
             rules_import: self.rules_import.clone(),
+            limits: crate::agent::LiveLimits::of(&MayConfig::default()),
+            services: crate::terminal_commands::SharedServices::new(&self.dir.join(".may")),
+            model_context_window: None,
+            sleep: None,
         }
     }
 }
@@ -335,16 +405,48 @@ impl Session {
         Self::start_with(config, false).await
     }
 
+    /// Starts a session whose cache entry ages on the system clock, for a
+    /// test that waits on the idle worker's real timers.
+    pub(super) async fn start_on_system_clock(config: &MayConfig) -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parts = SessionParts::new(temp.path().to_path_buf()).await;
+        let clock = ManualClock::new();
+        let agent = Box::pin(Self::build_on(config, &parts, None, 0)).await;
+        Self {
+            agent,
+            clock,
+            parts,
+            temp,
+        }
+    }
+
     /// Starts a session that persists its interactions through a runtime
     /// service over its database, as the web server's sessions do.
     pub(super) async fn start_with_runtime(config: &MayConfig) -> Self {
         Self::start_with(config, true).await
     }
 
+    /// Starts a session whose agent is one of the main agents `messaging`
+    /// connects.
+    pub(crate) async fn start_with_messaging(
+        config: &MayConfig,
+        messaging: crate::agent_link::AgentMessaging,
+    ) -> Self {
+        Self::start_from(config, false, Some(messaging)).await
+    }
+
     async fn start_with(config: &MayConfig, with_runtime: bool) -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        Self::start_from(config, with_runtime, None).await
+    }
+
+    async fn start_from(
+        config: &MayConfig,
+        with_runtime: bool,
+        agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    ) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut parts = SessionParts::new(temp.path().to_path_buf()).await;
+        parts.agent_messaging = agent_messaging;
         if with_runtime {
             parts
                 .db
@@ -358,6 +460,7 @@ impl Session {
             parts.runtime = Some(Arc::new(crate::session::SessionRuntimeService::new(
                 parts.db.clone(),
                 crate::ui_event_bus::UiEventBus::new(),
+                crate::session::MayHomePaths::new(temp.path().join("home")),
             )));
         }
         let clock = ManualClock::new();
@@ -379,12 +482,24 @@ impl Session {
         clock: &ManualClock,
         prompt_cache_epoch: u32,
     ) -> MayAgent {
-        let mut input = parts.input();
+        Self::build_on(config, parts, Some(clock), prompt_cache_epoch).await
+    }
+
+    /// Like [`Self::build`], on the system clock when `clock` is `None`.
+    async fn build_on(
+        config: &MayConfig,
+        parts: &SessionParts,
+        clock: Option<&ManualClock>,
+        prompt_cache_epoch: u32,
+    ) -> MayAgent {
+        let mut input = parts.input().await;
         input.prompt_cache_epoch = prompt_cache_epoch;
+        input.limits = crate::agent::LiveLimits::of(config);
         let mut agent_config: MayAgentConfig = MayAgent::session_config(config, input)
             .await
             .expect("the session config resolves");
-        agent_config.clock = Some(clock.clone());
+        agent_config.clock = clock.cloned();
+        agent_config.ssh_servers = parts.ssh_servers.clone();
         agent_config.host_reader = Some(parts.host.source());
         Box::pin(MayAgent::new(agent_config))
             .await

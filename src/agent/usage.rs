@@ -38,6 +38,10 @@ pub struct ModelUsageRow {
     /// Cost in USD when the model's pricing is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// How many of `requests` only refreshed the prompt cache while a
+    /// background command ran; their cost is part of the row's totals.
+    #[serde(default)]
+    pub keep_warm_requests: u64,
 }
 
 /// Aggregated provider usage of one session, answer of `/usage`.
@@ -141,6 +145,7 @@ pub fn assemble_usage_report(
         cache_misses: 0,
         cache_miss_tokens: 0,
         cost_usd: None,
+        keep_warm_requests: 0,
     };
     for row in rows {
         let index = models
@@ -152,6 +157,7 @@ pub fn assemble_usage_report(
             });
         let entry = &mut models[index];
         entry.requests += 1;
+        entry.keep_warm_requests += u64::from(row.keep_warm);
         entry.prompt_tokens += u64::try_from(row.prompt_tokens.unwrap_or(0)).unwrap_or_default();
         entry.completion_tokens +=
             u64::try_from(row.completion_tokens.unwrap_or(0)).unwrap_or_default();
@@ -295,6 +301,7 @@ mod tests {
             elapsed_ms: 1,
             ok: true,
             error: None,
+            keep_warm: false,
         }
     }
 

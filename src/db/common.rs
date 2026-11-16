@@ -46,12 +46,29 @@ pub enum ChatDbError {
         /// Number of items already pinned.
         current: i64,
     },
+    /// The default profile cannot be deleted.
+    #[error("The default profile cannot be deleted")]
+    DefaultProfileProtected,
     /// A PR in a terminal state (`merged` or `closed`) cannot be closed.
     #[error("PR is already {state}")]
     PrTerminal {
         /// The terminal state the PR is in.
-        state: String,
+        state: super::PrState,
     },
+    /// Every model-facing id of a session is leased.
+    #[error(transparent)]
+    IdsExhausted(#[from] aither_core::IdsExhausted),
+    /// An id the database keeps for a session could not be leased again
+    /// when its pool was built: two stored ids share its word, or it is not
+    /// a pool word.
+    #[error("a stored model-facing id could not be leased again: {0}")]
+    StoredIdUnavailable(#[from] aither_core::WordUnavailable),
+    /// Every session name the generator can issue was issued.
+    #[error("every session name was issued")]
+    SessionNamesExhausted,
+    /// The database's tables differ from the schema this build creates.
+    #[error("{0}")]
+    SchemaMismatch(super::schema_check::SchemaProblems),
 }
 
 impl From<SkyDbError> for ChatDbError {
@@ -274,6 +291,8 @@ pub struct RequestLogParams<'a> {
     pub ok: bool,
     /// Error summary when `ok` is false.
     pub error: Option<&'a str>,
+    /// Whether the request only refreshed the prompt cache.
+    pub keep_warm: bool,
 }
 
 /// Aggregate prompt-cache statistics across assistant messages.
@@ -301,6 +320,8 @@ pub struct PendingAskUserLookup {
     pub(crate) session_id: String,
     /// Whether a run is waiting on the prompt, as opposed to an open question.
     pub(crate) blocking: bool,
+    /// The word the model knows an open question by.
+    pub(crate) word: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
@@ -353,7 +374,6 @@ pub(super) struct PendingMessageAttachmentRow {
     pub(super) name: String,
     pub(super) attachment_type: String,
     pub(super) url: String,
-    pub(super) upload_data_url: Option<String>,
     pub(super) text_content: Option<String>,
 }
 
@@ -482,43 +502,12 @@ pub struct ContextDebugSnapshotMessage {
     pub tool_call_names: Vec<String>,
 }
 
-/// Outcome of consuming a notification's pending callback.
-#[derive(Debug, Clone)]
-pub struct NotificationCallbackConsumeResult {
-    /// Notification id that was consumed.
-    pub id: String,
-    /// Session the notification belongs to, if any.
-    pub session_id: Option<String>,
-    /// Profile the notification belongs to, if any.
-    pub profile_id: Option<String>,
-    /// Serialized context fragment attached to the callback.
-    pub callback_context_xml: Option<String>,
-    /// Callback message text delivered to the session.
-    pub callback_message: Option<String>,
-    /// Whether a callback was registered for the notification.
-    pub has_callback: bool,
-    /// Whether the callback had already been consumed.
-    pub callback_consumed: bool,
-}
-
 pub(super) struct DefaultProfile<'a> {
     pub(super) slug: &'static str,
     pub(super) name: &'a str,
     pub(super) icon: &'static str,
     pub(super) environment: &'static str,
     pub(super) location_aware: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct SqliteTableInfoRow {
-    pub(super) name: String,
-}
-
-/// Row shape for the snapshot-layout backfill: session + its checkpoint blob.
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct SnapshotMigrationRow {
-    pub(super) session_id: String,
-    pub(super) checkpoint_blob: Vec<u8>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
@@ -697,10 +686,6 @@ pub(super) fn parse_profile_environment(
     match value {
         "local" => Ok(ProfileEnvironmentKind::Local),
         "container" => Ok(ProfileEnvironmentKind::Container),
-        "remote" => Err(ChatDbError::InvalidProfileEnvironment(
-            "remote is no longer a valid home environment; legacy rows should have been migrated to local"
-                .to_string(),
-        )),
         other => Err(ChatDbError::InvalidProfileEnvironment(other.to_string())),
     }
 }

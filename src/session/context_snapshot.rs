@@ -1,4 +1,4 @@
-use aither_agent::{AgentCheckpoint, CheckpointContext};
+use aither_agent::AgentCheckpoint;
 
 use crate::{
     MayAgent,
@@ -14,6 +14,8 @@ pub struct PersistedContextSnapshot {
     /// Highest transcript `seq` the checkpoint covers; restore appends only
     /// entries after it.
     pub applied_seq: i64,
+    /// When the snapshot was written, as an ISO timestamp.
+    pub updated_at: String,
 }
 
 /// Convert a stored snapshot row into a [`PersistedContextSnapshot`].
@@ -24,17 +26,7 @@ pub fn parse_persisted_context_snapshot(
     PersistedContextSnapshot {
         checkpoint: snapshot.checkpoint,
         applied_seq: snapshot.applied_seq,
-    }
-}
-
-/// Build an [`AgentCheckpoint`] from a checkpoint-hook context.
-#[must_use]
-pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
-    AgentCheckpoint {
-        context: ctx.context.clone(),
-        tool_surface_hash: ctx.tool_surface_hash.to_string(),
-        context_window: ctx.window.clone(),
-        has_background_tasks: ctx.has_background_tasks,
+        updated_at: snapshot.updated_at,
     }
 }
 
@@ -126,19 +118,26 @@ async fn persist_checkpoint(
     Ok(())
 }
 
-/// Persist a checkpoint produced by a checkpoint hook as the session's
-/// context snapshot, as the run holding `fence`.
+/// Persist the newest checkpoint `checkpoints` holds as the session's context
+/// snapshot, as the run holding `fence`.
+///
+/// A run hands one out with [`aither_agent::Run::checkpoints`]; each time it
+/// emits a checkpoint event, the handler calls this, so a crash mid-run loses
+/// no completed turn. Before the run's first checkpoint there is nothing to
+/// persist.
 ///
 /// # Errors
 ///
-/// Returns [`ChatDbError`](crate::db::ChatDbError) when reading the latest
-/// message ID or upserting the snapshot fails.
-pub async fn persist_checkpoint_from_hook(
+/// Returns the storage error when the snapshot cannot be stored.
+pub async fn persist_run_checkpoint(
     db: &ChatDb,
     fence: &RunFence,
-    ctx: &CheckpointContext<'_>,
+    checkpoints: &aither_agent::Checkpoints,
 ) -> Result<(), crate::db::ChatDbError> {
-    persist_checkpoint(db, fence, checkpoint_from_hook(ctx)).await
+    match checkpoints.latest() {
+        Some(checkpoint) => persist_checkpoint(db, fence, checkpoint).await,
+        None => Ok(()),
+    }
 }
 
 /// Export the agent's checkpoint and persist it as the session's context
@@ -163,7 +162,7 @@ pub async fn persist_agent_context_snapshot(
 mod tests {
     use aither_agent::{
         AgentCheckpoint, Context, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot,
-        HandoffDocument,
+        Handoff,
     };
     use aither_core::llm::Message;
 
@@ -190,7 +189,6 @@ mod tests {
                 },
                 messages: Vec::new(),
             },
-            has_background_tasks: false,
         }
     }
 
@@ -220,7 +218,12 @@ mod tests {
         let second = context.push(answer.clone());
         assert_eq!((first, second), (0, 1));
         let fork_point = context.fork_point();
-        context.apply_handoff(&HandoffDocument::default(), fork_point, 0);
+        context.apply_handoff(
+            Handoff::new("summary"),
+            fork_point,
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             context.checkpoint().items().is_empty(),
             "the handoff covers every item"

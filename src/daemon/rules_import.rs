@@ -69,8 +69,13 @@ async fn open_import_session(
 ) -> SkyResult<String> {
     let model = resolve_default_model(&state.config_snapshot(), None)
         .ok_or_else(|| bad_request_error("No model configured"))?;
-    let session_id =
-        super::sessions::create_session_for_profile(state, None, Some(profile_id), &model).await?;
+    let session_id = super::sessions::create_session_for_profile(
+        state,
+        super::sessions::SessionName::Generate,
+        Some(profile_id),
+        &model,
+    )
+    .await?;
     state
         .db()
         .set_session_rules_import(&session_id, import.source())

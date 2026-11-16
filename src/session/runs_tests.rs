@@ -8,10 +8,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::{
-    AcquireError, CancelReason, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
-    PersistedAskUserQuestion, PersistedAskUserRequest, PersistedPermissionRequest,
-    PersistedPermissionRequestPayload, PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload,
-    RunOutcome, SessionRuntimeService, SessionRuntimeState,
+    AcquireError, CancelReason, FinishError, PendingMessageState, PendingUserMessage,
+    PendingUserMessageMode, PersistedAskUserQuestion, PersistedAskUserRequest,
+    PersistedPermissionRequest, PersistedPermissionRequestPayload, PersistedWorkspaceRequest,
+    PersistedWorkspaceRequestPayload, RunOutcome, SessionRuns, SessionRuntimeService,
+    SessionRuntimeState, SettleRetry,
 };
 use crate::PermissionRequestMode;
 use crate::db::ChatDb;
@@ -19,10 +20,6 @@ use crate::ui_event_bus::UiEventBus;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
-
-fn init_executor() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-}
 
 /// Bound `future` by [`WAIT_BOUND`], naming `what` it waits for on expiry.
 async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
@@ -32,13 +29,13 @@ async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     service: Arc<SessionRuntimeService>,
 }
 
 impl Fixture {
     async fn new(session_ids: &[&str]) -> Self {
-        init_executor();
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
@@ -49,9 +46,10 @@ impl Fixture {
                 .expect("create session");
         }
         let bus = UiEventBus::new();
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
-            _dir: dir,
-            service: Arc::new(SessionRuntimeService::new(db, bus)),
+            dir,
+            service: Arc::new(SessionRuntimeService::new(db, bus, home)),
         }
     }
 }
@@ -159,12 +157,12 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
                         "session",
                         Some(PersistedPermissionRequest {
                             id: "permission".to_string(),
-                            request: PersistedPermissionRequestPayload {
-                                mode: PermissionRequestMode::Default,
-                                script: "echo hi".to_string(),
-                                session_id: Some("session".to_string()),
-                                agent_id: None,
-                            },
+                            request: PersistedPermissionRequestPayload::new(
+                                PermissionRequestMode::Default,
+                                "echo hi".to_string(),
+                                Some("session".to_string()),
+                                None,
+                            ),
                         }),
                     )
                     .await
@@ -345,12 +343,12 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
             "stale",
             Some(PersistedPermissionRequest {
                 id: "permission".to_string(),
-                request: PersistedPermissionRequestPayload {
-                    mode: PermissionRequestMode::Default,
-                    script: "echo hi".to_string(),
-                    session_id: Some("stale".to_string()),
-                    agent_id: None,
-                },
+                request: PersistedPermissionRequestPayload::new(
+                    PermissionRequestMode::Default,
+                    "echo hi".to_string(),
+                    Some("stale".to_string()),
+                    None,
+                ),
             }),
         )
         .await
@@ -364,10 +362,14 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
 
     // Recovery runs at daemon start, before any run exists; the forgotten
     // guard is not in this registry either, so forget it too.
-    let fresh = SessionRuntimeService::new(service.db(), UiEventBus::new());
+    let fresh = SessionRuntimeService::new(
+        service.db(),
+        UiEventBus::new(),
+        crate::session::MayHomePaths::new(fixture.dir.path().join("home")),
+    );
     fresh
         .runs()
-        .recover_after_restart()
+        .recover_after_restart(crate::db::PreviousDaemon::Stopped)
         .await
         .expect("recovery");
 
@@ -472,4 +474,92 @@ async fn settle_stopped_returns_after_a_dropped_settle() {
         .expect("settle");
     assert_eq!(runtime.state, SessionRuntimeState::Idle);
     assert!(!service.runs().is_held("session"));
+}
+
+/// Runs over the fixture's database that retry a failed settle within
+/// milliseconds.
+fn quick_retry_runs(service: &SessionRuntimeService) -> SessionRuns {
+    SessionRuns::new(service.db(), UiEventBus::new()).with_settle_retry(SettleRetry {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(20),
+    })
+}
+
+/// Wait until the session's persisted state is `Idle`, without acquiring.
+async fn wait_until_idle(service: &SessionRuntimeService) {
+    bounded("the retry to record the end of the run", async {
+        loop {
+            let runtime = service.get("session").await.expect("runtime");
+            if runtime.state == SessionRuntimeState::Idle {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+/// A storage error while recording the end of a run is returned and releases
+/// the session in memory; a background retry then records the end without any
+/// new acquire, and the next run starts.
+#[tokio::test]
+async fn a_failed_settle_is_retried_until_the_row_is_idle() {
+    let fixture = Fixture::new(&["session"]).await;
+    let service = &fixture.service;
+    let runs = quick_retry_runs(service);
+    let run = runs.acquire("session").await.expect("acquire");
+    let released = run.released();
+    service
+        .db()
+        .run_gates
+        .fail_next_finish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = run
+        .finish_idle(RunOutcome::Completed)
+        .await
+        .expect_err("the injected storage failure is reported");
+    assert!(matches!(error, crate::db::ChatDbError::Storage(_)));
+    assert!(!runs.is_held("session"));
+    bounded("the failed settle to release the session", released.wait()).await;
+
+    wait_until_idle(service).await;
+    let next = runs
+        .acquire("session")
+        .await
+        .expect("acquire after the retry landed");
+    next.finish_idle(RunOutcome::Completed)
+        .await
+        .expect("finish");
+}
+
+/// `finish` reports the failed settle as [`FinishError::Settle`], and the
+/// retry frees the row.
+#[tokio::test]
+async fn a_failed_finish_reports_the_settle_and_is_retried() {
+    let fixture = Fixture::new(&["session"]).await;
+    let service = &fixture.service;
+    let runs = quick_retry_runs(service);
+    let run = runs.acquire("session").await.expect("acquire");
+    service
+        .db()
+        .run_gates
+        .fail_next_finish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = run
+        .finish(RunOutcome::Completed)
+        .await
+        .expect_err("the injected storage failure is reported");
+    assert!(matches!(error, FinishError::Settle(_)));
+    assert!(!runs.is_held("session"));
+
+    wait_until_idle(service).await;
+    let next = runs
+        .acquire("session")
+        .await
+        .expect("acquire after the retry landed");
+    next.finish_idle(RunOutcome::Completed)
+        .await
+        .expect("finish");
 }

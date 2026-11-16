@@ -4,5 +4,13 @@ The user answered your ask_user question {{ request_id }}.
 Question: {{ entry.question }}
 Answer: {{ entry.answer }}
 {% endfor -%}
-Clear the BLOCKING {{ request_id }} marks in tasks.md and continue with the work this unblocks.
+{% if unblocked.is_empty() -%}
+No row of tasks.md was marked BLOCKING {{ request_id }}.
+{% else -%}
+tasks.md no longer marks these rows BLOCKING {{ request_id }}; they are pending again:
+{% for row in unblocked -%}
+{{ row.number }}. {{ row.title }}
+{% endfor -%}
+Continue with the work this unblocks.
+{% endif -%}
 </system-reminder>

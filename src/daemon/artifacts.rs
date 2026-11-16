@@ -134,14 +134,6 @@ pub(super) async fn collect_session_artifacts(
     Ok(entries)
 }
 
-pub(super) fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
-    entries
-        .iter()
-        .map(|e| format!("{}:{}:{}", e.path, e.fingerprint, e.is_html))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 pub(super) async fn resolve_scoped_path(
     scope_root: &Path,
     relative_path: PathBuf,
@@ -255,7 +247,26 @@ pub(super) fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::
     response
 }
 
-const ARTIFACT_SANDBOX_CSP: &str = "sandbox allow-scripts";
+/// What an agent- or user-written file served from the daemon's origin may
+/// execute when it is opened as a document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScriptPolicy {
+    /// Active documents run script in an opaque origin without API access;
+    /// artifact previews are built on this.
+    Sandboxed,
+    /// Active documents run no script, load no subresources and submit no
+    /// forms; plain session files use this.
+    Denied,
+}
+
+impl ScriptPolicy {
+    const fn content_security_policy(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandbox allow-scripts",
+            Self::Denied => "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        }
+    }
+}
 
 fn is_active_artifact_content_type(content_type: &str) -> bool {
     let essence = content_type.split(';').next().map_or("", str::trim);
@@ -265,17 +276,25 @@ fn is_active_artifact_content_type(content_type: &str) -> bool {
         || essence.ends_with("+xml")
 }
 
-fn insert_artifact_security_headers(response: &mut skyzen::Response, content_type: &str) {
+fn insert_security_headers(
+    response: &mut skyzen::Response,
+    content_type: &str,
+    policy: ScriptPolicy,
+) {
     insert_header(response, skyzen::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     if is_active_artifact_content_type(content_type) {
         insert_header(
             response,
             skyzen::header::CONTENT_SECURITY_POLICY,
-            ARTIFACT_SANDBOX_CSP,
+            policy.content_security_policy(),
         );
     }
 }
 
+/// An artifact file response: every session-controlled byte stream served
+/// from the daemon's origin is built by this function or
+/// [`session_file_response`], and both set their security headers through
+/// [`insert_security_headers`].
 pub(super) fn file_response(
     bytes: Vec<u8>,
     content_type: &str,
@@ -286,7 +305,20 @@ pub(super) fn file_response(
     insert_header(&mut response, skyzen::header::CONTENT_TYPE, content_type);
     insert_header(&mut response, skyzen::header::ETAG, etag);
     insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
-    insert_artifact_security_headers(&mut response, content_type);
+    insert_security_headers(&mut response, content_type, ScriptPolicy::Sandboxed);
+    response
+}
+
+/// A response for a file under the session's `files/` directory.
+pub(super) fn session_file_response(
+    bytes: Vec<u8>,
+    content_type: &str,
+    cache_control: &str,
+) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
+    insert_header(&mut response, skyzen::header::CONTENT_TYPE, content_type);
+    insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
+    insert_security_headers(&mut response, content_type, ScriptPolicy::Denied);
     response
 }
 
@@ -1241,14 +1273,23 @@ fn normalized_artifact_diagnostics(diagnostics: Vec<String>) -> Result<Vec<Strin
                 return Err(bad_request_error("artifact diagnostic cannot be empty"));
             }
 
-            if diagnostic.chars().count() <= MAX_ARTIFACT_DIAGNOSTIC_CHARS {
+            if diagnostic
+                .char_indices()
+                .nth(MAX_ARTIFACT_DIAGNOSTIC_CHARS)
+                .is_none()
+            {
                 return Ok(diagnostic.to_string());
             }
 
+            // The suffix is ASCII, so its byte length is its character count.
             let retained_chars = MAX_ARTIFACT_DIAGNOSTIC_CHARS
-                .checked_sub(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX.chars().count())
+                .checked_sub(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX.len())
                 .expect("artifact diagnostic truncation suffix must fit the diagnostic limit");
-            let mut truncated = diagnostic.chars().take(retained_chars).collect::<String>();
+            let keep = diagnostic
+                .char_indices()
+                .nth(retained_chars)
+                .map_or(diagnostic.len(), |(at, _)| at);
+            let mut truncated = diagnostic[..keep].to_string();
             truncated.push_str(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX);
             Ok(truncated)
         })
@@ -1399,13 +1440,15 @@ pub(super) async fn get_slidev_static_asset(
 /// `session_artifacts` topic notification covers a burst of writes.
 const ARTIFACT_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Whether `path` lies under a session's `artifacts/` directory, in either
-/// layout (`~/.may/sessions/<id>` or `~/.may/profiles/<pid>/sessions/<id>`).
-fn is_session_artifacts_path(path: &Path) -> bool {
+/// The session owning `path` when it lies under `sessions/<id>/artifacts/`,
+/// in either layout (`~/.may/sessions/<id>` or
+/// `~/.may/profiles/<pid>/sessions/<id>`).
+fn session_artifacts_owner(path: &Path) -> Option<String> {
     let components: Vec<_> = path.components().collect();
     components
         .windows(3)
-        .any(|window| window[0].as_os_str() == "sessions" && window[2].as_os_str() == "artifacts")
+        .find(|window| window[0].as_os_str() == "sessions" && window[2].as_os_str() == "artifacts")
+        .and_then(|window| window[1].as_os_str().to_str().map(str::to_owned))
 }
 
 /// Watches the session roots and publishes `session_artifacts` on the UI
@@ -1443,18 +1486,25 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
 
         let quiet = tokio::time::sleep(ARTIFACT_WATCH_DEBOUNCE);
         tokio::pin!(quiet);
-        let mut dirty = false;
+        let mut dirty = std::collections::BTreeSet::new();
         loop {
             tokio::select! {
                 maybe_event = watch_rx.recv() => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            if event.paths.iter().any(|path| is_session_artifacts_path(path)) {
-                                dirty = true;
-                                quiet.as_mut().reset(
-                                    tokio::time::Instant::now() + ARTIFACT_WATCH_DEBOUNCE,
-                                );
-                            }
+                            crate::panic_boundary::round("artifact watcher", async {
+                                let owners = event
+                                    .paths
+                                    .iter()
+                                    .filter_map(|path| session_artifacts_owner(path));
+                                if owners.clone().next().is_some() {
+                                    dirty.extend(owners);
+                                    quiet.as_mut().reset(
+                                        tokio::time::Instant::now() + ARTIFACT_WATCH_DEBOUNCE,
+                                    );
+                                }
+                            })
+                            .await;
                         }
                         Some(Err(error)) => {
                             tracing::warn!(error = %error, "artifact watcher error");
@@ -1462,9 +1512,16 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
                         None => break,
                     }
                 }
-                () = &mut quiet, if dirty => {
-                    dirty = false;
-                    bus.publish(crate::ui_event_bus::UiEventTopics::SESSION_ARTIFACTS);
+                () = &mut quiet, if !dirty.is_empty() => {
+                    crate::panic_boundary::round("artifact watcher", async {
+                        for session_id in std::mem::take(&mut dirty) {
+                            bus.publish_session_change(
+                                &session_id,
+                                crate::daemon::session_events::SessionChange::Artifacts,
+                            );
+                        }
+                    })
+                    .await;
                 }
             }
         }
@@ -2016,5 +2073,19 @@ mod tests {
             .expect("cached diagnostics should complete lock acquisition")
             .is_none()
         );
+    }
+
+    #[test]
+    fn bounds_cjk_diagnostics_on_a_character_boundary() {
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "a👍🏽"] {
+            let diagnostics = vec![unit.repeat(MAX_ARTIFACT_DIAGNOSTIC_CHARS)];
+            let normalized = normalized_artifact_diagnostics(diagnostics).expect("bounded");
+            assert_eq!(
+                normalized[0].chars().count(),
+                MAX_ARTIFACT_DIAGNOSTIC_CHARS,
+                "{unit}"
+            );
+            assert!(normalized[0].ends_with(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX));
+        }
     }
 }

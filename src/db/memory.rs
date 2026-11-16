@@ -212,40 +212,4 @@ impl ChatDb {
         .await?;
         Ok(())
     }
-
-    // ── Global Memory (DB-backed MEMORY.md replacement) ──────
-
-    /// Get the global memory content.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn get_global_memory(&self) -> Result<Option<String>, ChatDbError> {
-        #[derive(serde::Deserialize, skyzen::FromRow)]
-        struct Row {
-            content: String,
-        }
-        Ok(
-            query!(self.db, "SELECT content FROM global_memory WHERE id = 1")
-                .fetch_optional::<Row>()
-                .await?
-                .map(|r| r.content),
-        )
-    }
-
-    /// Upsert the global memory content.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn set_global_memory(&self, content: &str) -> Result<(), ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        query!(
-            self.db,
-            "INSERT INTO global_memory (id, content, updated_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-            content,
-            now
-        )
-        .execute()
-        .await?;
-        Ok(())
-    }
 }

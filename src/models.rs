@@ -3,7 +3,7 @@
 use aither_cloud::{
     ClaudeProvider, CloudModelProvider, CodexProvider, CopilotProvider, GeminiProvider,
 };
-use aither_core::llm::{LanguageModelProvider, model::Ability};
+use aither_core::llm::LanguageModelProvider;
 use aither_models::lookup as lookup_model_info;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -233,8 +233,11 @@ async fn fetch_models_for_provider(
                 provider_description.to_string()
             };
 
-            let mut abilities: Vec<String> =
-                p.abilities.into_iter().map(ability_to_label).collect();
+            let mut abilities: Vec<String> = p
+                .abilities
+                .into_iter()
+                .map(|a| a.label().to_string())
+                .collect();
 
             // Enrich with abilities from the static model database when the
             // provider API returns none (Claude/Gemini list_models omit them).
@@ -244,7 +247,7 @@ async fn fetch_models_for_provider(
                 abilities = info
                     .abilities()
                     .iter()
-                    .map(|a| ability_to_label(*a))
+                    .map(|a| a.label().to_string())
                     .collect();
             }
 
@@ -301,14 +304,12 @@ async fn fetch_openai_compatible_models(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| model_id.clone());
 
-            let abilities = aither_models::lookup(&model_id)
-                .map(|info| {
-                    info.abilities()
-                        .iter()
-                        .map(|ability| ability_to_label(*ability))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let abilities = aither_models::lookup(&model_id).map_or_default(|info| {
+                info.abilities()
+                    .iter()
+                    .map(|ability| ability.label().to_string())
+                    .collect()
+            });
 
             FetchedModel {
                 id: model_id,
@@ -337,32 +338,6 @@ struct OpenAiModelDescriptor {
     max_tokens: Option<u32>,
     #[serde(default, alias = "inputTokenLimit", alias = "input_token_limit")]
     input_token_limit: Option<u32>,
-}
-
-/// Stable lowercase label for a model [`Ability`], used in listings.
-///
-/// # Panics
-///
-/// Panics on an [`Ability`] variant added without a corresponding label —
-/// keep the arm list in sync.
-#[must_use]
-pub fn ability_to_label(ability: Ability) -> String {
-    match ability {
-        Ability::ToolUse => "tool_use".to_string(),
-        Ability::Vision => "vision".to_string(),
-        Ability::Audio => "audio".to_string(),
-        Ability::AudioOutput => "audio_output".to_string(),
-        Ability::Video => "video".to_string(),
-        Ability::WebSearch => "web_search".to_string(),
-        Ability::Pdf => "pdf".to_string(),
-        Ability::CodeExecution => "code_execution".to_string(),
-        Ability::Reasoning => "reasoning".to_string(),
-        Ability::ImageGeneration => "image_generation".to_string(),
-        Ability::ComputerUse => "computer_use".to_string(),
-        Ability::PromptCaching => "prompt_caching".to_string(),
-        Ability::AssistantPrefill => "assistant_prefill".to_string(),
-        _ => panic!("unsupported ability variant: {ability:?}"),
-    }
 }
 
 /// Trailing tokens a provider catalog uses to encode a reasoning-effort rung
@@ -397,6 +372,31 @@ pub fn effort_family_base(model_id: &str) -> String {
         }
     }
     model_id.to_string()
+}
+
+/// The context window of `model_id` on `provider_id`: what the provider
+/// reports in its model list, else the `aither_models` table (also looked up
+/// by effort family, so `o4-mini-high` resolves like `o4-mini`).
+#[must_use]
+pub fn resolve_context_window(
+    fetched: &[FetchedModel],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<u32> {
+    let family = effort_family_base(model_id);
+    let reported = |wanted: &str| {
+        fetched
+            .iter()
+            .find(|model| model.provider_id == provider_id && model.id == wanted)
+            .and_then(|model| model.context_window)
+    };
+    let tabled = |wanted: &str| {
+        lookup_model_info(wanted).and_then(aither_models::ModelEntry::max_input_tokens)
+    };
+    reported(model_id)
+        .or_else(|| reported(&family))
+        .or_else(|| tabled(model_id))
+        .or_else(|| tabled(&family))
 }
 
 /// Whether two selector strings address the same selectable model.
@@ -471,6 +471,9 @@ pub fn record_family_effort_rungs(rungs: &mut FamilyEffortRungs, models: &[Fetch
         family.sort_by_key(|rung| effort_rung_rank(rung));
     }
 }
+
+/// The level a session uses before any selection.
+pub const DEFAULT_EFFORT: &str = "medium";
 
 /// The reasoning-effort ladder a provider's wire protocol expresses.
 ///
@@ -547,6 +550,56 @@ mod tests {
         assert_eq!(
             effort_ladder(&rungs, "relay", "gpt-x", Some(ProviderType::Google)),
             ["minimal", "low", "medium", "high"]
+        );
+    }
+
+    fn with_window(provider_id: &str, id: &str, window: u32) -> FetchedModel {
+        FetchedModel {
+            context_window: Some(window),
+            ..fetched(provider_id, id)
+        }
+    }
+
+    #[test]
+    fn a_provider_reported_window_resolves_a_model_the_table_lacks() {
+        let list = [with_window("relay", "relay-only-model", 262_144)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "relay-only-model"),
+            Some(262_144)
+        );
+        assert_eq!(
+            super::resolve_context_window(&list, "other", "relay-only-model"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_provider_window_beats_the_table_and_the_table_fills_the_rest() {
+        let table = aither_models::lookup("gpt-4o")
+            .and_then(aither_models::ModelEntry::max_input_tokens)
+            .expect("the table lists gpt-4o");
+        assert_eq!(
+            super::resolve_context_window(&[], "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [fetched("relay", "gpt-4o")];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [with_window("relay", "gpt-4o", 12_345)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn an_effort_rung_resolves_through_its_family() {
+        let list = [with_window("relay", "o4-mini", 4_321)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "o4-mini-high"),
+            Some(4_321)
         );
     }
 

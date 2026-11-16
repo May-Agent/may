@@ -16,7 +16,11 @@ export type ApiErrorCode =
   | 'container_runtime_unavailable'
   | 'managed_podman_approval_required'
   | 'location_unavailable'
-  | 'github_unauthenticated';
+  | 'github_unauthenticated'
+  | 'cloud_account_unusable'
+  | 'repo_declined'
+  | 'loop_stopped'
+  | 'session_suspended';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =
@@ -29,8 +33,8 @@ export type ToolVariant =
   | 'web_fetch'
   | 'ask'
   | 'session'
-  | 'notify'
   | 'task'
+  | 'compact'
   | 'generic';
 
 export type MessageRole = 'user' | 'assistant' | 'system';
@@ -49,21 +53,14 @@ export interface ApiAttachment {
   name: string;
   type: AttachmentKind;
   url: string;
-  uploadDataUrl?: string | null;
   textContent?: string | null;
 }
 
-export type TerminalCommandMode = 'default' | 'sandboxed' | 'unsafe' | 'ssh';
+export type TerminalCommandMode = 'default' | 'unsafe';
+/** Scope of a permission request; `ssh` is still a wire value of it. */
+export type PermissionRequestMode = TerminalCommandMode | 'ssh';
 export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
 
-export interface ApiTerminalExecution {
-  id: string;
-  description: string;
-  input: string;
-  output?: string | null;
-  status: TerminalExecutionStatus;
-  mode: TerminalCommandMode;
-}
 
 export interface RequestStats {
   providerId?: string | null;
@@ -98,7 +95,6 @@ export interface ApiMessage {
   isStreaming?: boolean | null;
   isThinking?: boolean | null;
   toolEvent?: unknown;
-  terminalExecutions?: ApiTerminalExecution[];
   stats?: RequestStats | null;
 }
 
@@ -146,7 +142,103 @@ export interface PersistedPermissionRequest {
   mode: string;
   script: string;
   sessionId?: string | null;
+  /** How the daemon read the script; absent for a request with no script. */
+  reading?: CommandReading | null;
 }
+
+export type DiffOp = 'context' | 'added' | 'removed';
+
+export interface DiffLine {
+  op: DiffOp;
+  text: string;
+  old?: number | null;
+  new?: number | null;
+}
+
+export interface DiffHunk {
+  anchor?: string | null;
+  lines: DiffLine[];
+}
+
+export type FileChange =
+  | { kind: 'add'; lines: DiffLine[] }
+  | { kind: 'delete' }
+  | { kind: 'update'; movedTo?: string | null; hunks: DiffHunk[] };
+
+export interface FileEdit {
+  path: string;
+  change: FileChange;
+}
+
+/** What one command of a terminal script does, as the daemon read it. */
+export type CommandIntent =
+  | { kind: 'edit'; files: FileEdit[] }
+  | { kind: 'read'; path: string; range: unknown }
+  | { kind: 'search'; tool: string; pattern?: string | null; paths: string[] }
+  | { kind: 'list'; tool: string; paths: string[] }
+  | { kind: 'git'; subcommand?: string | null }
+  | { kind: 'build'; tool: string; subcommand?: string | null; target?: string | null }
+  | { kind: 'tasks'; args: string[] }
+  | { kind: 'unknown'; source: string };
+
+export type StepLink = 'start' | 'pipe' | 'and' | 'or' | 'then';
+
+export interface CommandStep {
+  link: StepLink;
+  intent: CommandIntent;
+  /** The command in plain words; the source text for an unknown one. */
+  line: string;
+}
+
+export interface CommandReading {
+  steps: CommandStep[];
+}
+
+export type RowChangeKind = 'added' | 'started' | 'finished' | 'blocked' | 'unblocked' | 'edited';
+
+/** A `tasks.md` row as a card shows it. */
+export interface RowView {
+  section: string;
+  title: string;
+  detail: string;
+}
+
+export interface RowChange {
+  change: RowChangeKind;
+  before?: RowView | null;
+  after?: RowView | null;
+}
+
+export interface AskedCard {
+  section: string;
+  question: string;
+  options: string[];
+  multiSelect: boolean;
+  secret: boolean;
+}
+
+export interface AnswerCard {
+  section: string;
+  text: string;
+}
+
+/**
+ * What a `terminal` call of one of May's commands renders as, built by the
+ * daemon from what the command did. A call without one shows as the
+ * ordinary command row.
+ */
+export type CommandCard =
+  | { kind: 'tasks'; changes: RowChange[] }
+  | {
+      kind: 'subagent';
+      agent: string;
+      title: string;
+      state: 'running' | 'done' | 'interrupted';
+      startedAt: string;
+      finishedAt?: string | null;
+      result?: string | null;
+    }
+  | { kind: 'askUser'; requestId: string; questions: AskedCard[]; answers?: AnswerCard[] | null };
 
 export interface PersistedWorkspaceRequest {
   id: string;
@@ -173,6 +265,7 @@ export interface SessionRuntimeSummary {
   state?: SessionRuntimeState;
   planState?: SessionPlanState;
   yolo?: boolean;
+  memoryOff?: boolean;
   interactions?: SessionInteractionState;
   queuedCount?: number;
   pendingImmediate?: PendingUserMessage | null;
@@ -189,12 +282,51 @@ export interface ApiSession {
   title: string;
   lastModified: string;
   preview: string;
-  messages?: ApiMessage[];
   profileId: string | null;
   model: string;
   reasoningEffort?: string | null;
   runtime: SessionRuntimeSummary;
   repo?: string | null;
+  /** Cursor the session's event stream resumes from. */
+  cursor?: string;
+  /** The cloud machine the session lives on; absent for the daemon's own. */
+  location?: SessionLocation;
+}
+
+/** One machine type of a cloud provider's catalog. */
+export interface MachineType {
+  /** The provider's name of the type, which a new session names. */
+  name: string;
+  displayName: string;
+  cpus: number;
+  memoryBytes: number;
+  storageBytes: number;
+}
+
+export interface SessionLocation {
+  provider: 'codespaces';
+  machine: string;
+  machineType: string;
+}
+
+export type CloudSessionPhase =
+  | 'creating'
+  | 'starting'
+  | 'checking'
+  | 'downloading'
+  | 'installing'
+  | 'cloning'
+  | 'starting_daemon'
+  | 'connecting'
+  | 'ready'
+  | 'failed';
+
+/** One step of bringing a cloud session's machine up. */
+export interface CloudSessionEvent {
+  sessionId: string;
+  phase: CloudSessionPhase;
+  machineState?: 'provisioning' | 'running' | 'suspended' | 'gone';
+  error?: string;
 }
 
 export interface ChatRequestPayload {
@@ -205,7 +337,7 @@ export interface ChatRequestPayload {
   deliveryMode?: PendingUserMessageMode;
 }
 
-// ── Turn events: `session_turn` frames on /api/events ───────
+// ── Turn events: `session_turn` frames on the session stream ─
 
 export interface SseStart {
   kind: 'start';
@@ -265,6 +397,12 @@ export interface ToolSummary {
   action?: string | null;
   target?: string | null;
   prompt?: string | null;
+  /** How the daemon read a terminal call's script, once the call is complete. */
+  reading?: CommandReading | null;
+  /** Why a terminal-family call's complete arguments do not match the tool's schema. */
+  argumentsError?: string | null;
+  /** The card of a call that ran one of May's commands, once the daemon built it. */
+  card?: CommandCard | null;
 }
 
 export interface SseToolStart {
@@ -301,18 +439,47 @@ export interface SseToolEnd {
   summary?: ToolSummary;
 }
 
-export interface SseTodoItem {
-  text: string;
-  checked: boolean;
+/**
+ * The card of the terminal call `id` changed. Carries no `seq`: it can also
+ * arrive after the turn that ran the command, when an answer comes in.
+ */
+export interface SseToolCard {
+  kind: 'tool_card';
+  turnId: string;
+  id: string;
+  /** Absent when the call has none, so the ordinary command row shows. */
+  card: CommandCard | null;
+}
+
+/** A section of `tasks.md` that holds rows. */
+export type TaskSection = 'roots' | 'doing' | 'queued';
+
+/** An issue or pull request a row names. */
+export interface TaskReference {
+  /** `owner/repo` when the row writes one. */
+  repository: string | null;
+  number: number;
+  pullRequest: boolean;
+}
+
+/** One row of `Roots`, `Doing` or `Queued`, parsed by the daemon. */
+export interface TaskRow {
+  section: TaskSection;
+  /** First line of the row; the sidebar shows this alone. */
+  title: string;
+  /** Detail lines joined by newlines; empty when the row has none. */
+  detail: string;
+  /** Payload of the row's `BLOCKING <what>` mark. */
+  blocking: string | null;
+  references: TaskReference[];
 }
 
 export interface SseTodoUpdate {
   kind: 'todo_update';
   seq: number;
   turnId: string;
-  items: SseTodoItem[];
-  total: number;
-  completed: number;
+  /** All rows of the document; empty once every row is deleted. */
+  rows: TaskRow[];
 }
 
 export interface SseError {
@@ -329,16 +496,26 @@ export interface SseDone {
   seq: number;
   turnId: string;
   sessionId: string;
+  /** The reply, under the id of the first assistant message the turn stored. */
   assistant: ApiMessage;
+  /** The stored user message the turn answers, as the session's messages name it. */
+  userMessageId: string | null;
+  /** Every assistant message the turn stored, as the session's messages name them. */
+  messageIds: string[];
 }
 
-/** The turn paused for a browser takeover; carries the partial reply. */
+/**
+ * The turn paused for a browser takeover; carries the partial reply, which
+ * is absent when the pause came before the turn stored one.
+ */
 export interface SsePaused {
   kind: 'paused';
   seq: number;
   turnId: string;
   sessionId: string;
-  assistant: ApiMessage;
+  assistant: ApiMessage | null;
+  userMessageId: string | null;
+  messageIds: string[];
 }
 
 /** Last event of every turn, however it ended. */
@@ -387,6 +564,19 @@ export interface SseRetract {
   turnId: string;
 }
 
+/**
+ * The turn was stopped before any tool call or response text: the daemon
+ * withdrew it, so its message left the conversation. The client that sent
+ * the message puts it back into its composer.
+ */
+export interface SseWithdrawn {
+  kind: 'withdrawn';
+  seq: number;
+  turnId: string;
+  content: string;
+  attachments: ApiAttachment[];
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -396,6 +586,7 @@ export type ChatStreamEvent =
   | SseToolStart
   | SseToolDelta
   | SseToolEnd
+  | SseToolCard
   | SseTodoUpdate
   | SseError
   | SseDone
@@ -404,7 +595,8 @@ export type ChatStreamEvent =
   | SsePing
   | SseSpeed
   | SseHold
-  | SseRetract;
+  | SseRetract
+  | SseWithdrawn;
 
 // ── UI event stream /api/events ─────────────────────────────
 
@@ -473,8 +665,8 @@ export type UiEvent =
   | { kind: 'config'; payload: UiConfigResponse }
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
   | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
+  | { kind: 'cloud_session'; payload: CloudSessionEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
-  | { kind: 'session_runtime'; payload: SessionRuntimePayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }
   | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
@@ -482,7 +674,7 @@ export type UiEvent =
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
   | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
-  | { kind: 'session_artifacts'; payload: SessionArtifactsPayload };
+  | { kind: 'prs'; payload: { prs: import('./api/prs').ApiPr[] } };
 
 // ── Artifacts ──────────────────────────────────────────────
 
@@ -495,11 +687,6 @@ export interface ArtifactEntry {
 }
 
 export interface SessionArtifactsResponse {
-  artifacts: ArtifactEntry[];
-}
-
-export interface SessionArtifactsPayload {
-  sessionId: string;
   artifacts: ArtifactEntry[];
 }
 
@@ -517,6 +704,8 @@ export interface ArtifactDiagnosticsResponse {
 export interface SessionTasksPayload {
   content: string;
   planState: SessionPlanState;
+  /** Parsed rows of `content`; set by the daemon, ignored when saving. */
+  rows?: TaskRow[];
 }
 
 export interface SessionPlanStateRequest {

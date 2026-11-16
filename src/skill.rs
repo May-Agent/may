@@ -94,6 +94,9 @@ pub struct SkillInfo {
     pub path: PathBuf,
     /// Source of the skill.
     pub source: SkillSource,
+    /// The command the skill is about: the session catalog offers the skill
+    /// only when that command is registered.
+    pub requires_command: Option<String>,
 }
 
 /// SKILL.md frontmatter structure.
@@ -101,6 +104,8 @@ pub struct SkillInfo {
 struct SkillFrontmatter {
     name: String,
     description: String,
+    #[serde(default, rename = "requires-command")]
+    requires_command: Option<String>,
 }
 
 /// Parse YAML frontmatter (`---` delimited) from content.
@@ -199,6 +204,7 @@ impl SkillManager {
             dir_name: skill_dir.file_name()?.to_string_lossy().to_string(),
             path: skill_dir.to_path_buf(),
             source,
+            requires_command: metadata.requires_command,
         })
     }
 
@@ -412,6 +418,7 @@ fn parse_skill_sync(skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> 
         dir_name: skill_dir.file_name()?.to_string_lossy().to_string(),
         path: skill_dir.to_path_buf(),
         source,
+        requires_command: metadata.requires_command,
     })
 }
 

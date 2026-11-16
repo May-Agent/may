@@ -49,7 +49,10 @@ pub enum SessionError {
     Daemon(#[from] crate::client::DaemonClientError),
 }
 
-/// Unique session identifier (four random words joined by `-`).
+/// A session's name: the id of the session and of the main agent running
+/// it. The daemon's one generator issues it
+/// ([`ChatDb::issue_session_name`](crate::db::ChatDb::issue_session_name));
+/// it never changes and is never issued again.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
@@ -57,15 +60,6 @@ pub enum SessionError {
 pub struct SessionId(String);
 
 impl SessionId {
-    /// Create a new random session ID using four words.
-    ///
-    /// # Panics
-    /// Panics if the embedded petname dictionary cannot produce an id.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(crate::id::new_long())
-    }
-
     /// Create from an existing string.
     pub fn from_string(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -75,12 +69,6 @@ impl SessionId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -119,6 +107,87 @@ pub struct Session {
     pub persisted: bool,
     /// Repository the session is bound to, when one was named at launch.
     pub repo: Option<String>,
+    /// The host directory the session works in; `None` for a repo-less chat
+    /// and for a session started directly on a GitHub repository.
+    pub cwd: Option<PathBuf>,
+    /// Cursor `GET /api/sessions/{id}` reported at load, for the session
+    /// events stream to continue from. `None` for a new session.
+    pub events_cursor: Option<String>,
+    /// The machine type a new session runs entirely in the cloud on, until
+    /// it is persisted; `None` for a session on the daemon's machine.
+    pub cloud: Option<String>,
+    /// Whether the session's codespace was suspended when it was loaded:
+    /// its history arrives once a message starts the codespace.
+    pub suspended: bool,
+}
+
+/// The GitHub repository a cloud session of `repo` (a spec or a path) or,
+/// without one, of the checkout at `cwd` is created from: a codespace
+/// needs a GitHub repository, never a local checkout. Runs `git`.
+#[must_use]
+pub fn cloud_repository(repo: Option<&str>, cwd: Option<&Path>) -> Option<String> {
+    let github_of = |path: &Path| match crate::trust::repo_kind(path) {
+        crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+        crate::trust::RepoKind::Git => None,
+    };
+    match repo {
+        Some(spec) if Path::new(spec).is_dir() => github_of(Path::new(spec)),
+        Some(spec) => spec
+            .strip_prefix("github:")
+            .unwrap_or(spec)
+            .parse::<crate::workspace::GitHubRepository>()
+            .ok()
+            .map(|repository| repository.to_string()),
+        None => cwd.and_then(|cwd| {
+            crate::repo_search::worktree_root(cwd).and_then(|root| github_of(&root))
+        }),
+    }
+}
+
+/// How a client starts its sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionLaunch {
+    /// In the directory the client runs in; its repository, if any, binds
+    /// the session once its trust is decided.
+    #[default]
+    Checkout,
+    /// A repo-less chat: no directory and no repository, parity with the web
+    /// UI's new chat. Every session this client creates is one.
+    RepoLess,
+    /// Directly on a repository: `owner/repo` needs no local checkout, a
+    /// path binds that checkout's repository. Consumed by the first session.
+    Repo(String),
+}
+
+impl SessionLaunch {
+    /// The directory a session started this way works in, given the client's
+    /// own directory `client_cwd`.
+    #[must_use]
+    pub fn cwd(&self, client_cwd: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Checkout => Some(client_cwd.to_path_buf()),
+            Self::RepoLess => None,
+            Self::Repo(spec) => std::fs::canonicalize(spec)
+                .ok()
+                .filter(|path| path.is_dir()),
+        }
+    }
+
+    /// The repository binding spec sent to the daemon: `owner/repo` as given,
+    /// a path as the client's canonical absolute path, since the daemon
+    /// resolves it from its own directory.
+    #[must_use]
+    pub fn repo(&self) -> Option<String> {
+        match self {
+            Self::Repo(spec) => Some(
+                std::fs::canonicalize(spec)
+                    .ok()
+                    .filter(|path| path.is_dir())
+                    .map_or_else(|| spec.clone(), |path| path.display().to_string()),
+            ),
+            Self::Checkout | Self::RepoLess => None,
+        }
+    }
 }
 
 impl Session {
@@ -260,6 +329,69 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
     }
 }
 
+/// Decode one stored `messages` row into a [`ChatMessage`].
+///
+/// # Errors
+/// Returns [`SessionError`] when the row's role, attachments, reasoning,
+/// tool calls or translation are malformed.
+pub fn chat_message_from_row(
+    msg: crate::db::entity::messages::Model,
+) -> Result<ChatMessage, SessionError> {
+    let persisted = PersistedMessage::try_from(&msg)?;
+    let role = persisted.role.clone();
+    let timestamp = persisted.timestamp;
+    let attachments = persisted.attachments;
+    let stats = map_db_message_stats(&msg);
+    let reasoning = msg
+        .reasoning
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })?
+        .unwrap_or_default();
+    let tool_calls = msg
+        .tool_calls
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })?
+        .unwrap_or_default();
+    let translation = msg
+        .translation
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })?;
+
+    Ok(ChatMessage {
+        id: Some(msg.id),
+        role,
+        content: msg.content,
+        attachments,
+        timestamp,
+        tool_call_id: msg.tool_call_id,
+        stats,
+        reasoning,
+        tool_calls,
+        translation,
+        reading: None,
+        card: None,
+        thinking: msg.thinking,
+    })
+}
+
 /// Load the persisted chat history for a session from the database.
 ///
 /// # Errors
@@ -279,57 +411,7 @@ pub async fn load_history_from_db(
     }
 
     for msg in db_messages {
-        let persisted = PersistedMessage::try_from(&msg)?;
-        let role = persisted.role.clone();
-        let timestamp = persisted.timestamp;
-        let attachments = persisted.attachments;
-        let stats = map_db_message_stats(&msg);
-        let reasoning = msg
-            .reasoning
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|source| PersistedMessageError::InvalidAttachments {
-                session_id: msg.session_id.clone(),
-                message_id: msg.id,
-                source,
-            })?
-            .unwrap_or_default();
-        let tool_calls = msg
-            .tool_calls
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|source| PersistedMessageError::InvalidAttachments {
-                session_id: msg.session_id.clone(),
-                message_id: msg.id,
-                source,
-            })?
-            .unwrap_or_default();
-        let translation = msg
-            .translation
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|source| PersistedMessageError::InvalidAttachments {
-                session_id: msg.session_id.clone(),
-                message_id: msg.id,
-                source,
-            })?;
-
-        history.push(ChatMessage {
-            id: Some(msg.id),
-            role,
-            content: msg.content,
-            attachments,
-            timestamp,
-            tool_call_id: msg.tool_call_id,
-            stats,
-            reasoning,
-            tool_calls,
-            translation,
-            thinking: msg.thinking,
-        });
+        history.push(chat_message_from_row(msg)?);
     }
 
     Ok(history)
@@ -406,18 +488,6 @@ pub async fn initialize_session_persistence(
 ) -> Result<(SessionStore, ChatDb, String), SessionError> {
     let store = initialize_session_dirs(may_dir).await?;
     let db = ChatDb::open(&home_paths_db(may_dir)).await?;
-    // Migrate the retired DB-backed global memory into the file store once.
-    let memory_file = MayHomePaths::new(may_dir.to_path_buf()).memory_file();
-    if let Ok(Some(content)) = db.get_global_memory().await
-        && !content.trim().is_empty()
-        && async_fs::read_to_string(&memory_file)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    {
-        async_fs::write(&memory_file, &content).await?;
-    }
     let default_profile_id = db.ensure_default_profiles().await?;
     for profile in db.list_profiles().await? {
         store.sync_profile_scoped_resources(&profile.id).await?;
@@ -475,8 +545,10 @@ pub struct SessionManager {
     current: Option<Session>,
     /// The currently active profile ID (sessions are created within this profile).
     current_profile_id: Option<String>,
-    /// Repository spec the next created session binds to; taken once.
-    pending_repo: Option<String>,
+    /// How sessions are started.
+    launch: SessionLaunch,
+    /// A repository start for the next session only.
+    once: Option<SessionLaunch>,
 }
 
 impl SessionManager {
@@ -505,16 +577,35 @@ impl SessionManager {
             daemon: None,
             current: None,
             current_profile_id: None,
-            pending_repo: None,
+            launch: SessionLaunch::default(),
+            once: None,
         };
         Ok(manager)
     }
 
-    /// Bind the next created session to a repository spec
-    /// (`owner/repo` or a local path); consumed by the first session
-    /// created after the call.
-    pub fn set_pending_repo(&mut self, repo: Option<String>) {
-        self.pending_repo = repo;
+    /// Choose how this client starts sessions. A [`SessionLaunch::Repo`]
+    /// start applies to the next session created and then gives way to the
+    /// way sessions were started before it.
+    pub fn set_launch(&mut self, launch: SessionLaunch) {
+        match launch {
+            SessionLaunch::Repo(_) => self.once = Some(launch),
+            base => {
+                self.once = None;
+                self.launch = base;
+            }
+        }
+    }
+
+    /// How the next session will be started.
+    #[must_use]
+    pub fn launch(&self) -> &SessionLaunch {
+        self.once.as_ref().unwrap_or(&self.launch)
+    }
+
+    /// The directory the next session works in, given the client's own.
+    #[must_use]
+    pub fn launch_cwd(&self, client_cwd: &Path) -> Option<PathBuf> {
+        self.launch().cwd(client_cwd)
     }
 
     /// Connect the manager to the daemon that owns session persistence.
@@ -544,26 +635,44 @@ impl SessionManager {
         &self.may_dir
     }
 
-    /// Create a new session in the current profile (lazy - not persisted until first message).
+    /// A session name the daemon's generator issued for a session this
+    /// client is about to create.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the daemon cannot issue one.
+    pub async fn issue_session_name(&self) -> Result<SessionId, SessionError> {
+        let issued: crate::client::IssuedSessionName = self
+            .daemon()?
+            .post("/api/session-names", &serde_json::json!({}))
+            .await?;
+        Ok(SessionId::from_string(issued.name))
+    }
+
+    /// Create a new session named `id` in the current profile (lazy - not
+    /// persisted until first message).
     ///
     /// # Errors
     /// Returns [`SessionError`] when the session cannot be created.
-    pub fn create_session(&mut self) -> Result<&Session, SessionError> {
-        self.create_session_with_model(None)
+    pub fn create_session(&mut self, id: SessionId) -> Result<&Session, SessionError> {
+        self.create_session_with_model(id, None)
     }
 
-    /// Create a new session with a specific model in the current profile.
+    /// Create a new session named `id` with a specific model in the current
+    /// profile.
     ///
     /// # Errors
     /// Returns [`SessionError`] when the session cannot be created.
     pub fn create_session_with_model(
         &mut self,
+        id: SessionId,
         model: Option<String>,
     ) -> Result<&Session, SessionError> {
-        self.create_session_in_profile(model, self.current_profile_id.clone())
+        self.create_session_in_profile(id, model, self.current_profile_id.clone())
     }
 
-    /// Create a new session with a specific model and profile.
+    /// Create a new session named `id`, which
+    /// [`issue_session_name`](Self::issue_session_name) issued, with a
+    /// specific model and profile.
     ///
     /// # Errors
     /// Returns [`SessionError`] when the session cannot be created.
@@ -572,11 +681,15 @@ impl SessionManager {
     /// Panics if the freshly created session cannot be retrieved (internal invariant).
     pub fn create_session_in_profile(
         &mut self,
+        id: SessionId,
         model: Option<String>,
         profile_id: Option<String>,
     ) -> Result<&Session, SessionError> {
-        let id = SessionId::new();
         let now = Timestamp::now();
+        let client_cwd = std::env::current_dir()?;
+        let launch = self.once.take().unwrap_or_else(|| self.launch.clone());
+        let cwd = launch.cwd(&client_cwd);
+        let repo = launch.repo();
 
         // Don't create directories yet - defer until first message
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
@@ -590,12 +703,42 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             persisted: false,
-            repo: self.pending_repo.take(),
+            repo,
+            cwd,
+            events_cursor: None,
+            cloud: None,
+            suspended: false,
         };
 
         self.current = Some(session);
         // SAFETY: We just set `self.current` to `Some` above.
         Ok(self.current.as_ref().expect("just assigned"))
+    }
+
+    /// Makes the current session, not yet persisted, run entirely on a
+    /// cloud machine of `machine_type`; persisting it creates the machine.
+    ///
+    /// # Errors
+    /// [`SessionError::NoActiveSession`] when no session is active or the
+    /// current one is already persisted: a session's home environment is
+    /// chosen when it starts.
+    pub fn run_in_cloud(&mut self, machine_type: String) -> Result<(), SessionError> {
+        let session = self
+            .current
+            .as_mut()
+            .filter(|session| !session.persisted)
+            .ok_or(SessionError::NoActiveSession)?;
+        session.cloud = Some(machine_type);
+        Ok(())
+    }
+
+    /// The repository spec and directory the current session starts with,
+    /// which pick a cloud session's repository.
+    #[must_use]
+    pub fn launch_place(&self) -> (Option<String>, Option<PathBuf>) {
+        self.current.as_ref().map_or((None, None), |session| {
+            (session.repo.clone(), session.cwd.clone())
+        })
     }
 
     /// Ensure current session is persisted to disk and database.
@@ -604,7 +747,7 @@ impl SessionManager {
     /// # Errors
     /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn ensure_persisted(&mut self) -> Result<(), SessionError> {
-        let (session_id, _title, model, profile_id, already_persisted) = {
+        let (session_id, _title, model, profile_id, already_persisted, cwd) = {
             let session = self.current.as_ref().ok_or(SessionError::NoActiveSession)?;
             (
                 session.id.as_str().to_string(),
@@ -612,14 +755,26 @@ impl SessionManager {
                 session.model.clone(),
                 session.profile_id.clone(),
                 session.persisted,
+                session.cwd.clone(),
             )
         };
 
         if !already_persisted {
             // The session works where this client runs, not where the
-            // daemon happened to be started.
-            let cwd = std::env::current_dir()?;
+            // daemon happened to be started; a repo-less chat or a GitHub
+            // start works in neither. A cloud session works in its
+            // codespace, created from the checkout's GitHub repository.
             // The daemon creates the session's row and directory layout.
+            let repo = self.current.as_ref().and_then(|s| s.repo.clone());
+            let cloud = self.current.as_ref().and_then(|s| s.cloud.clone());
+            let repo = match &cloud {
+                Some(_) => {
+                    let cwd = cwd.clone();
+                    blocking::unblock(move || cloud_repository(repo.as_deref(), cwd.as_deref()))
+                        .await
+                }
+                None => repo,
+            };
             let _: crate::client::WireSession = self
                 .daemon()?
                 .post(
@@ -628,8 +783,11 @@ impl SessionManager {
                         id: Some(session_id.clone()),
                         model: model.clone(),
                         profile_id: profile_id.clone(),
-                        cwd: Some(cwd.display().to_string()),
-                        repo: self.current.as_ref().and_then(|s| s.repo.clone()),
+                        cwd: cwd.map(|cwd| cwd.display().to_string()),
+                        repo,
+                        cloud: cloud.map(|machine_type| {
+                            crate::daemon::types::CloudSessionRequest { machine_type }
+                        }),
                     },
                 )
                 .await?;
@@ -660,10 +818,13 @@ impl SessionManager {
         let Some(session_id) = self.current.as_ref().map(|session| session.id.clone()) else {
             return Ok(());
         };
-        let messages: Vec<ChatMessage> = self
-            .daemon()?
-            .get(&format!("/api/sessions/{}/history", session_id.as_str()))
-            .await?;
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(
+            &self
+                .daemon()?
+                .get_transcript(session_id.as_str())
+                .await?
+                .entries,
+        );
         if let Some(session) = self.current.as_mut()
             && session.id == session_id
         {
@@ -682,9 +843,14 @@ impl SessionManager {
     /// which cannot happen given the immediately preceding assignment.
     pub async fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
         let daemon = self.daemon()?;
-        let api = daemon
+        let api = match daemon
             .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
-            .await?;
+            .await
+        {
+            Ok(api) => api,
+            Err(error) if error.is_suspended() => return Ok(self.suspended_session(id)),
+            Err(error) => return Err(error.into()),
+        };
 
         let title = Some(api.title.clone()).filter(|t| t != "New Chat");
         let model = Some(api.model.clone()).filter(|m| !m.is_empty());
@@ -696,9 +862,12 @@ impl SessionManager {
             .unwrap_or_else(|_| Timestamp::now());
         let created_at = updated_at;
 
-        let messages: Vec<ChatMessage> = daemon
-            .get(&format!("/api/sessions/{}/history", id.as_str()))
-            .await?;
+        let transcript = match daemon.get_transcript(id.as_str()).await {
+            Ok(transcript) => transcript,
+            Err(error) if error.is_suspended() => return Ok(self.suspended_session(id)),
+            Err(error) => return Err(error.into()),
+        };
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(&transcript.entries);
         let history = ChatHistory::default();
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
@@ -712,10 +881,36 @@ impl SessionManager {
             updated_at,
             persisted: true,
             repo: None,
+            cwd: None,
+            events_cursor: api.cursor,
+            cloud: None,
+            suspended: false,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 
         Ok(self.current.as_ref().expect("just assigned"))
+    }
+
+    /// `id`, a cloud session whose codespace is suspended, as current: what
+    /// it holds is the codespace daemon's to tell once a message starts it.
+    fn suspended_session(&mut self, id: &SessionId) -> &Session {
+        let now = Timestamp::now();
+        self.current.insert(Session {
+            id: id.clone(),
+            title: None,
+            model: None,
+            profile_id: None,
+            history: ChatHistory::default(),
+            sandbox_dir: self.store.sandbox_dir(id.as_str(), None),
+            created_at: now,
+            updated_at: now,
+            persisted: true,
+            repo: None,
+            cwd: None,
+            events_cursor: None,
+            cloud: None,
+            suspended: true,
+        })
     }
 
     /// The profile a persisted session belongs to, read from the daemon
@@ -745,6 +940,10 @@ impl SessionManager {
     /// [`SessionError::NotFound`] when `prompt_index` does not point at a
     /// user message or the persisted rows diverge from the in-memory
     /// history, or [`SessionError`] on persistence failure.
+    ///
+    /// # Panics
+    /// Panics when the stored user row lacks its id; persisted history
+    /// rows always carry it.
     pub async fn rewind_to_prompt(
         &mut self,
         prompt_index: usize,
@@ -773,10 +972,14 @@ impl SessionManager {
             cut -= 1;
         }
 
+        let entry_id = session.history.messages()[prompt_index]
+            .id
+            .expect("stored rows carry their id")
+            .to_string();
         let user_message_id: i64 = daemon
             .post(
-                &format!("/api/sessions/{session_id}/rewind"),
-                &crate::client::RewindRequest { index: cut },
+                &format!("/api/sessions/{session_id}/actions/rewind"),
+                &crate::client::RewindRequest { entry_id },
             )
             .await?;
         session.history.messages_mut().truncate(cut);
@@ -832,7 +1035,7 @@ impl SessionManager {
         session.history.metadata.title = Some(title.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     title: Some(title),
@@ -856,7 +1059,7 @@ impl SessionManager {
         session.history.metadata.model = Some(model.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     model: Some(model),
@@ -912,5 +1115,89 @@ impl SessionManager {
             .delete(&format!("/api/sessions/{id}"))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    async fn manager() -> (tempfile::TempDir, SessionManager) {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::at(tmp.path().join("may")).await.unwrap();
+        (tmp, manager)
+    }
+
+    #[test]
+    fn a_launch_decides_the_directory_a_session_works_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = Path::new("/work/client");
+        assert_eq!(
+            SessionLaunch::Checkout.cwd(client),
+            Some(client.to_path_buf())
+        );
+        assert_eq!(SessionLaunch::RepoLess.cwd(client), None);
+        // `owner/repo` needs no checkout.
+        assert_eq!(SessionLaunch::Repo("acme/app".into()).cwd(client), None);
+        let path = tmp.path().canonicalize().unwrap();
+        assert_eq!(
+            SessionLaunch::Repo(path.display().to_string()).cwd(client),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn a_launch_sends_the_daemon_a_canonical_path_or_the_repository_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let dotted = path.join("inner").join("..");
+        std::fs::create_dir(path.join("inner")).unwrap();
+        assert_eq!(
+            SessionLaunch::Repo(dotted.display().to_string()).repo(),
+            Some(path.display().to_string())
+        );
+        assert_eq!(
+            SessionLaunch::Repo("acme/app".into()).repo(),
+            Some("acme/app".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repo_less_launch_creates_sessions_with_no_directory_or_repository() {
+        let (_tmp, mut manager) = manager().await;
+        manager.set_launch(SessionLaunch::RepoLess);
+        for name in ["amber-river", "cedar-stone"] {
+            let session = manager
+                .create_session(SessionId::from_string(name))
+                .unwrap();
+            assert_eq!(session.cwd, None);
+            assert_eq!(session.repo, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repo_start_binds_one_session_and_then_gives_way() {
+        let (_tmp, mut manager) = manager().await;
+        manager.set_launch(SessionLaunch::RepoLess);
+        manager.set_launch(SessionLaunch::Repo("acme/app".into()));
+        let first = manager
+            .create_session(SessionId::from_string("amber-river"))
+            .unwrap();
+        assert_eq!(first.repo.as_deref(), Some("acme/app"));
+        assert_eq!(first.cwd, None);
+        let second = manager
+            .create_session(SessionId::from_string("cedar-stone"))
+            .unwrap();
+        assert_eq!(second.repo, None);
+        assert_eq!(second.cwd, None, "the repo-less launch resumes");
+    }
+
+    #[tokio::test]
+    async fn the_default_launch_works_in_the_clients_directory() {
+        let (_tmp, mut manager) = manager().await;
+        let session = manager
+            .create_session(SessionId::from_string("amber-river"))
+            .unwrap();
+        assert_eq!(session.cwd, Some(std::env::current_dir().unwrap()));
     }
 }

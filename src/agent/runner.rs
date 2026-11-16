@@ -21,13 +21,14 @@
 use std::future::Future;
 use std::ops::ControlFlow;
 
-use aither_agent::{CompactResult, TimedEvent};
+use aither_agent::{AgentEvent, CompactResult, TimedEvent};
 use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
 
 use crate::MayAgent;
-use crate::agent::{ContextDump, ContextReport, ModelSlot};
+use crate::agent::{CompactionReporter, ContextDump, ContextReport, ModelSlot};
+use crate::client::CompactionPhase;
 use crate::db::{ChatDb, RunFence};
 use crate::session::{CancelReason, RunOutcome, SessionRunGuard, SessionRuns};
 
@@ -68,6 +69,21 @@ pub enum TuiEvent {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
+    /// The daemon read a terminal call's script; sent right after the
+    /// call's `ToolCallStart`.
+    ToolReading {
+        /// The call the reading belongs to.
+        call_id: String,
+        /// How the daemon read the call's script.
+        reading: crate::command_reading::CommandReading,
+    },
+    /// The card of a terminal call that ran one of May's commands changed.
+    ToolCard {
+        /// The call the card belongs to.
+        call_id: String,
+        /// The card; absent when the call has none and shows as a command row.
+        card: Option<crate::command_reading::Card>,
+    },
     /// The daemon parked the run.
     Hold {
         /// What the run waits for.
@@ -78,6 +94,29 @@ pub enum TuiEvent {
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
     Retract,
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it, marked as translated.
+    ReplyTranslated {
+        /// The reply translated into the communication language.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
+    },
+    /// The daemon withdrew the turn: it was stopped before any tool call or
+    /// response text, so its message left the conversation.
+    Withdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
+    /// The user declined, at the session's repository question, to work
+    /// where the session starts: the turn did not run, and nothing failed.
+    Declined(String),
+    /// The daemon ended the turn because its agent kept looping after the
+    /// alert; the message says which loop. The session takes the next
+    /// message, but what the turn was asked for was not carried out.
+    LoopStopped(String),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -176,15 +215,15 @@ pub(crate) enum WorkerCommand {
 pub struct AgentWorker {
     /// Sender for commands to the worker.
     command_tx: Sender<WorkerCommand>,
-    /// Background-job registry shared with the session's terminal tool;
-    /// `None` when the agent runs in the daemon.
-    job_registry: Option<aither_sandbox::JobRegistry>,
+    /// The session's background jobs, shared with its shell; `None` when the
+    /// agent runs in the daemon.
+    jobs: Option<aither_sandbox::Jobs>,
     /// Registry of in-flight `subagent` command runs; `None` when the agent
     /// runs in the daemon.
-    subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
+    subagent_runs: Option<aither_agent::SubagentRuns>,
     /// The agent's own language guard; `None` when the agent runs in the
     /// daemon.
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     /// The agent's prompt-cache entry; `None` when the agent runs in the
     /// daemon.
     warmth: Option<aither_agent::CacheWarmth>,
@@ -393,15 +432,15 @@ impl AgentWorker {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
     }
 
-    /// Registry of background terminal jobs for this worker's session.
+    /// The background terminal jobs of this worker's session.
     #[must_use]
-    pub const fn job_registry(&self) -> Option<&aither_sandbox::JobRegistry> {
-        self.job_registry.as_ref()
+    pub const fn jobs(&self) -> Option<&aither_sandbox::Jobs> {
+        self.jobs.as_ref()
     }
 
     /// Registry of in-flight subagent runs — list or cancel them.
     #[must_use]
-    pub const fn subagent_runs(&self) -> Option<&aither_agent::specialized::SubagentRuns> {
+    pub const fn subagent_runs(&self) -> Option<&aither_agent::SubagentRuns> {
         self.subagent_runs.as_ref()
     }
 
@@ -440,7 +479,7 @@ impl AgentWorker {
     /// The communication and working languages the agent was configured
     /// with.
     #[must_use]
-    pub fn languages(&self) -> Option<aither_agent::Languages> {
+    pub fn languages(&self) -> Option<crate::harness::language::Languages> {
         self.languages.as_ref().map(|guard| *guard.languages())
     }
 
@@ -459,7 +498,7 @@ impl AgentWorker {
     ) -> Self {
         Self {
             command_tx,
-            job_registry: None,
+            jobs: None,
             subagent_runs: None,
             languages: None,
             warmth: None,
@@ -540,7 +579,7 @@ pub fn spawn_worker<E: Executor + 'static>(
     snapshot_db: ChatDb,
     runs: SessionRuns,
 ) -> AgentWorker {
-    spawn_idle_worker(executor, agent, snapshot_db, runs, None)
+    spawn_idle_worker(executor, agent, snapshot_db, runs, None, None)
 }
 
 /// Where an idle worker reports the background commands its earlier runs
@@ -548,7 +587,7 @@ pub fn spawn_worker<E: Executor + 'static>(
 #[derive(Debug)]
 pub struct BackgroundWakes {
     /// Receives each wake that needs the model.
-    pub wakes: Sender<aither_agent::BackgroundWake>,
+    pub wakes: Sender<super::BackgroundWake>,
     /// The worker starts waiting on background commands once this fires.
     pub released: crate::session::RunReleased,
 }
@@ -562,9 +601,10 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     snapshot_db: ChatDb,
     runs: SessionRuns,
     background_wakes: Option<BackgroundWakes>,
+    compactions: Option<Sender<CompactionPhase>>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
-    let job_registry = agent.job_registry();
+    let jobs = agent.jobs();
     let subagent_runs = agent.subagent_runs();
     let languages = agent.language_guard();
     let warmth = agent.cache_warmth();
@@ -578,12 +618,13 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
             snapshot_db,
             runs,
             background_wakes,
+            compactions,
         ))
         .detach();
 
     AgentWorker {
         command_tx,
-        job_registry: Some(job_registry),
+        jobs: Some(jobs),
         subagent_runs: Some(subagent_runs),
         languages: Some(languages),
         warmth: Some(warmth),
@@ -601,7 +642,13 @@ async fn run_worker(
     snapshot_db: ChatDb,
     runs: SessionRuns,
     background_wakes: Option<BackgroundWakes>,
+    compactions: Option<Sender<CompactionPhase>>,
 ) {
+    let reporter = || {
+        compactions
+            .clone()
+            .map_or_else(CompactionReporter::silent, CompactionReporter::new)
+    };
     loop {
         // Wait for a command; an idle session is compacted on the way, and
         // its detached background commands are collected.
@@ -611,6 +658,7 @@ async fn run_worker(
             &snapshot_db,
             &runs,
             background_wakes.as_ref(),
+            &reporter,
         )
         .await
         else {
@@ -638,6 +686,7 @@ async fn run_worker(
                     &command_rx,
                     &command_tx,
                     &event_tx,
+                    &reporter(),
                 ))
                 .await;
                 if matches!(outcome, WorkOutcome::Shutdown) {
@@ -655,7 +704,10 @@ async fn run_worker(
                     }
                 };
                 let outcome = race_against_commands(
-                    until_stopped(agent.compact(focus.as_deref()), guard.cancellation()),
+                    until_stopped(
+                        agent.compact_reporting(focus.as_deref(), &reporter()),
+                        guard.cancellation(),
+                    ),
                     &command_rx,
                     &command_tx,
                 )
@@ -743,9 +795,18 @@ async fn next_command(
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
     background_wakes: Option<&BackgroundWakes>,
+    reporter: &(dyn Fn() -> CompactionReporter + Sync),
 ) -> Option<WorkerCommand> {
+    // A refresh that failed is not retried until the next command, so a
+    // provider that refuses them is not asked again at once.
+    let mut keep_warm_failed = false;
     loop {
         let compaction_due_in = agent.idle_compaction_due_in();
+        let keep_warm_due_in = if keep_warm_failed {
+            None
+        } else {
+            agent.keep_warm_due_in().await
+        };
         let step = futures_lite::future::or(
             async { IdleStep::Command(command_rx.recv().await.ok()) },
             futures_lite::future::or(
@@ -758,34 +819,60 @@ async fn next_command(
                         None => std::future::pending().await,
                     }
                 },
-                async {
-                    match background_wakes {
-                        Some(background) => {
-                            // A job finishing before the run that parked the
-                            // agent released the session would wake a host
-                            // that finds the session held.
-                            background.released.wait().await;
-                            IdleStep::Background(agent.wait_background().await)
+                futures_lite::future::or(
+                    async {
+                        match keep_warm_due_in {
+                            Some(due_in) => {
+                                async_io::Timer::after(due_in).await;
+                                IdleStep::KeepWarm
+                            }
+                            None => std::future::pending().await,
                         }
-                        None => std::future::pending().await,
-                    }
-                },
+                    },
+                    async {
+                        match background_wakes {
+                            Some(background) => {
+                                // A job finishing before the run that parked the
+                                // agent released the session would wake a host
+                                // that finds the session held.
+                                background.released.wait().await;
+                                IdleStep::Background(agent.wait_background().await)
+                            }
+                            None => std::future::pending().await,
+                        }
+                    },
+                ),
             ),
         )
         .await;
         match step {
             IdleStep::Command(command) => return command,
+            IdleStep::KeepWarm => match crate::panic_boundary::round(
+                "keep warm",
+                keep_warm_idle(agent, command_rx, runs),
+            )
+            .await
+            .unwrap_or(KeepWarmOutcome::Failed)
+            {
+                KeepWarmOutcome::Refreshed | KeepWarmOutcome::NotDue => {}
+                KeepWarmOutcome::Failed => keep_warm_failed = true,
+                KeepWarmOutcome::Command(command) => return command,
+            },
             IdleStep::Background(wake) => {
                 // The wake is recorded in the agent's context; a wake that
-                // needs the model asks the host for a run.
-                if wake.needs_model
+                // starts a run asks the host for one.
+                if wake.starts_run
                     && let Some(background) = background_wakes
                 {
                     let _ = background.wakes.try_send(wake);
                 }
+                // A wake that starts nothing drops its completions here: the
+                // agent has them in its context, and they are taken.
             }
             IdleStep::Compact => {
-                if let Some(command) = compact_idle(agent, command_rx, snapshot_db, runs).await {
+                if let Some(command) =
+                    compact_idle(agent, command_rx, snapshot_db, runs, &reporter()).await
+                {
                     return command;
                 }
             }
@@ -799,8 +886,67 @@ enum IdleStep {
     Command(Option<WorkerCommand>),
     /// The idle compaction is due.
     Compact,
+    /// The prompt-cache refresh is due.
+    KeepWarm,
     /// A detached background command finished or raised an alert.
-    Background(aither_agent::BackgroundWake),
+    Background(super::BackgroundWake),
+}
+
+/// How one idle refresh of the prompt cache ended.
+enum KeepWarmOutcome {
+    /// A refresh was sent and its usage recorded.
+    Refreshed,
+    /// The refresh was no longer due when its time came: the background
+    /// command that called for it had ended, or a request restarted the
+    /// cache entry.
+    NotDue,
+    /// The provider refused the refresh; none is retried until the next
+    /// command.
+    Failed,
+    /// A command arrived meanwhile, or `None` when the channel closed; the
+    /// refresh was dropped where it stood.
+    Command(Option<WorkerCommand>),
+}
+
+/// Sends the idle agent's prompt-cache refresh and records its usage with
+/// the session's. The refresh leaves the conversation untouched, so it needs
+/// no run of its own; a command arriving meanwhile drops it.
+async fn keep_warm_idle(
+    agent: &mut MayAgent,
+    command_rx: &Receiver<WorkerCommand>,
+    runs: &SessionRuns,
+) -> KeepWarmOutcome {
+    // The decision is taken again now: the command that called for the
+    // refresh may have ended since it was scheduled.
+    if agent.keep_warm_due_in().await != Some(std::time::Duration::ZERO) {
+        return KeepWarmOutcome::NotDue;
+    }
+    let started = std::time::Instant::now();
+    let refresh = futures_lite::future::or(async { Ok(agent.keep_cache_warm().await) }, async {
+        Err(command_rx.recv().await.ok())
+    })
+    .await;
+    let usage = match refresh {
+        Err(command) => return KeepWarmOutcome::Command(command),
+        Ok(Ok(Some(usage))) => usage,
+        Ok(Ok(None)) => return KeepWarmOutcome::NotDue,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to refresh the idle prompt cache");
+            return KeepWarmOutcome::Failed;
+        }
+    };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let entry = crate::daemon::types::RequestLogEntry::new(
+        agent.session_id().as_str(),
+        &agent.model_selector().to_string(),
+        agent.provider_id(),
+        &usage,
+        agent.model_context_window(),
+    )
+    .success(elapsed_ms)
+    .keep_warm();
+    runs.record_keep_warm_request(entry).await;
+    KeepWarmOutcome::Refreshed
 }
 
 /// Compacts the idle session as a run of its own. `Some` is a command that
@@ -811,6 +957,7 @@ async fn compact_idle(
     command_rx: &Receiver<WorkerCommand>,
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
+    reporter: &CompactionReporter,
 ) -> Option<Option<WorkerCommand>> {
     // The compaction rewrites the session's context, so it runs as a run
     // of its own; a session another process is running is left alone.
@@ -823,7 +970,13 @@ async fn compact_idle(
         }
     };
     let compaction = futures_lite::future::or(
-        async { Ok(until_stopped(agent.compact_when_idle(), guard.cancellation()).await) },
+        async {
+            Ok(until_stopped(
+                agent.compact_when_idle_reporting(reporter),
+                guard.cancellation(),
+            )
+            .await)
+        },
         async { Err(command_rx.recv().await.ok()) },
     )
     .await;
@@ -979,6 +1132,7 @@ async fn run_agent_prompt(
     command_rx: &Receiver<WorkerCommand>,
     command_tx: &Sender<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
+    reporter: &CompactionReporter,
 ) -> WorkOutcome<()> {
     let PromptRun {
         prompt,
@@ -988,24 +1142,44 @@ async fn run_agent_prompt(
     } = run;
     agent.sync_runtime_context().await;
     let run = agent.run_with_hidden_context(&prompt, hidden_context.as_deref(), attachments);
+    let checkpoints = run.checkpoints();
+    let fence = &lease.fence;
     // The run stops between events on the lease's cancellation; a cancel
-    // command drops it where it stands.
+    // command drops it where it stands. Each checkpoint the run records is
+    // persisted before the event reaches the TUI, which releases the lease on
+    // `Complete`: a snapshot written after that would be refused.
     let driven = run.drive(
         event_tx,
         async {
             let _ = lease.cancellation.recv().await;
             PromptStop::Stopped
         },
-        |event_tx, timed| async move {
-            if event_tx.send(TuiEvent::Agent(Ok(timed))).await.is_err() {
-                ControlFlow::Break(PromptStop::ReceiverGone)
-            } else {
-                ControlFlow::Continue(event_tx)
+        |event_tx, timed| {
+            let checkpoints = &checkpoints;
+            async move {
+                if matches!(timed.event, AgentEvent::Checkpoint { .. })
+                    && let Err(error) =
+                        crate::session::persist_run_checkpoint(snapshot_db, fence, checkpoints)
+                            .await
+                {
+                    tracing::warn!(session_id = %fence.session_id, %error, "failed to persist the context snapshot");
+                }
+                if event_tx.send(TuiEvent::Agent(Ok(timed))).await.is_err() {
+                    ControlFlow::Break(PromptStop::ReceiverGone)
+                } else {
+                    ControlFlow::Continue(event_tx)
+                }
             }
         },
     );
     match race_against_commands(driven, command_rx, command_tx).await {
-        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {}
+        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {
+            // The `compact` tool ended the turn for a compaction: it runs
+            // before the lease is released, so its snapshot is accepted.
+            if let Err(error) = agent.compact_requested(snapshot_db, fence, reporter).await {
+                tracing::error!(session_id = %fence.session_id, %error, "the requested compaction failed");
+            }
+        }
         WorkOutcome::Finished(Err(error)) => {
             let _ = event_tx.send(TuiEvent::Agent(Err(error))).await;
         }
@@ -1015,6 +1189,9 @@ async fn run_agent_prompt(
         }
         WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::Stopped)))
         | WorkOutcome::Cancelled => {
+            // The user stopped the run: background completions wait for
+            // their next input.
+            agent.interrupt();
             // Completion after cancel lets the TUI know processing stopped.
             let _ = event_tx.send(TuiEvent::Complete).await;
             return WorkOutcome::Cancelled;
@@ -1024,7 +1201,6 @@ async fn run_agent_prompt(
             return WorkOutcome::Shutdown;
         }
     }
-    persist_snapshot(snapshot_db, &lease.fence, agent).await;
     let _ = event_tx.send(TuiEvent::Complete).await;
     WorkOutcome::Finished(())
 }
@@ -1066,7 +1242,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1087,11 +1263,19 @@ mod tests {
                         .next()
                         .is_some_and(|line| line.contains("/models"))
                     {
-                        let _ = socket
-                            .write_all(
-                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                            )
-                            .await;
+                        let body = serde_json::json!({
+                            "data": [{
+                                "id": crate::agent::idle_compaction_tests::SESSION_MODEL,
+                                "owned_by": "stub",
+                                "context_length": 128_000
+                            }]
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
                         return;
                     }
                     let _ = request_tx.send(()).await;
@@ -1101,24 +1285,20 @@ mod tests {
             }
         });
 
-        let llm = crate::agent::ModelSlot::new(
-            crate::agent::RedactedModel::new(
-                aither_cloud::CloudProvider::OpenAI(
-                    aither_cloud::openai::OpenAI::builder("test-key")
-                        .base_url(format!("http://{addr}"))
-                        .model("gpt-5")
-                        .no_retry()
-                        .build(),
-                ),
-                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
-            ),
-            aither_core::llm::model::Parameters::default(),
-        );
-        let (mut agent, temp) = crate::agent::may::test_agent(llm, "openai", "gpt-5").await;
+        let server = crate::agent::idle_compaction_tests::StubModel {
+            base_url: format!("http://{addr}"),
+            requests: std::sync::Arc::default(),
+        };
+        let session = crate::agent::idle_compaction_tests::Session::start(
+            &crate::agent::idle_compaction_tests::saved_config(&server, None),
+        )
+        .await;
+        let temp = session.temp.path().to_path_buf();
+        let mut agent = session.agent;
         agent.push_message(aither_core::llm::Message::user("first turn"));
         agent.push_message(aither_core::llm::Message::assistant("first answer"));
 
-        let db = crate::db::ChatDb::open(&temp.path().join("worker.db"))
+        let db = crate::db::ChatDb::open(&temp.join("worker.db"))
             .await
             .expect("open worker db");
         let runs =

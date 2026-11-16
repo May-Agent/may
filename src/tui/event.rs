@@ -67,6 +67,24 @@ pub enum AppEvent {
     /// Background config save completed.
     ConfigSaved(Result<(), TuiError>),
 
+    /// An `/ssh add` probe finished; the error is the probe's message.
+    SshProbed {
+        /// The name the server was added under.
+        name: String,
+        /// The probed server, or why it could not be reached.
+        result: Result<crate::config::SshServerConfig, String>,
+    },
+
+    /// A `/cloud` change finished: the updated profile, or why it failed.
+    CloudConfigured(Result<ProfileInfo, String>),
+
+    /// The machine types a cloud session may start on, or why they could
+    /// not be listed.
+    CloudCatalog(Result<Vec<crate::cloud::MachineType>, String>),
+
+    /// A step of bringing the current cloud session's machine up.
+    CloudSession(crate::daemon::types::CloudSessionEvent),
+
     /// The session's stored reasoning effort arrived from the daemon.
     EffortLoaded(Option<String>),
     /// A `/effort` update finished; Ok carries the applied token.
@@ -99,6 +117,8 @@ pub enum AppEvent {
         /// PR list entries.
         prs: Vec<crate::client::WirePr>,
     },
+    /// Daemon announced on `/api/events` (`topic = "prs"`) that PRs changed.
+    PrsInvalidated,
     /// Lookups of issues the session's tasks link.
     SidebarIssues {
         /// Session the tasks belong to.
@@ -129,11 +149,22 @@ pub enum AppEvent {
         /// Row id of the user message the turn answers.
         message_id: i32,
     },
+    /// The daemon withdrew the latest turn: it was stopped before any tool
+    /// call or response text, so its message left the conversation.
+    TurnWithdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
     /// The user's global sleep state, from the `sleep` event.
     Sleep(crate::sleep::SleepStatus),
+    /// A popup of some session waits on the user, from the
+    /// `user_notification` event.
+    UserNotification(Box<crate::notification::UserNotification>),
     /// A `session_suggestion` frame arrived: `text` is the new ghost text,
     /// `None` clears it.
     PromptSuggestion {
@@ -156,6 +187,37 @@ pub enum AppEvent {
         /// The suggested next step, when the recap named one.
         next_action: Option<String>,
     },
+    /// A card changed after the turn that ran its command ended (a question
+    /// answered, a detached run finished).
+    ToolCard {
+        /// The call the card belongs to.
+        call_id: String,
+        /// The card; absent when the call shows as a command row.
+        card: Option<crate::command_reading::Card>,
+    },
+    /// A `session_warning` frame arrived: shown to the user in the stream.
+    Warning {
+        /// Session the warning belongs to.
+        session_id: String,
+        /// The warning text.
+        message: String,
+    },
+    /// A usage frame carried the context window the daemon resolved for the
+    /// session's model.
+    ContextWindow {
+        /// Session the window belongs to.
+        session_id: String,
+        /// The window in tokens.
+        window: u32,
+    },
+    /// A `session_compaction` frame arrived: the session's compaction
+    /// started or ended.
+    Compaction {
+        /// Session being compacted.
+        session_id: String,
+        /// Where the compaction stands.
+        phase: crate::client::CompactionPhase,
+    },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -167,8 +229,8 @@ pub enum AppEvent {
     JobDetailLoaded {
         /// Refreshed job info, when the pid still exists.
         job: Option<aither_sandbox::JobInfo>,
-        /// Buffered `(stdout, stderr)`, when the registry still serves it.
-        output: Option<(Vec<u8>, Vec<u8>)>,
+        /// Buffered output, when the registry still serves it.
+        output: Option<Vec<u8>>,
     },
     /// Incremental terminal-output poll for running tool calls.
     TerminalOutputs(Vec<TerminalOutputDelta>),
@@ -180,6 +242,12 @@ pub enum AppEvent {
     BtwFinished,
     /// The `/btw` request failed.
     BtwFailed(String),
+
+    // ─── /progress ─────────────────────────────────────────────────
+    /// The `/progress` report arrived.
+    ProgressLoaded(crate::daemon::ProgressReport),
+    /// The `/progress` request failed.
+    ProgressFailed(String),
 
     // ─── bash mode / secrets ───────────────────────────────────────
     /// A bash-mode command finished; output is already masked.
@@ -215,27 +283,40 @@ impl AppEvent {
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ProfileSessionsPushed(_) => "profile_sessions_pushed",
             Self::ConfigSaved(_) => "config_saved",
+            Self::SshProbed { .. } => "ssh_probed",
+            Self::CloudConfigured(_) => "cloud_configured",
+            Self::CloudCatalog(_) => "cloud_catalog",
+            Self::CloudSession(_) => "cloud_session",
             Self::EffortLoaded(_) => "effort_loaded",
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",
             Self::SidebarTasks { .. } => "sidebar_tasks",
             Self::SidebarPrs { .. } => "sidebar_prs",
+            Self::PrsInvalidated => "prs_invalidated",
             Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
             Self::SessionRuntime(_) => "session_runtime",
             Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
             Self::Sleep(_) => "sleep",
+            Self::UserNotification(_) => "user_notification",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
+            Self::ToolCard { .. } => "tool_card",
+            Self::Warning { .. } => "warning",
+            Self::ContextWindow { .. } => "context_window",
+            Self::Compaction { .. } => "compaction",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",
             Self::BtwDelta(_) => "btw_delta",
             Self::BtwFinished => "btw_finished",
             Self::BtwFailed(_) => "btw_failed",
+            Self::ProgressLoaded(_) => "progress_loaded",
+            Self::ProgressFailed(_) => "progress_failed",
             Self::BashFinished(_) => "bash_finished",
             Self::SecretStored { .. } => "secret_stored",
         }

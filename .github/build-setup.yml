@@ -1,0 +1,5 @@
+- name: Install bun
+  uses: ./.github/actions/install-bun
+- name: Install nasm
+  if: runner.os == 'Linux' && runner.arch == 'X64'
+  uses: ./.github/actions/install-nasm

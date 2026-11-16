@@ -14,7 +14,7 @@ use std::fmt;
 use std::num::NonZeroU16;
 use std::path::Path;
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use linkify::{LinkFinder, LinkKind};
 use ratatui::buffer::{Buffer, CellDiffOption};
 #[cfg(test)]
@@ -177,27 +177,39 @@ pub fn mark_lines(lines: &[Line<'static>]) -> Option<(Vec<Line<'static>>, Vec<St
     let mut targets: Vec<String> = Vec::new();
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let found = if text.contains('/') {
-            detect(&text)
-        } else {
-            Vec::new()
-        };
-        if found.is_empty() {
-            out.push(line.clone());
-            continue;
-        }
         let first = u32::try_from(targets.len()).expect("link count fits the marker space");
-        targets.extend(found.iter().map(|link| link.uri.clone()));
-        let mut marked = line.clone();
-        marked.spans = tag_spans(&line.spans, &found, first);
-        out.push(marked);
+        out.push(mark_line(line, first).map_or_else(
+            || line.clone(),
+            |(marked, found)| {
+                targets.extend(found);
+                marked
+            },
+        ));
     }
     (!targets.is_empty()).then_some((out, targets))
+}
+
+/// Copy of `line` with its links tagged, and their targets.
+///
+/// Links are tagged by [`marker`], numbered from `first`; `None` when the
+/// line holds no link.
+#[must_use]
+pub fn mark_line(line: &Line<'static>, first: u32) -> Option<(Line<'static>, Vec<String>)> {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    if !text.contains('/') {
+        return None;
+    }
+    let found = detect(&text);
+    if found.is_empty() {
+        return None;
+    }
+    let mut marked = line.clone();
+    marked.spans = tag_spans(&line.spans, &found, first);
+    Some((marked, found.into_iter().map(|link| link.uri).collect()))
 }
 
 /// Split `spans` at the link boundaries and tag the link parts.
@@ -319,6 +331,35 @@ pub struct LinkHit {
     pub id: LinkId,
     /// Its target.
     pub uri: String,
+}
+
+impl LinkHit {
+    /// The target as the status bar shows it: a `file://` URI displays as
+    /// its decoded path with the user home collapsed to `~`, like the cwd
+    /// label; any other target shows as-is.
+    #[must_use]
+    pub fn display(&self) -> String {
+        let Ok(url) = Url::parse(&self.uri) else {
+            return self.uri.clone();
+        };
+        if url.scheme() != "file" {
+            return self.uri.clone();
+        }
+        let Ok(path) = url.to_file_path() else {
+            return self.uri.clone();
+        };
+        dirs::home_dir()
+            .and_then(|home| {
+                path.strip_prefix(home).ok().map(|rest| {
+                    if rest.as_os_str().is_empty() {
+                        "~".to_string()
+                    } else {
+                        format!("~/{}", rest.display())
+                    }
+                })
+            })
+            .unwrap_or_else(|| path.display().to_string())
+    }
 }
 
 /// A link run located on screen.
@@ -444,6 +485,28 @@ pub fn dispatch_click(opener: &dyn LinkOpener, mouse: &MouseEvent, hit: Option<&
         return false;
     };
     opener.open(&hit.uri);
+    true
+}
+
+/// Enter carrying an open modifier, asking to open the link under the
+/// pointer.
+///
+/// The Kitty keyboard flags the app pushes deliver it as `Enter` +
+/// `Ctrl`/`Cmd`. Returns whether the event was such a request — consumed
+/// whether or not a link is hovered, so a modified Enter never reaches
+/// the input handlers as a bare Enter.
+pub fn dispatch_enter(
+    opener: &dyn LinkOpener,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    hit: Option<&LinkHit>,
+) -> bool {
+    if code != KeyCode::Enter || !modifiers.intersects(OPEN_MODIFIERS) {
+        return false;
+    }
+    if let Some(hit) = hit {
+        opener.open(&hit.uri);
+    }
     true
 }
 
@@ -616,6 +679,65 @@ mod tests {
         );
         assert!(!dispatch_click(&opener, &event, None));
         assert!(opener.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enter_with_an_open_modifier_opens_the_hovered_link() {
+        for modifiers in [
+            KeyModifiers::SUPER,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ] {
+            let opener = Recorder::default();
+            assert!(dispatch_enter(
+                &opener,
+                KeyCode::Enter,
+                modifiers,
+                Some(&hit())
+            ));
+            assert_eq!(*opener.0.lock().unwrap(), vec!["https://example.com/"]);
+        }
+    }
+
+    #[test]
+    fn a_modified_enter_is_consumed_off_a_link_but_bare_enter_and_other_keys_are_not() {
+        let opener = Recorder::default();
+        assert!(dispatch_enter(
+            &opener,
+            KeyCode::Enter,
+            KeyModifiers::SUPER,
+            None
+        ));
+        assert!(!dispatch_enter(
+            &opener,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            Some(&hit())
+        ));
+        assert!(!dispatch_enter(
+            &opener,
+            KeyCode::Char('o'),
+            KeyModifiers::SUPER,
+            Some(&hit())
+        ));
+        assert!(opener.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_target_displays_as_its_path() {
+        let shown = |uri: &str| {
+            LinkHit {
+                id: LinkId { entry: 0, link: 0 },
+                uri: uri.into(),
+            }
+            .display()
+        };
+        assert_eq!(shown("file:///etc/hosts"), "/etc/hosts");
+        assert_eq!(shown("file:///tmp/a%20b"), "/tmp/a b");
+        assert_eq!(shown("https://example.com/x"), "https://example.com/x");
+        let under_home =
+            Url::from_file_path(dirs::home_dir().expect("home").join("notes.md")).unwrap();
+        assert_eq!(shown(under_home.as_str()), "~/notes.md");
     }
 
     #[test]

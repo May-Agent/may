@@ -5,9 +5,25 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use super::super::state::{
     AppMode, ConfigEditMode, ConfigSection, ConfigTextTarget, detect_api_key_from_env,
 };
-use super::{App, SendAction, char_to_byte_index};
+use super::{App, SendAction};
 use crate::config::{ModelTier, ProviderType, get_model_tier};
 use crate::model_selector::ModelSelector;
+use crate::tui::grapheme;
+
+/// Edits `input` at `cursor`, a byte offset on a grapheme boundary, for the
+/// cursor keys and text keys of a one-line field; other keys do nothing.
+fn apply_edit_key(code: KeyCode, input: &mut String, cursor: &mut usize) {
+    match code {
+        KeyCode::Backspace => *cursor = grapheme::remove_before(input, *cursor),
+        KeyCode::Delete => grapheme::remove_after(input, *cursor),
+        KeyCode::Left => *cursor = grapheme::prev_boundary(input, *cursor),
+        KeyCode::Right => *cursor = grapheme::next_boundary(input, *cursor),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = input.len(),
+        KeyCode::Char(c) => *cursor = grapheme::insert_char(input, *cursor, c),
+        _ => {}
+    }
+}
 
 impl App {
     /// Handle key in unified config mode.
@@ -127,7 +143,7 @@ impl App {
                             name: id.clone(),
                             base_url: inst.base_url.clone().unwrap_or_default(),
                             api_key: inst.api_key.clone().unwrap_or_default(),
-                            cursor: id.chars().count(),
+                            cursor: id.len(),
                             editing_existing: true,
                             original_name: Some(id),
                         };
@@ -163,8 +179,7 @@ impl App {
                         .models
                         .compaction_model
                         .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default();
+                        .map_or_default(ToString::to_string);
                     state.start_text_edit(&current);
                 }
                 _ => {}
@@ -186,6 +201,15 @@ impl App {
                         self.config.preferences.show_decode_speed =
                             !self.config.preferences.show_decode_speed;
                         self.persist_config_background();
+                    }
+                    3 => {
+                        // Edit the jobserver pool size; empty is automatic
+                        let current = self
+                            .config
+                            .sandbox
+                            .job_pool_size
+                            .map_or_default(|size| size.to_string());
+                        state.start_text_edit(&current);
                     }
                     _ => {}
                 }
@@ -307,50 +331,23 @@ impl App {
                     // Move to next field
                     *focused_field = (*focused_field + 1).min(2);
                     let new_input = focused_input!(*focused_field, name, base_url, api_key);
-                    *cursor = new_input.chars().count();
+                    *cursor = new_input.len();
                 }
                 KeyCode::BackTab | KeyCode::Up => {
                     // Move to previous field
                     *focused_field = focused_field.saturating_sub(1);
                     let new_input = focused_input!(*focused_field, name, base_url, api_key);
-                    *cursor = new_input.chars().count();
+                    *cursor = new_input.len();
                 }
-                KeyCode::Backspace => {
-                    if *cursor > 0 {
-                        *cursor -= 1;
-                        let input = focused_input!(*focused_field, name, base_url, api_key);
-                        let byte_idx = char_to_byte_index(input, *cursor);
-                        input.remove(byte_idx);
-                    }
-                }
-                KeyCode::Delete => {
+                KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char(_) => {
                     let input = focused_input!(*focused_field, name, base_url, api_key);
-                    let char_count = input.chars().count();
-                    if *cursor < char_count {
-                        let byte_idx = char_to_byte_index(input, *cursor);
-                        input.remove(byte_idx);
-                    }
-                }
-                KeyCode::Left => {
-                    *cursor = cursor.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    let input = focused_input!(*focused_field, name, base_url, api_key);
-                    let char_count = input.chars().count();
-                    *cursor = (*cursor + 1).min(char_count);
-                }
-                KeyCode::Home => {
-                    *cursor = 0;
-                }
-                KeyCode::End => {
-                    let input = focused_input!(*focused_field, name, base_url, api_key);
-                    *cursor = input.chars().count();
-                }
-                KeyCode::Char(c) => {
-                    let input = focused_input!(*focused_field, name, base_url, api_key);
-                    let byte_idx = char_to_byte_index(input, *cursor);
-                    input.insert(byte_idx, c);
-                    *cursor += 1;
+                    apply_edit_key(code, input, cursor);
                 }
                 KeyCode::Enter => {
                     // Validate and save
@@ -415,38 +412,13 @@ impl App {
         // Handle text edit mode
         if let Some((input, cursor)) = state.edit_text_mut() {
             match code {
-                KeyCode::Backspace => {
-                    if *cursor > 0 {
-                        *cursor -= 1;
-                        let byte_idx = char_to_byte_index(input, *cursor);
-                        input.remove(byte_idx);
-                    }
-                }
-                KeyCode::Delete => {
-                    let char_count = input.chars().count();
-                    if *cursor < char_count {
-                        let byte_idx = char_to_byte_index(input, *cursor);
-                        input.remove(byte_idx);
-                    }
-                }
-                KeyCode::Left => {
-                    *cursor = cursor.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    let char_count = input.chars().count();
-                    *cursor = (*cursor + 1).min(char_count);
-                }
-                KeyCode::Home => {
-                    *cursor = 0;
-                }
-                KeyCode::End => {
-                    *cursor = input.chars().count();
-                }
-                KeyCode::Char(c) => {
-                    let byte_idx = char_to_byte_index(input, *cursor);
-                    input.insert(byte_idx, c);
-                    *cursor += 1;
-                }
+                KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char(_) => apply_edit_key(code, input, cursor),
                 KeyCode::Enter => {
                     // Save the edited value
                     return self.save_config_edit();
@@ -508,19 +480,59 @@ impl App {
                     _ => {}
                 }
             }
-            ConfigSection::Preferences => {
-                if selected == 0 {
+            ConfigSection::Preferences => match selected {
+                0 => {
                     // Parse max_iterations
                     if let Ok(val) = value.parse::<usize>() {
                         self.config.max_iterations = val;
                     }
                 }
-            }
+                3 => return self.save_job_pool_edit(value.trim()),
+                _ => {}
+            },
         }
 
         self.config_state.cancel_edit();
         self.persist_config_background();
 
+        None
+    }
+
+    /// Saves the text edit of the jobserver pool size: empty is the host's
+    /// available parallelism. The daemon applies it to the running pool and
+    /// saves it; the config file is written here too when no daemon is
+    /// connected. Text that is not a positive number leaves the edit open
+    /// with the reason in the status line.
+    fn save_job_pool_edit(&mut self, value: &str) -> Option<SendAction> {
+        let size = if value.is_empty() {
+            None
+        } else if let Ok(size) = value.parse::<std::num::NonZeroUsize>() {
+            Some(size)
+        } else {
+            self.set_status("The jobserver pool size is a positive number, or empty");
+            return None;
+        };
+        self.config.sandbox.job_pool_size = size;
+        self.config_state.cancel_edit();
+        if let Some(client) = self.btw_daemon.clone() {
+            let body = crate::daemon::types::JobPoolRequest {
+                size: size.map(std::num::NonZeroUsize::get),
+            };
+            let tx = self.event_tx.clone();
+            executor_core::spawn(async move {
+                let result = client
+                    .put::<_, serde_json::Value>("/api/config/job-pool", &body)
+                    .await
+                    .map(|_| ())
+                    .map_err(crate::tui::error::TuiError::from);
+                let _ = tx
+                    .send(crate::tui::event::AppEvent::ConfigSaved(result))
+                    .await;
+            })
+            .detach();
+        } else {
+            self.persist_config_background();
+        }
         None
     }
 

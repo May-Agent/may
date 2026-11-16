@@ -31,11 +31,13 @@ use super::completion::{Completion, CompletionMode};
 use super::error::{AppResult, TuiError};
 use super::event::{AppEvent, EventSender};
 use super::file_diff::FileDiffHandle;
+use super::grapheme;
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
+use super::slash::SlashCommand;
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
-use crate::pasted_text::LARGE_PASTE_THRESHOLD;
+use crate::pasted_text;
 
 /// User-facing message shown when a tool response cannot be sent to the session.
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
@@ -45,19 +47,25 @@ const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 
 /// Two clicks at the same spot within this window select the word under
 /// the cursor.
+/// Rows one `Alt+Up`/`Alt+Down` press scrolls the sidebar.
+const SIDEBAR_KEY_STEP_LINES: usize = 3;
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a transient status notice (e.g. "Copied selection") stays on
 /// screen before it clears itself.
 const STATUS_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Convert a character index to a byte index in a string.
-pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+/// Whether two selection columns (byte offsets into `line`) are at most one
+/// character apart, the tolerance of a double click.
+fn same_click_spot(line: &str, a: usize, b: usize) -> bool {
+    let (low, high) = (a.min(b), a.max(b));
+    line.get(low..high)
+        .is_some_and(|between| between.char_indices().nth(1).is_none())
 }
 
 /// Agent event from aither-agent.
 pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
+use aither_agent::{OutputKind, RunOutcome, ToolOrigin};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, AuthReturn, ChatgptAuthStatus, ConfigEditMode,
@@ -114,10 +122,9 @@ pub struct App {
     pub worker_settings: crate::agent::AgentLiveSettings,
     /// Current input text
     pub input: String,
-    /// Input cursor position (character index, not byte index)
+    /// Input cursor position: a byte offset into `input` that always sits
+    /// on a grapheme cluster boundary.
     pub cursor: usize,
-    /// Cached character count for input (avoids O(n) .`chars().count()`)
-    pub input_char_count: usize,
     /// The daemon's suggested next prompt, drawn as ghost text while the
     /// input is empty; `Tab` lifts it into the draft.
     pub prompt_suggestion: Option<PromptSuggestion>,
@@ -141,17 +148,14 @@ pub struct App {
     pub status: Option<StatusNotice>,
     /// Whether agent is currently processing
     pub processing: bool,
-    /// Whether the in-flight turn produced any model output — a turn
-    /// stopped before its first event returns the sent draft to the
-    /// input box instead of dropping it.
-    turn_had_output: bool,
-    /// The last message handed to the agent, kept until the next send so
-    /// an aborted-before-any-action turn can put it back into the input.
-    last_sent_input: Option<String>,
     /// Hidden context attached to the next send after a rewind: tells the
     /// agent the conversation was cut back while the world — open and
     /// merged PRs — stands as recorded.
     pub rewind_notice: Option<crate::xml::XmlBlock>,
+    /// The hidden context the latest send carried, kept client-side until
+    /// the next send: a withdrawn turn deletes its rows, so the sender
+    /// attaches it to the message it sends again.
+    sent_hidden_context: Option<crate::xml::XmlBlock>,
     /// File picker state (when in `FilePicker` mode)
     pub file_picker: Option<FilePicker>,
     /// Image manager for clipboard images
@@ -259,16 +263,22 @@ pub struct App {
     pub pending_paste_results: std::collections::VecDeque<PendingPaste>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
-    /// Cumulative token usage for current session
+    /// Latest request's token usage; `prompt_tokens` is the status bar's
+    /// context footprint since every request resends the whole context
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
+    /// New Year greeting and fireworks
+    pub new_year: crate::tui::new_year::NewYearState,
     /// Spinner animation frame for the activity indicator above the status bar
     pub spinner_frame: usize,
     /// What the in-flight run is doing (thinking vs. producing output)
     pub activity_phase: crate::tui::ui::chat::ActivityPhase,
     /// Context window size for current model
     pub context_window: Option<u32>,
+    /// What the status bar's context meter shows in place of the usage while
+    /// a compaction runs and just after it.
+    pub compaction: crate::tui::state::CompactionMeter,
     /// Current model being used by the agent
     pub current_model: Option<String>,
     /// MCP server info for display (cached)
@@ -289,6 +299,12 @@ pub struct App {
     pub ssh_add_name: String,
     /// SSH add target input (`user@host`)
     pub ssh_add_target: String,
+    /// `/cloud`'s GitHub account input, while it is being typed; empty is
+    /// the `gh` login's active account.
+    pub cloud_login: Option<String>,
+    /// `/cloud`'s machine type picker for a new cloud session, once the
+    /// catalog arrived, with the selected row.
+    pub cloud_machines: Option<(Vec<crate::cloud::MachineType>, usize)>,
     /// Skill list for display
     pub skill_list: Vec<crate::skill::SkillInfo>,
     /// Selected skill index
@@ -321,6 +337,9 @@ pub struct App {
     pub event_tx: EventSender,
     /// Terminal image rendering support (None if terminal doesn't support graphics)
     pub image_support: Option<super::ui::image::TerminalImageSupport>,
+    /// Background of the input band, queried from the terminal at startup;
+    /// `None` keeps the terminal's default background.
+    pub band_bg: Option<ratatui::style::Color>,
     /// Image cache: URL -> fetched image state (for terminal image rendering)
     pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
     /// URLs currently being fetched (to avoid duplicate requests)
@@ -374,10 +393,16 @@ pub struct App {
     /// cumulative JSON `ToolCallDelta` fragments assembled so far, so the
     /// call's element can render before the canonical `ToolCallStart`.
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
+    /// The tool of each call the provider runs itself and has not finished,
+    /// keyed by call id: its end event does not name it.
+    pub hosted_tool_calls: std::collections::HashMap<String, String>,
     /// Last time file-diff previews were requested for running calls.
     pub diff_preview_at: Option<std::time::Instant>,
-    /// Loaded secret values for bash-mode masking and env injection.
-    pub secrets: crate::secrets::Secrets,
+    /// Loaded secret values for bash-mode masking and env injection, or why
+    /// they could not be read: bash mode then refuses to run.
+    pub secrets: Result<crate::secrets::Secrets, crate::secrets::SecretError>,
+    /// The compiled secret shapes bash-mode masking recognizes.
+    pub secret_patterns: crate::secrets::SecretPatterns,
     /// Questions the agent asked that nobody answered yet, for the status bar.
     pub open_question_count: usize,
     /// The session's blocking state as the daemon last reported it on the
@@ -469,12 +494,14 @@ pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
 /// How often live terminal output is read from the daemon while calls run.
 const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Base URL `<tunnel id>` tags resolve against in the TUI: the daemon's
-/// loopback listener.
-fn tunnel_base(config: &MayConfig) -> String {
-    format!(
-        "http://localhost:{}/tunnel",
-        config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT)
+/// Base URL `<tunnel id>` tags of `session` resolve against in the TUI: the
+/// session's tunnels on the daemon's loopback listener. A tunnel is named by
+/// a word of its session's ids, so the session is part of its address.
+fn tunnel_base(config: &MayConfig, session: Option<&SessionId>) -> String {
+    let port = config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT);
+    session.map_or_else(
+        || format!("http://localhost:{port}/tunnel"),
+        |session| format!("http://localhost:{port}/tunnel/{session}"),
     )
 }
 
@@ -593,7 +620,10 @@ impl App {
         status: Option<StatusNotice>,
     ) -> Self {
         let needs_setup = !config.is_configured();
-        let tunnel_base = tunnel_base(&config);
+        let tunnel_base = tunnel_base(
+            &config,
+            session_manager.current().map(|session| &session.id),
+        );
         // Always start in Chat mode - show inline message if not configured
         let mode = AppMode::Chat;
 
@@ -620,12 +650,12 @@ impl App {
         );
 
         Self {
+            secret_patterns: crate::secrets::SecretPatterns::default(),
             session_manager,
             worker_settings: crate::agent::AgentLiveSettings::of(&config),
             config,
             input: String::new(),
             cursor: 0,
-            input_char_count: 0,
             prompt_suggestion: None,
             attachments: Vec::new(),
             chat: ChatStream::new().with_tunnel_base(tunnel_base),
@@ -634,9 +664,8 @@ impl App {
             content_height: AtomicUsize::new(0),
             view_height: AtomicUsize::new(0),
             mode,
-            turn_had_output: false,
-            last_sent_input: None,
             rewind_notice: None,
+            sent_hidden_context: None,
             queue: MessageQueue::new(),
             status,
             processing: false,
@@ -691,9 +720,11 @@ impl App {
             pending_attachment_jobs: 0,
             usage: None,
             decode_meter: crate::decode_meter::DecodeMeter::default(),
+            new_year: crate::tui::new_year::NewYearState::default(),
             spinner_frame: 0,
             activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
+            compaction: crate::tui::state::CompactionMeter::default(),
             current_model: None,
             mcp_servers: Vec::new(),
             mcp_selected: 0,
@@ -704,6 +735,8 @@ impl App {
             ssh_add_mode: SshAddMode::None,
             ssh_add_name: String::new(),
             ssh_add_target: String::new(),
+            cloud_login: None,
+            cloud_machines: None,
             skill_list: Vec::new(),
             skill_selected: 0,
             skill_scroll: 0,
@@ -735,6 +768,7 @@ impl App {
             btw_daemon: None,
             sidebar: super::sidebar::SidebarState::default(),
             chat_area: ratatui::layout::Rect::default(),
+            band_bg: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
@@ -742,6 +776,7 @@ impl App {
             run_guard: None,
             live_reads: std::collections::HashMap::new(),
             pending_tool_calls: std::collections::HashMap::new(),
+            hosted_tool_calls: std::collections::HashMap::new(),
             diff_preview_at: None,
             secrets,
             open_question_count: 0,
@@ -757,7 +792,265 @@ impl App {
         }
     }
 
-    fn persist_config_background(&self) {
+    /// Probe an SSH server off the event loop; `ssh_probed` receives the
+    /// result.
+    pub fn start_ssh_probe(&mut self, name: String, target: String) {
+        self.set_persistent_status(format!("Probing SSH server: {name}"));
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let result = crate::config::SshServerConfig::probe(name.clone(), target)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SshProbed { name, result }).await;
+        })
+        .detach();
+    }
+
+    /// The profile the TUI is on, as last loaded.
+    pub fn current_profile(&self) -> Option<&ProfileInfo> {
+        let id = self
+            .current_profile_id
+            .as_deref()
+            .or_else(|| self.session_manager.current_profile_id())?;
+        self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    /// Toggles `name` in the active profile's attached SSH servers and returns
+    /// `(profile_id, updated_server_names, attached_now)`.
+    pub fn toggle_ssh_attachment(&mut self, name: &str) -> Option<(String, Vec<String>, bool)> {
+        let id = self
+            .current_profile_id
+            .as_deref()
+            .or_else(|| self.session_manager.current_profile_id())?
+            .to_owned();
+        let profile = self.profiles.iter_mut().find(|profile| profile.id == id)?;
+        let attached_now = if let Some(pos) = profile
+            .remote_attachments
+            .iter()
+            .position(|existing| existing == name)
+        {
+            profile.remote_attachments.remove(pos);
+            false
+        } else {
+            profile.remote_attachments.push(name.to_string());
+            true
+        };
+        Some((id, profile.remote_attachments.clone(), attached_now))
+    }
+
+    /// Removes `name` from every cached profile's attached SSH servers.
+    pub fn prune_ssh_attachment(&mut self, name: &str) {
+        for profile in &mut self.profiles {
+            profile
+                .remote_attachments
+                .retain(|existing| existing != name);
+        }
+    }
+
+    /// Set up GitHub Codespaces for the current profile as `login`, or the
+    /// `gh` login's active account; [`Self::cloud_configured`] receives the
+    /// daemon's answer.
+    pub fn start_codespaces_setup(&mut self, login: Option<String>) {
+        #[derive(serde::Serialize)]
+        struct Setup {
+            login: Option<String>,
+        }
+        self.set_persistent_status("Checking the GitHub account for Codespaces...");
+        self.request_cloud_change(move |client, path| async move {
+            client.put::<_, ProfileInfo>(&path, &Setup { login }).await
+        });
+    }
+
+    /// Remove the current profile's Codespaces account.
+    pub fn start_codespaces_removal(&mut self) {
+        self.set_persistent_status("Removing the Codespaces account...");
+        self.request_cloud_change(|client, path| async move {
+            client.delete::<ProfileInfo>(&path).await
+        });
+    }
+
+    fn request_cloud_change<F, Fut>(&self, call: F)
+    where
+        F: FnOnce(crate::client::DaemonClient, String) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<ProfileInfo, crate::client::DaemonClientError>> + Send,
+    {
+        let tx = self.event_tx.clone();
+        let target = self
+            .session_manager
+            .current_profile_id()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "no profile is selected".to_owned())
+            .and_then(|id| {
+                self.session_manager
+                    .daemon_handle()
+                    .map(|client| (client, id))
+                    .map_err(|error| error.to_string())
+            });
+        spawn(async move {
+            let result = match target {
+                Ok((client, id)) => call(client, format!("/api/profiles/{id}/cloud/codespaces"))
+                    .await
+                    .map_err(|error| error.reason()),
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(AppEvent::CloudConfigured(result)).await;
+        })
+        .detach();
+    }
+
+    /// List the machine types a new cloud session of the launch's
+    /// repository may start on; [`Self::cloud_catalog_loaded`] receives
+    /// them.
+    pub fn start_cloud_catalog(&mut self) {
+        #[derive(serde::Serialize)]
+        struct Catalog {
+            repo: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Listed {
+            machines: Vec<crate::cloud::MachineType>,
+        }
+        self.set_persistent_status("Listing the codespace machine types...");
+        let tx = self.event_tx.clone();
+        let (repo, cwd) = self.session_manager.launch_place();
+        let target = self
+            .session_manager
+            .current_profile_id()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "no profile is selected".to_owned())
+            .and_then(|id| {
+                self.session_manager
+                    .daemon_handle()
+                    .map(|client| (client, id))
+                    .map_err(|error| error.to_string())
+            });
+        spawn(async move {
+            let result = match target {
+                Ok((client, id)) => {
+                    let repo = blocking::unblock(move || {
+                        crate::session::cloud_repository(repo.as_deref(), cwd.as_deref())
+                    })
+                    .await;
+                    client
+                        .post::<_, Listed>(
+                            &format!("/api/profiles/{id}/cloud/codespaces/catalog"),
+                            &Catalog { repo },
+                        )
+                        .await
+                        .map(|listed| listed.machines)
+                        .map_err(|error| error.reason())
+                }
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(AppEvent::CloudCatalog(result)).await;
+        })
+        .detach();
+    }
+
+    /// Show the machine type picker the catalog fills.
+    pub fn cloud_catalog_loaded(&mut self, result: Result<Vec<crate::cloud::MachineType>, String>) {
+        self.clear_persistent_status();
+        match result {
+            Ok(machines) if machines.is_empty() => self
+                .chat
+                .push_error("GitHub offers no codespace machine types for this repository"),
+            Ok(machines) => self.cloud_machines = Some((machines, 0)),
+            Err(error) => self
+                .chat
+                .push_error(&format!("Listing codespace machines failed: {error}")),
+        }
+    }
+
+    /// Show a step of bringing the current cloud session's machine up: the
+    /// status line carries the wait until the machine serves the session.
+    pub fn cloud_session_step(&mut self, event: &crate::daemon::types::CloudSessionEvent) {
+        use crate::daemon::types::CloudSessionPhase;
+
+        if self
+            .session_manager
+            .current()
+            .is_none_or(|session| session.id.as_str() != event.session_id)
+        {
+            return;
+        }
+        let step = match event.phase {
+            CloudSessionPhase::Creating => "Creating the codespace...",
+            CloudSessionPhase::Starting => "Starting the codespace...",
+            CloudSessionPhase::Checking => "Checking May on the codespace...",
+            CloudSessionPhase::Downloading => "Downloading May for the codespace...",
+            CloudSessionPhase::Installing => "Installing May on the codespace...",
+            CloudSessionPhase::Cloning => "Cloning the repository into the codespace...",
+            CloudSessionPhase::StartingDaemon => "Starting May on the codespace...",
+            CloudSessionPhase::Connecting => "Connecting to the codespace...",
+            CloudSessionPhase::Ready => {
+                self.clear_persistent_status();
+                self.set_status("The codespace serves this session");
+                return;
+            }
+            CloudSessionPhase::Failed => {
+                self.clear_persistent_status();
+                self.chat.push_error(&format!(
+                    "The session's codespace could not be brought up: {}",
+                    event.error.as_deref().unwrap_or("no reason given")
+                ));
+                return;
+            }
+        };
+        self.set_persistent_status(step);
+    }
+
+    /// Show a `/cloud` change the daemon answered: the profile it returned
+    /// replaces the loaded one.
+    pub fn cloud_configured(&mut self, result: Result<ProfileInfo, String>) {
+        self.clear_persistent_status();
+        match result {
+            Ok(profile) => {
+                let message = profile.cloud.codespaces.as_ref().map_or_else(
+                    || "Codespaces account removed".to_owned(),
+                    |account| format!("Codespaces set up as {}", account.login),
+                );
+                match self
+                    .profiles
+                    .iter_mut()
+                    .find(|known| known.id == profile.id)
+                {
+                    Some(known) => *known = profile,
+                    None => self.profiles.push(profile),
+                }
+                self.set_status(message);
+            }
+            Err(error) => self
+                .chat
+                .push_error(&format!("Cloud setup failed: {error}")),
+        }
+    }
+
+    /// Add a probed SSH server to the config, or show why the probe failed.
+    /// Returns whether the config changed and must be saved.
+    pub fn ssh_probed(
+        &mut self,
+        name: &str,
+        result: Result<crate::config::SshServerConfig, String>,
+    ) -> bool {
+        match result {
+            Err(error) => {
+                self.status = None;
+                self.chat
+                    .push_error(&format!("Failed to add SSH server {name}: {error}"));
+                false
+            }
+            Ok(server) => {
+                self.config.upsert_ssh_server(server);
+                self.set_status(format!("Added SSH server: {name}"));
+                if self.ssh_selected + 1 < self.config.ssh_servers.len() {
+                    self.ssh_selected = self.config.ssh_servers.len() - 1;
+                }
+                true
+            }
+        }
+    }
+
+    pub(in crate::tui) fn persist_config_background(&self) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
         spawn(async move {
@@ -1122,7 +1415,7 @@ impl App {
         ) else {
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/btw");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/btw");
         if let AppMode::Btw(state) = &mut self.mode {
             state.loading = true;
         }
@@ -1144,12 +1437,39 @@ impl App {
         .detach();
     }
 
+    /// Open the `/progress` overlay and ask the daemon for the remaining
+    /// work. The request runs on the side: nothing touches the conversation.
+    pub fn open_progress(&mut self) {
+        let (Some(client), Some(session)) = (
+            self.btw_daemon.clone(),
+            self.session_manager
+                .current()
+                .filter(|session| session.persisted),
+        ) else {
+            self.chat
+                .push_notice("No model available for /progress — start a session first");
+            return;
+        };
+        let path = crate::client::session_path(session.id.as_str(), "/actions/progress");
+        self.mode = AppMode::Progress(super::state::ProgressState {
+            loading: true,
+            ..super::state::ProgressState::default()
+        });
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let report: Result<crate::daemon::ProgressReport, _> =
+                client.post(&path, &serde_json::json!({})).await;
+            let event = match report {
+                Ok(report) => AppEvent::ProgressLoaded(report),
+                Err(error) => AppEvent::ProgressFailed(error.to_string()),
+            };
+            let _ = tx.send(event).await;
+        })
+        .detach();
+    }
+
     /// System prompt for `/btw`: answer once, no tools, no side effects.
-    const BTW_SYSTEM: &'static str = "This is a side question from the user. \
-        Answer it directly in a single response. You share the conversation \
-        context but are a separate, lightweight instance — the main agent is \
-        NOT interrupted and keeps working. You have NO tools available and \
-        there will be no follow-up turns: never promise to take any action.";
+    const BTW_SYSTEM: &'static str = include_str!("../../../templates/btw_system.txt");
 
     /// Chat elements the `/btw` request sees, oldest first. Bounded to the
     /// most recent entries so the overlay stays cheap on long sessions.
@@ -1158,6 +1478,8 @@ impl App {
     /// Build the `/btw` request: system contract, recent chat as context,
     /// then the question itself.
     fn btw_messages(&self, question: &str) -> Vec<crate::daemon::BtwMessage> {
+        use askama::Template as _;
+
         use super::ui::chat::{ChatElement, ToolDisplay};
 
         let mut messages = vec![btw_message("system", Self::BTW_SYSTEM)];
@@ -1180,38 +1502,25 @@ impl App {
                             command,
                             output,
                             ..
-                        } => {
-                            let lead = if description.is_empty() {
-                                "ran terminal command".to_string()
-                            } else {
-                                format!("ran terminal command ({description})")
-                            };
-                            let mut text = format!("{lead}:\n{command}");
-                            if let Some(info) = output
-                                && !info.output.is_empty()
-                            {
-                                let tail: String = info.output.chars().take(600).collect();
-                                text.push_str("\noutput:\n");
-                                text.push_str(&tail);
-                            }
-                            text
+                        } => BtwTerminalCall {
+                            description,
+                            command,
+                            output_tail: btw_output_tail(output.as_ref()),
                         }
+                        .render()
+                        .expect("the btw terminal call template renders"),
                         ToolDisplay::Action {
                             chip,
                             summary,
                             output,
                             ..
-                        } => {
-                            let mut text = format!("called {chip}: {summary}");
-                            if let Some(info) = output
-                                && !info.output.is_empty()
-                            {
-                                let tail: String = info.output.chars().take(600).collect();
-                                text.push_str("\noutput:\n");
-                                text.push_str(&tail);
-                            }
-                            text
+                        } => BtwActionCall {
+                            chip,
+                            summary,
+                            output_tail: btw_output_tail(output.as_ref()),
                         }
+                        .render()
+                        .expect("the btw action call template renders"),
                         ToolDisplay::Builtin { tool, detail, .. } => {
                             format!("hosted tool {tool}: {detail}")
                         }
@@ -1711,7 +2020,11 @@ impl App {
     /// finished turn folds into its "Worked for" row. The last turn folds
     /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
-        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
+        self.chat = ChatStream::successor_of(&self.chat).with_tunnel_base(tunnel_base(
+            &self.config,
+            self.session_manager.current().map(|session| &session.id),
+        ));
+        self.chat.push_welcome(self.cwd_label());
         let mut turn = HistoryTurn::default();
         for (history_index, msg) in messages.iter().enumerate() {
             if msg.role == MessageRole::User {
@@ -1721,14 +2034,20 @@ impl App {
             turn.note(msg);
             match msg.role {
                 MessageRole::User => {
-                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
-                        |att| async move {
-                            super::runtime::tui_attachment_from_persisted(att.clone())
+                    let daemon = self.session_manager.daemon_handle().ok();
+                    let restored =
+                        futures_util::future::join_all(msg.attachments.iter().map(|att| {
+                            let daemon = daemon.clone();
+                            async move {
+                                super::runtime::tui_attachment_from_persisted(
+                                    daemon.as_ref(),
+                                    att.clone(),
+                                )
                                 .await
                                 .map_err(|error| (att.name.clone(), error))
-                        },
-                    ))
-                    .await;
+                            }
+                        }))
+                        .await;
                     let mut attachments = Vec::with_capacity(restored.len());
                     for result in restored {
                         match result {
@@ -1758,11 +2077,23 @@ impl App {
                             id,
                             name,
                             arguments,
+                            ..
                         }) => {
                             // A stored call carries the arguments schema of
                             // the build that ran it, so it is read field by
                             // field rather than against today's schema.
-                            self.show_tool_start(id, parse_tool_start_partial(&name, &arguments));
+                            self.show_tool_start(
+                                id.clone(),
+                                parse_tool_start_partial(&name, &arguments),
+                            );
+                            // The daemon read the script when it served the
+                            // history; the client does not parse it again.
+                            if let Some(reading) = msg.reading.clone() {
+                                self.chat.set_tool_reading(&id, reading);
+                            }
+                            if msg.card.is_some() {
+                                self.chat.set_tool_card(&id, msg.card.clone());
+                            }
                         }
                         Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
                             self.show_tool_end(&id, &result);
@@ -1811,8 +2142,7 @@ impl App {
         let messages = self
             .session_manager
             .current()
-            .map(|session| session.history.messages().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|session| session.history.messages().to_vec());
         self.render_history(&messages).await;
         self.scroll = usize::MAX;
     }
@@ -1826,16 +2156,10 @@ impl App {
     ///
     /// Panics if the session manager has no current session while a session is
     /// being initialized.
-    pub async fn init_session(
-        &mut self,
-        session_id: &SessionId,
-        messages: &[ChatMessage],
-        model: Option<&str>,
-    ) {
+    pub async fn init_session(&mut self, session_id: &SessionId, messages: &[ChatMessage]) {
         // Reset per-session UI state so /new starts from a clean screen in inline viewport mode.
         self.input.clear();
         self.cursor = 0;
-        self.input_char_count = 0;
         self.attachments.clear();
         self.completion.cancel();
         self.queue = MessageQueue::new();
@@ -1861,6 +2185,7 @@ impl App {
         self.live_output_read_at = None;
         self.live_reads.clear();
         self.pending_tool_calls.clear();
+        self.hosted_tool_calls.clear();
         self.diff_preview_at = None;
 
         // Load chat history into display
@@ -1882,16 +2207,9 @@ impl App {
         // Reset usage tracking for new session
         self.usage = None;
 
-        // Set context window from model info
-        if let Some(model_name) = model {
-            if let Some(info) = aither_models::lookup(model_name) {
-                self.context_window = info.max_input_tokens();
-            } else {
-                self.context_window = None;
-            }
-        } else {
-            self.context_window = None;
-        }
+        // The daemon sends the window with the session's next usage.
+        self.context_window = None;
+        self.compaction.cancel();
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
@@ -1949,7 +2267,26 @@ impl App {
         self.mode = AppMode::PermissionConfirm(crate::tui::state::PermissionConfirmState {
             request_id: request.id.clone(),
             request: request.request.clone(),
+            show_script: false,
         });
+    }
+
+    /// Whether the open dialog holds a request a run waits on (a permission
+    /// or workspace approval, or a blocking question). Such a request is
+    /// shown once, so the dialog must stay until it is answered.
+    fn holds_pending_request(&self) -> bool {
+        match &self.mode {
+            AppMode::PermissionConfirm(_) | AppMode::WorkspaceConfirm(_) => true,
+            AppMode::AskUser(state) => {
+                state.request.is_some()
+                    || self
+                        .session_runtime
+                        .waiting_ask_user
+                        .as_ref()
+                        .is_some_and(|waiting| waiting.id == state.request_id)
+            }
+            _ => false,
+        }
     }
 
     /// Close the permission dialog once its request is no longer the one the
@@ -2067,11 +2404,30 @@ impl App {
         self.processing || !self.session_runtime.state.is_idle()
     }
 
-    /// Answer a quit request: quits at once when no run is in flight, and
-    /// asks first what happens to a busy session's agent. A quit request
-    /// repeated while the dialog is up leaves the agent running.
+    /// Whether the current session's agent has background work alive: a
+    /// terminal job still running or a subagent run in flight.
+    #[must_use]
+    pub fn agent_has_background_work(&self) -> bool {
+        !self.subagents.is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|job| job.status == aither_sandbox::JobStatus::Running)
+    }
+
+    /// Whether the current session's agent is working: a run in flight or
+    /// background work alive.
+    #[must_use]
+    pub fn agent_working(&self) -> bool {
+        self.agent_busy() || self.agent_has_background_work()
+    }
+
+    /// Answer a quit request: quits at once when the agent is not working,
+    /// and asks first what happens to a working agent — a run in flight or
+    /// background work alive. A quit request repeated while the dialog is up
+    /// leaves the agent running.
     fn request_quit(&mut self) -> Option<SendAction> {
-        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_busy() {
+        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_working() {
             return Some(SendAction::Quit);
         }
         self.quit_pending = false;
@@ -2099,7 +2455,7 @@ impl App {
         match &self.mode {
             AppMode::Chat => {
                 // Chat has special handling for large pastes (attachments)
-                return Some(ActiveTextInput::Cursored {
+                return Some(ActiveTextInput::Composer {
                     input: &mut self.input,
                     cursor: &mut self.cursor,
                 });
@@ -2188,6 +2544,14 @@ impl App {
                 }
                 SshAddMode::None => {}
             },
+            AppMode::CloudManage => {
+                if let Some(login) = self.cloud_login.as_mut() {
+                    return Some(ActiveTextInput::Simple {
+                        input: login,
+                        filter: PasteFilter::Identifier,
+                    });
+                }
+            }
             AppMode::SkillManage => {
                 match self.skill_add_mode {
                     SkillAddMode::GitHubRepo => {
@@ -2268,7 +2632,7 @@ impl App {
     pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
         // Special handling for Chat mode: large pastes become attachments
         if matches!(self.mode, AppMode::Chat)
-            && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
+            && (text.contains('\n') || pasted_text::is_large(&text))
         {
             self.set_status("Saving pasted text...");
             self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
@@ -2296,16 +2660,12 @@ impl App {
 
         // Get active text input and paste into it
         match self.active_text_input() {
+            Some(ActiveTextInput::Composer { input, cursor }) => {
+                *cursor = grapheme::insert_str(input, *cursor, &text);
+                self.update_completion_state();
+            }
             Some(ActiveTextInput::Cursored { input, cursor }) => {
-                let byte_idx = char_to_byte_index(input, *cursor);
-                input.insert_str(byte_idx, &text);
-                *cursor += text.chars().count();
-
-                // Update input_char_count if this is the main chat input
-                if matches!(self.mode, AppMode::Chat) {
-                    self.input_char_count = self.input.chars().count();
-                    self.update_completion_state();
-                }
+                *cursor = grapheme::insert_str(input, *cursor, &text);
             }
             Some(ActiveTextInput::Simple { input, filter }) => {
                 let filtered = filter.filter(&text);
@@ -2323,6 +2683,29 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> AppResult<Option<SendAction>> {
+        // Any key ends the fireworks and is spent on that.
+        if self.new_year.animating() {
+            self.new_year.stop();
+            return Ok(None);
+        }
+        // Alt+Up/Down scroll the sidebar, Alt+E opens every section and detail.
+        if modifiers.contains(KeyModifiers::ALT) && matches!(self.mode, AppMode::Chat) {
+            match code {
+                KeyCode::Up => {
+                    self.sidebar.scroll_up(SIDEBAR_KEY_STEP_LINES);
+                    return Ok(None);
+                }
+                KeyCode::Down => {
+                    self.sidebar.scroll_down(SIDEBAR_KEY_STEP_LINES);
+                    return Ok(None);
+                }
+                KeyCode::Char('e') => {
+                    self.sidebar.toggle_expand_all();
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
         // Global shortcuts
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
@@ -2341,7 +2724,6 @@ impl App {
                     self.quit_pending = true;
                     self.input.clear();
                     self.cursor = 0;
-                    self.input_char_count = 0;
                     self.attachments.clear();
                     self.completion.cancel();
                     self.set_status("^C Press Ctrl+C again to exit");
@@ -2355,7 +2737,21 @@ impl App {
                     self.handle_paste();
                     return Ok(None);
                 }
+                // Ctrl+Left (open questions), Ctrl+N (new session) and Ctrl+P
+                // (profiles / sessions) replace the screen or the session; a
+                // dialog a run waits on is answered first, so they do nothing
+                // while one is open.
+                KeyCode::Left | KeyCode::Char('n' | 'p') if self.holds_pending_request() => {
+                    return Ok(None);
+                }
                 KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
+                // Ctrl+F plays the New Year fireworks while the greeting shows.
+                KeyCode::Char('f')
+                    if matches!(self.mode, AppMode::Chat) && self.new_year.greeting() =>
+                {
+                    self.new_year.start();
+                    return Ok(None);
+                }
                 // Ctrl+B shows/hides the right sidebar (wide terminals only).
                 KeyCode::Char('b') => {
                     self.sidebar.enabled = !self.sidebar.enabled;
@@ -2393,6 +2789,19 @@ impl App {
         // Ctrl+V.
         if modifiers.contains(KeyModifiers::SUPER) && matches!(code, KeyCode::Char('v' | 'V')) {
             self.handle_paste();
+            return Ok(None);
+        }
+
+        // Cmd+Enter (Ctrl where Cmd cannot reach the app) opens the link
+        // under the pointer, as the same-modified click does.
+        if matches!(self.mode, AppMode::Chat)
+            && super::ui::links::dispatch_enter(
+                self.link_opener.as_ref(),
+                code,
+                modifiers,
+                self.hovered_link().as_ref(),
+            )
+        {
             return Ok(None);
         }
 
@@ -2451,6 +2860,7 @@ impl App {
             }
             AppMode::McpManage => Ok(super::reducer::manage::handle_mcp_key(self, code)),
             AppMode::SshManage => Ok(super::reducer::manage::handle_ssh_key(self, code)),
+            AppMode::CloudManage => Ok(super::reducer::manage::handle_cloud_key(self, code)),
             AppMode::AskUser(_) => Ok(super::reducer::ask_user::handle_ask_user_key(self, code)),
             AppMode::SkillManage => Ok(super::reducer::manage::handle_skill_key(self, code)),
             AppMode::ProfileSelect => Ok(super::reducer::navigation::handle_profile_select_key(
@@ -2465,6 +2875,7 @@ impl App {
                 self, code,
             )),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
+            AppMode::Progress(_) => Ok(super::reducer::navigation::handle_progress_key(self, code)),
             AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
                 self, code,
             )),
@@ -2607,8 +3018,11 @@ impl App {
             }
         }
 
-        // Regular sessions
-        list.extend(ps.regular.iter().cloned());
+        // Regular sessions, grouped by project
+        list.extend(crate::session::group_sessions(
+            ps.regular.clone(),
+            |session| session.repo.as_deref(),
+        ));
 
         self.session_list = list;
     }
@@ -2861,8 +3275,9 @@ impl App {
                         if mode == CompletionMode::Slash {
                             self.input.clear();
                             self.cursor = 0;
-                            self.input_char_count = 0;
-                            return self.execute_slash_command(&cmd);
+                            let command = SlashCommand::from_name(&cmd)
+                                .expect("completion lists only table commands");
+                            return self.execute_slash_command(command);
                         }
 
                         // For file completion, insert into input
@@ -2896,11 +3311,8 @@ impl App {
             KeyCode::Backspace => {
                 self.history.reset_navigation();
                 if self.cursor > 0 {
-                    // Delete character before cursor
-                    self.cursor -= 1;
-                    let byte_idx = char_to_byte_index(&self.input, self.cursor);
-                    self.input.remove(byte_idx);
-                    self.input_char_count -= 1;
+                    // Delete the grapheme before the cursor
+                    self.cursor = grapheme::remove_before(&mut self.input, self.cursor);
                     self.update_completion_state();
                 } else if !self.attachments.is_empty() {
                     // Cursor at start and has attachments - delete last attachment
@@ -2909,26 +3321,23 @@ impl App {
             }
             KeyCode::Delete => {
                 self.history.reset_navigation();
-                if self.cursor < self.input_char_count {
-                    let byte_idx = char_to_byte_index(&self.input, self.cursor);
-                    self.input.remove(byte_idx);
-                    self.input_char_count -= 1;
+                if self.cursor < self.input.len() {
+                    grapheme::remove_after(&mut self.input, self.cursor);
                     self.update_completion_state();
                 }
             }
             KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = grapheme::prev_boundary(&self.input, self.cursor);
             }
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.input_char_count);
+                self.cursor = grapheme::next_boundary(&self.input, self.cursor);
             }
             KeyCode::Up => {
                 if self.completion.has_matches() {
                     self.completion.prev();
                 } else if let Some(entry) = self.history.prev(&self.input) {
                     self.input = entry.to_string();
-                    self.input_char_count = self.input.chars().count();
-                    self.cursor = self.input_char_count;
+                    self.cursor = self.input.len();
                 }
             }
             KeyCode::Down => {
@@ -2936,8 +3345,7 @@ impl App {
                     self.completion.next();
                 } else if let Some(entry) = self.history.next_entry() {
                     self.input = entry.to_string();
-                    self.input_char_count = self.input.chars().count();
-                    self.cursor = self.input_char_count;
+                    self.cursor = self.input.len();
                 } else if self.background.is_some() {
                     // ↓ past the newest history entry opens the background
                     // jobs/subagents panel (status bar hint: `N shells ↓`).
@@ -2958,7 +3366,7 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::End => {
-                self.cursor = self.input_char_count;
+                self.cursor = self.input.len();
             }
             KeyCode::Esc => {
                 if self.prompt_suggestion.is_some() {
@@ -2980,7 +3388,6 @@ impl App {
                     if !self.input.is_empty() {
                         self.input.clear();
                         self.cursor = 0;
-                        self.input_char_count = 0;
                     }
                 }
             }
@@ -2992,9 +3399,8 @@ impl App {
                     return None;
                 }
                 if let Some(suggestion) = self.own_visible_suggestion().map(str::to_owned) {
-                    self.input_char_count = suggestion.chars().count();
+                    self.cursor = suggestion.len();
                     self.input = suggestion;
-                    self.cursor = self.input_char_count;
                     self.prompt_suggestion = None;
                     return None;
                 }
@@ -3009,10 +3415,7 @@ impl App {
             KeyCode::Char(c) => {
                 // Reset history navigation when typing
                 self.history.reset_navigation();
-                let byte_idx = char_to_byte_index(&self.input, self.cursor);
-                self.input.insert(byte_idx, c);
-                self.cursor += 1;
-                self.input_char_count += 1;
+                self.cursor = grapheme::insert_char(&mut self.input, self.cursor, c);
 
                 // Trigger or update completion
                 self.update_completion_state();
@@ -3078,6 +3481,13 @@ impl App {
         const SCROLL_STEP_LINES: usize = 3;
 
         self.hover = None;
+        // Any click ends the fireworks and is spent on that.
+        if self.new_year.animating() {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.new_year.stop();
+            }
+            return Ok(None);
+        }
         match &self.mode {
             AppMode::Chat => {}
             AppMode::ImageView(_) => {
@@ -3094,6 +3504,32 @@ impl App {
                 return Ok(None);
             }
             _ => return Ok(None),
+        }
+
+        // Over the sidebar the wheel scrolls it while it overflows, and a
+        // click folds or expands the row under the pointer.
+        let over_sidebar = self
+            .sidebar
+            .area
+            .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+        if over_sidebar {
+            match mouse.kind {
+                MouseEventKind::ScrollUp if self.sidebar.scrollable() => {
+                    self.sidebar.scroll_up(SCROLL_STEP_LINES);
+                    return Ok(None);
+                }
+                MouseEventKind::ScrollDown if self.sidebar.scrollable() => {
+                    self.sidebar.scroll_down(SCROLL_STEP_LINES);
+                    return Ok(None);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(action) = self.sidebar.click_action(mouse.row) {
+                        self.trigger_sidebar_pr_action(action);
+                    }
+                    return Ok(None);
+                }
+                _ => {}
+            }
         }
 
         // Clicks and drags outside the chat column (the sidebar) select
@@ -3126,19 +3562,29 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 let point = self.mouse_to_selection_point(mouse);
+                if let Some(p) = point
+                    && self.chat_layout.greeting_row() == Some(p.line)
+                {
+                    self.new_year.start();
+                    self.selection = None;
+                    return Ok(None);
+                }
                 // A click inside the composer moves the input caret to the
                 // hit cell instead of starting a text selection.
                 if let Some(p) = point
                     && let Some((start, rows)) = self.chat_layout.input_span()
                     && (start..start + rows).contains(&p.line)
                 {
-                    let mut cursor = 0usize;
+                    // Cells from the input line's left edge to the click: the
+                    // rows above (as drawn) plus the column in the clicked row.
+                    let mut column = usize::from(mouse.column.saturating_sub(self.chat_area.x));
                     for row in start..p.line {
                         if let Some(text) = self.chat_layout.plain_line(row) {
-                            cursor += text.chars().count();
+                            column += unicode_width::UnicodeWidthStr::width(text);
                         }
                     }
-                    self.cursor = (cursor + p.column).min(self.input_char_count);
+                    self.cursor =
+                        super::ui::chat::caret_at_column(&self.input, &self.attachments, column);
                     self.selection = None;
                     return Ok(None);
                 }
@@ -3146,7 +3592,10 @@ impl App {
                     self.last_click.is_some_and(|(at, last)| {
                         at.elapsed() <= DOUBLE_CLICK_WINDOW
                             && last.line == p.line
-                            && last.column.abs_diff(p.column) <= 1
+                            && self
+                                .chat_layout
+                                .plain_line(p.line)
+                                .is_some_and(|line| same_click_spot(line, last.column, p.column))
                     })
                 });
                 if double_click {
@@ -3263,22 +3712,21 @@ impl App {
 
         for line_idx in start.line..=end_line {
             let line = self.chat_layout.plain_line(line_idx).unwrap_or_default();
-            let char_count = line.chars().count();
+            // Selection columns are byte offsets on char boundaries of the
+            // line; a stale one is rounded down to a boundary.
             let from = if line_idx == start.line {
-                start.column.min(char_count)
+                line.floor_char_boundary(start.column)
             } else {
                 0
             };
             let to = if line_idx == end_line {
-                end.column.min(char_count)
+                line.floor_char_boundary(end.column)
             } else {
-                char_count
+                line.len()
             };
 
-            if from < to {
-                let from_b = char_to_byte_index(line, from);
-                let to_b = char_to_byte_index(line, to);
-                out.push_str(&line[from_b..to_b]);
+            if let Some(selected) = line.get(from..to) {
+                out.push_str(selected);
             }
 
             if line_idx != end_line {
@@ -3311,20 +3759,25 @@ impl App {
     }
 
     /// Execute a slash command directly (from menu selection only).
-    fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
-        match cmd {
-            "/session" => {
+    fn execute_slash_command(&mut self, command: SlashCommand) -> Option<SendAction> {
+        match command {
+            SlashCommand::Session => {
                 self.session_view = super::state::SessionView::Recent;
                 self.load_session_list();
                 None
             }
-            "/archive" => {
+            SlashCommand::Archive => {
                 self.session_view = super::state::SessionView::Archive;
                 self.load_session_list();
                 None
             }
-            "/new" => Some(SendAction::NewSession),
-            "/profile" => {
+            SlashCommand::New => Some(SendAction::NewSession),
+            SlashCommand::Chat => {
+                self.session_manager
+                    .set_launch(crate::session::SessionLaunch::RepoLess);
+                Some(SendAction::NewSession)
+            }
+            SlashCommand::Profile => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
                         .profiles
@@ -3338,7 +3791,7 @@ impl App {
                 }
                 None
             }
-            "/sandbox" => {
+            SlashCommand::Sandbox => {
                 if let Some(session) = self.session_manager.current() {
                     let sandbox_dir = &session.sandbox_dir;
                     #[cfg(target_os = "macos")]
@@ -3360,26 +3813,26 @@ impl App {
                 }
                 None
             }
-            "/help" => {
+            SlashCommand::Help => {
                 self.help_scroll = 0;
                 self.mode = AppMode::Help;
                 None
             }
-            "/config" => {
+            SlashCommand::Config => {
                 self.config_state = ConfigState::default();
                 self.config_state.load_providers(&self.config);
                 self.mode = AppMode::Config;
                 None
             }
-            "/model" => self.open_model_select(""),
-            "/effort" => {
+            SlashCommand::Model => self.open_model_select(""),
+            SlashCommand::Effort => {
                 self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
                 None
             }
-            "/rewind" => {
+            SlashCommand::Rewind => {
                 if self.processing {
                     self.chat
                         .push_notice("Wait for the current turn to finish before rewinding");
@@ -3388,65 +3841,74 @@ impl App {
                 }
                 None
             }
-            "/jobs" => {
+            SlashCommand::Jobs => {
                 self.open_jobs();
                 None
             }
-            "/questions" => Some(SendAction::OpenQuestions),
-            "/btw" => {
+            SlashCommand::Questions => Some(SendAction::OpenQuestions),
+            SlashCommand::Btw => {
                 self.open_btw();
                 None
             }
-            "/resume-claude" => {
+            SlashCommand::Progress => {
+                self.open_progress();
+                None
+            }
+            SlashCommand::ResumeClaude => {
                 self.open_resume_picker();
                 None
             }
-            "/import-claude" => Some(SendAction::RulesImport(
+            SlashCommand::ImportClaude => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Claude,
             )),
-            "/import-codex" => Some(SendAction::RulesImport(
+            SlashCommand::ImportCodex => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Codex,
             )),
-            "/connect" => {
+            SlashCommand::Connect => {
                 self.open_connect_picker();
                 None
             }
-            "/login" => {
+            SlashCommand::Login => {
                 self.login_selected = 0;
                 self.mode = AppMode::Login;
                 None
             }
-            "/resume-codex" | "/secret" => {
+            SlashCommand::ResumeCodex | SlashCommand::Secret => {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
-                self.input = format!("{cmd} ");
-                self.input_char_count = self.input.chars().count();
-                self.cursor = self.input_char_count;
+                self.input = format!("{} ", command.name());
+                self.cursor = self.input.len();
                 None
             }
-            "/quit" => self.request_quit(),
-            "/compact" => Some(SendAction::Compact(None)),
-            "/recap" => Some(SendAction::Recap),
-            "/yolo" => Some(SendAction::ToggleYolo),
-            "/sleep" => Some(SendAction::Sleep),
-            "/sleep off" => Some(SendAction::Wake),
-            "/context" => Some(SendAction::ContextReport),
-            "/usage" => Some(SendAction::UsageReport),
-            "/context dump" => Some(SendAction::ContextDump),
-            "/bug" => Some(SendAction::BugReport),
-            "/mcp" => {
+            SlashCommand::Quit => self.request_quit(),
+            SlashCommand::Compact => Some(SendAction::Compact(None)),
+            SlashCommand::Recap => Some(SendAction::Recap),
+            SlashCommand::Yolo => Some(SendAction::ToggleYolo),
+            SlashCommand::MemoryOff => Some(SendAction::MemoryOff),
+            SlashCommand::Sleep => Some(SendAction::Sleep),
+            SlashCommand::SleepOff => Some(SendAction::Wake),
+            SlashCommand::Context => Some(SendAction::ContextReport),
+            SlashCommand::Usage => Some(SendAction::UsageReport),
+            SlashCommand::ContextDump => Some(SendAction::ContextDump),
+            SlashCommand::Bug => Some(SendAction::BugReport),
+            SlashCommand::Mcp => {
                 self.mode = AppMode::McpManage;
                 None
             }
-            "/ssh" => {
+            SlashCommand::Ssh => {
                 self.mode = AppMode::SshManage;
                 None
             }
-            "/permission" => {
+            SlashCommand::Cloud => {
+                self.cloud_login = None;
+                self.mode = AppMode::CloudManage;
+                None
+            }
+            SlashCommand::Permission => {
                 self.open_permission_gate();
                 None
             }
-            "/skill" => {
+            SlashCommand::Skill => {
                 let tx = self.event_tx.clone();
                 let may_dir = self.session_manager.may_dir().to_path_buf();
                 let profile_id = self
@@ -3468,7 +3930,6 @@ impl App {
                 self.set_status("Loading skills...");
                 None
             }
-            _ => None,
         }
     }
 
@@ -3507,11 +3968,10 @@ impl App {
 
     /// Apply a queued paste to the UI.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TuiError`] when an attachment-bound paste fails to save or
-    /// the result carries a clipboard failure.
-    pub async fn handle_pending_paste(&mut self, paste: PendingPaste) -> AppResult<()> {
+    /// A paste that cannot be applied (the attachment fails to save, a
+    /// manager is missing) is logged and shown as an error in the chat; the
+    /// client keeps running.
+    pub async fn handle_pending_paste(&mut self, paste: PendingPaste) {
         match paste {
             PendingPaste::Input(text) => {
                 // Clear the "Reading clipboard..." notice: attachment-bound
@@ -3519,9 +3979,14 @@ impl App {
                 // input leaves none behind.
                 self.status = None;
                 self.handle_bracketed_paste(text);
-                Ok(())
             }
-            PendingPaste::Attachment(result) => self.handle_paste_result(result).await,
+            PendingPaste::Attachment(result) => {
+                if let Err(error) = self.handle_paste_result(result).await {
+                    tracing::warn!(%error, "failed to apply a paste");
+                    self.status = None;
+                    self.chat.push_error(&format!("Paste failed: {error}"));
+                }
+            }
         }
     }
 
@@ -3571,12 +4036,12 @@ impl App {
             // terminal paste; only large or multiline text needs an
             // attachment (and its file).
             if !matches!(self.mode, AppMode::Chat)
-                || (!text.contains('\n') && text.len() <= LARGE_PASTE_THRESHOLD)
+                || (!text.contains('\n') && !pasted_text::is_large(&text))
             {
                 self.handle_bracketed_paste(text);
                 return Ok(());
             }
-            let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
+            let saved_path = if pasted_text::is_large(&text) {
                 let manager = self
                     .text_manager
                     .as_mut()
@@ -3644,14 +4109,23 @@ impl App {
     /// environment, and show a running terminal block for it.
     fn submit_bash(&mut self) -> Option<SendAction> {
         let command = self.input[1..].trim().to_string();
-        self.input.clear();
-        self.cursor = 0;
-        self.input_char_count = 0;
         if command.is_empty() {
+            self.input.clear();
+            self.cursor = 0;
             return None;
         }
-
-        let (masked, had_secret) = self.secrets.mask(&command);
+        // Without the stored secrets nothing can be masked: the command is
+        // neither run nor recorded, and stays in the input.
+        let secrets = match &self.secrets {
+            Ok(secrets) => secrets.clone(),
+            Err(error) => {
+                self.chat.push_error(&error.to_string());
+                return None;
+            }
+        };
+        self.input.clear();
+        self.cursor = 0;
+        let (masked, had_secret) = secrets.mask(&self.secret_patterns, &command);
         self.history.push(format!("! {masked}"));
         self.history.save();
         if had_secret {
@@ -3664,7 +4138,10 @@ impl App {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: format!("! {masked}"),
-                mode: aither_sandbox::TerminalExecutionMode::Unsafe,
+                mode: aither_sandbox::SandboxMode::Unsandboxed,
+                location: None,
+                reading: None,
+                card: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -3675,6 +4152,7 @@ impl App {
         Some(SendAction::RunBash {
             call_id: id,
             command,
+            secrets,
         })
     }
 
@@ -3684,7 +4162,6 @@ impl App {
     fn submit_secret(&mut self) -> Option<SendAction> {
         let line = std::mem::take(&mut self.input);
         self.cursor = 0;
-        self.input_char_count = 0;
         let rest = line.trim_start()["/secret".len()..].trim();
         let Some((key, value)) = rest.split_once(char::is_whitespace) else {
             self.chat
@@ -3715,19 +4192,17 @@ impl App {
         let content = std::mem::take(&mut self.input);
         let attachments = std::mem::take(&mut self.attachments);
         self.cursor = 0;
-        self.input_char_count = 0;
-
         let trimmed = content.trim();
-        if trimmed == "/context" && attachments.is_empty() {
+        if trimmed == SlashCommand::Context.name() && attachments.is_empty() {
             return Some(SendAction::ContextReport);
         }
-        if trimmed == "/context dump" && attachments.is_empty() {
+        if trimmed == SlashCommand::ContextDump.name() && attachments.is_empty() {
             return Some(SendAction::ContextDump);
         }
-        if trimmed == "/bug" && attachments.is_empty() {
+        if trimmed == SlashCommand::Bug.name() && attachments.is_empty() {
             return Some(SendAction::BugReport);
         }
-        if let Some(rest) = trimmed.strip_prefix("/compact")
+        if let Some(rest) = trimmed.strip_prefix(SlashCommand::Compact.name())
             && attachments.is_empty()
         {
             let focus = rest.trim();
@@ -3747,9 +4222,12 @@ impl App {
             return Some(SendAction::RulesImport(source));
         }
         for (cmd, source) in [
-            ("/resume-codex", crate::session::import::ForeignAgent::Codex),
             (
-                "/resume-claude",
+                SlashCommand::ResumeCodex.name(),
+                crate::session::import::ForeignAgent::Codex,
+            ),
+            (
+                SlashCommand::ResumeClaude.name(),
                 crate::session::import::ForeignAgent::Claude,
             ),
         ] {
@@ -3765,7 +4243,7 @@ impl App {
         // `/connect` opens the picker; `/connect <command> [args…]` connects
         // that command directly.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/connect")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Connect.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             if rest.trim().is_empty() {
@@ -3781,16 +4259,52 @@ impl App {
         // `/model` opens the picker and `/model <query>` searches it —
         // either way the line is a command, never a message to the agent.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/model")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Model.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             return self.open_model_select(rest.trim());
         }
+        // `/btw` opens the side-question overlay and `/btw <question>`
+        // asks it at once — either way the line is a command, never a
+        // message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Btw.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let question = rest.trim();
+            self.open_btw();
+            if !question.is_empty()
+                && let AppMode::Btw(state) = &mut self.mode
+            {
+                state.input = question.to_string();
+                self.submit_btw();
+            }
+            return None;
+        }
+        // `/new <owner/repo|path>` starts the next session directly on that
+        // repository, like `may --repo`; plain `/new` is handled by the menu.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::New.name())
+            && rest.starts_with(char::is_whitespace)
+            && !rest.trim().is_empty()
+        {
+            self.session_manager
+                .set_launch(crate::session::SessionLaunch::Repo(rest.trim().to_string()));
+            return Some(SendAction::NewSession);
+        }
+        // `/progress` is a side request too: never a message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Progress.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.open_progress();
+            return None;
+        }
 
-        self.last_sent_input = Some(content.clone());
+        self.sent_hidden_context = self.rewind_notice.take();
         let msg = PendingMessage {
             content,
-            hidden_context_xml: self.rewind_notice.take(),
+            hidden_context_xml: self.sent_hidden_context.clone(),
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
@@ -3804,23 +4318,28 @@ impl App {
         }
     }
 
-    /// A turn stopped before its first agent event puts the sent message
-    /// back into the input box — the usual "I sent a typo" recovery.
-    pub fn restore_aborted_draft(&mut self) {
-        if self.turn_had_output {
-            return;
-        }
-        if let Some(draft) = self.last_sent_input.take() {
-            self.input_char_count = draft.chars().count();
-            self.cursor = self.input_char_count;
-            self.input = draft;
+    /// The daemon withdrew the latest turn, stopped before any tool call or
+    /// response text: its message and the turn's markers leave the chat.
+    /// The client that sent it gets its text and attachments back in the
+    /// input — the usual "I sent a typo" recovery. The session history is
+    /// reloaded without the message.
+    pub fn withdraw_turn(&mut self, content: String, own: bool) {
+        let attachments = self.chat.withdraw_last_prompt(&content);
+        if own {
+            // The withdrawn message took its hidden context with it; a
+            // rewind since then supersedes it.
+            if self.rewind_notice.is_none() {
+                self.rewind_notice = self.sent_hidden_context.take();
+            }
+            self.cursor = content.len();
+            self.input = content;
+            self.attachments = attachments.unwrap_or_default();
         }
     }
 
     /// Called when starting to process a message.
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
-        self.turn_had_output = false;
         self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
@@ -3888,10 +4407,9 @@ impl App {
             .session_paths(session.id.as_str(), session.profile_id.as_deref());
         match paths.tasks_content().await {
             Ok(content) => {
-                let checklist = crate::todo_parser::TodoChecklist::parse(
+                self.chat.set_todos(crate::task_rows::task_rows(
                     content.as_deref().unwrap_or_default(),
-                );
-                self.chat.set_todos(checklist.items);
+                ));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
@@ -3899,26 +4417,30 @@ impl App {
         }
     }
 
-    /// Fetch the current session's PRs for the sidebar from the daemon
-    /// (`GET /api/sessions/{id}/prs`); the answer arrives as
-    /// [`AppEvent::SidebarPrs`].
+    /// Fetch the session/repo/orphaned PRs for the sidebar from the daemon
+    /// (`GET /api/prs?forSession={id}` or `/api/prs?orphaned=true&state=open`);
+    /// the answer arrives as [`AppEvent::SidebarPrs`].
     pub fn request_sidebar_prs(&mut self) {
-        let Some(session_id) = self
-            .session_manager
-            .current()
-            .map(|session| session.id.as_str().to_string())
-        else {
-            return;
-        };
         let Some(client) = self.btw_daemon.clone() else {
             return;
         };
+        let session_id = self
+            .session_manager
+            .current()
+            .filter(|session| session.persisted)
+            .map(|session| session.id.as_str().to_string());
+        let path = session_id.as_deref().map_or_else(
+            || "/api/prs?orphaned=true&state=open".to_string(),
+            |id| {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                query.append_pair("forSession", id);
+                format!("/api/prs?{}", query.finish())
+            },
+        );
+        let session_id = session_id.unwrap_or_default();
         let tx = self.event_tx.clone();
         spawn(async move {
-            match client
-                .get::<Vec<crate::client::WirePr>>(&format!("/api/sessions/{session_id}/prs"))
-                .await
-            {
+            match client.get::<Vec<crate::client::WirePr>>(&path).await {
                 Ok(prs) => {
                     let _ = tx.send(AppEvent::SidebarPrs { session_id, prs }).await;
                 }
@@ -3926,7 +4448,43 @@ impl App {
                     tracing::debug!(%error, "sidebar: failed to fetch PRs");
                 }
             }
-        });
+        })
+        .detach();
+    }
+
+    fn trigger_sidebar_pr_action(&self, action: crate::tui::sidebar::SidebarPrAction) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let (pr_id, op) = match action {
+            crate::tui::sidebar::SidebarPrAction::Merge(id) => (id, "merge"),
+            crate::tui::sidebar::SidebarPrAction::Close(id) => (id, "close"),
+        };
+        let session_id = self
+            .session_manager
+            .current()
+            .map_or_default(|session| session.id.as_str().to_string());
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let path = format!("/api/prs/{pr_id}/{op}");
+            match client
+                .post::<_, crate::daemon::types::ApiPr>(&path, &serde_json::json!({}))
+                .await
+            {
+                Ok(_) => {
+                    let _ = tx.send(AppEvent::PrsInvalidated).await;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(AppEvent::Warning {
+                            session_id,
+                            message: format!("Failed to {op} PR: {error}"),
+                        })
+                        .await;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Fetch the current session's `tasks.md` for the sidebar from the
@@ -4073,10 +4631,15 @@ impl App {
                 description,
                 script,
                 mode,
+                location,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
+                location,
+                // The daemon's reading arrives right after the start.
+                reading: None,
+                card: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4111,15 +4674,39 @@ impl App {
                 output: None,
                 pinned: None,
             },
+            ToolStartKind::Malformed {
+                name,
+                arguments,
+                error,
+            } => {
+                let mut detail = vec![format!("invalid arguments: {error}")];
+                detail.extend(pretty_arguments(&arguments));
+                ToolDisplay::Action {
+                    chip: name,
+                    task_id: None,
+                    summary: "invalid arguments".to_string(),
+                    detail,
+                    status: super::ui::chat::ToolStatus::Failed(format!(
+                        "invalid arguments: {error}"
+                    )),
+                    output: None,
+                    pinned: None,
+                }
+            }
             ToolStartKind::Generic {
                 name,
                 summary,
                 arguments,
             } => ToolDisplay::Action {
+                // A compaction takes no arguments and has nothing to expand.
+                detail: if name == super::agent_event_adapter::COMPACT_TOOL {
+                    Vec::new()
+                } else {
+                    pretty_arguments(&arguments)
+                },
                 chip: name,
                 task_id: None,
                 summary,
-                detail: pretty_arguments(&arguments),
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
@@ -4127,15 +4714,27 @@ impl App {
         }
     }
 
+    /// The model response in flight is being sent again: drop what it
+    /// streamed, which the replacement does not continue.
+    pub fn retract_response(&mut self) {
+        self.chat.retract_response();
+        self.pending_tool_calls.retain(|_, pending| pending.started);
+        self.thinking_start = None;
+    }
+
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
+            // A subagent's events ride its parent's stream; its own views
+            // show them.
+            Ok(TimedEvent { agent, .. }) if !agent.is_main() => false,
             Ok(TimedEvent { event, .. }) => {
-                // Any event from the agent stream counts as the turn having
-                // acted — a stop before this point restores the sent draft.
-                self.turn_had_output = true;
                 match event {
-                    AgentEvent::Text(chunk) => {
+                    AgentEvent::BlockDelta {
+                        kind: OutputKind::Text,
+                        text: chunk,
+                        ..
+                    } => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.chat.collapse_thinking();
                         self.thinking_start = None;
@@ -4143,10 +4742,11 @@ impl App {
                         self.chat.push_text(&chunk);
                         self.input_visible = true;
                     }
-                    AgentEvent::ReplyTranslated { text, language } => {
-                        self.chat.set_translation(text, &language);
-                    }
-                    AgentEvent::Reasoning(chunk) => {
+                    AgentEvent::BlockDelta {
+                        kind: OutputKind::Reasoning,
+                        text: chunk,
+                        ..
+                    } => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
                         self.decode_meter.note_output(chunk.len());
                         if self.thinking_start.is_none() {
@@ -4159,10 +4759,12 @@ impl App {
                         }
                     }
                     AgentEvent::ToolCallDelta {
-                        id,
+                        call,
                         name,
                         arguments_fragment,
+                        ..
                     } => {
+                        let id = call.as_str().to_owned();
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.decode_meter.note_output(arguments_fragment.len());
                         let kind = {
@@ -4189,11 +4791,35 @@ impl App {
                             self.chat.upsert_tool_display(id, display);
                         }
                     }
-                    AgentEvent::ToolCallStart {
-                        id,
+                    AgentEvent::ToolCallStarted {
+                        call,
                         name,
                         arguments,
+                        origin: ToolOrigin::Hosted,
+                        ..
                     } => {
+                        // Provider-hosted call (server-side web search etc.):
+                        // visible like a tool call, executed by the provider.
+                        let detail = arguments
+                            .as_str()
+                            .map_or_else(|| arguments.to_string(), str::to_owned);
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
+                        self.chat.collapse_thinking();
+                        self.chat.end_text();
+                        self.thinking_start = None;
+                        self.decode_meter.note_boundary();
+                        let id = call.as_str().to_owned();
+                        self.hosted_tool_calls.insert(id.clone(), name.clone());
+                        self.chat.push_builtin(id, name, detail);
+                    }
+                    AgentEvent::ToolCallStarted {
+                        call,
+                        name,
+                        arguments,
+                        ..
+                    } => {
+                        let id = call.as_str().to_owned();
+                        let arguments = arguments.to_string();
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.chat.collapse_thinking();
                         self.chat.end_text();
@@ -4212,46 +4838,44 @@ impl App {
                         }
                         self.show_tool_start(id, parse_tool_start(&name, &arguments));
                     }
-                    AgentEvent::ToolCallEnd { id, result, .. } => {
-                        // Back to waiting on the model for the next burst.
-                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
-                        self.show_tool_end(&id, &result);
-                        self.live_reads.remove(&id);
-                        self.pending_tool_calls.remove(&id);
-                        self.request_file_diff(&id);
-                        self.refresh_todos().await;
-                    }
-                    AgentEvent::BuiltInToolCall { id, tool, detail } => {
-                        // Provider-hosted call (server-side web search etc.):
-                        // visible like a tool call, executed by the provider.
-                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
-                        self.chat.collapse_thinking();
-                        self.chat.end_text();
-                        self.thinking_start = None;
-                        self.decode_meter.note_boundary();
-                        self.chat.push_builtin(id, tool, detail);
-                    }
-                    AgentEvent::BuiltInToolResult { id, tool, result } => {
-                        // The provider reports the call done; the model call
-                        // that follows is thinking again.
-                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
-                        self.decode_meter.note_boundary();
-                        self.chat.finish_builtin(&id, &tool, result);
+                    AgentEvent::ToolCallEnded { call, result, .. } => {
+                        let id = call.as_str().to_owned();
+                        if let Some(tool) = self.hosted_tool_calls.remove(&id) {
+                            // The provider reports the call done; the model
+                            // call that follows is thinking again.
+                            self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
+                            self.decode_meter.note_boundary();
+                            self.chat
+                                .finish_builtin(&id, &tool, result.render_for_model());
+                        } else {
+                            // Back to waiting on the model for the next burst.
+                            self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
+                            self.show_tool_end(&id, &result);
+                            self.live_reads.remove(&id);
+                            self.pending_tool_calls.remove(&id);
+                            self.request_file_diff(&id);
+                            self.refresh_todos().await;
+                        }
                     }
                     // A reply that ends without tool calls may be followed
                     // by another in the same run (the harness re-prompting,
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
-                    AgentEvent::TurnComplete {
-                        has_tool_calls: false,
-                        ..
-                    } => {
-                        self.chat.end_text();
-                        self.decode_meter.note_boundary();
+                    AgentEvent::TurnEnded { tool_calls, .. } => {
+                        if tool_calls == 0 {
+                            self.chat.end_text();
+                            self.decode_meter.note_boundary();
+                        }
+                        self.chat.seal_response();
                     }
-                    AgentEvent::Complete { .. } => {
-                        // Text was already streamed via AgentEvent::Text events
-                        // Just finalize the message
+                    // A failed run reports as the error it carries.
+                    AgentEvent::RunEnded {
+                        outcome: RunOutcome::Failed { .. },
+                        ..
+                    } => {}
+                    AgentEvent::RunEnded { .. } => {
+                        // Text was already streamed as block deltas; just
+                        // finalize the message.
                         self.chat.collapse_thinking();
                         self.chat.finish_running_calls();
                         self.chat.end_text();
@@ -4264,19 +4888,17 @@ impl App {
                         // Signal that processing is complete
                         return true;
                     }
-                    AgentEvent::Usage(u) => {
-                        self.decode_meter.note_usage(u.completion_tokens);
-                        // Accumulate token usage
-                        if let Some(ref mut usage) = self.usage {
-                            usage.accumulate(&u);
-                        } else {
-                            self.usage = Some(u);
-                        }
+                    AgentEvent::RequestEnded {
+                        usage: Some(usage), ..
+                    } => {
+                        self.decode_meter.note_usage(usage.completion_tokens);
+                        self.usage = Some(usage);
                     }
                     AgentEvent::CompactionRecovery {
                         error,
                         alerts_removed,
                         outputs_spilled,
+                        ..
                     } => {
                         self.chat
                             .push_compaction_recovery(&error, alerts_removed, outputs_spilled);
@@ -4326,8 +4948,8 @@ impl App {
         )
     }
 
-    /// Mirror the daemon's pending-message queue from the last
-    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// Mirror the daemon's pending-message queue from the last runtime
+    /// snapshot, so an enqueued message keeps a
     /// `[steer]`/`[queue]` preview until the turn it starts renders it.
     pub fn sync_queue_from_runtime(&mut self) {
         let runtime = &self.session_runtime;
@@ -4358,7 +4980,7 @@ impl App {
         self.current_effort
             .as_deref()
             .or(self.config.last_effort.as_deref())
-            .unwrap_or("medium")
+            .unwrap_or(crate::models::DEFAULT_EFFORT)
     }
 
     /// The effort rungs `/effort` offers for the current model: the
@@ -4388,7 +5010,11 @@ impl App {
         self.effort_ladder
             .iter()
             .position(|rung| *rung == self.effective_effort())
-            .or_else(|| self.effort_ladder.iter().position(|rung| *rung == "medium"))
+            .or_else(|| {
+                self.effort_ladder
+                    .iter()
+                    .position(|rung| *rung == crate::models::DEFAULT_EFFORT)
+            })
             .unwrap_or(0)
     }
 
@@ -4408,15 +5034,12 @@ impl App {
 
     /// Set the current model being used.
     pub fn set_current_model(&mut self, model: &str) {
-        self.current_model = Some(model.to_string());
-        // Also update context window from model info
-        let lookup_model = model.parse::<crate::ModelSelector>().map_or_else(
-            |_| model.to_string(),
-            |selector| crate::models::effort_family_base(selector.model_id()),
-        );
-        if let Some(info) = aither_models::lookup(&lookup_model) {
-            self.context_window = info.max_input_tokens();
+        // The window belongs to the model: the daemon sends the new one
+        // with the next usage.
+        if self.current_model.as_deref() != Some(model) {
+            self.context_window = None;
         }
+        self.current_model = Some(model.to_string());
     }
 
     /// Get context usage information for display.
@@ -4455,6 +5078,9 @@ pub enum SendAction {
     StopAgentAndQuit,
     /// User wants to create a new session.
     NewSession,
+    /// User wants a new session that runs entirely on a cloud machine of
+    /// this machine type.
+    NewCloudSession(String),
     /// User wants to load an existing session.
     LoadSession(SessionId),
     /// Send this message to the agent.
@@ -4465,6 +5091,8 @@ pub enum SendAction {
     Recap,
     /// Flip the session's yolo switch.
     ToggleYolo,
+    /// Turn memory off for the rest of this session (`/memory off`).
+    MemoryOff,
     /// Mark the user asleep for every session; this session's agent says
     /// good night.
     Sleep,
@@ -4475,6 +5103,9 @@ pub enum SendAction {
     /// Reload the session's history, which turns this client missed
     /// changed.
     ReloadHistory,
+    /// Raise a desktop notification through the terminal: a popup of some
+    /// session waits on the user.
+    DesktopNotification(Box<crate::notification::UserNotification>),
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
@@ -4568,6 +5199,11 @@ pub enum SendAction {
         /// Name of the SSH server to remove.
         name: String,
     },
+    /// Toggle an SSH server attachment on the active profile.
+    SshToggleAttachment {
+        /// Name of the SSH server to attach or detach.
+        name: String,
+    },
     /// Answer the launch-directory grant prompt.
     RespondLaunchGrant {
         /// The directory being decided.
@@ -4639,6 +5275,8 @@ pub enum SendAction {
         call_id: String,
         /// The raw command to execute.
         command: String,
+        /// The secrets the command runs with and its output is masked by.
+        secrets: crate::secrets::Secrets,
     },
     /// Store a secret in the OS keychain and refresh the session env file.
     StoreSecret {
@@ -4647,6 +5285,34 @@ pub enum SendAction {
         /// Secret value — never persisted to transcript or input history.
         value: String,
     },
+}
+
+/// How much of a tool call's output a `/btw` request carries, in characters.
+const BTW_OUTPUT_CHARS: usize = 600;
+
+/// A terminal call as the `/btw` request recounts it.
+#[derive(askama::Template)]
+#[template(path = "btw_terminal_call.txt", escape = "none")]
+struct BtwTerminalCall<'a> {
+    description: &'a str,
+    command: &'a str,
+    output_tail: Option<String>,
+}
+
+/// A labelled action call as the `/btw` request recounts it.
+#[derive(askama::Template)]
+#[template(path = "btw_action_call.txt", escape = "none")]
+struct BtwActionCall<'a> {
+    chip: &'a str,
+    summary: &'a str,
+    output_tail: Option<String>,
+}
+
+/// The leading part of a call's output, none when it printed nothing.
+fn btw_output_tail(output: Option<&super::ui::chat::TerminalCallInfo>) -> Option<String> {
+    output
+        .filter(|info| !info.output.is_empty())
+        .map(|info| info.output.chars().take(BTW_OUTPUT_CHARS).collect())
 }
 
 fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMessage {
@@ -4658,8 +5324,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 #[cfg(test)]
 mod tests {
-    use super::utf8_complete_len;
-    use super::{App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction};
+    use super::{
+        App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction, TimedEvent,
+    };
+    use super::{AppMode, ConfigEditMode, same_click_spot, utf8_complete_len};
     use crate::session::SessionManager;
     use crate::tui::ui::chat::ChatElement;
 
@@ -4670,7 +5338,7 @@ mod tests {
             .await
             .expect("session manager");
         let id = sessions
-            .create_session_in_profile(None, None)
+            .create_session_in_profile(crate::SessionId::from_string("amber-river"), None, None)
             .expect("session")
             .id
             .as_str()
@@ -4709,6 +5377,351 @@ mod tests {
             .draw(|frame| crate::tui::ui::render(frame, app))
             .expect("draw");
         crate::tui::ui::test_screen::buffer_screen(frame.buffer)
+    }
+
+    /// A `terminal` call whose arguments miss `script` shows as that call
+    /// with the invalid-arguments marker and the parse error, as a failed
+    /// call, and nothing panics.
+    #[tokio::test]
+    async fn a_terminal_call_with_malformed_arguments_renders_with_its_error() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for tool in ["terminal", "terminal_kill"] {
+            let kind =
+                crate::tui::agent_event_adapter::parse_tool_start(tool, r#"{"command":"ls"}"#);
+            app.show_tool_start(format!("call-{tool}"), kind);
+            let display = app.chat.get_tool(&format!("call-{tool}")).expect("shown");
+            let super::ToolDisplay::Action {
+                chip,
+                summary,
+                detail,
+                status,
+                ..
+            } = display
+            else {
+                panic!("malformed call renders as an action");
+            };
+            assert_eq!(chip, tool);
+            assert_eq!(summary, "invalid arguments");
+            assert!(detail[0].starts_with("invalid arguments: "), "{detail:?}");
+            assert!(
+                matches!(status, crate::tui::ui::chat::ToolStatus::Failed(error) if error.contains("missing field")),
+                "{status:?}"
+            );
+        }
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("invalid arguments"), "{screen}");
+    }
+
+    /// A pasted image that cannot be saved shows an error in the chat, is not
+    /// attached, and leaves the app running.
+    #[tokio::test]
+    async fn a_paste_that_fails_to_save_shows_an_error_and_keeps_running() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        // A session directory that is a file: the images directory cannot be created.
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").expect("file");
+        app.image_manager = Some(super::ImageManager::new(&not_a_directory));
+
+        let image = crate::tui::clipboard::ClipboardImage {
+            data: vec![1, 2, 3],
+            format: crate::tui::clipboard::ImageFormat::Png,
+        };
+        app.enqueue_clipboard_result(Ok(crate::tui::clipboard::ClipboardPasteResult::image(
+            image,
+        )));
+        let paste = app.dequeue_pending_paste().expect("queued paste");
+        app.handle_pending_paste(paste).await;
+
+        assert!(app.attachments.is_empty());
+        assert!(!app.quit_pending);
+        assert!(
+            app.chat.elements().iter().any(|element| matches!(
+                element,
+                ChatElement::Error { message } if message.starts_with("Paste failed: ")
+            )),
+            "{:?}",
+            app.chat.elements()
+        );
+    }
+
+    /// The Preferences tab lists the jobserver pool size (automatic until
+    /// set), Enter opens it for editing, and text that is not a positive
+    /// number leaves the edit open without changing the setting.
+    #[tokio::test]
+    async fn preferences_list_and_edit_the_job_pool_size() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.mode = crate::tui::AppMode::Config;
+        app.config_state.section = crate::tui::state::ConfigSection::Preferences;
+        app.config_state.selected = 3;
+
+        let auto = format!("auto ({})", crate::jobserver::default_pool_size());
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Job pool size"), "{screen}");
+        assert!(screen.contains(&auto), "{screen}");
+
+        app.config.sandbox.job_pool_size = std::num::NonZeroUsize::new(6);
+        let screen = session_screen(&mut app).join("\n");
+        assert!(!screen.contains("auto ("), "{screen}");
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("Job pool size") && line.contains('6')),
+            "{screen}"
+        );
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("enter");
+        assert_eq!(
+            app.config_state.edit_text().map(|(text, _)| text),
+            Some("6")
+        );
+
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .expect("backspace");
+        app.handle_key(KeyCode::Char('0'), KeyModifiers::NONE)
+            .expect("zero");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("save");
+        assert!(app.config_state.is_editing(), "zero is refused");
+        assert_eq!(
+            app.config.sandbox.job_pool_size,
+            std::num::NonZeroUsize::new(6)
+        );
+    }
+
+    const BLOCK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(40, 40, 48);
+    const BOX_DRAWING: [char; 8] = ['┌', '┐', '└', '┘', '─', '│', '╭', '╯'];
+
+    /// Draws `app` at `width`×`height`, returning the buffer.
+    fn draw_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw")
+            .buffer
+            .clone()
+    }
+
+    fn row_of(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// The jobs panel and the command list are filled blocks: the title is
+    /// the block's first row, no box-drawing character appears, and every
+    /// cell of the block carries the block colour.
+    #[tokio::test]
+    async fn popups_are_filled_blocks_without_borders() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+
+        app.mode = crate::tui::AppMode::Jobs;
+        let buffer = draw_buffer(&mut app, 100, 30);
+        let title = (0..30)
+            .find(|&y| row_of(&buffer, y).contains("Jobs & subagents"))
+            .expect("the panel title row");
+        let panel_rows = title..title + 6;
+        for y in panel_rows {
+            let row = row_of(&buffer, y);
+            assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
+            assert!(
+                (1..99).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                "row {y} is filled: {row:?}"
+            );
+        }
+        assert!(
+            row_of(&buffer, title).trim_start().starts_with("Jobs"),
+            "the title is inside the block"
+        );
+
+        app.mode = crate::tui::AppMode::Chat;
+        app.completion.start_slash("");
+        let buffer = draw_buffer(&mut app, 100, 30);
+        let title = (0..30)
+            .find(|&y| row_of(&buffer, y).contains("Commands"))
+            .expect("the list title row");
+        let help = (title..30)
+            .find(|&y| row_of(&buffer, y).contains("/help"))
+            .expect("a command row");
+        for y in title..=help {
+            let row = row_of(&buffer, y);
+            assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
+        }
+        assert!(
+            (title..=help)
+                .any(|y| (1..99).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue)),
+            "the selected row is shown by its background"
+        );
+    }
+
+    /// The sidebar is one block: no divider column, its whole area filled
+    /// with the block colour, which the chat beside it does not use.
+    #[tokio::test]
+    async fn the_sidebar_is_a_filled_block_without_a_divider() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+        let (width, height) = (160u16, 30u16);
+        assert!(app.sidebar.visible_at(width));
+        let buffer = draw_buffer(&mut app, width, height);
+        let sidebar_width = crate::tui::sidebar::SidebarState::width_for(width);
+        let left = width - sidebar_width;
+        for y in 0..height {
+            assert!(
+                (left..width).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                "sidebar row {y} is filled"
+            );
+            assert!(
+                (left..width).all(|x| !BOX_DRAWING
+                    .contains(&buffer[(x, y)].symbol().chars().next().unwrap_or(' '))),
+                "no divider on row {y}: {:?}",
+                row_of(&buffer, y)
+            );
+        }
+        // Inner padding: the first column of the block stays empty.
+        assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
+        // The chat beside it is not painted with the block colour.
+        assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+    }
+
+    fn sidebar_screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = draw_buffer(app, width, height);
+        let left = width - crate::tui::sidebar::SidebarState::width_for(width);
+        (0..height)
+            .map(|y| {
+                // A wide glyph owns the cell after it too.
+                let mut row = String::new();
+                let mut x = left;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1))
+                        .expect("width");
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn doing(app: &mut App, rows: &[String]) {
+        let content = format!("## Doing\n{}\n", rows.join("\n"));
+        app.sidebar.set_tasks("s", Some(&content));
+    }
+
+    /// Content taller than the window scrolls, with a marker for what is off
+    /// screen, and every entry is reachable.
+    #[tokio::test]
+    async fn an_overflowing_sidebar_scrolls_and_says_what_is_off_screen() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..40).map(|n| format!("- task number {n}")).collect();
+        doing(&mut app, &rows);
+
+        let first = sidebar_screen(&mut app, 160, 20);
+        assert!(first.contains("task number 0"), "{first}");
+        assert!(!first.contains("task number 39"), "{first}");
+        assert!(first.contains('↓'), "more below is marked: {first}");
+        assert!(!first.contains('↑'), "nothing above yet: {first}");
+        assert!(app.sidebar.scrollable());
+
+        app.sidebar.scroll_down(usize::MAX);
+        let last = sidebar_screen(&mut app, 160, 20);
+        assert!(last.contains("task number 39"), "{last}");
+        assert!(!last.contains("task number 0\n"), "{last}");
+        assert!(last.contains('↑'), "more above is marked: {last}");
+        assert!(!last.contains('↓'), "nothing below at the end: {last}");
+
+        app.sidebar.scroll_up(usize::MAX);
+        assert!(sidebar_screen(&mut app, 160, 20).contains("task number 0"));
+    }
+
+    /// The wheel over the sidebar scrolls it, not the chat.
+    #[tokio::test]
+    async fn the_wheel_over_the_sidebar_scrolls_the_sidebar() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..40).map(|n| format!("- task number {n}")).collect();
+        doing(&mut app, &rows);
+        let _ = draw_buffer(&mut app, 160, 20);
+        let wheel = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 150,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel).expect("mouse");
+        assert_eq!(app.sidebar.scroll, 3);
+    }
+
+    /// A task row with a detail shows it once clicked; a folded section hides
+    /// its rows.
+    #[tokio::test]
+    async fn clicking_expands_a_task_detail_and_folds_a_section() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        doing(
+            &mut app,
+            &["- 实现侧边栏滚动\n  详细说明在这里".to_string()],
+        );
+        let (width, height) = (160u16, 20u16);
+
+        let folded = sidebar_screen(&mut app, width, height);
+        assert!(folded.contains("实现侧边栏滚动"), "{folded}");
+        assert!(!folded.contains("详细说明在这里"), "{folded}");
+
+        let click = |row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 150,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let row_of_text = |screen: &str, needle: &str| {
+            u16::try_from(
+                screen
+                    .lines()
+                    .position(|line| line.contains(needle))
+                    .expect("row on screen"),
+            )
+            .expect("row")
+        };
+        app.handle_mouse(click(row_of_text(&folded, "实现侧边栏滚动")))
+            .expect("mouse");
+        let open = sidebar_screen(&mut app, width, height);
+        assert!(open.contains("详细说明在这里"), "{open}");
+
+        app.handle_mouse(click(row_of_text(&open, "Doing")))
+            .expect("mouse");
+        let closed = sidebar_screen(&mut app, width, height);
+        assert!(closed.contains("▸ Doing"), "{closed}");
+        assert!(!closed.contains("实现侧边栏滚动"), "{closed}");
+    }
+
+    /// `… N more` lists the rest; CJK titles keep their width.
+    #[tokio::test]
+    async fn expand_all_reveals_every_detail_and_keeps_cjk_rows_whole() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..3)
+            .map(|n| format!("- 任务{n}：渲染终端界面とレイアウト한국어\n  第{n}个细节"))
+            .collect();
+        doing(&mut app, &rows);
+        let before = sidebar_screen(&mut app, 160, 30);
+        assert!(!before.contains("第1个细节"), "{before}");
+        app.handle_key(KeyCode::Char('e'), KeyModifiers::ALT)
+            .expect("key");
+        let after = sidebar_screen(&mut app, 160, 30);
+        for n in 0..3 {
+            assert!(after.contains(&format!("第{n}个细节")), "{after}");
+        }
+        assert!(after.contains("任务0"), "{after}");
     }
 
     #[tokio::test]
@@ -4752,6 +5765,40 @@ mod tests {
         app.handle_key(code, KeyModifiers::NONE).expect("key")
     }
 
+    /// A withdrawn message takes its hidden context with it; the sender puts
+    /// the rewind notice back so the message it sends again carries it.
+    #[tokio::test]
+    async fn a_withdrawn_message_returns_its_rewind_notice_to_the_sender() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let text = "你好 こんにちは 안녕하세요";
+        let notice = crate::xml::XmlBlock::parse("The conversation was rewound.".to_string())
+            .expect("notice parses");
+        app.rewind_notice = Some(notice.clone());
+        for c in text.chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let Some(SendAction::Send(sent)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the message");
+        };
+        assert_eq!(sent.hidden_context_xml, Some(notice.clone()));
+        assert!(app.rewind_notice.is_none(), "the send took the notice");
+
+        // Another client's withdrawn turn leaves this client's state alone.
+        app.withdraw_turn("someone else's".to_string(), false);
+        assert!(app.rewind_notice.is_none());
+
+        app.withdraw_turn(text.to_string(), true);
+        assert_eq!(app.input, text);
+        assert_eq!(app.rewind_notice, Some(notice.clone()));
+
+        let Some(SendAction::Send(again)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the restored message");
+        };
+        assert_eq!(again.content, text);
+        assert_eq!(again.hidden_context_xml, Some(notice));
+    }
+
     #[tokio::test]
     async fn an_unbound_modified_character_is_not_text() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4775,6 +5822,25 @@ mod tests {
             .expect("key");
         press(&mut app, KeyCode::Char('b'));
         assert_eq!(app.input, "Ab", "plain and shifted characters still type");
+    }
+
+    /// An Enter carrying Ctrl or Cmd is a link-open request, not a submit:
+    /// with no link under the pointer it does nothing.
+    #[tokio::test]
+    async fn a_modified_enter_never_sends() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for c in "draft".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
+            assert!(
+                app.handle_key(KeyCode::Enter, modifier)
+                    .expect("key")
+                    .is_none()
+            );
+        }
+        assert_eq!(app.input, "draft", "a modified Enter sends nothing");
     }
 
     #[tokio::test]
@@ -4846,6 +5912,128 @@ mod tests {
             })
     }
 
+    fn probed_server(name: &str) -> crate::config::SshServerConfig {
+        crate::config::SshServerConfig {
+            name: name.to_string(),
+            target: "me@example.test".to_string(),
+            platform: crate::config::SshPlatformConfig {
+                os: "Linux".to_string(),
+                arch: "x86_64".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_ssh_probe_saves_the_server_and_selects_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.config.upsert_ssh_server(probed_server("first"));
+        app.set_persistent_status("Probing SSH server: second");
+
+        let save = app.ssh_probed("second", Ok(probed_server("second")));
+
+        assert!(save, "a probed server must be saved");
+        assert_eq!(app.config.ssh_servers.len(), 2);
+        assert_eq!(app.config.ssh_servers[1].name, "second");
+        assert_eq!(app.ssh_selected, 1);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Added SSH server: second")
+        );
+        assert_eq!(last_error(&app), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_ssh_probe_shows_the_error_and_saves_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.set_persistent_status("Probing SSH server: down");
+
+        let save = app.ssh_probed("down", Err("connection timed out".to_string()));
+
+        assert!(!save);
+        assert_eq!(app.config.ssh_servers.len(), 0);
+        assert!(app.status.is_none());
+        assert_eq!(
+            last_error(&app),
+            Some("Failed to add SSH server down: connection timed out")
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_popup_toggles_per_profile_attachment_and_renders_checkboxes() {
+        use crossterm::event::KeyCode;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.config.upsert_ssh_server(probed_server("prod"));
+        app.config.upsert_ssh_server(probed_server("staging"));
+        app.profiles = vec![
+            crate::ProfileInfo::from_db_parts(
+                crate::db::entity::profiles::Model {
+                    id: "prof-1".to_string(),
+                    slug: Some("default".to_string()),
+                    name: "Default".to_string(),
+                    icon: None,
+                    environment: "local".to_string(),
+                    container_id: None,
+                    persona: None,
+                    location_aware: false,
+                    pinned_limit: 10,
+                    sort_order: 0,
+                    created_at: "2026-03-24T00:00:00Z".to_string(),
+                    updated_at: "2026-03-24T00:00:00Z".to_string(),
+                },
+                None,
+                vec!["prod".to_string()],
+                crate::cloud::ProfileCloud::default(),
+            )
+            .expect("profile"),
+        ];
+        app.current_profile_id = Some("prof-1".to_string());
+        app.mode = AppMode::SshManage;
+        app.ssh_selected = 1;
+
+        let render_popup = |app: &mut App| -> String {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("term");
+            terminal
+                .draw(|frame| crate::tui::ui::render(frame, app))
+                .expect("draw");
+            let buf = terminal.backend().buffer();
+            (0..20)
+                .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let before = render_popup(&mut app);
+        assert!(before.contains("[x] prod"), "{before}");
+        assert!(before.contains("[ ] staging"), "{before}");
+        assert!(before.contains("[Space] Toggle"), "{before}");
+
+        let action = crate::tui::reducer::manage::handle_ssh_key(&mut app, KeyCode::Char(' '));
+        assert!(matches!(
+            action,
+            Some(SendAction::SshToggleAttachment { ref name }) if name == "staging"
+        ));
+        let (profile_id, updated, attached) =
+            app.toggle_ssh_attachment("staging").expect("toggled");
+        assert_eq!(profile_id, "prof-1");
+        assert!(attached);
+        assert_eq!(updated, vec!["prod".to_string(), "staging".to_string()]);
+
+        let after_attach = render_popup(&mut app);
+        assert!(after_attach.contains("[x] prod"), "{after_attach}");
+        assert!(after_attach.contains("[x] staging"), "{after_attach}");
+
+        app.prune_ssh_attachment("prod");
+        assert_eq!(
+            app.current_profile().expect("profile").remote_attachments,
+            vec!["staging".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn a_refused_daemon_request_is_a_chat_error_not_a_failure() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4911,7 +6099,7 @@ mod tests {
         let action = press(&mut app, KeyCode::Tab);
         assert!(action.is_none(), "accepting never submits");
         assert_eq!(app.input, "run the tests");
-        assert_eq!(app.cursor, app.input_char_count);
+        assert_eq!(app.cursor, app.input.len());
         assert!(app.prompt_suggestion.is_none(), "consumed");
         press(&mut app, KeyCode::Char('!'));
         assert_eq!(app.input, "run the tests!", "the lifted text is editable");
@@ -4968,6 +6156,212 @@ mod tests {
         ));
     }
 
+    /// A reload shows an edit's diff from the reading the daemon served with
+    /// the history; the client does not parse the script again.
+    #[tokio::test]
+    async fn a_reloaded_edit_shows_the_reading_the_daemon_served() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let script =
+            "apply_patch <<'P'\n*** Begin Patch\n*** Add File: b.txt\n+one\n*** End Patch\nP\n";
+        let arguments = serde_json::json!({ "description": "add b", "script": script }).to_string();
+        let start = crate::session::ToolEventRecord::Start {
+            id: "c1".to_string(),
+            name: "terminal".to_string(),
+            arguments: arguments.clone(),
+            reading: None,
+        };
+        let mut served = crate::ChatMessage::user(serde_json::to_string(&start).expect("start"));
+        served.role = MessageRole::Tool;
+        // As the daemon attaches it when it serves the history.
+        served.reading = Some(crate::command_reading::CommandReading::of(script));
+        app.render_history(&[crate::ChatMessage::user("hi"), served])
+            .await;
+        let Some(ChatElement::ToolCall {
+            display: crate::tui::ui::chat::ToolDisplay::Terminal { reading, .. },
+            ..
+        }) = app
+            .chat
+            .elements()
+            .iter()
+            .find(|element| matches!(element, ChatElement::ToolCall { .. }))
+        else {
+            panic!("the stored call is shown");
+        };
+        assert!(
+            reading
+                .as_ref()
+                .is_some_and(crate::command_reading::CommandReading::recognises_any)
+        );
+    }
+
+    /// A session reloaded from the daemon's transcript shows the step lines
+    /// of a past call, from the reading the transcript entry carries.
+    #[tokio::test]
+    async fn a_reloaded_transcript_call_shows_its_step_lines() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let script = "cat src/lib.rs | head -n 5";
+        let reading = crate::command_reading::CommandReading::of(script);
+        let entries = vec![
+            crate::client::WireTranscriptEntry::User {
+                id: "1".into(),
+                timestamp: None,
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "2".into(),
+                timestamp: None,
+                call_id: "c1".into(),
+                name: "terminal".into(),
+                arguments: serde_json::json!({ "description": "look", "script": script })
+                    .to_string(),
+                status: "running".into(),
+                result: None,
+                reading: Some(reading.clone()),
+                card: None,
+            },
+        ];
+        let messages = crate::session::chat_messages_from_transcript(&entries);
+        app.render_history(&messages).await;
+        let Some(ChatElement::ToolCall {
+            display: crate::tui::ui::chat::ToolDisplay::Terminal { reading: shown, .. },
+            ..
+        }) = app
+            .chat
+            .elements()
+            .iter()
+            .find(|element| matches!(element, ChatElement::ToolCall { .. }))
+        else {
+            panic!("the stored call is shown");
+        };
+        assert_eq!(shown.as_ref(), Some(&reading));
+        assert!(reading.recognises_any());
+    }
+
+    #[tokio::test]
+    async fn the_status_window_is_the_one_the_daemon_sent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        app.usage = Some(aither_core::llm::Usage {
+            prompt_tokens: Some(1_000),
+            ..aither_core::llm::Usage::default()
+        });
+        // A model the table lacks: the client looks nothing up.
+        app.set_current_model("relay::relay-only-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "no window before the daemon sends one"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: "another-session".to_string(),
+            window: 1,
+        })
+        .expect("window frame");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "another session's window is ignored"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: id,
+            window: 262_144,
+        })
+        .expect("window frame");
+        assert_eq!(app.context_usage(), Some((1_000, 262_144)));
+
+        app.set_current_model("relay::another-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "a new model drops the old window"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_context_meter_follows_a_compaction_and_returns_to_the_usage() {
+        use crate::client::CompactionPhase;
+        use crate::tui::state::{COMPACTED_HOLD, CompactionMeter};
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        let frame = |session_id: &str, phase| AppEvent::Compaction {
+            session_id: session_id.to_string(),
+            phase,
+        };
+        assert_eq!(app.compaction, CompactionMeter::Idle);
+
+        app.handle_event(frame("another-session", CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Idle, "another session");
+
+        app.handle_event(frame(&id, CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Compacting);
+
+        app.handle_event(frame(&id, CompactionPhase::Applied))
+            .expect("frame");
+        let CompactionMeter::Compacted { until } = app.compaction else {
+            panic!(
+                "a finished compaction reads Compacted: {:?}",
+                app.compaction
+            );
+        };
+
+        let start = until.checked_sub(COMPACTED_HOLD).expect("hold start");
+        app.compaction
+            .clear_expired(start + COMPACTED_HOLD.mul_f32(0.5));
+        assert!(app.compaction.is_holding(), "held for the whole hold");
+        app.compaction.clear_expired(until);
+        assert_eq!(app.compaction, CompactionMeter::Idle);
+
+        // A compaction that changed nothing restores the usage figure.
+        for ended in [
+            CompactionPhase::NothingToCompact,
+            CompactionPhase::Failed,
+            CompactionPhase::Discarded,
+        ] {
+            app.handle_event(frame(&id, CompactionPhase::Started))
+                .expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Compacting);
+            app.handle_event(frame(&id, ended)).expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Idle, "{ended:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_events_keep_the_latest_request_not_their_sum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let usage = |prompt_tokens| {
+            let usage = aither_core::llm::Usage {
+                prompt_tokens: Some(prompt_tokens),
+                ..aither_core::llm::Usage::default()
+            };
+            Ok(serde_json::from_value::<TimedEvent>(serde_json::json!({
+                "at": "2026-11-07T00:00:00Z",
+                "agent": [],
+                "event": {"RequestEnded": {
+                    "request": 1,
+                    "usage": serde_json::to_value(usage).expect("usage"),
+                    "outcome": "Completed",
+                }},
+            }))
+            .expect("a timed event"))
+        };
+        app.handle_agent_event(usage(40_000)).await;
+        app.handle_agent_event(usage(45_000)).await;
+        assert_eq!(
+            app.usage.and_then(|u| u.prompt_tokens),
+            Some(45_000),
+            "each request resends the whole context, so prompt_tokens is \
+             the latest request's footprint, not a running total"
+        );
+    }
+
     #[tokio::test]
     async fn a_stored_recap_row_is_restored_as_a_card_when_history_reloads() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4985,6 +6379,66 @@ mod tests {
         assert!(matches!(
             app.chat.elements().last(),
             Some(ChatElement::Recap { summary, next_action: None }) if summary == "Where it stands."
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebuilt_history_never_stacks_worked_for_rows() {
+        use crate::ChatMessage;
+        use crate::session::ToolEventRecord;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let at = |second: i64| jiff::Timestamp::from_second(1_800_000_000 + second).expect("time");
+        let call = |id: &str, script: &str, second: i64| {
+            let start = ToolEventRecord::Start {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                arguments: serde_json::json!({ "description": script, "script": script })
+                    .to_string(),
+                reading: None,
+            };
+            let end = ToolEventRecord::End {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                result: aither_core::llm::ToolResult::text("done"),
+            };
+            [
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&start).expect("start"),
+                    at(second),
+                ),
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&end).expect("end"),
+                    at(second + 1),
+                ),
+            ]
+        };
+        // An interrupted turn with no reply, then a normal turn.
+        let rows: Vec<ChatMessage> = std::iter::once(ChatMessage::user("実行 运行 실행"))
+            .chain(call("terminal:0#a", "one", 2))
+            .chain(call("terminal:0#b", "two", 4))
+            .chain([ChatMessage::user("next")])
+            .chain(call("terminal:0#c", "three", 32))
+            .chain(call("terminal:0#d", "four", 40))
+            .chain([ChatMessage::assistant("done 完成 완료", at(50))])
+            .collect();
+        app.render_history(&rows).await;
+
+        let mut previous_row = false;
+        let mut rows_seen = 0;
+        for element in app.chat.elements() {
+            let is_row = matches!(element, ChatElement::WorkedFor { .. });
+            assert!(!(is_row && previous_row), "adjacent rows");
+            previous_row = is_row;
+            rows_seen += usize::from(is_row);
+        }
+        assert_eq!(rows_seen, 2);
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::AssistantText { .. })
         ));
     }
 
@@ -5008,6 +6462,7 @@ mod tests {
                 name: "terminal".to_string(),
                 arguments: serde_json::json!({ "description": script, "script": script })
                     .to_string(),
+                reading: None,
             };
             let end = ToolEventRecord::End {
                 id: id.to_string(),
@@ -5069,7 +6524,9 @@ mod tests {
                 })
                 .collect()
         };
-        let elements = app.chat.elements();
+        let all = app.chat.elements();
+        assert!(matches!(&all[0], ChatElement::Welcome { .. }));
+        let elements = &all[1..];
         assert_eq!(elements.len(), 6, "{elements:#?}");
         assert!(matches!(&elements[0], ChatElement::UserMessage { .. }));
         let ChatElement::WorkedFor {
@@ -5086,16 +6543,13 @@ mod tests {
             matches!(&elements[2], ChatElement::AssistantText { content, .. } if content == "None open.")
         );
         assert!(matches!(&elements[3], ChatElement::UserMessage { .. }));
-        let ChatElement::WorkedFor {
-            seconds,
-            elements: work,
-            ..
-        } = &elements[4]
-        else {
-            panic!("last turn is not folded: {:?}", elements[4]);
-        };
-        assert_eq!(*seconds, 10);
-        assert_eq!(commands(work), ["cat workspace.toml"]);
+        // A turn whose work is one command shows that command's own row.
+        assert_eq!(
+            commands(&elements[4..5]),
+            ["cat workspace.toml"],
+            "{:?}",
+            elements[4]
+        );
         assert!(
             matches!(&elements[5], ChatElement::AssistantText { content, .. } if content == "It is local.")
         );
@@ -5132,12 +6586,12 @@ mod tests {
         let runtime = crate::client::SessionRuntimeSnapshot {
             waiting_permission: id.map(|id| crate::client::PermissionPollItem {
                 id: id.to_string(),
-                request: crate::session::PersistedPermissionRequestPayload {
-                    mode: crate::PermissionRequestMode::Unsafe,
-                    script: "rm -rf build".to_string(),
-                    session_id: None,
-                    agent_id: None,
-                },
+                request: crate::session::PersistedPermissionRequestPayload::new(
+                    crate::PermissionRequestMode::Unsafe,
+                    "rm -rf build".to_string(),
+                    None,
+                    None,
+                ),
             }),
             ..Default::default()
         };
@@ -5172,6 +6626,115 @@ mod tests {
         );
     }
 
+    /// Every global shortcut that replaces the screen or the session.
+    fn mode_shortcuts() -> [KeyCode; 3] {
+        [KeyCode::Left, KeyCode::Char('n'), KeyCode::Char('p')]
+    }
+
+    /// Ctrl+Left, Ctrl+N and Ctrl+P leave an open permission dialog in
+    /// place, and the request is then answered.
+    #[tokio::test]
+    async fn global_shortcuts_keep_a_pending_permission_dialog() {
+        for shortcut in mode_shortcuts() {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _) = app_with_session(dir.path()).await;
+            app.handle_event(waiting_permission_snapshot(Some("p1")))
+                .expect("snapshot");
+            app.open_waiting_permission();
+            let action = app
+                .handle_key(shortcut, KeyModifiers::CONTROL)
+                .expect("key");
+            assert!(action.is_none(), "{shortcut:?} emits no action");
+            assert!(
+                matches!(app.mode, crate::tui::AppMode::PermissionConfirm(_)),
+                "{shortcut:?} dropped the permission dialog"
+            );
+            let answer = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(
+                    answer,
+                    Some(SendAction::RespondPermission { ref request_id, approved: true })
+                        if request_id == "p1"
+                ),
+                "{shortcut:?}: the request is answered"
+            );
+        }
+    }
+
+    /// The same for a workspace approval.
+    #[tokio::test]
+    async fn global_shortcuts_keep_a_pending_workspace_dialog() {
+        for shortcut in mode_shortcuts() {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _) = app_with_session(dir.path()).await;
+            app.mode =
+                crate::tui::AppMode::WorkspaceConfirm(crate::tui::state::WorkspaceConfirmState {
+                    request_id: "w1".to_string(),
+                    path: "/tmp/elsewhere".to_string(),
+                    reason: "build".to_string(),
+                    request: None,
+                });
+            let action = app
+                .handle_key(shortcut, KeyModifiers::CONTROL)
+                .expect("key");
+            assert!(action.is_none(), "{shortcut:?} emits no action");
+            assert!(
+                matches!(app.mode, crate::tui::AppMode::WorkspaceConfirm(_)),
+                "{shortcut:?} dropped the workspace dialog"
+            );
+            let answer = press(&mut app, KeyCode::Esc);
+            assert!(
+                matches!(
+                    answer,
+                    Some(SendAction::RespondWorkspace { ref request_id, approved: false, .. })
+                        if request_id == "w1"
+                ),
+                "{shortcut:?}: the request is answered"
+            );
+        }
+    }
+
+    /// The same for a question a run blocks on, shown from the runtime
+    /// snapshot.
+    #[tokio::test]
+    async fn global_shortcuts_keep_a_blocking_question_dialog() {
+        for shortcut in mode_shortcuts() {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _) = app_with_session(dir.path()).await;
+            let request = crate::session::PersistedAskUserRequest {
+                id: "q1".to_string(),
+                questions: vec![crate::session::PersistedAskUserQuestion {
+                    section: String::new(),
+                    question: "Which database?".to_string(),
+                    option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
+                    multi_select: false,
+                    secret: None,
+                }],
+            };
+            app.session_runtime.waiting_ask_user = Some(request.clone());
+            app.show_blocking_prompt(crate::tui::AppMode::AskUser(
+                crate::tui::AskUserState::for_open_question(request),
+            ));
+            let action = app
+                .handle_key(shortcut, KeyModifiers::CONTROL)
+                .expect("key");
+            assert!(action.is_none(), "{shortcut:?} emits no action");
+            assert!(
+                matches!(app.mode, crate::tui::AppMode::AskUser(_)),
+                "{shortcut:?} dropped the question"
+            );
+            let answer = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(
+                    answer,
+                    Some(SendAction::RespondAskUser { ref request_id, .. })
+                        if request_id == "q1"
+                ),
+                "{shortcut:?}: the question is answered"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_request_resolved_elsewhere_closes_the_dialog() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5194,5 +6757,566 @@ mod tests {
             app.mode,
             crate::tui::AppMode::PermissionConfirm(_)
         ));
+    }
+
+    /// The screen as rows of text.
+    fn draw_rows(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &mut App,
+    ) -> Vec<String> {
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn set_date(app: &mut App, date: &str, zone: &str) {
+        let zone = jiff::tz::TimeZone::get(zone).expect("zone");
+        let now = date
+            .parse::<jiff::civil::DateTime>()
+            .expect("datetime")
+            .to_zoned(zone.clone())
+            .expect("zoned")
+            .timestamp();
+        app.new_year.set_date(now, &zone);
+    }
+
+    #[tokio::test]
+    async fn the_greeting_sits_above_the_input_only_on_new_year_days() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        for zone in ["America/New_York", "Asia/Tokyo"] {
+            for (date, shown) in [
+                ("2026-12-30T12:00:00", false),
+                ("2026-12-31T12:00:00", true),
+                ("2027-01-01T12:00:00", true),
+                ("2027-01-02T12:00:00", false),
+            ] {
+                set_date(&mut app, date, zone);
+                let rows = draw_rows(&mut terminal, &mut app);
+                let greeting = rows
+                    .iter()
+                    .position(|row| row.contains(crate::tui::new_year::GREETING));
+                assert_eq!(greeting.is_some(), shown, "{date} in {zone}");
+                if greeting.is_some() {
+                    assert!(app.chat_layout.greeting_row().is_some());
+                } else {
+                    assert_eq!(app.chat_layout.greeting_row(), None);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fireworks_start_and_end_early_leave_the_chat_as_it_was() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.chat.push_user("hello", Vec::new(), 0);
+        app.input = "draft".to_string();
+        app.cursor = 5;
+        set_date(&mut app, "2026-12-31T12:00:00", "America/New_York");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let before = draw_rows(&mut terminal, &mut app);
+        let scroll = app.scroll;
+
+        // Ctrl+F starts them; the animation paints over the chat.
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .expect("key");
+        assert!(app.new_year.animating());
+        for _ in 0..10 {
+            app.new_year.tick();
+        }
+        assert_ne!(draw_rows(&mut terminal, &mut app), before, "sparks drawn");
+
+        // Any key ends them early and is not typed.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.new_year.animating());
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.scroll, scroll);
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+
+        // A click on the greeting starts them; a click anywhere ends them.
+        let row = app.chat_layout.greeting_row().expect("greeting row");
+        let area = app.chat_area;
+        let screen_row = area.y
+            + u16::try_from(row + app.chat_layout.top_padding() - app.effective_scroll())
+                .expect("row");
+        let click = |kind| crossterm::event::MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: screen_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left);
+        app.handle_mouse(click(down)).expect("mouse");
+        assert!(app.new_year.animating(), "clicking the greeting plays them");
+        app.handle_mouse(click(down)).expect("mouse");
+        assert!(!app.new_year.animating());
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+
+        // They end by themselves.
+        app.new_year.start();
+        for _ in 0..crate::tui::new_year::Fireworks::FRAMES {
+            app.new_year.tick();
+        }
+        assert!(!app.new_year.animating());
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_does_nothing_off_new_year_days() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        set_date(&mut app, "2026-12-30T12:00:00", "Asia/Tokyo");
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .expect("key");
+        assert!(!app.new_year.animating());
+    }
+
+    async fn effort_app(dir: &std::path::Path) -> App {
+        let (mut app, _) = app_with_session(dir).await;
+        app.current_effort = Some("medium".to_string());
+        app.effort_ladder = vec!["low", "medium", "high", "max"];
+        app.effort_index = app.effort_ladder_index();
+        app.mode = crate::tui::AppMode::EffortSelect;
+        app
+    }
+
+    #[tokio::test]
+    async fn effort_arrows_send_nothing_until_enter() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Left).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::EffortSelect));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        match press(&mut app, KeyCode::Enter) {
+            Some(SendAction::SetEffort(Some(effort))) => assert_eq!(effort, "high"),
+            _ => panic!("Enter must apply the highlighted level"),
+        }
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+    }
+
+    #[tokio::test]
+    async fn effort_escape_keeps_the_previous_effort() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert!(press(&mut app, KeyCode::Esc).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        assert_eq!(app.effective_effort(), "medium");
+    }
+
+    #[tokio::test]
+    async fn effort_panel_is_drawn_with_the_marker_under_the_heading() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Effort"), "{screen}");
+        assert!(screen.contains("▲"), "{screen}");
+        assert!(screen.contains("Esc to cancel"), "{screen}");
+    }
+
+    fn background_job(status: aither_sandbox::JobStatus) -> aither_sandbox::JobInfo {
+        aither_sandbox::JobInfo {
+            pid: 4242,
+            task_id: "brisk-otter".to_string(),
+            execution_key: "key".to_string(),
+            script: "sleep 300".to_string(),
+            interpreter: aither_sandbox::Interpreter::Shell,
+            mode: aither_sandbox::SandboxMode::Sandboxed,
+            started_at: std::time::Instant::now(),
+            status,
+            output_path: None,
+            place: aither_sandbox::JobPlace::Host,
+            timeout: None,
+        }
+    }
+
+    /// With no turn in flight, quitting asks first while a background command
+    /// still runs, and quits at once once it finished.
+    #[tokio::test]
+    async fn quitting_asks_while_only_a_background_command_runs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        assert!(!app.agent_busy(), "no turn is in flight");
+
+        app.handle_event(AppEvent::BackgroundLoaded {
+            jobs: vec![background_job(aither_sandbox::JobStatus::Running)],
+            subagents: Vec::new(),
+        })
+        .expect("background event");
+        assert!(app.request_quit().is_none(), "the quit waits for an answer");
+        assert!(matches!(app.mode, crate::tui::AppMode::QuitConfirm(_)));
+        let screen = session_screen(&mut app).join("\n");
+        assert!(
+            screen.contains("Keep it running in the background"),
+            "{screen}"
+        );
+        assert!(screen.contains("Stop the agent, then quit"), "{screen}");
+        assert!(matches!(
+            app.handle_event(AppEvent::Key(KeyCode::Char('s'), KeyModifiers::NONE))
+                .expect("key event"),
+            Some(SendAction::StopAgentAndQuit)
+        ));
+
+        app.mode = crate::tui::AppMode::Chat;
+        app.handle_event(AppEvent::BackgroundLoaded {
+            jobs: vec![background_job(aither_sandbox::JobStatus::Completed {
+                exit_code: 0,
+                delivery: aither_sandbox::Delivery::Taken,
+            })],
+            subagents: Vec::new(),
+        })
+        .expect("background event");
+        assert!(matches!(app.request_quit(), Some(SendAction::Quit)));
+    }
+
+    /// What the composer must treat as one character: a ZWJ family emoji, a
+    /// flag (two regional indicators), a letter with a combining accent and
+    /// one character each of Chinese, Japanese and Korean, with the cells the
+    /// renderer draws for it.
+    const COMPOSER_CLUSTERS: [(&str, &str, usize); 6] = [
+        (
+            "zwj family",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            2,
+        ),
+        ("flag", "\u{1F1E8}\u{1F1E6}", 2),
+        ("combining accent", "e\u{0301}", 1),
+        ("chinese", "中", 2),
+        ("japanese", "あ", 2),
+        ("korean", "한", 2),
+    ];
+
+    async fn composer_with(dir: &std::path::Path, text: &str, cursor: usize) -> App {
+        let (mut app, _id) = app_with_session(dir).await;
+        app.input = text.to_string();
+        app.cursor = cursor;
+        app
+    }
+
+    #[tokio::test]
+    async fn left_and_right_move_one_grapheme() {
+        for (name, cluster, _) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let text = format!("a{cluster}b");
+            let mut app = composer_with(dir.path(), &text, 0).await;
+            let stops = [0, 1, 1 + cluster.len(), text.len()];
+            for stop in &stops[1..] {
+                press(&mut app, KeyCode::Right);
+                assert_eq!(app.cursor, *stop, "{name}: Right");
+            }
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.cursor, text.len(), "{name}: Right at the end");
+            for stop in stops[..3].iter().rev() {
+                press(&mut app, KeyCode::Left);
+                assert_eq!(app.cursor, *stop, "{name}: Left");
+            }
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.cursor, 0, "{name}: Left at the start");
+        }
+    }
+
+    #[tokio::test]
+    async fn backspace_and_delete_remove_one_whole_grapheme() {
+        for (name, cluster, _) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let text = format!("a{cluster}b");
+            let mut app = composer_with(dir.path(), &text, 1 + cluster.len()).await;
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(
+                (app.input.as_str(), app.cursor),
+                ("ab", 1),
+                "{name}: Backspace"
+            );
+
+            let mut app = composer_with(dir.path(), &text, 1).await;
+            press(&mut app, KeyCode::Delete);
+            assert_eq!(
+                (app.input.as_str(), app.cursor),
+                ("ab", 1),
+                "{name}: Delete"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_clusters_are_one_backspace() {
+        for (name, cluster, _) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let (mut app, _id) = app_with_session(dir.path()).await;
+            for c in cluster.chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert_eq!(app.cursor, cluster.len(), "{name}: cursor after typing");
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!((app.input.as_str(), app.cursor), ("", 0), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pasting_keeps_the_cursor_on_a_boundary() {
+        let dir = tempfile::tempdir().expect("dir");
+        let flag = "\u{1F1E8}\u{1F1E6}";
+        let mut app = composer_with(dir.path(), "ab", 1).await;
+        assert!(app.handle_bracketed_paste(flag.to_string()).is_none());
+        assert_eq!(app.input, format!("a{flag}b"));
+        assert_eq!(app.cursor, 1 + flag.len());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!((app.input.as_str(), app.cursor), ("ab", 1));
+    }
+
+    /// Click the input row `column` cells into the drawn text.
+    fn click_input(
+        app: &mut App,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        column: u16,
+    ) {
+        draw_rows(terminal, app);
+        let (row, _) = app.chat_layout.input_span().expect("input row");
+        let area = app.chat_area;
+        let screen_row = area.y
+            + u16::try_from(row + app.chat_layout.top_padding() - app.effective_scroll())
+                .expect("row");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x + column,
+            row: screen_row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("mouse");
+    }
+
+    #[tokio::test]
+    async fn clicking_places_the_caret_on_the_grapheme_under_the_pointer() {
+        for (name, cluster, width) in COMPOSER_CLUSTERS {
+            let dir = tempfile::tempdir().expect("dir");
+            let text = format!("a{cluster}b");
+            let mut app = composer_with(dir.path(), &text, 0).await;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+                .expect("terminal");
+            let width = u16::try_from(width).expect("width");
+            // (column clicked, cursor expected)
+            let cases = [
+                (0, 0),
+                (1, 1),
+                (1 + width - 1, 1),
+                (1 + width, 1 + cluster.len()),
+                (2 + width, text.len()),
+                (40, text.len()),
+            ];
+            for (column, expected) in cases {
+                click_input(&mut app, &mut terminal, column);
+                assert_eq!(app.cursor, expected, "{name}: click at column {column}");
+            }
+        }
+    }
+
+    /// Chinese, Japanese and Korean text and a thumbs-up with a skin tone
+    /// (two scalar values, one cluster).
+    const EDITED_TEXTS: [&str; 4] = ["你好世界", "こんにちは", "안녕하세요", "👍🏽"];
+
+    /// The Models section with its first tier's text field open and empty.
+    async fn config_text_edit(dir: &std::path::Path) -> App {
+        let (mut app, _id) = app_with_session(dir).await;
+        app.mode = AppMode::Config;
+        app.config_state.section = crate::tui::state::ConfigSection::Models;
+        app.config_state.selected = 0;
+        app.config_state.start_text_edit("");
+        app
+    }
+
+    fn edited(app: &App) -> (String, usize) {
+        let (input, cursor) = app.config_state.edit_text().expect("text edit");
+        (input.to_string(), cursor)
+    }
+
+    #[tokio::test]
+    async fn config_text_edit_types_moves_and_deletes_by_grapheme() {
+        use unicode_segmentation::UnicodeSegmentation as _;
+
+        for text in EDITED_TEXTS {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut app = config_text_edit(dir.path()).await;
+            for c in text.chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert_eq!(
+                edited(&app),
+                (text.to_string(), text.len()),
+                "{text}: typed"
+            );
+
+            let clusters: Vec<&str> = text.graphemes(true).collect();
+            let (first, last) = (clusters[0], clusters[clusters.len() - 1]);
+
+            press(&mut app, KeyCode::Left);
+            assert_eq!(edited(&app).1, text.len() - last.len(), "{text}: Left");
+            press(&mut app, KeyCode::Right);
+            assert_eq!(edited(&app).1, text.len(), "{text}: Right");
+            press(&mut app, KeyCode::Home);
+            assert_eq!(edited(&app).1, 0, "{text}: Home");
+            press(&mut app, KeyCode::Right);
+            assert_eq!(edited(&app).1, first.len(), "{text}: Right from Home");
+            press(&mut app, KeyCode::End);
+            assert_eq!(edited(&app).1, text.len(), "{text}: End");
+
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(
+                edited(&app),
+                (
+                    text[..text.len() - last.len()].to_string(),
+                    text.len() - last.len()
+                ),
+                "{text}: Backspace"
+            );
+            press(&mut app, KeyCode::Home);
+            press(&mut app, KeyCode::Delete);
+            let middle: String = clusters
+                .iter()
+                .skip(1)
+                .take(clusters.len().saturating_sub(2))
+                .copied()
+                .collect();
+            assert_eq!(edited(&app), (middle, 0), "{text}: Delete");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_text_edit_inserts_in_the_middle_of_cjk_text() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = config_text_edit(dir.path()).await;
+        for c in "你好世界".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('こ'));
+        press(&mut app, KeyCode::Char('한'));
+        assert_eq!(edited(&app), ("你好こ한世界".to_string(), 12));
+        assert!(app.handle_bracketed_paste("안녕".to_string()).is_none());
+        assert_eq!(edited(&app), ("你好こ한안녕世界".to_string(), 18));
+    }
+
+    #[tokio::test]
+    async fn config_text_edit_draws_the_text_and_puts_the_caret_after_it() {
+        for text in EDITED_TEXTS {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut app = config_text_edit(dir.path()).await;
+            for c in text.chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+                .expect("terminal");
+            let rows = draw_rows(&mut terminal, &mut app);
+            assert!(
+                rows.iter().any(|row| row.replace(' ', "").contains(text)),
+                "{text}: {rows:#?}"
+            );
+            let end = terminal.get_cursor_position().expect("cursor");
+
+            press(&mut app, KeyCode::Home);
+            draw_rows(&mut terminal, &mut app);
+            let home = terminal.get_cursor_position().expect("cursor");
+            assert_eq!(
+                usize::from(end.x - home.x),
+                unicode_width::UnicodeWidthStr::width(text),
+                "{text}: caret columns"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_provider_form_edits_each_field_by_grapheme() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.mode = AppMode::Config;
+        app.config_state.edit_mode = ConfigEditMode::CustomProvider {
+            focused_field: 0,
+            name: String::new(),
+            base_url: "https://例え.jp/안녕".to_string(),
+            api_key: "👍🏽あ".to_string(),
+            cursor: 0,
+            editing_existing: false,
+            original_name: None,
+        };
+        let state = |app: &App| match &app.config_state.edit_mode {
+            ConfigEditMode::CustomProvider {
+                name,
+                base_url,
+                api_key,
+                cursor,
+                focused_field,
+                ..
+            } => (
+                *focused_field,
+                name.clone(),
+                base_url.clone(),
+                api_key.clone(),
+                *cursor,
+            ),
+            other => panic!("unexpected mode {other:?}"),
+        };
+        for c in "你好".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(state(&app).1, "好");
+        assert_eq!(state(&app).4, 0);
+
+        // Moving to the API key puts the caret at its end, a byte offset.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        let (field, _, _, key, cursor) = state(&app);
+        assert_eq!((field, cursor), (2, key.len()));
+        press(&mut app, KeyCode::Left);
+        assert_eq!(state(&app).4, "👍🏽".len());
+        press(&mut app, KeyCode::Left);
+        assert_eq!(state(&app).4, 0);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(state(&app).3, "あ");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!((state(&app).3, state(&app).4), (String::new(), 0));
+
+        // The API key field is drawn masked: one star per grapheme.
+        for c in "👍🏽한".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).expect("terminal");
+        let rows = draw_rows(&mut terminal, &mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("**")),
+            "{:?} {rows:#?}",
+            state(&app)
+        );
+        assert!(rows.iter().all(|row| !row.contains('한')), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_double_click_spot_is_one_character_wide() {
+        let line = "你好 こんにちは";
+        assert!(same_click_spot(line, 3, 3));
+        assert!(same_click_spot(line, 0, 3));
+        assert!(same_click_spot(line, 3, 0));
+        assert!(!same_click_spot(line, 0, 6));
+        // Off a char boundary there is no spot.
+        assert!(!same_click_spot(line, 1, 3));
     }
 }

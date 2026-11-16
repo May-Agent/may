@@ -6,26 +6,22 @@ use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::db::ProfileEnvironmentKind;
-use crate::session::{
-    MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
-};
+use crate::session::{MayHomePaths, SandboxResourceLayout, SessionStore, list_summaries_from_db};
 use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error, internal_error_message};
-use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_effort, persist_last_model, preferred_advanced_model, resolve_default_model,
 };
 use super::state::DaemonState;
 use super::types::{
-    ApiHealth, ApiPr, ApiPrEvent, ApiSession, ContextDebugMessage, CreateSessionRequest,
-    NullableStringPatch, RewindRequest, SessionContextDebugResponse,
-    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
-    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
+    ApiHealth, ApiPr, ApiSession, ContextDebugMessage, CreateSessionRequest, RewindRequest,
+    SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    SessionContextWindowSnapshotResponse, SessionTasksPayload,
 };
 
-fn session_not_found_error(session_id: &str) -> SkyError {
+pub(super) fn session_not_found_error(session_id: &str) -> SkyError {
     SkyError::msg(format!("Session {session_id} not found")).set_status(StatusCode::NOT_FOUND)
 }
 
@@ -65,24 +61,10 @@ pub(super) async fn list_api_sessions(
         let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
             internal_error_message(format!("no model resolved for session {}", s.id.as_str()))
         })?;
-        sessions.push(ApiSession::from_summary(s, model, Vec::new()));
+        sessions.push(ApiSession::from_summary(s, model));
     }
 
     Ok(sessions)
-}
-
-/// `GET /api/sessions/{id}/history` — the session's stored messages in the
-/// clients' own `ChatMessage` shape, so a reload replays history losslessly.
-pub(super) async fn get_session_history(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<skyzen::Response> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    let history = crate::session::load_history_from_db(&db, &id)
-        .await
-        .map_err(internal_error)?;
-    super::error::json_ok_response(&history.messages().to_vec())
 }
 
 /// `POST /api/sessions/{id}/history` — append stored messages in the
@@ -111,30 +93,37 @@ pub(super) async fn append_session_history(
 
 /// `POST /api/sessions/{id}/rewind` — delete the session's stored history
 /// from the `index`-th stored row on, the truncation half of a client-side
-/// rewind. Clients index it because message row ids never cross the wire.
-pub(super) async fn rewind_session(
-    params: Params,
-    Json(req): Json<RewindRequest>,
-    State(state): State<Arc<DaemonState>>,
+/// rewind. Clients index it by position among the stored rows, which hidden
+/// and tool rows share with the messages they see.
+pub(super) async fn rewind_inner(
+    state: &Arc<DaemonState>,
+    id: &str,
+    req: &RewindRequest,
 ) -> SkyResult<Json<i64>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
-    let rows = db.get_messages(&id).await.map_err(internal_error)?;
-    let Some(row) = rows.get(req.index) else {
+    let rows = db.get_messages(id).await.map_err(internal_error)?;
+    let index = {
+        let history = crate::session::load_history_from_db(&db, id)
+            .await
+            .map_err(internal_error)?;
+        let entries = super::transcript::build_entries(history.messages());
+        super::transcript::entry_cut_index(&rows, &entries, &req.entry_id)?
+    };
+    let Some(row) = rows.get(index) else {
         return Err(bad_request_error("rewind index out of range"));
     };
     let cut_id = i64::from(row.id);
-    db.delete_messages_from(&id, cut_id)
+    db.delete_messages_from(id, cut_id)
         .await
         .map_err(internal_error)?;
     // The audit log is append-only: every PR this session opened keeps a
     // `rewound` event so its history records that the conversation was
     // cut back while the proposal itself still stands.
-    if let Ok(prs) = db.list_session_prs(&id).await {
+    if let Ok(prs) = db.list_session_prs(id).await {
         let detail = format!("history rewound to message {cut_id}");
         for pr in prs {
             let _ = db
-                .add_pr_event(pr.id, "rewound", &id, "user", None, Some(&detail))
+                .add_pr_event(pr.id, "rewound", id, "user", None, Some(&detail))
                 .await;
         }
     }
@@ -168,11 +157,9 @@ pub(super) async fn linked_issue_briefs(
     paths: &crate::session::SessionPaths,
 ) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
     let content = paths.tasks_content().await.map_err(internal_error)?;
-    let numbers = content
-        .as_deref()
-        .map(crate::tui::sidebar::TaskTree::parse)
-        .map(|tree| tree.linked_issues())
-        .unwrap_or_default();
+    let numbers = content.as_deref().map_or_default(|content| {
+        crate::tui::sidebar::linked_issues(&crate::task_rows::task_rows(content))
+    });
     let mut briefs = issue_briefs(state, session_id, numbers).await?;
     // A failed lookup says nothing new; the client keeps what it shows.
     briefs.retain(|brief| brief.title.is_some());
@@ -198,10 +185,17 @@ async fn issue_briefs(
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     let sandbox_dir = store.sandbox_dir(&id, session.profile_id.as_deref());
     let workspace_config = crate::session::SessionPaths::new(sandbox_dir).workspace_config();
-    let issue_store =
-        blocking::unblock(move || crate::issue::resolve_issue_store(&cwd, &workspace_config, db))
-            .await
-            .map_err(internal_error)?;
+    let binding = session
+        .repo
+        .as_deref()
+        .map(crate::session::RepoBinding::parse)
+        .transpose()
+        .map_err(internal_error)?;
+    let issue_store = blocking::unblock(move || {
+        crate::issue::resolve_bound_issue_store(binding.as_ref(), &cwd, &workspace_config, db)
+    })
+    .await
+    .map_err(internal_error)?;
     let mut briefs = Vec::with_capacity(numbers.len());
     for number in numbers {
         let brief = match issue_store.get(number).await {
@@ -210,18 +204,25 @@ async fn issue_briefs(
                 title: Some(detail.title),
                 closed: matches!(detail.state, crate::issue::IssueState::Closed),
             },
-            Err(error) => {
-                tracing::debug!(%error, number, "issue lookup failed");
-                crate::tui::sidebar::IssueBrief {
-                    number,
-                    title: None,
-                    closed: false,
-                }
-            }
+            Err(error) => unresolved_issue_brief(number, &error),
         };
         briefs.push(brief);
     }
     Ok(briefs)
+}
+
+/// The brief shown for an issue whose lookup failed; the failure goes to the
+/// daemon log.
+pub(super) fn unresolved_issue_brief(
+    number: i64,
+    error: &dyn std::fmt::Display,
+) -> crate::tui::sidebar::IssueBrief {
+    tracing::warn!(%error, number, "issue lookup failed");
+    crate::tui::sidebar::IssueBrief {
+        number,
+        title: None,
+        closed: false,
+    }
 }
 
 pub(super) async fn get_session(
@@ -229,6 +230,10 @@ pub(super) async fn get_session(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+
+    // The cursor must precede every read so nothing between it and the
+    // client's `?after=` subscription is lost.
+    let cursor = state.session_cursor(&id);
 
     let db = state.db();
 
@@ -245,10 +250,11 @@ pub(super) async fn get_session(
         tokio::join!(db.get_session_runtime(&id), db.get_messages(&id),);
     summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
-    let db_messages = messages_result.map_err(internal_error)?;
-    let messages = map_db_messages(&db_messages).map_err(internal_error)?;
+    let _ = messages_result.map_err(internal_error)?;
 
-    Ok(Json(ApiSession::from_summary(summary, model, messages)))
+    let mut session = ApiSession::from_summary(summary, model);
+    session.cursor = Some(cursor);
+    Ok(Json(session))
 }
 
 pub(super) async fn get_session_context_debug(
@@ -308,6 +314,7 @@ pub(super) async fn get_session_tasks(
         .map_err(internal_error)?
         .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
+        rows: crate::task_rows::task_rows(&content),
         content,
         plan_state: runtime.plan_state,
     }))
@@ -338,79 +345,27 @@ pub(super) async fn get_session_prs(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<ApiPr>>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    Ok(Json(
+        session_prs(&state, &id).await.map_err(internal_error)?,
+    ))
+}
+
+/// The session's PRs with their events and the live checks the daemon's
+/// poller last read (see `pr_checks`), newest first.
+pub(super) async fn session_prs(
+    state: &DaemonState,
+    session_id: &str,
+) -> Result<Vec<ApiPr>, crate::db::ChatDbError> {
     let rows = state
         .db()
-        .list_session_prs(&id)
-        .await
-        .map_err(internal_error)?;
-    let mut prs = Vec::with_capacity(rows.len());
-    for row in rows {
-        let events = state
-            .db()
-            .pr_events(row.id)
-            .await
-            .map_err(internal_error)?
-            .into_iter()
-            .map(|e| ApiPrEvent {
-                kind: e.kind,
-                detail: e.detail,
-                created_at: e.created_at,
-            })
-            .collect();
-        prs.push(ApiPr {
-            number: row.number,
-            title: row.title,
-            state: row.state,
-            backend: row.backend,
-            external_number: row.external_number,
-            issue_number: row.issue_number,
-            auto_merge: row.auto_merge,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            merged_at: row.merged_at,
-            events,
-        });
-    }
-    Ok(Json(prs))
+        .list_prs_with_repo(None, Some(session_id), crate::db::PrFilter::All, false)
+        .await?;
+    super::prs::build_api_prs(state, rows).await
 }
 
 /// Atomically set the plan state for a session without touching task content.
 ///
-/// This is what the UI uses to toggle plan mode (enter/approve/reopen); it
-/// avoids the fetch-then-save race of the generic `save_session_tasks` path.
-pub(super) async fn set_session_plan_state(
-    params: Params,
-    Json(payload): Json<SessionPlanStateRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionPlanStateResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let runtime = state
-        .runtime_service
-        .set_plan_state(&id, payload.plan_state)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(SessionPlanStateResponse {
-        plan_state: runtime.plan_state,
-    }))
-}
-
 /// Set the session's yolo switch; it applies to the next approval request.
-pub(super) async fn set_session_yolo(
-    params: Params,
-    Json(payload): Json<super::types::SessionYoloRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::SessionYoloResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let runtime = state
-        .runtime_service
-        .set_yolo(&id, payload.yolo)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(super::types::SessionYoloResponse {
-        yolo: runtime.yolo,
-    }))
-}
-
 pub(super) async fn save_session_tasks(
     params: Params,
     Json(payload): Json<SessionTasksPayload>,
@@ -427,6 +382,7 @@ pub(super) async fn save_session_tasks(
         .await
         .map_err(internal_error)?;
     Ok(Json(SessionTasksPayload {
+        rows: crate::task_rows::task_rows(&payload.content),
         content: payload.content,
         plan_state: runtime.plan_state,
     }))
@@ -471,8 +427,21 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
         LlmRole::User => "user",
         LlmRole::Assistant => "assistant",
         LlmRole::System => "system",
+        LlmRole::Configuration => "configuration",
         LlmRole::Tool => "tool",
     }
+}
+
+/// Where a new session's name comes from.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SessionName<'a> {
+    /// The daemon's generator draws one.
+    Generate,
+    /// A client brings one the daemon issued it.
+    Issued(&'a str),
+    /// The daemon fronting this cloud home brings one its own generator
+    /// drew, so the session has the same name on both daemons.
+    Fronting(&'a str),
 }
 
 /// Creates the durable DB row and session directory layout for a profile.
@@ -481,12 +450,35 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
 /// which open a fresh conversation in the originating profile.
 pub(super) async fn create_session_for_profile(
     state: &Arc<DaemonState>,
-    id: Option<&str>,
+    name: SessionName<'_>,
     profile_id: Option<&str>,
     model: &str,
 ) -> SkyResult<String> {
-    let id = id.map_or_else(|| SessionId::new().to_string(), str::to_string);
     let db = state.db();
+    // Every session is named by the one generator: a name a client brings
+    // is one the daemon issued it and no session took yet. A cloud home's
+    // sessions are named by the generator of the daemon fronting it.
+    let id = match name {
+        SessionName::Issued(id) => {
+            if !db.session_name_unused(id).await.map_err(internal_error)? {
+                return Err(bad_request_error(
+                    "session name was not issued by this daemon or is already taken",
+                ));
+            }
+            id.to_string()
+        }
+        SessionName::Fronting(id) => {
+            if db.get_session(id).await.map_err(internal_error)?.is_some() {
+                return Err(bad_request_error("session name is already taken"));
+            }
+            id.to_string()
+        }
+        SessionName::Generate => db
+            .issue_session_name()
+            .await
+            .map_err(internal_error)?
+            .to_string(),
+    };
     let layout = match profile_id {
         Some(profile_id) => {
             let profile = db
@@ -515,11 +507,40 @@ pub(super) async fn create_session_for_profile(
     Ok(id)
 }
 
+/// `POST /api/session-names` — issues a session name for a session the
+/// client creates later with `POST /api/sessions`.
+pub(super) async fn issue_session_name(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::IssuedSessionName>> {
+    let name = state
+        .db()
+        .issue_session_name()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(super::types::IssuedSessionName {
+        name: name.to_string(),
+    }))
+}
+
 pub(super) async fn create_session(
+    fronted: super::auth::Fronted,
     Json(req): Json<CreateSessionRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let requested_profile_id = req.profile_id.clone();
+    let name = match (req.id.as_deref(), fronted) {
+        (Some(id), super::auth::Fronted(true)) => SessionName::Fronting(id),
+        (Some(id), super::auth::Fronted(false)) => SessionName::Issued(id),
+        (None, _) => SessionName::Generate,
+    };
+    let cloud_account = match &req.cloud {
+        Some(_) => Some(cloud_account(&state, requested_profile_id.as_deref()).await?),
+        None => None,
+    };
+    let cloud_project = match (&req.cloud, req.repo.as_deref()) {
+        (Some(_), Some(spec)) => Some(cloud_repository(spec)?),
+        _ => None,
+    };
     let model = {
         let config = state.config_snapshot();
         req.model
@@ -531,18 +552,14 @@ pub(super) async fn create_session(
     let resolved_profile_id = requested_profile_id
         .clone()
         .or_else(|| Some(state.default_profile_id.clone()));
-    let id = create_session_for_profile(
-        &state,
-        req.id.as_deref(),
-        resolved_profile_id.as_deref(),
-        &model,
-    )
-    .await?;
+    let id =
+        create_session_for_profile(&state, name, resolved_profile_id.as_deref(), &model).await?;
+    // A cloud session works in its codespace's workspace, never here.
     if let Some(cwd) = req
         .cwd
         .as_deref()
         .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
+        .filter(|cwd| !cwd.is_empty() && req.cloud.is_none())
     {
         state
             .db()
@@ -562,14 +579,88 @@ pub(super) async fn create_session(
             .map_err(internal_error)?;
     }
 
-    persist_last_model(&state, &model)
-        .await
-        .map_err(internal_error)?;
+    let location = match (&req.cloud, &cloud_account) {
+        (Some(cloud), Some(account)) => {
+            let created = state
+                .cloud_sessions
+                .create(&id, account, cloud_project.as_ref(), &cloud.machine_type)
+                .await;
+            match created {
+                Ok(location) => Some(location),
+                Err(error) => {
+                    // No codespace serves it: the session is not kept.
+                    let _ = state.db().delete_session(&id).await;
+                    return Err(bad_request_error(error.to_string()));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // The model a user last chose is this machine's user's choice; a cloud
+    // home's sessions carry the choice made on the fronting daemon.
+    if !fronted.0 {
+        persist_last_model(&state, &model)
+            .await
+            .map_err(internal_error)?;
+    }
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
 
     let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
     session.repo = resolve_repo_binding(req.repo.as_deref()).ok().flatten();
+    session.location = location;
     Ok(Json(session))
+}
+
+/// The Codespaces account `profile_id` runs cloud sessions as.
+async fn cloud_account(
+    state: &Arc<DaemonState>,
+    profile_id: Option<&str>,
+) -> SkyResult<crate::cloud::CodespacesAccount> {
+    let profile_id = profile_id.unwrap_or(&state.default_profile_id);
+    state
+        .db()
+        .profile_cloud(profile_id)
+        .await
+        .map_err(internal_error)?
+        .codespaces
+        .ok_or_else(|| {
+            bad_request_error(
+                "this profile has no Codespaces account; set one up with /cloud first",
+            )
+        })
+}
+
+/// The GitHub repository a cloud session binds: a codespace is created
+/// from a GitHub repository, never a local checkout.
+fn cloud_repository(spec: &str) -> SkyResult<crate::workspace::GitHubRepository> {
+    let spec = spec.trim();
+    spec.strip_prefix("github:")
+        .unwrap_or(spec)
+        .parse()
+        .map_err(|_| {
+            bad_request_error(format!(
+                "a cloud session's repository is a GitHub repository (owner/repo), not {spec}"
+            ))
+        })
+}
+
+/// `POST /api/profiles/{id}/cloud/codespaces/catalog` — the machine types
+/// a cloud session of the profile with the repository may start on.
+pub(super) async fn cloud_catalog(
+    params: Params,
+    Json(req): Json<super::types::CloudCatalogRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::CloudCatalogResponse>> {
+    let profile_id = params.get("id").map_err(bad_request_error)?.to_string();
+    let account = cloud_account(&state, Some(&profile_id)).await?;
+    let project = req.repo.as_deref().map(cloud_repository).transpose()?;
+    let machines = state
+        .cloud_sessions
+        .catalog(&account, project.as_ref())
+        .await
+        .map_err(|error| bad_request_error(error.to_string()))?;
+    Ok(Json(super::types::CloudCatalogResponse { machines }))
 }
 
 /// Normalize a repo spec into a stored binding: `owner/repo` or a
@@ -580,6 +671,13 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
+    // The stored `local:<identity>` form is the daemon's own identity format
+    // for a local repository, which clients echo back from a session's group.
+    if spec.starts_with("local:") {
+        return crate::session::RepoBinding::parse(spec)
+            .map(|binding| Some(binding.to_stored()))
+            .map_err(|error| error.to_string());
+    }
     let github = spec.strip_prefix("github:").unwrap_or(spec);
     let looks_like_github = {
         let mut parts = github.split('/');
@@ -603,115 +701,6 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
     Err(format!("invalid repo spec '{spec}'"))
 }
 
-pub(super) async fn update_session(
-    params: Params,
-    Json(req): Json<UpdateSessionRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<ApiSession>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    let session = db
-        .get_session(&id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| session_not_found_error(&id))?;
-
-    let mut model_to_persist: Option<String> = None;
-    let requested_title = req.title.clone();
-    let requested_model = req.model.clone();
-    let requested_effort_patch = req.reasoning_effort.clone();
-    let next_title = requested_title.clone().or_else(|| session.title.clone());
-    let next_model = requested_model.clone().or_else(|| session.model.clone());
-    let next_effort = match requested_effort_patch.as_ref() {
-        Some(NullableStringPatch::Null) => None,
-        Some(NullableStringPatch::Set(value)) => Some(value.clone()),
-        None => session.reasoning_effort.clone(),
-    };
-
-    if let Some(model) = next_model.clone()
-        && session.model.as_deref() != Some(model.as_str())
-    {
-        model_to_persist = Some(model);
-    }
-
-    let effort_patch_ref = requested_effort_patch.as_ref().map(|inner| match inner {
-        NullableStringPatch::Null => None,
-        NullableStringPatch::Set(value) => Some(value.as_str()),
-    });
-
-    db.update_session(
-        &id,
-        requested_title.as_deref(),
-        requested_model.as_deref(),
-        effort_patch_ref,
-    )
-    .await
-    .map_err(internal_error)?;
-
-    if let Some(model) = model_to_persist {
-        persist_last_model(&state, &model)
-            .await
-            .map_err(internal_error)?;
-    }
-    if let Some(NullableStringPatch::Set(effort)) = requested_effort_patch.as_ref() {
-        persist_last_effort(&state, effort)
-            .await
-            .map_err(internal_error)?;
-    }
-    if let Some(cwd) = req
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
-    {
-        db.set_session_cwd(&id, cwd).await.map_err(internal_error)?;
-        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
-            let _ = db.touch_repo_usage(&worktree).await;
-        }
-    }
-    let mut next_repo = session.repo.clone();
-    if let Some(patch) = req.repo.clone() {
-        next_repo = match patch {
-            crate::daemon::types::NullableStringPatch::Null => None,
-            crate::daemon::types::NullableStringPatch::Set(spec) => {
-                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
-            }
-        };
-        db.set_session_repo(&id, next_repo.as_deref())
-            .await
-            .map_err(internal_error)?;
-    }
-    if req.non_interactive == Some(true) {
-        db.set_session_non_interactive(&id)
-            .await
-            .map_err(internal_error)?;
-    }
-
-    let model = resolve_session_model(&state, session.id.as_str(), next_model.clone())?;
-    let runtime = state
-        .runtime_service
-        .get(&id)
-        .await
-        .map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-
-    Ok(Json(ApiSession {
-        id,
-        title: next_title.unwrap_or_else(|| "New Chat".to_string()),
-        last_modified: jiff::Timestamp::now().to_string(),
-        preview: session
-            .preview
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "New conversation started".to_string()),
-        messages: Vec::new(),
-        profile_id: session.profile_id,
-        model,
-        reasoning_effort: next_effort,
-        runtime: runtime.into(),
-        repo: next_repo,
-    }))
-}
-
 pub(super) async fn delete_session(
     params: Params,
     State(state): State<Arc<DaemonState>>,
@@ -727,10 +716,7 @@ pub(super) async fn delete_session(
     // them `orphaned` so a later session knows to `pr adopt` before merge.
     if let Ok(prs) = db.list_session_prs(&id).await {
         for pr in prs {
-            if matches!(
-                pr.state.as_str(),
-                "open" | "checks_pending" | "failed" | "rejected" | "merging"
-            ) {
+            if pr.state.is_live() {
                 let _ = db
                     .add_pr_event(
                         pr.id,
@@ -751,6 +737,13 @@ pub(super) async fn delete_session(
     blocking::unblock(move || secrets.remove_session(&session_id))
         .await
         .map_err(internal_error)?;
+    // So is its codespace: a failed deletion keeps the session, so the
+    // delete can be retried instead of leaving the machine running.
+    state
+        .cloud_sessions
+        .delete(&id)
+        .await
+        .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     // After the eviction, whose dropped agent sessions start closing: the
@@ -762,6 +755,7 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal_error)?;
     state.runtime_service.forget_terminal_grants(&id);
+    state.runtime_service.forget_task_events(&id);
     state.tunnels.remove_session(&id);
     #[cfg(target_os = "macos")]
     if state.computer.is_running() {
@@ -783,7 +777,9 @@ pub(super) async fn delete_session(
         .delete_session(&id, profile_id.as_deref(), &db)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
+    state.notify_ui_events(
+        UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES | UiEventTopics::PRS,
+    );
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -794,7 +790,7 @@ pub(super) async fn delete_all_sessions(
     let db = state.db();
     state.tunnels.remove_all();
     // Every live PR outlives its session — mark them `orphaned` first.
-    if let Ok(prs) = db.list_prs(None, Some("open")).await {
+    if let Ok(prs) = db.list_prs(None, crate::db::PrFilter::Open).await {
         for pr in prs {
             let _ = db
                 .add_pr_event(
@@ -819,6 +815,7 @@ pub(super) async fn delete_all_sessions(
         .await
         .map_err(internal_error)?;
     state.runtime_service.forget_all_terminal_grants();
+    state.runtime_service.forget_all_task_events();
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]
     {
@@ -842,6 +839,252 @@ pub(super) async fn delete_all_sessions(
         .delete_all_session_dirs()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
+    state.notify_ui_events(
+        UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES | UiEventTopics::PRS,
+    );
     Ok(Json(ApiHealth { ok: true }))
+}
+
+/// `GET /api/sessions/{id}/queue`: the session's pending user messages —
+/// the immediate one first, then queued oldest-first.
+pub(super) async fn get_session_queue(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::SessionQueueResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let runtime = state
+        .runtime_service
+        .get(&id)
+        .await
+        .map_err(internal_error)?;
+    let mut entries = Vec::new();
+    entries.extend(runtime.pending_immediate);
+    entries.extend(runtime.queued_messages);
+    Ok(Json(super::types::SessionQueueResponse { entries }))
+}
+
+/// `DELETE /api/sessions/{id}/queue/{entryId}`: drop one pending entry by
+/// its id, whichever kind it is.
+pub(super) async fn remove_queue_entry(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::SessionRuntimeResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let entry_id = params
+        .get("entryId")
+        .map_err(bad_request_error)?
+        .parse::<i64>()
+        .map_err(|_| bad_request_error("queue entry id must be a number"))?;
+    let runtime = state
+        .runtime_service
+        .remove_pending_entry(&id, entry_id)
+        .await
+        .map_err(|error| match error {
+            crate::db::ChatDbError::RowNotFound(message) => {
+                skyzen::Error::msg(message).set_status(skyzen::StatusCode::NOT_FOUND)
+            }
+            error => internal_error(error),
+        })?;
+    Ok(Json(super::types::SessionRuntimeResponse::from(runtime)))
+}
+
+/// `PATCH /api/sessions/{id}`: apply any subset of session fields. Every
+/// field is validated before anything is written; the response is the same
+/// `ApiSession` `GET` returns, with a fresh `?after=` cursor.
+pub(super) async fn patch_session(
+    params: Params,
+    Json(req): Json<super::types::SessionPatch>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ApiSession>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+
+    // ── Validate everything up front: nothing is written until the whole
+    // patch is known to apply. ──
+    if let Some(model) = req.model.as_deref()
+        && resolve_default_model(&state.config_snapshot(), Some(model.to_string())).is_none()
+    {
+        return Err(bad_request_error(format!("unknown model {model}")));
+    }
+    if let Some(super::types::NullableStringPatch::Set(spec)) = req.repo.as_ref() {
+        resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?;
+    }
+    if req.memory_off == Some(false) {
+        return Err(bad_request_error(
+            "memory stays off for the rest of the session once turned off",
+        ));
+    }
+    let next_pinned = req.pinned.unwrap_or(session.pinned);
+    let next_archived = req.archived.unwrap_or(session.archived);
+    let next_folder = match req.folder_id.as_ref() {
+        Some(super::types::NullableStringPatch::Null) => None,
+        Some(super::types::NullableStringPatch::Set(folder)) => Some(folder.clone()),
+        None => session.folder_id.clone(),
+    };
+    if let Some(folder_id) = next_folder.as_deref() {
+        if next_archived {
+            return Err(bad_request_error(
+                "cannot move an archived session into a pinned folder",
+            ));
+        }
+        if !next_pinned {
+            return Err(bad_request_error(
+                "cannot move an unpinned session into a pinned folder",
+            ));
+        }
+        let profile_id = session.profile_id.as_deref().ok_or_else(|| {
+            super::error::internal_error_message("session has no profile for folders")
+        })?;
+        let folders = db.list_folders(profile_id).await.map_err(internal_error)?;
+        if !folders.iter().any(|folder| folder.id == folder_id) {
+            return Err(bad_request_error(format!("unknown folder {folder_id}")));
+        }
+    }
+
+    // ── Apply. ──
+    let list_visible_changed = req.title.is_some()
+        || req.model.is_some()
+        || req.reasoning_effort.is_some()
+        || req.repo.is_some()
+        || req.pinned.is_some()
+        || req.archived.is_some()
+        || req.folder_id.is_some();
+
+    let effort_patch = req.reasoning_effort.as_ref().map(|patch| match patch {
+        super::types::NullableStringPatch::Null => None,
+        super::types::NullableStringPatch::Set(value) => Some(value.as_str()),
+    });
+    if req.title.is_some() || req.model.is_some() || effort_patch.is_some() {
+        db.update_session(
+            &id,
+            req.title.as_deref(),
+            req.model.as_deref(),
+            effort_patch,
+        )
+        .await
+        .map_err(internal_error)?;
+    }
+    if let Some(model) = req.model.as_deref()
+        && session.model.as_deref() != Some(model)
+    {
+        persist_last_model(&state, model)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(super::types::NullableStringPatch::Set(effort)) = req.reasoning_effort.as_ref() {
+        persist_last_effort(&state, effort)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(cwd) = req
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        db.set_session_cwd(&id, cwd).await.map_err(internal_error)?;
+        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
+            let _ = db.touch_repo_usage(&worktree).await;
+        }
+    }
+    if let Some(patch) = req.repo.as_ref() {
+        let next_repo = match patch {
+            super::types::NullableStringPatch::Null => None,
+            super::types::NullableStringPatch::Set(spec) => {
+                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
+            }
+        };
+        db.set_session_repo(&id, next_repo.as_deref())
+            .await
+            .map_err(internal_error)?;
+    }
+    if req.non_interactive == Some(true) {
+        db.set_session_non_interactive(&id)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(pinned) = req.pinned
+        && pinned != session.pinned
+    {
+        {
+            if pinned {
+                db.pin_session(&id)
+                    .await
+                    .map_err(super::profiles::map_profile_error)?;
+            } else {
+                db.unpin_session(&id).await.map_err(internal_error)?;
+            }
+        }
+    }
+    if let Some(folder_patch) = req.folder_id.as_ref()
+        && next_folder.as_deref() != session.folder_id.as_deref()
+    {
+        let target = match folder_patch {
+            super::types::NullableStringPatch::Null => None,
+            super::types::NullableStringPatch::Set(folder) => Some(folder.as_str()),
+        };
+        db.move_session_to_folder(&id, target)
+            .await
+            .map_err(super::profiles::map_profile_error)?;
+    }
+    if let Some(archived) = req.archived
+        && archived != session.archived
+    {
+        {
+            if archived {
+                db.archive_session(&id).await.map_err(internal_error)?;
+                state.parked_agents.evict(&id);
+            } else {
+                db.unarchive_session(&id).await.map_err(internal_error)?;
+            }
+        }
+    }
+    if let Some(yolo) = req.yolo {
+        state
+            .runtime_service
+            .set_yolo(&id, yolo)
+            .await
+            .map_err(internal_error)?;
+    }
+    if req.memory_off == Some(true) {
+        state
+            .runtime_service
+            .set_memory_off(&id)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(plan_state) = req.plan_state {
+        state
+            .runtime_service
+            .set_plan_state(&id, plan_state)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    if list_visible_changed {
+        state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    }
+
+    // Respond like `get_session`: cursor first, then the fresh row.
+    let cursor = state.session_cursor(&id);
+    let db_session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+    let mut summary = crate::session::SessionSummary::from_db_model(db_session);
+    summary.runtime = db
+        .get_session_runtime(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
+    let model = resolve_session_model(&state, &id, summary.model.clone())?;
+    let mut patched = ApiSession::from_summary(summary, model);
+    patched.cursor = Some(cursor);
+    Ok(Json(patched))
 }

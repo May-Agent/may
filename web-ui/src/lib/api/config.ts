@@ -121,6 +121,8 @@ export type CommandPriority = 'normal' | 'low' | 'lowest';
 
 export interface UiSandboxConfig {
   commandPriority: CommandPriority;
+  /** Jobserver tokens shared by every terminal; null is the host's available parallelism. */
+  jobPoolSize: number | null;
 }
 
 export type StreamCodec = 'auto' | 'h264' | 'av1';
@@ -163,6 +165,8 @@ export interface UiSessionsConfig {
 export interface UiSshServerConfig {
   name: string;
   target: string;
+  /** Kernel and architecture the server reported when it was added. */
+  platform: { os: string; arch: string };
 }
 
 export interface UiConfigResponse {
@@ -170,6 +174,8 @@ export interface UiConfigResponse {
   maxIterations: number;
   uiFont: string;
   uiTheme: string;
+  /** IANA name of the user's timezone (`[time] timezone`). */
+  timezone: string;
   fullConfig: UiFullConfig;
 }
 
@@ -228,7 +234,7 @@ export function setFullConfig(full: UiFullConfig): Promise<void> {
   return apiPost<void>('/config/full', body);
 }
 
-export function upsertSshServer(server: UiSshServerConfig): Promise<void> {
+export function upsertSshServer(server: Pick<UiSshServerConfig, 'name' | 'target'>): Promise<void> {
   return apiPost<void>('/ssh', server);
 }
 

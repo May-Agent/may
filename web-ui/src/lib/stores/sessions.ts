@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type {
   ApiMessage,
   ApiSession,
+  CommandCard,
   SessionPlanState,
   SessionRuntimeSummary,
 } from '../types';
@@ -10,6 +11,7 @@ import {
   createSession,
   deleteSession,
   getSession,
+  getTranscript,
   listSessions,
   updateSession,
   unarchiveSession,
@@ -17,7 +19,14 @@ import {
   type UpdateSessionPatch,
 } from '../api/sessions';
 import { putSessionTasks } from '../api/tasks';
+import { ApiError } from '../api/client';
+import { foldTranscript, withToolCard } from '../transcript';
 import { useConfigStore } from './config';
+
+/** The daemon's answer for a cloud session whose codespace is suspended. */
+export function isSuspendedError(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 503 && err.code === 'session_suspended';
+}
 
 const DRAFT_PREFIX = 'draft_';
 const LOCAL_PREFIX = 'local-';
@@ -70,6 +79,8 @@ interface DraftRecord {
   session: ApiSession;
   /** `tasks.md` content staged while the session was still a draft. */
   planContent: string | null;
+  /** The codespace machine type the session runs on; `null` for this machine. */
+  machineType: string | null;
 }
 
 interface SessionsState {
@@ -78,6 +89,11 @@ interface SessionsState {
   active: ApiSession | null;
   /** Client-side new chats, keyed by their draft id. */
   drafts: Record<string, DraftRecord>;
+  /**
+   * Cloud sessions whose codespace was suspended when they were read: they
+   * show as waiting for a message, which starts the codespace.
+   */
+  suspended: Record<string, true>;
   /** Loaded messages keyed by the session that owns them. */
   messages: Record<string, ApiMessage[]>;
   loading: boolean;
@@ -94,6 +110,8 @@ interface SessionsState {
   materialize: (id: string) => Promise<ApiSession>;
   /** Stage a plan on a draft without touching the daemon. */
   saveDraftPlan: (id: string, content: string, planState: SessionPlanState) => void;
+  /** Choose where a draft runs: a codespace machine type, or `null` for this machine. */
+  setDraftMachine: (id: string, machineType: string | null) => void;
   rename: (id: string, title: string) => Promise<void>;
   setModel: (id: string, model: string) => Promise<void>;
   setReasoningEffort: (id: string, effort: ReasoningEffortPatch) => Promise<void>;
@@ -102,6 +120,17 @@ interface SessionsState {
 
   appendMessage: (sessionId: string, msg: ApiMessage) => void;
   replaceMessage: (sessionId: string, msg: ApiMessage) => void;
+  /** Drop the latest user message whose text is `content`: a withdrawn turn's. */
+  withdrawUserMessage: (sessionId: string, content: string) => void;
+  /** The card of a finished turn's terminal call changed (a question was answered). */
+  applyToolCard: (sessionId: string, callId: string, card: CommandCard | null) => void;
+  /**
+   * A turn ended: the oldest not-yet-stored user message takes the id the
+   * daemon stored it under, and the reply, when the turn stored one, joins
+   * under its stored id (or replaces the copy a refresh already fetched), so
+   * a later refresh updates both in place.
+   */
+  settleTurn: (sessionId: string, userMessageId: string | null, reply: ApiMessage | null) => void;
   updateRuntime: (id: string, runtime: Partial<SessionRuntimeSummary>) => void;
 }
 
@@ -112,6 +141,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   order: [],
   active: null,
   drafts: {},
+  suspended: {},
   messages: {},
   loading: false,
   error: null,
@@ -147,17 +177,43 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const session = await getSession(id);
+      const transcript = foldTranscript((await getTranscript(id)).entries);
       if (generation !== activeRequestGeneration) return;
-      set({
-        active: session,
-        messages: {
-          ...get().messages,
-          [id]: mergePendingLocal(session.messages ?? [], get().messages[id] ?? []),
-        },
-        loading: false,
+      set((prev) => {
+        const { [id]: _woken, ...suspended } = prev.suspended;
+        return {
+          active: session,
+          suspended,
+          messages: {
+            ...prev.messages,
+            [id]: mergePendingLocal(transcript, prev.messages[id] ?? []),
+          },
+          loading: false,
+        };
       });
     } catch (err) {
       if (generation !== activeRequestGeneration) return;
+      if (isSuspendedError(err)) {
+        // Nothing failed: the session's codespace waits for a message. What
+        // the list knows of the session stands in until it is running.
+        const summary = get().index[id];
+        set((prev) => ({
+          active: {
+            id,
+            title: summary?.title ?? '',
+            lastModified: summary?.lastModified ?? new Date().toISOString(),
+            preview: summary?.preview ?? '',
+            profileId: summary?.profileId ?? null,
+            model: '',
+            reasoningEffort: null,
+            runtime: summary?.runtime ?? {},
+          },
+          suspended: { ...prev.suspended, [id]: true },
+          messages: { ...prev.messages, [id]: prev.messages[id] ?? [] },
+          loading: false,
+        }));
+        return;
+      }
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
   },
@@ -167,19 +223,26 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     const generation = ++activeRequestGeneration;
     try {
       const session = await getSession(id);
+      const transcript = foldTranscript((await getTranscript(id)).entries);
       if (generation !== activeRequestGeneration) return;
       set((prev) => {
         if (prev.active?.id !== id) return prev;
+        const { [id]: _woken, ...suspended } = prev.suspended;
         return {
           active: session,
+          suspended,
           messages: {
             ...prev.messages,
-            [id]: mergePendingLocal(session.messages ?? [], prev.messages[id] ?? []),
+            [id]: mergePendingLocal(transcript, prev.messages[id] ?? []),
           },
         };
       });
     } catch (err) {
       if (generation !== activeRequestGeneration) return;
+      if (isSuspendedError(err)) {
+        set((prev) => ({ suspended: { ...prev.suspended, [id]: true } }));
+        return;
+      }
       set({ error: err instanceof Error ? err.message : String(err) });
     }
   },
@@ -191,7 +254,6 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       title: 'New Chat',
       lastModified: new Date().toISOString(),
       preview: '',
-      messages: [],
       profileId: profileId ?? null,
       model: useConfigStore.getState().config?.fullConfig.lastModel ?? '',
       reasoningEffort: null,
@@ -199,7 +261,10 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       repo: opts?.repo ?? null,
     };
     set((prev) => ({
-      drafts: { ...prev.drafts, [draft.id]: { session: draft, planContent: null } },
+      drafts: {
+        ...prev.drafts,
+        [draft.id]: { session: draft, planContent: null, machineType: null },
+      },
       active: draft,
       messages: { ...prev.messages, [draft.id]: [] },
     }));
@@ -213,6 +278,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       profileId: record.session.profileId,
       model: record.session.model || undefined,
       repo: record.session.repo ?? undefined,
+      cloud: record.machineType ? { machineType: record.machineType } : undefined,
     });
     const patch: UpdateSessionPatch = {};
     if (record.session.title !== 'New Chat') patch.title = record.session.title;
@@ -263,9 +329,17 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         runtime: { ...draft.session.runtime, planState },
       };
       return {
-        drafts: { ...prev.drafts, [id]: { session, planContent: content } },
+        drafts: { ...prev.drafts, [id]: { ...draft, session, planContent: content } },
         active: prev.active?.id === id ? session : prev.active,
       };
+    });
+  },
+
+  setDraftMachine(id, machineType) {
+    set((prev) => {
+      const draft = prev.drafts[id];
+      if (!draft) return prev;
+      return { drafts: { ...prev.drafts, [id]: { ...draft, machineType } } };
     });
   },
 
@@ -377,6 +451,26 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     }));
   },
 
+  withdrawUserMessage(sessionId, content) {
+    set((prev) => {
+      const messages = prev.messages[sessionId] ?? [];
+      const at = messages.findLastIndex((m) => m.role === 'user' && m.content === content);
+      if (at < 0) return prev;
+      return {
+        messages: { ...prev.messages, [sessionId]: messages.filter((_, i) => i !== at) },
+      };
+    });
+  },
+
+  applyToolCard(sessionId, callId, card) {
+    set((prev) => ({
+      messages: {
+        ...prev.messages,
+        [sessionId]: withToolCard(prev.messages[sessionId] ?? [], callId, card),
+      },
+    }));
+  },
+
   replaceMessage(sessionId, msg) {
     set((prev) => ({
       messages: {
@@ -384,6 +478,24 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         [sessionId]: (prev.messages[sessionId] ?? []).map((m) => (m.id === msg.id ? msg : m)),
       },
     }));
+  },
+
+  settleTurn(sessionId, userMessageId, reply) {
+    set((prev) => {
+      let list = prev.messages[sessionId] ?? [];
+      if (userMessageId !== null && !list.some((m) => m.id === userMessageId)) {
+        const index = list.findIndex((m) => m.role === 'user' && m.id.startsWith(LOCAL_PREFIX));
+        if (index >= 0) {
+          list = list.map((m, i) => (i === index ? { ...m, id: userMessageId } : m));
+        }
+      }
+      if (reply !== null) {
+        list = list.some((m) => m.id === reply.id)
+          ? list.map((m) => (m.id === reply.id ? reply : m))
+          : [...list, reply];
+      }
+      return { messages: { ...prev.messages, [sessionId]: list } };
+    });
   },
 
   updateRuntime(id, patch) {

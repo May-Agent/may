@@ -7,6 +7,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::session_find::{FindError, FindRequest, find};
 use crate::db::{ChatDb, IndexedMessageRow};
 use crate::repo_search::indexer::{
     IndexerError, SESSIONS_COLLECTION, SearchIndexer, parse_message_doc_id,
@@ -27,18 +28,30 @@ pub enum SessionOutputMode {
 }
 
 /// Search May sessions by what was discussed, or inspect, read and list them.
+///
+/// `session "find <regex>"` is rule-based search over session history, newest
+/// first, not the ranked index: `--session-id`, `--role`, `--since`, `--until`
+/// and `--title-contains` filter in SQLite, then the regex runs over message
+/// text. `--ignore-case` matches ignoring case, `--context N` shows N
+/// neighbouring messages per match, `--count` reports matching messages per
+/// session, `--tools` also searches tool calls and their output, `--limit`
+/// (default 20, at most 200) and `--offset` page the matches. Thinking is
+/// never searched. A hit names its session and message id; read it in place
+/// with `session "messages <session>" --around <message id>`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionArgs {
     /// Optional command-form input. Supported:
     /// - `session <id> search <prompt>`
     /// - `session search <prompt>`
+    /// - `session find <regex>`
     /// - `session inspect <id>`
     /// - `session messages <id>`
     /// - `session list`
     #[serde(default)]
     pub command: Option<String>,
 
-    /// What to find, described in natural language.
+    /// What to find, described in natural language; with `find`, the regular
+    /// expression after it.
     pub query: String,
 
     /// Output mode: `sessions` (aggregated) or `messages`.
@@ -89,6 +102,15 @@ pub struct SessionArgs {
     #[serde(default)]
     pub include_content: bool,
 
+    /// With `session messages <id>`: return only the messages around this
+    /// message id instead of the whole session.
+    #[serde(default)]
+    pub around: Option<i64>,
+
+    /// With `--around`: how many messages to return on each side. Default 3.
+    #[serde(default)]
+    pub context: Option<usize>,
+
     /// Include current session. Default false.
     #[serde(default)]
     pub include_current: bool,
@@ -96,6 +118,19 @@ pub struct SessionArgs {
     /// Include archived sessions. Default false.
     #[serde(default)]
     pub include_archived: bool,
+
+    /// With `find`: match the pattern ignoring case.
+    #[serde(default)]
+    pub ignore_case: bool,
+
+    /// With `find`: report the number of matching messages per session
+    /// instead of the matches.
+    #[serde(default)]
+    pub count: bool,
+
+    /// With `find`: also search tool calls and their output.
+    #[serde(default)]
+    pub tools: bool,
 }
 
 const fn default_output_mode() -> SessionOutputMode {
@@ -124,6 +159,10 @@ enum SessionToolError {
         #[source]
         source: shell_words::ParseError,
     },
+    #[error(transparent)]
+    Find(#[from] FindError),
+    #[error("invalid session command: missing regular expression after 'find'")]
+    MissingFindPattern,
     #[error("session search is unavailable: {0}")]
     Index(#[from] IndexerError),
     #[error("session search is unavailable: {0}")]
@@ -144,6 +183,8 @@ enum SessionToolError {
     MissingActionSessionId { action: &'static str },
     #[error("session '{session_id}' was not found")]
     SessionNotFound { session_id: String },
+    #[error("session '{session_id}' has no message {message_id}")]
+    MessageNotFound { session_id: String, message_id: i64 },
     #[error(
         "every matching message is already present in the current context window; refine the query to recall older or other-session content"
     )]
@@ -158,9 +199,30 @@ struct SearchDefaults {
 #[derive(Debug, Clone)]
 enum SessionExecutionPlan {
     Search(SessionArgs),
+    Find(FindRequest),
     Inspect(SessionInspectRequest),
     Messages(SessionMessagesRequest),
     List(SessionListRequest),
+}
+
+impl FindRequest {
+    /// `session find <pattern>` with the filters `args` carries.
+    fn new(pattern: String, args: &SessionArgs) -> Self {
+        Self {
+            pattern,
+            session: args.session_id.clone(),
+            role: args.role.clone(),
+            since: args.since.clone(),
+            until: args.until.clone(),
+            title: args.title_contains.clone(),
+            ignore_case: args.ignore_case,
+            context: args.context,
+            count: args.count,
+            tools: args.tools,
+            limit: args.limit,
+            offset: args.offset,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +233,28 @@ struct SessionInspectRequest {
 #[derive(Debug, Clone)]
 struct SessionMessagesRequest {
     session_id: String,
+    around: Option<MessageWindow>,
+}
+
+/// The messages around one message of a session.
+#[derive(Debug, Clone, Copy)]
+struct MessageWindow {
+    message_id: i64,
+    context: usize,
+}
+
+const DEFAULT_AROUND_CONTEXT: usize = 3;
+
+impl SessionMessagesRequest {
+    fn new(session_id: String, args: &SessionArgs) -> Self {
+        Self {
+            session_id,
+            around: args.around.map(|message_id| MessageWindow {
+                message_id,
+                context: args.context.unwrap_or(DEFAULT_AROUND_CONTEXT),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +360,10 @@ async fn execute_plan(
         SessionExecutionPlan::Search(args) => {
             let index = index.ok_or(SessionToolError::NoIndex)?;
             execute_search(index, &current_session_id, args).await
+        }
+        SessionExecutionPlan::Find(request) => {
+            let db = ChatDb::open(&db_path).await?;
+            Ok(ToolResult::text(find(&db, request).await?))
         }
         SessionExecutionPlan::Inspect(request) => execute_inspect(db_path, request).await,
         SessionExecutionPlan::Messages(request) => execute_messages(db_path, request).await,
@@ -504,12 +592,21 @@ async fn execute_messages(
             session_id: request.session_id.clone(),
         }
     })?;
-    let messages = db
-        .get_messages(&request.session_id)
-        .await?
-        .into_iter()
-        .map(SessionMessageView::from)
-        .collect::<Vec<_>>();
+    let messages = match request.around {
+        None => db.get_messages(&request.session_id).await?,
+        Some(window) => {
+            let context = i64::try_from(window.context).unwrap_or(i64::MAX);
+            db.messages_around(&request.session_id, window.message_id, context)
+                .await?
+                .ok_or_else(|| SessionToolError::MessageNotFound {
+                    session_id: request.session_id.clone(),
+                    message_id: window.message_id,
+                })?
+        }
+    }
+    .into_iter()
+    .map(SessionMessageView::from)
+    .collect::<Vec<_>>();
 
     let text = SessionMessagesText {
         session: SessionSummaryView::from(session),
@@ -693,6 +790,15 @@ fn plan_from_tokens(
     }
 
     match first {
+        "find" => {
+            let pattern = tokens[1..].join(" ");
+            if pattern.is_empty() {
+                return Err(SessionToolError::MissingFindPattern);
+            }
+            Ok(Some(SessionExecutionPlan::Find(FindRequest::new(
+                pattern, args,
+            ))))
+        }
         "search" => {
             let prompt = tokens
                 .iter()
@@ -723,9 +829,7 @@ fn plan_from_tokens(
                 .get(1)
                 .ok_or(SessionToolError::MissingActionSessionId { action: "messages" })?;
             Ok(Some(SessionExecutionPlan::Messages(
-                SessionMessagesRequest {
-                    session_id: session_id.clone(),
-                },
+                SessionMessagesRequest::new(session_id.clone(), args),
             )))
         }
         "list" if tokens.len() == 1 => Ok(Some(SessionExecutionPlan::List(SessionListRequest {
@@ -753,6 +857,16 @@ fn plan_from_raw_query(
         return None;
     }
 
+    // The regular expression is everything after `find`, spacing kept.
+    if let Some(("find", pattern)) = trimmed.split_once(char::is_whitespace)
+        && !pattern.trim().is_empty()
+    {
+        return Some(SessionExecutionPlan::Find(FindRequest::new(
+            pattern.trim().to_string(),
+            args,
+        )));
+    }
+
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let first = tokens.first().copied()?;
 
@@ -762,11 +876,9 @@ fn plan_from_raw_query(
                 session_id: tokens[1].to_string(),
             }))
         }
-        "messages" if tokens.len() == 2 => {
-            Some(SessionExecutionPlan::Messages(SessionMessagesRequest {
-                session_id: tokens[1].to_string(),
-            }))
-        }
+        "messages" if tokens.len() == 2 => Some(SessionExecutionPlan::Messages(
+            SessionMessagesRequest::new(tokens[1].to_string(), args),
+        )),
         "list" if tokens.len() == 1 => Some(SessionExecutionPlan::List(SessionListRequest {
             limit: args.limit.clamp(1, 200),
             offset: args.offset,
@@ -914,7 +1026,7 @@ fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> boo
     args.include_archived || !row.archived
 }
 
-fn truncate_text(input: &str, max_chars: usize) -> String {
+pub(super) fn truncate_text(input: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in input.chars().enumerate() {
         if idx >= max_chars {
@@ -1013,10 +1125,108 @@ mod tests {
             since: None,
             until: None,
             title_contains: None,
+            around: None,
+            context: None,
             include_content: false,
             include_current: false,
             include_archived: false,
+            ignore_case: false,
+            count: false,
+            tools: false,
         }
+    }
+
+    fn defaults() -> SearchDefaults {
+        SearchDefaults {
+            current_session_id: "current".to_string(),
+        }
+    }
+
+    #[test]
+    fn find_is_a_session_subcommand_that_carries_every_filter() {
+        let mut args = base_args();
+        args.session_id = Some("alpha".to_string());
+        args.role = Some("user".to_string());
+        args.since = Some("2026-01-01T00:00:00Z".to_string());
+        args.until = Some("2026-02-01T00:00:00Z".to_string());
+        args.title_contains = Some("deploy".to_string());
+        args.ignore_case = true;
+        args.context = Some(2);
+        args.count = true;
+        args.tools = true;
+        args.limit = 5;
+        args.offset = 7;
+
+        // The raw query keeps the regular expression's own spacing.
+        let mut raw = args.clone();
+        raw.query = "find  roll   out ".to_string();
+        let Some(SessionExecutionPlan::Find(request)) = plan_from_raw_query(&raw, &defaults())
+        else {
+            panic!("expected find plan");
+        };
+        assert_eq!(request.pattern, "roll   out");
+        assert_eq!(request.session.as_deref(), Some("alpha"));
+        assert_eq!(request.role.as_deref(), Some("user"));
+        assert_eq!(request.since.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(request.until.as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(request.title.as_deref(), Some("deploy"));
+        assert!(request.ignore_case && request.count && request.tools);
+        assert_eq!(request.context, Some(2));
+        assert_eq!((request.limit, request.offset), (5, 7));
+
+        // The command form tokenises shell words and rejoins the pattern.
+        let tokens = split_command_form_tokens("session find \"canary\" live", "session")
+            .expect("command form should parse");
+        let Some(SessionExecutionPlan::Find(request)) =
+            plan_from_tokens(&tokens, &args, &defaults()).expect("plan should parse")
+        else {
+            panic!("expected find plan");
+        };
+        assert_eq!(request.pattern, "canary live");
+    }
+
+    #[test]
+    fn find_without_a_pattern_is_refused() {
+        let tokens = vec!["find".to_string()];
+        let error =
+            plan_from_tokens(&tokens, &base_args(), &defaults()).expect_err("find needs a pattern");
+        assert!(error.to_string().contains("after 'find'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn session_find_searches_history_through_the_session_tool_path() {
+        use crate::db::MessageMeta;
+        use crate::session::MessageRole;
+
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("alpha", Some("Deploy plan"), Some("m"))
+            .await
+            .expect("session");
+        db.append_message(
+            "alpha",
+            MessageRole::User,
+            "roll out the canary",
+            Some("2026-01-01T10:00:00Z"),
+            MessageMeta::default(),
+        )
+        .await
+        .expect("append");
+
+        let mut args = base_args();
+        args.query = "find CANARY".to_string();
+        args.ignore_case = true;
+        let plan = build_execution_plan(args, SessionCommandInput::RawQuery, &defaults())
+            .expect("find plan");
+        let text = execute_plan(db_path, None, "current".to_string(), plan)
+            .await
+            .expect("find runs without a search index")
+            .as_text()
+            .expect("text")
+            .to_string();
+        assert!(text.contains("Showing 1 matching message(s)"), "{text}");
+        assert!(text.contains("> roll out the canary"), "{text}");
     }
 
     #[test]
@@ -1194,6 +1404,69 @@ mod tests {
             panic!("expected search plan");
         };
         assert_eq!(args.query, "abc123");
+    }
+
+    #[tokio::test]
+    async fn messages_around_returns_exactly_the_window() {
+        use crate::db::MessageMeta;
+        use crate::session::MessageRole;
+
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("s1", Some("t"), Some("m"))
+            .await
+            .expect("session");
+        db.create_session("s2", Some("t"), Some("m"))
+            .await
+            .expect("session");
+        let mut ids = Vec::new();
+        for n in 0..9 {
+            // An interleaved row of another session must not enter the window.
+            let session = if n == 4 { "s2" } else { "s1" };
+            let message = db
+                .append_message(
+                    session,
+                    MessageRole::User,
+                    &format!("body {n}"),
+                    Some("2026-01-01T00:00:00Z"),
+                    MessageMeta::default(),
+                )
+                .await
+                .expect("append");
+            ids.push(i64::from(message.id));
+        }
+
+        let mut args = base_args();
+        args.around = Some(ids[6]);
+        args.context = Some(2);
+        let request = SessionMessagesRequest::new("s1".to_string(), &args);
+        let text = execute_messages(db_path.clone(), request)
+            .await
+            .expect("messages")
+            .as_text()
+            .expect("text")
+            .to_string();
+        assert!(text.contains("5 message(s):"), "{text}");
+        for n in [3, 5, 6, 7, 8] {
+            assert!(
+                text.contains(&format!("body {n}\n")) || text.ends_with(&format!("body {n}\n")),
+                "{text}"
+            );
+        }
+        for n in [0, 1, 2, 4] {
+            assert!(!text.contains(&format!("body {n}")), "{text}");
+        }
+
+        let mut args = base_args();
+        args.around = Some(ids[4]);
+        let missing = execute_messages(
+            db_path,
+            SessionMessagesRequest::new("s1".to_string(), &args),
+        )
+        .await
+        .expect_err("message of another session");
+        assert!(missing.to_string().contains("has no message"), "{missing}");
     }
 
     fn match_row(session_id: &str, message_id: i64, content: &str) -> SessionMatchRow {

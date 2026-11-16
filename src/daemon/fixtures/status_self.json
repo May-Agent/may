@@ -1,0 +1,24 @@
+{
+  "Version": "1.82.0-t0a1b2c3d4",
+  "TUN": true,
+  "BackendState": "Running",
+  "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::10"],
+  "Self": {
+    "ID": "nUfW3rEmzX11CNTRL",
+    "PublicKey": "nodekey:08bc8fc80a4a9233900ba536866adec8dd377c805aa5bb2d1f92cb592879bc4b",
+    "HostName": "Mac",
+    "DNSName": "Mac.tail1234.ts.net.",
+    "OS": "macOS",
+    "UserID": 8247853801640854,
+    "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::10"],
+    "Online": true
+  },
+  "MagicDNSSuffix": "tail1234.ts.net",
+  "User": {
+    "8247853801640854": {
+      "ID": 8247853801640854,
+      "LoginName": "owner@example.com",
+      "DisplayName": "Owner"
+    }
+  }
+}

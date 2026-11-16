@@ -18,7 +18,8 @@ use crate::client::{DaemonClient, DaemonClientError};
 
 /// launchd label and systemd unit name of the installed service.
 pub const SERVICE_LABEL: &str = "com.github.may-agent.may";
-/// launchd label of the daemon a client starts on demand on macOS.
+/// Prefix of the launchd label of the daemon a client starts on demand on
+/// macOS; [`on_demand_label`] appends a key of the May home.
 const ON_DEMAND_LABEL: &str = "com.github.may-agent.may.on-demand";
 const SYSTEMD_UNIT: &str = "may-daemon.service";
 
@@ -97,10 +98,70 @@ struct LaunchdPlist<'a> {
     environment: &'a [(String, String)],
 }
 
+/// The name `tasks` is invoked under: the daemon's link to its own
+/// executable, which then runs the `tasks` command instead of May.
+const TASKS_COMMAND: &str = "tasks";
+
+/// Whether a process started as `argv0` is the `tasks` command.
+#[must_use]
+pub fn invoked_as_tasks(argv0: Option<&std::ffi::OsStr>) -> bool {
+    argv0.is_some_and(|name| {
+        Path::new(name).file_name() == Some(std::ffi::OsStr::new(TASKS_COMMAND))
+    })
+}
+
+/// `~/.may/bin`, the directory leading the `PATH` of every sandboxed
+/// command.
+fn bin_dir(paths: &DaemonPaths) -> PathBuf {
+    paths.root().join("bin")
+}
+
+/// Keeps `~/.may/bin/tasks` a symlink to this executable, so every build
+/// serves the `tasks` command from itself: created when missing and
+/// replaced when it points elsewhere.
+///
+/// # Errors
+/// Fails when the directory or the link cannot be written.
+pub fn ensure_tasks_link(paths: &DaemonPaths) -> std::io::Result<()> {
+    let directory = bin_dir(paths);
+    std::fs::create_dir_all(&directory)?;
+    let link = directory.join(TASKS_COMMAND);
+    let target = current_exe()?;
+    match std::fs::read_link(&link) {
+        Ok(current) if current == target => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Pointing elsewhere, or not a symlink at all.
+        Ok(_) | Err(_) => std::fs::remove_file(&link)?,
+    }
+    std::os::unix::fs::symlink(&target, &link)
+}
+
 /// The calling process's environment as text. A launchd job starts with
 /// launchd's default environment, so the daemon is given the client's.
-fn environment() -> Result<Vec<(String, String)>, LifecycleError> {
-    text_environment(std::env::vars_os())
+///
+/// Its `PATH` leads with [`bin_dir`], so `tasks` is on the `PATH` of every
+/// sandboxed command.
+fn environment(paths: &DaemonPaths) -> Result<Vec<(String, String)>, LifecycleError> {
+    let mut environment = text_environment(std::env::vars_os())?;
+    let path = path_with_bin_dir(paths)?;
+    match environment.iter_mut().find(|(name, _)| name == "PATH") {
+        Some((_, value)) => *value = path,
+        None => environment.push(("PATH".to_string(), path)),
+    }
+    Ok(environment)
+}
+
+/// The calling process's `PATH` led by [`bin_dir`].
+fn path_with_bin_dir(paths: &DaemonPaths) -> Result<String, LifecycleError> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let joined =
+        std::env::join_paths(std::iter::once(bin_dir(paths)).chain(std::env::split_paths(&path)))
+            .map_err(std::io::Error::other)?;
+    joined
+        .into_string()
+        .map_err(|_| LifecycleError::NonUnicodeEnvironment {
+            name: "PATH".to_string(),
+        })
 }
 
 fn text_environment(
@@ -246,7 +307,7 @@ pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
             program: &program,
             log: &paths.log().display().to_string(),
             keep_alive: true,
-            environment: &environment()?,
+            environment: &environment(paths)?,
         }
         .render()?;
         let domain = format!("gui/{}", uid().await?);
@@ -321,12 +382,18 @@ fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
     let mut command = std::process::Command::new(current_exe()?);
     command
         .arg("daemon")
+        .env("PATH", path_with_bin_dir(paths)?)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        // Its own process group: the daemon outlives the terminal that
-        // started it, and a Ctrl+C there does not reach it.
-        .process_group(0);
+        .stderr(log);
+    // Its own process session: the daemon outlives the terminal that started
+    // it, a Ctrl+C there does not reach it, and it leads the session every
+    // process it starts shares.
+    // SAFETY: `setsid` is async-signal-safe and touches no memory of the
+    // parent; the child is not a process-group leader before it runs.
+    unsafe {
+        command.pre_exec(|| rustix::process::setsid().map(drop).map_err(Into::into));
+    }
     Ok(command.spawn()?)
 }
 
@@ -404,15 +471,73 @@ fn on_demand_plist_path(paths: &DaemonPaths) -> PathBuf {
     paths.root().join("daemon.plist")
 }
 
+/// The on-demand job's label for the May home `root`: one job per home, so
+/// starting one home's daemon never boots out another home's, the user's own
+/// included. `root` is canonical, so every spelling of a home names one job.
+fn on_demand_label(root: &Path) -> String {
+    use sha2::Digest as _;
+
+    let digest = sha2::Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let key = digest.get(..8).expect("a SHA-256 digest has 32 bytes");
+    format!("{ON_DEMAND_LABEL}.{}", hex::encode(key))
+}
+
+/// Whether `label` names an on-demand job of some May home.
+#[cfg(target_os = "macos")]
+fn is_on_demand_label(label: &str) -> bool {
+    label
+        .strip_prefix(ON_DEMAND_LABEL)
+        .is_some_and(|key| key.starts_with('.'))
+}
+
+/// Boots out the on-demand jobs in `domain` whose plist is gone, returning
+/// the services it removed. The plist lives under its May home, so a job
+/// whose plist is gone belongs to a deleted home (a test's or a relocated
+/// one) and its daemon would otherwise run on until logout. A job launchd
+/// reports no plist for is kept: nothing proves its home gone.
+#[cfg(target_os = "macos")]
+fn sweep_stale_jobs(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    domain: &str,
+) -> Result<Vec<String>, LifecycleError> {
+    let launch = |error: repo_search_client::launcher::install::LaunchctlError| {
+        LifecycleError::ServiceManager {
+            command: "launchctl".to_string(),
+            detail: error.to_string(),
+        }
+    };
+    let mut removed = Vec::new();
+    for label in launchctl.labels(domain).map_err(launch)? {
+        if !is_on_demand_label(&label) {
+            continue;
+        }
+        let service = format!("{domain}/{label}");
+        let Some(plist) = launchctl
+            .service(&service)
+            .map_err(launch)?
+            .and_then(|loaded| loaded.path)
+        else {
+            continue;
+        };
+        if !plist.try_exists()?
+            && crate::repo_search::boot_out_loaded(launchctl, &service).map_err(launch)?
+        {
+            removed.push(service);
+        }
+    }
+    Ok(removed)
+}
+
 /// Renders the on-demand job: no `KeepAlive`, so a stopped daemon stays
 /// stopped.
 fn on_demand_plist(
+    label: &str,
     program: &str,
     log: &str,
     environment: &[(String, String)],
 ) -> Result<String, LifecycleError> {
     Ok(LaunchdPlist {
-        label: ON_DEMAND_LABEL,
+        label,
         program,
         log,
         keep_alive: false,
@@ -431,24 +556,42 @@ async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    std::fs::create_dir_all(paths.root())?;
+    let label = on_demand_label(&std::fs::canonicalize(paths.root())?);
+    // Jobs of deleted homes go first, so a start never leaves them behind.
+    #[cfg(target_os = "macos")]
+    {
+        let sweep_domain = domain.clone();
+        let removed = blocking::unblock(move || {
+            sweep_stale_jobs(
+                &mut repo_search_client::launcher::install::SystemLaunchctl,
+                &sweep_domain,
+            )
+        })
+        .await?;
+        for service in removed {
+            tracing::info!(%service, "booted out the on-demand daemon of a deleted May home");
+        }
+    }
     let plist = on_demand_plist_path(paths);
     write_private(
         &plist,
         &on_demand_plist(
+            &label,
             &current_exe()?.display().to_string(),
             &log.display().to_string(),
-            &environment()?,
+            &environment(paths)?,
         )?,
     )?;
-    // A job left from an earlier start (a stopped or replaced daemon) is
-    // still loaded and would refuse the new bootstrap.
-    boot_out(&domain, ON_DEMAND_LABEL, &plist).await?;
+    // A job left from an earlier start of this home (a stopped or replaced
+    // daemon) is still loaded and would refuse the new bootstrap.
+    boot_out(&domain, &label, &plist).await?;
     run(
         "launchctl",
         &["bootstrap", &domain, &plist.display().to_string()],
     )
     .await?;
-    Ok(Started::Job(format!("{domain}/{ON_DEMAND_LABEL}")))
+    Ok(Started::Job(format!("{domain}/{label}")))
 }
 
 async fn start(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
@@ -640,15 +783,87 @@ mod launchd_job_tests {
     use std::ffi::OsString;
 
     use super::{
-        LifecycleError, job_exit, on_demand_plist, require_gui_domain, text_environment,
-        write_private,
+        LifecycleError, ON_DEMAND_LABEL, current_exe, environment, job_exit, on_demand_label,
+        on_demand_plist, path_with_bin_dir, require_gui_domain, text_environment, write_private,
     };
+    use crate::daemon::DaemonPaths;
 
     #[test]
     fn the_on_demand_plist_is_not_kept_alive() {
-        let plist = on_demand_plist("/bin/may", "/home/.may/daemon.log", &[]).expect("renders");
-        assert!(plist.contains("com.github.may-agent.may.on-demand"));
+        let label = on_demand_label(std::path::Path::new("/home/.may"));
+        let plist =
+            on_demand_plist(&label, "/bin/may", "/home/.may/daemon.log", &[]).expect("renders");
+        assert!(plist.contains(&format!("<string>{label}</string>")));
         assert!(plist.contains("<key>KeepAlive</key>\n  <false/>"));
+    }
+
+    /// Two May homes on one machine, a test's and the user's, run their
+    /// on-demand daemons side by side: a start in one boots out only that
+    /// home's earlier job.
+    #[test]
+    fn each_may_home_gets_its_own_on_demand_job() {
+        let one = on_demand_label(std::path::Path::new("/Users/me/.may"));
+        let other = on_demand_label(std::path::Path::new("/private/var/folders/x/T/.tmp1/.may"));
+        assert_ne!(one, other);
+        assert_eq!(one, on_demand_label(std::path::Path::new("/Users/me/.may")));
+        for label in [&one, &other] {
+            assert!(label.starts_with(&format!("{ON_DEMAND_LABEL}.")));
+            assert_ne!(label.as_str(), super::SERVICE_LABEL);
+        }
+    }
+
+    #[test]
+    fn the_daemon_path_leads_with_the_may_bin_directory() {
+        let paths = DaemonPaths::new(std::path::PathBuf::from("/home/.may"));
+        let path = path_with_bin_dir(&paths).expect("the path is text");
+        assert_eq!(
+            std::env::split_paths(&path).next().as_deref(),
+            Some(std::path::Path::new("/home/.may/bin"))
+        );
+        let environment = environment(&paths).expect("the environment is text");
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|(name, _)| name == "PATH")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_tasks_link_points_at_this_executable_and_is_repaired() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths::new(home.path().to_path_buf());
+        let link = home.path().join("bin").join("tasks");
+        let executable = current_exe().expect("the test binary has a path");
+
+        super::ensure_tasks_link(&paths).expect("the link is created");
+        assert_eq!(std::fs::read_link(&link).expect("a symlink"), executable);
+
+        std::fs::remove_file(&link).expect("removed");
+        std::os::unix::fs::symlink("/elsewhere", &link).expect("a stale link");
+        super::ensure_tasks_link(&paths).expect("the link is repaired");
+        assert_eq!(std::fs::read_link(&link).expect("a symlink"), executable);
+
+        std::fs::remove_file(&link).expect("removed");
+        std::fs::write(&link, b"a file").expect("a regular file");
+        super::ensure_tasks_link(&paths).expect("the file is replaced");
+        assert_eq!(std::fs::read_link(&link).expect("a symlink"), executable);
+    }
+
+    #[test]
+    fn only_the_name_tasks_runs_the_tasks_command() {
+        use std::ffi::OsStr;
+
+        for (argv0, expected) in [
+            ("/home/.may/bin/tasks", true),
+            ("tasks", true),
+            ("/usr/local/bin/may", false),
+            ("/home/.may/bin/tasks-old", false),
+        ] {
+            assert_eq!(super::invoked_as_tasks(Some(OsStr::new(argv0))), expected);
+        }
+        assert!(!super::invoked_as_tasks(None));
     }
 
     #[test]
@@ -657,7 +872,13 @@ mod launchd_job_tests {
             ("PATH".to_string(), "/opt/homebrew/bin:/usr/bin".to_string()),
             ("PS1".to_string(), "a & b <c>".to_string()),
         ];
-        let plist = on_demand_plist("/bin/may", "/log", &environment).expect("renders");
+        let plist = on_demand_plist(
+            &on_demand_label(std::path::Path::new("/home/.may")),
+            "/bin/may",
+            "/log",
+            &environment,
+        )
+        .expect("renders");
         assert!(plist.contains("<key>PATH</key>\n    <string>/opt/homebrew/bin:/usr/bin</string>"));
         // askama's escaper uses numeric character references.
         assert!(plist.contains("<string>a &#38; b &#60;c&#62;</string>"));
@@ -738,6 +959,71 @@ mod launchd_job_tests {
             job_exit("\tlast terminating signal = Killed: 9\n").as_deref(),
             Some("signal Killed: 9")
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod stale_job_tests {
+    use std::path::{Path, PathBuf};
+
+    use repo_search_client::launcher::install::{Launchctl, LaunchctlError, Service};
+
+    use super::{ON_DEMAND_LABEL, on_demand_label, sweep_stale_jobs};
+
+    /// A launchd holding `loaded` labels with their plists, recording every
+    /// `bootout`.
+    struct Fake {
+        loaded: Vec<(String, Option<PathBuf>)>,
+        booted_out: Vec<String>,
+    }
+
+    impl Launchctl for Fake {
+        fn service(&mut self, service: &str) -> Result<Option<Service>, LaunchctlError> {
+            Ok(self
+                .loaded
+                .iter()
+                .find(|(label, _)| service.strip_prefix("gui/1/") == Some(label.as_str()))
+                .map(|(_, path)| Service {
+                    pid: None,
+                    path: path.clone(),
+                }))
+        }
+
+        fn labels(&mut self, _: &str) -> Result<Vec<String>, LaunchctlError> {
+            Ok(self.loaded.iter().map(|(label, _)| label.clone()).collect())
+        }
+
+        fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
+            self.booted_out.push(service.to_owned());
+            Ok(())
+        }
+
+        fn bootstrap(&mut self, _: &str, _: &Path) -> Result<(), LaunchctlError> {
+            unreachable!("sweeping never bootstraps")
+        }
+    }
+
+    #[test]
+    fn boots_out_only_the_jobs_of_deleted_homes() {
+        let live = tempfile::tempdir().expect("tempdir");
+        let live_plist = live.path().join("daemon.plist");
+        std::fs::write(&live_plist, "").expect("plist written");
+        let gone = live.path().join("deleted").join("daemon.plist");
+        let deleted = on_demand_label(Path::new("/deleted/.may"));
+        let mut launchctl = Fake {
+            loaded: vec![
+                (on_demand_label(live.path()), Some(live_plist)),
+                (deleted.clone(), Some(gone.clone())),
+                (on_demand_label(Path::new("/unknown/.may")), None),
+                ("com.example.other".to_string(), Some(gone.clone())),
+                (format!("{ON_DEMAND_LABEL}x"), Some(gone)),
+            ],
+            booted_out: Vec::new(),
+        };
+        let removed = sweep_stale_jobs(&mut launchctl, "gui/1").expect("sweeps");
+        let expected = vec![format!("gui/1/{deleted}")];
+        assert_eq!(removed, expected);
+        assert_eq!(launchctl.booted_out, expected);
     }
 }
 

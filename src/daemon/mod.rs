@@ -17,9 +17,12 @@ mod attachments;
 mod auth;
 #[cfg(test)]
 mod auth_tests;
+mod auto_update;
 mod bootstrap;
 mod browser;
 mod chat;
+mod cloud_home;
+mod cloud_sessions;
 mod computer;
 mod config;
 mod error;
@@ -31,16 +34,27 @@ mod github_repos_tests;
 mod helpers;
 mod interaction;
 pub use interaction::ASK_USER_NOT_OPEN;
+#[cfg(test)]
+mod attachments_tests;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
 mod notifications;
+mod pr_checks;
+mod process_session;
 mod profiles;
+mod prs;
 mod remote_access;
 mod rules_import;
 mod server;
 #[cfg(test)]
+mod session_commands_tests;
+#[cfg(test)]
 mod session_directory_tests;
+pub(crate) mod session_events;
+#[cfg(test)]
+mod session_events_tests;
+mod session_ids;
 mod sessions;
 mod sleep;
 mod state;
@@ -48,11 +62,21 @@ mod tasks;
 mod terminal_parsing;
 mod title_generation;
 mod tool_summary;
+mod transcript;
+#[cfg(test)]
+mod transcript_tests;
 mod tunnel;
 pub(crate) mod types;
+mod user_wait;
 
 #[cfg(test)]
+mod compression_tests;
+#[cfg(test)]
 mod funnel_tests;
+#[cfg(test)]
+mod issue_brief_tests;
+#[cfg(test)]
+mod memory_off_tests;
 #[cfg(test)]
 mod paths_tests;
 #[cfg(test)]
@@ -62,12 +86,15 @@ mod response_tests;
 #[cfg(test)]
 mod secret_question_tests;
 #[cfg(test)]
+mod user_wait_tests;
+#[cfg(test)]
 mod yolo_tests;
 
 pub use chat::{
-    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
+    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, ProgressReport,
+    RecapRecord,
 };
-pub use server::{DEFAULT_PORT, DaemonMode, parse_listen_args};
+pub use server::{DEFAULT_PORT, DaemonMode};
 pub(crate) use server::{start, sync_remote_access};
 pub use types::DaemonHealth;
 
@@ -81,9 +108,9 @@ use anyhow::Context as _;
 use skyzen::routing::Router;
 
 use crate::config::MayConfig;
+use crate::repo_search::RepoSearchCollections;
 use crate::repo_search::auto_index::AutoIndexer;
 use crate::repo_search::indexer::{IndexerStatus, SearchIndexer};
-use crate::repo_search::{RepoSearch, RepoSearchCollections};
 use crate::ui_event_bus::UiEventTopics;
 
 /// How long a shutdown waits for running turns before exiting anyway.
@@ -279,30 +306,6 @@ fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance
     Ok(SingleInstance { _lock: lock })
 }
 
-/// Removes the `LanceDB` session index May kept before search moved to
-/// repo-search.
-fn remove_legacy_search_index(may_dir: &Path) {
-    for name in [
-        "session_index.lancedb",
-        "session_index.meta.json",
-        "session_index.semantic.redb",
-    ] {
-        let path = may_dir.join(name);
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match removed {
-            Ok(()) => tracing::info!(path = %path.display(), "removed the legacy session index"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "failed to remove the legacy session index");
-            }
-        }
-    }
-}
-
 fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -319,11 +322,50 @@ fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
     Ok(listener)
 }
 
+/// The routers a TCP bind is served with, chosen by its address when it is
+/// bound. A loopback address admits loopback `Host` and `Origin` headers
+/// only. Any other address is remote access: every request to it must carry
+/// an identity, resolved from the peer address through tailscaled's `WhoIs`
+/// — the Tailscale header is only valid through tailscale serve's own proxy
+/// on the remote listener.
+struct TcpRouters {
+    state: Arc<state::DaemonState>,
+    loopback: Arc<Router>,
+    direct: Arc<Router>,
+}
+
+impl TcpRouters {
+    /// The router serving a bind on `addr`.
+    const fn router_for(&self, addr: SocketAddr) -> &Arc<Router> {
+        if addr.ip().is_loopback() {
+            &self.loopback
+        } else {
+            &self.direct
+        }
+    }
+
+    /// Serves `listener`, bound on `addr`, with its policy's router.
+    fn spawn(
+        &self,
+        listener: tokio::net::TcpListener,
+        addr: SocketAddr,
+    ) -> tokio::task::JoinHandle<()> {
+        let router = self.router_for(addr).clone();
+        if addr.ip().is_loopback() {
+            tokio::spawn(serve::serve_tcp(listener, router))
+        } else {
+            tokio::spawn(serve::serve_tcp_tailnet(
+                listener,
+                router,
+                self.state.clone(),
+            ))
+        }
+    }
+}
+
 /// The extra `[daemon] listen` listeners, rebound whenever the config changes.
 struct ExtraListeners {
-    state: Arc<state::DaemonState>,
-    local_router: Arc<Router>,
-    direct_router: Arc<Router>,
+    routers: TcpRouters,
     running: HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
 }
 
@@ -341,24 +383,10 @@ impl ExtraListeners {
             if self.running.contains_key(addr) {
                 continue;
             }
-            // A non-loopback bind is remote access: every request to it must
-            // carry an identity, resolved from the peer address through
-            // tailscaled's `WhoIs` — the Tailscale header is only valid
-            // through tailscale serve's own proxy on the remote listener.
-            // Loopback extras stay local.
-            let direct = !addr.ip().is_loopback();
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     tracing::info!(%addr, remote = !addr.ip().is_loopback(), "listening");
-                    let task = if direct {
-                        tokio::spawn(serve::serve_tcp_tailnet(
-                            listener,
-                            self.direct_router.clone(),
-                            self.state.clone(),
-                        ))
-                    } else {
-                        tokio::spawn(serve::serve_tcp(listener, self.local_router.clone()))
-                    };
+                    let task = self.routers.spawn(listener, *addr);
                     self.running.insert(*addr, task);
                 }
                 Err(error) => tracing::warn!(%addr, %error, "failed to listen"),
@@ -374,12 +402,17 @@ impl ExtraListeners {
 /// Fails when another daemon holds the lock, or when the server cannot be
 /// started or its socket bound.
 pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
+    // Everything the daemon starts shares the session it leads, so a daemon
+    // started after an unexpected exit can end what the exited one left.
+    let Some(process_session) = process_session::ProcessSession::lead()
+        .context("failed to give the daemon a process session of its own")?
+    else {
+        return process_session::run_in_own_session().await;
+    };
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
-    // heel executes the sandboxed commands this process runs; configure the
-    // managed binary before any spawned task can reach a sandbox.
-    crate::configure_heel_binary().await;
-    remove_legacy_search_index(paths.root());
+    lifecycle::ensure_tasks_link(&paths)
+        .context("failed to link `tasks` to the daemon's executable")?;
 
     // Agents of relocated homes whose runs were killed before they could
     // retire them, swept before the daemon answers so a client never sees
@@ -394,11 +427,15 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         Err(error) => tracing::warn!(%error, "could not sweep stale repo-search agents"),
     }
 
-    let started = crate::daemon::start(options.mode).await?;
+    let started = crate::daemon::start(options.mode, process_session).await?;
     let state = started.state;
-    let router = Arc::new(started.router);
+    let socket_router = Arc::new(started.socket_router);
     let remote_router = Arc::new(started.remote_router);
-    let direct_router = Arc::new(started.direct_router);
+    let tcp_routers = TcpRouters {
+        state: state.clone(),
+        loopback: Arc::new(started.loopback_router),
+        direct: Arc::new(started.direct_router),
+    };
     state
         .remote_access_manager
         .set_webhook_router(Arc::new(started.webhook_router));
@@ -412,19 +449,32 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .with_context(|| format!("failed to listen on {tcp}"))?;
     // Remote access needs identity: it forwards the tailnet to the remote
     // listener, bound on loopback because only the tunnel process connects.
-    let remote_listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .context("failed to bind the remote listener")?;
+    // A cloud home binds the port its fronting daemon forwards to.
+    let remote_port = started
+        .cloud_home
+        .as_ref()
+        .map_or(0, |home| home.remote_port);
+    let remote_listener =
+        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], remote_port)))
+            .await
+            .context("failed to bind the remote listener")?;
     let unix_listener = bind_unix(&paths.socket())?;
-    state.remote_access_manager.set_local_addr(
+    state.remote_access_manager.set_local_listener_addr(
+        tcp_listener
+            .local_addr()
+            .context("the daemon's local listener has no address")?,
+    );
+    state.remote_access_manager.set_remote_listener_addr(
         remote_listener
             .local_addr()
             .context("the daemon's remote listener has no address")?,
     );
     crate::daemon::sync_remote_access(&state).await?;
-    tokio::spawn(serve::serve_tcp(tcp_listener, router.clone()));
-    tokio::spawn(serve::serve_unix(unix_listener, router.clone()));
-    tokio::spawn(serve::serve_tcp(remote_listener, remote_router.clone()));
+    // `--host` may name a non-loopback address: it gets the identity policy
+    // like any other non-loopback bind.
+    tcp_routers.spawn(tcp_listener, tcp);
+    tokio::spawn(serve::serve_unix(unix_listener, socket_router));
+    tokio::spawn(serve::serve_tcp(remote_listener, remote_router));
     tracing::info!(%tcp, socket = %paths.socket().display(), "May daemon listening");
     eprintln!(
         "May daemon listening on http://{tcp} and {}",
@@ -432,9 +482,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     );
 
     let mut extra = ExtraListeners {
-        state: state.clone(),
-        local_router: router.clone(),
-        direct_router: direct_router.clone(),
+        routers: tcp_routers,
         running: HashMap::new(),
     };
     extra.reconcile(&config.daemon.listen).await;
@@ -446,17 +494,32 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         loop {
             match config_events.recv().await {
                 Ok(topics) if topics.contains(UiEventTopics::CONFIG) => {
-                    extra
-                        .reconcile(&config_state.config_snapshot().daemon.listen)
-                        .await;
+                    crate::panic_boundary::round("config watcher", async {
+                        config_state
+                            .live_limits
+                            .apply(&config_state.config_snapshot());
+                        extra
+                            .reconcile(&config_state.config_snapshot().daemon.listen)
+                            .await;
+                    })
+                    .await;
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // A lagged receiver may have missed the change.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    crate::panic_boundary::round("config watcher", async {
+                        config_state
+                            .live_limits
+                            .apply(&config_state.config_snapshot());
+                    })
+                    .await;
+                }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
 
-    let repo_search = RepoSearch::global(paths.root());
+    let repo_search = state.services.repo_search.clone();
     let indexer = SearchIndexer::new(
         state.db.clone(),
         RepoSearchCollections::new(repo_search.clone()),
@@ -490,6 +553,12 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // The next daemon tells this stop from an unexpected exit by this record.
+    state
+        .db()
+        .record_daemon_stop()
+        .await
+        .context("failed to record the daemon's stop")?;
     match repo_search.retire().await {
         Ok(removed) => {
             for service in removed {

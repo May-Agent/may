@@ -194,7 +194,6 @@ impl TitleGenerationQueue {
 #[derive(Debug, Clone)]
 pub struct UiToolDispatchers {
     pub(crate) task: TaskBroker,
-    pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
     pub(crate) browser: BrowserBroker,
     pub(crate) register_skills: RegisterBroker,
     pub(crate) tunnel: crate::agent::tunnel_tool::TunnelBroker,
@@ -202,7 +201,6 @@ pub struct UiToolDispatchers {
 
 pub struct UiToolQueues {
     pub(crate) task: TaskQueue,
-    pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
     pub(crate) browser: BrowserQueue,
     pub(crate) register_skills: RegisterQueue,
     pub(crate) tunnel: crate::agent::tunnel_tool::TunnelQueue,
@@ -210,7 +208,6 @@ pub struct UiToolQueues {
 
 pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     let (task, task_queue) = crate::agent::task_tool::channel();
-    let (notify, notify_queue) = crate::agent::notify_tool::channel();
     let (browser, browser_queue) = crate::agent::browser_tool::channel();
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
     let (tunnel, tunnel_queue) = crate::agent::tunnel_tool::channel();
@@ -218,14 +215,12 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     (
         UiToolDispatchers {
             task,
-            notify,
             browser,
             register_skills,
             tunnel,
         },
         UiToolQueues {
             task: task_queue,
-            notify: notify_queue,
             browser: browser_queue,
             register_skills: register_skills_queue,
             tunnel: tunnel_queue,
@@ -253,6 +248,11 @@ impl<T: Clone + Send + Sync> RefreshableCache<T> {
             inner: ArcSwapOption::empty(),
             refresh_lock: Mutex::new(()),
         }
+    }
+
+    /// The stored value of any age, without refreshing.
+    pub(crate) fn latest(&self) -> Option<T> {
+        self.inner.load_full().map(|cached| cached.value.clone())
     }
 
     pub(crate) async fn get_or_refresh<F, Fut>(&self, refresh: F) -> T
@@ -423,6 +423,8 @@ pub struct DaemonState {
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) fetched_models_cache: RefreshableCache<Vec<crate::models::FetchedModel>>,
     pub(crate) config: Arc<ArcSwap<MayConfig>>,
+    /// The limits every agent is built with, moved by each config change.
+    pub(crate) live_limits: crate::agent::LiveLimits,
     pub(crate) ui_event_bus: UiEventBus,
     pub(crate) container_prepare: ContainerPrepareTracker,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
@@ -435,6 +437,12 @@ pub struct DaemonState {
     /// (display, stream, input) lives in that respawnable process.
     pub(crate) computer: Arc<crate::computer::ComputerAgent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
+    /// The cloud sessions this daemon fronts: their codespaces, hosts and
+    /// the steps of bringing them up.
+    pub(crate) cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
+    /// On a cloud home, the providers the fronting daemon pushed: kept
+    /// apart from `config`, so no configuration write carries them.
+    pub(crate) pushed_providers: crate::cloud::access::PushedProviders,
     /// Whether the user is asleep, for every session and client.
     pub(crate) sleep: Arc<crate::sleep::SleepState>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
@@ -445,9 +453,11 @@ pub struct DaemonState {
     pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     /// Embedded baseline tool distribution shared by agents, tasks and containers.
-    pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    pub(crate) tool_distribution: Arc<crate::tools::ToolDistribution>,
     /// Prepared tool environments reused by every agent rebuilt for a session.
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
+    /// The machine-wide jobserver pool every terminal draws its jobs from.
+    pub(crate) job_server: crate::jobserver::JobServer,
     pub(crate) may_dir: PathBuf,
     /// Wakes the search indexer after new messages land.
     pub(crate) search_index_wake_tx: async_channel::Sender<()>,
@@ -455,8 +465,14 @@ pub struct DaemonState {
     pub(crate) search_index_wake: async_channel::Receiver<()>,
     /// Latest outcome of the search indexer.
     pub(crate) search_index_status: crate::repo_search::indexer::IndexerStatus,
-    /// The repo-search daemon handle worktree coverage is polled through.
-    pub(crate) repo_search: crate::repo_search::RepoSearch,
+    /// The compiled quota-reset matchers turns parse upstream errors with.
+    pub(crate) quota_patterns: crate::quota::QuotaPatterns,
+    /// Native on-device OCR & token-saving downscaler for text-dense images.
+    pub(crate) vision_ocr: crate::vision_ocr::VisionOcr,
+    /// The compiled secret shapes bash-mode output is masked with.
+    pub(crate) secret_patterns: crate::secrets::SecretPatterns,
+    /// The repo-search handle and PR land locks every session's agent shares.
+    pub(crate) services: crate::terminal_commands::SharedServices,
     /// Signalled by `POST /api/daemon/shutdown`.
     pub(crate) daemon_shutdown: Arc<tokio::sync::Notify>,
     /// Set once shutdown starts draining: new turns are refused so the
@@ -469,17 +485,33 @@ pub struct DaemonState {
     pub(crate) turn_hub: Arc<super::chat::TurnHub>,
     /// Each session's agent between turns.
     pub(crate) parked_agents: super::chat::ParkedAgents,
+    /// Each session agent's fork source and model, working or idle, for
+    /// `btw` questions from other agents.
+    pub(crate) agent_forks: crate::agent_link::ForkHosts,
     /// Each session's in-flight aux task (suggestion, recap), if any.
     pub(crate) aux_tasks: super::chat::AuxTasks,
     /// Each session's armed idle-recap timer, if any.
     pub(crate) recap_schedules: super::chat::RecapSchedules,
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,
+    /// The live checks of every in-flight GitHub PR, as the poller last read
+    /// them.
+    pub(crate) pr_checks: super::pr_checks::PrChecksCache,
     pub(crate) tunnels: Arc<super::tunnel::TunnelRegistry>,
     /// The machine's reachability and sleep/wake state: the one source every
     /// agent and terminal the daemon builds watches, and the turn runner
     /// waits on after a network failure.
     pub(crate) connectivity: aither_connectivity::Connectivity,
+    /// Epoch of the session-event cursors, fixed at daemon start (ns): a
+    /// cursor another daemon minted fails its epoch check and resyncs.
+    pub(crate) session_events_epoch: u64,
+    /// Producers' side of the session-change channel; the dispatcher on the
+    /// receiver recomputes and diffs each piece.
+    pub(crate) session_change_tx: super::session_events::SessionChangeSender,
+    pub(crate) session_change_rx: super::session_events::SessionChangeReceiver,
+    /// The dispatcher spawns once, when the daemon starts or the first
+    /// session stream attaches.
+    pub(crate) session_publisher_once: std::sync::Once,
 }
 
 impl DaemonState {
@@ -491,8 +523,48 @@ impl DaemonState {
         self.db.clone()
     }
 
+    /// The context window of `selector`: what its provider reports in the
+    /// fetched model list, else the `aither_models` table. The list is read
+    /// from the cache at any age; the network is touched only when the cache
+    /// holds no list and the table cannot answer.
+    pub(crate) async fn model_context_window(
+        &self,
+        selector: &crate::ModelSelector,
+    ) -> Option<u32> {
+        let resolve = |fetched: &[crate::models::FetchedModel]| {
+            crate::models::resolve_context_window(
+                fetched,
+                selector.provider_id(),
+                selector.model_id(),
+            )
+        };
+        let cached = self.fetched_models_cache.latest().unwrap_or_default();
+        if !cached.is_empty() {
+            return resolve(&cached);
+        }
+        if let Some(window) = resolve(&[]) {
+            return Some(window);
+        }
+        let config = (*self.config_snapshot()).clone();
+        let fetched = self
+            .fetched_models_cache
+            .get_or_refresh(move || async move { crate::models::fetch_all_models(&config).await })
+            .await;
+        resolve(&fetched)
+    }
+
     pub(crate) fn config_snapshot(&self) -> Arc<MayConfig> {
         self.config.load_full()
+    }
+
+    /// The tool distribution's `heel`, prepared in the home's tools
+    /// directory, which runs the sandboxes of ACP probes and trials.
+    pub(crate) async fn heel(&self) -> Result<heel::HeelBinary, crate::tools::ToolRuntimeError> {
+        crate::tools::prepare_heel(
+            &self.tool_distribution,
+            &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
+        )
+        .await
     }
 
     pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
@@ -500,6 +572,18 @@ impl DaemonState {
         let _ = update(&mut config);
         self.config.store(Arc::new(config.clone()));
         config
+    }
+
+    /// Writes `config` to this daemon's `config.toml`, in its own May
+    /// directory.
+    ///
+    /// # Errors
+    /// Fails when the configuration does not validate or the write fails.
+    pub(crate) async fn save_config(
+        &self,
+        config: &MayConfig,
+    ) -> Result<(), crate::config::ConfigError> {
+        config.save_to(&self.may_dir.join("config.toml")).await
     }
 
     pub(crate) fn browser_manager(&self) -> Option<Arc<crate::container::browser::BrowserManager>> {
@@ -526,6 +610,33 @@ impl DaemonState {
 
     pub(crate) fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
         self.browser_lifecycle_tx.subscribe()
+    }
+
+    /// Queues `kind` for the session's diff publisher, which recomputes
+    /// the piece and emits `*.upserted` / `*.removed` / `*.changed` frames
+    /// on `/api/sessions/{id}/events` for the real differences.
+    pub(crate) fn publish_session_change(
+        &self,
+        session_id: &str,
+        kind: super::session_events::SessionChange,
+    ) {
+        super::session_events::notify_change(&self.session_change_tx, session_id, kind);
+    }
+
+    /// Starts the session-change dispatcher when it has not started yet.
+    pub(crate) fn ensure_session_publisher(self: &Arc<Self>) {
+        self.session_publisher_once.call_once(|| {
+            super::session_events::spawn(self.clone(), self.session_change_rx.clone());
+        });
+    }
+
+    /// The cursor `GET /api/sessions/{id}` reports: epoch plus the index a
+    /// subscriber naming it as `after` continues from.
+    pub(crate) fn session_cursor(&self, session_id: &str) -> String {
+        super::session_events::format_cursor(
+            self.session_events_epoch,
+            self.turn_hub.cursor_index(session_id),
+        )
     }
 }
 
@@ -633,13 +744,6 @@ pub struct UiQuestionAnswer {
     pub(crate) answer: UiAnswerInput,
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct AskUserRespondRequest {
-    pub(crate) id: String,
-    pub(crate) answers: Vec<UiQuestionAnswer>,
-}
-
 /// What resolving a question did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskUserOutcome {
@@ -674,6 +778,19 @@ fn answers_allow(request: &PersistedAskUserRequest, answers: &[QuestionAnswer]) 
         .first()
         .and_then(|question| PermissionChoice::from_options(&question.option))
         .is_some_and(|choice| choice.allows(answers))
+}
+
+/// If `answers` selected `"Always allow for session"`, returns the question
+/// prompt text so a resumed run records the session-wide SSH grant.
+fn session_allow_question<'a>(
+    request: &'a PersistedAskUserRequest,
+    answers: &[QuestionAnswer],
+) -> Option<&'a str> {
+    let question = request.questions.first()?;
+    let choice = PermissionChoice::from_options(&question.option)?;
+    choice
+        .allows_for_session(answers)
+        .then_some(question.question.as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -883,6 +1000,11 @@ impl AskUserApprover {
                 .await
             {
                 tracing::warn!(session_id = %session_id, error = %error, "failed to register ask-user request");
+            } else {
+                runtime_service.announce_user_wait(crate::session::UserWait {
+                    session_id: session_id.to_string(),
+                    ask: crate::session::UserAsk::question(&persisted_request),
+                });
             }
         }
 
@@ -948,6 +1070,17 @@ impl AskUserApprover {
         } else if waiter.is_some_and(|waiter| waiter.try_send(answers.clone()).is_ok()) {
             AskUserOutcome::Woke
         } else {
+            if let Some(question) = session_allow_question(&committed.request, &answers) {
+                runtime
+                    .db()
+                    .append_granted_permission(
+                        &committed.session_id,
+                        crate::PermissionHistoryMode::Ssh,
+                        question,
+                        None,
+                    )
+                    .await?;
+            }
             AskUserOutcome::Resume {
                 approved: answers_allow(&committed.request, &answers),
             }
@@ -1056,6 +1189,13 @@ impl WorkspaceApprover {
                 self.resolve(&request_id, true)
                     .await
                     .map_err(|error| WorkspaceApprovalError::YoloGrant(Box::new(error)))?;
+            } else {
+                runtime_service.announce_user_wait(crate::session::UserWait {
+                    session_id: session_id.to_string(),
+                    ask: crate::session::UserAsk::Workspace {
+                        path: request.path.clone(),
+                    },
+                });
             }
         }
 
@@ -1236,20 +1376,30 @@ impl DaemonState {
         config: MayConfig,
         connectivity: aither_connectivity::Connectivity,
     ) -> anyhow::Result<Self> {
+        crate::test_support::install_global_executor();
+        // The daemon writes the bundled skills there at startup, and a
+        // session's shell grants the directory.
+        std::fs::create_dir_all(may_dir.join("skills"))?;
         let db = crate::db::ChatDb::open(&may_dir.join("history.db")).await?;
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
+        let (session_change_tx, session_change_rx) = async_channel::unbounded();
+        ui_event_bus.set_session_changes(session_change_tx.clone());
         let lease_handle = tokio::runtime::Handle::current();
         let runtime_service = std::sync::Arc::new(
-            crate::session::SessionRuntimeService::new(db.clone(), ui_event_bus.clone())
-                .with_spawner(std::sync::Arc::new(move |task| {
-                    lease_handle.spawn(task);
-                })),
+            crate::session::SessionRuntimeService::new(
+                db.clone(),
+                ui_event_bus.clone(),
+                crate::session::MayHomePaths::new(may_dir.to_path_buf()),
+            )
+            .with_spawner(std::sync::Arc::new(move |task| {
+                lease_handle.spawn(task);
+            })),
         );
         let (title_generation_queue, _rx) = TitleGenerationQueue::new();
         let (tool_dispatchers, _queues) = tool_dispatch_channels();
-        let tool_distribution = std::sync::Arc::new(crate::tools::fixture_distribution(
-            &may_dir.join("tool-fixtures"),
-        ));
+        let tool_distribution = std::sync::Arc::new(
+            crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await,
+        );
         let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
         let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(4);
         let notification_manager = std::sync::Arc::new(
@@ -1270,6 +1420,7 @@ impl DaemonState {
             .await?
             .with_secret_store(SecretStore::in_memory(may_dir)),
         );
+        let live_limits = crate::agent::LiveLimits::of(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
@@ -1283,7 +1434,7 @@ impl DaemonState {
                 ui_event_bus.clone(),
                 db.clone(),
             )),
-            db,
+            db: db.clone(),
             github_api: crate::pr::PrContext::default_github_api(),
             default_profile_id: "test".to_string(),
             mcp_service: McpService::spawn(crate::mcp::McpManager::new(
@@ -1297,7 +1448,8 @@ impl DaemonState {
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
-            config,
+            config: config.clone(),
+            live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
             container_manager: None,
@@ -1308,6 +1460,16 @@ impl DaemonState {
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
             ),
+            cloud_sessions: std::sync::Arc::new(
+                super::cloud_sessions::CloudSessions::load(
+                    db.clone(),
+                    super::cloud_sessions::GitHubCloud,
+                    config.clone(),
+                    ui_event_bus.clone(),
+                )
+                .await?,
+            ),
+            pushed_providers: crate::cloud::access::PushedProviders::default(),
             notification_service,
             memory_processor: None,
             local_url_port_mapper: std::sync::Arc::new(
@@ -1319,8 +1481,17 @@ impl DaemonState {
             task_runtime,
             tool_distribution,
             tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
+            job_server: crate::jobserver::JobServer::start(
+                may_dir,
+                crate::jobserver::default_pool_size(),
+            )
+            .await
+            .expect("test jobserver starts"),
             may_dir: may_dir.to_path_buf(),
-            repo_search: crate::repo_search::RepoSearch::global(may_dir),
+            services: crate::terminal_commands::SharedServices::new(may_dir),
+            quota_patterns: crate::quota::QuotaPatterns::default(),
+            vision_ocr: crate::vision_ocr::VisionOcr::new(),
+            secret_patterns: crate::secrets::SecretPatterns::default(),
             search_index_wake_tx,
             search_index_wake,
             search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
@@ -1329,11 +1500,21 @@ impl DaemonState {
             build_id: "test".to_string(),
             turn_hub: std::sync::Arc::new(super::chat::TurnHub::default()),
             parked_agents: super::chat::ParkedAgents::default(),
+            agent_forks: crate::agent_link::ForkHosts::default(),
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),
             session_background: super::chat::SessionBackgrounds::default(),
+            pr_checks: super::pr_checks::PrChecksCache::default(),
             tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
             connectivity,
+            session_events_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+                }),
+            session_change_tx,
+            session_change_rx,
+            session_publisher_once: std::sync::Once::new(),
         })
     }
 }

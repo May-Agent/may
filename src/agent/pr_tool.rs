@@ -2,11 +2,12 @@
 
 use std::borrow::Cow;
 
+use crate::ipc::{Binding, Role as CommandRole};
 use aither_core::llm::{Tool, ToolResult};
-use aither_sandbox::{CommandRole, TerminalBinding};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::db::PrFilter;
 use crate::pr::{PrContext, PrError, PrStore};
 use crate::repo_clone::CloneSandbox;
 
@@ -69,9 +70,10 @@ pub enum PrArgs {
     },
     /// List PRs, newest first.
     List {
-        /// `open`, `merged`, `closed` or `all`.
+        /// `open` (not merged or closed), `checks_pending`, `failed`,
+        /// `rejected`, `merging`, `merged`, `closed` or `all` (default).
         #[serde(default)]
-        state: Option<String>,
+        state: PrFilter,
         /// Repo key or clone dir; default the session's only clone or all.
         #[serde(default)]
         repo: Option<String>,
@@ -105,22 +107,25 @@ pub enum PrArgs {
 #[derive(Debug, Clone)]
 pub struct PrCommand {
     context: PrContext,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
+    timeout_cap: aither_sandbox::LiveDuration,
 }
 
 impl PrCommand {
-    /// The command for one session's PRs.
+    /// The command for one session's PRs; what it runs in a clone is killed
+    /// at the shell's `timeout_cap`.
     #[must_use]
-    pub const fn new(context: PrContext) -> Self {
+    pub const fn new(context: PrContext, timeout_cap: aither_sandbox::LiveDuration) -> Self {
         Self {
             context,
             languages: None,
+            timeout_cap,
         }
     }
 
     /// Refuse a PR title outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -129,11 +134,16 @@ impl PrCommand {
     /// session clone runs in that terminal's sandbox, and a subagent's
     /// terminal answers the reading actions alone.
     #[must_use]
-    pub fn for_terminal(&self, binding: &TerminalBinding) -> PrTool {
+    ///
+    /// # Panics
+    /// Panics when the registry serves no shell: the command runs git in the
+    /// shell's sandbox.
+    pub fn for_terminal(&self, binding: &Binding<'_>) -> PrTool {
+        let shell = binding.shell.expect("`pr` runs in a session's shell");
         PrTool {
             store: PrStore::new(
                 self.context.clone(),
-                CloneSandbox::new(binding.runner().clone()),
+                CloneSandbox::new(shell.clone(), self.timeout_cap.get()),
             ),
             languages: self.languages.clone(),
             role: binding.role(),
@@ -145,7 +155,7 @@ impl PrCommand {
 /// for the main agent, `list` and `show` for a subagent.
 pub struct PrTool {
     store: PrStore,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     role: CommandRole,
 }
 
@@ -198,17 +208,17 @@ impl Tool for PrTool {
         if self.role == CommandRole::Subagent
             && let Some(action) = args.write_action()
         {
-            return Ok(ToolResult::text(PrError::MainAgentOnly(action).to_string()));
+            return Err(PrError::MainAgentOnly(action).into());
         }
         // A call made inside a session clone means that clone's repository.
         let repo = args.repo_mut();
         if repo.is_none()
             && let Some(dir) = cx.working_dir()
         {
-            match self.store.clone_containing(std::path::Path::new(dir)).await {
-                Ok(found) => *repo = found,
-                Err(error) => return Ok(ToolResult::text(error.to_string())),
-            }
+            *repo = self
+                .store
+                .clone_containing(std::path::Path::new(dir))
+                .await?;
         }
         if let (
             Some(guard),
@@ -217,7 +227,9 @@ impl Tool for PrTool {
             },
         ) = (&self.languages, &args)
         {
-            guard.check_working(title, aither_agent::WorkingText::Public)?;
+            guard
+                .check_working(title, crate::harness::language::WorkingText::Public)
+                .map_err(super::notices::language_refused)?;
         }
         let result = match args {
             PrArgs::Open {
@@ -232,14 +244,13 @@ impl Tool for PrTool {
             }
             PrArgs::Update { number, repo } => self.store.update(number, repo.as_deref()).await,
             PrArgs::Merge { number, repo } => self.store.merge(number, repo.as_deref()).await,
-            PrArgs::List { state, repo } => {
-                self.store.list(repo.as_deref(), state.as_deref()).await
-            }
+            PrArgs::List { state, repo } => self.store.list(repo.as_deref(), state).await,
             PrArgs::Show { number, repo } => self.store.show(number, repo.as_deref()).await,
             PrArgs::Close { number, repo } => self.store.close(number, repo.as_deref()).await,
             PrArgs::Adopt { number, repo } => self.store.adopt(number, repo.as_deref()).await,
         };
-        Ok(result.map_or_else(|e| ToolResult::text(e.to_string()), ToolResult::text))
+        // A failed action is a failed command, so aither logs it at WARN.
+        Ok(ToolResult::text(result?))
     }
 }
 
@@ -247,8 +258,8 @@ impl Tool for PrTool {
 mod tests {
     use aither_core::llm::ToolContext;
 
-    use super::{CommandRole, PrArgs, PrStore, PrTool, Tool};
-    use crate::pr::PrContext;
+    use super::{CommandRole, PrArgs, PrFilter, PrStore, PrTool, Tool};
+    use crate::pr::{LandLocks, PrContext};
     use crate::repo_clone::test_sandbox::TestTerminal;
 
     fn text(result: &aither_core::llm::ToolResult) -> String {
@@ -273,14 +284,19 @@ mod tests {
                     scratch_root: tmp.path().join("scratch"),
                     cwd: root,
                     workspace_config: crate::workspace::WorkspaceConfig::default(),
-                    screen: None,
+                    review: None,
                     signing: crate::commit_signing::CommitSigning::new(
                         crate::host_git::HostGit::inherit(),
                         tmp.path(),
                         "s1",
                     ),
                     github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
+                    checkouts: None,
+                    task_events: None,
+                    ci: None,
                     publish: None,
+                    ui_events: None,
                 },
                 terminal.sandbox(),
             ),
@@ -291,7 +307,7 @@ mod tests {
         let listed = tool
             .call(
                 PrArgs::List {
-                    state: None,
+                    state: PrFilter::All,
                     repo: None,
                 },
                 ToolContext::new(),
@@ -324,7 +340,11 @@ mod tests {
                 "adopt",
             ),
         ] {
-            let refused = text(&tool.call(args, ToolContext::new()).await.unwrap());
+            let refused = tool
+                .call(args, ToolContext::new())
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(
                 refused.contains(&format!("`pr {action}` is the main agent's")),
                 "{refused}"
@@ -378,10 +398,15 @@ mod tests {
                     scratch_root: tmp.join("staging"),
                     cwd: checkouts[1].clone(),
                     workspace_config: crate::workspace::WorkspaceConfig::default(),
-                    screen: None,
+                    review: None,
                     signing: user.signing(&tmp.join("may-home"), "s1"),
                     github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
+                    checkouts: None,
+                    task_events: None,
+                    ci: None,
                     publish: None,
+                    ui_events: None,
                 },
                 terminal.sandbox(),
             ),
@@ -396,7 +421,13 @@ mod tests {
             };
             repo.call(trust, at(checkout)).await.unwrap();
             let report = repo
-                .call(RepoArgs::Clone { path: None }, at(checkout))
+                .call(
+                    RepoArgs::Clone {
+                        path: None,
+                        new: false,
+                    },
+                    at(checkout),
+                )
                 .await
                 .unwrap();
             let report = report.as_text().unwrap();

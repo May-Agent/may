@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use aither_agent::tool_request::{
+use crate::harness::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Expose an HTTP endpoint through the daemon.
 ///
 /// `tunnel http://localhost:3000` returns a word id; the endpoint is then
-/// proxied under `/tunnel/<id>/` on every address the daemon serves, so the
+/// proxied under `/tunnel/<session>/<id>/` on every address the daemon serves, so the
 /// link works however the user reaches May (localhost, tailnet, LAN). Emit
 /// `<tunnel id="<id>" />` in the reply where the link should appear.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -41,7 +41,7 @@ pub struct TunnelResult {
     pub id: String,
     /// The normalized target URL being proxied.
     pub url: String,
-    /// Path prefix the endpoint is proxied under, e.g. `/tunnel/<id>/`.
+    /// Path prefix the endpoint is proxied under, e.g. `/tunnel/<session>/<id>/`.
     pub path: String,
     /// Local URL on the daemon host.
     pub local_url: String,

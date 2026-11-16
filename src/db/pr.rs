@@ -10,6 +10,120 @@
 use super::common::I64ValueRow;
 use super::{ChatDb, ChatDbError, query};
 
+/// Where a session PR stands. Stored in `prs.state` and sent over the wire
+/// under the same `snake_case` names.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    skyzen::ToSchema,
+    skyzen::Column,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PrState {
+    /// Opened or re-pinned; nothing has run against it yet.
+    Open,
+    /// Waiting on the checks of its pinned commit.
+    ChecksPending,
+    /// A check failed, or the merge queue dropped it; `pr merge` retries.
+    Failed,
+    /// The merge hit a conflict; `pr update` then `pr merge` retries.
+    Rejected,
+    /// Checks passed and the merge is landing.
+    Merging,
+    /// Landed.
+    Merged,
+    /// Abandoned, or closed on the remote.
+    Closed,
+}
+
+impl PrState {
+    /// The stored and wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::ChecksPending => "checks_pending",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::Merging => "merging",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// Landed or abandoned: no transition leaves it.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Merged | Self::Closed)
+    }
+
+    /// Not terminal: the session still owns work in this PR.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        !self.is_terminal()
+    }
+
+    /// Open, checks pending or merging: the states GitHub still reports
+    /// checks on, and the ones the sidebar lists.
+    #[must_use]
+    pub const fn is_in_flight(self) -> bool {
+        matches!(self, Self::Open | Self::ChecksPending | Self::Merging)
+    }
+}
+
+impl std::fmt::Display for PrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which PRs `pr list --state` selects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFilter {
+    /// Every PR.
+    #[default]
+    All,
+    /// Every PR that is not merged or closed ([`PrState::is_live`]).
+    Open,
+    /// Exactly [`PrState::ChecksPending`].
+    ChecksPending,
+    /// Exactly [`PrState::Failed`].
+    Failed,
+    /// Exactly [`PrState::Rejected`].
+    Rejected,
+    /// Exactly [`PrState::Merging`].
+    Merging,
+    /// Exactly [`PrState::Merged`].
+    Merged,
+    /// Exactly [`PrState::Closed`].
+    Closed,
+}
+
+impl PrFilter {
+    /// Whether a PR in `state` is selected.
+    #[must_use]
+    pub const fn selects(self, state: PrState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Open => state.is_live(),
+            Self::ChecksPending => matches!(state, PrState::ChecksPending),
+            Self::Failed => matches!(state, PrState::Failed),
+            Self::Rejected => matches!(state, PrState::Rejected),
+            Self::Merging => matches!(state, PrState::Merging),
+            Self::Merged => matches!(state, PrState::Merged),
+            Self::Closed => matches!(state, PrState::Closed),
+        }
+    }
+}
+
 /// One `prs` row.
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PrRow {
@@ -25,9 +139,8 @@ pub struct PrRow {
     pub title: String,
     /// PR body.
     pub body: String,
-    /// `open`, `checks_pending`, `failed`, `rejected`, `merging`, `merged`
-    /// or `closed`.
-    pub state: String,
+    /// Where the PR stands.
+    pub state: PrState,
     /// Local backend: the durable ref holding the PR's commit in the checkout
     /// (`refs/may/pr/<number>`); GitHub: the session branch on `upstream`.
     pub branch: String,
@@ -51,6 +164,79 @@ pub struct PrRow {
     pub updated_at: String,
     /// UTC of the merge.
     pub merged_at: Option<String>,
+}
+
+/// A `prs` row joined with its repository key and whether its owning session
+/// has been deleted.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub struct PrSummaryRow {
+    /// Surrogate id.
+    pub id: i64,
+    /// Owning `issue_projects` row.
+    pub project_id: i64,
+    /// Repository identity (`owner/repo` or local `.git` path).
+    pub repo_key: String,
+    /// Whether the owning session row no longer exists.
+    pub orphaned: bool,
+    /// Per-project number, like an issue number.
+    pub number: i64,
+    /// Session that opened (or last adopted) the PR.
+    pub session_id: String,
+    /// PR title.
+    pub title: String,
+    /// PR body.
+    pub body: String,
+    /// Where the PR stands.
+    pub state: PrState,
+    /// Local durable ref or GitHub remote branch.
+    pub branch: String,
+    /// Base commit the PR was opened against.
+    pub base_sha: String,
+    /// Pinned head commit.
+    pub head_sha: Option<String>,
+    /// `may` or `github`.
+    pub backend: String,
+    /// External PR number (GitHub), when the backend created one.
+    pub external_number: Option<i64>,
+    /// Merge as soon as checks pass vs. hold for explicit merge.
+    pub auto_merge: bool,
+    /// Associated issue number, when linked.
+    pub issue_number: Option<i64>,
+    /// Commit that merged the PR.
+    pub merge_commit_sha: Option<String>,
+    /// UTC creation time.
+    pub created_at: String,
+    /// UTC of the last update.
+    pub updated_at: String,
+    /// UTC of the merge.
+    pub merged_at: Option<String>,
+}
+
+impl PrSummaryRow {
+    /// Project into the plain [`PrRow`] shape.
+    #[must_use]
+    pub fn into_pr_row(self) -> PrRow {
+        PrRow {
+            id: self.id,
+            project_id: self.project_id,
+            number: self.number,
+            session_id: self.session_id,
+            title: self.title,
+            body: self.body,
+            state: self.state,
+            branch: self.branch,
+            base_sha: self.base_sha,
+            head_sha: self.head_sha,
+            backend: self.backend,
+            external_number: self.external_number,
+            auto_merge: self.auto_merge,
+            issue_number: self.issue_number,
+            merge_commit_sha: self.merge_commit_sha,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            merged_at: self.merged_at,
+        }
+    }
 }
 
 /// One `pr_events` row.
@@ -112,11 +298,12 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         query!(
             tx,
-            "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, external_number, auto_merge, issue_number, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ? FROM prs WHERE project_id = ?",
+            "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, external_number, auto_merge, issue_number, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM prs WHERE project_id = ?",
             project_id,
             session_id,
             title,
             body,
+            PrState::Open.as_str(),
             branch,
             base_sha,
             backend,
@@ -158,6 +345,68 @@ impl ChatDb {
         .await?)
     }
 
+    /// The session's open PR in workspace `dir` on `repo_key`, when one exists.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn open_pr_for_workspace(
+        &self,
+        repo_key: &str,
+        session_id: &str,
+        dir: &str,
+    ) -> Result<Option<PrRow>, ChatDbError> {
+        let Some(project_id) = self.find_project(repo_key).await? else {
+            return Ok(None);
+        };
+        Ok(query!(
+            self.db,
+            "SELECT p.* FROM prs AS p INNER JOIN pr_workspaces AS w ON w.pr_id = p.id WHERE p.project_id = ? AND p.session_id = ? AND w.dir = ?",
+            project_id,
+            session_id,
+            dir
+        )
+        .fetch_all::<PrRow>()
+        .await?
+        .into_iter()
+        .find(|row| row.state.is_live()))
+    }
+
+    /// Record the clone directory name under `<session>/repos/` bound to `pr_id`.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn set_pr_workspace(&self, pr_id: i64, dir: &str) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "INSERT INTO pr_workspaces (pr_id, dir) VALUES (?, ?) ON CONFLICT (pr_id) DO UPDATE SET dir = excluded.dir",
+            pr_id,
+            dir
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// The clone directory name under `<session>/repos/` bound to `pr_id`, if
+    /// recorded.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn pr_workspace(&self, pr_id: i64) -> Result<Option<String>, ChatDbError> {
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct DirRow {
+            dir: String,
+        }
+        let row = query!(
+            self.db,
+            "SELECT dir FROM pr_workspaces WHERE pr_id = ?",
+            pr_id
+        )
+        .fetch_optional::<DirRow>()
+        .await?;
+        Ok(row.map(|r| r.dir))
+    }
+
     /// The session's open PR on a project, when one exists.
     ///
     /// # Errors
@@ -172,12 +421,14 @@ impl ChatDb {
         };
         Ok(query!(
             self.db,
-            "SELECT * FROM prs WHERE project_id = ? AND session_id = ? AND state IN ('open','checks_pending','failed','rejected','merging')",
+            "SELECT * FROM prs WHERE project_id = ? AND session_id = ?",
             project_id,
             session_id
         )
-        .fetch_optional::<PrRow>()
-        .await?)
+        .fetch_all::<PrRow>()
+        .await?
+        .into_iter()
+        .find(|row| row.state.is_live()))
     }
 
     /// Name the durable ref a local PR's commit lives under.
@@ -214,6 +465,76 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Look up one PR by its surrogate row id.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn get_pr_by_id(&self, id: i64) -> Result<Option<PrRow>, ChatDbError> {
+        Ok(query!(self.db, "SELECT * FROM prs WHERE id = ?", id)
+            .fetch_optional::<PrRow>()
+            .await?)
+    }
+
+    /// PRs for a project or session (or across all projects), newest first,
+    /// joined with their `repo_key` and orphaned status.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn list_prs_with_repo(
+        &self,
+        repo_key: Option<&str>,
+        session_id: Option<&str>,
+        filter: PrFilter,
+        orphaned_only: bool,
+    ) -> Result<Vec<PrSummaryRow>, ChatDbError> {
+        let rows = match (repo_key, session_id) {
+            (Some(key), _) => {
+                query!(
+                    self.db,
+                    "SELECT p.*, ip.repo_key, (s.id IS NULL) AS orphaned \
+                 FROM prs p \
+                 JOIN issue_projects ip ON ip.id = p.project_id \
+                 LEFT JOIN sessions s ON s.id = p.session_id \
+                 WHERE ip.repo_key = ? \
+                 ORDER BY p.id DESC",
+                    key
+                )
+                .fetch_all::<PrSummaryRow>()
+                .await?
+            }
+            (None, Some(sid)) => {
+                query!(
+                    self.db,
+                    "SELECT p.*, ip.repo_key, (s.id IS NULL) AS orphaned \
+                 FROM prs p \
+                 JOIN issue_projects ip ON ip.id = p.project_id \
+                 LEFT JOIN sessions s ON s.id = p.session_id \
+                 WHERE p.session_id = ? \
+                 ORDER BY p.id DESC",
+                    sid
+                )
+                .fetch_all::<PrSummaryRow>()
+                .await?
+            }
+            (None, None) => {
+                query!(
+                    self.db,
+                    "SELECT p.*, ip.repo_key, (s.id IS NULL) AS orphaned \
+                 FROM prs p \
+                 JOIN issue_projects ip ON ip.id = p.project_id \
+                 LEFT JOIN sessions s ON s.id = p.session_id \
+                 ORDER BY p.id DESC"
+                )
+                .fetch_all::<PrSummaryRow>()
+                .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|row| filter.selects(row.state) && (!orphaned_only || row.orphaned))
+            .collect())
+    }
+
     /// PRs for a project (or across all projects), newest first.
     ///
     /// # Errors
@@ -221,7 +542,7 @@ impl ChatDb {
     pub async fn list_prs(
         &self,
         repo_key: Option<&str>,
-        state: Option<&str>,
+        filter: PrFilter,
     ) -> Result<Vec<PrRow>, ChatDbError> {
         let rows = if let Some(key) = repo_key {
             query!(
@@ -236,17 +557,9 @@ impl ChatDb {
                 .fetch_all::<PrRow>()
                 .await?
         };
-        let state = state.unwrap_or("all");
         Ok(rows
             .into_iter()
-            .filter(|row| match state {
-                "open" => matches!(
-                    row.state.as_str(),
-                    "open" | "checks_pending" | "failed" | "rejected" | "merging"
-                ),
-                "all" => true,
-                other => row.state == other,
-            })
+            .filter(|row| filter.selects(row.state))
             .collect())
     }
 
@@ -257,7 +570,7 @@ impl ChatDb {
     pub async fn update_pr(
         &self,
         id: i64,
-        state: &str,
+        state: PrState,
         head_sha: Option<&str>,
         merge_commit_sha: Option<&str>,
         merged_at: Option<&str>,
@@ -266,7 +579,7 @@ impl ChatDb {
         query!(
             self.db,
             "UPDATE prs SET state = ?, head_sha = COALESCE(?, head_sha), merge_commit_sha = COALESCE(?, merge_commit_sha), merged_at = COALESCE(?, merged_at), updated_at = ? WHERE id = ?",
-            state,
+            state.as_str(),
             head_sha,
             merge_commit_sha,
             merged_at,
@@ -293,12 +606,13 @@ impl ChatDb {
         let row = query!(tx, "SELECT * FROM prs WHERE id = ?", id)
             .fetch_one::<PrRow>()
             .await?;
-        if matches!(row.state.as_str(), "merged" | "closed") {
+        if row.state.is_terminal() {
             return Err(ChatDbError::PrTerminal { state: row.state });
         }
         query!(
             tx,
-            "UPDATE prs SET state = 'closed', updated_at = ? WHERE id = ?",
+            "UPDATE prs SET state = ?, updated_at = ? WHERE id = ?",
+            PrState::Closed.as_str(),
             now,
             id
         )
@@ -367,5 +681,87 @@ impl ChatDb {
         )
         .fetch_all::<PrEventRow>()
         .await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PrFilter, PrState};
+    use crate::db::{ChatDb, query};
+
+    const STORED: [(&str, PrState); 7] = [
+        ("open", PrState::Open),
+        ("checks_pending", PrState::ChecksPending),
+        ("failed", PrState::Failed),
+        ("rejected", PrState::Rejected),
+        ("merging", PrState::Merging),
+        ("merged", PrState::Merged),
+        ("closed", PrState::Closed),
+    ];
+
+    #[tokio::test]
+    async fn a_row_written_with_each_stored_name_reads_as_its_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChatDb::open(&dir.path().join("history.db")).await.unwrap();
+        let pr = db
+            .create_pr(
+                "github:o/r",
+                "s",
+                "t",
+                "",
+                "b",
+                "base",
+                "github",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for (name, state) in STORED {
+            query!(db.db, "UPDATE prs SET state = ? WHERE id = ?", name, pr.id)
+                .execute()
+                .await
+                .unwrap();
+            let row = db.get_pr("github:o/r", pr.number).await.unwrap().unwrap();
+            assert_eq!(row.state, state, "{name}");
+            // Written through the typed path, the column holds the same name.
+            db.update_pr(pr.id, state, None, None, None).await.unwrap();
+            let stored: String =
+                query!(db.db, "SELECT state AS value FROM prs WHERE id = ?", pr.id)
+                    .fetch_one::<crate::db::common::StringValueRow>()
+                    .await
+                    .unwrap()
+                    .value;
+            assert_eq!(stored, name);
+        }
+    }
+
+    #[test]
+    fn each_variant_serializes_as_its_stored_name() {
+        for (name, state) in STORED {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<PrState>(&format!("\"{name}\"")).unwrap(),
+                state
+            );
+            assert_eq!(state.as_str(), name);
+        }
+    }
+
+    #[test]
+    fn predicates_and_filters_partition_the_states() {
+        for (_, state) in STORED {
+            assert_eq!(state.is_live(), !state.is_terminal());
+            assert!(PrFilter::All.selects(state));
+            assert_eq!(PrFilter::Open.selects(state), state.is_live());
+        }
+        assert!(PrState::Merging.is_in_flight() && !PrState::Failed.is_in_flight());
+        assert!(
+            PrFilter::Merged.selects(PrState::Merged) && !PrFilter::Merged.selects(PrState::Closed)
+        );
     }
 }

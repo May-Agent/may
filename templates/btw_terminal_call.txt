@@ -1,0 +1,4 @@
+ran terminal command{% if !description.is_empty() %} ({{ description }}){% endif %}:
+{{ command }}{% if let Some(tail) = output_tail %}
+output:
+{{ tail }}{% endif %}

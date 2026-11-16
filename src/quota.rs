@@ -14,8 +14,6 @@
 //! - Free tier: `will reset in 2 minutes (at 04:11 UTC)` — a relative delay
 //!   plus a parenthesized UTC instant.
 //! - aither providers' `Retry-After` rendering: `(retry after 30s)`.
-
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -23,108 +21,115 @@ use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use regex::Regex;
 
-/// The instant an upstream error message says its quota resets, when the
-/// message declares one in a recognized format and that instant is still in
-/// the future. `now` anchors relative delays and day-free wall times.
-pub fn reset_at(message: &str, now: Timestamp) -> Option<Timestamp> {
-    relative(message, now)
-        .or_else(|| retry_after(message, now))
-        .or_else(|| try_again_at(message))
-        .or_else(|| resets_in_zone(message, now))
-        .or_else(|| at_utc(message, now))
-        .filter(|until| *until > now)
+/// The compiled matchers, one per announcement format. Built once by the
+/// daemon and shared by every turn that parses an upstream error.
+#[derive(Debug)]
+pub struct QuotaPatterns {
+    relative: Regex,
+    retry_after: Regex,
+    try_again_at: Regex,
+    resets_in_zone: Regex,
+    at_utc: Regex,
 }
 
-fn captures<'a>(
-    cell: &OnceLock<Regex>,
-    pattern: &str,
-    text: &'a str,
-) -> Option<regex::Captures<'a>> {
-    cell.get_or_init(|| Regex::new(pattern).expect("quota-reset pattern must compile"))
-        .captures(text)
+fn compile(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("quota-reset pattern must compile")
 }
 
-/// `reset(s) in N <unit>` — the delay the message declares.
-fn relative(message: &str, now: Timestamp) -> Option<Timestamp> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let caps = captures(
-        &RE,
-        r"(?i)\breset\w*\s+in\s+(\d+)\s*(second|minute|hour|day)s?\b",
-        message,
-    )?;
-    let count: u64 = caps[1].parse().ok()?;
-    let unit = caps[2].to_ascii_lowercase();
-    let seconds = match unit.as_str() {
-        "second" => count,
-        "minute" => count.checked_mul(60)?,
-        "hour" => count.checked_mul(3_600)?,
-        "day" => count.checked_mul(86_400)?,
-        _ => return None,
-    };
-    now.checked_add(Duration::from_secs(seconds)).ok()
-}
-
-/// aither's `Retry-After` rendering: `(retry after 30s)`.
-fn retry_after(message: &str, now: Timestamp) -> Option<Timestamp> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let caps = captures(&RE, r"(?i)\bretry after\s+(\d+)\s*s\b", message)?;
-    now.checked_add(Duration::from_secs(caps[1].parse().ok()?))
-        .ok()
-}
-
-/// Codex/`ChatGPT`: `try again at Nov 4th, 2026 1:40 AM` — the message
-/// leaves its zone unstated, so it is read in the local zone, matching how
-/// the announcing CLI renders it.
-fn try_again_at(message: &str) -> Option<Timestamp> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let caps = captures(
-        &RE,
-        r"(?i)\btry again at\s+([A-Za-z]+\s+\d{1,2})(?:st|nd|rd|th)?\s*(,\s*\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)\b",
-        message,
-    )?;
-    let date_time = format!("{}{}", &caps[1], &caps[2]);
-    for format in ["%B %d, %Y %I:%M %p", "%b %d, %Y %I:%M %p"] {
-        if let Ok(date_time) = DateTime::strptime(format, &date_time) {
-            return TimeZone::system()
-                .to_ambiguous_zoned(date_time)
-                .compatible()
-                .ok()
-                .map(|zoned| zoned.timestamp());
+impl Default for QuotaPatterns {
+    fn default() -> Self {
+        Self {
+            relative: compile(r"(?i)\breset\w*\s+in\s+(\d+)\s*(second|minute|hour|day)s?\b"),
+            retry_after: compile(r"(?i)\bretry after\s+(\d+)\s*s\b"),
+            try_again_at: compile(
+                r"(?i)\btry again at\s+([A-Za-z]+\s+\d{1,2})(?:st|nd|rd|th)?\s*(,\s*\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)\b",
+            ),
+            resets_in_zone: compile(
+                r"(?i)\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\s*\(([A-Za-z][A-Za-z0-9_+\-/]*)\)",
+            ),
+            at_utc: compile(r"(?i)\bat\s+(\d{1,2}):(\d{2})\s*UTC\b"),
         }
     }
-    None
 }
 
-/// `Claude`: `resets 2am (America/New_York)` — the next occurrence of that
-/// wall time in the named zone.
-fn resets_in_zone(message: &str, now: Timestamp) -> Option<Timestamp> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let caps = captures(
-        &RE,
-        r"(?i)\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\s*\(([A-Za-z][A-Za-z0-9_+\-/]*)\)",
-        message,
-    )?;
-    let hour12: i8 = caps[1].parse().ok()?;
-    let minute: i8 = caps.get(2).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-    let hour = hour12 % 12 + i8::from(caps[3].eq_ignore_ascii_case("p")) * 12;
-    let zone = if caps[4].eq_ignore_ascii_case("utc") {
-        TimeZone::UTC
-    } else {
-        TimeZone::get(&caps[4]).ok()?
-    };
-    next_wall_time(&zone, hour, minute, now)
-}
+impl QuotaPatterns {
+    /// The instant an upstream error message says its quota resets, when the
+    /// message declares one in a recognized format and that instant is still in
+    /// the future. `now` anchors relative delays and day-free wall times.
+    pub fn reset_at(&self, message: &str, now: Timestamp) -> Option<Timestamp> {
+        self.relative(message, now)
+            .or_else(|| self.retry_after(message, now))
+            .or_else(|| self.try_again_at(message))
+            .or_else(|| self.resets_in_zone(message, now))
+            .or_else(|| self.at_utc(message, now))
+            .filter(|until| *until > now)
+    }
 
-/// `at 04:11 UTC` — the next occurrence of the UTC wall time.
-fn at_utc(message: &str, now: Timestamp) -> Option<Timestamp> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let caps = captures(&RE, r"(?i)\bat\s+(\d{1,2}):(\d{2})\s*UTC\b", message)?;
-    next_wall_time(
-        &TimeZone::UTC,
-        caps[1].parse().ok()?,
-        caps[2].parse().ok()?,
-        now,
-    )
+    /// `reset(s) in N <unit>` — the delay the message declares.
+    fn relative(&self, message: &str, now: Timestamp) -> Option<Timestamp> {
+        let caps = self.relative.captures(message)?;
+        let count: u64 = caps[1].parse().ok()?;
+        let unit = caps[2].to_ascii_lowercase();
+        let seconds = match unit.as_str() {
+            "second" => count,
+            "minute" => count.checked_mul(60)?,
+            "hour" => count.checked_mul(3_600)?,
+            "day" => count.checked_mul(86_400)?,
+            _ => return None,
+        };
+        now.checked_add(Duration::from_secs(seconds)).ok()
+    }
+
+    /// aither's `Retry-After` rendering: `(retry after 30s)`.
+    fn retry_after(&self, message: &str, now: Timestamp) -> Option<Timestamp> {
+        let caps = self.retry_after.captures(message)?;
+        now.checked_add(Duration::from_secs(caps[1].parse().ok()?))
+            .ok()
+    }
+
+    /// Codex/`ChatGPT`: `try again at Nov 4th, 2026 1:40 AM` — the message
+    /// leaves its zone unstated, so it is read in the local zone, matching how
+    /// the announcing CLI renders it.
+    fn try_again_at(&self, message: &str) -> Option<Timestamp> {
+        let caps = self.try_again_at.captures(message)?;
+        let date_time = format!("{}{}", &caps[1], &caps[2]);
+        for format in ["%B %d, %Y %I:%M %p", "%b %d, %Y %I:%M %p"] {
+            if let Ok(date_time) = DateTime::strptime(format, &date_time) {
+                return TimeZone::system()
+                    .to_ambiguous_zoned(date_time)
+                    .compatible()
+                    .ok()
+                    .map(|zoned| zoned.timestamp());
+            }
+        }
+        None
+    }
+
+    /// `Claude`: `resets 2am (America/New_York)` — the next occurrence of that
+    /// wall time in the named zone.
+    fn resets_in_zone(&self, message: &str, now: Timestamp) -> Option<Timestamp> {
+        let caps = self.resets_in_zone.captures(message)?;
+        let hour12: i8 = caps[1].parse().ok()?;
+        let minute: i8 = caps.get(2).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+        let hour = hour12 % 12 + i8::from(caps[3].eq_ignore_ascii_case("p")) * 12;
+        let zone = if caps[4].eq_ignore_ascii_case("utc") {
+            TimeZone::UTC
+        } else {
+            TimeZone::get(&caps[4]).ok()?
+        };
+        next_wall_time(&zone, hour, minute, now)
+    }
+
+    /// `at 04:11 UTC` — the next occurrence of the UTC wall time.
+    fn at_utc(&self, message: &str, now: Timestamp) -> Option<Timestamp> {
+        let caps = self.at_utc.captures(message)?;
+        next_wall_time(
+            &TimeZone::UTC,
+            caps[1].parse().ok()?,
+            caps[2].parse().ok()?,
+            now,
+        )
+    }
 }
 
 /// The next instant `zone`'s wall clock reads `hour`:`minute`, today or
@@ -152,7 +157,11 @@ mod tests {
     use jiff::civil::DateTime;
     use jiff::tz::TimeZone;
 
-    use super::reset_at;
+    use super::QuotaPatterns;
+
+    fn reset_at(message: &str, now: Timestamp) -> Option<Timestamp> {
+        QuotaPatterns::default().reset_at(message, now)
+    }
 
     fn now() -> Timestamp {
         "2026-11-01T00:00:00Z".parse().expect("timestamp")

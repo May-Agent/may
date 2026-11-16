@@ -16,7 +16,7 @@ pub use code_search::CodeSearchTool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aither_sandbox::{HostProgram, ToolRuntimeError, ToolTarget};
+use crate::tools::{HostProgram, ToolRuntimeError, ToolTarget};
 use async_lock::OnceCell;
 use repo_search_client::client::{Client, ClientError};
 use repo_search_client::launcher::{self, ConnectError, Launcher as _};
@@ -70,7 +70,8 @@ struct Inner {
     prepared: OnceCell<Prepared>,
     /// `true` once [`RepoSearch::retire`] ran. Every launch holds it shared
     /// while it may install agents, so a retirement waits for those in flight
-    /// and no launch installs after it.
+    /// and no launch installs after it. The binary is prepared before the
+    /// lock is taken, so a retirement never waits on the network.
     retired: async_lock::RwLock<bool>,
 }
 
@@ -97,19 +98,11 @@ impl RepoSearch {
         }
     }
 
-    /// The process-wide handle; `may_dir` is fixed for a process, so the
-    /// first caller's value is the one kept.
-    #[must_use]
-    pub fn global(may_dir: &Path) -> Self {
-        static GLOBAL: std::sync::OnceLock<RepoSearch> = std::sync::OnceLock::new();
-        GLOBAL.get_or_init(|| Self::new(may_dir)).clone()
-    }
-
     async fn prepared(&self) -> Result<&Prepared, RepoSearchError> {
         self.inner
             .prepared
             .get_or_try_init(|| async {
-                let distribution = crate::tools::host_program_distribution()?;
+                let distribution = crate::tools::embedded_distribution()?;
                 let path = distribution
                     .prepare_host_program(
                         HostProgram::RepoSearch,
@@ -132,11 +125,13 @@ impl RepoSearch {
     /// unreachable, and with [`RepoSearchError::Retired`] after
     /// [`RepoSearch::retire`].
     pub async fn client(&self) -> Result<Client, RepoSearchError> {
+        // Preparing the binary installs no agents, so it runs outside the
+        // lock: a retirement must not wait out a download's retries.
+        let prepared = self.prepared().await?;
         let retired = self.inner.retired.read().await;
         if *retired {
             return Err(RepoSearchError::Retired);
         }
-        let prepared = self.prepared().await?;
         let mut launcher = PlatformLauncher::user(prepared.program.clone())?;
         let report = launcher.prepare().await;
         let client = launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?;
@@ -193,22 +188,62 @@ fn boot_out_relocated(
     if daemon == LABEL && server == SERVER_LABEL {
         return Ok(Vec::new());
     }
+    let launch = |error: repo_search_client::launcher::install::LaunchctlError| {
+        RepoSearchError::Launch(error.to_string())
+    };
     let mut removed = Vec::new();
     for label in [server, daemon] {
         let service = format!("{domain}/{label}");
-        if launchctl
-            .service(&service)
-            .map_err(|error| RepoSearchError::Launch(error.to_string()))?
-            .is_some()
+        if launchctl.service(&service).map_err(launch)?.is_some()
+            && boot_out_loaded(launchctl, &service).map_err(launch)?
         {
-            launchctl
-                .bootout(&service)
-                .map_err(|error| RepoSearchError::Launch(error.to_string()))?;
             removed.push(service);
         }
     }
+    await_bootouts(launchctl, &removed)?;
     Ok(removed)
 }
+
+/// Blocks until every service in `booted_out` has left launchd.
+///
+/// `bootout` returns once launchd has signalled the job, not once the process
+/// exited: a server stopping mid-load stays registered, in state `SIGTERMed`,
+/// until it exits or launchd's exit timeout kills it.
+///
+/// # Errors
+/// Fails when the launchd state cannot be read, or a service is still
+/// registered [`BOOTOUT_SETTLE`] after its bootout.
+#[cfg(target_os = "macos")]
+fn await_bootouts(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    booted_out: &[String],
+) -> Result<(), RepoSearchError> {
+    let deadline = std::time::Instant::now() + BOOTOUT_SETTLE;
+    for service in booted_out {
+        while launchctl
+            .service(service)
+            .map_err(|error| RepoSearchError::Launch(error.to_string()))?
+            .is_some()
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(RepoSearchError::Launch(format!(
+                    "{service} is still registered {BOOTOUT_SETTLE:?} after its bootout"
+                )));
+            }
+            std::thread::sleep(BOOTOUT_POLL);
+        }
+    }
+    Ok(())
+}
+
+/// How long a booted-out agent may stay registered while its process stops:
+/// twice the 5 s exit timeout launchd applies before it kills the process.
+#[cfg(target_os = "macos")]
+const BOOTOUT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The interval at which a booted-out agent's registration is rechecked.
+#[cfg(target_os = "macos")]
+const BOOTOUT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Boots out every relocated-home repo-search agent whose plist no longer
 /// exists, returning the services it removed.
@@ -300,12 +335,40 @@ fn sweep_stale(
         else {
             continue;
         };
-        if !plist.try_exists()? {
-            launchctl.bootout(&service).map_err(launch)?;
+        if !plist.try_exists()? && boot_out_loaded(launchctl, &service).map_err(launch)? {
             removed.push(service);
         }
     }
+    await_bootouts(launchctl, &removed)?;
     Ok(removed)
+}
+
+/// Boots out `service`, returning whether this call removed it.
+///
+/// Concurrent sweeps (every daemon and client start runs one) find the same
+/// stale service; the loser's `bootout` fails because the winner's already
+/// took it out. A refused `bootout` of a service launchd still holds stays an
+/// error.
+///
+/// # Errors
+/// The `bootout` error, when the service is still loaded after it.
+#[cfg(target_os = "macos")]
+pub(crate) fn boot_out_loaded(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    service: &str,
+) -> Result<bool, repo_search_client::launcher::install::LaunchctlError> {
+    match launchctl.bootout(service) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if launchctl
+                .service(service)
+                .is_ok_and(|loaded| loaded.is_none()) =>
+        {
+            tracing::debug!(%service, %error, "another sweep booted the service out first");
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -319,14 +382,29 @@ mod tests {
 
     /// A launchd holding `loaded` services, recording every `bootout`.
     /// `plists` gives the plist launchd reports for a service, by label.
+    /// A booted-out service stays registered for `linger` more lookups, as a
+    /// process still stopping does.
     struct Fake {
         loaded: Vec<String>,
         booted_out: Vec<String>,
         plists: Vec<(String, std::path::PathBuf)>,
+        linger: usize,
+        stopping: Vec<(String, usize)>,
     }
 
     impl Launchctl for Fake {
         fn service(&mut self, service: &str) -> Result<Option<Service>, LaunchctlError> {
+            if let Some(index) = self.stopping.iter().position(|(name, _)| name == service) {
+                let left = &mut self.stopping[index].1;
+                if *left > 0 {
+                    *left -= 1;
+                    return Ok(Some(Service {
+                        pid: None,
+                        path: None,
+                    }));
+                }
+                self.stopping.remove(index);
+            }
             Ok(self
                 .loaded
                 .iter()
@@ -353,6 +431,9 @@ mod tests {
         fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
             self.booted_out.push(service.to_owned());
             self.loaded.retain(|loaded| loaded != service);
+            if self.linger > 0 {
+                self.stopping.push((service.to_owned(), self.linger));
+            }
             Ok(())
         }
 
@@ -369,6 +450,29 @@ mod tests {
                 .collect(),
             booted_out: Vec::new(),
             plists: Vec::new(),
+            linger: 0,
+            stopping: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_sweep_returns_once_its_swept_agents_have_left_launchd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let login = Path::new("/Users/login");
+        let (stale, stale_server) = labels_for(Path::new("/tmp/gone-home"), login);
+        let mut launchctl = fake_with(&[&stale, &stale_server]);
+        let gone = dir.path().join("gone.plist");
+        launchctl.plists = vec![(stale, gone.clone()), (stale_server, gone)];
+        launchctl.linger = 3;
+
+        let removed = sweep_stale(&mut launchctl, "user/501").expect("sweep should succeed");
+
+        assert_eq!(removed.len(), 2);
+        for service in &removed {
+            assert!(
+                launchctl.service(service).expect("lookup").is_none(),
+                "{service} should have left launchd when the sweep returned"
+            );
         }
     }
 

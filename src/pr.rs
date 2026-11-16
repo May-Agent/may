@@ -17,15 +17,21 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use askama::Template;
 
-use crate::db::ChatDb;
+use crate::db::{ChatDb, PrFilter, PrState};
 use crate::host_git::HostGit;
 use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
+
+pub(crate) mod checks;
+pub(crate) mod merge_watch;
+mod pull_sync;
+
+use pull_sync::SyncedCheckout;
 
 /// Error type for `pr` operations.
 #[derive(Debug, thiserror::Error)]
@@ -90,17 +96,38 @@ pub struct PrContext {
     pub cwd: PathBuf,
     /// Workspace config — `[[projects]]` backends and checks.
     pub workspace_config: crate::workspace::WorkspaceConfig,
-    /// Outbound screen: `Ok(true)` publishes, anything else blocks. Wired
-    /// to the fast model by the command registration.
-    pub screen: Option<std::sync::Arc<ScreenFn>>,
+    /// Outbound publish review wired to the fast model and local pre-screen.
+    pub review: Option<crate::harness::publish_review::PublishReview>,
     /// The user's signing configuration: every commit of a PR must carry
     /// a signature valid under its key.
     pub signing: crate::commit_signing::CommitSigning,
     /// GitHub REST client the GitHub backend's direct calls go through.
     pub github_api: GitHubRest<PrTokenSource>,
+    /// The per-repository land locks every session of the daemon shares.
+    pub land_locks: LandLocks,
+    /// Daemon-held per-repo default-branch checkouts updated when GitHub PRs merge.
+    pub checkouts: Option<crate::repo_clone::DaemonCheckouts>,
+    /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
+    /// rejected or closes.
+    pub task_events: Option<crate::harness::working_document::WorkEvents>,
     /// Asks the user before a PR is opened on a repository they do not own;
     /// `None` publishes without asking.
     pub publish: Option<crate::agent::publish_approval::PublishGate>,
+    /// Records the durations of the PR's checks, when the session keeps
+    /// them; `None` records nothing.
+    pub ci: Option<CiWatch>,
+    /// Announces PR state changes to live UI/TUI subscribers.
+    pub ui_events: Option<crate::ui_event_bus::UiEventBus>,
+}
+
+/// What recording a PR's CI durations needs beyond the database.
+#[derive(Clone, Debug)]
+pub struct CiWatch {
+    /// The May home, whose `config.toml` holds the `[ci]` thresholds, read
+    /// each time a PR's checks finish.
+    pub may_dir: PathBuf,
+    /// Where a finding's warning is announced to the clients.
+    pub ui_events: crate::ui_event_bus::UiEventBus,
 }
 
 /// Token source for the GitHub backend's REST client.
@@ -136,14 +163,6 @@ impl PrContext {
     }
 }
 
-/// Screen callback signature: `(title, body)` → publish verdict.
-pub type ScreenFn = dyn Fn(
-        &str,
-        &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
-    + Send
-    + Sync;
-
 impl std::fmt::Debug for PrContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrContext")
@@ -152,15 +171,37 @@ impl std::fmt::Debug for PrContext {
     }
 }
 
-/// Serialized per-repo merge: one in-flight land per repository.
-static LAND_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Records a GitHub PR's check durations when its checks finish.
+struct CiObserver<'a> {
+    store: &'a PrStore,
+    pr: &'a crate::db::PrRow,
+    owner_repo: &'a str,
+    head_sha: &'a str,
+}
 
-fn land_lock(repo_key: &str) -> Arc<Mutex<()>> {
-    let mut locks = LAND_LOCKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    locks.entry(repo_key.to_string()).or_default().clone()
+impl merge_watch::ChecksObserver for CiObserver<'_> {
+    async fn finished(&self) {
+        self.store
+            .observe_github_checks(self.pr, self.owner_repo, self.head_sha)
+            .await;
+    }
+}
+
+/// Serialized per-repo merge: one in-flight land per repository.
+///
+/// Cloning shares the locks, so the daemon hands one set to every session and
+/// a land in one session excludes a land of the same repository in another.
+#[derive(Clone, Debug, Default)]
+pub struct LandLocks(Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>);
+
+impl LandLocks {
+    fn get(&self, repo_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.entry(repo_key.to_string()).or_default().clone()
+    }
 }
 
 /// The resolved clone a `pr` operates on.
@@ -188,8 +229,13 @@ impl PrStore {
     #[must_use]
     pub fn new(context: PrContext, sandbox: CloneSandbox) -> Self {
         let repos = context.db.clone().map(|db| {
-            SessionRepos::new(&context.session_root, context.session_id.clone(), db)
-                .with_host(context.signing.host().clone())
+            let mut repos =
+                SessionRepos::new(&context.session_root, context.session_id.clone(), db)
+                    .with_host(context.signing.host().clone());
+            if let Some(checkouts) = context.checkouts.clone() {
+                repos = repos.with_checkouts(checkouts);
+            }
+            repos
         });
         Self {
             context,
@@ -211,22 +257,89 @@ impl PrStore {
             .ok_or_else(|| PrError::Resolve("pr requires the history database".to_string()))
     }
 
-    /// Which repo does `pr` mean: `--repo` wins, then the session's only
-    /// clone, then the cwd's repository (cloned on demand).
+    /// Which repo does `pr` mean: `--repo` wins (preferring an exact workspace
+    /// directory name), then the session's unique workspace matching `cwd` or
+    /// binding, then cloning on demand when none exists yet.
     async fn resolve(&self, repo: Option<&str>) -> Result<Resolved, PrError> {
         let repos = self.repos()?;
         let clones = repos.clones().await?;
         if let Some(name) = repo {
-            if let Some(record) = clones
-                .into_iter()
-                .find(|c| c.repo_key == name || c.dir.as_str() == name)
-            {
+            if let Some(record) = clones.iter().find(|c| c.dir.as_str() == name) {
                 return Ok(Resolved {
                     dir: repos.path(&record.dir),
-                    record,
+                    record: record.clone(),
                 });
             }
-            return Err(PrError::Resolve(format!("no session clone named {name}")));
+            let by_key: Vec<_> = clones.iter().filter(|c| c.repo_key == name).collect();
+            return match by_key.as_slice() {
+                [record] => Ok(Resolved {
+                    dir: repos.path(&record.dir),
+                    record: (*record).clone(),
+                }),
+                [] => Err(PrError::Resolve(format!("no session clone named {name}"))),
+                _ => Err(PrError::Resolve(format!(
+                    "several session workspaces exist for {name}; run inside one or pass its workspace directory name"
+                ))),
+            };
+        }
+        // The repository the cwd sits in, when it has one unambiguous workspace.
+        let cwd_key = crate::repo_search::worktree_root(&self.context.cwd)
+            .and_then(|worktree| {
+                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
+                    .ok()
+                    .flatten()
+            })
+            .map(|source| source.key());
+        if let Some(key) = cwd_key.as_deref() {
+            let matching: Vec<_> = clones.iter().filter(|c| c.repo_key == key).collect();
+            match matching.as_slice() {
+                [record] => {
+                    return Ok(Resolved {
+                        dir: repos.path(&record.dir),
+                        record: (*record).clone(),
+                    });
+                }
+                [] => {}
+                _ => {
+                    return Err(PrError::Resolve(
+                        "several session clones exist; run inside one or pass --repo".to_string(),
+                    ));
+                }
+            }
+        }
+        // The session's own binding names its repository, checkout or not.
+        if let Some(binding) = self.session_binding().await? {
+            let matching: Vec<_> = clones
+                .iter()
+                .filter(|c| c.repo_key == binding.clone_key())
+                .collect();
+            match matching.as_slice() {
+                [record] => {
+                    return Ok(Resolved {
+                        dir: repos.path(&record.dir),
+                        record: (*record).clone(),
+                    });
+                }
+                [] => {}
+                _ => {
+                    return Err(PrError::Resolve(
+                        "several session clones exist; run inside one or pass --repo".to_string(),
+                    ));
+                }
+            }
+            let dir = repos
+                .ensure_clone_of_binding(
+                    &binding,
+                    &self.context.workspace_config,
+                    &self.context.scratch_root,
+                )
+                .await?
+                .ok_or_else(|| {
+                    PrError::Resolve(
+                        "repository trust is undecided or binds no clone — run `repo trust set <full|prs-only|local-branch>`".to_string(),
+                    )
+                })?;
+            return Self::registered(repos, dir).await;
         }
         if let [record] = clones.as_slice() {
             return Ok(Resolved {
@@ -270,6 +383,165 @@ impl PrStore {
             .ok_or_else(|| {
                 PrError::Resolve("trust binds no clone for this repository".to_string())
             })?;
+        Self::registered(repos, dir).await
+    }
+
+    /// Resolve the workspace for an existing PR `#number`, consulting
+    /// `pr_workspaces` when `repo` leaves ambiguity between multiple concurrent
+    /// workspaces on the same repository.
+    async fn resolve_for_pr(
+        &self,
+        repo: Option<&str>,
+        number: i64,
+    ) -> Result<(Resolved, crate::db::PrRow), PrError> {
+        let repos = self.repos()?;
+        let clones = repos.clones().await?;
+        let db = self.db()?;
+        // Exact workspace directory always wins.
+        if let Some(name) = repo
+            && let Some(record) = clones.iter().find(|c| c.dir.as_str() == name)
+        {
+            let pr = db
+                .get_pr(&record.repo_key, number)
+                .await?
+                .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+            return Ok((
+                Resolved {
+                    dir: repos.path(&record.dir),
+                    record: record.clone(),
+                },
+                pr,
+            ));
+        }
+        let candidate_key = if let Some(name) = repo {
+            Some(name.to_string())
+        } else if let Some(key) = crate::repo_search::worktree_root(&self.context.cwd)
+            .and_then(|w| {
+                crate::repo_clone::CloneSource::of(&w, &self.context.workspace_config)
+                    .ok()
+                    .flatten()
+            })
+            .map(|s| s.key())
+        {
+            Some(key)
+        } else if let Some(binding) = self.session_binding().await? {
+            Some(binding.clone_key())
+        } else {
+            let mut keys: Vec<String> = clones.iter().map(|c| c.repo_key.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            if keys.len() == 1 { keys.pop() } else { None }
+        };
+        if let Some(key) = candidate_key
+            && let Some(pr) = db.get_pr(&key, number).await?
+            && let Some(bound_dir) = db.pr_workspace(pr.id).await?
+            && let Some(record) = clones
+                .iter()
+                .find(|c| c.repo_key == key && c.dir.as_str() == bound_dir)
+        {
+            return Ok((
+                Resolved {
+                    dir: repos.path(&record.dir),
+                    record: record.clone(),
+                },
+                pr,
+            ));
+        }
+        let resolved = self.resolve(repo).await?;
+        let pr = db
+            .get_pr(&resolved.record.repo_key, number)
+            .await?
+            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        Ok((resolved, pr))
+    }
+
+    /// Resolve only the repository identity for read-only queries (`list`, `show`).
+    async fn resolve_repo_key(&self, repo: Option<&str>) -> Result<String, PrError> {
+        let clones = self.repos()?.clones().await?;
+        if let Some(name) = repo {
+            if let Some(record) = clones
+                .iter()
+                .find(|c| c.dir.as_str() == name || c.repo_key == name)
+            {
+                return Ok(record.repo_key.clone());
+            }
+            if let Some(project) = self.context.workspace_config.projects.iter().find(|p| {
+                p.github_repository()
+                    .is_some_and(|r| format!("{}/{}", r.owner(), r.repo()) == name)
+                    || p.path.as_ref().is_some_and(|w| {
+                        crate::issue::repository_identity(Path::new(w))
+                            .is_ok_and(|id| p.has_identity(&id) && name == w)
+                    })
+            }) {
+                if let Some(gh) = project.github_repository() {
+                    return Ok(format!(
+                        "https://github.com/{}/{}.git",
+                        gh.owner(),
+                        gh.repo()
+                    ));
+                }
+                if let Some(path) = &project.path
+                    && let Ok(identity) = crate::issue::repository_identity(Path::new(path))
+                {
+                    return Ok(identity.display().to_string());
+                }
+            }
+            if let Ok(Some(source)) =
+                crate::repo_clone::CloneSource::of(Path::new(name), &self.context.workspace_config)
+            {
+                return Ok(source.key());
+            }
+            if let Ok(resolved) = self.resolve(Some(name)).await {
+                return Ok(resolved.record.repo_key);
+            }
+            if let Ok(db) = self.db() {
+                let summaries = db
+                    .list_prs_with_repo(None, None, PrFilter::All, false)
+                    .await?;
+                if let Some(found) = summaries.into_iter().find(|pr| {
+                    pr.repo_key == name || github_owner_repo(&pr.repo_key).as_deref() == Some(name)
+                }) {
+                    return Ok(found.repo_key);
+                }
+            }
+            return Err(PrError::Resolve(format!("no session clone named {name}")));
+        }
+        if let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd)
+            && let Ok(Some(source)) =
+                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
+        {
+            return Ok(source.key());
+        }
+        if let Some(binding) = self.session_binding().await? {
+            return Ok(binding.clone_key());
+        }
+        let resolved = self.resolve(None).await.or_else(|err| {
+            let mut keys: Vec<String> = clones.iter().map(|c| c.repo_key.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            if let [only] = keys.as_slice() {
+                Ok(Resolved {
+                    dir: PathBuf::new(),
+                    record: clones.iter().find(|c| &c.repo_key == only).unwrap().clone(),
+                })
+            } else {
+                Err(err)
+            }
+        })?;
+        Ok(resolved.record.repo_key)
+    }
+
+    /// The repository the session is bound to, when it has a binding.
+    async fn session_binding(&self) -> Result<Option<crate::session::RepoBinding>, PrError> {
+        let row = self.db()?.get_session(&self.context.session_id).await?;
+        row.and_then(|row| row.repo)
+            .map(|stored| crate::session::RepoBinding::parse(&stored))
+            .transpose()
+            .map_err(|error| PrError::Resolve(error.to_string()))
+    }
+
+    /// The registry record of the clone in `dir`.
+    async fn registered(repos: &SessionRepos, dir: PathBuf) -> Result<Resolved, PrError> {
         let record = repos
             .clones()
             .await?
@@ -293,15 +565,31 @@ impl PrStore {
         hold: bool,
     ) -> Result<String, PrError> {
         let resolved = self.resolve(repo).await?;
-        if self
+        let has_workspace_pr = self
+            .db()?
+            .open_pr_for_workspace(
+                &resolved.record.repo_key,
+                &self.context.session_id,
+                resolved.record.dir.as_str(),
+            )
+            .await?
+            .is_some();
+        let has_legacy_pr = if has_workspace_pr {
+            false
+        } else if let Some(existing) = self
             .db()?
             .open_pr_for(&resolved.record.repo_key, &self.context.session_id)
             .await?
-            .is_some()
         {
+            // Only treat a live PR on the same repo as belonging to this
+            // workspace when it has no bound workspace of its own.
+            self.db()?.pr_workspace(existing.id).await?.is_none()
+        } else {
+            false
+        };
+        if has_workspace_pr || has_legacy_pr {
             return Err(PrError::State(
-                "this session already has an open PR on this repo — merge or close it first"
-                    .to_string(),
+                "this workspace already has an open PR — merge or close it first".to_string(),
             ));
         }
         let dirty = uncommitted_changes(&self.sandbox, &resolved.dir).await?;
@@ -313,6 +601,7 @@ impl PrStore {
         if resolved.record.local && head_sha == base_sha {
             return Err(PrError::State("no committed work in the clone".to_string()));
         }
+        self.check_pinned_backend(&resolved.record)?;
         let (backend, github_repo) = Self::backend_for(&resolved.record);
         let subjects = self
             .commit_subjects(&resolved, &base_sha, &head_sha)
@@ -331,12 +620,19 @@ impl PrStore {
         } else {
             github_branch(&self.context.session_id, &head_sha)
         };
-        // The outbound screen vets every published text before it leaves —
-        // the "PRs only" trust mode's guard.
-        if backend == "github"
-            && let Some(reason) = self.screen_outbound(&resolved.record, title, body).await?
-        {
-            return Err(PrError::Screened(reason));
+        // Review outbound PR title, body, and commit messages before anything
+        // leaves the machine.
+        if backend == "github" {
+            let commits = self
+                .commit_messages(&resolved, &base_sha, &head_sha)
+                .await?;
+            let commit_refs: Vec<_> = commits.iter().map(OwnedCommit::as_ref).collect();
+            self.review_outbound(crate::harness::publish_review::Publication::pull_request(
+                title,
+                body,
+                &commit_refs,
+            ))
+            .await?;
         }
         if backend == "github"
             && let (Some(gate), Some(owner_repo)) = (&self.context.publish, github_repo.as_deref())
@@ -361,6 +657,10 @@ impl PrStore {
             self.verify_local(&resolved, &base_sha, &head_sha).await?;
             None
         };
+        let project = self.project_for_record(&resolved.record);
+        let config_hold = project.is_some_and(|p| p.pr.auto_merge == Some(false));
+        let require_review = project.is_some_and(|p| p.pr.require_review == Some(true));
+        let effective_hold = hold || config_hold || require_review;
         let pr = self
             .db()?
             .create_pr(
@@ -371,22 +671,28 @@ impl PrStore {
                 &branch,
                 &base_sha,
                 backend,
-                !hold,
+                !effective_hold,
                 issue_number,
                 external_number,
             )
             .await?;
         // The PR owns its commit from here on: pin it once, land only it.
         let db = self.db()?;
+        db.set_pr_workspace(pr.id, resolved.record.dir.as_str())
+            .await?;
         if resolved.record.local {
             db.set_pr_branch(pr.id, &pin_ref(pr.number)).await?;
             self.pin(&resolved, pr.number, &head_sha).await?;
         }
         let pr = db
-            .update_pr(pr.id, "open", Some(&head_sha), None, None)
+            .update_pr(pr.id, PrState::Open, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "opened", Some(&format!("base {base_sha}")))
             .await;
+        self.task_event(
+            &pr,
+            crate::harness::working_document::WorkEvent::PullRequestOpened,
+        );
         if let Some(n) = external_number {
             self.event(&pr, "opened", Some(&format!("github PR #{n}")))
                 .await;
@@ -395,10 +701,20 @@ impl PrStore {
             self.event(&pr, "issue_linked", Some(&format!("issue #{n}")))
                 .await;
         }
-        if hold {
+        if require_review && !hold && !config_hold {
+            self.event(
+                &pr,
+                "review_required",
+                Some("user review required before merge"),
+            )
+            .await;
+            return Ok(format!("opened PR #{} (awaiting review)", pr.number));
+        }
+        if effective_hold {
             return Ok(format!("opened PR #{} (hold)", pr.number));
         }
-        self.merge(pr.number, repo).await
+        self.merge(pr.number, Some(resolved.record.dir.as_str()))
+            .await
     }
 
     /// `pr merge <n>` — checks, preflight, serialized land, cleanup. Also
@@ -410,22 +726,22 @@ impl PrStore {
     /// # Panics
     /// Never: the merge report renders for every input.
     pub async fn merge(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
             )));
         }
-        match pr.state.as_str() {
-            "merged" | "closed" => {
-                return Err(PrError::State(format!("PR #{number} is {}", pr.state)));
-            }
-            _ => {}
+        if self
+            .project_for_record(&resolved.record)
+            .is_some_and(|p| p.pr.require_review == Some(true))
+        {
+            return Err(PrError::State(format!(
+                "PR #{number} requires user review before merging"
+            )));
+        }
+        if pr.state.is_terminal() {
+            return Err(PrError::State(format!("PR #{number} is {}", pr.state)));
         }
         // Merging deletes the clone: work it holds outside a commit would
         // go with it, so it refuses and names the files.
@@ -441,7 +757,7 @@ impl PrStore {
             ))
         })?;
         self.db()?
-            .update_pr(pr.id, "checks_pending", Some(&head_sha), None, None)
+            .update_pr(pr.id, PrState::ChecksPending, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "checks_pending", None).await;
         if pr.backend == "github" {
@@ -453,21 +769,22 @@ impl PrStore {
             && let Err(err) = self.check_pinned(&resolved, &pr, &head_sha, &cmd).await
         {
             self.db()?
-                .update_pr(pr.id, "failed", Some(&head_sha), None, None)
+                .update_pr(pr.id, PrState::Failed, Some(&head_sha), None, None)
                 .await?;
             self.event(&pr, "check_failed", Some(&err)).await;
             return Err(PrError::CheckFailed(err));
         }
         // Serialized land: one in-flight merge per repository.
-        let lock = land_lock(&resolved.record.repo_key);
+        let lock = self.context.land_locks.get(&resolved.record.repo_key);
         self.event(&pr, "merging", None).await;
         let result = blocking::unblock({
             let checkout = resolved.record.source.clone();
             let refname = pr.branch.clone();
+            let base = pr.base_sha.clone();
             let sha = head_sha.clone();
             let number = pr.number;
             let host = self.context.signing.host().clone();
-            move || land(&host, &checkout, &refname, &sha, number, &lock)
+            move || land(&host, &checkout, &refname, &base, &sha, number, &lock)
         })
         .await;
         let now = jiff::Timestamp::now().to_string();
@@ -476,13 +793,25 @@ impl PrStore {
                 self.db()?
                     .update_pr(
                         pr.id,
-                        "merged",
+                        PrState::Merged,
                         Some(&head_sha),
                         Some(&merge_sha),
                         Some(&now),
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
+                close_linked_may_issue(
+                    self.db()?,
+                    &self.context.workspace_config,
+                    &resolved.record.repo_key,
+                    &pr,
+                    self.project_for_record(&resolved.record),
+                )
+                .await;
+                self.task_event(
+                    &pr,
+                    crate::harness::working_document::WorkEvent::PullRequestMerged,
+                );
                 let clone = self.retire_clone(&resolved, &head_sha).await?;
                 Ok(PrMerged {
                     number,
@@ -490,15 +819,20 @@ impl PrStore {
                     clone_dir: resolved.record.dir.as_str(),
                     clone,
                     remote_branch: RemoteBranch::Local,
+                    pull_sync: Vec::new(),
                 }
                 .render()
                 .expect("the merge result renders"))
             }
             Err(reason) => {
                 self.db()?
-                    .update_pr(pr.id, "rejected", Some(&head_sha), None, None)
+                    .update_pr(pr.id, PrState::Rejected, Some(&head_sha), None, None)
                     .await?;
                 self.event(&pr, "rejected", Some(&reason)).await;
+                self.task_event(
+                    &pr,
+                    crate::harness::working_document::WorkEvent::PullRequestRejected,
+                );
                 Err(PrError::Rejected(reason))
             }
         }
@@ -509,12 +843,7 @@ impl PrStore {
     /// # Errors
     /// Fails on ownership or a terminal state.
     pub async fn close(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
@@ -522,7 +851,7 @@ impl PrStore {
         }
         // A terminal PR is refused before anything leaves the machine; the
         // transition below re-checks atomically.
-        if matches!(pr.state.as_str(), "merged" | "closed") {
+        if pr.state.is_terminal() {
             return Err(PrError::State(format!(
                 "PR #{number} is already {}",
                 pr.state
@@ -540,6 +869,10 @@ impl PrStore {
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
+        self.task_event(
+            &pr,
+            crate::harness::working_document::WorkEvent::PullRequestClosed,
+        );
         if resolved.record.local {
             drop_ref(
                 self.context.signing.host(),
@@ -548,6 +881,8 @@ impl PrStore {
             )
             .await;
         }
+        self.retire_closed_clone(&resolved, pr.head_sha.as_deref())
+            .await?;
         Ok(format!("closed PR #{number}"))
     }
 
@@ -557,12 +892,7 @@ impl PrStore {
     /// # Errors
     /// Fails on ownership, a terminal state, or a dirty clone.
     pub async fn update(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
@@ -577,6 +907,22 @@ impl PrStore {
         }
         let head_sha = self.head_sha(&resolved).await?;
         if pr.backend == "github" {
+            let since = pr.head_sha.as_deref().unwrap_or(&pr.base_sha);
+            let commits = match self.commit_messages(&resolved, since, &head_sha).await {
+                Ok(commits) => commits,
+                Err(_) if pr.head_sha.is_some() => {
+                    self.commit_messages(&resolved, &pr.base_sha, &head_sha)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            let commit_refs: Vec<_> = commits.iter().map(OwnedCommit::as_ref).collect();
+            if !commit_refs.is_empty() {
+                self.review_outbound(
+                    crate::harness::publish_review::Publication::commit_messages(&commit_refs),
+                )
+                .await?;
+            }
             push_pinned(
                 &self.context.scratch_root,
                 &resolved.dir,
@@ -596,7 +942,7 @@ impl PrStore {
             self.pin(&resolved, pr.number, &head_sha).await?;
         }
         self.db()?
-            .update_pr(pr.id, "open", Some(&head_sha), None, None)
+            .update_pr(pr.id, PrState::Open, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "updated", Some(&head_sha)).await;
         Ok(format!("PR #{number} now holds {head_sha}"))
@@ -609,12 +955,7 @@ impl PrStore {
     /// # Errors
     /// Fails when the PR does not exist.
     pub async fn adopt(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
-            .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        let (_resolved, pr) = self.resolve_for_pr(repo, number).await?;
         if pr.session_id == self.context.session_id {
             return Ok(format!("PR #{number} is already this session's"));
         }
@@ -622,106 +963,168 @@ impl PrStore {
         self.db()?.adopt_pr(pr.id, &self.context.session_id).await?;
         let detail = format!("from session {previous}");
         self.event(&pr, "adopted", Some(&detail)).await;
+        self.notify_prs(&self.context.session_id);
         Ok(format!("adopted PR #{number} (was session {previous})"))
     }
 
-    /// `pr list` — every PR on the repo (or all repos with `--repo all`-less
-    /// call), newest first.
+    /// `pr list` — every PR on the repo (or all repos when no repo scope is
+    /// implied), newest first, with repo, state, checks, and provenance.
     ///
     /// # Errors
     /// Fails on database errors.
-    pub async fn list(&self, repo: Option<&str>, state: Option<&str>) -> Result<String, PrError> {
+    pub async fn list(&self, repo: Option<&str>, filter: PrFilter) -> Result<String, PrError> {
         let key = if let Some(name) = repo {
-            let resolved = self.resolve(Some(name)).await?;
-            Some(resolved.record.repo_key)
+            Some(self.resolve_repo_key(Some(name)).await?)
+        } else if let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd)
+            && let Ok(Some(source)) =
+                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
+        {
+            Some(source.key())
+        } else if let Some(binding) = self.session_binding().await? {
+            Some(binding.clone_key())
         } else {
             let clones = self.repos()?.clones().await?;
-            if clones.len() == 1 {
-                Some(clones[0].repo_key.clone())
-            } else {
-                None
-            }
+            let mut keys: Vec<String> = clones.into_iter().map(|c| c.repo_key).collect();
+            keys.sort();
+            keys.dedup();
+            if keys.len() == 1 { keys.pop() } else { None }
         };
-        let rows = self.db()?.list_prs(key.as_deref(), state).await?;
+        let db = self.db()?;
+        let rows = db
+            .list_prs_with_repo(key.as_deref(), None, filter, false)
+            .await?;
         if rows.is_empty() {
             return Ok("no PRs".to_string());
         }
-        // A PR whose owning session was deleted shows an `orphaned` marker —
-        // another session adopts it with `pr adopt` before merging.
-        let mut dead = std::collections::HashSet::<&str>::new();
-        for pr in &rows {
-            if dead.contains(pr.session_id.as_str()) {
-                continue;
-            }
-            if self.db()?.get_session(&pr.session_id).await?.is_none() {
-                dead.insert(&pr.session_id);
-            }
+        let mut items = Vec::with_capacity(rows.len());
+        for pr in rows {
+            let events = db.pr_events(pr.id).await?;
+            let check_state = db.pr_check_state(pr.id).await?;
+            let opened = pr_opened_provenance(&events);
+            let detail = pr_failure_detail(&events, pr.state, check_state.as_ref());
+            let checks = format_cached_checks(check_state.as_ref());
+            items.push(PrListItemView {
+                number: pr.number,
+                state: pr.state,
+                title: pr.title,
+                external_number: pr.external_number,
+                merge_commit_sha: pr.merge_commit_sha,
+                orphaned: pr.orphaned,
+                repo_key: pr.repo_key,
+                backend: pr.backend,
+                session_id: pr.session_id,
+                opened,
+                checks,
+                detail,
+            });
         }
-        let mut out = String::new();
-        for pr in &rows {
-            let _ = std::fmt::Write::write_fmt(
-                &mut out,
-                format_args!(
-                    "PR #{} [{}] {}{}{} (session {})\n",
-                    pr.number,
-                    pr.state,
-                    pr.title,
-                    pr.merge_commit_sha
-                        .as_deref()
-                        .map(|s| format!(" → {s}"))
-                        .unwrap_or_default(),
-                    if dead.contains(pr.session_id.as_str()) {
-                        " — orphaned"
-                    } else {
-                        ""
-                    },
-                    pr.session_id
-                ),
-            );
-        }
-        Ok(out.trim_end().to_string())
+        PrListTemplate { prs: &items }
+            .render()
+            .map(|text| text.trim_end().to_string())
+            .map_err(|e| PrError::State(e.to_string()))
     }
 
-    /// `pr show <n>` — one PR with its event trail.
+    /// `pr show <n>` — one PR with its state, checks, failure detail, and
+    /// full provenance/event trail. Works even after clone retirement or from
+    /// another session or subagent.
     ///
     /// # Errors
-    /// Fails when the PR does not exist.
+    /// Fails when the PR does not exist or its repository is ambiguous.
     pub async fn show(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
-        let resolved = self.resolve(repo).await?;
-        let pr = self
-            .db()?
-            .get_pr(&resolved.record.repo_key, number)
+        let key = if let Some(name) = repo {
+            Some(self.resolve_repo_key(Some(name)).await?)
+        } else {
+            self.resolve_repo_key(None).await.ok()
+        };
+        let db = self.db()?;
+        let mut matches: Vec<_> = db
+            .list_prs_with_repo(key.as_deref(), None, PrFilter::All, false)
             .await?
-            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
-        let events = self.db()?.pr_events(pr.id).await?;
-        let orphaned = self.db()?.get_session(&pr.session_id).await?.is_none();
-        let mut out = format!(
-            "PR #{} [{}] {}\nsession {}{} · backend {} · base {} · head {}",
-            pr.number,
-            pr.state,
-            pr.title,
-            pr.session_id,
-            if orphaned { " (orphaned)" } else { "" },
-            pr.backend,
-            pr.base_sha,
-            pr.head_sha.as_deref().unwrap_or("-")
-        );
-        if let Some(sha) = &pr.merge_commit_sha {
-            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\nmerge {sha}"));
+            .into_iter()
+            .filter(|pr| pr.number == number)
+            .collect();
+        if matches.is_empty() && key.is_some() && repo.is_none() {
+            matches = db
+                .list_prs_with_repo(None, None, PrFilter::All, false)
+                .await?
+                .into_iter()
+                .filter(|pr| pr.number == number)
+                .collect();
         }
-        for e in events {
-            let _ = std::fmt::Write::write_fmt(
-                &mut out,
-                format_args!(
-                    "\n  {} {} {}{}",
-                    e.created_at,
-                    e.kind,
-                    e.agent_id,
-                    e.detail.map(|d| format!(" — {d}")).unwrap_or_default()
-                ),
-            );
+        let mut iter = matches.into_iter();
+        let pr = match (iter.next(), iter.next()) {
+            (None, _) => return Err(PrError::State(format!("no PR #{number}"))),
+            (Some(row), None) => row,
+            (Some(_), Some(_)) => {
+                return Err(PrError::Resolve(format!(
+                    "several repositories have PR #{number}; pass --repo"
+                )));
+            }
+        };
+        let events = db.pr_events(pr.id).await?;
+        let check_state = db.pr_check_state(pr.id).await?;
+        let opened = pr_opened_provenance(&events);
+        let detail = pr_failure_detail(&events, pr.state, check_state.as_ref());
+        // The live check rollup for a GitHub PR still in flight — one
+        // snapshot, best-effort, skipped for the may backend and for
+        // states GitHub no longer reports checks on.
+        let checks = if pr.backend == "github"
+            && pr.state.is_in_flight()
+            && let (Some(owner_repo), Some(external)) =
+                (github_owner_repo(&pr.repo_key), pr.external_number)
+        {
+            let github = merge_watch::GithubPr {
+                api: &self.context.github_api,
+                owner_repo: &owner_repo,
+                number: external,
+            };
+            let section = match merge_watch::Upstream::snapshot(&github).await {
+                Ok(snapshot) => {
+                    let report = checks::ChecksReport::of(&snapshot);
+                    let failures = checks::failure_details(&owner_repo, external, &report).await;
+                    checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
+                }
+                Err(error) => checks::ChecksSection::Unreadable(error.to_string()),
+            };
+            Some(
+                section
+                    .render()
+                    .map_err(|e| PrError::State(e.to_string()))?,
+            )
+        } else {
+            format_cached_checks(check_state.as_ref()).map(|summary| format!("checks: {summary}"))
+        };
+        let event_views: Vec<PrEventView> = events
+            .into_iter()
+            .map(|e| PrEventView {
+                created_at: e.created_at,
+                kind: e.kind,
+                agent_id: e.agent_id,
+                session_id: e.session_id,
+                message_id: e.message_id,
+                detail: e.detail,
+            })
+            .collect();
+        PrShowTemplate {
+            number: pr.number,
+            state: pr.state,
+            title: &pr.title,
+            external_number: pr.external_number,
+            repo_key: &pr.repo_key,
+            session_id: &pr.session_id,
+            orphaned: pr.orphaned,
+            backend: &pr.backend,
+            base_sha: &pr.base_sha,
+            head_sha: pr.head_sha.as_deref().unwrap_or("-"),
+            merge_commit_sha: pr.merge_commit_sha.as_deref(),
+            opened: opened.as_ref(),
+            checks: checks.as_deref(),
+            detail: detail.as_deref(),
+            events: &event_views,
         }
-        Ok(out)
+        .render()
+        .map(|text| text.trim_end().to_string())
+        .map_err(|e| PrError::State(e.to_string()))
     }
 
     /// Which backend lands this record: local-bound clones merge into the
@@ -733,6 +1136,21 @@ impl PrStore {
             return ("may", None);
         }
         github_owner_repo(&record.source).map_or(("may", None), |repo| ("github", Some(repo)))
+    }
+
+    /// `[[projects]] pr.backend = "may"` pins landing to the checkout. A
+    /// clone made from the remote has no checkout to land into, so the pin
+    /// and the clone disagree and the PR is refused.
+    fn check_pinned_backend(&self, record: &CloneRecord) -> Result<(), PrError> {
+        let pinned = self
+            .project_for_record(record)
+            .and_then(|project| project.pr.backend.as_deref());
+        if !record.local && pinned == Some("may") {
+            return Err(PrError::Resolve(
+                "this project pins pr.backend to \"may\" but the session clone comes from the GitHub remote; re-run `repo trust set` to settle one backend".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// The `[[projects]]` entry covering this record, by repository
@@ -766,30 +1184,37 @@ impl PrStore {
         Ok(log.lines().map(str::to_string).collect())
     }
 
-    /// Run the outbound screen when the project enables it. `Some(reason)`
-    /// means the published text was blocked.
-    async fn screen_outbound(
+    /// Commits in `base..head`, oldest first, with abbreviated hash and full message.
+    async fn commit_messages(
         &self,
-        record: &CloneRecord,
-        title: &str,
-        body: &str,
-    ) -> Result<Option<String>, PrError> {
-        if !self
-            .project_for_record(record)
-            .and_then(|p| p.pr.screen)
-            .unwrap_or(false)
-        {
-            return Ok(None);
+        resolved: &Resolved,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<OwnedCommit>, PrError> {
+        let script = CommitMessages {
+            base: ShellWord::new(base).map_err(PrError::State)?,
+            head: ShellWord::new(head).map_err(PrError::State)?,
         }
-        let Some(screen) = self.context.screen.as_ref() else {
-            tracing::warn!("pr.screen is set but no screen is wired");
-            return Ok(None);
+        .render()
+        .expect("the commit messages script renders");
+        let log = self.sandbox.run(&resolved.dir, &script).await?;
+        Ok(parse_commit_messages(&log))
+    }
+
+    /// Run outbound publish review for external text before it leaves May.
+    async fn review_outbound(
+        &self,
+        publication: crate::harness::publish_review::Publication<'_>,
+    ) -> Result<(), PrError> {
+        let Some(review) = self.context.review.as_ref() else {
+            return Err(PrError::Screened(
+                "no outbound publish review is wired".to_string(),
+            ));
         };
-        Ok(match screen(title, body).await {
-            Ok(true) => None,
-            Ok(false) => Some("withheld by the outbound screen".to_string()),
-            Err(reason) => Some(reason),
-        })
+        review
+            .review(publication)
+            .await
+            .map_err(|error| PrError::Screened(error.to_string()))
     }
 
     /// Push the session branch to the GitHub remote and open a real PR.
@@ -858,58 +1283,83 @@ impl PrStore {
         let external = pr
             .external_number
             .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
-        let lock = land_lock(&resolved.record.repo_key);
+        let lock = self.context.land_locks.get(&resolved.record.repo_key);
+        let github = merge_watch::GithubPr {
+            api: &self.context.github_api,
+            owner_repo: &owner_repo,
+            number: external,
+        };
+        // Read before queueing: the bound and the removals that predate it.
+        let before = merge_watch::Upstream::snapshot(&github).await?;
+        ensure_head_pinned(external, head_sha, &before.head_sha)?;
+        let expected = merge_watch::Upstream::expected_checks(&github).await?;
         self.event(pr, "queued", None).await;
-        // Serialized land: queue + watch run inside one blocking call so
-        // the mutex guard never crosses an await.
-        let state = blocking::unblock({
+        // Serialized land: the lock covers queueing the PR, not the wait for
+        // it to land.
+        blocking::unblock({
             let owner_repo = owner_repo.clone();
-            move || -> Result<String, String> {
+            let head_sha = head_sha.to_string();
+            move || -> Result<(), String> {
                 let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
-                gh(&[
-                    "pr",
-                    "merge",
-                    &external.to_string(),
-                    "--repo",
-                    &owner_repo,
-                    "--auto",
-                    "--squash",
-                ])
-                .map_err(|e| e.to_string())?;
-                // Watch upstream until terminal: merged, closed, or timeout.
-                for _ in 0..60 {
-                    let out = gh(&[
-                        "pr",
-                        "view",
-                        &external.to_string(),
-                        "--repo",
-                        &owner_repo,
-                        "--json",
-                        "state",
-                    ])
-                    .map_err(|e| e.to_string())?;
-                    if let Some(state) = out
-                        .split('"')
-                        .nth(3)
-                        .map(str::to_string)
-                        .filter(|s| s != "OPEN")
-                    {
-                        return Ok(state);
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                }
-                Err("still open after watching".to_string())
+                let args = merge_args(external, &owner_repo, &head_sha);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                gh(&args).map(drop).map_err(|e| e.to_string())
             }
         })
-        .await;
+        .await
+        .map_err(PrError::Gh)?;
+        // The checks are timed the moment they finish, not when the PR lands.
+        let observer = CiObserver {
+            store: self,
+            pr,
+            owner_repo: &owner_repo,
+            head_sha,
+        };
+        let watching = merge_watch::Observing::new(&github, &observer);
+        let outcome = merge_watch::watch(
+            &watching,
+            &merge_watch::SystemClock::new(),
+            before.removals,
+            expected,
+        )
+        .await?;
+        watching.tell_if_unheard().await;
         let now = jiff::Timestamp::now().to_string();
-        match state.as_deref() {
-            Ok("MERGED") => {
+        match outcome {
+            merge_watch::Outcome::Merged => {
                 self.db()?
-                    .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
+                    .update_pr(
+                        pr.id,
+                        PrState::Merged,
+                        Some(head_sha),
+                        None,
+                        Some(now.as_str()),
+                    )
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
-                self.pull_sync(&owner_repo).await;
+                close_linked_may_issue(
+                    self.db()?,
+                    &self.context.workspace_config,
+                    &resolved.record.repo_key,
+                    pr,
+                    self.project_for_record(&resolved.record),
+                )
+                .await;
+                self.record_queue_wait(pr).await;
+                self.task_event(
+                    pr,
+                    crate::harness::working_document::WorkEvent::PullRequestMerged,
+                );
+                let pull_sync = self.pull_sync(&resolved.record, &owner_repo).await;
+                if let Some(checkouts) = &self.context.checkouts
+                    && let Err(error) = checkouts.refresh_existing(&resolved.record.repo_key).await
+                {
+                    tracing::warn!(
+                        %error,
+                        repo = %resolved.record.repo_key,
+                        "failed to refresh daemon checkout after GitHub PR merged"
+                    );
+                }
                 let clone = self.retire_clone(resolved, head_sha).await?;
                 let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
                 Ok(PrMerged {
@@ -918,23 +1368,50 @@ impl PrStore {
                     clone_dir: resolved.record.dir.as_str(),
                     clone,
                     remote_branch,
+                    pull_sync,
                 }
                 .render()
                 .expect("the merge result renders"))
             }
-            Ok(other) => {
-                self.db()?
-                    .update_pr(pr.id, "closed", Some(head_sha), None, None)
-                    .await?;
-                self.event(pr, "closed", Some(other)).await;
-                Err(PrError::State(format!("upstream PR {other}")))
-            }
-            Err(reason) => {
-                self.db()?
-                    .update_pr(pr.id, "failed", Some(head_sha), None, None)
-                    .await?;
-                self.event(pr, "check_failed", Some(reason)).await;
-                Err(PrError::Gh(reason.clone()))
+            merge_watch::Outcome::Stopped(stopped) => {
+                let report = merge_watch::StoppedReport::new(pr.number, &stopped)
+                    .render()
+                    .expect("the watch report renders");
+                let report = report.trim_end().to_string();
+                match stopped {
+                    merge_watch::Stopped::Closed => {
+                        self.db()?
+                            .update_pr(pr.id, PrState::Closed, Some(head_sha), None, None)
+                            .await?;
+                        self.event(pr, "closed", Some(&report)).await;
+                        self.task_event(
+                            pr,
+                            crate::harness::working_document::WorkEvent::PullRequestClosed,
+                        );
+                        let _ = self.retire_closed_clone(resolved, Some(head_sha)).await;
+                        Err(PrError::State(report))
+                    }
+                    merge_watch::Stopped::CheckFailed(_) => {
+                        self.db()?
+                            .update_pr(pr.id, PrState::Failed, Some(head_sha), None, None)
+                            .await?;
+                        self.event(pr, "check_failed", Some(&report)).await;
+                        Err(PrError::CheckFailed(report))
+                    }
+                    merge_watch::Stopped::Removed(_) => {
+                        self.db()?
+                            .update_pr(pr.id, PrState::Failed, Some(head_sha), None, None)
+                            .await?;
+                        self.event(pr, "removed_from_queue", Some(&report)).await;
+                        Err(PrError::State(report))
+                    }
+                    merge_watch::Stopped::TimedOut { .. } => {
+                        // Still queued: the state stays as it is, and
+                        // `pr merge` watches it again.
+                        self.event(pr, "watch_timeout", Some(&report)).await;
+                        Err(PrError::State(report))
+                    }
+                }
             }
         }
     }
@@ -942,76 +1419,34 @@ impl PrStore {
     /// Close the upstream pull request through the REST API, authenticated
     /// with the `gh` login's token.
     async fn close_github(&self, owner_repo: &str, external: i64) -> Result<(), PrError> {
-        let api = &self.context.github_api;
-        let url = format!("{}/repos/{owner_repo}/pulls/{external}", api.api_base());
-        api.request(
-            zenwave::Method::PATCH,
-            url,
-            Some(serde_json::json!({ "state": "closed" })),
-        )
-        .await
-        .map_err(|error| match error {
-            IssueError::NotFound(_) => {
-                PrError::Gh(format!("close PR #{external}: not found on {owner_repo}"))
-            }
-            other => PrError::Gh(format!("close PR #{external}: {other}")),
-        })?;
-        Ok(())
+        close_github_api(&self.context.github_api, owner_repo, external).await
     }
 
     /// Delete a merged PR's `may/*` branch on GitHub. A branch already gone
     /// (the repository deletes head branches on merge) counts as deleted;
     /// any other failure is reported, since the merge itself has landed.
     async fn delete_remote_branch(&self, owner_repo: &str, branch: &str) -> RemoteBranch {
-        if !branch.starts_with("may/") {
-            return RemoteBranch::NotDeleted(
-                branch.to_string(),
-                "only may/* branches are the session's to delete".to_string(),
-            );
-        }
-        let api = &self.context.github_api;
-        let url = format!(
-            "{}/repos/{owner_repo}/git/refs/heads/{branch}",
-            api.api_base()
-        );
-        match api
-            .request_unchecked(zenwave::Method::DELETE, url, None)
-            .await
-        {
-            // 404 and 422 ("Reference does not exist"): already deleted.
-            Ok(response) if response.status().is_success() => {
-                RemoteBranch::Deleted(branch.to_string())
-            }
-            Ok(response) if matches!(response.status().as_u16(), 404 | 422) => {
-                RemoteBranch::Deleted(branch.to_string())
-            }
-            Ok(response) => RemoteBranch::NotDeleted(
-                branch.to_string(),
-                format!("GitHub answered {}", response.status()),
-            ),
-            Err(error) => RemoteBranch::NotDeleted(branch.to_string(), error.to_string()),
-        }
+        delete_remote_branch_api(&self.context.github_api, owner_repo, branch).await
     }
 
-    /// Best-effort `git pull --ff-only` on the cwd's checkout when it
-    /// tracks the merged remote — a sync target, never a blocker.
-    async fn pull_sync(&self, owner_repo: &str) {
-        let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd) else {
-            return;
+    /// Best-effort `git pull --ff-only` on every local checkout recorded
+    /// for the merged repository — sync targets, never blockers.
+    /// `[[projects]] pr.pull_sync = false` turns it off. What happened to
+    /// each checkout is returned for the merge report.
+    async fn pull_sync(&self, record: &CloneRecord, owner_repo: &str) -> Vec<SyncedCheckout> {
+        let disabled = self
+            .project_for_record(record)
+            .is_some_and(|project| !project.pr.pulls_after_merge());
+        let Some(db) = self.context.db.as_ref().filter(|_| !disabled) else {
+            return Vec::new();
         };
-        let owner_repo = owner_repo.to_string();
-        let host = self.context.signing.host().clone();
-        let synced = blocking::unblock(move || {
-            let url = host_git(&host, Some(&worktree), &["remote", "get-url", "origin"]).ok()?;
-            if github_owner_repo(&url).as_deref() != Some(owner_repo.as_str()) {
-                return None;
-            }
-            host_git(&host, Some(&worktree), &["pull", "--ff-only"]).ok()
-        })
-        .await;
-        if synced.is_none() {
-            tracing::warn!("post-merge pull sync skipped or failed");
-        }
+        let checkouts = pull_sync::recorded_checkouts(db, owner_repo).await;
+        pull_sync::sync(
+            self.context.signing.host(),
+            checkouts,
+            pull_sync::PULL_TIMEOUT,
+        )
+        .await
     }
 
     fn check_command(&self, record: &CloneRecord) -> Option<String> {
@@ -1022,7 +1457,11 @@ impl PrStore {
     }
 
     async fn base_sha(&self, resolved: &Resolved) -> Result<String, PrError> {
-        if resolved.record.local {
+        if let Some(base) = &resolved.record.base_sha {
+            // The clone was based on its checkout's work in progress: the
+            // session's work starts after that commit.
+            Ok(base.clone())
+        } else if resolved.record.local {
             blocking::unblock({
                 let src = resolved.record.source.clone();
                 let host = self.context.signing.host().clone();
@@ -1144,7 +1583,14 @@ impl PrStore {
         .render()
         .expect("the check clone script renders");
         let result = match self.sandbox.run(root, &prepare).await {
-            Ok(_) => self.sandbox.run(&root.join(&target), cmd).await.map(drop),
+            Ok(_) => {
+                let started = jiff::Timestamp::now();
+                let clock = std::time::Instant::now();
+                let ran = self.sandbox.run(&root.join(&target), cmd).await.map(drop);
+                self.observe_local_check(pr, sha, cmd, started, clock.elapsed(), ran.is_ok())
+                    .await;
+                ran
+            }
             Err(error) => Err(error),
         }
         .map_err(|e| e.to_string());
@@ -1171,6 +1617,50 @@ impl PrStore {
             Ok(CloneFate::Deleted)
         } else {
             Ok(CloneFate::Kept)
+        }
+    }
+
+    /// After closing a PR, delete its workspace when the directory is missing
+    /// or holds no uncommitted work beyond the PR commit.
+    async fn retire_closed_clone(
+        &self,
+        resolved: &Resolved,
+        pinned: Option<&str>,
+    ) -> Result<CloneFate, PrError> {
+        if !resolved.dir.exists() {
+            self.repos()?.delete_clone(&resolved.record.dir).await?;
+            return Ok(CloneFate::Deleted);
+        }
+        let clean = uncommitted_changes(&self.sandbox, &resolved.dir)
+            .await?
+            .is_empty();
+        let same = match pinned {
+            Some(sha) if sha != "base" => self.head_sha(resolved).await? == sha,
+            _ => true,
+        };
+        if clean && same {
+            self.repos()?.delete_clone(&resolved.record.dir).await?;
+            Ok(CloneFate::Deleted)
+        } else {
+            Ok(CloneFate::Kept)
+        }
+    }
+
+    /// Records on the `tasks.md` inbox that `pr` changed state as `change`
+    /// says.
+    fn task_event(
+        &self,
+        pr: &crate::db::PrRow,
+        change: fn(
+            crate::harness::working_document::WorkRef,
+        ) -> crate::harness::working_document::WorkEvent,
+    ) {
+        if let Some(events) = &self.context.task_events
+            && let Ok(number) = u64::try_from(pr.number)
+        {
+            events.record(change(
+                crate::harness::working_document::WorkRef::pull_request(number),
+            ));
         }
     }
 
@@ -1202,13 +1692,729 @@ impl PrStore {
             .map(|c| c.dir.as_str().to_string()))
     }
 
-    async fn event(&self, pr: &crate::db::PrRow, kind: &str, detail: Option<&str>) {
-        if let Some(db) = self.context.db.as_ref() {
-            let _ = db
-                .add_pr_event(pr.id, kind, &self.context.session_id, "main", None, detail)
-                .await;
+    fn notify_prs(&self, session_id: &str) {
+        if let Some(bus) = self
+            .context
+            .ui_events
+            .as_ref()
+            .or_else(|| self.context.ci.as_ref().map(|watch| &watch.ui_events))
+        {
+            notify_prs_bus(bus, session_id);
         }
     }
+
+    async fn event(&self, pr: &crate::db::PrRow, kind: &str, detail: Option<&str>) {
+        if let Some(db) = self.context.db.as_ref() {
+            let message_id = db
+                .max_message_id(&self.context.session_id)
+                .await
+                .ok()
+                .flatten();
+            let _ = db
+                .add_pr_event(
+                    pr.id,
+                    kind,
+                    &self.context.session_id,
+                    "main",
+                    message_id,
+                    detail,
+                )
+                .await;
+        }
+        self.notify_prs(&pr.session_id);
+    }
+
+    /// The `[ci]` thresholds as they are now. `None` when the session keeps
+    /// no CI durations or its config cannot be read, which is reported.
+    async fn ci_limits(&self) -> Option<(&CiWatch, crate::ci::timing::Limits)> {
+        let watch = self.context.ci.as_ref()?;
+        match crate::config::MayConfig::load_from(&watch.may_dir.join("config.toml")).await {
+            Ok(config) => Some((watch, config.ci.into())),
+            Err(error) => {
+                tracing::error!(%error, "the [ci] settings could not be read, so this PR's CI durations are not recorded");
+                None
+            }
+        }
+    }
+
+    /// Records the GitHub checks of `head_sha` and warns the user about an
+    /// abnormally long job. A recording failure is reported, never fatal: the
+    /// PR lands or fails on its checks, not on their timing.
+    async fn observe_github_checks(&self, pr: &crate::db::PrRow, owner_repo: &str, head_sha: &str) {
+        let (Some((watch, limits)), Ok(db), Some(external)) =
+            (self.ci_limits().await, self.db(), pr.external_number)
+        else {
+            return;
+        };
+        let actions = crate::ci::github::GhActions::new(owner_repo, external);
+        let recorder = crate::ci::record::Recorder {
+            db,
+            actions: &actions,
+            limits,
+        };
+        match recorder.observe_github(pr, head_sha).await {
+            Ok(Some(_)) => {
+                watch.ui_events.publish_session_change(
+                    &pr.session_id,
+                    crate::daemon::session_events::SessionChange::Warning,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, pr = pr.number, "recording the PR's CI durations failed");
+            }
+        }
+    }
+
+    /// Records a local check that took `duration` and warns the user when it
+    /// ran abnormally long.
+    async fn observe_local_check(
+        &self,
+        pr: &crate::db::PrRow,
+        head_sha: &str,
+        command: &str,
+        started: jiff::Timestamp,
+        duration: std::time::Duration,
+        success: bool,
+    ) {
+        let (Some((watch, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
+            return;
+        };
+        let recorder = crate::ci::record::Recorder {
+            db,
+            actions: &(),
+            limits,
+        };
+        match recorder
+            .observe_local(pr, head_sha, command, started, duration, success)
+            .await
+        {
+            Ok(Some(_)) => {
+                watch.ui_events.publish_session_change(
+                    &pr.session_id,
+                    crate::daemon::session_events::SessionChange::Warning,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, pr = pr.number, "recording the local check's duration failed");
+            }
+        }
+    }
+
+    /// Records the PR's merge-queue wait against its run time.
+    async fn record_queue_wait(&self, pr: &crate::db::PrRow) {
+        let (Some((_, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
+            return;
+        };
+        let recorder = crate::ci::record::Recorder {
+            db,
+            actions: &(),
+            limits,
+        };
+        if let Err(error) = recorder.record_queue_wait(pr).await {
+            tracing::error!(%error, pr = pr.number, "recording the merge-queue wait failed");
+        }
+    }
+}
+
+/// Announces to live Web UI and TUI subscribers that PR lists may have changed.
+pub(crate) fn notify_prs_bus(bus: &crate::ui_event_bus::UiEventBus, session_id: &str) {
+    bus.publish(crate::ui_event_bus::UiEventTopics::PRS);
+    if !session_id.is_empty() {
+        bus.publish_session_change(
+            session_id,
+            crate::daemon::session_events::SessionChange::Prs,
+        );
+    }
+}
+
+/// Whether the repository configuration requires explicit user review before
+/// merging PRs from this backend/repository.
+#[must_use]
+pub(crate) fn pr_requires_review(
+    workspace: &crate::workspace::WorkspaceConfig,
+    backend: &str,
+    repo_key: &str,
+) -> bool {
+    workspace
+        .projects
+        .iter()
+        .find(|project| {
+            if backend == "github" {
+                github_owner_repo(repo_key)
+                    == project
+                        .github_repository()
+                        .map(|repo| format!("{}/{}", repo.owner(), repo.repo()))
+            } else {
+                project.has_identity(Path::new(repo_key))
+            }
+        })
+        .is_some_and(|project| project.pr.require_review == Some(true))
+}
+
+/// Merge an orphaned PR (or one awaiting user review) directly on the host,
+/// attributing every recorded lifecycle event to `"user"`.
+///
+/// # Errors
+/// Fails when the DB is unavailable, the PR does not exist, belongs to an
+/// active session that does not require review, is already terminal, or the
+/// land/GitHub merge fails.
+pub async fn user_merge_pr(context: &PrContext, pr_id: i64) -> Result<crate::db::PrRow, PrError> {
+    let db = context
+        .db
+        .as_ref()
+        .ok_or_else(|| PrError::Resolve("pr requires the history database".to_string()))?;
+    let pr = db
+        .get_pr_by_id(pr_id)
+        .await?
+        .ok_or_else(|| PrError::State(format!("no PR with id {pr_id}")))?;
+    let repo_key = db
+        .repo_key_of_project(pr.project_id)
+        .await?
+        .ok_or_else(|| PrError::State(format!("PR #{} repository is missing", pr.number)))?;
+    let orphaned = !db.session_exists(&pr.session_id).await?;
+    let require_review = pr_requires_review(&context.workspace_config, &pr.backend, &repo_key);
+    if !orphaned && !require_review {
+        return Err(PrError::Ownership(format!(
+            "PR #{} belongs to active session {} — wait for it or delete the session first",
+            pr.number, pr.session_id
+        )));
+    }
+    if pr.state.is_terminal() {
+        return Err(PrError::State(format!(
+            "PR #{} is already {}",
+            pr.number, pr.state
+        )));
+    }
+    let head_sha = pr.head_sha.clone().ok_or_else(|| {
+        PrError::State(format!("PR #{} has no pinned commit to merge", pr.number))
+    })?;
+    let pr = db
+        .update_pr(pr.id, PrState::ChecksPending, Some(&head_sha), None, None)
+        .await?;
+    record_user_event(db, context, &pr, "checks_pending", None).await;
+    if pr.backend == "github" {
+        return user_merge_github(db, context, &pr, &repo_key, &head_sha).await;
+    }
+    let checkout = resolve_host_checkout(db, &context.workspace_config, &repo_key).await?;
+    let lock = context.land_locks.get(&repo_key);
+    record_user_event(db, context, &pr, "merging", None).await;
+    let result = blocking::unblock({
+        let refname = pr.branch.clone();
+        let base = pr.base_sha.clone();
+        let sha = head_sha.clone();
+        let number = pr.number;
+        let host = context.signing.host().clone();
+        let checkout = checkout.to_string_lossy().into_owned();
+        move || land(&host, &checkout, &refname, &base, &sha, number, &lock)
+    })
+    .await;
+    let now = jiff::Timestamp::now().to_string();
+    match result {
+        Ok(merge_sha) => {
+            let updated = db
+                .update_pr(
+                    pr.id,
+                    PrState::Merged,
+                    Some(&head_sha),
+                    Some(&merge_sha),
+                    Some(&now),
+                )
+                .await?;
+            record_user_event(db, context, &updated, "merged", Some(&merge_sha)).await;
+            close_linked_may_issue(db, &context.workspace_config, &repo_key, &updated, None).await;
+            Ok(updated)
+        }
+        Err(reason) => {
+            let updated = db
+                .update_pr(pr.id, PrState::Rejected, Some(&head_sha), None, None)
+                .await?;
+            record_user_event(db, context, &updated, "rejected", Some(&reason)).await;
+            Err(PrError::Rejected(reason))
+        }
+    }
+}
+
+/// Close an orphaned PR (or one awaiting user review) directly on the host,
+/// attributing the close event to `"user"`.
+///
+/// # Errors
+/// Fails when the DB is unavailable, the PR does not exist, belongs to an
+/// active session that does not require review, is already terminal, or
+/// GitHub rejects the close.
+pub async fn user_close_pr(context: &PrContext, pr_id: i64) -> Result<crate::db::PrRow, PrError> {
+    let db = context
+        .db
+        .as_ref()
+        .ok_or_else(|| PrError::Resolve("pr requires the history database".to_string()))?;
+    let pr = db
+        .get_pr_by_id(pr_id)
+        .await?
+        .ok_or_else(|| PrError::State(format!("no PR with id {pr_id}")))?;
+    let repo_key = db
+        .repo_key_of_project(pr.project_id)
+        .await?
+        .ok_or_else(|| PrError::State(format!("PR #{} repository is missing", pr.number)))?;
+    let orphaned = !db.session_exists(&pr.session_id).await?;
+    let require_review = pr_requires_review(&context.workspace_config, &pr.backend, &repo_key);
+    if !orphaned && !require_review {
+        return Err(PrError::Ownership(format!(
+            "PR #{} belongs to active session {} — close it from that session or delete the session first",
+            pr.number, pr.session_id
+        )));
+    }
+    if pr.state.is_terminal() {
+        return Err(PrError::State(format!(
+            "PR #{} is already {}",
+            pr.number, pr.state
+        )));
+    }
+    if pr.backend == "github" {
+        let owner_repo = github_owner_repo(&repo_key)
+            .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+        let external = pr
+            .external_number
+            .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
+        close_github_api(&context.github_api, &owner_repo, external).await?;
+    }
+    let updated = db.close_pr(pr.id).await?;
+    record_user_event(db, context, &updated, "closed", None).await;
+    if pr.backend == "may"
+        && let Ok(checkout) = resolve_host_checkout(db, &context.workspace_config, &repo_key).await
+    {
+        drop_ref(
+            context.signing.host(),
+            &checkout.to_string_lossy(),
+            &pr.branch,
+        )
+        .await;
+    }
+    Ok(updated)
+}
+
+struct NoopChecksObserver;
+
+impl merge_watch::ChecksObserver for NoopChecksObserver {
+    async fn finished(&self) {}
+}
+
+async fn user_merge_github(
+    db: &ChatDb,
+    context: &PrContext,
+    pr: &crate::db::PrRow,
+    repo_key: &str,
+    head_sha: &str,
+) -> Result<crate::db::PrRow, PrError> {
+    let owner_repo = github_owner_repo(repo_key)
+        .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+    let external = pr
+        .external_number
+        .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
+    let lock = context.land_locks.get(repo_key);
+    let github = merge_watch::GithubPr {
+        api: &context.github_api,
+        owner_repo: &owner_repo,
+        number: external,
+    };
+    let before = merge_watch::Upstream::snapshot(&github).await?;
+    ensure_head_pinned(external, head_sha, &before.head_sha)?;
+    let expected = merge_watch::Upstream::expected_checks(&github).await?;
+    record_user_event(db, context, pr, "queued", None).await;
+    blocking::unblock({
+        let owner_repo = owner_repo.clone();
+        let head_sha = head_sha.to_string();
+        move || -> Result<(), String> {
+            let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
+            let args = merge_args(external, &owner_repo, &head_sha);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            gh(&args).map(drop).map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(PrError::Gh)?;
+    let observer = NoopChecksObserver;
+    let watching = merge_watch::Observing::new(&github, &observer);
+    let outcome = merge_watch::watch(
+        &watching,
+        &merge_watch::SystemClock::new(),
+        before.removals,
+        expected,
+    )
+    .await?;
+    let now = jiff::Timestamp::now().to_string();
+    match outcome {
+        merge_watch::Outcome::Merged => {
+            let updated = db
+                .update_pr(
+                    pr.id,
+                    PrState::Merged,
+                    Some(head_sha),
+                    None,
+                    Some(now.as_str()),
+                )
+                .await?;
+            record_user_event(db, context, &updated, "merged", Some(head_sha)).await;
+            close_linked_may_issue(db, &context.workspace_config, repo_key, &updated, None).await;
+            let disabled = context
+                .workspace_config
+                .projects
+                .iter()
+                .find(|project| {
+                    project.github_repository().is_some_and(|repo| {
+                        format!("{}/{}", repo.owner(), repo.repo()) == owner_repo
+                    })
+                })
+                .is_some_and(|project| !project.pr.pulls_after_merge());
+            if !disabled {
+                let checkouts = pull_sync::recorded_checkouts(db, &owner_repo).await;
+                pull_sync::sync(context.signing.host(), checkouts, pull_sync::PULL_TIMEOUT).await;
+            }
+            if let Some(checkouts) = &context.checkouts
+                && let Err(error) = checkouts.refresh_existing(repo_key).await
+            {
+                tracing::warn!(
+                    %error,
+                    repo = %repo_key,
+                    "failed to refresh daemon checkout after user merged GitHub PR"
+                );
+            }
+            let _ = delete_remote_branch_api(&context.github_api, &owner_repo, &pr.branch).await;
+            Ok(updated)
+        }
+        merge_watch::Outcome::Stopped(stopped) => {
+            let report = merge_watch::StoppedReport::new(pr.number, &stopped)
+                .render()
+                .expect("the watch report renders");
+            let report = report.trim_end().to_string();
+            match stopped {
+                merge_watch::Stopped::Closed => {
+                    db.update_pr(pr.id, PrState::Closed, Some(head_sha), None, None)
+                        .await?;
+                    record_user_event(db, context, pr, "closed", Some(&report)).await;
+                    Err(PrError::State(report))
+                }
+                merge_watch::Stopped::CheckFailed(_) => {
+                    db.update_pr(pr.id, PrState::Failed, Some(head_sha), None, None)
+                        .await?;
+                    record_user_event(db, context, pr, "check_failed", Some(&report)).await;
+                    Err(PrError::CheckFailed(report))
+                }
+                merge_watch::Stopped::Removed(_) => {
+                    db.update_pr(pr.id, PrState::Failed, Some(head_sha), None, None)
+                        .await?;
+                    record_user_event(db, context, pr, "removed_from_queue", Some(&report)).await;
+                    Err(PrError::State(report))
+                }
+                merge_watch::Stopped::TimedOut { .. } => {
+                    record_user_event(db, context, pr, "watch_timeout", Some(&report)).await;
+                    Err(PrError::State(report))
+                }
+            }
+        }
+    }
+}
+
+async fn close_linked_may_issue(
+    db: &ChatDb,
+    workspace_config: &crate::workspace::WorkspaceConfig,
+    repo_key: &str,
+    pr: &crate::db::PrRow,
+    project: Option<&crate::workspace::ProjectConfig>,
+) {
+    let Some(issue_number) = pr.issue_number else {
+        return;
+    };
+    let uses_github_issues = project
+        .or_else(|| {
+            workspace_config.projects.iter().find(|p| {
+                p.has_identity(Path::new(repo_key))
+                    || github_owner_repo(repo_key)
+                        == p.github_repository()
+                            .map(|r| format!("{}/{}", r.owner(), r.repo()))
+            })
+        })
+        .is_some_and(|p| p.github_repository().is_some());
+    if uses_github_issues {
+        return;
+    }
+    let Ok(Some(_)) = db.get_issue(repo_key, issue_number).await else {
+        return;
+    };
+    let relation_note = format!("landed_by PR #{}", pr.number);
+    if let Err(error) = db
+        .add_issue_comment(repo_key, issue_number, &relation_note)
+        .await
+    {
+        tracing::warn!(
+            %error,
+            pr = pr.number,
+            issue = issue_number,
+            "failed to record landed_by comment on May issue"
+        );
+    }
+    if let Err(error) = db
+        .update_issue(
+            repo_key,
+            issue_number,
+            None,
+            None,
+            Some(crate::issue::IssueState::Closed),
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            pr = pr.number,
+            issue = issue_number,
+            "failed to close linked May issue on PR merge"
+        );
+    } else {
+        let _ = db
+            .add_pr_event(
+                pr.id,
+                "issue_closed",
+                &pr.session_id,
+                "pr",
+                None,
+                Some(&relation_note),
+            )
+            .await;
+    }
+}
+
+async fn record_user_event(
+    db: &ChatDb,
+    context: &PrContext,
+    pr: &crate::db::PrRow,
+    kind: &str,
+    detail: Option<&str>,
+) {
+    let _ = db
+        .add_pr_event(pr.id, kind, &pr.session_id, "user", None, detail)
+        .await;
+    if let Some(bus) = context
+        .ui_events
+        .as_ref()
+        .or_else(|| context.ci.as_ref().map(|watch| &watch.ui_events))
+    {
+        notify_prs_bus(bus, &pr.session_id);
+    }
+}
+
+async fn resolve_host_checkout(
+    db: &ChatDb,
+    workspace_config: &crate::workspace::WorkspaceConfig,
+    repo_key: &str,
+) -> Result<PathBuf, PrError> {
+    let target = Path::new(repo_key);
+    if target.file_name().is_some_and(|name| name == ".git")
+        && let Some(parent) = target.parent()
+        && parent.join(".git").exists()
+    {
+        return Ok(parent.to_path_buf());
+    }
+    if target.join(".git").exists() {
+        return Ok(target.to_path_buf());
+    }
+    for project in &workspace_config.projects {
+        if project.has_identity(target)
+            && let Some(path) = &project.path
+        {
+            let candidate = Path::new(path);
+            if candidate.exists() {
+                return Ok(candidate.to_path_buf());
+            }
+        }
+    }
+    if let Ok(usage) = db.repo_usage_since(0).await {
+        for entry in usage {
+            let candidate = entry.path();
+            if candidate.exists()
+                && crate::issue::repository_identity(&candidate)
+                    .is_ok_and(|identity| identity == target)
+            {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(PrError::Resolve(format!(
+        "no local checkout found on disk for repository {repo_key}"
+    )))
+}
+
+async fn close_github_api(
+    api: &GitHubRest<PrTokenSource>,
+    owner_repo: &str,
+    external: i64,
+) -> Result<(), PrError> {
+    let url = format!("{}/repos/{owner_repo}/pulls/{external}", api.api_base());
+    api.request(
+        zenwave::Method::PATCH,
+        url,
+        Some(serde_json::json!({ "state": "closed" })),
+    )
+    .await
+    .map_err(|error| match error {
+        IssueError::NotFound(_) => {
+            PrError::Gh(format!("close PR #{external}: not found on {owner_repo}"))
+        }
+        other => PrError::Gh(format!("close PR #{external}: {other}")),
+    })?;
+    Ok(())
+}
+
+async fn delete_remote_branch_api(
+    api: &GitHubRest<PrTokenSource>,
+    owner_repo: &str,
+    branch: &str,
+) -> RemoteBranch {
+    if !branch.starts_with("may/") {
+        return RemoteBranch::NotDeleted(
+            branch.to_string(),
+            "only may/* branches are the session's to delete".to_string(),
+        );
+    }
+    let url = format!(
+        "{}/repos/{owner_repo}/git/refs/heads/{branch}",
+        api.api_base()
+    );
+    match api
+        .request_unchecked(zenwave::Method::DELETE, url, None)
+        .await
+    {
+        Ok(response) if response.status().is_success() => RemoteBranch::Deleted(branch.to_string()),
+        Ok(response) if matches!(response.status().as_u16(), 404 | 422) => {
+            RemoteBranch::Deleted(branch.to_string())
+        }
+        Ok(response) => RemoteBranch::NotDeleted(
+            branch.to_string(),
+            format!("GitHub answered {}", response.status()),
+        ),
+        Err(error) => RemoteBranch::NotDeleted(branch.to_string(), error.to_string()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PrOpenProvenance {
+    session_id: String,
+    agent_id: String,
+    message_id: Option<i64>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct PrListItemView {
+    number: i64,
+    state: PrState,
+    title: String,
+    external_number: Option<i64>,
+    merge_commit_sha: Option<String>,
+    orphaned: bool,
+    repo_key: String,
+    backend: String,
+    session_id: String,
+    opened: Option<PrOpenProvenance>,
+    checks: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "pr_list.txt", escape = "none")]
+struct PrListTemplate<'a> {
+    prs: &'a [PrListItemView],
+}
+
+struct PrEventView {
+    created_at: String,
+    kind: String,
+    agent_id: String,
+    session_id: String,
+    message_id: Option<i64>,
+    detail: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "pr_show.txt", escape = "none")]
+struct PrShowTemplate<'a> {
+    number: i64,
+    state: PrState,
+    title: &'a str,
+    external_number: Option<i64>,
+    repo_key: &'a str,
+    session_id: &'a str,
+    orphaned: bool,
+    backend: &'a str,
+    base_sha: &'a str,
+    head_sha: &'a str,
+    merge_commit_sha: Option<&'a str>,
+    opened: Option<&'a PrOpenProvenance>,
+    checks: Option<&'a str>,
+    detail: Option<&'a str>,
+    events: &'a [PrEventView],
+}
+
+fn pr_opened_provenance(events: &[crate::db::PrEventRow]) -> Option<PrOpenProvenance> {
+    events
+        .iter()
+        .find(|event| event.kind == "opened")
+        .or_else(|| events.first())
+        .map(|event| PrOpenProvenance {
+            session_id: event.session_id.clone(),
+            agent_id: event.agent_id.clone(),
+            message_id: event.message_id,
+            created_at: event.created_at.clone(),
+        })
+}
+
+fn pr_failure_detail(
+    events: &[crate::db::PrEventRow],
+    state: PrState,
+    check_state: Option<&crate::db::PrCheckState>,
+) -> Option<String> {
+    if matches!(state, PrState::Failed | PrState::Rejected)
+        && let Some(detail) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "rejected" | "check_failed" | "removed_from_queue"
+                ) && event.detail.as_ref().is_some_and(|d| !d.trim().is_empty())
+            })
+            .and_then(|event| event.detail.clone())
+    {
+        return Some(detail);
+    }
+    if state == PrState::Closed
+        && let Some(detail) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == "closed"
+                    && event.detail.as_ref().is_some_and(|d| !d.trim().is_empty())
+            })
+            .and_then(|event| event.detail.clone())
+    {
+        return Some(detail);
+    }
+    if check_state.is_some_and(|c| c.unreadable) {
+        return Some("latest GitHub check poll could not read check status".to_string());
+    }
+    None
+}
+
+fn format_cached_checks(check_state: Option<&crate::db::PrCheckState>) -> Option<String> {
+    let check_state = check_state?;
+    if check_state.unreadable {
+        return Some("unreadable".to_string());
+    }
+    let status = match check_state.rollup {
+        checks::Rollup::Pending => "pending",
+        checks::Rollup::Passed => "passed",
+        checks::Rollup::Failed => "failed",
+    };
+    Some(format!("{status} ({})", check_state.head_sha))
 }
 
 /// The remote branch of a GitHub PR, named from its session and the commit it
@@ -1364,13 +2570,35 @@ async fn drop_ref(host: &HostGit, checkout: &str, refname: &str) {
     .await;
 }
 
-/// The serialized land of the PR's pinned commit `sha`: merge-tree
-/// preflight, checkout-overlap check, merge, then the ref is dropped. Runs
-/// inside `blocking::unblock` under the per-repo lock.
+/// One entry of `git status --porcelain=v1 -z`: two status letters, a space
+/// and the path.
+struct PorcelainStatus<'a> {
+    /// The entry renames or copies a path; the next entry is its origin.
+    renamed: bool,
+    path: &'a str,
+}
+
+impl<'a> PorcelainStatus<'a> {
+    fn parse(entry: &'a str) -> Self {
+        let mut chars = entry.chars();
+        let (index, worktree) = (chars.next(), chars.next());
+        let separator = chars.next();
+        assert_eq!(separator, Some(' '), "porcelain entry {entry:?}");
+        Self {
+            renamed: matches!(index, Some('R' | 'C')) || matches!(worktree, Some('R' | 'C')),
+            path: chars.as_str(),
+        }
+    }
+}
+
+/// The serialized land of the PR's pinned commit `sha`, whose work starts at
+/// `base`: merge-tree preflight, checkout-overlap check, merge, then the ref
+/// is dropped. Runs inside `blocking::unblock` under the per-repo lock.
 fn land(
     host: &HostGit,
     checkout: &str,
     refname: &str,
+    base: &str,
     sha: &str,
     number: i64,
     lock: &Mutex<()>,
@@ -1397,15 +2625,30 @@ fn land(
         Err(err) => return Err(format!("merge conflicts: {err}")),
     }
     // Do not overwrite the user's uncommitted files: dirty checkout paths
-    // must not intersect the PR's touched paths.
-    let dirty = git(Some(checkout_path), &["status", "--porcelain"])
-        .map_err(|e| e.to_string())?
-        .lines()
-        .map(|l| l[3..].trim().to_string())
-        .collect::<std::collections::HashSet<_>>();
+    // must not intersect the paths the PR's own work touched. A clone based
+    // on the checkout's work in progress holds those files in its base
+    // commit, so the diff starts at the PR's base, not at the checkout's HEAD.
+    let dirty = git(
+        Some(checkout_path),
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .map_err(|e| e.to_string())?
+    .split('\0')
+    .filter(|entry| !entry.is_empty())
+    .scan(false, |skip_origin, entry| {
+        // A rename lists its origin as a bare path entry after the entry.
+        if std::mem::take(skip_origin) {
+            return Some(None);
+        }
+        let status = PorcelainStatus::parse(entry);
+        *skip_origin = status.renamed;
+        Some(Some(status.path.to_string()))
+    })
+    .flatten()
+    .collect::<std::collections::HashSet<_>>();
     let touched = git(
         Some(checkout_path),
-        &["diff", "--name-only", &format!("{head}..{sha}")],
+        &["diff", "--name-only", &format!("{base}..{sha}")],
     )
     .map_err(|e| e.to_string())?
     .lines()
@@ -1458,6 +2701,40 @@ impl std::fmt::Display for ShellWord {
     }
 }
 
+/// One commit's short hash and raw message parsed from `pr_commit_messages.sh`.
+struct OwnedCommit {
+    short_sha: String,
+    message: String,
+}
+
+impl OwnedCommit {
+    fn as_ref(&self) -> crate::harness::publish_review::CommitMessage<'_> {
+        crate::harness::publish_review::CommitMessage {
+            short_sha: &self.short_sha,
+            message: &self.message,
+        }
+    }
+}
+
+fn parse_commit_messages(output: &str) -> Vec<OwnedCommit> {
+    output
+        .split('\0')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (short_sha, message) = entry
+                .split_once('\n')
+                .map_or((entry, ""), |(sha, msg)| (sha.trim(), msg.trim()));
+            Some(OwnedCommit {
+                short_sha: short_sha.to_string(),
+                message: message.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// The body of a PR opened by `pr open`: its commit subjects and, for a
 /// GitHub-backed project, the issue it closes.
 #[derive(Template)]
@@ -1478,6 +2755,8 @@ struct PrMerged<'a> {
     clone_dir: &'a str,
     clone: CloneFate,
     remote_branch: RemoteBranch,
+    /// What became of each local checkout's post-merge pull.
+    pull_sync: Vec<SyncedCheckout>,
 }
 
 /// What became of the session clone a PR landed from.
@@ -1546,6 +2825,15 @@ struct CommitSubjects {
     head: ShellWord,
 }
 
+/// Prints the short hashes and raw commit messages `base..head`, oldest first,
+/// NUL-separated; run in the session clone.
+#[derive(Template)]
+#[template(path = "pr_commit_messages.sh", escape = "none")]
+struct CommitMessages {
+    base: ShellWord,
+    head: ShellWord,
+}
+
 /// Removes a check's checkout; run in the session root.
 #[derive(Template)]
 #[template(path = "pr_check_remove.sh", escape = "none")]
@@ -1554,7 +2842,7 @@ struct RemoveCheckClone {
 }
 
 /// `gh` with the same error contract as [`git`].
-fn gh(args: &[&str]) -> Result<String, PrError> {
+pub(crate) fn gh(args: &[&str]) -> Result<String, PrError> {
     let output = std::process::Command::new("gh")
         .args(args)
         .output()
@@ -1568,7 +2856,7 @@ fn gh(args: &[&str]) -> Result<String, PrError> {
 }
 
 /// `owner/repo` from a GitHub remote URL (https or ssh), or `None`.
-fn github_owner_repo(url: &str) -> Option<String> {
+pub(crate) fn github_owner_repo(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches(".git");
     let tail = url
         .strip_prefix("https://github.com/")
@@ -1579,35 +2867,34 @@ fn github_owner_repo(url: &str) -> Option<String> {
     Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
 
-/// Screen published text through the fast model: `true` publishes. The
-/// registration site wraps this in the session's screen closure.
-///
-/// # Errors
-/// Returns the model's error as a string when the call fails.
-pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
-    llm: &LLM,
-    title: &str,
-    body: &str,
-) -> Result<bool, String> {
-    use aither_core::llm::{Event, oneshot};
-    use futures_lite::StreamExt;
-    let input = format!("TITLE: {title}\n\n{body}");
-    let mut stream = Box::pin(llm.respond(oneshot(SCREEN_PROMPT, &input)));
-    let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(Event::Text(chunk)) => text.push_str(&chunk),
-            Ok(_) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(!text.trim_start().to_ascii_uppercase().starts_with("BLOCK"))
+/// The `gh pr merge` arguments of a merge that names the commit it checked:
+/// GitHub refuses it when the PR's head is any other commit.
+fn merge_args(number: i64, owner_repo: &str, head_sha: &str) -> Vec<String> {
+    [
+        "pr",
+        "merge",
+        &number.to_string(),
+        "--repo",
+        owner_repo,
+        "--auto",
+        "--squash",
+        "--match-head-commit",
+        head_sha,
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
-const SCREEN_PROMPT: &str = "You screen pull request text before it is published to GitHub. \
-The project tracks issues and plans in an internal tool — published text must not mention \
-'may', internal issue numbers, agent or session details, or local filesystem paths. \
-Reply with exactly ALLOW if the text is safe to publish, or BLOCK: <one-line reason>.";
+/// Fails when the PR's head on GitHub is not the commit pinned at `pr update`.
+fn ensure_head_pinned(number: i64, pinned: &str, upstream: &str) -> Result<(), PrError> {
+    if pinned == upstream {
+        return Ok(());
+    }
+    Err(PrError::State(format!(
+        "PR #{number}'s head moved: GitHub holds {upstream}, the checked commit is {pinned} — \
+         run `pr update {number}` to pin the current head and check it again"
+    )))
+}
 
 /// `git` on the host through `host`, with its stdout trimmed.
 fn host_git(
@@ -1629,11 +2916,12 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchState, GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch,
+        BranchState, GitHubRest, LandLocks, PrContext, PrStore, PrTokenSource, git, github_branch,
         github_owner_repo, host_git, push_pinned,
     };
     use crate::commit_signing::test_user::TestUser;
-    use crate::repo_clone::test_sandbox::TestTerminal;
+    use crate::db::{PrFilter, PrState};
+    use crate::repo_clone::test_sandbox::{TestTerminal, arm_hostile_config, markers};
     use crate::repo_clone::{CloneSandbox, SessionRepos};
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
     use hyper::body::Bytes;
@@ -1729,7 +3017,8 @@ mod tests {
             self.user.identify(&clone);
             let projects = checks
                 .map(|c| ProjectConfig {
-                    path: self.checkout.clone(),
+                    path: Some(self.checkout.clone()),
+                    repository: None,
                     issues: ProjectIssues::default(),
                     checks: Some(c.to_string()),
                     pr: ProjectPr::default(),
@@ -1747,10 +3036,15 @@ mod tests {
                         workdirs: Vec::new(),
                         projects,
                     },
-                    screen: None,
+                    review: None,
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
+                    checkouts: None,
+                    task_events: None,
+                    ci: None,
                     publish: None,
+                    ui_events: None,
                 },
                 self.sandbox(id).await,
             );
@@ -1759,7 +3053,7 @@ mod tests {
 
         /// A store whose only clone is a GitHub remote clone of `o/r`, with
         /// a GitHub-backed PR #1 (upstream #7) in `state`, and its API at `base`.
-        async fn github_store(&self, id: &str, base: &str, state: &str) -> PrStore {
+        async fn github_store(&self, id: &str, base: &str, state: PrState) -> PrStore {
             let url = "https://github.com/o/r.git";
             self.db
                 .insert_repo_clone(
@@ -1769,6 +3063,7 @@ mod tests {
                         dir: "r-00000000".to_string(),
                         source: url.to_string(),
                         local: false,
+                        base_sha: None,
                     },
                 )
                 .await
@@ -1789,7 +3084,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if state != "open" {
+            if state != PrState::Open {
                 self.db
                     .update_pr(pr.id, state, None, None, None)
                     .await
@@ -1806,19 +3101,24 @@ mod tests {
                         workdirs: Vec::new(),
                         projects: Vec::new(),
                     },
-                    screen: None,
+                    review: None,
                     signing: self.signing(id),
                     github_api: GitHubRest::with_api_base(
                         PrTokenSource::Fixed("test-token".to_string()),
                         base,
                     ),
+                    land_locks: LandLocks::default(),
+                    checkouts: None,
+                    task_events: None,
+                    ci: None,
                     publish: None,
+                    ui_events: None,
                 },
                 self.sandbox(id).await,
             )
         }
 
-        async fn pr_state(&self) -> String {
+        async fn pr_state(&self) -> PrState {
             self.db
                 .get_pr("https://github.com/o/r.git", 1)
                 .await
@@ -1853,8 +3153,7 @@ mod tests {
                             .to_string();
                         let body = http_body_util::BodyExt::collect(body)
                             .await
-                            .map(http_body_util::Collected::to_bytes)
-                            .unwrap_or_default();
+                            .map_or_default(http_body_util::Collected::to_bytes);
                         seen.lock().unwrap().push((
                             parts.method.to_string(),
                             parts.uri.path().to_string(),
@@ -1925,6 +3224,71 @@ mod tests {
         std::fs::write(dir.join(name), name).unwrap();
         git(Some(dir), &["add", "."]).unwrap();
         git(Some(dir), &["commit", "-m", name]).unwrap();
+    }
+
+    /// A PR whose clone started from the checkout's work in progress touches
+    /// the checkout's uncommitted files only through its base commit: the
+    /// overlap check compares the dirty files with the PR's own work.
+    #[test]
+    fn the_overlap_check_ignores_the_work_in_progress_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        git(Some(&repo), &["init", "-q", "-b", "main"]).unwrap();
+        git(Some(&repo), &["config", "user.name", "t"]).unwrap();
+        git(Some(&repo), &["config", "user.email", "t@t"]).unwrap();
+        git(Some(&repo), &["config", "commit.gpgsign", "false"]).unwrap();
+        commit_file(&repo, "a.txt");
+        git(Some(&repo), &["checkout", "-q", "-b", "side"]).unwrap();
+        std::fs::write(repo.join("wip.txt"), "wip").unwrap();
+        git(Some(&repo), &["add", "."]).unwrap();
+        git(Some(&repo), &["commit", "-qm", "wip"]).unwrap();
+        let base = git(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        commit_file(&repo, "work.txt");
+        let sha = git(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        git(Some(&repo), &["update-ref", "refs/may/pr/1", &sha]).unwrap();
+        git(Some(&repo), &["checkout", "-q", "main"]).unwrap();
+        // The checkout holds the same uncommitted file the base commit has.
+        std::fs::write(repo.join("wip.txt"), "wip").unwrap();
+
+        let host = crate::host_git::HostGit::from_file("/dev/null");
+        let lock = Mutex::new(());
+        let outcome = super::land(
+            &host,
+            repo.to_str().unwrap(),
+            "refs/may/pr/1",
+            &base,
+            &sha,
+            1,
+            &lock,
+        );
+        let error = outcome.unwrap_err();
+        assert!(
+            !error.contains("uncommitted changes in PR paths"),
+            "the base commit's files are not the PR's: {error}"
+        );
+
+        std::fs::write(repo.join("work.txt"), "dirty").unwrap();
+        let overlap = super::land(
+            &host,
+            repo.to_str().unwrap(),
+            "refs/may/pr/1",
+            &base,
+            &sha,
+            1,
+            &lock,
+        )
+        .unwrap_err();
+        assert!(overlap.contains("work.txt"), "{overlap}");
+    }
+
+    #[test]
+    fn a_porcelain_entry_splits_into_its_status_and_path() {
+        let entry = super::PorcelainStatus::parse("R  new name.txt");
+        assert!(entry.renamed);
+        assert_eq!(entry.path, "new name.txt");
+        let entry = super::PorcelainStatus::parse("?? 文件/日本語.txt");
+        assert!(!entry.renamed);
+        assert_eq!(entry.path, "文件/日本語.txt");
     }
 
     /// Without `--title`, a single commit titles the PR and is its body.
@@ -2067,6 +3431,42 @@ mod tests {
         assert!(clone.join("late.txt").exists());
     }
 
+    /// A PR the session opens and closes reaches its `tasks.md` inbox, and
+    /// the row naming it is told of each change once.
+    #[tokio::test]
+    async fn an_opened_and_closed_pr_reaches_the_tasks_inbox() {
+        use aither_agent::{ContextSource, Moment};
+
+        let fx = Fixture::new().await;
+        let (mut store, clone) = fx.store("s1", None).await;
+        let events = crate::harness::working_document::WorkEvents::new();
+        store.context.task_events = Some(events.clone());
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("tasks.md"),
+            "## Doing\n- #3 work, PR #1 open\n",
+        )
+        .unwrap();
+        let mut tasks = crate::tasks_md::schema::working_document(sandbox.path(), events);
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+
+        commit_file(&clone, "work.txt");
+        store.open(None, Some("work"), None, true).await.unwrap();
+        store.close(1, None).await.unwrap();
+
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+        let alert = tasks
+            .blocks(Moment::ToolTurnEnd)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row is told");
+        let text = alert.block().content();
+        // The row naming PR #1 already records its opening.
+        assert_eq!(text.matches("PR #1 was opened").count(), 0, "{text}");
+        assert_eq!(text.matches("PR #1 was closed").count(), 1, "{text}");
+    }
+
     #[tokio::test]
     async fn close_drops_the_ref() {
         let fx = Fixture::new().await;
@@ -2087,7 +3487,7 @@ mod tests {
     async fn closing_a_github_pr_patches_upstream_then_records_closed() {
         let fx = Fixture::new().await;
         let (base, requests) = mock_api(200).await;
-        let store = fx.github_store("s1", &base, "open").await;
+        let store = fx.github_store("s1", &base, PrState::Open).await;
         store.close(1, None).await.unwrap();
         let seen = requests.lock().unwrap().clone();
         assert_eq!(
@@ -2099,28 +3499,28 @@ mod tests {
                 "{\"state\":\"closed\"}".to_string(),
             )]
         );
-        assert_eq!(fx.pr_state().await, "closed");
+        assert_eq!(fx.pr_state().await, PrState::Closed);
     }
 
     #[tokio::test]
     async fn a_failed_upstream_close_leaves_the_row_unchanged() {
         let fx = Fixture::new().await;
         let (base, requests) = mock_api(422).await;
-        let store = fx.github_store("s1", &base, "open").await;
+        let store = fx.github_store("s1", &base, PrState::Open).await;
         let err = store.close(1, None).await.unwrap_err();
         assert!(err.to_string().contains("422"), "{err}");
         assert_eq!(requests.lock().unwrap().len(), 1);
-        assert_eq!(fx.pr_state().await, "open");
+        assert_eq!(fx.pr_state().await, PrState::Open);
     }
 
     #[tokio::test]
     async fn a_merged_or_closed_github_pr_cannot_be_closed_again() {
-        for state in ["merged", "closed"] {
+        for state in [PrState::Merged, PrState::Closed] {
             let fx = Fixture::new().await;
             let (base, requests) = mock_api(200).await;
             let store = fx.github_store("s1", &base, state).await;
             let err = store.close(1, None).await.unwrap_err();
-            assert!(err.to_string().contains(state), "{err}");
+            assert!(err.to_string().contains(state.as_str()), "{err}");
             assert!(requests.lock().unwrap().is_empty());
             assert_eq!(fx.pr_state().await, state);
         }
@@ -2135,13 +3535,13 @@ mod tests {
         let key = fx.repo_key.to_str().unwrap();
         let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
         fx.db
-            .update_pr(pr.id, "merged", None, None, None)
+            .update_pr(pr.id, PrState::Merged, None, None, None)
             .await
             .unwrap();
         let err = store.close(1, None).await.unwrap_err();
         assert!(err.to_string().contains("merged"), "{err}");
         let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
-        assert_eq!(pr.state, "merged");
+        assert_eq!(pr.state, PrState::Merged);
         // The transition itself refuses too, not just `close`.
         assert!(matches!(
             fx.db.close_pr(pr.id).await,
@@ -2156,7 +3556,7 @@ mod tests {
         id: &str,
         workspace_config: WorkspaceConfig,
         github_api: GitHubRest<PrTokenSource>,
-        screen: Option<Arc<super::ScreenFn>>,
+        review: Option<crate::harness::publish_review::PublishReview>,
     ) -> PrStore {
         PrStore::new(
             PrContext {
@@ -2166,10 +3566,15 @@ mod tests {
                 scratch_root: fx.scratch_root(),
                 cwd: fx.checkout.clone(),
                 workspace_config,
-                screen,
+                review,
                 signing: fx.signing(id),
                 github_api,
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
                 publish: None,
+                ui_events: None,
             },
             fx.sandbox(id).await,
         )
@@ -2234,16 +3639,61 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn prs_only_finds_its_project_and_screens_without_a_github_issue_backend() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prs_only_finds_its_project_and_reviews_without_a_github_issue_backend() {
+        use aither_core::llm::{
+            Event, LLMRequest,
+            model::{Parameters, Profile},
+        };
+        use futures::Stream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct FixedModel {
+            reply: &'static str,
+            captured: Arc<Mutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[derive(Debug, thiserror::Error)]
+        #[error("fixed error")]
+        struct FixedErr;
+        impl aither_core::llm::Classify for FixedErr {
+            fn failure(&self) -> aither_core::llm::Failure {
+                aither_core::llm::Failure::permanent()
+            }
+        }
+        impl aither_core::LanguageModel for FixedModel {
+            type Error = FixedErr;
+            fn respond(
+                &self,
+                request: LLMRequest,
+            ) -> impl Stream<Item = Result<Event, FixedErr>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.captured.lock().unwrap().push(format!("{request:?}"));
+                let reply = self.reply.to_string();
+                futures_lite::stream::iter([Ok(Event::Text(reply))])
+            }
+            fn profile(
+                &self,
+            ) -> impl std::future::Future<Output = Result<Profile, FixedErr>> + Send {
+                std::future::ready(Ok(Profile::new("m", "t", "fast", "fast", 100_000)))
+            }
+        }
+
         let fx = Fixture::new().await;
-        let screened = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = screened.clone();
-        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, body: &str| {
-            seen.lock().unwrap().push(title.to_string());
-            seen.lock().unwrap().push(body.to_string());
-            Box::pin(async { Ok(false) })
-        });
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let review = crate::harness::publish_review::PublishReview::for_slot(
+            crate::agent::ModelSlot::new(
+                FixedModel {
+                    reply: r#"{"decision":"refuse","findings":["mentions internal workflow"]}"#,
+                    captured: captured.clone(),
+                    calls: calls.clone(),
+                },
+                Parameters::default(),
+            ),
+            crate::harness::publish_review::LocalEnvironment::empty(),
+        );
         add_github_origin(&fx);
         // A `prs-only` project as existing files carry it: no `repository`
         // key and no GitHub issue backend.
@@ -2266,7 +3716,7 @@ mod tests {
             "s1",
             config,
             PrContext::default_github_api(),
-            Some(screen),
+            Some(review),
         )
         .await;
         // Stand in for the network clone: an existing directory is adopted.
@@ -2286,15 +3736,255 @@ mod tests {
         let project = store.project_for_record(&resolved.record).unwrap();
         assert!(matches!(project.issues, ProjectIssues::May));
         assert_eq!(project.pr.screen, Some(true));
-        let verdict = store
-            .screen_outbound(&resolved.record, "a title", "- a subject\n")
+        let err = store
+            .review_outbound(crate::harness::publish_review::Publication::pull_request(
+                "a title",
+                "- a subject\n",
+                &[],
+            ))
+            .await
+            .expect_err("the review ran and withheld the text");
+        assert!(
+            err.to_string().contains("mentions internal workflow"),
+            "{err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let reqs = captured.lock().unwrap();
+        assert!(reqs[0].contains("a title") && reqs[0].contains("- a subject"));
+        drop(reqs);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_outbound_review_refuses_when_unwired() {
+        let fx = Fixture::new().await;
+        add_github_origin(&fx);
+        let config_path = fx.tmp.path().join("screen-workspace.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[projects]]\npath = {:?}\n\n[projects.pr]\nbackend = \"github\"\nscreen = true\n",
+                fx.checkout
+            ),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
+        let err = store
+            .review_outbound(crate::harness::publish_review::Publication::pull_request(
+                "a title",
+                "- a subject\n",
+                &[],
+            ))
+            .await
+            .expect_err("no wired review refuses");
+        assert!(matches!(err, super::PrError::Screened(_)), "{err}");
+    }
+
+    #[test]
+    fn a_merge_names_the_checked_commit_and_fails_when_the_head_moved() {
+        let args = super::merge_args(7, "o/r", "abc123");
+        assert_eq!(
+            args,
+            [
+                "pr",
+                "merge",
+                "7",
+                "--repo",
+                "o/r",
+                "--auto",
+                "--squash",
+                "--match-head-commit",
+                "abc123"
+            ]
+        );
+        assert!(super::ensure_head_pinned(7, "abc123", "abc123").is_ok());
+        let err = super::ensure_head_pinned(7, "abc123", "def456").unwrap_err();
+        assert!(matches!(err, super::PrError::State(_)), "{err}");
+        assert!(err.to_string().contains("head moved"), "{err}");
+    }
+
+    /// A store whose cwd is no repository at all, for session `id`.
+    async fn store_without_checkout(
+        fx: &Fixture,
+        id: &str,
+        workspace_config: WorkspaceConfig,
+    ) -> PrStore {
+        let elsewhere = fx.tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: id.to_string(),
+                session_root: fx.session_root(id),
+                scratch_root: fx.scratch_root(),
+                cwd: elsewhere,
+                workspace_config,
+                review: None,
+                signing: fx.signing(id),
+                github_api: PrContext::default_github_api(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+                ui_events: None,
+            },
+            fx.sandbox(id).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_github_bound_session_resolves_its_clone_with_no_checkout() {
+        let fx = Fixture::new().await;
+        let config_path = fx.tmp.path().join("remote-workspace.toml");
+        crate::trust::persist_github(&config_path, "o/r", crate::trust::TrustLevel::Full).unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        fx.db.create_session("s1", None, None).await.unwrap();
+        fx.db
+            .set_session_repo("s1", Some("github:o/r"))
             .await
             .unwrap();
-        assert!(verdict.is_some(), "the screen ran and withheld the text");
+        let store = store_without_checkout(&fx, "s1", config).await;
+        // Stand in for the network clone: an existing directory is adopted.
+        let seeded = store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(&seeded).unwrap();
+
+        let resolved = store.resolve(None).await.unwrap();
+
+        assert_eq!(resolved.dir, seeded);
+        assert!(!resolved.record.local);
         assert_eq!(
-            *screened.lock().unwrap(),
-            vec!["a title".to_string(), "- a subject\n".to_string()]
+            PrStore::backend_for(&resolved.record),
+            ("github", Some("o/r".to_string()))
         );
+        let project = store.project_for_record(&resolved.record).unwrap();
+        assert!(project.path.is_none(), "the project has no checkout");
+        assert!(matches!(project.issues, ProjectIssues::Github { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_without_a_checkout_cannot_resolve() {
+        let fx = Fixture::new().await;
+        fx.db.create_session("s1", None, None).await.unwrap();
+        let store = store_without_checkout(&fx, "s1", WorkspaceConfig::default()).await;
+        let Err(error) = store.resolve(None).await else {
+            panic!("resolved without a repository");
+        };
+        assert!(
+            error.to_string().contains("not inside a repository"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_several_clones_the_cwds_repository_is_chosen() {
+        let fx = Fixture::new().await;
+        add_github_origin(&fx);
+        let config = crate::trust::config_at(
+            fx.tmp.path(),
+            &fx.checkout,
+            crate::trust::TrustLevel::LocalBranch,
+        );
+        let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
+        let first = store.resolve(None).await.unwrap();
+        // A second clone, of another repository, joins the session.
+        let other = store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("x/y"));
+        std::fs::create_dir_all(&other).unwrap();
+        fx.db
+            .insert_repo_clone(
+                "s1",
+                &crate::db::RepoCloneRow {
+                    repo_key: "x/y".to_string(),
+                    dir: crate::repo_clone::CloneDir::for_repo_key("x/y")
+                        .as_str()
+                        .to_string(),
+                    source: "https://github.com/x/y.git".to_string(),
+                    local: false,
+                    base_sha: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let resolved = store.resolve(None).await.unwrap();
+
+        assert_eq!(resolved.dir, first.dir);
+        assert!(resolved.record.local);
+        let named = store.resolve(Some("x/y")).await.unwrap();
+        assert_eq!(named.dir, other);
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_the_may_backend_refuses_a_clone_of_the_remote() {
+        let fx = Fixture::new().await;
+        let record = crate::repo_clone::CloneRecord {
+            repo_key: "o/r".to_string(),
+            dir: crate::repo_clone::CloneDir::for_repo_key("o/r"),
+            source: "https://github.com/o/r.git".to_string(),
+            local: false,
+            base_sha: None,
+        };
+        let project = |backend: &str| WorkspaceConfig {
+            workdirs: Vec::new(),
+            projects: vec![ProjectConfig {
+                path: None,
+                repository: Some("o/r".parse().unwrap()),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: ProjectPr {
+                    backend: Some(backend.to_string()),
+                    ..ProjectPr::default()
+                },
+            }],
+        };
+        let pinned = store_without_checkout(&fx, "s1", project("may")).await;
+        assert!(pinned.check_pinned_backend(&record).is_err());
+        let github = store_without_checkout(&fx, "s2", project("github")).await;
+        assert!(github.check_pinned_backend(&record).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_project_turns_the_post_merge_pull_off() {
+        let fx = Fixture::new().await;
+        let record = crate::repo_clone::CloneRecord {
+            repo_key: "o/r".to_string(),
+            dir: crate::repo_clone::CloneDir::for_repo_key("o/r"),
+            source: "https://github.com/o/r.git".to_string(),
+            local: false,
+            base_sha: None,
+        };
+        let project = |pull_sync: Option<bool>| WorkspaceConfig {
+            workdirs: Vec::new(),
+            projects: vec![ProjectConfig {
+                path: None,
+                repository: Some("o/r".parse().unwrap()),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: ProjectPr {
+                    pull_sync,
+                    ..ProjectPr::default()
+                },
+            }],
+        };
+        // A recorded checkout of o/r whose pull would be visible if it ran.
+        let checkout = fx.tmp.path().join("recorded");
+        git(None, &["init", "-q", &checkout.to_string_lossy()]).unwrap();
+        git(
+            Some(&checkout),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        )
+        .unwrap();
+        fx.db.touch_repo_usage(&checkout).await.unwrap();
+
+        let off = store_without_checkout(&fx, "s1", project(Some(false))).await;
+        let synced = off.pull_sync(&record, "o/r").await;
+        assert_eq!(synced.len(), 0);
     }
 
     #[test]
@@ -2426,93 +4116,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
     }
 
-    /// Every executable setting a repository can carry for itself, set in
-    /// `clone` the way an agent writing it could: each runs a script that
-    /// touches `host/<name>` (outside the sandbox) and `ran/<name>` inside
-    /// the session, so a marker in `host/` means it ran on the host. Returns
-    /// the `host/` directory.
-    fn arm_hostile_config(session_root: &Path, clone: &Path, outside: &Path) -> PathBuf {
-        let host = outside.join("host");
-        let ran = session_root.join("ran");
-        let scripts = session_root.join("hostile");
-        let hooks = scripts.join("hooks");
-        for dir in [&host, &ran, &hooks] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        let script = |path: &Path, name: &str, tail: &str| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::write(
-                path,
-                format!(
-                    "#!/bin/sh\ntouch '{}/{name}' 2>/dev/null\ntouch '{}/{name}' 2>/dev/null\n{tail}\n",
-                    host.display(),
-                    ran.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        // Repository-local hooks, both where git looks by default and under
-        // `core.hooksPath`.
-        for hook in [
-            "pre-commit",
-            "prepare-commit-msg",
-            "commit-msg",
-            "post-commit",
-            "post-checkout",
-            "post-merge",
-            "pre-push",
-            "pre-receive",
-            "update",
-            "post-update",
-            "push-to-checkout",
-            "reference-transaction",
-            "pre-auto-gc",
-            "post-index-change",
-        ] {
-            script(&hooks.join(hook), hook, "exit 0");
-            script(&clone.join(".git/hooks").join(hook), hook, "exit 0");
-        }
-        let mut settings = vec![(
-            "core.hooksPath".to_string(),
-            hooks.to_string_lossy().into_owned(),
-        )];
-        for (key, tail) in [
-            // Answers "no fsmonitor data", so git falls back to a scan.
-            ("core.fsmonitor", "exit 1"),
-            ("filter.hostile.clean", "cat"),
-            ("filter.hostile.smudge", "cat"),
-            ("uploadpack.packObjectsHook", "exec \"$@\""),
-            ("core.sshCommand", "exit 1"),
-            ("core.alternateRefsCommand", "exit 0"),
-            ("credential.helper", "exit 0"),
-            ("core.pager", "cat"),
-            ("core.editor", "exit 0"),
-            ("diff.external", "exit 0"),
-            ("gpg.program", "exit 1"),
-        ] {
-            let path = scripts.join(key);
-            script(&path, key, tail);
-            settings.push((key.to_string(), path.to_string_lossy().into_owned()));
-        }
-        settings.push(("filter.hostile.required".to_string(), "true".to_string()));
-        for (key, value) in settings {
-            git(Some(clone), &["config", &key, &value]).unwrap();
-        }
-        std::fs::write(clone.join(".gitattributes"), "* filter=hostile\n").unwrap();
-        host
-    }
-
-    /// Names of the markers in `dir`.
-    fn markers(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
     /// The agent arms its clone with every executable setting, commits in
     /// the sandbox, and `pr` checks, pins and lands the work: what the clone
     /// configures runs in the sandbox, never on the host.
@@ -2621,7 +4224,13 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("no signature"), "{error}");
-        assert!(store.list(None, None).await.unwrap().contains("no PRs"));
+        assert!(
+            store
+                .list(None, PrFilter::All)
+                .await
+                .unwrap()
+                .contains("no PRs")
+        );
         assert!(!fx.checkout.join("signed.txt").exists());
     }
 
@@ -2883,7 +4492,10 @@ mod tests {
         assert!(!fx.checkout.join("work.txt").exists(), "nothing landed");
         assert!(clone.join("notes.txt").exists(), "nothing was deleted");
         let key = fx.repo_key.to_str().unwrap();
-        assert_eq!(fx.db.get_pr(key, 1).await.unwrap().unwrap().state, "open");
+        assert_eq!(
+            fx.db.get_pr(key, 1).await.unwrap().unwrap().state,
+            PrState::Open
+        );
 
         git(Some(&clone), &["checkout", "--", "work.txt"]).unwrap();
         std::fs::remove_file(clone.join("notes.txt")).unwrap();
@@ -2914,7 +4526,7 @@ mod tests {
         ] {
             let fx = Fixture::new().await;
             let (base, requests) = mock_api(status).await;
-            let store = fx.github_store("s1", &base, "merged").await;
+            let store = fx.github_store("s1", &base, PrState::Merged).await;
 
             assert_eq!(store.delete_remote_branch("o/r", "may/s").await, expected);
             assert_eq!(
@@ -2947,6 +4559,7 @@ mod tests {
                 clone_dir: "r-1a2b3c4d",
                 clone,
                 remote_branch,
+                pull_sync: Vec::new(),
             }
             .render()
             .unwrap()
@@ -2977,6 +4590,747 @@ mod tests {
                 super::RemoteBranch::Deleted("may/s".to_string())
             )
             .ends_with("The remote branch may/s was deleted.\n")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_prs_on_same_repo_open_land_and_retire_own_workspace() {
+        let fx = Fixture::new().await;
+        let config_file = fx.tmp.path().join("workspace.toml");
+        crate::trust::persist(
+            &config_file,
+            &fx.checkout,
+            None,
+            crate::trust::TrustLevel::LocalBranch,
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_file).unwrap();
+        let repos = SessionRepos::new(&fx.session_root("s1"), "s1", fx.db.clone());
+        let ws1 = repos
+            .request_clone_of(&fx.checkout, &config, &fx.scratch_root(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let ws2 = repos
+            .request_clone_of(&fx.checkout, &config, &fx.scratch_root(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ws1, ws2);
+        assert_eq!(fx.db.list_repo_clones("s1").await.unwrap().len(), 2);
+
+        fx.user.identify(&ws1);
+        fx.user.identify(&ws2);
+        commit_file(&ws1, "one.txt");
+        commit_file(&ws2, "two.txt");
+
+        let dir1 = ws1.file_name().unwrap().to_str().unwrap().to_string();
+        let dir2 = ws2.file_name().unwrap().to_str().unwrap().to_string();
+
+        let store = PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: "s1".to_string(),
+                session_root: fx.session_root("s1"),
+                scratch_root: fx.scratch_root(),
+                cwd: fx.checkout.clone(),
+                workspace_config: config,
+                review: None,
+                signing: fx.signing("s1"),
+                github_api: PrContext::default_github_api(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+                ui_events: None,
+            },
+            fx.sandbox("s1").await,
+        );
+
+        let r1 = store
+            .open(Some(&dir1), Some("pr one"), None, true)
+            .await
+            .unwrap();
+        assert!(r1.contains("PR #1"), "{r1}");
+        let r2 = store
+            .open(Some(&dir2), Some("pr two"), None, true)
+            .await
+            .unwrap();
+        assert!(r2.contains("PR #2"), "{r2}");
+
+        // Closing PR #1 deletes only ws1, leaving ws2 intact.
+        store.close(1, None).await.unwrap();
+        assert!(!ws1.exists());
+        assert!(ws2.exists());
+        assert_eq!(fx.db.list_repo_clones("s1").await.unwrap().len(), 1);
+
+        // Merging PR #2 lands two.txt and deletes ws2.
+        let merged = store.merge(2, None).await.unwrap();
+        assert!(merged.contains("merged PR #2"), "{merged}");
+        assert!(!ws2.exists());
+        assert!(fx.checkout.join("two.txt").exists());
+        assert!(!fx.checkout.join("one.txt").exists());
+        assert!(fx.db.list_repo_clones("s1").await.unwrap().is_empty());
+    }
+
+    fn mock_review(
+        reply: &str,
+        env: crate::harness::publish_review::LocalEnvironment,
+        credential: Option<(&str, &str)>,
+    ) -> (
+        crate::harness::publish_review::PublishReview,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        use aither_core::llm::{
+            Event, LLMRequest,
+            model::{Parameters, Profile},
+        };
+        use futures::Stream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct ScriptedPrModel {
+            reply: Arc<str>,
+            captured: Arc<Mutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[derive(Debug, thiserror::Error)]
+        #[error("scripted error")]
+        struct ScriptedErr;
+        impl aither_core::llm::Classify for ScriptedErr {
+            fn failure(&self) -> aither_core::llm::Failure {
+                aither_core::llm::Failure::permanent()
+            }
+        }
+        impl aither_core::LanguageModel for ScriptedPrModel {
+            type Error = ScriptedErr;
+            fn respond(
+                &self,
+                request: LLMRequest,
+            ) -> impl Stream<Item = Result<Event, ScriptedErr>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.captured.lock().unwrap().push(format!("{request:?}"));
+                let reply = self.reply.to_string();
+                futures_lite::stream::iter([Ok(Event::Text(reply))])
+            }
+            fn profile(
+                &self,
+            ) -> impl std::future::Future<Output = Result<Profile, ScriptedErr>> + Send
+            {
+                std::future::ready(Ok(Profile::new("m", "t", "fast", "fast", 100_000)))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut review = crate::harness::publish_review::PublishReview::for_slot(
+            crate::agent::ModelSlot::new(
+                ScriptedPrModel {
+                    reply: Arc::from(reply),
+                    captured: captured.clone(),
+                    calls: calls.clone(),
+                },
+                Parameters::default(),
+            ),
+            env,
+        );
+        if let Some((name, value)) = credential {
+            review = review.with_credential(name, value);
+        }
+        (review, calls, captured)
+    }
+
+    /// GitHub `pr open` reviews title, body, and commit messages before pushing,
+    /// and `pr update` reviews new commit messages and pushes only when clean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn github_pr_open_and_update_review_outbound_text() {
+        use std::sync::atomic::Ordering;
+
+        let secret = "provider-pr-secret-443322";
+        let fx = Fixture::new().await;
+        add_github_origin(&fx);
+        let config_path = fx.tmp.path().join("pr-review-workspace.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[projects]]\npath = {:?}\n\n[projects.pr]\nbackend = \"github\"\n",
+                fx.checkout
+            ),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        let env = crate::harness::publish_review::LocalEnvironment {
+            system_hosts: vec!["lexo-mbp.local".to_string()],
+            local_hosts: Vec::new(),
+            tailscale_hosts: Vec::new(),
+            home_dirs: vec![PathBuf::from("/Users/lexotest")],
+        };
+
+        // 1. `pr open` model refusal blocks before push and includes commit body.
+        let (refuse_review, refuse_calls, refuse_captured) = mock_review(
+            r#"{"decision":"refuse","findings":["remove session details from commit message"]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let open_store = trusted_store(
+            &fx,
+            "s-open",
+            config.clone(),
+            PrContext::default_github_api(),
+            Some(refuse_review),
+        )
+        .await;
+        let seeded = open_store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(seeded.parent().unwrap()).unwrap();
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                "--origin",
+                "upstream",
+                &fx.checkout.to_string_lossy(),
+                &seeded.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        identify(&seeded);
+        git(Some(&seeded), &["config", "commit.gpgsign", "false"]).unwrap();
+        git(
+            Some(&seeded),
+            &[
+                "update-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/master",
+            ],
+        )
+        .or_else(|_| {
+            git(
+                Some(&seeded),
+                &[
+                    "update-ref",
+                    "refs/remotes/upstream/HEAD",
+                    "refs/remotes/upstream/main",
+                ],
+            )
+        })
+        .unwrap();
+        std::fs::write(seeded.join("fix.txt"), "fix").unwrap();
+        git(Some(&seeded), &["add", "."]).unwrap();
+        git(
+            Some(&seeded),
+            &[
+                "commit",
+                "-m",
+                "Fix decoder bounds check",
+                "-m",
+                "In this session I traced the failure body.",
+            ],
+        )
+        .unwrap();
+
+        let err = open_store
+            .open(None, Some("Fix decoder bounds check"), None, true)
+            .await
+            .expect_err("model refusal stops github pr open");
+        assert!(
+            matches!(err, super::PrError::Screened(_))
+                && err
+                    .to_string()
+                    .contains("remove session details from commit message"),
+            "{err}"
+        );
+        assert_eq!(refuse_calls.load(Ordering::SeqCst), 1);
+        let sent = refuse_captured.lock().unwrap()[0].clone();
+        assert!(
+            sent.contains("In this session I traced the failure body."),
+            "commit body missing from fast-model review input: {sent}"
+        );
+        assert!(fx.db.get_pr("o/r", 1).await.unwrap().is_none());
+
+        // 2. `pr open` refuses home dir / host name / credential with 0 model calls.
+        let (pre_review, pre_calls, _) = mock_review(
+            r#"{"decision":"publish","findings":[]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let pre_store = trusted_store(
+            &fx,
+            "s-open",
+            config,
+            PrContext::default_github_api(),
+            Some(pre_review),
+        )
+        .await;
+        for bad_title in [
+            format!("Token {secret} leaked"),
+            "Crash on lexo-mbp.local".to_string(),
+            "Log from /Users/lexotest/may".to_string(),
+        ] {
+            let err = pre_store
+                .open(None, Some(&bad_title), None, true)
+                .await
+                .expect_err("precheck stops open without model call");
+            let msg = err.to_string();
+            assert!(matches!(err, super::PrError::Screened(_)), "{msg}");
+            assert!(!msg.contains(secret), "refusal echoed secret: {msg}");
+        }
+        assert_eq!(pre_calls.load(Ordering::SeqCst), 0);
+
+        // 3. `pr update` reviews new commits, blocks leaks/refusals, and pushes clean commits.
+        let remote = fx.tmp.path().join("update-remote.git");
+        let base_sha = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        seed_remote(&remote, &fx.checkout, &base_sha);
+        let session_root = fx.session_root("s-upd");
+        let update_clone = session_root.join("repos/r-upd");
+        std::fs::create_dir_all(update_clone.parent().unwrap()).unwrap();
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                &remote.to_string_lossy(),
+                &update_clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        fx.user.identify(&update_clone);
+        let sandbox = fx.signing_sandbox("s-upd").await;
+        std::fs::write(update_clone.join("one.txt"), "one").unwrap();
+        sandbox
+            .run(&update_clone, "git add . && git commit -m 'initial change'")
+            .await
+            .unwrap();
+        let first_sha = git(Some(&update_clone), &["rev-parse", "HEAD"]).unwrap();
+        let branch = "may/s-upd";
+        push_pinned(
+            &fx.scratch_root(),
+            &update_clone,
+            &remote.to_string_lossy(),
+            &first_sha,
+            branch,
+            BranchState::New,
+            range_of(&fx.signing("s-upd"), &base_sha),
+        )
+        .await
+        .unwrap();
+        let remote_url = remote.to_string_lossy().into_owned();
+        fx.db
+            .insert_repo_clone(
+                "s-upd",
+                &crate::db::RepoCloneRow {
+                    repo_key: "https://github.com/o/upd.git".to_string(),
+                    dir: "r-upd".to_string(),
+                    source: remote_url.clone(),
+                    local: false,
+                    base_sha: Some(base_sha.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let pr = fx
+            .db
+            .create_pr(
+                "https://github.com/o/upd.git",
+                "s-upd",
+                "Initial PR",
+                "",
+                branch,
+                &base_sha,
+                "github",
+                true,
+                None,
+                Some(12),
+            )
+            .await
+            .unwrap();
+        fx.db
+            .update_pr(pr.id, PrState::Open, Some(&first_sha), None, None)
+            .await
+            .unwrap();
+
+        let make_update_store = |review| {
+            PrStore::new(
+                PrContext {
+                    db: Some(fx.db.clone()),
+                    session_id: "s-upd".to_string(),
+                    session_root: fx.session_root("s-upd"),
+                    scratch_root: fx.scratch_root(),
+                    cwd: fx.tmp.path().to_path_buf(),
+                    workspace_config: WorkspaceConfig::default(),
+                    review: Some(review),
+                    signing: fx.signing("s-upd"),
+                    github_api: PrContext::default_github_api(),
+                    land_locks: LandLocks::default(),
+                    checkouts: None,
+                    task_events: None,
+                    ci: None,
+                    publish: None,
+                    ui_events: None,
+                },
+                sandbox.clone(),
+            )
+        };
+
+        // Add a clean commit -> passes review and pushes to remote.git.
+        std::fs::write(update_clone.join("two.txt"), "two").unwrap();
+        sandbox
+            .run(
+                &update_clone,
+                "git add . && git commit -m 'Handle empty header' -m 'Return explicit error.'",
+            )
+            .await
+            .unwrap();
+        let second_sha = git(Some(&update_clone), &["rev-parse", "HEAD"]).unwrap();
+        let (upd_pass, upd_pass_calls, upd_pass_captured) = mock_review(
+            r#"{"decision":"publish","findings":[]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        make_update_store(upd_pass)
+            .update(pr.number, None)
+            .await
+            .expect("clean commit updates PR");
+        assert_eq!(upd_pass_calls.load(Ordering::SeqCst), 1);
+        let upd_sent = upd_pass_captured.lock().unwrap()[0].clone();
+        assert!(
+            upd_sent.contains("Handle empty header") && upd_sent.contains("Return explicit error.")
+        );
+        assert!(!upd_sent.contains("initial change"));
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .unwrap(),
+            second_sha
+        );
+
+        // Add a commit with internal narration -> model refusal prevents push.
+        std::fs::write(update_clone.join("three.txt"), "three").unwrap();
+        sandbox
+            .run(
+                &update_clone,
+                "git add . && git commit -m 'Fix after agent retry'",
+            )
+            .await
+            .unwrap();
+        let (upd_refuse, upd_refuse_calls, _) = mock_review(
+            r#"{"decision":"refuse","findings":["remove agent retry mention"]}"#,
+            env.clone(),
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let err = make_update_store(upd_refuse)
+            .update(pr.number, None)
+            .await
+            .expect_err("model refusal stops update push");
+        assert!(
+            err.to_string().contains("remove agent retry mention"),
+            "{err}"
+        );
+        assert_eq!(upd_refuse_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .unwrap(),
+            second_sha
+        );
+
+        // Secret / host name / home dir in commit message stops before any model call.
+        git(
+            Some(&update_clone),
+            &[
+                "commit",
+                "--amend",
+                "-m",
+                &format!("Read {secret} from /Users/lexotest on lexo-mbp.local"),
+            ],
+        )
+        .unwrap();
+        let (upd_pre, upd_pre_calls, _) = mock_review(
+            r#"{"decision":"publish","findings":[]}"#,
+            env,
+            Some(("GITHUB_TOKEN", secret)),
+        );
+        let err = make_update_store(upd_pre)
+            .update(pr.number, None)
+            .await
+            .expect_err("precheck stops update before model call");
+        assert!(matches!(err, super::PrError::Screened(_)), "{err}");
+        assert!(!err.to_string().contains(secret), "{err}");
+        assert_eq!(upd_pre_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .unwrap(),
+            second_sha
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_list_and_show_surface_provenance_and_survive_clone_retirement() {
+        let fx = Fixture::new().await;
+        fx.db.create_session("s1", None, None).await.unwrap();
+        fx.db.create_session("s2", None, None).await.unwrap();
+
+        let (store1, clone1) = fx.store("s1", None).await;
+        let resolved1 = store1.resolve(None).await.unwrap();
+        fx.user.identify(&clone1);
+        commit_file(&clone1, "a.txt");
+        let open_out = store1
+            .open(None, Some("Feature A"), None, false)
+            .await
+            .unwrap();
+        assert!(open_out.contains("PR #1"));
+
+        let pr_row = fx
+            .db
+            .get_pr(resolved1.record.repo_key.as_str(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        fx.db
+            .update_pr(
+                pr_row.id,
+                PrState::Rejected,
+                pr_row.head_sha.as_deref(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        fx.db
+            .add_pr_event(
+                pr_row.id,
+                "rejected",
+                "s1",
+                "main",
+                None,
+                Some("merge conflict in file.txt"),
+            )
+            .await
+            .unwrap();
+
+        // Retire session 1's clone row and verify another session (s2) can still
+        // list and show the PR with full state, detail, repo key, and provenance.
+        fx.db
+            .delete_repo_clone("s1", resolved1.record.dir.as_str())
+            .await
+            .unwrap();
+
+        let (store2, _) = fx.store("s2", None).await;
+        let listed = store2.list(None, PrFilter::All).await.unwrap();
+        assert!(listed.contains("#1"), "{listed}");
+        assert!(listed.contains("Feature A"), "{listed}");
+        assert!(listed.contains("rejected"), "{listed}");
+
+        let shown = store2.show(1, None).await.unwrap();
+        assert!(shown.contains("Feature A"), "{shown}");
+        assert!(shown.contains("rejected"), "{shown}");
+        assert!(shown.contains("merge conflict in file.txt"), "{shown}");
+        assert!(shown.contains("s1"), "{shown}");
+        assert!(shown.contains("main"), "{shown}");
+        assert!(shown.contains(&resolved1.record.repo_key), "{shown}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn require_review_blocks_agent_merge_and_allows_user_merge_and_close() {
+        let fx = Fixture::new().await;
+        fx.db.create_session("s1", None, None).await.unwrap();
+        let bus = crate::ui_event_bus::UiEventBus::new();
+        let mut rx = bus.subscribe();
+
+        let root = fx.session_root("s1");
+        let clone = SessionRepos::new(&root, "s1", fx.db.clone())
+            .ensure_local_clone(&fx.checkout, &fx.repo_key, &fx.scratch_root())
+            .await
+            .unwrap();
+        fx.user.identify(&clone);
+
+        let project = ProjectConfig {
+            path: Some(fx.checkout.clone()),
+            repository: None,
+            issues: ProjectIssues::default(),
+            checks: None,
+            pr: ProjectPr {
+                auto_merge: Some(false),
+                require_review: Some(true),
+                ..ProjectPr::default()
+            },
+        };
+        let store = PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: "s1".to_string(),
+                session_root: root.clone(),
+                scratch_root: fx.scratch_root(),
+                cwd: fx.checkout.clone(),
+                workspace_config: WorkspaceConfig {
+                    workdirs: Vec::new(),
+                    projects: vec![project.clone()],
+                },
+                review: None,
+                signing: fx.signing("s1"),
+                github_api: PrContext::default_github_api(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+                ui_events: Some(bus.clone()),
+            },
+            fx.sandbox("s1").await,
+        );
+
+        commit_file(&clone, "feature1.txt");
+        store.open(None, Some("PR one"), None, false).await.unwrap();
+        let pr1 = fx
+            .db
+            .get_pr(&fx.repo_key.to_string_lossy(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!pr1.auto_merge);
+
+        let err = store
+            .merge(1, None)
+            .await
+            .expect_err("require_review blocks agent merge");
+        assert!(err.to_string().contains("requires user review"), "{err}");
+
+        let host_ctx = PrContext {
+            db: Some(fx.db.clone()),
+            session_id: String::new(),
+            session_root: root,
+            scratch_root: fx.scratch_root(),
+            cwd: fx.checkout.clone(),
+            workspace_config: WorkspaceConfig {
+                workdirs: Vec::new(),
+                projects: vec![project],
+            },
+            review: None,
+            signing: fx.user.signing(&fx.tmp.path().join("may"), "user"),
+            github_api: PrContext::default_github_api(),
+            land_locks: LandLocks::default(),
+            checkouts: None,
+            task_events: None,
+            ci: None,
+            publish: None,
+            ui_events: Some(bus.clone()),
+        };
+
+        let merged = super::user_merge_pr(&host_ctx, pr1.id).await.unwrap();
+        assert_eq!(merged.state, PrState::Merged);
+        let evs = fx.db.pr_events(pr1.id).await.unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| e.agent_id == "user" && e.kind == "merged"),
+            "{evs:?}"
+        );
+
+        // Drain events and check UI bus received PRS topic.
+        let mut saw_prs = false;
+        while let Ok(topics) = rx.try_recv() {
+            if topics.contains(crate::ui_event_bus::UiEventTopics::PRS) {
+                saw_prs = true;
+            }
+        }
+        assert!(saw_prs, "expected UiEventTopics::PRS publish");
+
+        // Second PR on another session: closed by user after session deletion (orphaned).
+        fx.db.create_session("s2", None, None).await.unwrap();
+        let root2 = fx.session_root("s2");
+        let clone2 = SessionRepos::new(&root2, "s2", fx.db.clone())
+            .ensure_local_clone(&fx.checkout, &fx.repo_key, &fx.scratch_root())
+            .await
+            .unwrap();
+        fx.user.identify(&clone2);
+        let store2 = PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: "s2".to_string(),
+                session_root: root2,
+                scratch_root: fx.scratch_root(),
+                cwd: fx.checkout.clone(),
+                workspace_config: host_ctx.workspace_config.clone(),
+                review: None,
+                signing: fx.signing("s2"),
+                github_api: PrContext::default_github_api(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+                ui_events: Some(bus.clone()),
+            },
+            fx.sandbox("s2").await,
+        );
+        commit_file(&clone2, "feature2.txt");
+        store2
+            .open(None, Some("PR two"), None, false)
+            .await
+            .unwrap();
+        let pr2 = fx
+            .db
+            .get_pr(&fx.repo_key.to_string_lossy(), 2)
+            .await
+            .unwrap()
+            .unwrap();
+        fx.db.delete_session("s2").await.unwrap();
+        let closed = super::user_close_pr(&host_ctx, pr2.id).await.unwrap();
+        assert_eq!(closed.state, PrState::Closed);
+        let evs2 = fx.db.pr_events(pr2.id).await.unwrap();
+        assert!(
+            evs2.iter()
+                .any(|e| e.agent_id == "user" && e.kind == "closed"),
+            "{evs2:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merging_pr_with_linked_may_issue_records_landed_by_and_closes_issue() {
+        let fx = Fixture::new().await;
+        fx.db.create_session("s1", None, None).await.unwrap();
+        let repo_key = fx.repo_key.to_string_lossy().to_string();
+        let issue = fx
+            .db
+            .create_issue(&repo_key, "Fix bug", "Details", &[])
+            .await
+            .unwrap();
+        assert_eq!(issue.state, crate::issue::IssueState::Open);
+
+        let (store, clone) = fx.store("s1", None).await;
+        fx.user.identify(&clone);
+        commit_file(&clone, "fix.txt");
+        let out = store
+            .open(None, Some("Fix bug"), Some(issue.number), false)
+            .await
+            .unwrap();
+        assert!(out.contains("merged"), "{out}");
+
+        let refreshed = fx
+            .db
+            .get_issue(&repo_key, issue.number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.state, crate::issue::IssueState::Closed);
+        assert!(
+            refreshed
+                .comments
+                .iter()
+                .any(|c| c.body.contains("landed_by PR #1")),
+            "{:?}",
+            refreshed.comments
         );
     }
 }

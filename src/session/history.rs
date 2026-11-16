@@ -56,6 +56,11 @@ pub enum ToolEventRecord {
         name: String,
         /// Raw JSON arguments.
         arguments: String,
+        /// How May read the script of a terminal call as it started, with
+        /// line numbers a later edit of the files would change; absent for
+        /// other calls and for rows stored before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reading: Option<crate::command_reading::CommandReading>,
     },
     /// Tool call completed.
     #[serde(rename = "end")]
@@ -277,6 +282,15 @@ pub struct ChatMessage {
     /// content above stays the original.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation: Option<MessageTranslation>,
+    /// How the daemon read the script of a stored `terminal` call start,
+    /// attached when the daemon serves the history; never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::command_reading::CommandReading>,
+    /// The card of a stored `terminal` call start whose command renders as
+    /// one, attached when the daemon serves the history; never stored on the
+    /// row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<crate::command_reading::Card>,
     /// The reasoning text streamed before an assistant message, kept for
     /// display. Never part of the model's context: provider reasoning state
     /// lives in `reasoning`.
@@ -297,7 +311,7 @@ pub struct MessageTranslation {
 /// when the detector does not know it.
 #[must_use]
 pub fn language_display_name(code: &str) -> String {
-    code.parse::<aither_agent::Language>()
+    code.parse::<crate::harness::language::Language>()
         .map_or_else(|_| code.to_string(), |language| language.name().to_string())
 }
 
@@ -323,6 +337,8 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -340,6 +356,8 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -361,6 +379,8 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -378,6 +398,8 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -399,6 +421,8 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -419,6 +443,8 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
+            card: None,
             thinking: None,
         }
     }
@@ -477,6 +503,33 @@ impl ChatHistory {
         self.messages.len()
     }
 
+    /// The input messages stored after `since`: the user messages and hidden
+    /// context a run's agent was given, in order, as aither messages.
+    ///
+    /// An agent restored from a checkpoint older than these rows never saw
+    /// them. Everything a run produces (replies, tool events) is left out: its
+    /// checkpoints carry what it committed.
+    ///
+    /// # Errors
+    /// Returns [`HistoryReplayError`] when a stored user message carries an
+    /// attachment that cannot be replayed.
+    pub fn input_messages_after(
+        &self,
+        since: Timestamp,
+    ) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
+        self.messages
+            .iter()
+            .filter(|message| message.timestamp.is_some_and(|stored| stored > since))
+            .filter_map(|message| match message.role {
+                MessageRole::User => Some(replay_user_message(message)),
+                MessageRole::HiddenContext => {
+                    Some(Ok(aither_core::llm::Message::system(&message.content)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Convert to aither messages.
     ///
     /// Rebuild durable LLM history from persisted chat messages.
@@ -517,6 +570,7 @@ impl ChatHistory {
                                 id,
                                 name,
                                 arguments,
+                                ..
                             } => {
                                 if id != tool_call_id {
                                     return Some(Err(HistoryReplayError::ToolEventIdMismatch {
@@ -652,24 +706,8 @@ fn replay_user_message(
 fn attachment_url(
     attachment: &super::runtime::PersistedAttachment,
 ) -> Result<url::Url, HistoryReplayError> {
-    if let Some(url) = attachment
-        .upload_data_url
-        .as_deref()
-        .and_then(|raw| url::Url::parse(raw).ok())
-    {
-        return Ok(url);
-    }
-    let url = url::Url::parse(&attachment.url)
-        .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))?;
-    let file_gone = url.to_file_path().is_ok_and(|path| !path.exists());
-    if !file_gone {
-        return Ok(url);
-    }
-    attachment
-        .upload_data_url
-        .as_deref()
-        .and_then(|raw| url::Url::parse(raw).ok())
-        .ok_or_else(|| invalid_attachment(attachment, "file missing and no stored bytes"))
+    url::Url::parse(&attachment.url)
+        .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))
 }
 
 fn attachment_media_type(
@@ -731,12 +769,37 @@ mod tests {
     }
 
     #[test]
+    fn input_after_a_snapshot_is_the_user_and_hidden_rows_stored_later() {
+        let mut history = ChatHistory::new();
+        let mut checkpointed = ChatMessage::user("answered");
+        checkpointed.timestamp = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        history.messages_mut().push(checkpointed);
+        let mut reply = ChatMessage::assistant("reply", "2026-01-01T00:00:01Z".parse().unwrap());
+        reply.timestamp = Some("2026-01-01T00:00:03Z".parse().unwrap());
+        history.messages_mut().push(reply);
+        let mut hidden = ChatMessage::hidden_context("<note/>");
+        hidden.timestamp = Some("2026-01-01T00:00:04Z".parse().unwrap());
+        history.messages_mut().push(hidden);
+        let mut interrupted = ChatMessage::user("interrupted");
+        interrupted.timestamp = Some("2026-01-01T00:00:05Z".parse().unwrap());
+        history.messages_mut().push(interrupted);
+
+        let since = "2026-01-01T00:00:02Z".parse().unwrap();
+        let messages = history.input_messages_after(since).unwrap();
+        assert_eq!(messages.len(), 2, "only later input rows: {messages:?}");
+        assert_eq!(messages[0].role(), Role::System);
+        assert_eq!(messages[1].role(), Role::User);
+        assert_eq!(messages[1].content(), "interrupted");
+    }
+
+    #[test]
     fn tool_lifecycle_replays_as_matching_assistant_call_and_result() {
         let mut history = ChatHistory::new();
         let start = serde_json::to_string(&ToolEventRecord::Start {
             id: "call_123".to_string(),
             name: "lookup".to_string(),
             arguments: "{\"query\":\"rust\"}".to_string(),
+            reading: None,
         })
         .expect("serialize tool start");
         let end = serde_json::to_string(&ToolEventRecord::End {
@@ -801,6 +864,7 @@ mod tests {
             id: "call_9".to_string(),
             name: "terminal".to_string(),
             arguments: "{}".to_string(),
+            reading: None,
         })
         .expect("serialize tool start");
         let stopped = serde_json::to_string(&ToolEventRecord::Stopped {
@@ -853,5 +917,283 @@ mod tests {
             history.to_aither_messages(),
             Err(HistoryReplayError::InvalidToolEvent(_))
         ));
+    }
+}
+
+/// Rebuilds `ChatMessage` rows from transcript entries (the inverse of
+/// the daemon's folding).
+///
+/// A `toolCall` becomes its start record plus an end/stopped record, so
+/// rendering, export and injection replay the same rows.
+#[must_use]
+pub fn chat_messages_from_transcript(
+    entries: &[crate::client::WireTranscriptEntry],
+) -> Vec<ChatMessage> {
+    use crate::client::WireTranscriptEntry as E;
+
+    fn timestamp(ts: Option<&str>) -> Option<Timestamp> {
+        ts.and_then(|t| t.parse().ok())
+    }
+    fn row_id(id: &str) -> Option<i32> {
+        id.parse().ok()
+    }
+    fn base(row: &str, role: MessageRole, content: String, ts: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            id: row_id(row),
+            role,
+            content,
+            attachments: Vec::new(),
+            timestamp: timestamp(ts),
+            tool_call_id: None,
+            stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
+            translation: None,
+            reading: None,
+            card: None,
+            thinking: None,
+        }
+    }
+
+    let mut messages = Vec::new();
+    for entry in entries {
+        match entry {
+            E::User {
+                id,
+                timestamp: ts,
+                text,
+                attachments,
+            } => messages.push(ChatMessage {
+                attachments: attachments.clone(),
+                ..base(id, MessageRole::User, text.clone(), ts.as_deref())
+            }),
+            E::Assistant {
+                id,
+                timestamp: ts,
+                text,
+                thinking,
+                translation,
+                stats,
+            } => {
+                messages.push(ChatMessage {
+                    thinking: thinking.clone(),
+                    translation: translation.clone(),
+                    stats: stats.clone(),
+                    ..base(id, MessageRole::Assistant, text.clone(), ts.as_deref())
+                });
+            }
+            E::ToolCall {
+                id,
+                timestamp: ts,
+                call_id,
+                name,
+                arguments,
+                status,
+                result,
+                reading,
+                card,
+            } => {
+                let start = ToolEventRecord::Start {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    reading: None,
+                };
+                messages.push(ChatMessage {
+                    tool_call_id: Some(call_id.clone()),
+                    // The reading rides on the row, as the daemon served it.
+                    reading: reading.clone(),
+                    card: card.clone(),
+                    ..base(
+                        id,
+                        MessageRole::Tool,
+                        serde_json::to_string(&start).unwrap_or_default(),
+                        ts.as_deref(),
+                    )
+                });
+                let end = match (status.as_str(), result) {
+                    ("done", Some(result)) => Some(ToolEventRecord::End {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        result: result.clone(),
+                    }),
+                    ("stopped", _) => Some(ToolEventRecord::Stopped {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(end) = end {
+                    messages.push(ChatMessage {
+                        id: None,
+                        tool_call_id: Some(call_id.clone()),
+                        ..base(
+                            "",
+                            MessageRole::Tool,
+                            serde_json::to_string(&end).unwrap_or_default(),
+                            ts.as_deref(),
+                        )
+                    });
+                }
+            }
+            E::InteractionRequest {
+                id,
+                timestamp: ts,
+                interaction,
+                content,
+            } => {
+                let role = match interaction.as_str() {
+                    "permission" => MessageRole::PermissionRequest,
+                    "workspace" => MessageRole::WorkspaceRequest,
+                    _ => MessageRole::AskUserRequest,
+                };
+                messages.push(base(id, role, content.clone(), ts.as_deref()));
+            }
+            E::InteractionResponse {
+                id,
+                timestamp: ts,
+                interaction,
+                content,
+            } => {
+                let role = match interaction.as_str() {
+                    "permission" => MessageRole::PermissionResponse,
+                    "workspace" => MessageRole::WorkspaceResponse,
+                    _ => MessageRole::AskUserResponse,
+                };
+                messages.push(base(id, role, content.clone(), ts.as_deref()));
+            }
+            E::HiddenContext {
+                id,
+                timestamp: ts,
+                text,
+            } => {
+                messages.push(base(
+                    id,
+                    MessageRole::HiddenContext,
+                    text.clone(),
+                    ts.as_deref(),
+                ));
+            }
+            E::Recap {
+                id,
+                timestamp: ts,
+                content,
+            } => {
+                messages.push(base(id, MessageRole::Recap, content.clone(), ts.as_deref()));
+            }
+            E::System {
+                id,
+                timestamp: ts,
+                text,
+            } => {
+                messages.push(base(id, MessageRole::System, text.clone(), ts.as_deref()));
+            }
+        }
+    }
+    messages
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_entries_fold_back_into_the_same_rows() {
+        let at = "2025-01-01T00:00:00Z".to_string();
+        let result = aither_core::llm::ToolResult::text("done!");
+        let entries = vec![
+            crate::client::WireTranscriptEntry::User {
+                id: "1".into(),
+                timestamp: Some(at.clone()),
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+            crate::client::WireTranscriptEntry::Assistant {
+                id: "2".into(),
+                timestamp: Some(at.clone()),
+                text: "hello".into(),
+                thinking: None,
+                translation: None,
+                stats: None,
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "3".into(),
+                timestamp: Some(at.clone()),
+                call_id: "c1".into(),
+                name: "terminal".into(),
+                arguments: "{}".into(),
+                status: "done".into(),
+                result: Some(result),
+                reading: Some(crate::command_reading::CommandReading::of("cat a.rs")),
+                card: None,
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "4".into(),
+                timestamp: Some(at.clone()),
+                call_id: "c2".into(),
+                name: "monitor".into(),
+                arguments: "{}".into(),
+                status: "stopped".into(),
+                result: None,
+                reading: None,
+                card: None,
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "5".into(),
+                timestamp: Some(at.clone()),
+                call_id: "c3".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+                status: "running".into(),
+                result: None,
+                reading: None,
+                card: None,
+            },
+            crate::client::WireTranscriptEntry::HiddenContext {
+                id: "6".into(),
+                timestamp: Some(at),
+                text: "ctx".into(),
+            },
+        ];
+
+        let messages = chat_messages_from_transcript(&entries);
+        assert_eq!(messages.len(), 8);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].id, Some(1));
+        assert_eq!(messages[0].content, "hi");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+
+        // The done call's rows parse back as its Start and End records.
+        let start: ToolEventRecord =
+            serde_json::from_str(&messages[2].content).expect("start record");
+        assert!(matches!(start, ToolEventRecord::Start { ref id, .. } if id == "c1"));
+        let end: ToolEventRecord = serde_json::from_str(&messages[3].content).expect("end record");
+        assert!(matches!(end, ToolEventRecord::End { ref id, .. } if id == "c1"));
+        // The served reading rides on the call's start row for the clients.
+        assert_eq!(
+            messages[2].reading,
+            Some(crate::command_reading::CommandReading::of("cat a.rs"))
+        );
+        assert!(messages[3].reading.is_none());
+
+        // Stopped: Start + Stopped; running: Start only.
+        let stopped: ToolEventRecord =
+            serde_json::from_str(&messages[5].content).expect("stopped record");
+        assert!(matches!(stopped, ToolEventRecord::Stopped { ref id, .. } if id == "c2"));
+        let running: ToolEventRecord =
+            serde_json::from_str(&messages[6].content).expect("running start");
+        assert!(matches!(running, ToolEventRecord::Start { ref id, .. } if id == "c3"));
+
+        assert_eq!(messages[7].role, MessageRole::HiddenContext);
+        assert_eq!(messages[7].id, Some(6));
+    }
+
+    #[test]
+    fn rewind_requests_the_user_entry_id() {
+        let body = serde_json::to_string(&crate::client::RewindRequest {
+            entry_id: "7".into(),
+        })
+        .expect("serialize");
+        assert_eq!(body, "{\"entryId\":\"7\"}");
     }
 }

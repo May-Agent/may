@@ -5,12 +5,26 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Clear, List, ListItem, Paragraph},
 };
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::super::super::app::App;
 use super::super::super::state::{ConfigEditMode, ConfigSection};
-use super::{centered_rect, char_to_byte_idx, display_width_prefix};
+use super::super::band::panel;
+use super::{centered_rect, display_width_prefix};
+
+/// A secret field's text: one `*` per grapheme the cursor steps over.
+fn masked(value: &str) -> String {
+    value.graphemes(true).map(|_| '*').collect()
+}
+
+/// Cells of the masked text before the byte offset `at`.
+fn masked_width_before(value: &str, at: usize) -> usize {
+    value
+        .get(..at)
+        .map_or(0, |before| before.graphemes(true).count())
+}
 
 pub(super) fn render_config_screen(frame: &mut Frame, area: Rect, app: &App) {
     // Guard: need minimum size to render safely
@@ -178,12 +192,11 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             })
             .collect();
 
-        let list = List::new(list_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title("Select Provider Type"),
-        );
+        let list = List::new(list_items).block(panel(
+            Some(Span::raw("Select Provider Type")),
+            Color::Cyan,
+            app.band_bg,
+        ));
         frame.render_widget(list, popup_area);
         return;
     }
@@ -219,37 +232,23 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
                             label: &str,
                             value: &str,
                             is_focused: bool,
-                            cur: usize,
                             mask: bool| {
-            let display_value = if mask {
-                value.chars().map(|_| '*').collect::<String>()
+            let display = if mask {
+                masked(value)
             } else {
                 value.to_string()
-            };
-            // Convert char index to byte index for safe slicing
-            let cursor_pos = char_to_byte_idx(&display_value, cur);
-            let display = if is_focused {
-                format!(
-                    "{}{}",
-                    &display_value[..cursor_pos],
-                    &display_value[cursor_pos..]
-                )
-            } else {
-                display_value
             };
             let style = if is_focused {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::White)
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(if is_focused {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Gray)
-                })
-                .title(label);
+            let accent = if is_focused {
+                Color::Yellow
+            } else {
+                Color::Gray
+            };
+            let block = panel(Some(Span::raw(label)), accent, app.band_bg);
             let paragraph = Paragraph::new(display).style(style).block(block);
             frame.render_widget(paragraph, area);
         };
@@ -260,7 +259,6 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             "Name (ID)",
             name,
             *focused_field == 0,
-            *cursor,
             false,
         );
         render_field(
@@ -269,7 +267,6 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             "Base URL",
             base_url,
             *focused_field == 1,
-            *cursor,
             false,
         );
         render_field(
@@ -278,19 +275,18 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             "API Key (optional)",
             api_key,
             *focused_field == 2,
-            *cursor,
             true,
         );
 
         // IME anchor at the caret of the focused field (masked fields
-        // show one `*` per char, so width equals the char cursor).
-        let (value, field_area, masked) = match *focused_field {
+        // show one `*` per grapheme).
+        let (value, field_area, is_masked) = match *focused_field {
             0 => (name, chunks[0], false),
             1 => (base_url, chunks[1], false),
             _ => (api_key, chunks[2], true),
         };
-        let text_w = if masked {
-            *cursor
+        let text_w = if is_masked {
+            masked_width_before(value, *cursor)
         } else {
             display_width_prefix(value, *cursor)
         };
@@ -306,38 +302,36 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
                 .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(instructions, chunks[3]);
 
-        // Draw border around the popup
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Add Custom Provider");
+        // Fill the popup behind the fields
+        let block = panel(
+            Some(Span::raw("Add Custom Provider")),
+            Color::Cyan,
+            app.band_bg,
+        );
         frame.render_widget(block, popup_area);
         return;
     }
 
     // If in text edit mode, show edit overlay
     if let Some((input, cursor)) = state.edit_text() {
-        // Show input at selected row (masked is ASCII so byte=char, but use helper for consistency)
-        let masked: String = input.chars().map(|_| '*').collect();
-        let cursor_pos = char_to_byte_idx(&masked, cursor);
-        let display = format!("{}{}", &masked[..cursor_pos], &masked[cursor_pos..]);
+        let display = masked(input);
         items[state.selected] = ListItem::new(format!("  API Key: {display}"))
             .style(Style::default().fg(Color::Yellow));
 
         // IME anchor at the caret inside the selected row.
         let row = area.y + 1 + u16::try_from(state.selected).unwrap_or(u16::MAX);
         if row < area.bottom().saturating_sub(1) {
-            let caret_x = area.x + 12 + u16::try_from(cursor).unwrap_or(u16::MAX);
+            let caret_x =
+                area.x + 12 + u16::try_from(masked_width_before(input, cursor)).unwrap_or(u16::MAX);
             frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), row));
         }
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Manage LLM providers"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("Manage LLM providers")),
+        Color::Cyan,
+        app.band_bg,
+    ));
     frame.render_widget(list, area);
 }
 
@@ -386,8 +380,7 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
             .models
             .compaction_model
             .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
+            .map_or_default(ToString::to_string),
     ];
 
     let mut items: Vec<ListItem> = tier_names
@@ -411,10 +404,8 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
 
     // If in text edit mode, show edit overlay
     if let Some((input, cursor)) = state.edit_text() {
-        let cursor_pos = char_to_byte_idx(input, cursor);
-        let display = format!("{}{}", &input[..cursor_pos], &input[cursor_pos..]);
         items[state.selected] =
-            ListItem::new(format!("  {}: {}", tier_names[state.selected], display))
+            ListItem::new(format!("  {}: {}", tier_names[state.selected], input))
                 .style(Style::default().fg(Color::Yellow));
 
         // IME anchor at the caret inside the selected row.
@@ -427,12 +418,11 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Configure model preferences by tier"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("Configure model preferences by tier")),
+        Color::Cyan,
+        app.band_bg,
+    ));
     frame.render_widget(list, area);
 }
 
@@ -445,6 +435,7 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         "Max iterations",
         "Warn on model change",
         "Show decode speed",
+        "Job pool size",
     ];
     let pref_values: Vec<String> = vec![
         if config.max_iterations == 0 {
@@ -454,6 +445,10 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         },
         config.preferences.warn_on_model_change.to_string(),
         config.preferences.show_decode_speed.to_string(),
+        config.sandbox.job_pool_size.map_or_else(
+            || format!("auto ({})", crate::jobserver::default_pool_size()),
+            |size| size.to_string(),
+        ),
     ];
 
     let mut items: Vec<ListItem> = pref_names
@@ -474,26 +469,52 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         })
         .collect();
 
-    // If in text edit mode for max_iterations
+    // If in text edit mode for the selected row
     if let Some((input, cursor)) = state.edit_text()
-        && state.selected == 0
+        && let Some(name) = pref_names.get(state.selected)
     {
-        let cursor_pos = char_to_byte_idx(input, cursor);
-        let display = format!("{}{}", &input[..cursor_pos], &input[cursor_pos..]);
-        items[0] = ListItem::new(format!("  Max iterations:        {display}"))
+        items[state.selected] = ListItem::new(format!("> {name:<25} {input}"))
             .style(Style::default().fg(Color::Yellow));
 
         // IME anchor at the caret inside the edited row.
         let caret_x =
-            area.x + 26 + u16::try_from(display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
-        frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), area.y + 1));
+            area.x + 29 + u16::try_from(display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
+        let row = u16::try_from(state.selected).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            caret_x.min(area.right().saturating_sub(2)),
+            area.y + 1 + row,
+        ));
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("General preferences"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("General preferences")),
+        Color::Cyan,
+        app.band_bg,
+    ));
     frame.render_widget(list, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{masked, masked_width_before};
+
+    #[test]
+    fn a_secret_is_masked_one_star_per_grapheme() {
+        assert_eq!(masked("你好世界"), "****");
+        assert_eq!(masked("こんにちは"), "*****");
+        assert_eq!(masked("안녕하세요"), "*****");
+        assert_eq!(masked("a👍🏽e\u{301}"), "***");
+        assert_eq!(masked(""), "");
+    }
+
+    #[test]
+    fn the_masked_caret_counts_graphemes_before_the_byte_offset() {
+        let key = "a👍🏽한";
+        assert_eq!(masked_width_before(key, 0), 0);
+        assert_eq!(masked_width_before(key, 1), 1);
+        assert_eq!(masked_width_before(key, 1 + 8), 2);
+        assert_eq!(masked_width_before(key, key.len()), 3);
+        // Off a char boundary there is nothing to count.
+        assert_eq!(masked_width_before(key, 2), 0);
+    }
 }

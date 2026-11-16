@@ -92,18 +92,17 @@ impl LoopPhases {
 }
 
 /// Jank-report threshold from `MAY_JANK_MS`; defaults to
-/// [`DEFAULT_JANK_THRESHOLD_MS`]. `0` disables reporting.
+/// [`DEFAULT_JANK_THRESHOLD_MS`]. `0` disables reporting. The TUI reads it
+/// once at startup and passes it to [`report`].
+#[must_use]
 pub fn jank_threshold() -> Duration {
-    static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("MAY_JANK_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or_else(
-                || Duration::from_millis(DEFAULT_JANK_THRESHOLD_MS),
-                Duration::from_millis,
-            )
-    })
+    std::env::var("MAY_JANK_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or_else(
+            || Duration::from_millis(DEFAULT_JANK_THRESHOLD_MS),
+            Duration::from_millis,
+        )
 }
 
 fn millis(d: Duration) -> u64 {
@@ -115,6 +114,7 @@ fn millis(d: Duration) -> u64 {
 /// document/scroll state needed to reproduce the stall later.
 #[allow(clippy::too_many_arguments)]
 pub fn report(
+    threshold: Duration,
     phases: &LoopPhases,
     stats: &FrameStats,
     scroll: usize,
@@ -123,7 +123,6 @@ pub fn report(
     event: &'static str,
 ) {
     let busy = phases.busy();
-    let threshold = jank_threshold();
     if threshold.is_zero() || busy <= threshold {
         return;
     }

@@ -4,11 +4,13 @@
 //!   keypair generation/loading, push subscription management, and
 //!   sending notifications to all subscribed browsers.
 //! - [`service::NotificationService`] wraps the manager with a durable
-//!   mailbox so pending callbacks survive may restarts.
+//!   mailbox so pending notifications survive may restarts.
 
 pub mod service;
+mod user_wait;
 
 pub use service::{NotificationService, NotificationServiceError};
+pub use user_wait::UserNotification;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +24,6 @@ use web_push::{
 };
 
 use crate::db::ChatDb;
-use crate::xml::XmlBlock;
 
 /// Push notification payload delivered to browser service workers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -38,14 +39,10 @@ pub struct NotificationPayload {
     /// Session the notification relates to, when any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Hidden context delivered back to the session when the user opens the
-    /// notification.
+    /// Profile of that session; opening the notification goes to the session
+    /// under it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub callback_context_xml: Option<XmlBlock>,
-    /// Message injected into the session when the user opens the
-    /// notification.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub callback_message: Option<String>,
+    pub profile_id: Option<String>,
 }
 
 /// Error type for notification operations.
@@ -163,8 +160,7 @@ impl NotificationManager {
             title: title.to_string(),
             body: body.to_string(),
             session_id: None,
-            callback_context_xml: None,
-            callback_message: None,
+            profile_id: None,
         })
         .await
     }

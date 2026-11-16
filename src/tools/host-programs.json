@@ -3,48 +3,142 @@
   "host_programs": [
     {
       "tool": "repo_search",
-      "version": "0.0.12",
+      "version": "0.0.14",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-aarch64-apple-darwin.tar.xz",
-      "sha256": "e86f7979c882131fc1e650c14d798784a32f376d5d992bf8d5f464857ac64e48",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.14/repo-search-aarch64-apple-darwin.tar.xz",
+      "sha256": "d24773818dcd244d7eed69689f5676365018be36e371732f8d477802cca79770",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
       },
-      "executable_sha256": "c4aed794ad9fc19a23b8c80ac767faf11b577a6afdb53d00b9bc1bb69613cfc4"
+      "executable_sha256": "c53d89516339979ca1149164f0e6a2a08ecea548506af268ad1a67a6f7c94b57",
+      "size": 5833780
     },
     {
       "tool": "repo_search",
-      "version": "0.0.12",
+      "version": "0.0.14",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-aarch64-unknown-linux-gnu.tar.xz",
-      "sha256": "47b2d9f28263cd0e7c7cf4fa5422bfccbd21b33cc61338d379682df6835c5e6b",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.14/repo-search-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "7a6c14ee0a61d336eeb62edb60190bedd68493b40bd37c1a2d6eeb163a86eb3f",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
       },
-      "executable_sha256": "ad46d20332ddeb4eb69fc62ca3ef43b6f76a821c16cdb37c85f16d49cd6d5c27"
+      "executable_sha256": "7e3df237ac6bf78d871450f48512780679950aa8fb6ad3f13f7bb6b62c3d5c56",
+      "size": 12900264
     },
     {
       "tool": "repo_search",
-      "version": "0.0.12",
+      "version": "0.0.14",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-x86_64-unknown-linux-gnu.tar.xz",
-      "sha256": "045b40cc581a341cda676520ceb986c76c43c9a05706938fd787102f4bd6073a",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.14/repo-search-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "0fd51117ef5b2500d4e8c8ea46ee0b1682acb801397456feb725e81de6dd1c0e",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"
       },
-      "executable_sha256": "031f400d85a1f2f34c242a92f8e388e1e55fecb4aebb93070b3cc05799642e00"
+      "executable_sha256": "43917671e925de1b8952ceea0656f79e73734289a99a44fbc57eb3c8acc1e818",
+      "size": 14743532
+    },
+    {
+      "tool": "heel",
+      "version": "0.10.1",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-aarch64-apple-darwin",
+      "sha256": "74be3a57e6b597aef483a5223246d0dd173dcf599d5312c10d9ee2e13adce63c",
+      "encoding": {
+        "format": "executable"
+      },
+      "executable_sha256": "74be3a57e6b597aef483a5223246d0dd173dcf599d5312c10d9ee2e13adce63c",
+      "size": 4130928
+    },
+    {
+      "tool": "heel",
+      "version": "0.10.1",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-aarch64-unknown-linux-gnu",
+      "sha256": "75667a4d8cb988c016494b4ca5c24ae776d58918fbd16a94ff7f42ffdae02094",
+      "encoding": {
+        "format": "executable"
+      },
+      "executable_sha256": "75667a4d8cb988c016494b4ca5c24ae776d58918fbd16a94ff7f42ffdae02094",
+      "size": 4596960
+    },
+    {
+      "tool": "heel",
+      "version": "0.10.1",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-x86_64-unknown-linux-gnu",
+      "sha256": "022684b48d70d7e986ecb8f058c791271a945b9c263968f46b0907e6cd021849",
+      "encoding": {
+        "format": "executable"
+      },
+      "executable_sha256": "022684b48d70d7e986ecb8f058c791271a945b9c263968f46b0907e6cd021849",
+      "size": 5132184
+    },
+    {
+      "tool": "heel",
+      "version": "0.10.1",
+      "target": {
+        "os": "windows",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-aarch64-pc-windows-msvc.exe",
+      "sha256": "428a6b3e2140b00b24740b756ce5607dffed78dd48fc8062f5eae6d5e4ebeb07",
+      "encoding": {
+        "format": "executable"
+      },
+      "executable_sha256": "428a6b3e2140b00b24740b756ce5607dffed78dd48fc8062f5eae6d5e4ebeb07",
+      "size": 4672000
+    },
+    {
+      "tool": "heel",
+      "version": "0.10.1",
+      "target": {
+        "os": "windows",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-x86_64-pc-windows-msvc.exe",
+      "sha256": "721fc67c7d5f70bf487a7a21abd4aef1f6ca8d9a933202af1b6bf64908eea510",
+      "encoding": {
+        "format": "executable"
+      },
+      "executable_sha256": "721fc67c7d5f70bf487a7a21abd4aef1f6ca8d9a933202af1b6bf64908eea510",
+      "size": 5537280
+    },
+    {
+      "tool": "podman",
+      "version": "6.2.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/podman-container-tools/podman/releases/download/v6.2.0/podman-remote-release-darwin_arm64.zip",
+      "sha256": "34b4a24e2a749d1ad5e2edacaf01efcf2c2cc89175e5db8c953fd46ba663d17e",
+      "encoding": {
+        "format": "zip",
+        "executable": "podman-6.2.0/usr/bin/podman"
+      },
+      "executable_sha256": "8e3b114af315589ea12428725f12a72fe5a34c4d99e1a65db0ad57eee27e0c04",
+      "size": 26140403
     }
   ]
 }

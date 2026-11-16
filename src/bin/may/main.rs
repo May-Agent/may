@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::mem;
 use std::panic;
 
-use aither_agent::{AgentEvent, TimedEvent};
+use aither_agent::{AgentEvent, OutputKind, TimedEvent};
 use anyhow::Context;
 use askama::Template as _;
 
@@ -122,6 +122,15 @@ fn tokio_runtime() -> io::Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
+    // Under the name `tasks` (the daemon's `~/.may/bin/tasks` link) this
+    // executable is the `tasks` command.
+    if may_agent::daemon::lifecycle::invoked_as_tasks(std::env::args_os().next().as_deref()) {
+        return Ok(may_tasks::run(
+            std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        ));
+    }
     // The permission helper instances the computer agent launches run this
     // same executable; they do their work and exit before anything else.
     #[cfg(target_os = "macos")]
@@ -160,6 +169,10 @@ async fn async_main() -> anyhow::Result<()> {
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
+    if let CliMode::Completion(shell) = cli_mode {
+        io::stdout().write_all(&cli::completion_script(shell))?;
+        return Ok(());
+    }
     if let CliMode::ComputerAgent {
         stderr: Some(path), ..
     } = &cli_mode
@@ -170,7 +183,7 @@ async fn async_main() -> anyhow::Result<()> {
     // diagnostics go there too.
     let is_server_mode = matches!(
         cli_mode,
-        CliMode::Ui(_)
+        CliMode::Ui
             | CliMode::Rest(_)
             | CliMode::Daemon(cli::DaemonCommand::Run)
             | CliMode::ComputerAgent { .. }
@@ -237,37 +250,28 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::warn!("fatal-signal log dump not installed: {error}");
     }
 
-    if !matches!(cli_mode, CliMode::Help(_)) {
-        may_agent::startup::validate_configuration().await?;
-    }
+    may_agent::startup::validate_configuration().await?;
 
     let resume = match &cli_mode {
         CliMode::Resume(args) => Some(args.clone()),
         _ => None,
     };
-    let tui_repo = match &cli_mode {
-        CliMode::Tui(args) => args.repo.clone(),
-        _ => None,
+    let tui_launch = match &cli_mode {
+        CliMode::Tui(args) => args.launch.clone(),
+        _ => may_agent::session::SessionLaunch::default(),
     };
     match cli_mode {
-        CliMode::Help(help_text) => {
-            use std::io::Write as _;
-            io::stdout().write_all(help_text.as_bytes())?;
-            io::stdout().write_all(
-                b"
-",
-            )?;
-            return Ok(());
-        }
-        CliMode::Ui(_) => return open_web_ui().await,
-        CliMode::Rest(rest_args) => {
+        CliMode::Completion(_) => unreachable!("handled before the configuration check"),
+        CliMode::Ui => return open_web_ui().await,
+        CliMode::Rest(address) => {
             return may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
                 mode: may_agent::daemon::DaemonMode::Rest,
-                tcp: Some(may_agent::daemon::parse_listen_args(&rest_args)?),
+                tcp: Some(address),
             })
             .await;
         }
         CliMode::Daemon(command) => return run_daemon_command(command).await,
+        CliMode::Update => return run_update().await,
         CliMode::ComputerAgent { may_dir, .. } => {
             #[cfg(target_os = "macos")]
             {
@@ -308,6 +312,10 @@ async fn async_main() -> anyhow::Result<()> {
         default_hook(panic_info);
     }));
 
+    // The band colour comes from the terminal's own colours: asked once,
+    // on a blocking thread so the runtime keeps turning, before raw mode.
+    let band_bg = blocking::unblock(may_agent::tui::ui::band::query_band_color).await;
+
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
@@ -325,7 +333,15 @@ async fn async_main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support, log_ring, resume, tui_repo).await;
+    let result = run_app(
+        &mut terminal,
+        image_support,
+        band_bg,
+        log_ring,
+        resume,
+        tui_launch,
+    )
+    .await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -376,16 +392,18 @@ struct ExitSummary {
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
+    band_bg: Option<ratatui::style::Color>,
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
-    tui_repo: Option<String>,
+    tui_launch: may_agent::session::SessionLaunch,
 ) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut events = EventHandler::new();
     let mut app = App::new(events.sender(), image_support).await?;
-    app.session_manager.set_pending_repo(tui_repo);
+    app.band_bg = band_bg;
+    app.session_manager.set_launch(tui_launch);
     let mut worker: Option<AgentWorker> = None;
 
     tracing::info!("=== MAY STARTUP - channels created ===");
@@ -616,14 +634,20 @@ struct RepoTrust {
 
 /// The launch gate for a session that will run in `profile_id`: a repository
 /// launch asks for its trust level, any other launch asks for the
-/// write-grant. Both read and persist that profile's `workspace.toml`.
+/// write-grant. Both read and persist that profile's `workspace.toml`. A
+/// session that works in no directory — a repo-less chat, or a start on
+/// `owner/repo` — has no launch gate here; the daemon asks the repository's
+/// trust when the session starts.
 fn startup_gate_check(
     app: &App,
     profile_id: Option<&str>,
 ) -> Result<Option<StartupGate>, may_agent::workspace::WorkspaceConfigError> {
+    let Some(dir) = app.session_manager.launch_cwd(&app.cwd) else {
+        return Ok(None);
+    };
     gate_check(
         app.session_manager.may_dir(),
-        &app.cwd,
+        &dir,
         profile_id,
         &app.profiles,
     )
@@ -861,6 +885,7 @@ where
 
         tracing::info!("=== LOOP START ===");
         let mut phases = may_agent::tui::perf::LoopPhases::default();
+        let jank_threshold = may_agent::tui::perf::jank_threshold();
 
         // First draw: updates content_height/view_height for accurate overflow calculation.
         if needs_draw {
@@ -904,9 +929,11 @@ where
                 Err(TryRecvError::Closed) => {
                     app.clipboard_rx = None;
                     app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
-                    return Err(anyhow::anyhow!(
-                        "Clipboard task closed before sending a result"
-                    ));
+                    app.enqueue_clipboard_result(Err(may_agent::tui::error::TuiError::Clipboard(
+                        may_agent::tui::clipboard::ImageError::Clipboard(
+                            "clipboard task closed before sending a result".to_string(),
+                        ),
+                    )));
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -914,7 +941,7 @@ where
 
         let step_start = std::time::Instant::now();
         while let Some(paste) = app.dequeue_pending_paste() {
-            app.handle_pending_paste(paste).await?;
+            app.handle_pending_paste(paste).await;
         }
         phases.step("paste_results", step_start.elapsed());
 
@@ -955,19 +982,6 @@ where
         let had_none = app.open_question_count == 0;
         app.open_question_count = open.len();
         if had_none && let Some(first) = open.into_iter().next() {
-            let question_text = first
-                .questions
-                .first()
-                .map_or("A new question is waiting", |q| q.question.as_str());
-            if let Some(session_id) = app
-                .session_manager
-                .current()
-                .map(|session| session.id.clone())
-            {
-                runtime_deps
-                    .notify_open_question(&session_id, question_text)
-                    .await;
-            }
             let _ = io::stdout()
                 .write_all(b"\x07")
                 .and_then(|()| io::stdout().flush());
@@ -1017,8 +1031,11 @@ where
             match runtime_deps.begin_queued_run(app)? {
                 QueuedRunStart::Started(msg) => {
                     busy_elsewhere_notified = false;
-                    agent_handle =
-                        Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
+                    agent_handle = Some(
+                        runtime_deps
+                            .start_agent_task(app, w, msg, &mut pending_title_gen)
+                            .await?,
+                    );
                     assistant_response.clear();
                     continue;
                 }
@@ -1108,11 +1125,16 @@ where
 
         let Some(event) = event else {
             tracing::warn!("All channels closed, exiting");
-            agent_left_running = agent_handle.is_some() || app.agent_busy();
+            agent_left_running = agent_handle.is_some() || app.agent_working();
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
-            needs_draw = app.processing || last_draw.elapsed() >= std::time::Duration::from_secs(1);
+            // The fireworks redraw every tick, and once more on the tick
+            // that ends them so no spark stays on screen.
+            needs_draw = app.processing
+                || app.new_year.animating()
+                || app.compaction.is_holding()
+                || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
             Event::Terminal(e) => e.kind(),
@@ -1179,8 +1201,16 @@ where
                         // Capture text for title generation
                         if let Ok(TimedEvent {
                             at,
-                            event: AgentEvent::Text(ref text),
+                            event:
+                                AgentEvent::BlockDelta {
+                                    kind: OutputKind::Text,
+                                    ref text,
+                                    ..
+                                },
+                            ref agent,
+                            ..
                         }) = result
+                            && agent.is_main()
                         {
                             assistant_response.push(text, at);
                         }
@@ -1208,6 +1238,12 @@ where
                     }
                     TuiEvent::ReasoningEnd { seconds } => {
                         app.chat.finish_thinking(seconds);
+                    }
+                    TuiEvent::ToolReading { call_id, reading } => {
+                        app.chat.set_tool_reading(&call_id, reading);
+                    }
+                    TuiEvent::ToolCard { call_id, card } => {
+                        app.chat.set_tool_card(&call_id, card);
                     }
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {
@@ -1239,8 +1275,15 @@ where
                         }
                     },
                     TuiEvent::Retract => {
-                        app.chat.retract_text();
+                        app.retract_response();
                         assistant_response.clear();
+                    }
+                    TuiEvent::ReplyTranslated { text, language } => {
+                        app.chat.set_translation(text, &language);
+                    }
+                    TuiEvent::Withdrawn { content, own } => {
+                        assistant_response.clear();
+                        app.withdraw_turn(content, own);
                     }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
@@ -1264,6 +1307,18 @@ where
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Completed,
+                            )
+                            .await;
+                    }
+                    TuiEvent::Declined(message) | TuiEvent::LoopStopped(message) => {
+                        app.chat.push_notice(&message);
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                                RunOutcome::Cancelled,
                             )
                             .await;
                     }
@@ -1367,7 +1422,6 @@ where
                         if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
-                        app.restore_aborted_draft();
                         app.status = None;
                         // Clean up loading/streaming state before adding interrupt message
                         app.chat.collapse_thinking();
@@ -1403,7 +1457,7 @@ where
                 let dispatched = async {
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => {
-                        agent_left_running = agent_handle.is_some() || app.agent_busy();
+                        agent_left_running = agent_handle.is_some() || app.agent_working();
                         return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::StopAgentAndQuit) => {
@@ -1411,10 +1465,10 @@ where
                             (runtime_deps.daemon(), app.session_manager.current())
                         {
                             let stopped: Result<serde_json::Value, _> = client
-                                .post(
-                                    &may_agent::client::session_path(session.id.as_str(), "/stop"),
-                                    &serde_json::json!({}),
-                                )
+                                .delete(&may_agent::client::session_path(
+                                    session.id.as_str(),
+                                    "/turns/current",
+                                ))
                                 .await;
                             if let Err(error) = stopped {
                                 tracing::warn!(%error, "failed to stop the session's run before quitting");
@@ -1439,6 +1493,16 @@ where
                         } else {
                             runtime_deps.begin_new_session(app, worker).await?;
                         }
+                    }
+                    Some(SendAction::NewCloudSession(machine_type)) => {
+                        held_turn = None;
+                        // The session works on its codespace, never in this
+                        // directory, so no launch trust gates it.
+                        runtime_deps.begin_new_session(app, worker).await?;
+                        app.session_manager.run_in_cloud(machine_type.clone())?;
+                        app.set_status(format!(
+                            "New cloud session on {machine_type}: its codespace is created with the first message"
+                        ));
                     }
                     Some(SendAction::LoadSession(id)) => {
                         held_turn = None;
@@ -1517,7 +1581,8 @@ where
                             // The worker is still being built: show the turn
                             // now and send it as soon as the worker exists.
                             let turn =
-                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)?;
+                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)
+                                    .await?;
                             held_turn = Some(HeldTurn {
                                 turn: Some(turn),
                                 behind: Vec::new(),
@@ -1531,7 +1596,7 @@ where
                                     w,
                                     msg,
                                     &mut pending_title_gen,
-                                )?);
+                                ).await?);
                                 assistant_response.clear();
                             } else {
                                 app.chat.push_notice(
@@ -1629,6 +1694,23 @@ where
                     Some(SendAction::ReloadHistory) => {
                         app.reload_chat().await;
                     }
+                    Some(SendAction::DesktopNotification(notification)) => {
+                        // The terminal write stays off the event loop; a
+                        // failure never reaches the popup.
+                        let protocol = may_agent::tui::desktop_notification::Protocol::detect(
+                            std::env::var("TERM_PROGRAM").ok().as_deref(),
+                            std::env::var("TERM").ok().as_deref(),
+                        );
+                        blocking::unblock(move || {
+                            if let Err(error) = may_agent::tui::desktop_notification::raise(
+                                &notification,
+                                protocol,
+                            ) {
+                                tracing::warn!(%error, "failed to raise the desktop notification");
+                            }
+                        })
+                        .detach();
+                    }
                     Some(SendAction::OpenQuestions) => {
                         let open = app.session_runtime.open_questions.clone();
                         if open.is_empty() {
@@ -1703,7 +1785,7 @@ where
                             let tx = app.event_tx.clone();
                             spawn(async move {
                                 let result = client
-                                    .put::<_, serde_json::Value>(
+                                    .patch::<_, serde_json::Value>(
                                         &format!("/api/sessions/{}", session_id.as_str()),
                                         &serde_json::json!({"reasoningEffort": effort}),
                                     )
@@ -1711,7 +1793,8 @@ where
                                     .map(|_| effort)
                                     .map_err(may_agent::tui::error::TuiError::from);
                                 let _ = tx.send(AppEvent::EffortApplied(result)).await;
-                            });
+                            })
+                            .detach();
                         }
                     }
                     Some(SendAction::OpenChatgptAuthUrl { url, code }) => {
@@ -1767,11 +1850,8 @@ where
                             (Some(client), Some(session_id)) => {
                                 let enable = !app.session_runtime.yolo;
                                 let put = client
-                                    .put::<_, serde_json::Value>(
-                                        &may_agent::client::session_path(
-                                            session_id.as_str(),
-                                            "/yolo",
-                                        ),
+                                    .patch::<_, serde_json::Value>(
+                                        &format!("/api/sessions/{session_id}"),
                                         &serde_json::json!({ "yolo": enable }),
                                     )
                                     .await;
@@ -1782,6 +1862,35 @@ where
                                         "Yolo off: approval requests ask again"
                                     }),
                                     Err(error) => app.chat.push_error(&error.to_string()),
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
+                    Some(SendAction::MemoryOff) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                if app.session_runtime.memory_off {
+                                    app.chat.push_notice(
+                                        "Memory is already off for the rest of this session",
+                                    );
+                                } else {
+                                    let put = client
+                                        .patch::<_, serde_json::Value>(
+                                            &format!("/api/sessions/{session_id}"),
+                                            &serde_json::json!({ "memoryOff": true }),
+                                        )
+                                        .await;
+                                    match put {
+                                        Ok(_) => app.chat.push_notice(
+                                            "Memory off for the rest of this session: it will neither read nor save memories",
+                                        ),
+                                        Err(error) => app.chat.push_error(&error.to_string()),
+                                    }
                                 }
                             }
                             _ => app.chat.push_notice("No session is attached"),
@@ -1826,7 +1935,7 @@ where
                                     .post::<_, serde_json::Value>(
                                         &may_agent::client::session_path(
                                             session_id.as_str(),
-                                            "/recap",
+                                            "/actions/recap",
                                         ),
                                         &serde_json::json!({}),
                                     )
@@ -2004,23 +2113,11 @@ where
                         }
                     }
                     Some(SendAction::SshAdd { name, target }) => {
-                        app.config
-                            .upsert_ssh_server(may_agent::config::SshServerConfig {
-                                name: name.clone(),
-                                target,
-                            });
-                        if let Err(e) = app.config.clone().save().await {
-                            let err_msg = format!("Failed to save SSH server: {e}");
-                            app.chat.push_error(&err_msg);
-                        } else {
-                            app.set_status(format!("Added SSH server: {name}"));
-                            if app.ssh_selected + 1 < app.config.ssh_servers.len() {
-                                app.ssh_selected = app.config.ssh_servers.len() - 1;
-                            }
-                        }
+                        app.start_ssh_probe(name, target);
                     }
                     Some(SendAction::SshRemove { name }) => {
                         if app.config.remove_ssh_server(&name) {
+                            app.prune_ssh_attachment(&name);
                             if let Err(e) = app.config.clone().save().await {
                                 let err_msg = format!("Failed to save SSH config: {e}");
                                 app.chat.push_error(&err_msg);
@@ -2032,6 +2129,42 @@ where
                                     app.ssh_selected = app.config.ssh_servers.len() - 1;
                                 }
                             }
+                        }
+                    }
+                    Some(SendAction::SshToggleAttachment { name }) => {
+                        if let Some((profile_id, updated, attached_now)) =
+                            app.toggle_ssh_attachment(&name)
+                        {
+                            let result = match app.session_manager.daemon_handle() {
+                                Ok(client) => {
+                                    let body = serde_json::json!({ "serverNames": updated });
+                                    client
+                                        .put::<_, serde_json::Value>(
+                                            &format!("/api/profiles/{profile_id}/remotes"),
+                                            &body,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|error| error.to_string())
+                                }
+                                Err(error) => Err(error.to_string()),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    let verb = if attached_now { "Attached" } else { "Detached" };
+                                    app.set_status(format!(
+                                        "{verb} SSH server {name} for current profile"
+                                    ));
+                                }
+                                Err(error) => {
+                                    let _ = app.toggle_ssh_attachment(&name);
+                                    app.chat.push_error(&format!(
+                                        "Failed to update profile SSH servers: {error}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            app.chat.push_error("No active profile selected");
                         }
                     }
                     Some(SendAction::RespondLaunchGrant {
@@ -2225,13 +2358,19 @@ where
                         })
                         .detach();
                     }
-                    Some(SendAction::RunBash { call_id, command }) => {
+                    Some(SendAction::RunBash {
+                        call_id,
+                        command,
+                        secrets,
+                    }) => {
                         let tx = events.sender();
-                        let secrets = app.secrets.clone();
                         let cwd = app.cwd.clone();
+                        let patterns = app.secret_patterns.clone();
                         spawn(async move {
                             let mut outcome = blocking::unblock(move || {
-                                may_agent::bash::run_bash_command(&command, &cwd, &secrets)
+                                may_agent::bash::run_bash_command(
+                                    &command, &cwd, &secrets, &patterns,
+                                )
                             })
                             .await;
                             outcome.call_id = call_id;
@@ -2272,6 +2411,7 @@ where
         // Report a stall whenever one busy iteration exceeded the jank
         // threshold; the log carries the render breakdown for repro.
         may_agent::tui::perf::report(
+            jank_threshold,
             &phases,
             &app.frame_stats,
             app.scroll,
@@ -2996,6 +3136,34 @@ async fn open_web_ui() -> anyhow::Result<()> {
 }
 
 /// `may daemon [install|uninstall|status|stop]`.
+/// `may update`: replaces this binary on its channel, then restarts a
+/// running daemon onto the new one. The restart is the new binary's own
+/// `daemon restart`: this process is still the old build.
+async fn run_update() -> anyhow::Result<()> {
+    use may_agent::update::{Channel, Outcome, update};
+
+    match update(Channel::current(), |step| eprintln!("{step}")).await? {
+        Outcome::UpToDate => eprintln!("May is up to date."),
+        Outcome::Updated { executable, to } => {
+            eprintln!("Updated May to {to}.");
+            let paths = may_agent::daemon::DaemonPaths::user()?;
+            let running = may_agent::client::DaemonClient::new(paths.socket())
+                .health()
+                .await
+                .is_ok();
+            if running {
+                eprintln!("Restarting the May daemon…");
+                let status = async_process::Command::new(&executable)
+                    .args(["daemon", "restart"])
+                    .status()
+                    .await?;
+                anyhow::ensure!(status.success(), "the new May could not restart the daemon");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
     use may_agent::daemon::{DaemonOptions, DaemonPaths, lifecycle};
 
@@ -3025,6 +3193,17 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        cli::DaemonCommand::Restart => {
+            lifecycle::stop(&paths).await?;
+            lifecycle::ensure_running(&paths, |step| eprintln!("{step}")).await?;
+            eprintln!("The May daemon runs this build.");
+            Ok(())
+        }
+        cli::DaemonCommand::Start => {
+            lifecycle::ensure_running(&paths, |step| eprintln!("{step}")).await?;
+            eprintln!("The May daemon runs this build.");
+            Ok(())
+        }
         cli::DaemonCommand::Status => {
             let client = may_agent::client::DaemonClient::new(paths.socket());
             match client.health().await {
@@ -3044,8 +3223,7 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
                         health
                             .search_index
                             .last_error
-                            .map(|error| format!("; last error: {error}"))
-                            .unwrap_or_default()
+                            .map_or_default(|error| format!("; last error: {error}"))
                     );
                 }
                 Err(_) => println!("May daemon not running."),

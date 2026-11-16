@@ -4,6 +4,7 @@ import {
   Archive,
   ChevronDown,
   ChevronRight,
+  Folder,
   Github,
   Loader2,
   PanelLeftClose,
@@ -23,10 +24,11 @@ import { isWorking } from '@/lib/sessionLists';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
-import { githubBinding, repoLabel } from '@/lib/repo';
+import { githubBinding, groupByRepo, parseRepo, repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
+import { closePr, mergePr } from '@/lib/api/prs';
 import type { ProfileSessions } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -42,6 +44,9 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const toggleSidebar = useUiStore((s) => s.toggleSidebar);
   const setSidebarSheetOpen = useUiStore((s) => s.setSidebarSheetOpen);
   const profileSessions = useRuntimeStore((s) => s.profileSessions);
+  const orphanedPrs = useRuntimeStore((s) => s.orphanedPrs);
+  const [prBusy, setPrBusy] = useState<Record<number, 'merge' | 'close'>>({});
+  const [prError, setPrError] = useState<string | null>(null);
   const { profileId: activeProfileId } = useActiveProfile();
   const { start: startNewChat, creating, enabled: canCreate } = useNewChat();
   const { t } = useTranslation();
@@ -64,24 +69,10 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
 
   // Sessions bound to a repository cluster under a collapsible group
   // header; repo-less sessions stay flat above the groups.
-  const [regularNoRepo, repoGroups] = useMemo(() => {
-    const regular = scoped?.regular ?? [];
-    const flat: typeof regular = [];
-    const groups = new Map<string, typeof regular>();
-    for (const item of regular) {
-      if (item.repo) {
-        const list = groups.get(item.repo) ?? [];
-        list.push(item);
-        groups.set(item.repo, list);
-      } else {
-        flat.push(item);
-      }
-    }
-    const sorted = [...groups.entries()].sort(([a], [b]) =>
-      repoLabel(a).localeCompare(repoLabel(b)),
-    );
-    return [flat, sorted] as const;
-  }, [scoped]);
+  const { flat: regularNoRepo, groups: repoGroups } = useMemo(
+    () => groupByRepo(scoped?.regular ?? []),
+    [scoped],
+  );
 
   return (
     <aside
@@ -247,7 +238,13 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                     />
                   ))}
                   {repoGroups.map(([repo, items]) => (
-                    <RepoGroup key={repo} repo={repo} count={items.length}>
+                    <RepoGroup
+                      key={repo}
+                      repo={repo}
+                      count={items.length}
+                      disabled={!canCreate}
+                      onNewChat={() => void startNewChat({ repo })}
+                    >
                       {items.map((item) => (
                         <SessionNode
                           key={item.id}
@@ -262,6 +259,77 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       ))}
                     </RepoGroup>
                   ))}
+                </Section>
+              )}
+
+              {orphanedPrs.length > 0 && (
+                <Section label={t('sidebar.orphanedPrs')}>
+                  {orphanedPrs.map((pr) => {
+                    const busy = prBusy[pr.id];
+                    const repo = repoLabel(pr.repoKey);
+                    return (
+                      <li key={pr.id} className="rounded-md px-2 py-1.5 text-xs hover:bg-accent/50">
+                        <div className="flex items-center gap-1.5 font-medium">
+                          <span className="tabular-nums text-muted-foreground">#{pr.number}</span>
+                          <span className="min-w-0 flex-1 truncate" title={pr.title}>
+                            {pr.title}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 truncate text-[11px] text-muted-foreground" title={pr.repoKey}>
+                          {repo}
+                        </p>
+                        <div className="mt-1 flex items-center gap-1.5">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[11px]"
+                            disabled={Boolean(busy)}
+                            onClick={() => {
+                              setPrError(null);
+                              setPrBusy((prev) => ({ ...prev, [pr.id]: 'merge' }));
+                              void mergePr(pr.id)
+                                .catch((err) =>
+                                  setPrError(err instanceof Error ? err.message : String(err)),
+                                )
+                                .finally(() =>
+                                  setPrBusy((prev) => {
+                                    const next = { ...prev };
+                                    delete next[pr.id];
+                                    return next;
+                                  }),
+                                );
+                            }}
+                          >
+                            {busy === 'merge' ? t('inspector.prMerging') : t('inspector.prMerge')}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-[11px] text-destructive hover:text-destructive"
+                            disabled={Boolean(busy)}
+                            onClick={() => {
+                              setPrError(null);
+                              setPrBusy((prev) => ({ ...prev, [pr.id]: 'close' }));
+                              void closePr(pr.id)
+                                .catch((err) =>
+                                  setPrError(err instanceof Error ? err.message : String(err)),
+                                )
+                                .finally(() =>
+                                  setPrBusy((prev) => {
+                                    const next = { ...prev };
+                                    delete next[pr.id];
+                                    return next;
+                                  }),
+                                );
+                            }}
+                          >
+                            {busy === 'close' ? t('inspector.prClosing') : t('inspector.prClose')}
+                          </Button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                  {prError && <li className="px-2 text-[11px] text-destructive">{prError}</li>}
                 </Section>
               )}
 
@@ -322,30 +390,57 @@ function Section({ label, children }: SectionProps) {
 interface RepoGroupProps {
   repo: string;
   count: number;
+  disabled: boolean;
+  /** Start a new chat bound to this project. */
+  onNewChat: () => void;
   children: React.ReactNode;
 }
 
-/** Collapsible header binding the sessions of one repository together. */
-function RepoGroup({ repo, count, children }: RepoGroupProps) {
+/**
+ * Collapsible header binding the sessions of one repository together: the
+ * GitHub logo and `owner/repo` for a GitHub project (never a path), the
+ * checkout's path for a local one, and a button for a new chat under it.
+ */
+function RepoGroup({ repo, count, disabled, onNewChat, children }: RepoGroupProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(true);
+  const label = repoLabel(repo);
+  const github = parseRepo(repo).kind === 'github';
   return (
     <li>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
-        aria-expanded={open}
-      >
-        {open ? (
-          <ChevronDown className="size-3.5" aria-hidden />
-        ) : (
-          <ChevronRight className="size-3.5" aria-hidden />
-        )}
-        <span className="truncate" title={repo}>
-          {repoLabel(repo)}
-        </span>
-        <span className="ml-auto font-normal tabular-nums">{count}</span>
-      </button>
+      <div className="group/repo flex h-7 items-center rounded-md text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex h-full min-w-0 flex-1 items-center gap-1 px-2"
+          aria-expanded={open}
+        >
+          {open ? (
+            <ChevronDown className="size-3.5 shrink-0" aria-hidden />
+          ) : (
+            <ChevronRight className="size-3.5 shrink-0" aria-hidden />
+          )}
+          {github ? (
+            <Github className="size-3.5 shrink-0" aria-hidden />
+          ) : (
+            <Folder className="size-3.5 shrink-0" aria-hidden />
+          )}
+          <span className="truncate" title={label}>
+            {label}
+          </span>
+          <span className="ml-auto font-normal tabular-nums">{count}</span>
+        </button>
+        <button
+          type="button"
+          onClick={onNewChat}
+          disabled={disabled}
+          aria-label={t('sidebar.newChatInRepo', { repo: label })}
+          title={t('sidebar.newChatInRepo', { repo: label })}
+          className="mr-1 flex size-5 shrink-0 items-center justify-center rounded hover:bg-accent disabled:opacity-50 touch:size-9"
+        >
+          <Plus className="size-3.5" aria-hidden />
+        </button>
+      </div>
       {open && <ul className="space-y-px">{children}</ul>}
     </li>
   );

@@ -68,6 +68,10 @@ const fn default_list_state() -> IssueListState {
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
 /// - `issue comment <number> <body>` — on a repository the user does not own,
 ///   waits for the user's approval unless the user opened the issue
+///
+/// `--body`/`<body>` take the text literally: a `\n` in it stays a literal
+/// backslash-n. Write real newlines with `printf`, `$'...\n...'` or a
+/// heredoc.
 /// - `issue close <number>` (reopen with `edit --state open`)
 /// - `issue label <number> [--add name ...] [--remove name ...]`
 /// - `issue blocked-by <number> [--add n ...] [--remove n ...]` — the issue
@@ -83,7 +87,8 @@ pub enum IssueArgs {
         kind: IssueKind,
         /// Issue title.
         title: String,
-        /// Issue body (markdown).
+        /// Issue body (markdown). Literal: a `\n` in it stays a backslash-n;
+        /// pass real newlines (`printf`, `$'...\n...'`, heredoc).
         #[serde(default)]
         body: Option<String>,
         /// Labels to apply.
@@ -156,7 +161,8 @@ pub enum IssueArgs {
         /// New title.
         #[serde(default)]
         title: Option<String>,
-        /// New body.
+        /// New body. Literal: a `\n` in it stays a backslash-n; pass real
+        /// newlines (`printf`, `$'...\n...'`, heredoc).
         #[serde(default)]
         body: Option<String>,
         /// New state (`open` reopens, `closed` closes).
@@ -167,7 +173,8 @@ pub enum IssueArgs {
     Comment {
         /// Issue number.
         number: i64,
-        /// Comment body.
+        /// Comment body. Literal: a `\n` in it stays a backslash-n; pass real
+        /// newlines (`printf`, `$'...\n...'`, heredoc).
         body: String,
     },
     /// Close an issue.
@@ -298,18 +305,29 @@ struct IssueSearchText<'a> {
 /// Tells connected clients that an issue changed, so the issues they show
 /// are looked up again.
 #[derive(Clone)]
-pub struct IssueChangeNotifier(std::sync::Arc<crate::session::SessionRuntimeService>);
+pub struct IssueChangeNotifier {
+    runtime: std::sync::Arc<crate::session::SessionRuntimeService>,
+    session_id: String,
+}
 
 impl IssueChangeNotifier {
     /// Publish through the daemon's runtime service.
     #[must_use]
-    pub const fn new(runtime: std::sync::Arc<crate::session::SessionRuntimeService>) -> Self {
-        Self(runtime)
+    pub fn new(
+        runtime: std::sync::Arc<crate::session::SessionRuntimeService>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            session_id: session_id.into(),
+        }
     }
 
     fn notify(&self) {
-        self.0
-            .publish_ui_events(crate::ui_event_bus::UiEventTopics::SESSION_ISSUES);
+        self.runtime.publish_session_change(
+            &self.session_id,
+            crate::daemon::session_events::SessionChange::Issues,
+        );
     }
 }
 
@@ -327,10 +345,12 @@ pub struct IssueTool<S, T = GhCliTokenSource> {
     targets: Option<IssueTargets<T>>,
     provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
-    languages: Option<aither_agent::LanguageGuard>,
+    languages: Option<crate::harness::language::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
     owners: Option<IssueOwners>,
+    task_events: Option<crate::harness::working_document::WorkEvents>,
     publish: Option<PublishGate>,
+    publish_review: Option<crate::harness::publish_review::PublishReview>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -415,8 +435,11 @@ where
             self.targets.as_ref(),
             &self.provenance,
             &CallOrigin::from_context(&cx),
-            self.search.as_ref(),
-            self.owners.as_ref(),
+            SessionServices {
+                search: self.search.as_ref(),
+                owners: self.owners.as_ref(),
+                events: None,
+            },
             arguments,
         )
         .await
@@ -436,7 +459,9 @@ impl<S: IssueStore> IssueTool<S> {
             languages: None,
             changes: None,
             owners: None,
+            task_events: None,
             publish: None,
+            publish_review: None,
         }
     }
 }
@@ -453,14 +478,37 @@ impl<S: IssueStore, T> IssueTool<S, T> {
             languages: self.languages,
             changes: self.changes,
             owners: self.owners,
+            task_events: self.task_events,
             publish: self.publish,
+            publish_review: self.publish_review,
         }
+    }
+
+    /// Record every issue created or closed on `events`, the main agent's
+    /// `tasks.md` inbox.
+    #[must_use]
+    pub fn with_task_events(
+        mut self,
+        events: crate::harness::working_document::WorkEvents,
+    ) -> Self {
+        self.task_events = Some(events);
+        self
     }
 
     /// Ask the user before publishing, as `gate` decides.
     #[must_use]
     pub fn with_publish_gate(mut self, gate: PublishGate) -> Self {
         self.publish = Some(gate);
+        self
+    }
+
+    /// Review outbound issue and comment text before publishing to GitHub.
+    #[must_use]
+    pub fn with_publish_review(
+        mut self,
+        review: crate::harness::publish_review::PublishReview,
+    ) -> Self {
+        self.publish_review = Some(review);
         self
     }
 
@@ -473,7 +521,7 @@ impl<S: IssueStore, T> IssueTool<S, T> {
 
     /// Refuse issue text outside the working language `guard` enforces.
     #[must_use]
-    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+    pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
         self
     }
@@ -512,7 +560,30 @@ where
     ) -> aither_core::Result<Self::Res> {
         if let Some(guard) = &self.languages {
             for text in arguments.published_texts() {
-                guard.check_working(text, aither_agent::WorkingText::Public)?;
+                guard
+                    .check_working(text, crate::harness::language::WorkingText::Public)
+                    .map_err(super::notices::language_refused)?;
+            }
+        }
+        if let Some(review) = &self.publish_review
+            && self.store.info().name != "may"
+        {
+            use crate::harness::publish_review::Publication;
+            let publication = match &arguments {
+                IssueArgs::Create { title, body, .. } => {
+                    Some(Publication::issue(title.trim(), body.as_deref()))
+                }
+                IssueArgs::Edit { title, body, .. } if title.is_some() || body.is_some() => {
+                    Some(Publication::issue_edit(title.as_deref(), body.as_deref()))
+                }
+                IssueArgs::Comment { body, .. } => Some(Publication::comment(body)),
+                _ => None,
+            };
+            if let Some(publication) = publication {
+                review
+                    .review(publication)
+                    .await
+                    .map_err(|err| IssueError::PublishReview(err.to_string()))?;
             }
         }
         if let Some(gate) = &self.publish {
@@ -544,8 +615,11 @@ where
             self.targets.as_ref(),
             &self.provenance,
             &CallOrigin::from_context(&cx),
-            self.search.as_ref(),
-            self.owners.as_ref(),
+            SessionServices {
+                search: self.search.as_ref(),
+                owners: self.owners.as_ref(),
+                events: self.task_events.as_ref(),
+            },
             arguments,
         )
         .await;
@@ -558,18 +632,41 @@ where
     }
 }
 
+/// What the session adds to a call on top of its store.
+#[derive(Clone, Copy)]
+struct SessionServices<'a> {
+    search: Option<&'a SessionIssueSearch>,
+    owners: Option<&'a IssueOwners>,
+    /// The `tasks.md` inbox that hears of issues the session creates or
+    /// closes.
+    events: Option<&'a crate::harness::working_document::WorkEvents>,
+}
+
 /// Run `args` on the session's store, or on the project its `--repo` names.
 async fn execute_in_target<S: IssueStore, T: GitHubTokenSource + Clone>(
     session_store: &S,
     targets: Option<&IssueTargets<T>>,
     provenance: &IssueProvenance,
     origin: &CallOrigin,
-    search: Option<&SessionIssueSearch>,
-    owners: Option<&IssueOwners>,
+    services: SessionServices<'_>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
+    let SessionServices {
+        search,
+        owners,
+        events,
+    } = services;
     let Some(target) = args.repo().map(str::to_owned) else {
-        return execute(session_store, provenance, origin, search, owners, args).await;
+        return execute(
+            session_store,
+            provenance,
+            origin,
+            search,
+            owners,
+            events,
+            args,
+        )
+        .await;
     };
     let Some(targets) = targets else {
         return Err(IssueError::Invalid(
@@ -577,9 +674,12 @@ async fn execute_in_target<S: IssueStore, T: GitHubTokenSource + Clone>(
         ));
     };
     match targets.resolve(&target).await? {
-        TargetStore::May(store) => execute(&store, provenance, origin, search, owners, args).await,
+        // Another project's issues are not rows of this session's `tasks.md`.
+        TargetStore::May(store) => {
+            execute(&store, provenance, origin, search, owners, None, args).await
+        }
         TargetStore::GitHub(store) => {
-            execute(&store, provenance, origin, search, owners, args).await
+            execute(&store, provenance, origin, search, owners, None, args).await
         }
     }
 }
@@ -590,6 +690,7 @@ async fn execute<S: IssueStore>(
     origin: &CallOrigin,
     search: Option<&SessionIssueSearch>,
     owners: Option<&IssueOwners>,
+    events: Option<&crate::harness::working_document::WorkEvents>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
     let record = |number: i64,
@@ -605,7 +706,23 @@ async fn execute<S: IssueStore>(
                 action,
                 detail.as_deref(),
             )
-            .await
+            .await?;
+        // A created or closed issue changes what `tasks.md` rows say.
+        if let Some(events) = events
+            && let Ok(number) = u64::try_from(number)
+        {
+            let issue = crate::harness::working_document::WorkRef::issue(number);
+            match action {
+                IssueAction::Create => events.record(
+                    crate::harness::working_document::WorkEvent::IssueCreated(issue),
+                ),
+                IssueAction::Close => events.record(
+                    crate::harness::working_document::WorkEvent::IssueClosed(issue),
+                ),
+                _ => {}
+            }
+        }
+        Ok::<(), IssueError>(())
     };
     match args {
         IssueArgs::Create {
@@ -870,14 +987,13 @@ fn render_list(summaries: &[IssueSummary], owners: Option<&OwnerIndex>) -> Strin
         let owner = owners
             .filter(|_| summary.state == IssueState::Open)
             .and_then(|owners| owners.get(summary.number))
-            .map(|owner| {
+            .map_or_default(|owner| {
                 format!(
                     " (owner: {}, id {})",
                     owner.display_name(),
                     owner.session_id
                 )
-            })
-            .unwrap_or_default();
+            });
         let _ = writeln!(
             out,
             "#{}\t{}\t{}{}{}",
@@ -904,77 +1020,59 @@ fn render_detail(
     marks: Option<&IssueMarks>,
     owner: Option<&IssueOwner>,
 ) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "#{} {}\nstate: {}",
-        detail.number,
-        detail.title,
-        render_state(detail.state)
-    );
-    if let Some(owner) = owner {
-        let _ = writeln!(
-            out,
-            "owner: agent \"{}\" (id {})",
-            owner.display_name(),
-            owner.session_id
-        );
-    }
-    if let Some(marks) = marks {
-        match &marks.created_in {
-            Some(session) => {
-                let _ = writeln!(out, "written by may: yes (session {session})");
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "written by may: no (not created by may on this machine)"
-                );
-            }
-        }
-    }
-    if !detail.labels.is_empty() {
-        let _ = writeln!(out, "labels: {}", detail.labels.join(", "));
-    }
-    if !detail.sub_issues.is_empty() {
-        let _ = writeln!(out, "sub-issues: {}", render_related(&detail.sub_issues));
-    }
-    if !detail.blocked_by.is_empty() {
-        let _ = writeln!(out, "blocked-by: {}", render_related(&detail.blocked_by));
-    }
-    let _ = writeln!(
-        out,
-        "created: {}\nupdated: {}",
-        detail.created_at, detail.updated_at
-    );
-    if !detail.body.trim().is_empty() {
-        out.push('\n');
-        out.push_str(detail.body.trim());
-        out.push('\n');
-    }
-    if !detail.comments.is_empty() {
-        let _ = writeln!(out, "\ncomments ({}):", detail.comments.len());
-        for comment in &detail.comments {
-            let author = comment
+    let comments: Vec<IssueCommentLine<'_>> = detail
+        .comments
+        .iter()
+        .map(|comment| IssueCommentLine {
+            created_at: &comment.created_at,
+            author: comment
                 .author
                 .as_deref()
-                .map(|author| format!(" {author}"))
-                .unwrap_or_default();
-            let mark = marks.map_or("", |marks| {
+                .map_or_default(|author| format!(" {author}")),
+            mark: marks.map_or("", |marks| {
                 if marks.comment_ids.contains(&comment.id) {
                     " [written by may]"
                 } else {
                     " [not written by may]"
                 }
-            });
-            let _ = writeln!(
-                out,
-                "- [{}]{}{} {}",
-                comment.created_at, author, mark, comment.body
-            );
-        }
+            }),
+            body: &comment.body,
+        })
+        .collect();
+    IssueDetailText {
+        detail,
+        state: render_state(detail.state),
+        marks,
+        owner,
+        sub_issues: render_related(&detail.sub_issues),
+        blocked_by: render_related(&detail.blocked_by),
+        body: detail.body.trim(),
+        comments: &comments,
     }
-    out
+    .render()
+    .expect("the issue detail template renders")
+}
+
+/// What the model reads for one issue: its fields and comments.
+#[derive(Template)]
+#[template(path = "issue_detail.txt", escape = "none")]
+struct IssueDetailText<'a> {
+    detail: &'a IssueDetail,
+    state: &'static str,
+    marks: Option<&'a IssueMarks>,
+    owner: Option<&'a IssueOwner>,
+    sub_issues: String,
+    blocked_by: String,
+    body: &'a str,
+    comments: &'a [IssueCommentLine<'a>],
+}
+
+/// One comment of an issue, with its author and provenance marks.
+struct IssueCommentLine<'a> {
+    created_at: &'a str,
+    author: String,
+    mark: &'static str,
+    body: &'a str,
 }
 
 /// Shared checks of the subagent's `issue` tool, run against each backend.
@@ -1324,6 +1422,68 @@ mod tests {
         assert!(detail.comments.is_empty() && detail.labels.is_empty());
     }
 
+    /// An issue the main agent creates and closes reaches its `tasks.md`
+    /// inbox: the row naming it is told, once each.
+    #[tokio::test]
+    async fn created_and_closed_issues_reach_the_tasks_inbox() {
+        use aither_agent::{ContextSource, Moment};
+        use aither_core::llm::ToolContext;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
+        let events = crate::harness::working_document::WorkEvents::new();
+        let tool = IssueTool::new(store, IssueProvenance::new(db, "test".to_string()))
+            .with_task_events(events.clone());
+        let sandbox = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).expect("sandbox");
+        std::fs::write(sandbox.join("tasks.md"), "## Doing\n- #1 the login bug\n")
+            .expect("tasks.md");
+        let mut tasks = crate::tasks_md::schema::working_document(&sandbox, events);
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+
+        let created = tool
+            .call(
+                IssueArgs::Create {
+                    title: "login bug".to_string(),
+                    body: None,
+                    kind: IssueKind::Bug,
+                    labels: Vec::new(),
+                },
+                ToolContext::new(),
+            )
+            .await;
+        created.expect("create");
+        tool.call(IssueArgs::Close { number: 1 }, ToolContext::new())
+            .await
+            .expect("close");
+        tool.call(
+            IssueArgs::View {
+                number: 1,
+                repo: None,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("view");
+
+        tasks.blocks(Moment::Request { reassembled: false }).await;
+        let alert = tasks
+            .blocks(Moment::ToolTurnEnd)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row is told");
+        let text = alert.block().content();
+        // The row naming #1 already records its creation; its closing is
+        // what the row has yet to follow.
+        assert_eq!(text.matches("Issue #1 was created").count(), 0, "{text}");
+        assert_eq!(text.matches("Issue #1 was closed").count(), 1, "{text}");
+        assert!(text.contains("\"#1 the login bug\""), "{text}");
+    }
+
     #[tokio::test]
     async fn a_write_announces_an_issue_change_and_a_read_does_not() {
         use aither_core::llm::ToolContext;
@@ -1334,13 +1494,18 @@ mod tests {
             .expect("chat db should open");
         let bus = crate::ui_event_bus::UiEventBus::new();
         let mut events = bus.subscribe();
-        let runtime =
-            std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
+        let (changes_tx, changes_rx) = async_channel::unbounded();
+        bus.set_session_changes(changes_tx);
+        let runtime = std::sync::Arc::new(crate::session::SessionRuntimeService::new(
+            db.clone(),
+            bus,
+            crate::session::MayHomePaths::new(dir.path().join("home")),
+        ));
         let provenance = IssueProvenance::new(db.clone(), "test".to_string());
         let store = crate::issue::MayIssueStore::new(db, "test".to_string());
         let seed = store.create("seed", "body", &[]).await.expect("seed issue");
-        let tool =
-            IssueTool::new(store, provenance).with_changes(IssueChangeNotifier::new(runtime));
+        let tool = IssueTool::new(store, provenance)
+            .with_changes(IssueChangeNotifier::new(runtime, "test"));
 
         tool.call(
             IssueArgs::View {
@@ -1364,9 +1529,14 @@ mod tests {
         )
         .await
         .expect("rename");
+        assert!(events.try_recv().is_err(), "the topics bus is quiet");
+        let notice = changes_rx
+            .try_recv()
+            .expect("the rename is announced to the session stream");
+        assert_eq!(notice.session_id, "test");
         assert_eq!(
-            events.try_recv().expect("the rename is announced"),
-            crate::ui_event_bus::UiEventTopics::SESSION_ISSUES
+            notice.kind,
+            crate::daemon::session_events::SessionChange::Issues
         );
     }
 
@@ -1478,5 +1648,450 @@ mod tests {
             }
             other => panic!("unexpected args: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+    use crate::issue::{IssueComment, RelatedIssue};
+
+    #[test]
+    fn a_detail_reads_as_its_fields_then_its_comments() {
+        let detail = IssueDetail {
+            number: 7,
+            title: "Crash".to_string(),
+            body: "\n  It crashes.  \n".to_string(),
+            state: IssueState::Open,
+            labels: vec!["bug".to_string(), "area: cli".to_string()],
+            comments: vec![
+                IssueComment {
+                    id: 1,
+                    author: Some("lexoliu".to_string()),
+                    body: "first".to_string(),
+                    created_at: "2026-01-01".to_string(),
+                },
+                IssueComment {
+                    id: 2,
+                    author: None,
+                    body: "second".to_string(),
+                    created_at: "2026-01-02".to_string(),
+                },
+            ],
+            sub_issues: Vec::new(),
+            blocked_by: vec![RelatedIssue {
+                repository: None,
+                number: 3,
+                title: "Other".to_string(),
+                state: IssueState::Closed,
+            }],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+        let marks = IssueMarks {
+            created_in: Some("session-1".to_string()),
+            comment_ids: vec![2],
+        };
+        assert_eq!(
+            render_detail(&detail, Some(&marks), None),
+            "#7 Crash
+state: open
+written by may: yes (session session-1)
+labels: bug, area: cli
+blocked-by: #3 (closed)
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-02T00:00:00Z
+
+It crashes.
+
+comments (2):
+- [2026-01-01] lexoliu [not written by may] first
+- [2026-01-02] [written by may] second
+"
+        );
+        assert_eq!(
+            render_detail(
+                &IssueDetail {
+                    body: String::new(),
+                    labels: Vec::new(),
+                    comments: Vec::new(),
+                    blocked_by: Vec::new(),
+                    ..detail
+                },
+                None,
+                None
+            ),
+            "#7 Crash
+state: open
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-02T00:00:00Z
+"
+        );
+    }
+}
+
+#[cfg(test)]
+mod publish_review_tests {
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use aither_core::llm::{
+        Event, LLMRequest, LanguageModel, Tool, ToolContext,
+        model::{Parameters, Profile},
+    };
+    use futures::Stream;
+
+    use crate::agent::ModelSlot;
+    use crate::db::ChatDb;
+    use crate::harness::publish_review::{LocalEnvironment, PublishReview};
+    use crate::issue::{
+        CommentedIssue, IssueBackendInfo, IssueDetail, IssueError, IssueKind, IssueListState,
+        IssueRelationKind, IssueState, IssueStatus, IssueStore, IssueSummary, MayIssueStore,
+        provenance::IssueProvenance,
+    };
+
+    use super::{IssueArgs, IssueTool};
+
+    #[derive(Debug, Clone)]
+    struct MockGitHubStore {
+        inner: MayIssueStore,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl IssueStore for MockGitHubStore {
+        fn info(&self) -> IssueBackendInfo {
+            IssueBackendInfo {
+                name: "github",
+                repository: Some("o/r".to_string()),
+            }
+        }
+
+        fn search_key(&self) -> String {
+            self.inner.search_key()
+        }
+
+        fn owned_by_user(&self) -> impl Future<Output = Result<bool, IssueError>> + Send {
+            std::future::ready(Ok(true))
+        }
+
+        fn opened_by_user(
+            &self,
+            _number: i64,
+        ) -> impl Future<Output = Result<bool, IssueError>> + Send {
+            std::future::ready(Ok(true))
+        }
+
+        fn updated_since(
+            &self,
+            since: Option<&str>,
+            limit: i64,
+        ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send {
+            self.inner.updated_since(since, limit)
+        }
+
+        async fn create(
+            &self,
+            title: &str,
+            body: &str,
+            labels: &[String],
+        ) -> Result<IssueDetail, IssueError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.create(title, body, labels).await
+        }
+
+        fn get(&self, number: i64) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send {
+            self.inner.get(number)
+        }
+
+        fn status(
+            &self,
+            number: i64,
+        ) -> impl Future<Output = Result<IssueStatus, IssueError>> + Send {
+            self.inner.status(number)
+        }
+
+        fn list(
+            &self,
+            state: IssueListState,
+            labels: &[String],
+            limit: i64,
+        ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send {
+            self.inner.list(state, labels, limit)
+        }
+
+        async fn edit(
+            &self,
+            number: i64,
+            title: Option<&str>,
+            body: Option<&str>,
+            state: Option<IssueState>,
+        ) -> Result<IssueDetail, IssueError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.edit(number, title, body, state).await
+        }
+
+        async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.comment(number, body).await
+        }
+
+        fn edit_labels(
+            &self,
+            number: i64,
+            add: &[String],
+            remove: &[String],
+        ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send {
+            self.inner.edit_labels(number, add, remove)
+        }
+
+        fn edit_relation(
+            &self,
+            number: i64,
+            kind: IssueRelationKind,
+            target_number: i64,
+            add: bool,
+        ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send {
+            self.inner.edit_relation(number, kind, target_number, add)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedModel {
+        reply: Arc<str>,
+        calls: Arc<AtomicUsize>,
+        captured: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("mock model error")]
+    struct MockModelError;
+
+    impl aither_core::llm::Classify for MockModelError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
+    impl LanguageModel for ScriptedModel {
+        type Error = MockModelError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.captured.lock().unwrap().push(format!("{request:?}"));
+            let reply = self.reply.to_string();
+            futures_lite::stream::iter([Ok(Event::Text(reply))])
+        }
+
+        fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
+            std::future::ready(Ok(Profile::new(
+                "mock",
+                "test",
+                "fast",
+                "fast mock",
+                100_000,
+            )))
+        }
+    }
+
+    const SECRET: &str = "provider-secret-value-987654";
+
+    fn scripted_review(reply: &str) -> (PublishReview, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel {
+            reply: Arc::from(reply),
+            calls: calls.clone(),
+            captured: captured.clone(),
+        };
+        let env = LocalEnvironment {
+            system_hosts: vec!["lexos-workstation.local".to_string()],
+            local_hosts: vec!["Lexos-Workstation".to_string()],
+            tailscale_hosts: vec!["lexo-ts.tail123.ts.net".to_string()],
+            home_dirs: vec![PathBuf::from("/Users/lexotest")],
+        };
+        let review = PublishReview::for_slot(ModelSlot::new(model, Parameters::default()), env)
+            .with_credential("OPENAI_API_KEY", SECRET);
+        (review, calls, captured)
+    }
+
+    #[tokio::test]
+    async fn publish_review_gates_github_issue_create_edit_and_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChatDb::open(&dir.path().join("history.db")).await.unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let store = MockGitHubStore {
+            inner: MayIssueStore::new(db.clone(), "s1".to_string()),
+            writes: writes.clone(),
+        };
+
+        // 1. Passing review publishes create, edit (title/body), and comment.
+        let (pass_review, pass_calls, pass_captured) =
+            scripted_review(r#"{"decision":"publish","findings":[]}"#);
+        let pass_tool = IssueTool::new(
+            store.clone(),
+            IssueProvenance::new(db.clone(), "s1".to_string()),
+        )
+        .with_publish_review(pass_review);
+
+        pass_tool
+            .call(
+                IssueArgs::Create {
+                    kind: IssueKind::Bug,
+                    title: "Fix null deref in parser".to_string(),
+                    body: Some("Check the token slice before indexing.".to_string()),
+                    labels: Vec::new(),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("clean create passes");
+        pass_tool
+            .call(
+                IssueArgs::Edit {
+                    number: 1,
+                    title: Some("Fix empty slice handling in parser".to_string()),
+                    body: None,
+                    state: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("clean edit passes");
+        pass_tool
+            .call(
+                IssueArgs::Comment {
+                    number: 1,
+                    body: "Reproduced with an empty input file.".to_string(),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("clean comment passes");
+        // State-only edit sends no authored text and needs no model call.
+        pass_tool
+            .call(
+                IssueArgs::Edit {
+                    number: 1,
+                    title: None,
+                    body: None,
+                    state: Some(IssueState::Closed),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("state-only edit succeeds");
+        assert_eq!(pass_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+        assert_eq!(pass_captured.lock().unwrap().len(), 3);
+
+        // 2. Model refusal blocks create, edit, and comment with findings.
+        let (refuse_review, refuse_calls, _) = scripted_review(
+            r#"{"decision":"refuse","findings":["remove working-process narration"]}"#,
+        );
+        let refuse_tool = IssueTool::new(
+            store.clone(),
+            IssueProvenance::new(db.clone(), "s1".to_string()),
+        )
+        .with_publish_review(refuse_review);
+
+        for args in [
+            IssueArgs::Create {
+                kind: IssueKind::Bug,
+                title: "Session log".to_string(),
+                body: Some("During the previous turn I noticed this.".to_string()),
+                labels: Vec::new(),
+            },
+            IssueArgs::Edit {
+                number: 1,
+                title: None,
+                body: Some("Updated after running subagent check.".to_string()),
+                state: None,
+            },
+            IssueArgs::Comment {
+                number: 1,
+                body: "Checking from this session now.".to_string(),
+            },
+        ] {
+            let err = refuse_tool
+                .call(args, ToolContext::new())
+                .await
+                .expect_err("model refusal stops publish");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("remove working-process narration"),
+                "missing findings: {msg}"
+            );
+        }
+        assert_eq!(refuse_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+
+        // 3. Credentials, shaped keys, host names, and home dirs refuse before any model call.
+        let (precheck_review, precheck_calls, _) =
+            scripted_review(r#"{"decision":"publish","findings":[]}"#);
+        let precheck_tool =
+            IssueTool::new(store, IssueProvenance::new(db.clone(), "s1".to_string()))
+                .with_publish_review(precheck_review);
+
+        let blocked_payloads = [
+            IssueArgs::Create {
+                kind: IssueKind::Bug,
+                title: "Auth failure".to_string(),
+                body: Some(format!("Using key {SECRET} failed.")),
+                labels: Vec::new(),
+            },
+            IssueArgs::Edit {
+                number: 1,
+                title: Some("Host lexos-workstation.local unreachable".to_string()),
+                body: None,
+                state: None,
+            },
+            IssueArgs::Comment {
+                number: 1,
+                body: "Trace came from /Users/lexotest/src/main.rs and sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+                    .to_string(),
+            },
+        ];
+        for args in blocked_payloads {
+            let err = precheck_tool
+                .call(args, ToolContext::new())
+                .await
+                .expect_err("precheck stops leak");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains(SECRET),
+                "refusal must not repeat raw credential: {msg}"
+            );
+        }
+        assert_eq!(precheck_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+
+        // 4. Local `may` issues bypass publish review even if the fast model refuses everything.
+        let (local_refuse, local_calls, _) =
+            scripted_review(r#"{"decision":"refuse","findings":["blocked"]}"#);
+        let may_tool = IssueTool::new(
+            MayIssueStore::new(db.clone(), "s1".to_string()),
+            IssueProvenance::new(db, "s1".to_string()),
+        )
+        .with_publish_review(local_refuse);
+        may_tool
+            .call(
+                IssueArgs::Create {
+                    kind: IssueKind::Bug,
+                    title: "Local note".to_string(),
+                    body: Some("Runs on lexos-workstation.local under /Users/lexotest".to_string()),
+                    labels: Vec::new(),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("may-local issue skips outbound review");
+        assert_eq!(local_calls.load(Ordering::SeqCst), 0);
     }
 }

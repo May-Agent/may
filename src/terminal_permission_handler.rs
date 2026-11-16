@@ -1,22 +1,42 @@
+use std::future::Future;
 use std::sync::Arc;
 
-use aither_sandbox::TerminalMode;
-use aither_sandbox::permission::{NoopPermissionHandler, PermissionError, PermissionHandler};
+use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
+use aither_sandbox::{DomainApprover, DomainRequest};
+use arc_swap::ArcSwap;
 
 use crate::agent::PermissionApprover;
+use crate::agent::permission::{PermissionError, SSH_KIND, UNSANDBOXED_KIND};
+use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::SessionRuntimeService;
 use crate::ui_event_bus::UiEventTopics;
 
-/// Permission handler for terminal commands: routes approval requests to
-/// the interactive approver and enforces the session's network policy.
+/// How the first command on an SSH server is decided.
+#[derive(Debug, Clone)]
+enum SshLocations {
+    /// No server is approved.
+    Deny,
+    /// Every server is approved.
+    Allow,
+    /// The session's user is asked; a subagent's request goes through the
+    /// same session, so the main agent's user answers for it.
+    Ask(Arc<MaySshAuthorizer>),
+}
+
+/// What decides a session's approvals and its network connections.
+///
+/// The [`Approver`] answers scripts that leave the sandbox, and the
+/// [`DomainApprover`] enforces the network policy and audits every
+/// connection.
 #[derive(Debug, Clone)]
 pub struct TerminalPermissionHandler {
+    ssh: SshLocations,
     approver: Option<PermissionApprover>,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
-    network_policy: Option<CompiledNetworkPolicy>,
+    network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     profile_id: Option<String>,
     source: NetworkAccessSource,
 }
@@ -37,30 +57,67 @@ impl TerminalPermissionHandler {
             .and_then(PermissionApprover::session_id)
             .map(str::to_string);
         Self {
+            ssh: SshLocations::Deny,
             approver,
             runtime_service,
             session_id,
-            network_policy,
+            network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
             profile_id,
             source: NetworkAccessSource::Chat,
         }
     }
 
+    /// Ask the user through `authorizer` before the first command on an SSH
+    /// server.
+    #[must_use]
+    pub fn with_ssh_authorizer(mut self, authorizer: Arc<MaySshAuthorizer>) -> Self {
+        self.ssh = SshLocations::Ask(authorizer);
+        self
+    }
+
     /// Create the handler used for one-shot `may exec` runs.
     #[must_use]
-    pub const fn for_exec(
+    pub fn for_exec(
         session_id: String,
         runtime_service: Arc<SessionRuntimeService>,
         network_policy: Option<CompiledNetworkPolicy>,
         profile_id: Option<String>,
     ) -> Self {
         Self {
+            ssh: SshLocations::Allow,
             approver: None,
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
-            network_policy,
+            network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
             profile_id,
             source: NetworkAccessSource::Exec,
+        }
+    }
+
+    /// Replaces the live outbound network policy used by subsequent requests.
+    pub fn set_network_policy(&self, policy: Option<CompiledNetworkPolicy>) {
+        self.network_policy.store(Arc::new(policy));
+    }
+
+    /// The handler a subagent's approvals go through: the same session's
+    /// user answers, under the subagent's own deadline and agent id.
+    #[must_use]
+    pub fn for_subagent(&self) -> Self {
+        Self {
+            approver: self.approver.clone().map(PermissionApprover::for_subagent),
+            ..self.clone()
+        }
+    }
+
+    /// Whether a script on an SSH server is asked about now: the session's
+    /// user is asked and its yolo switch is off.
+    pub async fn will_wait_for_location(&self) -> bool {
+        match &self.ssh {
+            SshLocations::Deny | SshLocations::Allow => false,
+            SshLocations::Ask(authorizer) => authorizer.will_ask().await.unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to read the session yolo switch");
+                false
+            }),
         }
     }
 
@@ -110,73 +167,75 @@ impl TerminalPermissionHandler {
                     domain,
                     port,
                     allowed,
-                    source = %self.source,
                     error = %error,
                     "failed to append network audit log"
                 );
             }
         }
     }
+
+    async fn authorize_server(&self, target: &str) -> Result<bool, PermissionError> {
+        match &self.ssh {
+            SshLocations::Deny => Ok(false),
+            SshLocations::Allow => Ok(true),
+            SshLocations::Ask(authorizer) => authorizer.authorize_connect(target).await,
+        }
+    }
 }
 
-impl PermissionHandler for TerminalPermissionHandler {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        match &self.approver {
-            Some(approver) => approver.check(mode, script).await,
-            None => NoopPermissionHandler.check(mode, script).await,
+impl Approver for TerminalPermissionHandler {
+    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        match request.kind().as_str() {
+            UNSANDBOXED_KIND => match &self.approver {
+                Some(approver) => approver.approve(request).await,
+                None => Ok(Approval::Approved),
+            },
+            SSH_KIND => {
+                let target = request.reason().unwrap_or_default();
+                match self.authorize_server(target).await {
+                    Ok(true) => Ok(Approval::Approved),
+                    Ok(false) => Ok(Approval::Denied {
+                        reason: format!("running on `{target}` was not approved"),
+                    }),
+                    Err(error) => Err(ApproverFailure::new(error)),
+                }
+            }
+            other => Ok(Approval::Denied {
+                reason: format!("nothing approves a `{other}` request here"),
+            }),
         }
     }
+}
 
-    async fn check_domain(&self, domain: &str, port: u16) -> bool {
-        if let Some(policy) = &self.network_policy {
-            let allowed_by_policy = policy.allows_domain(domain);
-            tracing::info!(
-                domain,
-                port,
-                mode = %policy.mode().as_str(),
-                allowed_by_policy,
-                "network policy evaluation for outbound domain"
-            );
-            self.append_network_audit_log(
-                domain,
-                port,
-                allowed_by_policy,
-                Some(policy.mode().as_str()),
-            )
-            .await;
-            if !allowed_by_policy {
-                return false;
+impl DomainApprover for TerminalPermissionHandler {
+    fn approve(&self, request: &DomainRequest) -> impl Future<Output = bool> + Send {
+        let (domain, port) = (request.host.clone(), request.port);
+        async move {
+            let network_policy = self.network_policy.load();
+            if let Some(policy) = network_policy.as_ref().as_ref() {
+                let allowed_by_policy = policy.allows_domain(&domain);
+                tracing::info!(
+                    domain,
+                    port,
+                    mode = %policy.mode().as_str(),
+                    allowed_by_policy,
+                    "network policy evaluation for outbound domain"
+                );
+                self.append_network_audit_log(
+                    &domain,
+                    port,
+                    allowed_by_policy,
+                    Some(policy.mode().as_str()),
+                )
+                .await;
+                if !allowed_by_policy {
+                    return false;
+                }
             }
-        }
-
-        let allowed = match &self.approver {
-            Some(approver) => approver.check_domain(domain, port).await,
-            None => NoopPermissionHandler.check_domain(domain, port).await,
-        };
-        self.append_network_audit_log(domain, port, allowed, None)
-            .await;
-        allowed
-    }
-
-    fn for_subagent(&self) -> Option<Self> {
-        self.approver.as_ref().map(|approver| Self {
-            approver: Some(approver.clone().for_subagent()),
-            runtime_service: self.runtime_service.clone(),
-            session_id: self.session_id.clone(),
-            network_policy: self.network_policy.clone(),
-            profile_id: self.profile_id.clone(),
-            source: self.source,
-        })
-    }
-
-    async fn will_wait_for_approval(&self, mode: TerminalMode, script: &str) -> bool {
-        match &self.approver {
-            Some(approver) => approver.will_wait_for_approval(mode, script).await,
-            None => {
-                NoopPermissionHandler
-                    .will_wait_for_approval(mode, script)
-                    .await
-            }
+            // The approval of the user is not asked per connection.
+            self.append_network_audit_log(&domain, port, true, None)
+                .await;
+            true
         }
     }
 }

@@ -9,8 +9,7 @@
 //! [`ProfileEnvironment::Container`]. Remote SSH servers are attached
 //! separately via the `profile_remote_servers` junction table and referenced
 //! through [`ProfileInfo::remote_attachments`]; the agent reaches them by
-//! invoking the `terminal` tool with `mode: "ssh"` and
-//! `ssh_server_id: <name>`.
+//! invoking the `terminal` tool with `location: <name>`.
 
 use crate::db::ChatDb;
 use crate::db::entity::profiles;
@@ -168,6 +167,9 @@ pub struct ProfileInfo {
     /// attached to this profile as auxiliary environments. Ordered by
     /// `profile_remote_servers.sort_order`.
     pub remote_attachments: Vec<String>,
+    /// The cloud provider accounts the profile's machines are created in,
+    /// set up with `/cloud`.
+    pub cloud: crate::cloud::ProfileCloud,
 }
 
 impl ProfileInfo {
@@ -179,6 +181,7 @@ impl ProfileInfo {
         m: profiles::Model,
         preferences: Option<ProfilePreferences>,
         remote_attachments: Vec<String>,
+        cloud: crate::cloud::ProfileCloud,
     ) -> Result<Self, crate::db::ChatDbError> {
         let environment = match m.environment.as_str() {
             "container" => ProfileEnvironment::Container {
@@ -203,6 +206,7 @@ impl ProfileInfo {
             pinned_limit: m.pinned_limit,
             sort_order: m.sort_order,
             remote_attachments,
+            cloud,
         })
     }
 }
@@ -252,7 +256,7 @@ impl AsRef<ProfileEnvironment> for HomeEnvironment {
 /// Only `Local` and `Container` are valid home environments. SSH servers are
 /// attached via the `profile_remote_servers` junction table and exposed on
 /// [`ProfileInfo::remote_attachments`]; agents reach them by invoking the
-/// `terminal` tool with `mode: "ssh"` and `ssh_server_id: <name>` rather than
+/// `terminal` tool with `location: <name>` rather than
 /// by treating the whole profile as remote.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -427,9 +431,7 @@ pub async fn list_profiles(db: &ChatDb) -> Result<Vec<ProfileInfo>, crate::db::C
     let models = db.list_profiles().await?;
     let mut profiles = Vec::with_capacity(models.len());
     for model in models {
-        let preferences = db.load_profile_preferences(&model).await?;
-        let attachments = db.list_profile_remote_servers(&model.id).await?;
-        profiles.push(ProfileInfo::from_db_parts(model, preferences, attachments)?);
+        profiles.push(db.profile_info_from_model(model).await?);
     }
     Ok(profiles)
 }
@@ -448,7 +450,6 @@ mod tests {
             environment: environment.to_string(),
             container_id: None,
             persona: None,
-            remote_ssh_server_id: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
@@ -459,20 +460,17 @@ mod tests {
 
     #[test]
     fn profile_info_wraps_environment_as_home_environment() {
-        let info = ProfileInfo::from_db_parts(make_profile_model("local"), None, Vec::new())
-            .expect("local profile should deserialize");
+        let info = ProfileInfo::from_db_parts(
+            make_profile_model("local"),
+            None,
+            Vec::new(),
+            crate::cloud::ProfileCloud::default(),
+        )
+        .expect("local profile should deserialize");
 
         assert!(matches!(info.environment, HomeEnvironment(_)));
         assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));
         assert_eq!(info.environment.as_db_str(), "local");
         assert_eq!(info.remote_attachments, [] as [std::string::String; 0]);
-    }
-
-    #[test]
-    fn profile_info_rejects_legacy_remote_environment() {
-        let error = ProfileInfo::from_db_parts(make_profile_model("remote"), None, Vec::new())
-            .expect_err("legacy remote environment must not deserialize");
-        let message = error.to_string();
-        assert!(message.contains("remote"), "unexpected error: {message}");
     }
 }

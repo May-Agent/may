@@ -58,6 +58,9 @@ pub struct RunGates {
     pub claim: RunGate,
     /// Passed before the finish transaction starts.
     pub finish: RunGate,
+    /// While set, the next finish fails with a storage error, as a full
+    /// disk would make it.
+    pub fail_next_finish: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ChatDb {
@@ -125,7 +128,16 @@ impl ChatDb {
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn finish_session_run(&self, fence: &RunFence) -> Result<bool, ChatDbError> {
         #[cfg(test)]
-        self.run_gates.finish.hit().await;
+        {
+            self.run_gates.finish.hit().await;
+            if self
+                .run_gates
+                .fail_next_finish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ChatDbError::Storage("injected finish failure".to_string()));
+            }
+        }
         let mut tx = match self.begin_fenced(fence).await {
             Ok(tx) => tx,
             Err(ChatDbError::RunLost { .. }) => return Ok(false),

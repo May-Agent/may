@@ -1,13 +1,9 @@
 #![doc = "CI helper for the GHCR container images: print their content-addressed refs and stage the workspace build context."]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use may_agent::container::image_ref;
 use may_agent::container::stage::stage_workspace_context;
-
-/// Byte for byte the manifest `embedded_distribution` loads; it is one of the
-/// workspace reference's hash inputs.
-const TOOL_DISTRIBUTION: &[u8] = include_bytes!("../src/tools/tool-distribution-0.14.1.json");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,10 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Prints `base=<ref>` and `workspace=<ref>` for `$GITHUB_OUTPUT`.
 fn refs() -> Result<(), Box<dyn std::error::Error>> {
     let base = image_ref::base_image_ref(Path::new("container/base"))?;
+    // The manifest `embedded_distribution` loads, one of the reference's hash inputs.
+    let distribution = may_agent::tools::manifest::combined_manifest_bytes()?;
     let workspace = image_ref::workspace_image_ref(
         Path::new("container/workspace"),
         &base,
-        TOOL_DISTRIBUTION,
+        &distribution,
+        Path::new("."),
         env!("MAY_HEEL_LIB_VERSION"),
     )?;
     println!("base={base}");
@@ -37,13 +36,34 @@ fn refs() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Builds the `tasks` binary for the host architecture, which is the image's.
+fn build_tasks() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "--locked", "-p", "may-tasks", "--bin", "tasks"])
+        .status()?;
+    if !status.success() {
+        return Err(format!("building the tasks binary failed: {status}").into());
+    }
+    // `<target>/<profile>/examples/container_image` sits beside `<target>/<profile>/tasks`.
+    let example = std::env::current_exe()?;
+    let profile = example
+        .ancestors()
+        .nth(2)
+        .ok_or("the example is not under <target>/<profile>/examples")?;
+    Ok(profile.join("tasks"))
+}
+
 /// Stages the generated workspace context entries for a Linux architecture:
-/// the baseline tools under `<context>/tools/<cache key>/bin` and the managed
-/// Linux `heel` binary at `<context>/heel`.
+/// the baseline tools under `<context>/tools/<cache key>/bin`, the managed
+/// Linux `heel` binary at `<context>/heel` and the `tasks` command at
+/// `<context>/tasks`.
 async fn stage(arch: &str, context: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::tempdir()?;
-    let staged = stage_workspace_context(arch, context, scratch.path()).await?;
+    let tasks = build_tasks()?;
+    let staged = stage_workspace_context(arch, context, scratch.path(), &tasks).await?;
     println!("tools={}", staged.display());
     println!("heel={}", context.join("heel").display());
+    println!("tasks={}", context.join("tasks").display());
     Ok(())
 }

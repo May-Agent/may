@@ -1,0 +1,1 @@
+A btw fork answers from its context alone and runs no command. Answer from what your context already holds.

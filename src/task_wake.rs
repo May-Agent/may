@@ -30,6 +30,9 @@ pub enum TaskWakeError {
         "task \"{0}\" was not created by a session, so there is no session to prompt; `wake` only works in tasks an agent created"
     )]
     NoSession(String),
+    /// The task was deleted while it ran.
+    #[error("task \"{0}\" was deleted, so its prompt is not delivered")]
+    Deleted(String),
     /// The runtime serving this run has no session queue.
     #[error("wake is unavailable in this runtime")]
     Unavailable,
@@ -114,8 +117,16 @@ impl SessionPrompts {
         task_name: &str,
         body: &str,
     ) -> Result<(), TaskWakeError> {
+        let word = self
+            .runtime_service
+            .db()
+            .get_scheduled_task(task_id)
+            .await?
+            .ok_or_else(|| TaskWakeError::Deleted(task_name.to_string()))?
+            .word
+            .expect("a task bound to a session is named by a word of its pool");
         let text = TaskPromptText {
-            task_id: AttributeText(task_id),
+            task_id: AttributeText(&word),
             task_name: AttributeText(task_name),
             body: UntrustedText(body),
         }

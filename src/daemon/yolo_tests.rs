@@ -6,18 +6,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::workspace_request::RequestWorkspaceArgs;
-use aither_sandbox::permission::{PermissionError, PermissionHandler};
-use aither_sandbox::{SshSessionAuthorizer, TerminalMode};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
+use aither_core::llm::{Approval, ApprovalKind, ApprovalRequest, Approver as _};
 use tempfile::TempDir;
 
 use super::state::WorkspaceApprover;
 use crate::agent::PermissionApprover;
+use crate::agent::permission::{SSH_KIND, UNSANDBOXED_KIND};
 use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{ChatDb, CreateScheduledTaskParams};
 use crate::session::SessionRuntimeService;
 use crate::task_trigger::PersistedTaskTrigger;
+use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::ui_event_bus::UiEventBus;
+
+/// A request to run `script` outside the sandbox.
+fn unsandboxed(script: &str) -> ApprovalRequest {
+    ApprovalRequest::new(ApprovalKind::new(UNSANDBOXED_KIND), script)
+}
 
 struct Fixture {
     _dir: TempDir,
@@ -26,7 +32,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
@@ -34,9 +40,10 @@ impl Fixture {
         db.create_session("session", Some("Session"), Some("test-model"))
             .await
             .expect("create session");
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
             _dir: dir,
-            runtime: Arc::new(SessionRuntimeService::new(db, UiEventBus::new())),
+            runtime: Arc::new(SessionRuntimeService::new(db, UiEventBus::new(), home)),
         }
     }
 
@@ -71,19 +78,15 @@ async fn an_unsafe_command_runs_without_a_prompt_in_a_yolo_session() {
     let approver = fixture.approver();
 
     let granted = approver
-        .check(TerminalMode::Unsafe, "make install")
+        .approve(unsandboxed("make install"))
         .await
         .expect("granted");
 
-    assert!(granted);
+    assert!(matches!(granted, Approval::Approved), "{granted:?}");
     let runtime = fixture.runtime.get("session").await.expect("runtime");
     assert!(runtime.yolo);
     assert!(runtime.waiting_permission.is_none());
-    assert!(
-        !approver
-            .will_wait_for_approval(TerminalMode::Unsafe, "x")
-            .await
-    );
+    assert!(!approver.will_wait_for_approval().await);
     assert_eq!(fixture.history("permission_request").await, 1);
     assert_eq!(fixture.history("permission_response").await, 1);
 }
@@ -93,12 +96,13 @@ async fn a_subagent_of_a_yolo_session_is_granted_too() {
     let fixture = Fixture::new().await;
     fixture.yolo(true).await;
     let subagent = fixture.approver().for_subagent();
-    assert!(
+    assert!(matches!(
         subagent
-            .check(TerminalMode::Unsafe, "make install")
+            .approve(unsandboxed("make install"))
             .await
-            .expect("granted")
-    );
+            .expect("granted"),
+        Approval::Approved
+    ));
 }
 
 #[tokio::test]
@@ -106,43 +110,40 @@ async fn turning_yolo_off_makes_the_next_request_ask_again() {
     let fixture = Fixture::new().await;
     let approver = fixture.approver();
     fixture.yolo(true).await;
-    assert!(
+    assert!(matches!(
         approver
-            .check(TerminalMode::Unsafe, "first")
+            .approve(unsandboxed("first"))
             .await
-            .expect("granted")
-    );
+            .expect("granted"),
+        Approval::Approved
+    ));
 
     fixture.yolo(false).await;
-    let error = approver
-        .check(TerminalMode::Unsafe, "second")
+    let denied = approver
+        .approve(unsandboxed("second"))
         .await
-        .expect_err("nobody answers, so the request is denied");
-    let PermissionError::Denied(message) = error else {
-        panic!("expected a denial, got {error:?}");
+        .expect("a request nobody answers is denied");
+    let Approval::Denied { reason } = denied else {
+        panic!("expected a denial, got {denied:?}");
     };
-    assert!(message.contains("not answered"), "{message}");
+    assert!(reason.contains("not answered"), "{reason}");
     assert_eq!(fixture.history("permission_request").await, 2);
-    assert!(
-        approver
-            .will_wait_for_approval(TerminalMode::Unsafe, "x")
-            .await
-    );
+    assert!(approver.will_wait_for_approval().await);
 }
 
 #[tokio::test]
 async fn a_session_without_yolo_still_asks() {
     let fixture = Fixture::new().await;
     assert!(!fixture.runtime.get("session").await.expect("runtime").yolo);
-    let error = fixture
+    let denied = fixture
         .approver()
-        .check(TerminalMode::Unsafe, "make install")
+        .approve(unsandboxed("make install"))
         .await
-        .expect_err("unanswered");
-    let PermissionError::Denied(message) = error else {
-        panic!("expected a denial, got {error:?}");
+        .expect("an unanswered request is denied");
+    let Approval::Denied { reason } = denied else {
+        panic!("expected a denial, got {denied:?}");
     };
-    assert!(message.contains("not answered"), "{message}");
+    assert!(reason.contains("not answered"), "{reason}");
 }
 
 #[tokio::test]
@@ -151,17 +152,19 @@ async fn ssh_connect_is_granted_without_asking_in_a_yolo_session() {
     fixture.yolo(true).await;
     // Nothing drains the queue: asking would hang.
     let (broker, _queue) = crate::ask_user::channel();
-    let authorizer = MaySshAuthorizer::new("session", broker, fixture.runtime.db());
+    let handler = TerminalPermissionHandler::for_agent(None, None, None).with_ssh_authorizer(
+        MaySshAuthorizer::new("session", broker, fixture.runtime.db()),
+    );
+    assert!(!handler.will_wait_for_location().await);
 
-    let granted = tokio::time::timeout(
-        Duration::from_secs(10),
-        authorizer.authorize_connect("user@host"),
-    )
-    .await
-    .expect("did not ask")
-    .expect("authorized");
+    let request =
+        ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "make").with_reason("user@host");
+    let granted = tokio::time::timeout(Duration::from_secs(10), handler.approve(request))
+        .await
+        .expect("did not ask")
+        .expect("authorized");
 
-    assert!(granted);
+    assert!(matches!(granted, Approval::Approved), "{granted:?}");
     assert_eq!(fixture.history("permission_response").await, 1);
 }
 
@@ -249,4 +252,166 @@ async fn a_task_created_without_yolo_stays_unapproved() {
 
     assert_eq!(unchanged, created);
     assert!(!unchanged.approved);
+}
+
+fn selected_answer(option: &str) -> Vec<crate::ask_user::QuestionAnswer> {
+    vec![crate::ask_user::QuestionAnswer {
+        section: String::new(),
+        answer: crate::ask_user::AnswerValue::Selected(vec![option.to_string()]),
+    }]
+}
+
+#[tokio::test]
+async fn ssh_connect_offers_three_options_and_approve_once_asks_again() {
+    let fixture = Fixture::new().await;
+    let (broker, requests) = crate::ask_user::channel();
+    let handler = TerminalPermissionHandler::for_agent(None, None, None).with_ssh_authorizer(
+        MaySshAuthorizer::new("session", broker, fixture.runtime.db()),
+    );
+    assert!(handler.will_wait_for_location().await);
+
+    let responder = tokio::spawn(async move {
+        let first = requests.next().await.expect("first ssh ask");
+        assert_eq!(
+            first.args.request.option,
+            vec!["Approve", "Always allow for session", "Deny"]
+        );
+        first
+            .respond(selected_answer("Approve"))
+            .expect("respond first");
+
+        let second = requests.next().await.expect("second ssh ask");
+        assert_eq!(
+            second.args.request.option,
+            vec!["Approve", "Always allow for session", "Deny"]
+        );
+        second
+            .respond(selected_answer("Deny"))
+            .expect("respond second");
+    });
+
+    let first_req =
+        ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "uname").with_reason("ops@prod");
+    assert!(matches!(
+        handler.approve(first_req).await.expect("decided"),
+        Approval::Approved
+    ));
+
+    let second_req =
+        ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "uname").with_reason("ops@prod");
+    assert!(matches!(
+        handler.approve(second_req).await.expect("decided"),
+        Approval::Denied { .. }
+    ));
+
+    responder.await.expect("responder");
+}
+
+#[tokio::test]
+async fn ssh_connect_always_allow_remembers_per_session_and_across_rebuilds() {
+    let fixture = Fixture::new().await;
+    let db = fixture.runtime.db();
+    db.create_session("other-session", Some("Other"), Some("test-model"))
+        .await
+        .expect("other session");
+
+    let (broker, requests) = crate::ask_user::channel();
+    let handler = TerminalPermissionHandler::for_agent(None, None, None)
+        .with_ssh_authorizer(MaySshAuthorizer::new("session", broker, db.clone()));
+
+    let responder = tokio::spawn(async move {
+        let first = requests.next().await.expect("initial ask");
+        first
+            .respond(selected_answer("Always allow for session"))
+            .expect("respond initial");
+        // Only one ask should occur for "session" regardless of subsequent calls
+        // or rebuilt authorizers; "other-session" uses its own channel below.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), requests.next())
+                .await
+                .is_err(),
+            "unexpected extra prompt for session grant"
+        );
+    });
+
+    let req = ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "ls").with_reason("ops@prod");
+    assert!(matches!(
+        handler.approve(req.clone()).await.expect("first"),
+        Approval::Approved
+    ));
+    // Cached in memory on same authorizer.
+    assert!(matches!(
+        handler.approve(req.clone()).await.expect("cached"),
+        Approval::Approved
+    ));
+
+    // Rebuilt authorizer reads ChatDb session grant.
+    let (rebuilt_broker, _rebuilt_requests) = crate::ask_user::channel();
+    let rebuilt_handler = TerminalPermissionHandler::for_agent(None, None, None)
+        .with_ssh_authorizer(MaySshAuthorizer::new("session", rebuilt_broker, db.clone()));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), rebuilt_handler.approve(req.clone()))
+            .await
+            .expect("did not ask after rebuild")
+            .expect("rebuilt"),
+        Approval::Approved
+    ));
+    responder.await.expect("responder");
+
+    // Another session still prompts.
+    let (other_broker, other_requests) = crate::ask_user::channel();
+    let other_handler = TerminalPermissionHandler::for_agent(None, None, None)
+        .with_ssh_authorizer(MaySshAuthorizer::new("other-session", other_broker, db));
+    let other_responder = tokio::spawn(async move {
+        let ask = other_requests.next().await.expect("other session asks");
+        assert_eq!(ask.args.session_id, "other-session");
+        ask.respond(selected_answer("Deny")).expect("respond other");
+    });
+    assert!(matches!(
+        other_handler.approve(req).await.expect("other"),
+        Approval::Denied { .. }
+    ));
+    other_responder.await.expect("other responder");
+}
+
+#[tokio::test]
+async fn subagent_ssh_connect_routes_through_main_session_and_shares_grants() {
+    let fixture = Fixture::new().await;
+    let (broker, requests) = crate::ask_user::channel();
+    let main_handler = TerminalPermissionHandler::for_agent(None, None, None).with_ssh_authorizer(
+        MaySshAuthorizer::new("session", broker, fixture.runtime.db()),
+    );
+    let subagent_handler = main_handler.for_subagent();
+
+    let responder = tokio::spawn(async move {
+        let ask = requests.next().await.expect("subagent routes through main");
+        assert_eq!(ask.args.session_id, "session");
+        assert_eq!(
+            ask.args.request.option,
+            vec!["Approve", "Always allow for session", "Deny"]
+        );
+        ask.respond(selected_answer("Always allow for session"))
+            .expect("respond subagent");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), requests.next())
+                .await
+                .is_err(),
+            "main handler should reuse grant from subagent"
+        );
+    });
+
+    let req =
+        ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "uname -a").with_reason("ops@buildbox");
+    assert!(matches!(
+        subagent_handler
+            .approve(req.clone())
+            .await
+            .expect("subagent approved"),
+        Approval::Approved
+    ));
+    assert!(matches!(
+        main_handler.approve(req).await.expect("main reuses grant"),
+        Approval::Approved
+    ));
+    responder.await.expect("responder");
 }

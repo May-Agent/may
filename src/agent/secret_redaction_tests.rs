@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use aither_agent::{Agent, AgentEvent};
 use aither_core::llm::{Tool, ToolResult};
@@ -25,9 +26,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use super::hooks::SecretRedactionHook;
+use super::hooks::MayHooks;
 use super::provider::{ProviderLlm, RedactedModel};
-use crate::secrets::SecretRedactor;
+use crate::command_policy::RefusedReads;
+use crate::harness::compact_tool::CompactSignal;
+use crate::repo_clone::test_sandbox::TestTerminal;
+use crate::secrets::{SecretRedactor, SecretStore};
+use crate::session::SessionId;
 
 const MODEL: &str = "test-model";
 const SECRET_NAME: &str = "DEPLOY_TOKEN";
@@ -151,7 +156,8 @@ fn model(base_url: &str, redactor: SecretRedactor) -> ProviderLlm {
                 .no_retry()
                 .build()
                 .with_chat_completions_api(),
-        ),
+        )
+        .into(),
         redactor,
     )
 }
@@ -184,12 +190,27 @@ fn assert_name_not_value(traffic: &[String]) {
 /// name.
 #[tokio::test]
 async fn main_agent_tool_result_carries_the_name_not_the_value() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let (base_url, requests) = spawn_stub().await;
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
-    let mut agent = Agent::builder(model(&base_url, redactor.clone()))
+    let dir = tempfile::tempdir().expect("session root");
+    let terminal = TestTerminal::new(dir.path()).await;
+    let hooks = MayHooks {
+        runtime: None,
+        session_id: SessionId::from_string("amber-river"),
+        redactor: redactor.clone(),
+        refused: RefusedReads::default(),
+        jobs: terminal.shell().jobs(),
+        valve: Arc::new(CompactSignal::default()),
+        compaction: Arc::new(AtomicBool::new(false)),
+        loops: crate::agent::loop_watch::LoopWatch::new(crate::agent::LoopLimits::default()),
+        vision_ocr: crate::vision_ocr::VisionOcr::new(),
+        call_images: crate::ipc::CallImageStore::default(),
+        outputs_dir: dir.path().to_path_buf(),
+    };
+    let mut agent = Agent::builder(model(&base_url, redactor))
         .tool(LeakTool)
-        .hook(SecretRedactionHook::new(redactor))
+        .hooks(hooks)
         .build();
 
     let mut published = Vec::new();
@@ -199,8 +220,8 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
             &mut published,
             std::future::pending::<()>(),
             |published, timed| async move {
-                if let AgentEvent::ToolCallEnd { result, .. } = &timed.event {
-                    published.push(format!("{result:?}"));
+                if let AgentEvent::ToolCallEnded { result, .. } = &timed.event {
+                    published.push(result.render_for_model());
                 }
                 ControlFlow::Continue(published)
             },
@@ -223,7 +244,7 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
 /// built: its model still never sends the value.
 #[tokio::test]
 async fn subagent_request_carries_the_name_not_the_value() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    crate::test_support::install_global_executor();
     let (base_url, requests) = spawn_stub().await;
     let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
     let mut agent = Agent::builder(model(&base_url, redactor))
@@ -239,4 +260,78 @@ async fn subagent_request_carries_the_name_not_the_value() {
         .expect("the run finishes");
 
     assert_name_not_value(&provider_traffic(&requests).await);
+}
+
+/// A redactor over a store whose names index exists and is not valid.
+fn broken_redactor(dir: &tempfile::TempDir) -> SecretRedactor {
+    std::fs::write(dir.path().join("secrets.json"), "{ not json").expect("write the index");
+    SecretRedactor::over(SecretStore::in_memory(dir.path()), None)
+}
+
+/// A broken index fails the request before it is sent: the provider sees
+/// nothing, rather than a request redacted against no secrets.
+#[tokio::test]
+async fn a_broken_secrets_index_sends_no_request() {
+    use aither_core::LanguageModel;
+    use futures_lite::StreamExt;
+
+    crate::test_support::install_global_executor();
+    let (base_url, requests) = spawn_stub().await;
+    let dir = tempfile::tempdir().expect("secrets root");
+    let llm = model(&base_url, broken_redactor(&dir));
+
+    let request = aither_core::llm::LLMRequest::new(vec![aither_core::llm::Message::user(
+        format!("token={SECRET_VALUE}"),
+    )]);
+    let mut stream = std::pin::pin!(llm.respond(request));
+    let first = stream.next().await.expect("the stream reports the failure");
+    assert!(
+        matches!(first, Err(super::provider::RedactedError::Secrets(_))),
+        "the request fails on the secrets"
+    );
+    assert!(stream.next().await.is_none());
+    assert_eq!(provider_traffic(&requests).await, [] as [String; 0]);
+}
+
+/// A broken index ends the run at the first tool result instead of showing
+/// the model the unredacted output.
+#[tokio::test]
+async fn a_broken_secrets_index_ends_the_run_before_the_tool_result_is_shown() {
+    crate::test_support::install_global_executor();
+    let (base_url, requests) = spawn_stub().await;
+    let dir = tempfile::tempdir().expect("secrets root");
+    let session = tempfile::tempdir().expect("session root");
+    let terminal = TestTerminal::new(session.path()).await;
+    let hooks = MayHooks {
+        runtime: None,
+        session_id: SessionId::from_string("amber-river"),
+        redactor: broken_redactor(&dir),
+        refused: RefusedReads::default(),
+        jobs: terminal.shell().jobs(),
+        valve: Arc::new(CompactSignal::default()),
+        compaction: Arc::new(AtomicBool::new(false)),
+        loops: crate::agent::loop_watch::LoopWatch::new(crate::agent::LoopLimits::default()),
+        vision_ocr: crate::vision_ocr::VisionOcr::new(),
+        call_images: crate::ipc::CallImageStore::default(),
+        outputs_dir: session.path().to_path_buf(),
+    };
+    let redactor = SecretRedactor::fixed(&[(SECRET_NAME, SECRET_VALUE)]);
+    let mut agent = Agent::builder(model(&base_url, redactor))
+        .tool(LeakTool)
+        .hooks(hooks)
+        .build();
+
+    let result = agent
+        .run("print the token", std::iter::empty())
+        .drive((), std::future::pending::<()>(), |(), _| async {
+            ControlFlow::Continue(())
+        })
+        .await;
+
+    let error = format!("{:?}", result.err());
+    assert!(error.contains("secrets.json"), "{error}");
+    let traffic = provider_traffic(&requests).await;
+    assert_eq!(traffic.len(), 1, "the tool result never reached the model");
+    let history = format!("{:?}", agent.history());
+    assert!(!history.contains(SECRET_VALUE), "stored context: {history}");
 }

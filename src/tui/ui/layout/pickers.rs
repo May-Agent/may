@@ -5,10 +5,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Clear, List, ListItem, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
+use super::super::band::panel;
 use jiff::Timestamp;
 
 use super::super::super::app::App;
@@ -29,8 +30,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
     // Build title with profile name
     let profile_label = app
         .current_profile_name()
-        .map(|n| format!(" [{n}]"))
-        .unwrap_or_default();
+        .map_or_default(|n| format!(" [{n}]"));
     let heading = match app.session_view {
         SessionView::Recent => "Sessions",
         SessionView::Archive => "Archived sessions",
@@ -46,10 +46,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
         )
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title)
+    let block = panel(Some(Span::raw(title)), Color::Cyan, app.band_bg)
         .title_alignment(ratatui::layout::Alignment::Left);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -165,6 +162,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 
         // Track section transitions for rendering headers
         let mut prev_section: Option<&str> = None;
+        let mut prev_repo: Option<&str> = None;
 
         for (display_idx, (_original_idx, summary)) in filtered
             .iter()
@@ -184,11 +182,8 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 
                 if prev_section != Some(section) {
                     if prev_section.is_some() {
-                        // Separator between sections
-                        session_lines.push(Line::from(Span::styled(
-                            "  ────────────────────────",
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        // Blank row between sections
+                        session_lines.push(Line::from(""));
                     }
                     // Section header
                     let header = match section {
@@ -222,6 +217,27 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )));
                     prev_section = Some(section);
+                    prev_repo = None;
+                }
+                // Regular sessions run in project groups: a header names the
+                // project, GitHub ones by `owner/repo` and local ones by path.
+                if section == "regular" && summary.repo.as_deref() != prev_repo {
+                    if let Some(repo) = summary.repo.as_deref() {
+                        let github = repo.starts_with("github:");
+                        session_lines.push(Line::from(vec![
+                            Span::styled(
+                                if github { "  GitHub " } else { "  " },
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                crate::session::project_label(repo),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                    prev_repo = summary.repo.as_deref();
                 }
             }
 
@@ -377,57 +393,65 @@ pub(super) fn render_search_preview(
     search: &str,
 ) {
     let query = search.to_lowercase();
-    let query_char_count = query.chars().count();
-    let content_lower = summary.content_preview.to_lowercase();
-    let Some(pos) = content_lower.find(&query) else {
+    let preview = summary.content_preview.as_str();
+    let Some(found) = find_case_insensitive(preview, &query) else {
         return;
     };
 
-    let start = summary.content_preview[..pos]
+    let start = preview[..found.start]
         .char_indices()
         .rev()
         .nth(20)
         .map_or(0, |(i, _)| i);
-    let end = summary.content_preview[pos..]
+    let end = preview[found.end..]
         .char_indices()
-        .nth(query_char_count + 40)
-        .map_or(summary.content_preview.len(), |(i, _)| pos + i);
-
-    let snippet = summary.content_preview[start..end].replace('\n', " ");
-    let snippet_lower = snippet.to_lowercase();
+        .nth(40)
+        .map_or(preview.len(), |(i, _)| found.end + i);
 
     let prefix = if start > 0 { "..." } else { "" };
-    let suffix = if end < summary.content_preview.len() {
-        "..."
-    } else {
-        ""
-    };
+    let suffix = if end < preview.len() { "..." } else { "" };
 
-    if let Some(match_pos) = snippet_lower.find(&query) {
-        let match_end = match_pos + query.len();
-        let before_match = snippet[..match_pos].to_string();
-        let matched = snippet[match_pos..match_end.min(snippet.len())].to_string();
-        let after_match = snippet[match_end.min(snippet.len())..].to_string();
+    let one_line = |part: &str| part.replace('\n', " ");
+    let before_match = one_line(&preview[start..found.start]);
+    let matched = one_line(&preview[found.clone()]);
+    let after_match = one_line(&preview[found.end..end]);
 
-        lines.push(Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(before_match, Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                matched,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::styled(after_match, Style::default().fg(Color::DarkGray)),
-            Span::styled(suffix.to_string(), Style::default().fg(Color::DarkGray)),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("    {prefix}{snippet}{suffix}"),
-            Style::default().fg(Color::DarkGray),
-        )));
+    lines.push(Line::from(vec![
+        Span::styled("    ", Style::default()),
+        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(before_match, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            matched,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(after_match, Style::default().fg(Color::DarkGray)),
+        Span::styled(suffix.to_string(), Style::default().fg(Color::DarkGray)),
+    ]));
+}
+
+/// Byte range in `haystack` of its first stretch whose lowercase form is
+/// `query_lower`. Lowercasing can change a text's byte length, so the match
+/// is searched on `haystack` itself and its range is a pair of char
+/// boundaries of it.
+fn find_case_insensitive(haystack: &str, query_lower: &str) -> Option<std::ops::Range<usize>> {
+    if query_lower.is_empty() {
+        return Some(0..0);
     }
+    for (from, _) in haystack.char_indices() {
+        let mut lowered = String::new();
+        for (offset, c) in haystack[from..].char_indices() {
+            lowered.extend(c.to_lowercase());
+            if lowered == query_lower {
+                return Some(from..from + offset + c.len_utf8());
+            }
+            if !query_lower.starts_with(&lowered) {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// Render profile selection popup.
@@ -435,10 +459,7 @@ pub(super) fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &A
     let popup_area = area;
     frame.render_widget(Clear, popup_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title("Switch Profile")
+    let block = panel(Some(Span::raw("Switch Profile")), Color::Cyan, app.band_bg)
         .title_alignment(ratatui::layout::Alignment::Left);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -539,12 +560,14 @@ pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App)
         Style::default().fg(Color::White)
     };
 
-    let search_input = Paragraph::new(input_text).style(input_style).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("Select File ({} matches)", picker.match_count())),
-    );
+    let search_input = Paragraph::new(input_text).style(input_style).block(panel(
+        Some(Span::raw(format!(
+            "Select File ({} matches)",
+            picker.match_count()
+        ))),
+        Color::Cyan,
+        app.band_bg,
+    ));
 
     frame.render_widget(search_input, chunks[0]);
     let caret_x =
@@ -571,18 +594,18 @@ pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App)
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Plain)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let list = List::new(items).block(panel(None::<Span>, Color::Cyan, app.band_bg));
 
     frame.render_widget(list, chunks[1]);
 }
 
 /// Render the `/resume-claude` session picker.
-pub(super) fn render_resume_picker(frame: &mut Frame, area: Rect, state: &ResumePickerState) {
+pub(super) fn render_resume_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ResumePickerState,
+    bg: Option<Color>,
+) {
     frame.render_widget(Clear, area);
 
     let filtered = state.filtered();
@@ -598,10 +621,7 @@ pub(super) fn render_resume_picker(frame: &mut Frame, area: Rect, state: &Resume
         )
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title)
+    let block = panel(Some(Span::raw(title)), Color::Cyan, bg)
         .title_alignment(ratatui::layout::Alignment::Left);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -678,9 +698,9 @@ pub(super) fn render_resume_picker(frame: &mut Frame, area: Rect, state: &Resume
                 Style::default().fg(Color::White)
             };
             let meta_style = Style::default().fg(Color::DarkGray);
-            let cwd = session.cwd.as_deref().map(display_cwd).unwrap_or_default();
+            let cwd = session.cwd.as_deref().map_or_default(display_cwd);
             let id_short: String = session.id.chars().take(8).collect();
-            let age = session.modified.map(relative_age).unwrap_or_default();
+            let age = session.modified.map_or_default(relative_age);
             lines.push(Line::from(vec![
                 Span::styled(
                     prefix,
@@ -776,6 +796,7 @@ pub(super) fn render_connect_picker(
     area: Rect,
     state: &ConnectState,
     spinner_frame: usize,
+    bg: Option<Color>,
 ) {
     frame.render_widget(Clear, area);
     let dim = Style::default().fg(Color::DarkGray);
@@ -873,10 +894,7 @@ pub(super) fn render_connect_picker(
             )
         }
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+    let block = panel(Some(Span::raw(title)), Color::Cyan, bg);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()
@@ -891,4 +909,28 @@ pub(super) fn render_connect_picker(
         ))),
         chunks[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_case_insensitive;
+
+    #[test]
+    fn the_match_range_is_on_char_boundaries_of_the_original_text() {
+        // Lowercasing `İ` changes its byte length, so a position found in the
+        // lowercased text would not index the original.
+        let text = "İİİ 你好世界 Hello こんにちは";
+        for (query, expected) in [
+            ("hello", "Hello"),
+            ("世界", "世界"),
+            ("こん", "こん"),
+            ("你", "你"),
+        ] {
+            let range = find_case_insensitive(text, query).expect(query);
+            assert_eq!(&text[range], expected, "{query}");
+        }
+        assert_eq!(find_case_insensitive(text, "안녕"), None);
+        assert_eq!(find_case_insensitive("안녕하세요", "하세"), Some(6..12));
+        assert_eq!(find_case_insensitive("abc", ""), Some(0..0));
+    }
 }

@@ -5,12 +5,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::super::super::app::App;
 use super::super::super::state::{McpAddMode, SkillAddMode, SshAddMode};
+use super::super::band::panel;
 
 pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;
@@ -161,10 +162,7 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(title)
+            panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
                 .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
@@ -185,6 +183,107 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
             popup_area.y + 1 + row,
         ));
     }
+}
+
+/// Render the `/cloud` popup: the profile's Codespaces account.
+pub(super) fn render_cloud_popup(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let key = |key: &'static str| Span::styled(key, Style::default().fg(Color::Cyan));
+    let label = |text: &'static str| Span::styled(text, Style::default().fg(Color::White));
+    let hint = |text: &'static str| Span::styled(text, Style::default().fg(Color::DarkGray));
+
+    let account_view = || {
+        let account = app
+            .current_profile()
+            .and_then(|profile| profile.cloud.codespaces.as_ref());
+        let state = account.map_or_else(
+            || Span::styled("not set up", Style::default().fg(Color::DarkGray)),
+            |account| {
+                Span::styled(
+                    format!("set up as {}", account.login),
+                    Style::default().fg(Color::Green),
+                )
+            },
+        );
+        (
+            " Cloud Machines ",
+            vec![
+                Line::from(""),
+                Line::from(vec![label("GitHub Codespaces: "), state]),
+                Line::from(""),
+                Line::from(hint(
+                    "Codespaces are created as a GitHub account of your gh login;",
+                )),
+                Line::from(hint("its token needs the codespace scope.")),
+                Line::from(""),
+                Line::from(vec![
+                    key("[n] "),
+                    label("New cloud session"),
+                    Span::raw("  "),
+                    key("[s] "),
+                    label("Set up"),
+                    Span::raw("  "),
+                    key("[d] "),
+                    label("Remove"),
+                    Span::raw("  "),
+                    key("[Esc] "),
+                    label("Close"),
+                ]),
+            ],
+        )
+    };
+    let machines_view = |(machines, selected): &(Vec<crate::cloud::MachineType>, usize)| {
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(label("The machine the new session runs entirely on:")),
+            Line::from(""),
+        ];
+        lines.extend(machines.iter().enumerate().map(|(index, machine)| {
+            let style = if index == *selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(
+                format!(" {} ({}) ", machine.display_name, machine.name),
+                style,
+            ))
+        }));
+        lines.push(Line::from(""));
+        lines.push(Line::from(hint(
+            "[Enter] Start the session  [↑/↓] Choose  [Esc] Back",
+        )));
+        (" New Cloud Session ", lines)
+    };
+    let login_view = |login: &String| {
+        (
+            " Set Up GitHub Codespaces ",
+            vec![
+                Line::from(""),
+                Line::from(label("GitHub account (empty for gh's active account):")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {login}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(hint("[Enter] Set up  [Esc] Back")),
+            ],
+        )
+    };
+    let (title, content) = match (&app.cloud_machines, &app.cloud_login) {
+        (Some(picker), _) => machines_view(picker),
+        (None, Some(login)) => login_view(login),
+        (None, None) => account_view(),
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+    frame.render_widget(widget, area);
 }
 
 /// Render SSH server management popup.
@@ -213,9 +312,15 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Yellow),
                 )));
             } else {
+                let attached: Option<&[String]> = app
+                    .current_profile()
+                    .map(|profile| profile.remote_attachments.as_slice());
                 for (idx, server) in app.config.ssh_servers.iter().enumerate() {
                     let selected = idx == app.ssh_selected;
                     let prefix = if selected { "> " } else { "  " };
+                    let is_attached =
+                        attached.is_some_and(|list| list.iter().any(|name| name == &server.name));
+                    let checkbox = if is_attached { "[x] " } else { "[ ] " };
                     lines.push(Line::from(vec![
                         Span::styled(
                             prefix,
@@ -223,6 +328,14 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
                                 Style::default().fg(Color::Yellow)
                             } else {
                                 Style::default()
+                            },
+                        ),
+                        Span::styled(
+                            checkbox,
+                            if is_attached {
+                                Style::default().fg(Color::Green)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
                             },
                         ),
                         Span::styled(
@@ -242,6 +355,9 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
+                Span::styled("[Space] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Toggle", Style::default().fg(Color::White)),
+                Span::raw("  "),
                 Span::styled("[a] ", Style::default().fg(Color::Cyan)),
                 Span::styled("Add", Style::default().fg(Color::White)),
                 Span::raw("  "),
@@ -296,10 +412,7 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(title)
+            panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
                 .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
@@ -333,10 +446,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     // Render the border block
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(title)
+    let block = panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
         .title_alignment(ratatui::layout::Alignment::Center);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);

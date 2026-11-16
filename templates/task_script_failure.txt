@@ -1,0 +1,2 @@
+task script failed with exit code {{ exit_code }}
+{{ output }}

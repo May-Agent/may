@@ -1,170 +1,55 @@
-//! State of the right sidebar: the session's task tree, the issues its
-//! tasks link, and what runs in the background.
+//! State of the right sidebar: the session's open work, the issues its
+//! rows name, and what runs in the background.
 //!
-//! The task tree comes from the session's `tasks.md`, served by the daemon
-//! at `GET /api/sessions/{id}/tasks`. Only checklist items are kept —
-//! headings, notes and other prose in the document are the model's working
-//! notes and never reach the sidebar. A task links an issue by mentioning
-//! it as `#<number>`; linked issues are looked up in the session's issue
-//! store for their title and state.
+//! The rows come from the session's `tasks.md`, parsed by aither's
+//! `TasksFile` ([`crate::task_rows`]); the daemon serves them at
+//! `GET /api/sessions/{id}/tasks`. Notes and decisions never reach the
+//! sidebar. A row names an issue of the session's repository as
+//! `#<number>`; named issues are looked up in the session's issue store for
+//! their title and state.
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use std::collections::HashSet;
+
+use crate::task_rows::TaskRow;
+
+/// Every collapsible section.
+const ALL_SECTIONS: [SidebarSection; 7] = [
+    SidebarSection::Doing,
+    SidebarSection::Queued,
+    SidebarSection::Issues,
+    SidebarSection::PullRequests,
+    SidebarSection::Changes,
+    SidebarSection::Subagents,
+    SidebarSection::Jobs,
+];
+
+/// The key a task row's detail state is kept under: its title.
+#[must_use]
+pub fn task_key(row: &TaskRow) -> String {
+    row.title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Terminal width from which the sidebar is shown.
 pub const SIDEBAR_MIN_TERMINAL_WIDTH: u16 = 120;
 
-/// One checklist item of `tasks.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskNode {
-    /// Item text, whitespace-normalized.
-    pub text: String,
-    /// Whether the item is checked.
-    pub done: bool,
-    /// Number of checklist items it is nested under.
-    pub depth: usize,
-    /// Issue numbers the item mentions as `#<number>`, in order.
-    pub issues: Vec<i64>,
-}
-
-/// The checklist items of a `tasks.md`, in document order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TaskTree {
-    /// Items with their nesting depth.
-    pub nodes: Vec<TaskNode>,
-}
-
-impl TaskTree {
-    /// Parse the task tree out of a `tasks.md` document. Nested lists keep
-    /// their depth counted in checklist ancestors (a plain bullet between
-    /// two task levels does not add one); everything that is not a task
-    /// item is dropped.
-    #[must_use]
-    pub fn parse(markdown: &str) -> Self {
-        struct Pending {
-            text: String,
-            task: bool,
-            done: bool,
-            parent: Option<usize>,
-        }
-        let mut items: Vec<Pending> = Vec::new();
-        let mut open: Vec<usize> = Vec::new();
-        for event in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS) {
-            match event {
-                Event::Start(Tag::Item) => {
-                    items.push(Pending {
-                        text: String::new(),
-                        task: false,
-                        done: false,
-                        parent: open.last().copied(),
-                    });
-                    open.push(items.len() - 1);
-                }
-                Event::End(TagEnd::Item) => {
-                    open.pop();
-                }
-                Event::TaskListMarker(checked) => {
-                    if let Some(&index) = open.last() {
-                        items[index].task = true;
-                        items[index].done = checked;
-                    }
-                }
-                Event::Text(text) | Event::Code(text) => {
-                    if let Some(&index) = open.last() {
-                        items[index].text.push_str(&text);
-                    }
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    if let Some(&index) = open.last() {
-                        items[index].text.push(' ');
-                    }
-                }
-                _ => {}
-            }
-        }
-        let depth_of = |mut parent: Option<usize>| {
-            let mut depth = 0;
-            while let Some(index) = parent {
-                if items[index].task {
-                    depth += 1;
-                }
-                parent = items[index].parent;
-            }
-            depth
-        };
-        let nodes = items
-            .iter()
-            .filter(|item| item.task)
-            .map(|item| {
-                let text = item.text.split_whitespace().collect::<Vec<_>>().join(" ");
-                TaskNode {
-                    issues: issue_refs(&text),
-                    text,
-                    done: item.done,
-                    depth: depth_of(item.parent),
-                }
-            })
-            .collect();
-        Self { nodes }
-    }
-
-    /// `(done, total)` item counts.
-    #[must_use]
-    pub fn progress(&self) -> (usize, usize) {
-        (
-            self.nodes.iter().filter(|node| node.done).count(),
-            self.nodes.len(),
-        )
-    }
-
-    /// Every linked issue number, first mention first, without repeats.
-    #[must_use]
-    pub fn linked_issues(&self) -> Vec<i64> {
-        let mut out: Vec<i64> = Vec::new();
-        for number in self.nodes.iter().flat_map(|node| node.issues.iter()) {
-            if !out.contains(number) {
-                out.push(*number);
-            }
-        }
-        out
-    }
-}
-
-/// Issue numbers mentioned as `#<digits>` in `text`. The `#` must start a
-/// word (so `C#1` or `foo#2` are not references) and the digits must end
-/// one.
+/// Every issue of the session's repository the rows name, first mention
+/// first, without repeats.
 #[must_use]
-pub fn issue_refs(text: &str) -> Vec<i64> {
-    let mut out = Vec::new();
-    let mut previous: Option<char> = None;
-    let mut chars = text.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch == '#' && previous.is_none_or(|p| !p.is_alphanumeric() && p != '#') {
-            let mut number: i64 = 0;
-            let mut digits = 0usize;
-            while let Some(&(_, digit)) = chars.peek() {
-                let Some(value) = digit.to_digit(10) else {
-                    break;
-                };
-                number = number.saturating_mul(10).saturating_add(i64::from(value));
-                digits += 1;
-                chars.next();
-            }
-            let ends_word = chars
-                .peek()
-                .is_none_or(|&(_, next)| !next.is_alphanumeric() && next != '_');
-            if digits > 0 && ends_word && number > 0 && !out.contains(&number) {
-                out.push(number);
-            }
-            previous = Some('0');
-            continue;
+pub fn linked_issues(rows: &[TaskRow]) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    for reference in rows.iter().flat_map(|row| &row.references) {
+        if reference.is_local_issue()
+            && let Ok(number) = i64::try_from(reference.number)
+            && !out.contains(&number)
+        {
+            out.push(number);
         }
-        previous = Some(ch);
     }
     out
 }
 
 /// A linked issue as the sidebar shows it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 pub struct IssueBrief {
     /// Issue number.
     pub number: i64,
@@ -174,9 +59,81 @@ pub struct IssueBrief {
     pub closed: bool,
 }
 
+/// A section of the sidebar that collapses under its heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SidebarSection {
+    /// Tasks in progress.
+    Doing,
+    /// Tasks waiting their turn.
+    Queued,
+    /// Issues the task rows name.
+    Issues,
+    /// The session's live pull requests.
+    PullRequests,
+    /// File changes per workspace root.
+    Changes,
+    /// Running subagents.
+    Subagents,
+    /// Background terminal jobs.
+    Jobs,
+}
+
+/// What a click on a sidebar row acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarHit {
+    /// A section heading: collapses or expands the section.
+    Heading(SidebarSection),
+    /// A `… N more` row: lists every entry of the section, or folds it again.
+    More(SidebarSection),
+    /// A task row with a detail: shows or hides the detail. Keyed by the
+    /// row's first line, which survives a re-read of `tasks.md`.
+    Task(String),
+    /// A PR row with checks: shows or hides them. Keyed by the PR number.
+    Pr(i64),
+    /// Merge an orphaned or review-required PR as `"user"`.
+    PrMerge(i64),
+    /// Close an orphaned or review-required PR as `"user"`.
+    PrClose(i64),
+}
+
+/// An asynchronous action triggered by clicking a PR control in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPrAction {
+    /// Merge the PR identified by its database ID as `"user"`.
+    Merge(i64),
+    /// Close the PR identified by its database ID as `"user"`.
+    Close(i64),
+}
+
+/// What the last frame drew, so input can act on it.
+#[derive(Debug, Default)]
+pub struct SidebarView {
+    /// Rows of the screen the click targets sit on.
+    pub hits: Vec<(u16, SidebarHit)>,
+    /// How far the body can scroll.
+    pub max_scroll: usize,
+}
+
 /// Sidebar state kept by the app.
 #[derive(Debug)]
 pub struct SidebarState {
+    /// Screen rect the sidebar occupied last frame (mouse mapping); empty
+    /// while it is hidden.
+    pub area: ratatui::layout::Rect,
+    /// Rows scrolled off the top of the body (everything below the title).
+    pub scroll: usize,
+    /// Sections folded under their heading.
+    pub collapsed: HashSet<SidebarSection>,
+    /// Sections listing every entry instead of their first few.
+    pub listed_all: HashSet<SidebarSection>,
+    /// Task rows showing their detail.
+    pub detailed: HashSet<String>,
+    /// PR rows (by number) showing their checks.
+    pub checked: HashSet<i64>,
+    /// Every section open, every list and every detail shown.
+    pub expand_all: bool,
+    /// What the last frame drew.
+    pub view: SidebarView,
     /// User toggle (`Ctrl+B`); the sidebar also needs a wide terminal.
     pub enabled: bool,
     /// Session the task tree belongs to.
@@ -184,9 +141,9 @@ pub struct SidebarState {
     /// The session's stored title. Titles are generated in the daemon, so
     /// the TUI's in-memory session never learns them by itself.
     pub title: Option<String>,
-    /// The session's task tree; `None` until loaded or when there is no
-    /// `tasks.md`.
-    pub tasks: Option<TaskTree>,
+    /// The rows of the session's `tasks.md`; `None` until loaded or when
+    /// there is no `tasks.md`.
+    pub tasks: Option<Vec<TaskRow>>,
     /// Linked issues with their lookups, in first-mention order.
     pub issues: Vec<IssueBrief>,
     /// The session's PRs from the daemon's `/prs` endpoint, newest first.
@@ -196,6 +153,14 @@ pub struct SidebarState {
 impl Default for SidebarState {
     fn default() -> Self {
         Self {
+            area: ratatui::layout::Rect::default(),
+            scroll: 0,
+            collapsed: HashSet::new(),
+            listed_all: HashSet::new(),
+            detailed: HashSet::new(),
+            checked: HashSet::new(),
+            expand_all: false,
+            view: SidebarView::default(),
             enabled: true,
             session_id: None,
             title: None,
@@ -226,12 +191,8 @@ impl SidebarState {
             self.session_id = Some(session_id.to_string());
             self.issues.clear();
         }
-        self.tasks = content.map(TaskTree::parse);
-        let linked = self
-            .tasks
-            .as_ref()
-            .map(TaskTree::linked_issues)
-            .unwrap_or_default();
+        self.tasks = content.map(crate::task_rows::task_rows);
+        let linked = self.tasks.as_deref().map_or_default(linked_issues);
         // Keep known lookups in mention order; unknown ones show their
         // number until their lookup arrives. An unresolved number (its
         // issue may not have existed yet) is looked up again.
@@ -258,7 +219,10 @@ impl SidebarState {
 
     /// Store the session's PR list from the daemon.
     pub fn set_prs(&mut self, session_id: &str, prs: Vec<crate::client::WirePr>) {
-        if self.session_id.as_deref() == Some(session_id) {
+        if session_id.is_empty()
+            || self.session_id.is_none()
+            || self.session_id.as_deref() == Some(session_id)
+        {
             self.prs = prs;
         }
     }
@@ -279,12 +243,123 @@ impl SidebarState {
         }
     }
 
+    /// Whether the body overflows, so the wheel and keys scroll it.
+    #[must_use]
+    pub const fn scrollable(&self) -> bool {
+        self.view.max_scroll > 0
+    }
+
+    /// Scroll the body up by `rows`.
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.scroll = self.scroll.min(self.view.max_scroll).saturating_sub(rows);
+    }
+
+    /// Scroll the body down by `rows`, stopping at its end.
+    pub fn scroll_down(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_add(rows).min(self.view.max_scroll);
+    }
+
+    /// Whether `section` is folded under its heading.
+    #[must_use]
+    pub fn is_collapsed(&self, section: SidebarSection) -> bool {
+        self.collapsed.contains(&section)
+    }
+
+    /// Whether `section` lists every entry.
+    #[must_use]
+    pub fn lists_all(&self, section: SidebarSection) -> bool {
+        self.expand_all || self.listed_all.contains(&section)
+    }
+
+    /// Whether the task row keyed `key` shows its detail.
+    #[must_use]
+    pub fn shows_detail(&self, key: &str) -> bool {
+        self.expand_all || self.detailed.contains(key)
+    }
+
+    /// Whether the PR numbered `number` shows its checks.
+    #[must_use]
+    pub fn shows_checks(&self, number: i64) -> bool {
+        self.expand_all || self.checked.contains(&number)
+    }
+
+    /// Open every section and show every entry and detail, or fold the
+    /// lists and details back.
+    pub fn toggle_expand_all(&mut self) {
+        self.expand_all = !self.expand_all;
+        if self.expand_all {
+            self.collapsed.clear();
+        }
+    }
+
+    /// Act on a click at screen row `row`.
+    pub fn click(&mut self, row: u16) {
+        let _ = self.click_action(row);
+    }
+
+    /// Act on a click at screen row `row` and return any async PR action triggered.
+    pub fn click_action(&mut self, row: u16) -> Option<SidebarPrAction> {
+        let hit = self
+            .view
+            .hits
+            .iter()
+            .find_map(|(y, hit)| (*y == row).then(|| hit.clone()))?;
+        match hit {
+            SidebarHit::Heading(section) => {
+                if !self.collapsed.remove(&section) {
+                    self.collapsed.insert(section);
+                }
+                None
+            }
+            SidebarHit::More(section) => {
+                if self.expand_all {
+                    self.expand_all = false;
+                    self.listed_all.extend(ALL_SECTIONS);
+                    self.listed_all.remove(&section);
+                } else if !self.listed_all.remove(&section) {
+                    self.listed_all.insert(section);
+                }
+                None
+            }
+            SidebarHit::Task(key) => {
+                if self.expand_all {
+                    self.expand_all = false;
+                    self.detailed
+                        .extend(self.tasks.iter().flatten().map(task_key));
+                    self.detailed.remove(&key);
+                } else if !self.detailed.remove(&key) {
+                    self.detailed.insert(key);
+                }
+                None
+            }
+            SidebarHit::Pr(number) => {
+                if self.expand_all {
+                    self.expand_all = false;
+                    self.checked.extend(self.prs.iter().map(|pr| pr.number));
+                    self.checked.remove(&number);
+                } else if !self.checked.remove(&number) {
+                    self.checked.insert(number);
+                }
+                None
+            }
+            SidebarHit::PrMerge(id) => Some(SidebarPrAction::Merge(id)),
+            SidebarHit::PrClose(id) => Some(SidebarPrAction::Close(id)),
+        }
+    }
+
     /// Forget everything about the previous session.
     pub fn reset(&mut self) {
+        self.scroll = 0;
+        self.collapsed.clear();
+        self.listed_all.clear();
+        self.detailed.clear();
+        self.checked.clear();
+        self.expand_all = false;
         self.session_id = None;
         self.title = None;
         self.tasks = None;
         self.issues.clear();
+        self.prs.clear();
     }
 }
 
@@ -292,45 +367,19 @@ impl SidebarState {
 mod tests {
     use super::*;
 
-    const TASKS: &str = "# Plan\n\nSome notes the model keeps for itself.\n\n## Phase 1\n\n- [x] Read the code (#12)\n- [ ] Fix rendering\n  - [x] images #13\n  - plain bullet\n    - [ ] nested under a bullet\n- [ ] Ship it, see #12 and C#4\n\n```\n- [ ] not a task, inside a fence\n```\n\n## Notes\n\nFree text #99 never shows.\n";
+    const TASKS: &str = "# Plan\n\n## Roots\n- #11\n\n## Doing\n- Read the code (#12)\n  more on #13\n- Other repo o/r#5 and PR #6\n\n## Queued\n- Ship it, see #12\n\n## Notes\n- Free text #99 never shows.\n";
 
     #[test]
-    fn parses_only_the_task_tree() {
-        let tree = TaskTree::parse(TASKS);
-        let summary: Vec<(&str, bool, usize)> = tree
-            .nodes
-            .iter()
-            .map(|node| (node.text.as_str(), node.done, node.depth))
-            .collect();
-        assert_eq!(
-            summary,
-            vec![
-                ("Read the code (#12)", true, 0),
-                ("Fix rendering", false, 0),
-                ("images #13", true, 1),
-                ("nested under a bullet", false, 1),
-                ("Ship it, see #12 and C#4", false, 0),
-            ]
-        );
-        assert_eq!(tree.progress(), (2, 5));
-        // Notes (#99) are not tasks; C#4 is not a reference.
-        assert_eq!(tree.linked_issues(), vec![12, 13]);
-    }
-
-    #[test]
-    fn issue_refs_need_word_boundaries() {
-        assert_eq!(
-            issue_refs("#1 fixes #22, (#3) a#4 #5x #6_ ##7"),
-            vec![1, 22, 3]
-        );
-        assert_eq!(issue_refs("见 #8。"), vec![8]);
+    fn only_local_issues_of_row_sections_are_linked() {
+        let rows = crate::task_rows::task_rows(TASKS);
+        assert_eq!(linked_issues(&rows), vec![11, 12, 13]);
     }
 
     #[test]
     fn set_tasks_keeps_known_issue_lookups() {
         let mut state = SidebarState::default();
         assert_eq!(
-            state.set_tasks("s", Some("- [ ] a #1\n- [ ] b #2\n")),
+            state.set_tasks("s", Some("## Doing\n- a #1\n- b #2\n")),
             vec![1, 2]
         );
         state.set_issues(
@@ -342,18 +391,18 @@ mod tests {
             }],
         );
         assert_eq!(
-            state.set_tasks("s", Some("- [ ] b #2\n- [ ] a #1\n- [ ] c #3\n")),
+            state.set_tasks("s", Some("## Doing\n- b #2\n- a #1\n- c #3\n")),
             vec![2, 3]
         );
         assert_eq!(state.issues[1].title.as_deref(), Some("First"));
         // Another session starts clean.
-        assert_eq!(state.set_tasks("t", Some("- [ ] a #1\n")), vec![1]);
+        assert_eq!(state.set_tasks("t", Some("## Doing\n- a #1\n")), vec![1]);
     }
 
     #[test]
     fn a_session_issues_event_renames_and_closes_a_shown_issue() {
         let mut state = SidebarState::default();
-        state.set_tasks("s", Some("- [ ] a #1\n- [ ] b #2\n"));
+        state.set_tasks("s", Some("## Doing\n- a #1\n- b #2\n"));
         state.set_issues(
             "s",
             vec![
@@ -390,5 +439,39 @@ mod tests {
         assert!(!state.visible_at(119));
         state.enabled = false;
         assert!(!state.visible_at(200));
+    }
+
+    #[test]
+    fn reset_clears_prs_and_click_action_dispatches_pr_controls() {
+        let mut state = SidebarState::default();
+        state.prs.push(crate::client::WirePr {
+            id: 42,
+            repo_key: "org/repo".to_string(),
+            session_id: "s1".to_string(),
+            orphaned: true,
+            require_review: false,
+            number: 1,
+            title: "t".to_string(),
+            state: crate::db::PrState::Open,
+            backend: "may".to_string(),
+            external_number: None,
+            issue_number: None,
+            auto_merge: false,
+            base_sha: String::new(),
+            head_sha: None,
+            merge_commit_sha: None,
+            checks: None,
+            checks_error: None,
+            events: Vec::new(),
+            updated_at: String::new(),
+        });
+        state.view.hits.push((3, SidebarHit::PrMerge(42)));
+        state.view.hits.push((4, SidebarHit::PrClose(42)));
+
+        assert_eq!(state.click_action(3), Some(SidebarPrAction::Merge(42)));
+        assert_eq!(state.click_action(4), Some(SidebarPrAction::Close(42)));
+
+        state.reset();
+        assert!(state.prs.is_empty());
     }
 }

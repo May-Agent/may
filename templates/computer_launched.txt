@@ -1,0 +1,4 @@
+Launched {{ bundle_id }} (pid {{ pid }}) on the session desktop without activating it.
+{% for window in windows %}Window {{ window.id }}: {{ window.width }}x{{ window.height }} at ({{ window.x }}, {{ window.y }})
+{% endfor %}{% if windows.is_empty() %}It opened no window on the desktop.
+{% endif %}

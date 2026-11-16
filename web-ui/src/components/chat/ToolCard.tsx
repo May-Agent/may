@@ -24,7 +24,13 @@ import { parsePartialJson, projectField } from '@/lib/stream/partialJson';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
-import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
+import { extractTerminalResult, terminalLocation, type OutputStream } from '@/lib/terminalResult';
+import { recognisesAny } from '@/lib/commandReading';
+import { CommandCardView } from './CommandCardView';
+import { CommandReadingView } from './CommandReadingView';
+import { CompactionRow } from './CompactionRow';
+import { searchFetchLabel } from '@/lib/hostedLabel';
+import { SearchRow } from './SearchRow';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
 
@@ -42,8 +48,8 @@ const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
   web_fetch: Globe,
   ask: HelpCircle,
   session: MessageSquare,
-  notify: MessageSquare,
   task: Sparkles,
+  compact: Sparkles,
   generic: Wrench,
 };
 
@@ -57,8 +63,8 @@ const VARIANT_LABEL_KEY: Record<ToolVariant, MessageKey> = {
   web_fetch: 'tools.webFetch',
   ask: 'tools.ask',
   session: 'tools.session',
-  notify: 'tools.notify',
   task: 'tools.task',
+  compact: 'tools.compact',
   generic: 'tools.generic',
 };
 
@@ -92,9 +98,8 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
       return fallback;
     }
     case 'web_search':
-      return s.query ? `Searched "${s.query}"` : fallback;
     case 'web_fetch':
-      return s.url ?? fallback;
+      return searchFetchLabel(tool.variant, s, fallback) ?? fallback;
     case 'browser': {
       if (s.action && s.target) return `${s.action} ${s.target}`;
       return s.action || s.target || fallback;
@@ -224,13 +229,18 @@ function TerminalDetails({
   const script = tool.summary?.script ?? '';
   const mode = projectField(tool.argumentsRaw, 'mode');
   const escalated = mode === 'unsafe';
+  const location = terminalLocation(tool.argumentsRaw);
   const terminal = extractTerminalResult(tool.result);
   const scriptRedundant = script.length > 0 && firstLine(script) === primary;
-  const showScript = script.length > 0 && !scriptRedundant;
+  const reading = tool.summary?.reading;
+  const readingShown = recognisesAny(reading);
+  const showScript = script.length > 0 && !scriptRedundant && !readingShown;
   const hasOutput =
     terminal !== null &&
     (terminal.stdout !== null || terminal.stderr !== null || terminal.exitCode !== null);
-  if (!showScript && !escalated && !hasOutput) return null;
+  if (!showScript && !readingShown && !escalated && location === null && !hasOutput) {
+    return null;
+  }
   const failed =
     terminal !== null && terminal.exitCode !== null && terminal.exitCode !== 0;
 
@@ -239,7 +249,13 @@ function TerminalDetails({
 
   return (
     <div className="space-y-2">
+      {readingShown && <CommandReadingView reading={reading} />}
       {showScript && <ShellBlock script={script} />}
+      {location !== null && (
+        <div className="text-[11px] text-muted-foreground">
+          [{t('tools.sshLocation')} {location}]
+        </div>
+      )}
       {escalated && (
         <div className="text-[11px] text-destructive">
           {t('tools.escalated')}
@@ -269,6 +285,25 @@ function TerminalDetails({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/** A terminal-family call whose arguments did not match its schema: the raw arguments and why. */
+function InvalidArgumentsDetails({ tool, error }: { tool: TurnToolState; error: string }) {
+  const { t } = useTranslation();
+  const resultText = extractGenericResultText(tool.result);
+  return (
+    <div className="space-y-2">
+      <div className="text-[11px] text-destructive">
+        {t('tools.invalidArguments')}: {error}
+      </div>
+      {tool.argumentsRaw.length > 0 && (
+        <pre className="text-xs font-mono text-foreground/80 whitespace-pre-wrap break-all max-h-48 overflow-auto scrollbar-thin">
+          {tool.argumentsRaw}
+        </pre>
+      )}
+      {resultText !== null && <OutputBlock text={resultText} />}
     </div>
   );
 }
@@ -307,12 +342,33 @@ function selectDetails(tool: TurnToolState, primary: string) {
 
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const { t } = useTranslation();
+  if (tool.variant === 'compact') return <CompactionRow tool={tool} />;
+  const rowLabel = searchFetchLabel(
+    tool.variant,
+    tool.summary,
+    t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic'),
+  );
+  if (rowLabel !== null) return <SearchRow tool={tool} label={rowLabel} />;
+  return <ExpandableToolCard tool={tool} />;
+});
+
+function ExpandableToolCard({ tool }: ToolCardProps) {
+  const { t } = useTranslation();
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const Icon = VARIANT_ICON[tool.variant] ?? Wrench;
   const variantLabel = t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic');
-  const primary = pickPrimaryLabel(tool, variantLabel);
   const streaming = tool.status === 'streaming';
-  const details = selectDetails(tool, primary);
+  const invalid = tool.summary?.argumentsError ?? null;
+  const primary =
+    invalid === null
+      ? pickPrimaryLabel(tool, variantLabel)
+      : `${variantLabel} (${t('tools.invalidArguments')})`;
+  const details =
+    invalid === null ? (
+      selectDetails(tool, primary)
+    ) : (
+      <InvalidArgumentsDetails tool={tool} error={invalid} />
+    );
   const streamTerminalDetails = streaming && isTerminalVariant(tool.variant);
 
   useEffect(() => {
@@ -321,7 +377,10 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
     }
   }, [streamTerminalDetails]);
 
+  const card = tool.summary?.card ?? null;
+
   return (
+    <>
     <details ref={detailsRef} className="group">
       <summary
         className={cn(
@@ -351,5 +410,11 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
       </summary>
       {details && <div className="mt-1.5 ml-5 space-y-2">{details}</div>}
     </details>
+    {card && (
+      <div className="mt-1 ml-5">
+        <CommandCardView card={card} />
+      </div>
+    )}
+    </>
   );
-});
+}

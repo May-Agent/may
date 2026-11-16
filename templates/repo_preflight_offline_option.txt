@@ -1,0 +1,1 @@
+checkout — Work on this checkout as it stands{% if dirty %}, uncommitted and untracked files included{% endif %}; GitHub issues and PRs are unavailable until the remote is reachable

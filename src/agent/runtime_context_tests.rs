@@ -5,16 +5,12 @@ use aither_core::llm::model::Parameters;
 
 use super::{
     AgentEnvironment, RuntimeSystemContext, build_agents_md_blocks, build_capabilities,
-    build_environment, build_work, tag,
+    build_efficiency, build_environment, build_work, tag,
 };
 
 #[test]
 fn the_system_layout_holds_the_languages_slot() {
-    assert!(
-        tag::layout()
-            .instructions()
-            .contains(&aither_agent::InstructionSlot::LANGUAGES)
-    );
+    assert!(tag::layout().instructions().contains(&tag::LANGUAGES));
 }
 
 fn test_context() -> aither_agent::Context {
@@ -258,25 +254,82 @@ fn global_rules_are_reread_each_sync() {
 
 fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -> String {
     let dir = tempdir().expect("temp dir should be created");
-    tokio_test::block_on(build_capabilities(commands, parameters, dir.path()))
+    tokio_test::block_on(build_capabilities(commands, &[], parameters, dir.path()))
         .expect("capabilities render")
 }
 
 #[test]
-fn the_work_section_names_the_issue_backend() {
-    let work = build_work(&crate::issue::IssueBackendInfo {
+fn the_computer_skill_is_listed_only_where_computer_is_registered() {
+    let dir = tempdir().expect("temp dir should be created");
+    let skill_dir = dir.path().join("computer");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        include_str!("../../skills/computer/SKILL.md"),
+    )
+    .expect("write skill");
+    let render = |commands: &[(String, String)]| {
+        tokio_test::block_on(build_capabilities(
+            commands,
+            &[],
+            &Parameters::default(),
+            dir.path(),
+        ))
+        .expect("capabilities render")
+    };
+
+    let with = render(&[("computer".to_string(), "the desktop".to_string())]);
+    assert!(with.contains("`skills/computer/SKILL.md`"), "{with}");
+    let without = render(&[("browser".to_string(), "pages".to_string())]);
+    assert!(!without.contains("skills/computer/SKILL.md"), "{without}");
+}
+
+#[test]
+fn the_pr_landing_rule_is_rendered_only_for_a_session_with_a_clone() {
+    let issues = crate::issue::IssueBackendInfo {
         name: "may",
         repository: None,
-    });
+    };
+    let with_clone = build_work(&issues, true);
+    assert!(
+        with_clone.contains("Land code with the `pr` command"),
+        "{with_clone}"
+    );
+    let direct = build_work(&issues, false);
+    assert!(!direct.contains("Land code with"), "{direct}");
+    assert!(!direct.contains("source checkout"), "{direct}");
+}
+
+#[test]
+fn the_work_section_names_the_issue_backend() {
+    let work = build_work(
+        &crate::issue::IssueBackendInfo {
+            name: "may",
+            repository: None,
+        },
+        false,
+    );
     assert!(work.contains("`issue` command (may backend)"), "{work}");
 
-    let work = build_work(&crate::issue::IssueBackendInfo {
+    let github = crate::issue::IssueBackendInfo {
         name: "github",
         repository: Some("May-Agent/may".to_string()),
-    });
+    };
+    let work = build_work(&github, false);
+    assert!(work.contains("`issue` command (github backend)"), "{work}");
+    assert!(!work.contains("May-Agent/may"), "{work}");
+
+    let dir = tempdir().expect("temp dir should be created");
+    let session = super::build_session(
+        &AgentEnvironment::Local,
+        &session_paths(&dir),
+        None,
+        None,
+        &github,
+    );
     assert!(
-        work.contains("`issue` command (github backend: May-Agent/may)"),
-        "{work}"
+        session.contains("Issue repository: May-Agent/may."),
+        "{session}"
     );
 }
 
@@ -324,10 +377,7 @@ fn the_system_layout_places_the_command_table_after_capabilities() {
         .iter()
         .position(|slot| *slot == tag::CAPABILITIES)
         .expect("capabilities are laid out");
-    assert_eq!(
-        slots.get(capabilities + 1),
-        Some(&aither_agent::InstructionSlot::COMMANDS)
-    );
+    assert_eq!(slots.get(capabilities + 1), Some(&tag::COMMANDS));
 }
 
 #[test]
@@ -349,52 +399,36 @@ fn session_paths(dir: &tempfile::TempDir) -> crate::session::SessionPaths {
 
 #[test]
 fn remote_hosts_render_only_while_one_is_connected() {
-    let dir = tempdir().expect("temp dir should be created");
-    let paths = session_paths(&dir);
-    let alone = build_environment(
-        "model",
-        &AgentEnvironment::Local,
-        &paths,
-        None,
-        Vec::new(),
-        None,
-    );
+    let alone = build_environment("model", &AgentEnvironment::Local, None, Vec::new());
     assert!(!alone.contains("ssh"), "{alone}");
     assert!(!alone.contains("Remote hosts"), "{alone}");
 
     let connected = build_environment(
         "model",
         &AgentEnvironment::Local,
-        &paths,
         None,
         vec![crate::config::SshServerConfig {
             name: "build-box".to_string(),
             target: "me@build-box".to_string(),
+            platform: crate::config::SshPlatformConfig {
+                os: "Linux".to_string(),
+                arch: "x86_64".to_string(),
+            },
         }],
-        None,
     );
     assert!(
         connected.contains("Remote hosts are connected"),
         "{connected}"
     );
     assert!(
-        connected.contains("- build-box (me@build-box)"),
+        connected.contains("- build-box (me@build-box), Linux x86_64"),
         "{connected}"
     );
 }
 
 #[test]
 fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
-    let dir = tempdir().expect("temp dir should be created");
-    let paths = session_paths(&dir);
-    let environment = build_environment(
-        "model",
-        &AgentEnvironment::Local,
-        &paths,
-        None,
-        Vec::new(),
-        None,
-    );
+    let environment = build_environment("model", &AgentEnvironment::Local, None, Vec::new());
     assert!(environment.contains("\n- tmp/: "), "{environment}");
     assert!(!environment.contains("- /tmp"), "{environment}");
     let home = crate::config::MayConfig::home_dir().expect("home should resolve");
@@ -402,19 +436,26 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         environment.contains(&format!("the user's home is {}", home.display())),
         "{environment}"
     );
-    let terminal = super::build_terminal(&AgentEnvironment::Local, &paths);
+    let terminal = super::build_terminal(&AgentEnvironment::Local);
     assert!(
-        terminal.contains(&format!("means {}/outputs/", dir.path().display())),
+        terminal.contains("means `outputs/…` in the session directory given in `<session>`"),
         "{terminal}"
+    );
+    assert!(
+        terminal.contains("- Use `uv` for Python dependencies (`uv add`, `uv pip install`)"),
+        "{terminal}"
+    );
+    assert_eq!(
+        terminal.contains("`grep`, `awk` and `find` fail in scripts"),
+        cfg!(not(windows)),
+        "only the managed bash refuses them: {terminal}"
     );
 }
 
 fn container_environment() -> AgentEnvironment {
     use std::sync::Arc;
 
-    use aither_sandbox::{
-        AnyContainerExec, BollardContainerExec, BridgeAddress, ContainerIpcRoute,
-    };
+    use aither_sandbox::{AnyContainerExec, BollardContainerExec, HostRoute};
 
     // An HTTP client handle neither probes a socket nor dials until used;
     // rendering never uses it.
@@ -423,11 +464,11 @@ fn container_environment() -> AgentEnvironment {
             .expect("an HTTP Docker client handle is built without connecting");
     AgentEnvironment::Container {
         container_id: "test-container".to_string(),
-        container_ipc_route: ContainerIpcRoute::new(
+        container_ipc_route: HostRoute::new(
             "host.docker.internal",
-            BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                .expect("loopback binds the bridge"),
-        ),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+        )
+        .expect("loopback is a usable host route"),
         container_exec: AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
             client,
         )))),
@@ -478,6 +519,25 @@ fn native_repo_clones_keep_the_host_path() {
 }
 
 #[test]
+fn the_wake_alert_says_how_the_sleep_ended() {
+    use crate::sleep::WakeCause;
+    use askama::Template;
+
+    let off = super::WakeAlert {
+        cause: WakeCause::SleepOff,
+    }
+    .render()
+    .expect("wake alert renders");
+    assert!(off.contains("they ran /sleep off"), "{off}");
+    let wrote = super::WakeAlert {
+        cause: WakeCause::UserWrote,
+    }
+    .render()
+    .expect("wake alert renders");
+    assert!(wrote.contains("they came back and wrote"), "{wrote}");
+}
+
+#[test]
 #[should_panic(expected = "outside the session directory")]
 fn container_clone_outside_the_session_directory_panics() {
     let dir = tempdir().expect("temp dir should be created");
@@ -487,4 +547,184 @@ fn container_clone_outside_the_session_directory_panics() {
         source: "x".to_string(),
     };
     let _ = super::build_repo_clones_context(&[stray], &container_environment(), &session_paths);
+}
+
+#[test]
+fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
+    let prompt = build_efficiency(&[]);
+    assert!(
+        prompt.contains("Fix with automated tools before hand edits"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("`cargo clippy --fix`"), "{prompt}");
+    assert!(
+        prompt.contains("Hand a large batch of small manual fixes to a subagent"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
+    let prompt = build_efficiency(&[]);
+    assert!(
+        prompt.contains(
+            "When answering means reading across many files and only the conclusion matters"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("`explore --prompt-file <path>`"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn the_capabilities_section_carries_each_core_commands_usage() {
+    let core = [
+        crate::terminal_commands::CoreCommandUsage {
+            name: "ask_user".to_string(),
+            usage: "Ask the user\n\nUsage:\n  ask_user <question>\n".to_string(),
+        },
+        crate::terminal_commands::CoreCommandUsage {
+            name: "tasks".to_string(),
+            usage: "Usage: tasks <subcommand>\n".to_string(),
+        },
+    ];
+    let dir = tempdir().expect("temp dir should be created");
+    let prompt = tokio_test::block_on(build_capabilities(
+        &[],
+        &core,
+        &Parameters::default(),
+        dir.path(),
+    ))
+    .expect("capabilities render");
+    for command in &core {
+        assert!(
+            prompt.contains(&format!(
+                "<usage command=\"{}\">\n{}\n</usage>",
+                command.name,
+                command.usage.trim()
+            )),
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn a_blocked_step_runs_in_unsafe_mode_without_asking_first() {
+    let prompt = super::build_permissions(&AgentEnvironment::Local, Vec::new(), None);
+    assert!(
+        prompt
+            .contains("When the sandbox blocks a step of the work, run that step in `unsafe` mode"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("never ask through `ask_user` whether you may use `unsafe`"),
+        "{prompt}"
+    );
+    let harness = super::build_harness();
+    assert!(
+        harness.contains("Get past it as the permissions section says"),
+        "{harness}"
+    );
+}
+
+/// The instruction blocks of a session in prompt order, as the model reads
+/// them.
+fn rendered_instructions(
+    dir: &tempfile::TempDir,
+    launch_dir: &str,
+    clone_source: &str,
+) -> Vec<(aither_agent::InstructionSlot, String)> {
+    let (_memory_dir, memory_path) = test_memory_file();
+    let paths = session_paths(dir);
+    let issues = crate::issue::IssueBackendInfo {
+        name: "may",
+        repository: None,
+    };
+    let clones = super::build_repo_clones_context(
+        &[super::RepoCloneEntry {
+            clone_path: paths.root().join("repos/may"),
+            source: clone_source.to_string(),
+        }],
+        &AgentEnvironment::Local,
+        &paths,
+    )
+    .expect("a clone renders a block");
+    let runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+        .with_instruction(tag::IDENTITY, super::build_identity())
+        .with_instruction(tag::HARNESS, super::build_harness())
+        .with_instruction(tag::EVIDENCE, super::build_evidence())
+        .with_instruction(
+            tag::ENVIRONMENT,
+            build_environment("model", &AgentEnvironment::Local, None, Vec::new()),
+        )
+        .with_instruction(
+            tag::TERMINAL,
+            super::build_terminal(&AgentEnvironment::Local),
+        )
+        .with_instruction(tag::EFFICIENCY, build_efficiency(&[]))
+        .with_instruction(tag::WORK, build_work(&issues, true))
+        .with_instruction(
+            tag::SESSION,
+            super::build_session(
+                &AgentEnvironment::Local,
+                &paths,
+                Some(launch_dir.to_string()),
+                None,
+                &issues,
+            ),
+        )
+        .with_instruction(tag::REPO_CLONES, clones);
+    let mut context = test_context();
+    runtime_context.reconcile(&mut context);
+    tag::layout()
+        .instructions()
+        .iter()
+        .filter_map(|slot| {
+            context
+                .instructions()
+                .get(slot)
+                .map(|text| (slot.clone(), text.clone()))
+        })
+        .collect()
+}
+
+#[test]
+fn sessions_differing_only_in_session_values_share_the_prompt_up_to_the_session_tier() {
+    let first_dir = tempdir().expect("temp dir should be created");
+    let second_dir = tempdir().expect("temp dir should be created");
+    let first = rendered_instructions(&first_dir, "/work/alpha", "/work/alpha");
+    let second = rendered_instructions(&second_dir, "/work/beta", "/work/beta");
+
+    let session_tier = [
+        tag::SESSION,
+        tag::REPO_CLONES,
+        tag::PLAN_MODE,
+        tag::PROJECT_RULES,
+    ];
+    let (shared_first, rest_first): (Vec<_>, Vec<_>) = first
+        .iter()
+        .partition(|(slot, _)| !session_tier.contains(slot));
+    let (shared_second, rest_second): (Vec<_>, Vec<_>) = second
+        .iter()
+        .partition(|(slot, _)| !session_tier.contains(slot));
+    assert!(
+        shared_first.len() > 4,
+        "the shared tiers hold the build-wide and configuration sections"
+    );
+    assert_eq!(shared_first, shared_second);
+    assert_ne!(rest_first, rest_second);
+
+    // No session-tier section comes before a shared one in the layout.
+    let order: Vec<_> = first.iter().map(|(slot, _)| slot.clone()).collect();
+    let first_session = order
+        .iter()
+        .position(|slot| session_tier.contains(slot))
+        .expect("the session tier is rendered");
+    assert!(
+        order[first_session..]
+            .iter()
+            .all(|slot| session_tier.contains(slot))
+    );
 }

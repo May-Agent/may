@@ -62,6 +62,8 @@ pub enum AppMode {
     McpManage,
     /// SSH server management overlay
     SshManage,
+    /// The profile's cloud machine setup (`/cloud`)
+    CloudManage,
     /// Ask user dialog
     AskUser(AskUserState),
     /// Skill management popup
@@ -79,6 +81,8 @@ pub enum AppMode {
     JobDetail(JobDetailState),
     /// `/btw` side-question overlay: answered outside conversation history
     Btw(BtwState),
+    /// `/progress` overlay: the remaining work with a progress bar
+    Progress(ProgressState),
     /// Zoomed image overlay (click an inline image to open)
     ImageView(ImageViewState),
     /// Quit confirmation shown while the session's agent still runs
@@ -120,6 +124,7 @@ impl AppMode {
             Self::RepoTrust(_) => "repo-trust",
             Self::McpManage => "mcp-manage",
             Self::SshManage => "ssh-manage",
+            Self::CloudManage => "cloud-manage",
             Self::AskUser(_) => "ask-user",
             Self::SkillManage => "skill-manage",
             Self::ProfileSelect => "profile-select",
@@ -128,6 +133,7 @@ impl AppMode {
             Self::Jobs => "jobs",
             Self::JobDetail(_) => "job-detail",
             Self::Btw(_) => "btw",
+            Self::Progress(_) => "progress",
             Self::ImageView(_) => "image-view",
             Self::QuitConfirm(_) => "quit-confirm",
         }
@@ -159,6 +165,19 @@ pub struct BtwState {
     pub scroll: u16,
 }
 
+/// `/progress` overlay state: one request, then the report it returns.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressState {
+    /// The request is in flight.
+    pub loading: bool,
+    /// The report once it arrived.
+    pub report: Option<crate::daemon::ProgressReport>,
+    /// Failure text when the request failed.
+    pub error: Option<String>,
+    /// Scroll offset (lines) for a long report.
+    pub scroll: u16,
+}
+
 /// What the job-detail view is showing.
 #[derive(Debug, Clone, Copy)]
 pub enum JobDetailTarget {
@@ -175,8 +194,8 @@ pub struct JobDetailState {
     pub target: JobDetailTarget,
     /// Latest job info for a `Job` target; `None` once the pid is gone.
     pub job: Option<aither_sandbox::JobInfo>,
-    /// Latest buffered `(stdout, stderr)` for a `Job` target.
-    pub output: Option<(Vec<u8>, Vec<u8>)>,
+    /// Latest buffered output for a `Job` target.
+    pub output: Option<Vec<u8>>,
     /// Latest snapshot for a `Subagent` target; kept after the run ends.
     pub subagent: Option<crate::agent::SubagentRunSnapshot>,
     /// Whether the followed entry has finished.
@@ -501,6 +520,20 @@ pub struct PermissionConfirmState {
     pub request_id: String,
     /// The permission request being confirmed.
     pub request: crate::session::PersistedPermissionRequestPayload,
+    /// Whether the raw script shows instead of the reading.
+    pub show_script: bool,
+}
+
+impl PermissionConfirmState {
+    /// The reading the dialog shows, unless the raw script was asked for
+    /// or May recognised nothing in the script.
+    #[must_use]
+    pub fn shown_reading(&self) -> Option<&crate::command_reading::CommandReading> {
+        self.request
+            .reading
+            .as_ref()
+            .filter(|reading| reading.recognises_any() && !self.show_script)
+    }
 }
 
 /// Status of Copilot OAuth authentication flow.
@@ -658,11 +691,19 @@ impl PasteFilter {
 /// Represents an active text input field for paste handling.
 #[derive(Debug)]
 pub enum ActiveTextInput<'a> {
-    /// Input with cursor position tracking (insert at cursor)
+    /// The chat composer: inserts at a cursor that is a byte offset on a
+    /// grapheme boundary.
+    Composer {
+        /// The buffer being edited.
+        input: &'a mut String,
+        /// Byte offset of the cursor within the buffer.
+        cursor: &'a mut usize,
+    },
+    /// A settings field whose cursor is a byte offset on a grapheme boundary
     Cursored {
         /// The buffer being edited.
         input: &'a mut String,
-        /// Cursor position within the buffer.
+        /// Byte offset of the cursor within the buffer.
         cursor: &'a mut usize,
     },
     /// Simple input (append at end) with character filter
@@ -679,7 +720,7 @@ pub enum ActiveTextInput<'a> {
 pub struct SelectionPoint {
     /// Line in the rendered viewport.
     pub line: usize,
-    /// Column in the rendered viewport.
+    /// Byte offset into the rendered line, on a char boundary.
     pub column: usize,
 }
 
@@ -709,23 +750,25 @@ impl TextSelection {
         }
     }
 
-    /// Word-shaped selection covering `point.column` in `text`: the maximal
-    /// run of same-class characters around it. `None` when the column lands
-    /// past the line's content.
+    /// Word-shaped selection covering the char at the byte offset
+    /// `point.column` in `text`: the maximal run of same-class characters
+    /// around it. `None` when the column lands past the line's content or off
+    /// a char boundary.
     #[must_use]
     pub fn word_at(text: &str, point: SelectionPoint) -> Option<Self> {
-        let chars: Vec<char> = text.chars().collect();
-        if point.column >= chars.len() {
-            return None;
-        }
-        let word = is_word_char(chars[point.column]);
-        let start = (0..point.column)
+        let before = text.get(..point.column)?;
+        let from_column = text.get(point.column..)?;
+        let word = is_word_char(from_column.chars().next()?);
+        let start = before
+            .char_indices()
             .rev()
-            .find(|&i| is_word_char(chars[i]) != word)
-            .map_or(0, |i| i + 1);
-        let end = (point.column + 1..chars.len())
-            .find(|&i| is_word_char(chars[i]) != word)
-            .unwrap_or(chars.len());
+            .find(|&(_, c)| is_word_char(c) != word)
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = from_column
+            .char_indices()
+            .skip(1)
+            .find(|&(_, c)| is_word_char(c) != word)
+            .map_or(text.len(), |(i, _)| point.column + i);
         Some(Self {
             anchor: SelectionPoint {
                 line: point.line,
@@ -793,6 +836,66 @@ impl StatusNotice {
     pub fn clear_expired(slot: &mut Option<Self>, now: std::time::Instant) {
         if slot.as_ref().is_some_and(|notice| notice.expired(now)) {
             *slot = None;
+        }
+    }
+}
+
+/// How long the context meter reads `Compacted` before the new usage.
+///
+/// Long enough to notice at a glance while working
+/// elsewhere in the terminal, short enough that the figure it hides is
+/// back before the user wonders about it.
+pub const COMPACTED_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What the status bar's context meter shows: the usage figure, or the
+/// state of a compaction in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionMeter {
+    /// No compaction to report: the meter shows the context usage.
+    #[default]
+    Idle,
+    /// A compaction is running.
+    Compacting,
+    /// A compaction finished; the meter reads `Compacted` until `until`.
+    Compacted {
+        /// When the meter returns to the usage figure.
+        until: std::time::Instant,
+    },
+}
+
+impl CompactionMeter {
+    /// Follow the compaction to `phase`, reported at `now`. Only a compaction
+    /// that replaced the context reads `Compacted`; any other end returns the
+    /// meter to the usage figure.
+    pub fn apply(&mut self, phase: crate::client::CompactionPhase, now: std::time::Instant) {
+        use crate::client::CompactionPhase;
+        *self = match phase {
+            CompactionPhase::Started => Self::Compacting,
+            CompactionPhase::Applied => Self::Compacted {
+                until: now + COMPACTED_HOLD,
+            },
+            CompactionPhase::NothingToCompact
+            | CompactionPhase::Failed
+            | CompactionPhase::Discarded => Self::Idle,
+        };
+    }
+
+    /// Return to the usage figure, as when the session changes.
+    pub const fn cancel(&mut self) {
+        *self = Self::Idle;
+    }
+
+    /// Whether `Compacted` is on screen, so ticks redraw until it clears.
+    #[must_use]
+    pub const fn is_holding(self) -> bool {
+        matches!(self, Self::Compacted { .. })
+    }
+
+    /// Return to the usage figure once the hold has passed at `now`; ticks
+    /// call this.
+    pub fn clear_expired(&mut self, now: std::time::Instant) {
+        if matches!(*self, Self::Compacted { until } if now >= until) {
+            *self = Self::Idle;
         }
     }
 }
@@ -888,7 +991,7 @@ pub enum ConfigEditMode {
     Text {
         /// Current text being edited.
         input: String,
-        /// Cursor position within `input`, in characters.
+        /// Byte offset of the cursor within `input`, on a grapheme boundary.
         cursor: usize,
     },
     /// Selecting from a list (provider type, model list)
@@ -908,7 +1011,8 @@ pub enum ConfigEditMode {
         base_url: String,
         /// API key (optional)
         api_key: String,
-        /// Cursor position in the focused field
+        /// Byte offset of the cursor in the focused field, on a grapheme
+        /// boundary
         cursor: usize,
         /// Whether we're editing an existing provider
         editing_existing: bool,
@@ -973,7 +1077,7 @@ impl ConfigState {
         match self.section {
             ConfigSection::Providers => self.provider_ids.len() + 1,
             ConfigSection::Models => 5,
-            ConfigSection::Preferences => 3,
+            ConfigSection::Preferences => 4,
         }
     }
 
@@ -1095,10 +1199,34 @@ mod tests {
     }
 
     #[test]
-    fn word_at_columns_are_char_indices_not_display_cells() {
-        // Wide chars take two cells but one char index each.
+    fn word_at_columns_are_byte_offsets_on_char_boundaries() {
+        // "你好" is six bytes; the word run after the space starts at byte 7.
+        let sel = TextSelection::word_at("你好 world", point(0, 8)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 7), point(0, 12)));
         let sel = TextSelection::word_at("你好 world", point(0, 3)).unwrap();
-        assert_eq!(sel.normalized(), (point(0, 3), point(0, 8)));
+        assert_eq!(sel.normalized(), (point(0, 0), point(0, 6)));
+        // Off a char boundary, there is no word.
+        assert!(TextSelection::word_at("你好 world", point(0, 1)).is_none());
+    }
+
+    #[test]
+    fn word_at_covers_japanese_korean_and_emoji_text() {
+        for (text, word) in [
+            ("こんにちは 世界", "こんにちは"),
+            ("안녕하세요 world", "안녕하세요"),
+        ] {
+            let sel = TextSelection::word_at(text, point(0, 3)).unwrap();
+            assert_eq!(
+                sel.normalized(),
+                (point(0, 0), point(0, word.len())),
+                "{text}"
+            );
+        }
+        // The thumbs-up with a skin tone (8 bytes) is not a word character:
+        // it forms one run with the spaces around it.
+        let text = "a 👍🏽 b";
+        let sel = TextSelection::word_at(text, point(0, 2)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 1), point(0, 1 + 1 + 8 + 1)));
     }
 
     #[test]

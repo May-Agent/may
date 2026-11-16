@@ -7,9 +7,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AnswerValue, AskUserArgs, AskUserRequest, AskUserRequestPayload};
-use aither_agent::workspace_request::RequestWorkspaceArgs;
-use aither_sandbox::TerminalMode;
+use crate::harness::ask_user::{AnswerValue, AskUserArgs, AskUserRequest, AskUserRequestPayload};
+use crate::harness::workspace_request::RequestWorkspaceArgs;
+use aither_sandbox::SandboxMode;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -23,10 +23,6 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
 
-fn init_executor() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-}
-
 /// Bound `future` by [`WAIT_BOUND`], naming `what` it waits for on expiry.
 async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT_BOUND, future)
@@ -35,14 +31,14 @@ async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     runtime: Arc<SessionRuntimeService>,
     events: broadcast::Receiver<UiEventTopics>,
 }
 
 impl Fixture {
     async fn new() -> Self {
-        init_executor();
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
@@ -52,9 +48,10 @@ impl Fixture {
             .expect("create session");
         let bus = UiEventBus::new();
         let events = bus.subscribe();
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
-            _dir: dir,
-            runtime: Arc::new(SessionRuntimeService::new(db, bus)),
+            dir,
+            runtime: Arc::new(SessionRuntimeService::new(db, bus, home)),
             events,
         }
     }
@@ -137,7 +134,7 @@ impl Prompt for Permission {
         let runtime = runtime.clone();
         tokio::spawn(async move {
             let accepted = approver
-                .request_and_wait(TerminalMode::Unsafe, "make install".to_string())
+                .request_and_wait(SandboxMode::Unsandboxed, "make install".to_string())
                 .await
                 .expect("the waiter is woken with a decision");
             observe(&runtime, Self::RESPONSE_ROLE, accepted).await
@@ -269,7 +266,7 @@ impl Prompt for Question {
         self.0
             .resolve(
                 id,
-                vec![aither_agent::ask_user::QuestionAnswer {
+                vec![crate::harness::ask_user::QuestionAnswer {
                     section: String::new(),
                     answer: AnswerValue::Selected(vec![answer.to_string()]),
                 }],
@@ -447,8 +444,8 @@ prompt_tests! {
     ask_user => Question,
 }
 
-fn answer(value: &str) -> Vec<aither_agent::ask_user::QuestionAnswer> {
-    vec![aither_agent::ask_user::QuestionAnswer {
+fn answer(value: &str) -> Vec<crate::harness::ask_user::QuestionAnswer> {
+    vec![crate::harness::ask_user::QuestionAnswer {
         section: String::new(),
         answer: AnswerValue::Selected(vec![value.to_string()]),
     }]
@@ -528,7 +525,7 @@ async fn only_selecting_the_allow_option_approves_a_late_answer() {
             .0
             .resolve(
                 &id,
-                vec![aither_agent::ask_user::QuestionAnswer {
+                vec![crate::harness::ask_user::QuestionAnswer {
                     section: String::new(),
                     answer: AnswerValue::Custom(typed.to_string()),
                 }],
@@ -551,7 +548,7 @@ async fn only_selecting_the_allow_option_approves_a_late_answer() {
 async fn an_answer_to_an_open_question_is_queued_once_and_a_retry_finds_it_committed() {
     let fixture = Fixture::new().await;
     let approver = AskUserApprover::new().with_runtime_service(fixture.runtime.clone());
-    fixture
+    let word = fixture
         .runtime
         .open_question(
             "session",
@@ -589,7 +586,10 @@ async fn an_answer_to_an_open_question_is_queued_once_and_a_retry_finds_it_commi
         .hidden_context_xml
         .expect("hidden context")
         .to_string();
-    assert!(queued.contains("open-1"), "{queued}");
+    assert!(
+        queued.contains(&format!("question {word}")) && !queued.contains("open-1"),
+        "the answer names the question by its word: {queued}"
+    );
     assert!(runtime.queued_messages.is_empty(), "queued once");
 }
 
@@ -608,7 +608,11 @@ async fn an_answer_to_an_unknown_question_is_not_found() {
 /// A second process sharing the database: its own service over the same
 /// database file, with its own run registry.
 fn other_process(fixture: &Fixture) -> SessionRuntimeService {
-    SessionRuntimeService::new(fixture.runtime.db(), UiEventBus::new())
+    SessionRuntimeService::new(
+        fixture.runtime.db(),
+        UiEventBus::new(),
+        crate::session::MayHomePaths::new(fixture.dir.path().join("home")),
+    )
 }
 
 async fn resume_from(process: &SessionRuntimeService) -> super::chat::WaitingTurnResume {
@@ -627,7 +631,7 @@ async fn resume_from(process: &SessionRuntimeService) -> super::chat::WaitingTur
 /// the state.
 #[tokio::test]
 async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let holder = fixture
         .runtime
@@ -640,7 +644,7 @@ async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
     let resumed = bounded("the resume", resume_from(&winner)).await;
 
     assert!(
-        matches!(resumed, super::chat::WaitingTurnResume::RunLive(_)),
+        resumed.dispatch.is_none(),
         "a live run's lease blocks the resume"
     );
     assert_eq!(
@@ -659,7 +663,7 @@ async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
 /// through its own prompt: a second, stale delivery.
 #[tokio::test]
 async fn a_resume_queues_no_reminder_behind_a_live_run() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let holder = fixture
         .runtime
@@ -689,15 +693,14 @@ async fn a_resume_queues_no_reminder_behind_a_live_run() {
 /// With no live run the resume takes the lease and queues the reminder.
 #[tokio::test]
 async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_lease() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let winner = other_process(&fixture);
 
     let resumed = bounded("the resume", resume_from(&winner)).await;
 
-    let super::chat::WaitingTurnResume::Dispatch { guard, runtime } = resumed else {
-        panic!("a session without a live run must be resumed");
-    };
+    let super::chat::WaitingTurnResume { runtime, dispatch } = resumed;
+    let guard = dispatch.expect("a session without a live run must be resumed");
     assert!(runtime.has_pending_messages(), "the reminder is queued");
     assert!(
         winner.runs().is_held("session"),
@@ -713,13 +716,13 @@ async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_
 /// and pushes it into the running terminal's grants before the run wakes.
 #[tokio::test]
 async fn an_approved_workspace_request_persists_and_grants_the_dir() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
     std::fs::write(&config_path, "").expect("workspace.toml");
     let approved_dir = tempfile::tempdir().expect("approved dir");
-    let grants = aither_sandbox::TerminalGrants::new();
+    let grants = aither_sandbox::Grants::new();
     fixture
         .runtime
         .set_terminal_grants("session", grants.clone());
@@ -772,13 +775,13 @@ async fn an_approved_workspace_request_persists_and_grants_the_dir() {
 /// A denied request persists nothing and grants nothing.
 #[tokio::test]
 async fn a_denied_workspace_request_grants_nothing() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
     std::fs::write(&config_path, "").expect("workspace.toml");
     let denied_dir = tempfile::tempdir().expect("denied dir");
-    let grants = aither_sandbox::TerminalGrants::new();
+    let grants = aither_sandbox::Grants::new();
     fixture
         .runtime
         .set_terminal_grants("session", grants.clone());
@@ -831,12 +834,12 @@ async fn a_denied_workspace_request_grants_nothing() {
 /// `workspace.toml` entry appears.
 #[tokio::test]
 async fn an_approval_with_an_unresolvable_path_leaves_the_request_pending() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     let may_dir = tempfile::tempdir().expect("may dir");
     let config_path = may_dir.path().join("workspace.toml");
     std::fs::write(&config_path, "").expect("workspace.toml");
-    let grants = aither_sandbox::TerminalGrants::new();
+    let grants = aither_sandbox::Grants::new();
     fixture
         .runtime
         .set_terminal_grants("session", grants.clone());
@@ -900,7 +903,7 @@ async fn an_approval_with_an_unresolvable_path_leaves_the_request_pending() {
 /// profile's `workspace.toml` and leaves the global one untouched.
 #[tokio::test]
 async fn an_approved_request_writes_the_profile_workspace_toml() {
-    init_executor();
+    crate::test_support::install_global_executor();
     let fixture = Fixture::new().await;
     fixture
         .runtime
@@ -978,8 +981,12 @@ async fn forgetting_terminal_grants_removes_the_handle() {
     let db = ChatDb::open(&dir.path().join("history.db"))
         .await
         .expect("open database");
-    let runtime = SessionRuntimeService::new(db, UiEventBus::new());
-    runtime.set_terminal_grants("session", aither_sandbox::TerminalGrants::new());
+    let runtime = SessionRuntimeService::new(
+        db,
+        UiEventBus::new(),
+        crate::session::MayHomePaths::new(dir.path().join("home")),
+    );
+    runtime.set_terminal_grants("session", aither_sandbox::Grants::new());
     assert!(runtime.terminal_grants("session").is_some());
     runtime.forget_terminal_grants("session");
     assert!(

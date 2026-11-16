@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
+use crate::harness::ask_user::{AnswerValue, QuestionAnswer};
 use aither_core::llm::{Tool, ToolContext};
 
 use super::{GlobalRulesArgs, GlobalRulesTool, RulesImport, SkillCopyReport, copy_skills};
@@ -86,6 +86,7 @@ async fn import_session(rules: &[u8]) -> ImportSession {
     let runtime = Arc::new(crate::session::SessionRuntimeService::new(
         db.clone(),
         crate::ui_event_bus::UiEventBus::new(),
+        crate::session::MayHomePaths::new(may_dir.clone()),
     ));
     let sandbox = temp.path().join("sandbox");
     std::fs::create_dir_all(&sandbox).expect("sandbox");
@@ -139,7 +140,7 @@ async fn write_is_refused_until_the_user_answers_a_question() {
         .call(
             AskUserArgs {
                 question: Some("Change `npm` to `bun`?".to_string()),
-                positional_question: None,
+                question_text: None,
                 option: vec!["Change it".to_string(), "Keep npm".to_string()],
                 multi_select: false,
                 secret: None,

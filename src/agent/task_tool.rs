@@ -1,4 +1,4 @@
-use aither_agent::tool_request::{
+use crate::harness::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
@@ -87,7 +87,7 @@ pub struct NormalizedTaskCreateRequest {
 /// Outcome of a handled task-create request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCreateResult {
-    /// ID assigned to the created task.
+    /// The word the model knows the created task by.
     pub task_id: String,
     /// Profile the task was created under.
     pub profile_id: String,

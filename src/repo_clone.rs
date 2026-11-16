@@ -21,10 +21,16 @@
 //! Subagents get child clones of a session clone via [`SessionRepos::child_clone`];
 //! their base is always a commit, so a run's work is `git diff base..head`.
 
+mod checkouts;
+pub use checkouts::{
+    CheckoutRefresh, CheckoutSnapshot, DaemonCheckouts, GenerationLease, cow_copy_dir,
+};
+
 use std::path::{Path, PathBuf};
 
-use aither_core::llm::{CommandOutcome, CommandStream};
-use aither_sandbox::{TerminalRunner, TerminalScript};
+use aither_core::llm::CommandStream;
+use aither_sandbox::{RunOutcome, Script, ScriptResult};
+use askama::Template;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -54,6 +60,13 @@ pub enum RepoCloneError {
     /// The clone path exists but is not a real directory.
     #[error("clone path {0} exists and is not a directory")]
     Conflict(PathBuf),
+    /// The checkout's work in progress cannot be committed without an author.
+    #[error(
+        "the checkout's work in progress cannot be committed: git has no author; \
+         set it with `git config --global user.name \"<name>\"` and \
+         `git config --global user.email \"<email>\"`"
+    )]
+    GitIdentity,
     /// A script in the session's terminal sandbox did not exit cleanly.
     #[error("`{script}` in the sandbox: {reason}")]
     Sandbox {
@@ -64,10 +77,6 @@ pub enum RepoCloneError {
     },
 }
 
-/// How long a script in the sandbox may run: the terminal's own cap, so a
-/// check runs as long as any agent command may.
-const SANDBOX_TIMEOUT: std::time::Duration = aither_sandbox::DEFAULT_TIMEOUT_CAP;
-
 /// The session's terminal sandbox, where everything inside an
 /// agent-writable repository runs.
 ///
@@ -75,14 +84,36 @@ const SANDBOX_TIMEOUT: std::time::Duration = aither_sandbox::DEFAULT_TIMEOUT_CAP
 /// so it gets no more authority than the agent's own commands.
 #[derive(Debug, Clone)]
 pub struct CloneSandbox {
-    runner: TerminalRunner,
+    shell: crate::ipc::SessionShell,
+    /// How long a script may run: the shell's own cap, so a check runs as
+    /// long as any agent command may.
+    timeout: std::time::Duration,
+}
+
+/// Why a script of a clone's sandbox did not exit 0.
+#[derive(Template)]
+#[template(path = "clone_script_failure.txt", escape = "none")]
+struct ScriptFailure<'a> {
+    exit: Option<i32>,
+    stderr: &'a str,
 }
 
 impl CloneSandbox {
-    /// Run scripts on the terminal `runner` belongs to.
+    /// Run scripts on `shell`, each killed after `timeout`.
     #[must_use]
-    pub const fn new(runner: TerminalRunner) -> Self {
-        Self { runner }
+    pub const fn new(shell: crate::ipc::SessionShell, timeout: std::time::Duration) -> Self {
+        Self { shell, timeout }
+    }
+
+    /// What a failed script printed on stderr, when it printed text.
+    async fn stderr_text(result: &ScriptResult) -> String {
+        match &result.stderr {
+            Some(CommandStream::Inline { text }) => text.clone(),
+            Some(CommandStream::Stored { file, .. }) => async_fs::read_to_string(&file.path)
+                .await
+                .unwrap_or_default(),
+            Some(CommandStream::Image { .. }) | None => String::new(),
+        }
     }
 
     /// Run `script` in `dir` inside the sandbox and return its stdout once
@@ -91,25 +122,41 @@ impl CloneSandbox {
     /// # Errors
     /// Fails when the terminal refuses or cannot run the script, or the
     /// script exits nonzero or is killed at its timeout.
+    ///
+    /// # Panics
+    /// Panics when the failure template fails to render, which typed input
+    /// never does.
     pub async fn run(&self, dir: &Path, script: &str) -> Result<String, RepoCloneError> {
         let failed = |reason: String| RepoCloneError::Sandbox {
             script: script.to_string(),
             reason,
         };
         let result = self
-            .runner
-            .run(TerminalScript::new(script, dir, SANDBOX_TIMEOUT))
+            .shell
+            .run(Script::new(script, dir, self.timeout))
             .await
             .map_err(|error| failed(error.to_string()))?;
-        match result.outcome {
-            CommandOutcome::Exited { code: 0 } => match result.stdout {
+        if result.outcome == (RunOutcome::Exited { code: 0 }) {
+            match result.stdout {
                 CommandStream::Inline { text } => Ok(text),
                 CommandStream::Stored { file, .. } => {
                     Ok(async_fs::read_to_string(&file.path).await?)
                 }
                 CommandStream::Image { .. } => Err(failed("printed an image".to_string())),
-            },
-            _ => Err(failed(result.render_for_model())),
+            }
+        } else {
+            let exit = match result.outcome {
+                RunOutcome::Exited { code } => Some(code),
+                RunOutcome::Killed(_) => None,
+            };
+            let stderr = Self::stderr_text(&result).await;
+            let reason = ScriptFailure {
+                exit,
+                stderr: stderr.trim(),
+            }
+            .render()
+            .expect("the script failure template renders typed input");
+            Err(failed(reason))
         }
     }
 }
@@ -247,6 +294,9 @@ pub struct CloneRecord {
     pub source: String,
     /// Whether the clone came from a local checkout.
     pub local: bool,
+    /// The work-in-progress commit the clone's work stacks on, when it was
+    /// based on its checkout as it stood.
+    pub base_sha: Option<String>,
 }
 
 impl TryFrom<RepoCloneRow> for CloneRecord {
@@ -258,6 +308,7 @@ impl TryFrom<RepoCloneRow> for CloneRecord {
             dir: CloneDir::try_from(row.dir)?,
             source: row.source,
             local: row.local,
+            base_sha: row.base_sha,
         })
     }
 }
@@ -283,6 +334,9 @@ pub struct SessionRepos {
     db: ChatDb,
     /// The git that makes clones.
     host: HostGit,
+    /// Daemon-held default-branch checkouts used to derive GitHub workspaces
+    /// copy-on-write without re-cloning over the network.
+    checkouts: Option<DaemonCheckouts>,
 }
 
 impl SessionRepos {
@@ -295,6 +349,7 @@ impl SessionRepos {
             session_id: session_id.into(),
             db,
             host: HostGit::inherit(),
+            checkouts: None,
         }
     }
 
@@ -302,6 +357,13 @@ impl SessionRepos {
     #[must_use]
     pub fn with_host(mut self, host: HostGit) -> Self {
         self.host = host;
+        self
+    }
+
+    /// Derive GitHub workspaces copy-on-write from `checkouts`.
+    #[must_use]
+    pub fn with_checkouts(mut self, checkouts: DaemonCheckouts) -> Self {
+        self.checkouts = Some(checkouts);
         self
     }
 
@@ -361,6 +423,188 @@ impl SessionRepos {
             .collect())
     }
 
+    /// Every clone serving `repo_key`.
+    ///
+    /// # Errors
+    /// Fails when the registry cannot be read.
+    pub async fn clones_for(&self, repo_key: &str) -> Result<Vec<CloneRecord>, RepoCloneError> {
+        Ok(self
+            .clones()
+            .await?
+            .into_iter()
+            .filter(|c| c.repo_key == repo_key)
+            .collect())
+    }
+
+    /// Pick the next unused single-component directory name for `repo_key`:
+    /// `<base>-<8hex>` when free, otherwise `-2`, `-3`, ...
+    async fn next_clone_dir(&self, repo_key: &str) -> Result<CloneDir, RepoCloneError> {
+        let base = CloneDir::for_repo_key(repo_key);
+        let existing: std::collections::HashSet<String> =
+            self.clones().await?.into_iter().map(|c| c.dir.0).collect();
+        if !existing.contains(base.as_str()) && !real_dir_exists(&self.path(&base))? {
+            return Ok(base);
+        }
+        let mut suffix = 2usize;
+        loop {
+            let candidate = CloneDir(format!("{}-{suffix}", base.as_str()));
+            if !existing.contains(candidate.as_str()) && !real_dir_exists(&self.path(&candidate))? {
+                return Ok(candidate);
+            }
+            suffix += 1;
+        }
+    }
+
+    /// Derive a fresh independent workspace for `checkout` when `create_new` is
+    /// true or existing workspaces already carry local changes/commits, live PRs,
+    /// or are behind the refreshed daemon checkout; otherwise reuse an untouched
+    /// clean workspace.
+    ///
+    /// # Errors
+    /// Fails when the checkout's identity cannot be read, git fails, or the
+    /// registry cannot be read or written.
+    pub async fn request_clone_of(
+        &self,
+        checkout: &Path,
+        config: &crate::workspace::WorkspaceConfig,
+        staging: &Path,
+        create_new: bool,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        let Some(source) = CloneSource::of(checkout, config)? else {
+            return Ok(None);
+        };
+        if !create_new && let Some(reusable) = self.reusable_untouched_clone(&source).await? {
+            return Ok(Some(reusable));
+        }
+        Ok(Some(match source {
+            CloneSource::Remote { url, owner_repo } => {
+                self.create_remote_clone(&url, &owner_repo, staging, None)
+                    .await?
+            }
+            CloneSource::Local { identity } => {
+                self.create_local_clone(checkout, &identity, staging, false)
+                    .await?
+            }
+        }))
+    }
+
+    /// Derive a fresh independent workspace from a session binding.
+    ///
+    /// # Errors
+    /// Fails when git fails or the registry cannot be written.
+    pub async fn request_clone_of_binding(
+        &self,
+        binding: &crate::session::RepoBinding,
+        config: &crate::workspace::WorkspaceConfig,
+        staging: &Path,
+        create_new: bool,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        match binding {
+            crate::session::RepoBinding::Github(repository) => {
+                let owner_repo = repository.to_string();
+                let publishes = {
+                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
+                        .await
+                }
+                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                if !publishes {
+                    return Ok(None);
+                }
+                let url = format!("https://github.com/{owner_repo}.git");
+                let source = CloneSource::Remote {
+                    url: url.clone(),
+                    owner_repo: owner_repo.clone(),
+                };
+                if !create_new
+                    && let Some(reusable) = self.reusable_untouched_clone(&source).await?
+                {
+                    return Ok(Some(reusable));
+                }
+                Ok(Some(
+                    self.create_remote_clone(&url, &owner_repo, staging, None)
+                        .await?,
+                ))
+            }
+            crate::session::RepoBinding::Local(_) => {
+                if !create_new && let Some(existing) = self.clone_for(&binding.clone_key()).await? {
+                    return Ok(Some(existing));
+                }
+                self.ensure_clone_of_binding(binding, config, staging).await
+            }
+        }
+    }
+
+    async fn reusable_untouched_clone(
+        &self,
+        source: &CloneSource,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        let key = source.key();
+        let existing = self.clones_for(&key).await?;
+        let Some(first) = existing.first() else {
+            return Ok(None);
+        };
+        if existing.len() > 1 {
+            return Ok(None);
+        }
+        let dir = self.path(&first.dir);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        // A workspace with a live PR stays dedicated to that PR.
+        if self
+            .db
+            .open_pr_for_workspace(&key, &self.session_id, first.dir.as_str())
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        // For GitHub workspaces backed by `DaemonCheckouts`, refresh the daemon
+        // checkout first and only reuse an untouched workspace if it already
+        // matches the remote HEAD.
+        let expected_head = match (source, &self.checkouts) {
+            (CloneSource::Remote { url, owner_repo }, Some(checkouts)) => {
+                Some(checkouts.refresh(owner_repo, url).await?.snapshot.head_sha)
+            }
+            _ => None,
+        };
+        let host = self.host.clone();
+        let dir_check = dir.clone();
+        let clean_and_current = blocking::unblock(move || -> bool {
+            let Ok(status) = host.output(Some(&dir_check), &["status", "--porcelain"]) else {
+                return false;
+            };
+            if !status.trim().is_empty() {
+                return false;
+            }
+            let Ok(head) = host.output(Some(&dir_check), &["rev-parse", "HEAD"]) else {
+                return false;
+            };
+            let head = head.trim();
+            if let Some(expected) = expected_head {
+                return head == expected;
+            }
+            let upstream_ref = if host
+                .output(
+                    Some(&dir_check),
+                    &["rev-parse", "--verify", "upstream/HEAD"],
+                )
+                .is_ok()
+            {
+                "upstream/HEAD"
+            } else {
+                "origin/HEAD"
+            };
+            if let Ok(upstream_head) = host.output(Some(&dir_check), &["rev-parse", upstream_ref]) {
+                return head == upstream_head.trim();
+            }
+            true
+        })
+        .await;
+        Ok(clean_and_current.then_some(dir))
+    }
+
     /// The clone directory serving `repo_key`, when one exists.
     ///
     /// # Errors
@@ -418,16 +662,83 @@ impl SessionRepos {
         }))
     }
 
+    /// Ensure the session's clone of the repository `binding` names exists
+    /// and return its path; `None` when the repository's trust binds no
+    /// clone. A GitHub binding clones the remote and reads no local
+    /// checkout, so it works with none present; a local binding clones its
+    /// checkout.
+    ///
+    /// # Errors
+    /// Fails when git fails, the checkout's identity cannot be read, or the
+    /// registry cannot be read or written.
+    pub async fn ensure_clone_of_binding(
+        &self,
+        binding: &crate::session::RepoBinding,
+        config: &crate::workspace::WorkspaceConfig,
+        staging: &Path,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        match binding {
+            crate::session::RepoBinding::Github(repository) => {
+                let owner_repo = repository.to_string();
+                // Matching a project reads its checkout's remote: off the
+                // executor.
+                let publishes = {
+                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
+                        .await
+                }
+                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                if !publishes {
+                    return Ok(None);
+                }
+                let url = format!("https://github.com/{owner_repo}.git");
+                Ok(Some(
+                    self.ensure_remote_clone(&url, &owner_repo, staging).await?,
+                ))
+            }
+            // A local binding is the checkout's own repository: its clone is
+            // always local, whatever the trust level would pick for a
+            // session that only meets the checkout. `local` trust writes the
+            // checkout and binds no clone.
+            crate::session::RepoBinding::Local(identity) => {
+                let Some(checkout) = binding.checkout() else {
+                    return Ok(None);
+                };
+                let clones = {
+                    let (config, identity, checkout) =
+                        (config.clone(), identity.clone(), checkout.clone());
+                    blocking::unblock(move || {
+                        crate::trust::trust_for(&config, &identity, &checkout)
+                    })
+                    .await
+                }
+                .is_some_and(crate::trust::TrustLevel::clones_work);
+                if !clones {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    self.ensure_local_clone(&checkout, identity, staging)
+                        .await?,
+                ))
+            }
+        }
+    }
+
     /// Run `git clone <args> <staged>` in a fresh directory under `staging`,
     /// then move the finished clone to `repos/<dir>`. The clone is never
     /// agent-writable while host git works on it, so nothing the agent writes
     /// into it runs on the host.
+    ///
+    /// With `wip_of`, the checkout's uncommitted and untracked files become
+    /// one commit on top of the clone's HEAD, whose id is returned.
     async fn clone_staged(
         &self,
         args: Vec<String>,
         staging: &Path,
         dir: &CloneDir,
-    ) -> Result<(), RepoCloneError> {
+        wip_of: Option<&Path>,
+    ) -> Result<Option<String>, RepoCloneError> {
+        let wip_of = wip_of.map(Path::to_path_buf);
         let staging = staging.to_path_buf();
         let session_root = self.session_root.clone();
         let dir = dir.clone();
@@ -443,9 +754,15 @@ impl SessionRepos {
             let staged_arg = staged.to_string_lossy();
             command.push(&staged_arg);
             host.output(None, &command)?;
+            // The clone is still host-owned here, so nothing the agent
+            // writes can run on the host.
+            let base = wip_of
+                .map(|checkout| wip::commit_onto(&host, &checkout, &staged))
+                .transpose()?
+                .flatten();
             std::fs::create_dir_all(&session_root)?;
             confined::install_clone(&session_root, &staged, &dir)?;
-            Ok(())
+            Ok(base)
         })
         .await
     }
@@ -457,6 +774,7 @@ impl SessionRepos {
         dir: &CloneDir,
         source: String,
         local: bool,
+        base_sha: Option<String>,
     ) -> Result<(), RepoCloneError> {
         self.db
             .insert_repo_clone(
@@ -466,6 +784,7 @@ impl SessionRepos {
                     dir: dir.0.clone(),
                     source,
                     local,
+                    base_sha,
                 },
             )
             .await?;
@@ -488,6 +807,66 @@ impl SessionRepos {
         repo_key: &Path,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
+        self.local_clone(checkout, repo_key, staging, false).await
+    }
+
+    /// Like [`Self::ensure_local_clone`], for a session that works on top of
+    /// the checkout as it stands: the checkout's uncommitted changes and
+    /// untracked files become one base commit in the clone, recorded as the
+    /// clone's base, and the session's work stacks on it.
+    ///
+    /// # Errors
+    /// Fails as [`Self::ensure_local_clone`] does, or when the base commit
+    /// cannot be made.
+    pub async fn ensure_wip_clone(
+        &self,
+        checkout: &Path,
+        repo_key: &Path,
+        staging: &Path,
+    ) -> Result<PathBuf, RepoCloneError> {
+        self.local_clone(checkout, repo_key, staging, true).await
+    }
+
+    async fn create_local_clone(
+        &self,
+        checkout: &Path,
+        repo_key: &Path,
+        staging: &Path,
+        with_wip: bool,
+    ) -> Result<PathBuf, RepoCloneError> {
+        let key = repo_key.to_string_lossy().into_owned();
+        let clone_dir = self.next_clone_dir(&key).await?;
+        let dir = self.path(&clone_dir);
+        let base = self
+            .clone_staged(
+                vec![
+                    "--local".to_string(),
+                    "--no-hardlinks".to_string(),
+                    checkout.to_string_lossy().into_owned(),
+                ],
+                staging,
+                &clone_dir,
+                with_wip.then_some(checkout),
+            )
+            .await?;
+        self.register(
+            key,
+            &clone_dir,
+            checkout.to_string_lossy().into_owned(),
+            true,
+            base,
+        )
+        .await?;
+        Ok(dir)
+    }
+
+    async fn local_clone(
+        &self,
+        checkout: &Path,
+        repo_key: &Path,
+        staging: &Path,
+        with_wip: bool,
+    ) -> Result<PathBuf, RepoCloneError> {
         let key = repo_key.to_string_lossy().into_owned();
         if let Some(dir) = self.clone_for(&key).await? {
             return Ok(dir);
@@ -502,27 +881,31 @@ impl SessionRepos {
                 &clone_dir,
                 checkout.to_string_lossy().into_owned(),
                 true,
+                None,
             )
             .await?;
             return Ok(dir);
         }
         // Objects are copied: the sandbox runs as the user's uid, so a
         // hardlinked object made writable would change the source's inode.
-        self.clone_staged(
-            vec![
-                "--local".to_string(),
-                "--no-hardlinks".to_string(),
-                checkout.to_string_lossy().into_owned(),
-            ],
-            staging,
-            &clone_dir,
-        )
-        .await?;
+        let base = self
+            .clone_staged(
+                vec![
+                    "--local".to_string(),
+                    "--no-hardlinks".to_string(),
+                    checkout.to_string_lossy().into_owned(),
+                ],
+                staging,
+                &clone_dir,
+                with_wip.then_some(checkout),
+            )
+            .await?;
         self.register(
             key,
             &clone_dir,
             checkout.to_string_lossy().into_owned(),
             true,
+            base,
         )
         .await?;
         Ok(dir)
@@ -540,15 +923,85 @@ impl SessionRepos {
         repo_key: &str,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
-        if let Some(dir) = self.clone_for(repo_key).await? {
-            return Ok(dir);
-        }
-        let clone_dir = CloneDir::for_repo_key(repo_key);
+        self.remote_clone(url, repo_key, staging, None).await
+    }
+
+    /// Like [`Self::ensure_remote_clone`], for a session that works on top of
+    /// `checkout` as it stands: the checkout's uncommitted changes and
+    /// untracked files become one base commit on the remote's HEAD, recorded
+    /// as the clone's base. The clone stays remote-sourced, so the session
+    /// keeps its GitHub binding.
+    ///
+    /// # Errors
+    /// Fails as [`Self::ensure_remote_clone`] does, or when the base commit
+    /// cannot be made.
+    pub async fn ensure_remote_wip_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        checkout: &Path,
+    ) -> Result<PathBuf, RepoCloneError> {
+        self.remote_clone(url, repo_key, staging, Some(checkout))
+            .await
+    }
+
+    async fn create_remote_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        wip_of: Option<&Path>,
+    ) -> Result<PathBuf, RepoCloneError> {
+        let clone_dir = self.next_clone_dir(repo_key).await?;
         let dir = self.path(&clone_dir);
-        if real_dir_exists(&dir)? {
-            self.register(repo_key.to_string(), &clone_dir, url.to_string(), false)
-                .await?;
-            return Ok(dir);
+        let base = self
+            .remote_clone_into_dir(url, repo_key, staging, &clone_dir, wip_of)
+            .await?;
+        self.register(
+            repo_key.to_string(),
+            &clone_dir,
+            url.to_string(),
+            false,
+            base,
+        )
+        .await?;
+        Ok(dir)
+    }
+
+    async fn remote_clone_into_dir(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        clone_dir: &CloneDir,
+        wip_of: Option<&Path>,
+    ) -> Result<Option<String>, RepoCloneError> {
+        if let Some(checkouts) = &self.checkouts {
+            let staging_buf = staging.to_path_buf();
+            let scratch = blocking::unblock(move || {
+                std::fs::create_dir_all(&staging_buf)?;
+                tempfile::Builder::new()
+                    .prefix("cow-")
+                    .tempdir_in(&staging_buf)
+            })
+            .await?;
+            let staged = scratch.path().join("repo");
+            checkouts.derive_workspace(repo_key, url, &staged).await?;
+            let wip_of_buf = wip_of.map(Path::to_path_buf);
+            let session_root = self.session_root.clone();
+            let dir_owned = clone_dir.clone();
+            let host = self.host.clone();
+            return blocking::unblock(move || {
+                let base = wip_of_buf
+                    .map(|checkout| wip::commit_onto(&host, &checkout, &staged))
+                    .transpose()?
+                    .flatten();
+                std::fs::create_dir_all(&session_root)?;
+                confined::install_clone(&session_root, &staged, &dir_owned)?;
+                Ok(base)
+            })
+            .await;
         }
         self.clone_staged(
             vec![
@@ -557,16 +1010,52 @@ impl SessionRepos {
                 url.to_string(),
             ],
             staging,
+            clone_dir,
+            wip_of,
+        )
+        .await
+    }
+
+    async fn remote_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        wip_of: Option<&Path>,
+    ) -> Result<PathBuf, RepoCloneError> {
+        if let Some(dir) = self.clone_for(repo_key).await? {
+            return Ok(dir);
+        }
+        let clone_dir = CloneDir::for_repo_key(repo_key);
+        let dir = self.path(&clone_dir);
+        if real_dir_exists(&dir)? {
+            self.register(
+                repo_key.to_string(),
+                &clone_dir,
+                url.to_string(),
+                false,
+                None,
+            )
+            .await?;
+            return Ok(dir);
+        }
+        let base = self
+            .remote_clone_into_dir(url, repo_key, staging, &clone_dir, wip_of)
+            .await?;
+        self.register(
+            repo_key.to_string(),
             &clone_dir,
+            url.to_string(),
+            false,
+            base,
         )
         .await?;
-        self.register(repo_key.to_string(), &clone_dir, url.to_string(), false)
-            .await?;
         Ok(dir)
     }
 
-    /// Clone `parent` into `child_dir` for a subagent run: a local clone
-    /// of the session clone that shares no file with it, so the run's base is always a commit
+    /// Clone `parent` into `child_dir` for a subagent run: a clone of the
+    /// session clone at its current commit that shares no file with it and
+    /// runs nothing `parent` configures, so the run's base is always a commit
     /// and its work is `git diff base..head`. Not registered — the parent
     /// session owns it and removes it with the run directory.
     ///
@@ -580,7 +1069,7 @@ impl SessionRepos {
         if let Some(parent_dir) = child_dir.parent() {
             std::fs::create_dir_all(parent_dir)?;
         }
-        local_clone(&self.host, parent, child_dir).await?;
+        clone_untrusted(&self.host, parent, child_dir).await?;
         Ok(child_dir.to_path_buf())
     }
 
@@ -630,6 +1119,8 @@ fn real_dir_exists(path: &Path) -> Result<bool, RepoCloneError> {
 /// is host-owned but everything in it is agent-writable, so each step runs
 /// relative to an open handle and never follows a symlink: a `repos` or
 /// clone directory swapped for a link is refused or unlinked, never entered.
+mod wip;
+
 mod confined {
     use std::ffi::CStr;
     use std::io;
@@ -714,17 +1205,40 @@ mod confined {
     }
 }
 
-/// Clone `source` into `target` copying its objects: the sandbox runs as the
-/// user's uid, so a hardlinked object made writable would change the source's
-/// inode too.
-async fn local_clone(host: &HostGit, source: &Path, target: &Path) -> Result<(), RepoCloneError> {
+/// Clone the agent-writable repository `source` into `target`, running
+/// nothing `source` configures on the host.
+///
+/// The clone goes through `git upload-pack` (`--no-local`), which copies no
+/// file of `source`: no hardlink to an object the sandbox could rewrite, no
+/// alternate it names, no symlink it plants. The configuration, hooks and
+/// attributes of `source` take no part in serving it (git reads
+/// `uploadpack.packObjectsHook` and the like from protected configuration
+/// only); the file system monitor is off for the whole command, no hook is
+/// installed in `target` and the hook path is void. `target` is the host's
+/// own new repository until the agent gets it.
+async fn clone_untrusted(
+    host: &HostGit,
+    source: &Path,
+    target: &Path,
+) -> Result<(), RepoCloneError> {
     let host = host.clone();
     let source = source.to_string_lossy().into_owned();
     let target = target.to_string_lossy().into_owned();
     blocking::unblock(move || {
         host.output(
             None,
-            &["clone", "--local", "--no-hardlinks", &source, &target],
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "clone",
+                "--no-local",
+                "--template=",
+                "--",
+                &source,
+                &target,
+            ],
         )
     })
     .await?;
@@ -774,49 +1288,48 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RepoCloneError> {
 pub(crate) mod test_sandbox {
     use std::path::{Path, PathBuf};
 
-    use aither_sandbox::permission::PermissionError;
-    use aither_sandbox::{Configured, TerminalMode, TerminalTool, ToolRegistryBuilder};
-    use executor_core::tokio::TokioGlobal;
+    use std::sync::Arc;
+
+    use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
+    use aither_sandbox::{DomainApprover, DomainRequest, Grants, Interpreter};
 
     use super::CloneSandbox;
+    use crate::agent::command_env::CommandEnv;
+    use crate::ipc::{CommandRegistryBuilder, SessionShell};
 
-    /// Runs sandboxed commands and refuses every unsafe one.
+    /// Runs sandboxed commands and refuses every unsandboxed one and every
+    /// connection.
+    #[derive(Debug, Clone, Copy)]
     pub struct SandboxedOnly;
 
-    impl aither_sandbox::PermissionHandler for SandboxedOnly {
-        fn check(
+    impl Approver for SandboxedOnly {
+        fn approve(
             &self,
-            mode: TerminalMode,
-            _script: &str,
-        ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-            std::future::ready(Ok(matches!(mode, TerminalMode::Sandboxed)))
+            _request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
+            std::future::ready(Ok(Approval::Denied {
+                reason: "the test terminal runs sandboxed scripts only".to_string(),
+            }))
         }
     }
 
-    /// The build's shared baseline-tool cache, the one the terminal E2E
-    /// suite keeps at `CARGO_TARGET_TMPDIR/may-tools`: a unit test binary
-    /// lives in `<target>/<profile>/deps/`. `MAY_TEST_CACHE` names the
-    /// directory that holds it instead, as it does for the E2E suite.
-    fn tool_cache() -> PathBuf {
-        if let Some(root) = std::env::var_os("MAY_TEST_CACHE") {
-            return PathBuf::from(root).join("may-tools");
+    impl DomainApprover for SandboxedOnly {
+        fn approve(&self, _request: &DomainRequest) -> impl Future<Output = bool> + Send {
+            std::future::ready(false)
         }
-        let exe = std::env::current_exe().expect("the test binary has a path");
-        exe.ancestors()
-            .nth(3)
-            .unwrap_or_else(|| panic!("{} is not under <target>/<profile>/deps", exe.display()))
-            .join("tmp/may-tools")
     }
 
-    /// A session terminal working in `session_root`, as May builds one: the
+    /// A session shell working in `session_root`, as May builds one: the
     /// root is its only writable place. Dropping it ends its sandbox.
     pub struct TestTerminal {
-        terminal: TerminalTool<SandboxedOnly, TokioGlobal, Configured>,
+        shell: Arc<SessionShell>,
+        timeout: std::time::Duration,
+        _audit: tempfile::TempDir,
     }
 
     impl TestTerminal {
         pub async fn new(session_root: &Path) -> Self {
-            Self::with_registry(session_root, ToolRegistryBuilder::new()).await
+            Self::configured(session_root, CommandRegistryBuilder::new(), None).await
         }
 
         /// A terminal as the daemon builds one for a session that signs: the
@@ -831,32 +1344,198 @@ pub(crate) mod test_sandbox {
                 .install_sandbox_git(session_root, None)
                 .await
                 .unwrap();
-            let mut builder = ToolRegistryBuilder::new();
-            builder.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
-            Self::with_registry(session_root, builder).await
+            let mut commands = CommandRegistryBuilder::new();
+            commands.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
+            Self::configured(session_root, commands, None).await
         }
 
-        async fn with_registry(session_root: &Path, builder: ToolRegistryBuilder) -> Self {
+        /// A terminal whose scripts can call the commands `commands` holds.
+        pub async fn with_commands(session_root: &Path, commands: CommandRegistryBuilder) -> Self {
+            Self::configured(session_root, commands, None).await
+        }
+
+        /// A terminal whose commands see the environment `env` supplies.
+        pub async fn with_env(session_root: &Path, env: CommandEnv) -> Self {
+            Self::configured(session_root, CommandRegistryBuilder::new(), Some(env)).await
+        }
+
+        async fn configured(
+            session_root: &Path,
+            commands: CommandRegistryBuilder,
+            env_source: Option<CommandEnv>,
+        ) -> Self {
+            // A shell spawns its job registry on the global executor, which
+            // the `may` binary installs at startup.
+            crate::test_support::install_global_executor();
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
-            let cache = tool_cache();
+            let cache = crate::tools::test_tool_cache();
             std::fs::create_dir_all(&cache).unwrap();
-            let terminal = TerminalTool::new_exact(session_root, SandboxedOnly, TokioGlobal)
+            std::fs::create_dir_all(session_root).unwrap();
+            let tools = crate::tools::ToolEnvironments::prepare_host(&distribution, &cache)
                 .await
-                .expect("the terminal starts")
-                .initialize_tools(&distribution, &cache)
+                .expect("the baseline tools prepare");
+            let audit = tempfile::tempdir().expect("an audit directory");
+            let audit_log = aither_sandbox::open_network_audit_log(audit.path(), 1)
                 .await
-                .expect("the baseline tools prepare")
-                .with_registry(std::sync::Arc::new(
-                    builder.build(session_root.join("outputs")),
-                ));
-            Self { terminal }
+                .expect("the audit log opens");
+            let grants = Grants::new();
+            grants.add_writable(session_root);
+            let settings = crate::config::ShellSettings::default();
+            let shell = crate::shell::ShellAssembly {
+                tools,
+                container: None,
+                working_dir: session_root.to_path_buf(),
+                grants,
+                priority: heel::ProcessPriority::default(),
+                audit_log,
+                permissions: SandboxedOnly,
+                env_source,
+                budgets: crate::shell::ShellBudgets::of(&settings),
+                // As a session's shell, whose tool definition a fork must
+                // present unchanged.
+                interpreters: vec![Interpreter::Shell, Interpreter::Python],
+                policies: crate::command_policy::PolicySet {
+                    managed_bash: crate::command_policy::runs_managed_bash(false),
+                    refused: crate::command_policy::RefusedReads::default(),
+                    checkout_reads: None,
+                },
+                slot: crate::ipc::ShellSlot::new(),
+                ssh_servers: Vec::new(),
+                ids: None,
+                spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
+                pool: None,
+                connectivity: None,
+            }
+            .build(commands.build())
+            .await
+            .expect("the shell builds");
+            Self {
+                shell,
+                timeout: settings.timeout_cap,
+                _audit: audit,
+            }
         }
 
-        /// The terminal's sandbox, as a terminal-bound command gets it.
-        pub fn sandbox(&self) -> CloneSandbox {
-            CloneSandbox::new(self.terminal.binding().runner().clone())
+        /// The session shell, as a command that launches work from it gets it.
+        pub fn shell(&self) -> &SessionShell {
+            &self.shell
         }
+
+        /// Starts a background job that sleeps for a minute, and returns it
+        /// with its pid.
+        pub async fn sleeping_job(&self) -> (aither_sandbox::Job, u32) {
+            let job = self
+                .shell
+                .run_background(aither_sandbox::ShellArgs {
+                    description: "sleeps".to_string(),
+                    script: "sleep 60".to_string(),
+                    interpreter: aither_sandbox::Interpreter::default(),
+                    sandbox: aither_sandbox::SandboxMode::Sandboxed,
+                    location: None,
+                    resolution: aither_sandbox::MediaResolution::default(),
+                    max_lines: None,
+                    raw: false,
+                    timeout: 120,
+                    background: true,
+                })
+                .await
+                .expect("the job starts");
+            let pid = job.info().await.pid;
+            (job, pid)
+        }
+
+        /// The terminal's sandbox, as a shell-bound command gets it.
+        pub fn sandbox(&self) -> CloneSandbox {
+            CloneSandbox::new(SessionShell::clone(&self.shell), self.timeout)
+        }
+    }
+
+    /// Every executable setting a repository can carry for itself, set in
+    /// `clone` the way an agent writing it could: each runs a script that
+    /// touches `host/<name>` (outside the sandbox) and `ran/<name>` inside
+    /// the session, so a marker in `host/` means it ran on the host. Returns
+    /// the `host/` directory.
+    pub fn arm_hostile_config(session_root: &Path, clone: &Path, outside: &Path) -> PathBuf {
+        let host = outside.join("host");
+        let ran = session_root.join("ran");
+        let scripts = session_root.join("hostile");
+        let hooks = scripts.join("hooks");
+        for dir in [&host, &ran, &hooks] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let script = |path: &Path, name: &str, tail: &str| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch '{}/{name}' 2>/dev/null\ntouch '{}/{name}' 2>/dev/null\n{tail}\n",
+                    host.display(),
+                    ran.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Repository-local hooks, both where git looks by default and under
+        // `core.hooksPath`.
+        for hook in [
+            "pre-commit",
+            "prepare-commit-msg",
+            "commit-msg",
+            "post-commit",
+            "post-checkout",
+            "post-merge",
+            "pre-push",
+            "pre-receive",
+            "update",
+            "post-update",
+            "push-to-checkout",
+            "reference-transaction",
+            "pre-auto-gc",
+            "post-index-change",
+        ] {
+            script(&hooks.join(hook), hook, "exit 0");
+            script(&clone.join(".git/hooks").join(hook), hook, "exit 0");
+        }
+        let mut settings = vec![(
+            "core.hooksPath".to_string(),
+            hooks.to_string_lossy().into_owned(),
+        )];
+        for (key, tail) in [
+            // Answers "no fsmonitor data", so git falls back to a scan.
+            ("core.fsmonitor", "exit 1"),
+            ("filter.hostile.clean", "cat"),
+            ("filter.hostile.smudge", "cat"),
+            ("uploadpack.packObjectsHook", "exec \"$@\""),
+            ("core.sshCommand", "exit 1"),
+            ("core.alternateRefsCommand", "exit 0"),
+            ("credential.helper", "exit 0"),
+            ("core.pager", "cat"),
+            ("core.editor", "exit 0"),
+            ("diff.external", "exit 0"),
+            ("gpg.program", "exit 1"),
+        ] {
+            let path = scripts.join(key);
+            script(&path, key, tail);
+            settings.push((key.to_string(), path.to_string_lossy().into_owned()));
+        }
+        settings.push(("filter.hostile.required".to_string(), "true".to_string()));
+        for (key, value) in settings {
+            super::git(Some(clone), &["config", &key, &value]).unwrap();
+        }
+        std::fs::write(clone.join(".gitattributes"), "* filter=hostile\n").unwrap();
+        host
+    }
+
+    /// Names of the markers in `dir`.
+    pub fn markers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }
 
@@ -866,7 +1545,7 @@ mod tests {
     use crate::trust::TrustLevel;
 
     fn init_repo(dir: &Path) {
-        git(None, &["init", &dir.to_string_lossy()]).unwrap();
+        git(None, &["init", "-b", "main", &dir.to_string_lossy()]).unwrap();
         git(Some(dir), &["config", "user.email", "t@t"]).unwrap();
         git(Some(dir), &["config", "user.name", "t"]).unwrap();
         std::fs::write(dir.join("file.txt"), "hello").unwrap();
@@ -1269,6 +1948,7 @@ mod tests {
                     dir: "../escape".into(),
                     source: "s".into(),
                     local: true,
+                    base_sha: None,
                 },
             )
             .await
@@ -1277,5 +1957,116 @@ mod tests {
             repos.clones().await,
             Err(RepoCloneError::InvalidDir(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn daemon_checkout_atomic_swap_leases_and_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostGit::from_file("/dev/null");
+        let remote = tmp.path().join("remote.git");
+        host.output(
+            None,
+            &["init", "--bare", "-b", "main", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        let work = tmp.path().join("work");
+        init_repo(&work);
+        git(
+            Some(&work),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        git(Some(&work), &["push", "-u", "origin", "main"]).unwrap();
+        let c1 = git(Some(&work), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let checkouts = DaemonCheckouts::new(tmp.path().join("checkouts")).with_host(host.clone());
+        let remote_url = format!("file://{}", remote.display());
+        let snap1 = checkouts.ensure_present("o/r", &remote_url).await.unwrap();
+        assert_eq!(snap1.head_sha, c1);
+        assert_eq!(checkouts.generation_numbers("o/r").unwrap(), vec![1]);
+
+        let lease1 = checkouts.acquire_lease("o/r").await.unwrap();
+        assert_eq!(lease1.generation(), 1);
+
+        // Push a new commit upstream, then refresh daemon checkout.
+        std::fs::write(work.join("next.txt"), "v2\n").unwrap();
+        git(Some(&work), &["add", "."]).unwrap();
+        git(Some(&work), &["commit", "-m", "v2"]).unwrap();
+        git(Some(&work), &["push", "origin", "main"]).unwrap();
+        let c2 = git(Some(&work), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let refresh = checkouts.refresh("o/r", &remote_url).await.unwrap();
+        assert!(refresh.updated);
+        assert_eq!(refresh.previous_sha.as_deref(), Some(c1.as_str()));
+        assert_eq!(refresh.snapshot.head_sha, c2);
+        assert_eq!(refresh.snapshot.generation, 2);
+        // Generation 1 stays while leased by an active reader.
+        assert_eq!(checkouts.generation_numbers("o/r").unwrap(), vec![1, 2]);
+
+        lease1.release().await;
+        assert_eq!(checkouts.generation_numbers("o/r").unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn cow_derive_updates_to_new_commit_and_keeps_multiple_workspaces_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostGit::from_file("/dev/null");
+        let remote = tmp.path().join("remote.git");
+        host.output(
+            None,
+            &["init", "--bare", "-b", "main", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        let work = tmp.path().join("work");
+        init_repo(&work);
+        git(
+            Some(&work),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        git(Some(&work), &["push", "-u", "origin", "main"]).unwrap();
+
+        let checkouts = DaemonCheckouts::new(tmp.path().join("checkouts")).with_host(host.clone());
+        let remote_url = format!("file://{}", remote.display());
+        checkouts.ensure_present("o/r", &remote_url).await.unwrap();
+
+        // Push a new commit from elsewhere before session requests a workspace.
+        std::fs::write(work.join("pushed.txt"), "from elsewhere\n").unwrap();
+        git(Some(&work), &["add", "."]).unwrap();
+        git(Some(&work), &["commit", "-m", "elsewhere"]).unwrap();
+        git(Some(&work), &["push", "origin", "main"]).unwrap();
+        let c2 = git(Some(&work), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let repos = session_repos(tmp.path())
+            .await
+            .with_host(host.clone())
+            .with_checkouts(checkouts.clone());
+        assert!(repos.clones().await.unwrap().is_empty());
+
+        let ws1 = repos
+            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()), None)
+            .await
+            .unwrap();
+        assert_eq!(git(Some(&ws1), &["rev-parse", "HEAD"]).unwrap().trim(), c2);
+        assert!(ws1.join("pushed.txt").exists());
+
+        // Derive a second independent workspace on the same repo.
+        std::fs::write(ws1.join("ws1_only.txt"), "one\n").unwrap();
+        let ws2 = repos
+            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()), None)
+            .await
+            .unwrap();
+        assert_ne!(ws1, ws2);
+        assert!(!ws2.join("ws1_only.txt").exists());
+        assert_eq!(repos.clones_for("o/r").await.unwrap().len(), 2);
     }
 }

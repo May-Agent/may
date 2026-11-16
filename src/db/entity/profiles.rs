@@ -17,8 +17,6 @@ pub struct Model {
     pub container_id: Option<String>,
     /// Persona overlay text injected into the agent system prompt.
     pub persona: Option<String>,
-    /// Legacy SSH server binding migrated into `profile_remote_servers`.
-    pub remote_ssh_server_id: Option<String>,
     /// Whether this profile has location awareness enabled.
     pub location_aware: bool,
     /// Maximum number of pinned items in this profile.

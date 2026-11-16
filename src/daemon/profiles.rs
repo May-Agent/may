@@ -55,11 +55,11 @@ const fn default_env() -> ProfileEnvironmentKind {
     ProfileEnvironmentKind::Local
 }
 
-fn map_profile_error(err: ChatDbError) -> skyzen::Error {
+pub(super) fn map_profile_error(err: ChatDbError) -> skyzen::Error {
     match err {
-        ChatDbError::PinnedLimitExceeded { .. } | ChatDbError::InvalidProfileEnvironment(_) => {
-            bad_request_error(err)
-        }
+        ChatDbError::PinnedLimitExceeded { .. }
+        | ChatDbError::InvalidProfileEnvironment(_)
+        | ChatDbError::DefaultProfileProtected => bad_request_error(err),
         _ => internal_error(err),
     }
 }
@@ -241,8 +241,7 @@ async fn prepare_profile_environment(
             Err(error) => {
                 let recent_logs = state
                     .get_container_prepare_status(profile_id)
-                    .map(|status| status.recent_logs)
-                    .unwrap_or_default();
+                    .map_or_default(|status| status.recent_logs);
 
                 state.set_container_prepare_status(ContainerPrepareStatus {
                     profile_id: profile_id.to_string(),
@@ -296,12 +295,6 @@ pub(super) struct UpdateFolderRequest {
     pub name: Option<String>,
     #[serde(default)]
     pub sort_order: Option<i32>,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct MoveToFolderRequest {
-    pub folder_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -406,7 +399,7 @@ pub(super) async fn delete_profile(
 
     let db = state.db();
 
-    db.delete_profile(&id).await.map_err(internal_error)?;
+    db.delete_profile(&id).await.map_err(map_profile_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;
@@ -458,7 +451,81 @@ pub(super) async fn set_profile_remote_servers(
         .await
         .map_err(internal_error)?;
 
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     json_ok_response(&super::types::API_OK)
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetCodespacesAccountRequest {
+    /// The `gh` account the profile's codespaces belong to; absent for the
+    /// `gh` login's active account.
+    #[serde(default)]
+    pub login: Option<String>,
+}
+
+/// `/cloud` setting up Codespaces: the account is saved once GitHub confirms
+/// its token can manage codespaces.
+pub(super) async fn set_profile_codespaces(
+    params: Params,
+    Json(req): Json<SetCodespacesAccountRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    use crate::cloud::Codespaces;
+    use crate::issue::github::{GhAccountTokenSource, GhCliTokenSource, GitHubRest};
+
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let model = db
+        .get_profile(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Profile not found"))?;
+
+    let verified = match req.login {
+        Some(login) => Codespaces::verify(&GitHubRest::new(GhAccountTokenSource::new(login))).await,
+        None => Codespaces::verify(&GitHubRest::new(GhCliTokenSource)).await,
+    };
+    let account = match verified {
+        Ok(account) => account,
+        Err(error) => {
+            return Ok(typed_error_response(
+                skyzen::StatusCode::BAD_REQUEST,
+                ApiErrorCode::CloudAccountUnusable,
+                error.to_string(),
+            ));
+        }
+    };
+    db.set_profile_codespaces_account(&id, Some(&account))
+        .await
+        .map_err(internal_error)?;
+    json_ok_response(
+        &db.profile_info_from_model(model)
+            .await
+            .map_err(map_profile_error)?,
+    )
+}
+
+/// `/cloud` removing the profile's Codespaces account.
+pub(super) async fn remove_profile_codespaces(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ProfileInfo>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let model = db
+        .get_profile(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("Profile not found"))?;
+    db.set_profile_codespaces_account(&id, None)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(
+        db.profile_info_from_model(model)
+            .await
+            .map_err(map_profile_error)?,
+    ))
 }
 
 pub(super) async fn get_profile_sessions(
@@ -560,76 +627,6 @@ pub(super) async fn delete_folder(
     let db = state.db();
 
     db.delete_folder(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-// ── Session pin/archive/move endpoints ──────────────────────
-
-pub(super) async fn pin_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.pin_session(&id).await.map_err(map_profile_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn unpin_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.unpin_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn archive_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.archive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn unarchive_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.unarchive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn move_to_folder(
-    params: Params,
-    Json(req): Json<MoveToFolderRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.move_session_to_folder(&id, req.folder_id.as_deref())
-        .await
-        .map_err(map_profile_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }

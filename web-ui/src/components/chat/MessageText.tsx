@@ -145,10 +145,10 @@ export const MessageText = memo(function MessageText({
           <Streamdown components={streamdownComponents}>{visibleText}</Streamdown>
         </div>
       )}
-      {tunnels.length > 0 && (
+      {sessionId && tunnels.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 py-1">
           {tunnels.map((id) => (
-            <TunnelLink key={id} id={id} />
+            <TunnelLink key={id} sessionId={sessionId} id={id} />
           ))}
         </div>
       )}

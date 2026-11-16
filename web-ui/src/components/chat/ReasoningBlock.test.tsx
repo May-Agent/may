@@ -26,4 +26,11 @@ describe('ReasoningBlock', () => {
     expect(markup).not.toContain('```');
     expect(markup).not.toContain('**verify**');
   });
+
+  test('a finished thought is its own row with an expand button and a hidden body', () => {
+    const markup = renderToStaticMarkup(<ReasoningBlock text={THINKING} seconds={4} />);
+    expect(markup).toContain('<button');
+    expect(markup).not.toContain('第一步');
+    expect(markup).not.toContain('Worked for');
+  });
 });

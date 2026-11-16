@@ -1,0 +1,8 @@
+{% if rows.is_empty() -%}
+No CI runs are recorded for this session's repositories yet; a PR's durations are recorded when its checks finish.
+{%- else -%}
+CI job durations over the recorded runs:
+{% for row in rows -%}
+- {{ row.workflow }} / {{ row.name }}: latest {{ row.latest }}, median {{ row.median }}, p90 {{ row.p90 }} over {{ row.runs }} run{% if row.runs != 1 %}s{% endif %}; {{ row.trend }}.
+{% endfor -%}
+{%- endif %}

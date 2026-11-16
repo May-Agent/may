@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aither_agent::context::LiveContent;
-use aither_agent::{AgentOptions, ExternalContent, InstructionSlot};
+use aither_agent::{ExternalContent, InstructionSlot};
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
@@ -28,6 +28,7 @@ use crate::config::{SshServerConfig, TimeZoneName};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
+use crate::terminal_commands::CoreCommandUsage;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 
 /// The slots of the blocks May writes, and the order of the whole prompt.
@@ -37,6 +38,7 @@ pub mod tag {
     pub const IDENTITY: InstructionSlot = InstructionSlot::new("identity");
     pub const PROFILE_PERSONA: InstructionSlot = InstructionSlot::new("profile_persona");
     pub const ENVIRONMENT: InstructionSlot = InstructionSlot::new("environment");
+    pub const SESSION: InstructionSlot = InstructionSlot::new("session");
     pub const REPO_CLONES: InstructionSlot = InstructionSlot::new("repo_clones");
     pub const TERMINAL: InstructionSlot = InstructionSlot::new("terminal");
     pub const EFFICIENCY: InstructionSlot = InstructionSlot::new("efficiency");
@@ -45,12 +47,16 @@ pub mod tag {
     pub const WORK: InstructionSlot = InstructionSlot::new("work");
     pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
     pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
-    /// aither's built-in permissions slot, holding May's text.
-    pub const PERMISSIONS: InstructionSlot = InstructionSlot::PERMISSIONS;
+    pub const PERMISSIONS: InstructionSlot = InstructionSlot::new("permissions");
     pub const HARNESS: InstructionSlot = InstructionSlot::new("harness");
     pub const EVIDENCE: InstructionSlot = InstructionSlot::new("evidence");
-    /// aither's built-in knowledge-and-time slot, holding May's text.
-    pub const TIME: InstructionSlot = InstructionSlot::KNOWLEDGE_AND_TIME;
+    pub const TIME: InstructionSlot = InstructionSlot::new("knowledge_and_time");
+    /// The prepared tools of the home environment.
+    pub const PREPARED_TOOLS: InstructionSlot = InstructionSlot::new("prepared_tools");
+    /// The table of the commands a script can call.
+    pub const COMMANDS: InstructionSlot = InstructionSlot::new("commands");
+    /// The languages the session talks and works in.
+    pub const LANGUAGES: InstructionSlot = InstructionSlot::new("languages");
 
     pub const MEMORY: ExternalSlot = ExternalSlot::new("memory");
     pub const PROFILE_MEMORIES: ExternalSlot = ExternalSlot::new("profile_memories");
@@ -59,52 +65,60 @@ pub mod tag {
     pub const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
-    /// The instruction slots May writes, in prompt order. aither's
-    /// `prepared_tools`, `commands` and `languages` blocks sit between them
-    /// in [`layout`].
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 15] = [
+    /// The instruction slots May writes, in prompt order.
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
         IDENTITY,
-        PROFILE_PERSONA,
-        ENVIRONMENT,
-        REPO_CLONES,
-        TERMINAL,
-        EFFICIENCY,
-        CAPABILITIES,
-        BROWSER,
-        WORK,
-        PROJECT_RULES,
-        PLAN_MODE,
-        PERMISSIONS,
         HARNESS,
         EVIDENCE,
+        PROFILE_PERSONA,
+        ENVIRONMENT,
+        TERMINAL,
+        PREPARED_TOOLS,
+        EFFICIENCY,
+        CAPABILITIES,
+        COMMANDS,
+        BROWSER,
+        WORK,
+        PERMISSIONS,
         TIME,
+        LANGUAGES,
+        SESSION,
+        REPO_CLONES,
+        PLAN_MODE,
+        PROJECT_RULES,
     ];
 
-    /// The system prompt's order: identity, environment, terminal,
-    /// efficiency, capabilities and the command table, work, permissions,
-    /// harness, evidence, time and languages; then the external content.
+    /// The system prompt's order, from most shared to least shared, so
+    /// sessions share the longest cached prefix. Text every session of a
+    /// build has comes first: identity, harness and evidence. Text that
+    /// depends on the installation and its configuration follows: persona,
+    /// environment, terminal, prepared tools, efficiency, capabilities and
+    /// the command table, browser, work, permissions, time and languages.
+    /// Text specific to the session comes last: the session section, repo
+    /// clones, plan mode and project rules, then the external content.
     #[must_use]
     pub fn layout() -> SystemLayout {
         SystemLayout::new(
             [
                 IDENTITY,
-                PROFILE_PERSONA,
-                ENVIRONMENT,
-                REPO_CLONES,
-                TERMINAL,
-                InstructionSlot::PREPARED_TOOLS,
-                EFFICIENCY,
-                CAPABILITIES,
-                InstructionSlot::COMMANDS,
-                BROWSER,
-                WORK,
-                PROJECT_RULES,
-                PLAN_MODE,
-                PERMISSIONS,
                 HARNESS,
                 EVIDENCE,
+                PROFILE_PERSONA,
+                ENVIRONMENT,
+                TERMINAL,
+                PREPARED_TOOLS,
+                EFFICIENCY,
+                CAPABILITIES,
+                COMMANDS,
+                BROWSER,
+                WORK,
+                PERMISSIONS,
                 TIME,
-                InstructionSlot::LANGUAGES,
+                LANGUAGES,
+                SESSION,
+                REPO_CLONES,
+                PLAN_MODE,
+                PROJECT_RULES,
             ],
             [
                 MEMORY,
@@ -133,6 +147,8 @@ pub struct RuntimeSystemContext {
     /// Instruction blocks fixed when the agent is built.
     instructions: BTreeMap<InstructionSlot, String>,
     profile_memories: Option<ExternalContent>,
+    /// Whether `MEMORY.md` and extracted profile memories are enabled for this session.
+    memory_enabled: bool,
     workdirs: Option<ExternalContent>,
     memory_path: PathBuf,
     /// Snapshot of every file under the memories directory; `None` until the
@@ -153,6 +169,7 @@ impl RuntimeSystemContext {
         Self {
             instructions: BTreeMap::new(),
             profile_memories: None,
+            memory_enabled: true,
             workdirs: None,
             memory_path,
             memories_snapshot: None,
@@ -181,9 +198,74 @@ impl RuntimeSystemContext {
         self
     }
 
-    pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
+    /// Replaces the command table; the next [`reconcile`](Self::reconcile)
+    /// announces the change.
+    pub(crate) fn set_commands(&mut self, table: String) {
+        self.instructions.insert(tag::COMMANDS, table);
+    }
+
+    /// Replaces the capabilities and skill catalog; the next
+    /// [`reconcile`](Self::reconcile) announces any change without breaking the
+    /// warm system prefix.
+    pub(crate) fn set_capabilities(&mut self, capabilities: String) {
+        self.instructions.insert(tag::CAPABILITIES, capabilities);
+    }
+
+    /// Replaces the environment block; the next [`reconcile`](Self::reconcile)
+    /// announces any change without breaking the warm system prefix.
+    pub(crate) fn set_environment(&mut self, environment: String) {
+        self.instructions.insert(tag::ENVIRONMENT, environment);
+    }
+
+    /// Replaces or removes an optional instruction block; the next
+    /// [`reconcile`](Self::reconcile) announces any change as live content.
+    pub(crate) fn set_instruction_opt(&mut self, slot: InstructionSlot, text: Option<String>) {
+        assert!(
+            tag::MAY_INSTRUCTIONS.contains(&slot) && slot != tag::PROJECT_RULES,
+            "`{}` is not a May-managed instruction block",
+            slot.name()
+        );
+        match text {
+            Some(value) => {
+                self.instructions.insert(slot, value);
+            }
+            None => {
+                self.instructions.remove(&slot);
+            }
+        }
+    }
+
+    /// Replaces or removes extracted profile memories; the next
+    /// [`reconcile`](Self::reconcile) announces any change as live content.
+    pub(crate) fn set_profile_memories(&mut self, memories: Option<ExternalContent>) {
         self.profile_memories = memories;
+    }
+
+    /// Replaces or removes approved workspace directories; the next
+    /// [`reconcile`](Self::reconcile) announces any change as live content.
+    pub(crate) fn set_workdirs(&mut self, workdirs: Option<ExternalContent>) {
+        self.workdirs = workdirs;
+    }
+
+    pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
+        self.profile_memories = self.memory_enabled.then_some(memories).flatten();
         self
+    }
+
+    pub(crate) const fn with_memory_enabled(mut self, enabled: bool) -> Self {
+        self.memory_enabled = enabled;
+        self
+    }
+
+    /// Enables or disables memory blocks (`MEMORY.md` and profile memories);
+    /// the next [`reconcile`](Self::reconcile) reconciles the live blocks.
+    pub(crate) fn set_memory_enabled(&mut self, enabled: bool) {
+        self.memory_enabled = enabled;
+        if !enabled {
+            self.profile_memories = None;
+            self.last_memory_content.clear();
+            self.memories_snapshot = None;
+        }
     }
 
     pub(crate) fn with_workdirs(mut self, workdirs: Option<ExternalContent>) -> Self {
@@ -217,49 +299,44 @@ impl RuntimeSystemContext {
         &self.agents_root_source
     }
 
-    fn memory_block(&self) -> ExternalContent {
-        ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str())
+    fn memory_block(&self) -> Option<ExternalContent> {
+        self.memory_enabled
+            .then(|| ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str()))
     }
 
-    /// Hands every block to the agent builder, so the first request carries
-    /// them before any reconcile.
-    pub(crate) fn install<B: AgentOptions>(&self, mut builder: B) -> B {
-        for (slot, text) in &self.instructions {
-            builder = builder.system_text(slot, text.clone());
-        }
-        if let Some(rules) = &self.agents.rules {
-            builder = builder.system_text(&tag::PROJECT_RULES, rules.clone());
-        }
-        builder = builder.external_content(&tag::MEMORY, self.memory_block());
-        for (slot, block) in [
-            (&tag::PROFILE_MEMORIES, &self.profile_memories),
-            (&tag::GLOBAL_AGENTS_MD, &self.agents.global),
-            (&tag::AGENTS_MD, &self.agents.root),
-            (&tag::HANDOFF_AGENTS_MD, &self.agents.handoff),
-            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
-        ] {
-            if let Some(block) = block {
-                builder = builder.external_content(slot, block.clone());
-            }
-        }
-        builder
-    }
-
+    /// Brings the blocks of `context` to this state. A context no request
+    /// has carried yet takes them as they are; a later one stages the
+    /// difference and announces it once.
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
-        let instructions = context.instructions_mut();
-        for slot in &tag::MAY_INSTRUCTIONS {
-            if *slot == tag::PROJECT_RULES {
-                continue;
-            }
-            match self.instructions.get(slot) {
-                Some(text) => instructions.insert(slot, text.clone()),
-                None => {
-                    instructions.remove(slot);
+        {
+            let instructions = context.instructions_mut();
+            for slot in &tag::MAY_INSTRUCTIONS {
+                if *slot == tag::PROJECT_RULES || is_live_instruction(slot) {
+                    continue;
+                }
+                match self.instructions.get(slot) {
+                    Some(text) => instructions.insert(slot, text.clone()),
+                    None => {
+                        instructions.remove(slot);
+                    }
                 }
             }
         }
+        for (content, slot) in LIVE_INSTRUCTIONS {
+            context.update_live(content, |update| {
+                update.instruction(slot, self.instructions.get(slot).cloned());
+            });
+        }
         context.update_live(&MEMORY_CONTENT, |update| {
-            update.external(&tag::MEMORY, Some(self.memory_block()));
+            update.external(&tag::MEMORY, self.memory_block());
+        });
+        context.update_live(&PROFILE_MEMORIES_CONTENT, |update| {
+            update.external(
+                &tag::PROFILE_MEMORIES,
+                self.memory_enabled
+                    .then(|| self.profile_memories.clone())
+                    .flatten(),
+            );
         });
         context.update_live(&AGENTS_MD_CONTENT, |update| {
             update
@@ -268,18 +345,9 @@ impl RuntimeSystemContext {
                 .external(&tag::AGENTS_MD, self.agents.root.clone())
                 .external(&tag::HANDOFF_AGENTS_MD, self.agents.handoff.clone());
         });
-        let external = context.external_mut();
-        for (slot, block) in [
-            (&tag::PROFILE_MEMORIES, &self.profile_memories),
-            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
-        ] {
-            match block {
-                Some(block) => external.insert(slot, block.clone()),
-                None => {
-                    external.remove(slot);
-                }
-            }
-        }
+        context.update_live(&WORKDIRS_CONTENT, |update| {
+            update.external(&tag::WORKSPACE_WORKDIRS, self.workdirs.clone());
+        });
     }
 
     /// Refreshes the `AGENTS.md` blocks: re-reads the global rules, rescans
@@ -329,6 +397,11 @@ impl RuntimeSystemContext {
     /// Re-read the memory index and watch the whole memories directory,
     /// alerting on changes to files this session has actually seen.
     pub(crate) async fn sync_memory_content(&mut self, context: &mut aither_agent::Context) {
+        if !self.memory_enabled {
+            self.last_memory_content.clear();
+            self.memories_snapshot = None;
+            return;
+        }
         match async_fs::read_to_string(&self.memory_path).await {
             Ok(index_content) => self.last_memory_content = index_content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -339,11 +412,15 @@ impl RuntimeSystemContext {
             }
         }
 
-        let Some(memories_dir) = self.memory_path.parent() else {
+        let Some(memories_dir) = self.memory_path.parent().map(Path::to_path_buf) else {
             return;
         };
-        let mut next = HashMap::new();
-        scan_memories_dir(memories_dir, memories_dir, &mut next);
+        let next = blocking::unblock(move || {
+            let mut next = HashMap::new();
+            scan_memories_dir(&memories_dir, &memories_dir, &mut next);
+            next
+        })
+        .await;
         let Some(snapshot) = self.memories_snapshot.replace(next.clone()) else {
             // First scan is a silent baseline: nothing counts as changed.
             return;
@@ -427,33 +504,91 @@ struct MemoriesChanges {
 #[derive(Template)]
 #[template(path = "alert_sleep.txt", escape = "none")]
 pub struct SleepAlert {
-    greet: bool,
+    pub(crate) greet: bool,
 }
 
-/// Durable alert telling the agent the user woke.
+/// Durable alert telling the agent the user woke and how.
 #[derive(Template)]
 #[template(path = "alert_wake.txt", escape = "none")]
-pub struct WakeAlert;
+pub struct WakeAlert {
+    pub(crate) cause: crate::sleep::WakeCause,
+}
 
-impl RuntimeSystemContext {
-    /// Records what the user's sleep state changed to as a durable alert.
-    pub(crate) fn push_sleep_notice(
-        context: &mut aither_agent::Context,
-        notice: crate::sleep::SleepNotice,
-    ) {
-        match notice {
-            crate::sleep::SleepNotice::Asleep { greet } => {
-                context.push_alert(&SleepAlert { greet });
-            }
-            crate::sleep::SleepNotice::Woke => {
-                context.push_alert(&WakeAlert);
-            }
-        }
+impl SleepAlert {
+    /// Renders the sleep alert text.
+    #[must_use]
+    pub(crate) fn render_text(&self) -> String {
+        self.render().expect("sleep alert template must render")
     }
+}
+
+impl WakeAlert {
+    /// Renders the wake alert text.
+    #[must_use]
+    pub(crate) fn render_text(&self) -> String {
+        self.render().expect("wake alert template must render")
+    }
+}
+
+/// The profile persona overlay, announced when it changes mid-session.
+const PERSONA_CONTENT: LiveContent = LiveContent::new("The profile persona", "persona_diff");
+
+/// The capabilities block and skill catalog, announced when skills or
+/// hosted tool capabilities change mid-session.
+const CAPABILITIES_CONTENT: LiveContent =
+    LiveContent::new("The skill catalog and capabilities", "skills_diff");
+
+/// The table of the commands a script can call, announced when a command is
+/// added or removed mid-session.
+const COMMANDS_CONTENT: LiveContent = LiveContent::new("The command table", "commands_diff");
+
+/// The execution environment and configured SSH servers, announced when
+/// servers or the model change mid-session.
+const ENVIRONMENT_CONTENT: LiveContent = LiveContent::new("The environment", "environment_diff");
+
+/// The permissions block (secrets and network policy), announced when it
+/// changes mid-session.
+const PERMISSIONS_CONTENT: LiveContent = LiveContent::new("The permissions", "permissions_diff");
+
+/// The time and location block, announced when timezone, location or hosted
+/// search availability changes mid-session.
+const TIME_CONTENT: LiveContent = LiveContent::new("The time and location context", "time_diff");
+
+/// The configured languages block, announced when languages change
+/// mid-session.
+const LANGUAGES_CONTENT: LiveContent =
+    LiveContent::new("The configured languages", "languages_diff");
+
+/// The plan-mode instructions, announced when plan state changes mid-session.
+const PLAN_MODE_CONTENT: LiveContent = LiveContent::new("The plan mode", "plan_mode_diff");
+
+/// All instruction slots synced as live content so mid-session changes keep
+/// the cached prefix warm until reassembly.
+const LIVE_INSTRUCTIONS: &[(&LiveContent, InstructionSlot)] = &[
+    (&PERSONA_CONTENT, tag::PROFILE_PERSONA),
+    (&ENVIRONMENT_CONTENT, tag::ENVIRONMENT),
+    (&CAPABILITIES_CONTENT, tag::CAPABILITIES),
+    (&COMMANDS_CONTENT, tag::COMMANDS),
+    (&PERMISSIONS_CONTENT, tag::PERMISSIONS),
+    (&TIME_CONTENT, tag::TIME),
+    (&LANGUAGES_CONTENT, tag::LANGUAGES),
+    (&PLAN_MODE_CONTENT, tag::PLAN_MODE),
+];
+
+fn is_live_instruction(slot: &InstructionSlot) -> bool {
+    LIVE_INSTRUCTIONS.iter().any(|(_, live)| live == slot)
 }
 
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
+
+/// Extracted profile memories, announced when they change mid-session.
+const PROFILE_MEMORIES_CONTENT: LiveContent =
+    LiveContent::new("The profile memories", "profile_memories_diff");
+
+/// Approved workspace directories, announced when workdirs change mid-session.
+const WORKDIRS_CONTENT: LiveContent =
+    LiveContent::new("The approved workspace directories", "workdirs_diff");
 
 /// The `AGENTS.md` blocks (the rules on how to treat them, the global rules,
 /// the launch directory's own file and the files the handoff linked),
@@ -655,8 +790,6 @@ impl RemoteHosts {
 struct EnvironmentTemplate<'a> {
     model_id: &'a str,
     home: HomeEnvironment,
-    session_dir: String,
-    launch_dir: Option<String>,
     modalities: Vec<&'static str>,
     remote: Option<RemoteHosts>,
 }
@@ -678,21 +811,18 @@ fn native_inputs(model_info: Option<&aither_models::ModelEntry>) -> Vec<&'static
     .collect()
 }
 
-/// The environment section: where the agent runs, the session directory and
-/// its layout, and the remote hosts while any is connected.
+/// The environment section: where the agent runs, the layout of the session
+/// directory and the remote hosts while any is connected. It refers to the
+/// session directory by role; [`build_session`] holds the path.
 pub fn build_environment(
     model_id: &str,
     environment: &AgentEnvironment,
-    session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
     remote_hosts: Vec<SshServerConfig>,
-    launch_dir: Option<String>,
 ) -> String {
     EnvironmentTemplate {
         model_id,
         home: HomeEnvironment::of(environment),
-        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
-        launch_dir,
         modalities: native_inputs(model_info),
         remote: RemoteHosts::connected(remote_hosts),
     }
@@ -701,18 +831,123 @@ pub fn build_environment(
 }
 
 #[derive(Template)]
+#[template(path = "prompt/session.md", escape = "none")]
+struct SessionTemplate<'a> {
+    session_dir: String,
+    launch_dir: Option<String>,
+    readonly_checkout: Option<String>,
+    issue_repository: Option<&'a str>,
+}
+
+/// The session section, where the values only this session has are stated:
+/// its directory, the launch directory, the optional read-only daemon checkout,
+/// and the issue repository.
+pub fn build_session(
+    environment: &AgentEnvironment,
+    session_paths: &SessionPaths,
+    launch_dir: Option<String>,
+    readonly_checkout: Option<String>,
+    issue_backend: &crate::issue::IssueBackendInfo,
+) -> String {
+    SessionTemplate {
+        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
+        launch_dir,
+        readonly_checkout,
+        issue_repository: issue_backend.repository.as_deref(),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render session: {error}"))
+}
+
+#[derive(Template)]
 #[template(path = "prompt/terminal.md", escape = "none")]
 struct TerminalTemplate {
-    session_dir: String,
+    /// Whether scripts run in the managed bash, which May's command policy
+    /// confines to `rg`, `fd` and a `sed` that writes no file.
+    managed_bash: bool,
 }
 
 /// The terminal section: how to run commands.
-pub fn build_terminal(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
+pub fn build_terminal(environment: &AgentEnvironment) -> String {
     TerminalTemplate {
-        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
+        managed_bash: crate::command_policy::runs_managed_bash(matches!(
+            environment,
+            AgentEnvironment::Container { .. }
+        )),
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render terminal: {error}"))
+}
+
+struct CommandRow {
+    name: String,
+    description: String,
+}
+
+impl CommandRow {
+    /// A row of the table: a name and its one-line description, without the
+    /// full stop that closes it.
+    fn new(name: &str, description: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.trim_end().trim_end_matches('.').to_string(),
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "commands.txt", escape = "none")]
+struct CommandTableTemplate {
+    commands: Vec<CommandRow>,
+}
+
+/// The table of the commands a script can call: the ones registered by name
+/// with their descriptions, then the tools of every command set as they are
+/// now, so a tool an MCP server added mid-session is announced.
+pub fn build_commands(
+    descriptions: &[(String, String)],
+    sets: &[crate::ipc::AnyCommandSet],
+) -> String {
+    let mut commands: Vec<CommandRow> = descriptions
+        .iter()
+        .map(|(name, description)| CommandRow::new(name, description))
+        .collect();
+    for definition in sets.iter().flat_map(crate::ipc::AnyCommandSet::definitions) {
+        if commands.iter().all(|row| row.name != definition.name()) {
+            commands.push(CommandRow::new(definition.name(), definition.description()));
+        }
+    }
+    CommandTableTemplate { commands }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render commands: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "languages.txt", escape = "none")]
+struct LanguagesTemplate<'a> {
+    communication: &'a str,
+    working: &'a str,
+}
+
+/// The languages section: set when the session has a communication language.
+pub fn build_languages(languages: &crate::harness::language::Languages) -> Option<String> {
+    let communication = languages.communication()?;
+    Some(
+        LanguagesTemplate {
+            communication: communication.name(),
+            working: languages.working().name(),
+        }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render languages: {error}")),
+    )
+}
+
+/// The prepared-tools section of the home environment's catalog.
+///
+/// # Errors
+/// Fails when the catalog does not render.
+pub fn build_prepared_tools(catalog: &crate::tools::ToolCatalog) -> Result<String, MayAgentError> {
+    Ok(catalog.render()?)
 }
 
 #[derive(Template)]
@@ -749,6 +984,7 @@ struct CapabilitiesTemplate {
     has_browser_command: bool,
     skills: Vec<CatalogSkill>,
     subagents: Vec<CatalogSubagent>,
+    core_commands: Vec<CoreCommandUsage>,
 }
 
 /// The capabilities section: how commands run, the skills and the
@@ -760,6 +996,7 @@ struct CapabilitiesTemplate {
 /// Fails when the skills directory cannot be read.
 pub async fn build_capabilities(
     commands: &[(String, String)],
+    core_commands: &[CoreCommandUsage],
     request_parameters: &Parameters,
     skills_dir: &Path,
 ) -> Result<String, MayAgentError> {
@@ -772,6 +1009,12 @@ pub async fn build_capabilities(
             MayAgentError::Sandbox(format!("failed to load skill prompt metadata: {error}"))
         })?
         .into_iter()
+        .filter(|skill| {
+            skill
+                .requires_command
+                .as_deref()
+                .is_none_or(|required| commands.iter().any(|(name, _)| name == required))
+        })
         .map(|skill| CatalogSkill {
             dir_name: skill.dir_name,
             name: skill.name,
@@ -779,14 +1022,11 @@ pub async fn build_capabilities(
         })
         .collect::<Vec<_>>();
 
-    let mut subagents: Vec<CatalogSubagent> = aither_agent::BUNDLED_SUBAGENTS
-        .iter()
-        .map(|bundled| {
-            let definition = bundled.definition();
-            CatalogSubagent {
-                id: definition.name,
-                description: definition.description,
-            }
+    let mut subagents: Vec<CatalogSubagent> = crate::bundle::Bundle::subagent_definitions()
+        .into_iter()
+        .map(|definition| CatalogSubagent {
+            id: definition.name,
+            description: definition.description,
         })
         .collect();
     subagents.push(CatalogSubagent {
@@ -801,6 +1041,7 @@ pub async fn build_capabilities(
         has_browser_command,
         skills,
         subagents,
+        core_commands: core_commands.to_vec(),
     }
     .render()
     .map_err(|error| MayAgentError::Sandbox(format!("failed to render capabilities: {error}")))
@@ -810,14 +1051,17 @@ pub async fn build_capabilities(
 #[template(path = "prompt/work.md", escape = "none")]
 struct WorkTemplate<'a> {
     issue_backend_name: &'a str,
-    issue_repository: Option<&'a str>,
+    works_in_clone: bool,
 }
 
-/// The work section: issues, PRs, `tasks.md`, artifacts and memory.
-pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo) -> String {
+/// The work section: issues, PRs, `tasks.md`, artifacts and memory. The
+/// issue repository is the session's, so the session section names it.
+/// `works_in_clone` is whether the session has a repository clone, the only
+/// place code lands through `pr`.
+pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo, works_in_clone: bool) -> String {
     WorkTemplate {
         issue_backend_name: issue_backend.name,
-        issue_repository: issue_backend.repository.as_deref(),
+        works_in_clone,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render work: {error}"))

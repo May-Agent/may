@@ -161,3 +161,219 @@ async fn an_agents_md_change_mid_session_is_one_diff_then_the_clean_version() {
     assert!(after[0].contains("rule one\nrule two"), "{}", after[0]);
     assert_eq!(diff_alerts(after, "agents_md_diff"), Vec::<&String>::new());
 }
+
+#[tokio::test]
+async fn an_ssh_server_change_mid_session_is_one_diff_then_the_clean_version() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let mut session = Box::pin(session_with(&stub, "", "rules\n")).await;
+
+    turn(&mut session).await;
+
+    // Attach an SSH server mid-session on the live session so the warm system
+    // prefix stays byte-identical and the diff is announced once.
+    let ssh_servers = vec![crate::config::SshServerConfig {
+        name: "prod".to_string(),
+        target: "ops@prod.example.com".to_string(),
+        platform: crate::config::SshPlatformConfig {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+        },
+    }];
+    session.agent.sync_ssh_servers(&ssh_servers);
+
+    turn(&mut session).await;
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, third] = requests.as_slice() else {
+        panic!("three turns: {requests:?}");
+    };
+    assert!(!first[0].contains("ops@prod.example.com"), "{}", first[0]);
+    assert_eq!(second[0], first[0], "the cached prefix stays as sent");
+    assert!(!second[0].contains("ops@prod.example.com"), "{}", second[0]);
+    let alerts = diff_alerts(second, "environment_diff");
+    assert_eq!(alerts.len(), 1, "{second:?}");
+    assert!(
+        alerts[0].starts_with("The environment changed."),
+        "{}",
+        alerts[0]
+    );
+    assert!(
+        alerts[0].contains("+- prod (ops@prod.example.com), Linux x86_64"),
+        "{}",
+        alerts[0]
+    );
+    assert_eq!(third[0], first[0]);
+    assert_eq!(diff_alerts(third, "environment_diff").len(), 1, "{third:?}");
+
+    compact(&mut session).await;
+    turn(&mut session).await;
+    let requests = turn_requests(&stub).await;
+    let after = requests.last().expect("the turn after compaction");
+    assert!(
+        after[0].contains("- prod (ops@prod.example.com), Linux"),
+        "{}",
+        after[0]
+    );
+    assert_eq!(
+        diff_alerts(after, "environment_diff"),
+        Vec::<&String>::new()
+    );
+}
+
+fn write_skill(may_dir: &std::path::Path, dir_name: &str, name: &str, description: &str) {
+    let dir = crate::session::MayHomePaths::new(may_dir.to_path_buf())
+        .skills_dir()
+        .join(dir_name);
+    std::fs::create_dir_all(&dir).expect("skill dir");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n# {name}\n"),
+    )
+    .expect("write SKILL.md");
+}
+
+#[tokio::test]
+async fn a_skill_change_mid_session_is_one_diff_then_the_clean_version() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start(&config)).await;
+    let may_dir = session.temp.path().join(".may");
+    write_skill(&may_dir, "alpha", "alpha", "Initial skill alpha.");
+    Box::pin(session.rebuild(&config)).await;
+
+    turn(&mut session).await;
+    write_skill(&may_dir, "beta", "beta", "Added skill beta.");
+    turn(&mut session).await;
+    // Unchanged skills restate nothing.
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, third] = requests.as_slice() else {
+        panic!("three turns: {requests:?}");
+    };
+    assert!(
+        first[0].contains("- alpha (`skills/alpha/SKILL.md`): Initial skill alpha."),
+        "{}",
+        first[0]
+    );
+    assert!(!first[0].contains("skills/beta/SKILL.md"), "{}", first[0]);
+    assert_eq!(
+        second[0], first[0],
+        "the cached prefix stays byte-identical"
+    );
+    assert!(!second[0].contains("skills/beta/SKILL.md"), "{}", second[0]);
+    let alerts = diff_alerts(second, "skills_diff");
+    assert_eq!(alerts.len(), 1, "{second:?}");
+    assert!(
+        alerts[0].contains("+- beta (`skills/beta/SKILL.md`): Added skill beta."),
+        "{}",
+        alerts[0]
+    );
+    assert_eq!(third[0], first[0]);
+    assert_eq!(diff_alerts(third, "skills_diff").len(), 1, "{third:?}");
+
+    compact(&mut session).await;
+    turn(&mut session).await;
+    let requests = turn_requests(&stub).await;
+    let after = requests.last().expect("the turn after compaction");
+    assert!(
+        after[0].contains("- beta (`skills/beta/SKILL.md`): Added skill beta."),
+        "{}",
+        after[0]
+    );
+    assert_eq!(diff_alerts(after, "skills_diff"), Vec::<&String>::new());
+}
+
+#[tokio::test]
+async fn memory_off_changes_prefix_only_on_reassembly() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start(&config)).await;
+    std::fs::write(memory_file(&session), "global memory note").expect("write MEMORY.md");
+    let memories = crate::memory::ProfileMemories {
+        preference: Some("prefers concise answers".to_string()),
+        recency: Some("testing memory off".to_string()),
+    };
+    session.parts.profile_memories = Some(memories.clone());
+    Box::pin(session.rebuild(&config)).await;
+
+    turn(&mut session).await;
+
+    // Turning memory off mid-session syncs into the live context while keeping
+    // the warm cached system prefix byte-identical until reassembly.
+    let model = format!(
+        "{}::{SESSION_MODEL}",
+        super::idle_compaction_tests::SESSION_PROVIDER
+    );
+    let cwd = session.temp.path().join("cwd");
+    session
+        .agent
+        .sync_for_turn(crate::agent::TurnSyncInput {
+            may_config: &config,
+            pushed_providers: &crate::cloud::access::PushedProviders::default(),
+            current_model: &model,
+            reasoning_effort: None,
+            model_context_window: None,
+            provider_attempt: 0,
+            profile_id: None,
+            profile_persona: None,
+            profile_memories: None,
+            memory_off: true,
+            plan_state: crate::session::SessionPlanState::default(),
+            location: None,
+            cwd: &cwd,
+            ssh_servers: &[],
+        })
+        .await
+        .expect("sync_for_turn");
+    turn(&mut session).await;
+
+    compact(&mut session).await;
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, _] = requests.as_slice() else {
+        panic!("expected three turns before/after compaction: {requests:?}");
+    };
+    let after = requests.last().expect("turn after compaction");
+
+    assert!(first[0].contains("global memory note"), "{}", first[0]);
+    assert!(first[0].contains("prefers concise answers"), "{}", first[0]);
+    assert_eq!(
+        second[0], first[0],
+        "warm cached system prefix stays byte-identical until reassembly"
+    );
+    assert!(!after[0].contains("global memory note"), "{}", after[0]);
+    assert!(
+        !after[0].contains("prefers concise answers"),
+        "{}",
+        after[0]
+    );
+    assert!(!after[0].contains("testing memory off"), "{}", after[0]);
+}
+
+#[tokio::test]
+async fn session_started_with_memory_off_never_injects_memories() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start(&config)).await;
+    std::fs::write(memory_file(&session), "global memory note").expect("write MEMORY.md");
+    session.parts.profile_memories = Some(crate::memory::ProfileMemories {
+        preference: Some("prefers concise answers".to_string()),
+        recency: None,
+    });
+    session.parts.memory_off = true;
+    Box::pin(session.rebuild(&config)).await;
+
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let first = requests.first().expect("first request");
+    assert!(!first[0].contains("global memory note"), "{}", first[0]);
+    assert!(
+        !first[0].contains("prefers concise answers"),
+        "{}",
+        first[0]
+    );
+}

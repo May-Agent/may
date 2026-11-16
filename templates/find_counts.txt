@@ -1,0 +1,8 @@
+{%- if sessions.is_empty() -%}
+No message matches.
+{%- else -%}
+{{ total }} matching message(s) in {{ sessions.len() }} session(s):
+{% for item in sessions %}
+{{ item.count }} in session {{ item.session_id }} "{{ item.title }}"
+{%- endfor %}
+{%- endif %}

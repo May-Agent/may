@@ -1,0 +1,9 @@
+{% match stopped -%}
+{% when Stopped::Closed -%}
+PR #{{ number }} was closed upstream without merging.
+{% when Stopped::CheckFailed with (check) -%}
+PR #{{ number }} did not land: the required check {{ check.name }} failed{% if let Some(url) = check.url %} ({{ url }}){% endif %}.
+{% when Stopped::Removed with (reason) -%}
+PR #{{ number }} did not land: the merge queue removed it ({{ reason }}).
+{% when Stopped::TimedOut { .. } -%}
+PR #{{ number }} is still open after {{ waited_minutes }} minutes of watching; its checks and the merge queue were expected to finish within {{ bound_minutes }}.{% endmatch -%}

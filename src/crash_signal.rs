@@ -27,7 +27,9 @@ const PATH_CAP: usize = 1024;
 
 /// What a signal handler needs, reachable without parameters. A handler
 /// receives only the signal and its `siginfo`, so the state it uses has to
-/// live in a static — the one place a static is unavoidable.
+/// live in a static — the one place a static is unavoidable. `sigaction`
+/// offers no user-data argument and a handler cannot be a closure, so no
+/// handler-safe alternative to a static exists.
 struct CrashState {
     ring: LogRingHandle,
     bugs_dir: CString,
@@ -37,7 +39,10 @@ struct CrashState {
 static CRASH_STATE: OnceLock<CrashState> = OnceLock::new();
 
 /// Set once the first dump is written so a nested or chained signal (the
-/// overflow that ends in abort) never writes a second file.
+/// overflow that ends in abort) never writes a second file. A static for the
+/// same reason as [`CRASH_STATE`]: the handler installed with `sigaction`
+/// (`SA_SIGINFO`) receives no context pointer, and an atomic is the one
+/// async-signal-safe way to share this flag between invocations.
 static DUMPED: AtomicBool = AtomicBool::new(false);
 
 /// Install the fatal-signal log dump for `SIGSEGV`, `SIGBUS` and `SIGABRT`.

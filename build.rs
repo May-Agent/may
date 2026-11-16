@@ -8,14 +8,25 @@ use std::process::Command;
 #[path = "src/container/image_ref.rs"]
 mod image_ref;
 
-/// The pinned tool-distribution manifest the workspace image stages.
-const TOOL_DISTRIBUTION_MANIFEST: &str = "src/tools/tool-distribution-0.14.1.json";
+/// The same combined manifest `embedded_distribution` loads; a build script
+/// cannot call the crate it builds, so it includes the module that holds it.
+#[path = "src/tools/manifest.rs"]
+mod manifest;
+
+/// The manifest files the workspace image's tag hashes, through
+/// `manifest::combined_manifest_bytes`.
+const TOOL_DISTRIBUTION_MANIFESTS: [&str; 3] = [
+    "src/tools/third-party-tools.json",
+    "src/tools/tool-artifacts.json",
+    "src/tools/host-programs.json",
+];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
     println!("cargo:rerun-if-changed=Cargo.lock");
 
+    emit_git_sha();
     let heel_lib_version = emit_heel_lib_version();
     emit_image_refs(&heel_lib_version);
     watch_web_ui_inputs();
@@ -32,6 +43,17 @@ fn main() {
     assert!(
         Path::new("web-ui").exists(),
         "web-ui directory not found; cannot embed frontend assets"
+    );
+
+    let status = Command::new("bun")
+        .args(["install", "--frozen-lockfile"])
+        .current_dir("web-ui")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run bun install for web-ui: {err}"));
+
+    assert!(
+        status.success(),
+        "bun install --frozen-lockfile failed in web-ui; cannot embed dist assets"
     );
 
     let status = Command::new("bun")
@@ -52,10 +74,30 @@ fn main() {
     );
 }
 
-/// The `heel` binary that executes sandbox IPC commands is provisioned
-/// separately from the `heel` library that generates those commands' shims,
-/// and the two must share a version: the library is pinned by `Cargo.lock`,
-/// so the managed-binary download requests the matching release tag.
+/// The commit the binary is built from, which a dev build compares with the
+/// CI run it would update to; empty outside a git checkout. Git moves `HEAD`
+/// and its reflog on every commit and checkout, so those are what rebuild it.
+fn emit_git_sha() {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    for name in ["HEAD", "logs/HEAD"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_default();
+    println!("cargo:rustc-env=MAY_GIT_SHA={sha}");
+}
+
+/// The version of the `heel` library `Cargo.lock` pins, which the
+/// distribution's `heel` binary must share; the workspace image is named by
+/// it and a test checks the binary's pin against it.
 fn emit_heel_lib_version() -> String {
     let lockfile = fs::read_to_string("Cargo.lock").expect("Cargo.lock must be readable");
     let version =
@@ -70,19 +112,27 @@ fn emit_heel_lib_version() -> String {
 fn emit_image_refs(heel_lib_version: &str) {
     let base_dir = Path::new("container/base");
     let workspace_dir = Path::new("container/workspace");
-    let manifest =
-        fs::read(TOOL_DISTRIBUTION_MANIFEST).expect("tool distribution manifest must be readable");
+    let manifest = manifest::combined_manifest_bytes()
+        .expect("tool distribution manifests must be valid JSON");
     let base_ref = image_ref::base_image_ref(base_dir).expect("base context must be readable");
-    let workspace_ref =
-        image_ref::workspace_image_ref(workspace_dir, &base_ref, &manifest, heel_lib_version)
-            .expect("workspace context must be readable");
+    let workspace_ref = image_ref::workspace_image_ref(
+        workspace_dir,
+        &base_ref,
+        &manifest,
+        Path::new("."),
+        heel_lib_version,
+    )
+    .expect("workspace context and tasks sources must be readable");
     println!("cargo:rustc-env=MAY_BASE_IMAGE={base_ref}");
     println!("cargo:rustc-env=MAY_WORKSPACE_IMAGE={workspace_ref}");
 
-    let mut inputs = vec![
-        PathBuf::from(TOOL_DISTRIBUTION_MANIFEST),
-        workspace_dir.to_path_buf(),
-    ];
+    let mut inputs: Vec<PathBuf> = TOOL_DISTRIBUTION_MANIFESTS
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    inputs.push(workspace_dir.to_path_buf());
+    inputs.extend(image_ref::tasks_sources(Path::new(".")).expect("tasks crate must be readable"));
+    inputs.push(PathBuf::from(image_ref::PYTHON_SHIM_TEMPLATE));
     inputs.extend(
         image_ref::workspace_hash_inputs(workspace_dir)
             .expect("workspace context must be readable")

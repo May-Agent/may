@@ -74,6 +74,23 @@ pub(super) async fn archive_idle(
     Ok(archived)
 }
 
+/// Runs one archive sweep on `state` and evicts parked agents of every newly
+/// archived session.
+async fn sweep_once(
+    state: &Arc<DaemonState>,
+    before: Timestamp,
+    held: &BTreeSet<String>,
+) -> Option<Result<Vec<String>, ChatDbError>> {
+    let swept =
+        crate::panic_boundary::round("archive", archive_idle(&state.db(), before, held)).await?;
+    if let Ok(archived) = &swept {
+        for session_id in archived {
+            state.parked_agents.evict(session_id);
+        }
+    }
+    Some(swept)
+}
+
 /// Sweeps for idle sessions for as long as the daemon runs.
 pub(super) fn spawn(state: Arc<DaemonState>) {
     state.tokio_handle.clone().spawn(async move {
@@ -86,7 +103,10 @@ pub(super) fn spawn(state: Arc<DaemonState>) {
             let before = cutoff(now, recent_hours);
             let busy = state.session_background.busy_sessions().await;
             let held = clock.held(busy, now, before);
-            match archive_idle(&state.db(), before, &held).await {
+            let Some(swept) = sweep_once(&state, before, &held).await else {
+                continue;
+            };
+            match swept {
                 Ok(archived) if archived.is_empty() => {}
                 Ok(archived) => {
                     tracing::info!(count = archived.len(), "archived idle sessions");
@@ -174,6 +194,7 @@ mod tests {
                     script: "ls".into(),
                     session_id: Some("permission".into()),
                     agent_id: None,
+                    reading: None,
                 },
             }),
         )
@@ -286,5 +307,55 @@ mod tests {
             .await
             .expect("sweep");
         assert_eq!(archived, ["s"]);
+    }
+
+    #[tokio::test]
+    async fn an_auto_archived_session_evicts_its_parked_agent() {
+        use crate::agent::idle_compaction_tests::{
+            SESSION_MODEL, Session, StubModel, saved_config,
+        };
+
+        let dir = tempfile::tempdir().expect("dir");
+        let stub = StubModel::spawn(SESSION_MODEL).await;
+        let config = saved_config(&stub, None);
+        let state = Arc::new(
+            DaemonState::for_test(dir.path(), config.clone())
+                .await
+                .expect("daemon state"),
+        );
+        state
+            .db()
+            .create_profile(CreateProfileParams {
+                id: "p",
+                name: "P",
+                environment: ProfileEnvironmentKind::Local,
+                slug: None,
+                icon: None,
+                persona: None,
+                preferences: None,
+                location_aware: false,
+            })
+            .await
+            .expect("profile");
+        add(&state.db(), "s").await;
+        let session = Box::pin(Session::start(&config)).await;
+        state.parked_agents.park(
+            &state,
+            "s",
+            session.agent,
+            crate::session::RunReleased::already_released(),
+        );
+        assert!(state.parked_agents.contains("s"));
+
+        let archived = sweep_once(&state, past_window(), &BTreeSet::new())
+            .await
+            .expect("panic boundary")
+            .expect("sweep");
+        assert_eq!(archived, ["s"]);
+        assert!(is_archived(&state.db(), "s").await);
+        assert!(
+            !state.parked_agents.contains("s"),
+            "auto-archiving drops the session's parked agent"
+        );
     }
 }

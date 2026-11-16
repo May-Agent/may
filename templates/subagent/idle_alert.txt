@@ -1,0 +1,1 @@
+Subagent '{{ subagent }}' needed {{ sent }} prompt-cache keep-alives during its run — subagents should not idle frequently. Reason for its most recent idle: {{ reason }}.

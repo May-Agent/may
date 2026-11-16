@@ -1,0 +1,5 @@
+{% for job in jobs -%}
+PR #{{ pr_number }}: {{ job.workflow }} / {{ job.name }} ran {{ job.duration }}, {% for reason in job.exceeded %}{{ reason }}{% if !loop.last %}; {% endif %}{% endfor %}.
+{%- if !job.steps.is_empty() %} Slowest steps: {% for step in job.steps %}{{ step.name }} ({{ step.duration }}){% if !loop.last %}, {% endif %}{% endfor %}.{% endif %}
+{%- if !job.tests.is_empty() %} Slowest tests: {% for test in job.tests %}{{ test.name }} ({{ test.duration }}){% if !loop.last %}, {% endif %}{% endfor %}.{% endif %}
+{% endfor -%}

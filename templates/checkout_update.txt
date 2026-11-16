@@ -1,0 +1,4 @@
+The read-only checkout for {{ repo_key }} updated from {{ old_commit }} to {{ new_commit }}.
+Files you previously read that changed:
+{% for file in files %}- {{ file }}
+{% endfor %}

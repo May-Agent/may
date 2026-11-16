@@ -5,6 +5,7 @@
 
 use ratatui::prelude::*;
 
+use super::highlight::Highlighting;
 use super::streaming_markdown::StreamingMarkdown;
 
 /// Whether terminal image rendering is supported.
@@ -41,8 +42,12 @@ pub struct MarkdownRenderResult {
 /// - true: show loading indicator (actual image rendered as overlay)
 /// - false: show as styled link
 #[must_use]
-pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line<'static>> {
-    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
+pub fn render_markdown_with_config(
+    text: &str,
+    images: ImageSupport,
+    highlighting: Highlighting,
+) -> Vec<Line<'static>> {
+    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled(), highlighting);
     renderer.push(text);
     renderer.flush(); // Ensure last line is parsed even without trailing newline
     renderer.lines().to_vec()
@@ -58,8 +63,10 @@ pub fn render_markdown_with_positions(
     text: &str,
     images: ImageSupport,
     width: usize,
+    highlighting: Highlighting,
 ) -> MarkdownRenderResult {
-    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled()).with_width(width);
+    let mut renderer =
+        StreamingMarkdown::with_image_support(images.is_enabled(), highlighting).with_width(width);
     renderer.push(text);
     renderer.flush(); // Ensure last line is parsed even without trailing newline
     MarkdownRenderResult {
@@ -71,16 +78,16 @@ pub fn render_markdown_with_positions(
 /// Render markdown text to ratatui lines (no image support).
 /// For image support, use `render_markdown_with_config`.
 #[must_use]
-pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
-    render_markdown_with_config(text, ImageSupport::Disabled)
+pub fn render_markdown(text: &str, highlighting: Highlighting) -> Vec<Line<'static>> {
+    render_markdown_with_config(text, ImageSupport::Disabled, highlighting)
 }
 
 /// Extract image URLs from markdown text.
 ///
 /// Returns a list of (`alt_text`, url) pairs for all images found.
 #[must_use]
-pub fn extract_images(text: &str) -> Vec<(String, String)> {
-    let mut renderer = StreamingMarkdown::new();
+pub fn extract_images(text: &str, highlighting: Highlighting) -> Vec<(String, String)> {
+    let mut renderer = StreamingMarkdown::new(highlighting);
     renderer.push(text);
     renderer.flush(); // Ensure last line is parsed even without trailing newline
     renderer.images()

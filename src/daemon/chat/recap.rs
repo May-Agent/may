@@ -12,10 +12,9 @@ use aither_agent::CacheWarmth;
 use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
-use skyzen::routing::Params;
-use skyzen::utils::{Json, State};
+use skyzen::utils::Json;
 
-use super::aux::AuxKind;
+use super::sidecar::AuxKind;
 use crate::daemon::state::DaemonState;
 use crate::session::MessageRole;
 
@@ -40,7 +39,7 @@ struct RecapOutput {
     next_action: Option<String>,
 }
 
-impl super::aux::AuxOutput for RecapOutput {
+impl super::sidecar::AuxOutput for RecapOutput {
     fn texts(&self) -> Vec<(&str, usize)> {
         let mut texts = vec![(self.summary.as_str(), SUMMARY_MAX_CHARS)];
         texts.extend(
@@ -110,12 +109,11 @@ pub struct RecapResponse {
 
 /// `POST /api/sessions/{id}/recap`: schedules a recap; the card arrives as
 /// a `session_recap` frame once generation finishes.
-pub async fn recap_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
+pub async fn recap_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
 ) -> SkyResult<Json<RecapResponse>> {
-    let session_id = super::hosts::session_id_param(&params)?;
-    begin_recap(&state, &session_id).await.map(Json)
+    begin_recap(state, session_id).await.map(Json)
 }
 
 /// Starts a manual recap, or refuses it while a turn runs: the turn holds
@@ -222,7 +220,9 @@ fn recap_window<'a>(
         if !matches!(role, MessageRole::User | MessageRole::Assistant) {
             continue;
         }
-        let size = content.chars().count();
+        // Counting stops one past the budget left, so the walk over all
+        // rows is bounded by the budget, not by the history's length.
+        let size = content.char_indices().take(remaining + 1).count();
         if size > remaining {
             break;
         }
@@ -239,15 +239,15 @@ fn recap_window<'a>(
 /// The recap instruction, written in the session's communication language
 /// when one is set.
 #[derive(Template)]
-#[template(path = "aux/recap.md", escape = "none")]
+#[template(path = "sidecar/recap.md", escape = "none")]
 struct RecapPrompt {
-    language: Option<aither_agent::Language>,
+    language: Option<crate::harness::language::Language>,
 }
 
 /// The aux request: the windowed conversation, then the recap instruction.
 fn recap_messages(
     conversation: &[(&MessageRole, &str)],
-    language: Option<aither_agent::Language>,
+    language: Option<crate::harness::language::Language>,
 ) -> Vec<aither_core::llm::Message> {
     let prompt = RecapPrompt { language }
         .render()
@@ -281,9 +281,9 @@ async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRec
         return None;
     }
     let turns = window.turns;
-    let languages = super::aux::languages(state, session_id).await.ok()?;
+    let languages = super::sidecar::languages(state, session_id).await.ok()?;
     let messages = recap_messages(&window.conversation, languages.communication());
-    super::aux::generate::<RecapOutput>(state, session_id, messages, GENERATION_TIMEOUT)
+    super::sidecar::generate::<RecapOutput>(state, session_id, messages, GENERATION_TIMEOUT)
         .await
         .ok()?
         .into_record(turns)
@@ -414,7 +414,7 @@ pub(super) fn arm(state: &Arc<DaemonState>, session_id: &str) {
     if !state.config.load().recap.auto {
         return;
     }
-    if let Some(warmth) = super::aux::warm_cache(state, session_id) {
+    if let Some(warmth) = super::sidecar::warm_cache(state, session_id) {
         state.recap_schedules.arm(state, session_id, warmth);
     }
 }
@@ -458,7 +458,7 @@ async fn freshness(state: &Arc<DaemonState>, session_id: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn last_message(language: Option<aither_agent::Language>) -> String {
+    fn last_message(language: Option<crate::harness::language::Language>) -> String {
         let conversation = [
             (&MessageRole::User, "ship it"),
             (&MessageRole::Assistant, "shipped"),
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn the_recap_request_names_the_session_communication_language() {
-        let chinese: aither_agent::Language = "Chinese".parse().unwrap();
+        let chinese: crate::harness::language::Language = "Chinese".parse().unwrap();
         let prompt = last_message(Some(chinese));
         assert!(prompt.contains("Write in Chinese."), "{prompt}");
         assert!(!prompt.contains("language of the user's messages"));
@@ -651,12 +651,14 @@ mod tests {
             .expect("release run");
     }
 
-    async fn recap_from(reply: &'static str) -> Result<RecapOutput, super::super::aux::AuxError> {
+    async fn recap_from(
+        reply: &'static str,
+    ) -> Result<RecapOutput, super::super::sidecar::AuxError> {
         let slot = crate::agent::ModelSlot::new(
-            super::super::aux::test_support::Replying(reply),
+            super::super::sidecar::test_support::Replying(reply),
             aither_core::llm::model::Parameters::default(),
         );
-        super::super::aux::generate_with::<_, RecapOutput>(
+        super::super::sidecar::generate_with::<_, RecapOutput>(
             &slot,
             recap_messages(&[(&MessageRole::User, "ship it")], None),
             GENERATION_TIMEOUT,
@@ -687,7 +689,7 @@ mod tests {
         );
         let error = recap_from(reply).await.expect_err("over the limit");
         assert!(
-            matches!(error, super::super::aux::AuxError::Output(_)),
+            matches!(error, super::super::sidecar::AuxError::Output(_)),
             "{error}"
         );
     }

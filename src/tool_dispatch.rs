@@ -6,7 +6,6 @@ use crate::ChatDb;
 use crate::SkillManager;
 use crate::agent::browser_tool::BrowserToolError;
 use crate::agent::browser_tool::{BrowserBroker, BrowserRequest, BrowserResult};
-use crate::agent::notify_tool::{NotifyArgs, NotifyBroker, NotifyResult};
 use crate::agent::register_tool::{RegisterBroker, RegisterRequest, RegisterResult};
 use crate::agent::task_tool::TaskBroker;
 use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, Question};
@@ -39,8 +38,6 @@ pub enum ToolDispatchError {
 pub struct ToolDispatchers {
     /// Broker for the `task` command.
     pub task: TaskBroker,
-    /// Broker for the `notify` command.
-    pub notify: NotifyBroker,
     /// Broker for `browser` commands, when enabled.
     pub browser: Option<BrowserBroker>,
     /// Broker for skill registration.
@@ -65,7 +62,7 @@ pub struct ToolDispatchConfig {
     /// Broker for `ask_user` prompts.
     pub ask_user_broker: AskUserBroker,
     /// Baseline tool distribution prepared for task terminals.
-    pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    pub tool_distribution: Arc<crate::tools::ToolDistribution>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,15 +136,6 @@ impl ToolDispatchers {
             }
         });
 
-        let (notify, notify_queue) = crate::agent::notify_channel();
-        tokio::spawn(async move {
-            while let Some(request) = notify_queue.next().await {
-                let result =
-                    handle_notify_request(&notification_service, request.args.clone()).await;
-                let _ = request.respond(result);
-            }
-        });
-
         let browser = if config.browser_config.enabled {
             let browser_service = BrowserServiceRuntime {
                 browser_config: config.browser_config,
@@ -189,7 +177,6 @@ impl ToolDispatchers {
 
         Ok(Self {
             task,
-            notify,
             browser,
             register_skills,
             tunnel,
@@ -222,25 +209,6 @@ async fn handle_exec_tunnel_request(
         path: response.path,
         local_url: response.local_url,
     })
-}
-
-async fn handle_notify_request(
-    notification_service: &Arc<NotificationService>,
-    args: NotifyArgs,
-) -> Result<NotifyResult, String> {
-    let payload = crate::notification::NotificationPayload {
-        notification_id: None,
-        title: args.title,
-        body: args.body,
-        session_id: args.session_id,
-        callback_context_xml: args.callback_context_xml,
-        callback_message: args.callback_message,
-    };
-    let sent = notification_service
-        .send_payload(payload)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(NotifyResult { sent })
 }
 
 async fn handle_browser_request(
@@ -353,10 +321,19 @@ async fn handle_browser_request(
                         resolve_browser_session_paths(browser_service, session_id.as_str())
                             .await
                             .map_err(BrowserToolError::request_failed)?;
-                    let page =
-                        persist_browser_page_capture(session_id.as_str(), &session_paths, *payload)
-                            .await
-                            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let session_ids = browser_service
+                        .db
+                        .session_ids(session_id.as_str())
+                        .await
+                        .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let page = persist_browser_page_capture(
+                        session_id.as_str(),
+                        &session_paths,
+                        session_ids.allocator(),
+                        *payload,
+                    )
+                    .await
+                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                     Ok(BrowserResult {
                         running: true,
                         cdp_endpoint: status.cdp_endpoint,

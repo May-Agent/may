@@ -290,8 +290,7 @@ fn preview_kind(relative_path: &Path, size: u64) -> PreviewKind {
     let extension = relative_path
         .extension()
         .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
+        .map_or_default(str::to_ascii_lowercase);
     match extension.as_str() {
         "md" | "markdown" => PreviewKind::Markdown,
         "html" | "htm" | "pdf" => PreviewKind::Frame,

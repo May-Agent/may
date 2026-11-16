@@ -1,0 +1,5 @@
+Fetch a URL and return it as markdown (an image URL returns the image). A large page is saved to a file and its path returned.
+
+When only part of a page is needed, pipe it into `ask "<question>"`, or into `rg` or `head` for a known string or section, so that only the answer reaches your context. Read the whole page only when the whole page is needed.
+
+Some sites block automated requests or require authentication.

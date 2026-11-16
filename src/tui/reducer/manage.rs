@@ -243,7 +243,6 @@ pub fn handle_quit_confirm_key(app: &mut App, code: KeyCode) -> Option<SendActio
     match code {
         KeyCode::Char('s' | 'S') => {
             app.mode = crate::tui::state::AppMode::Chat;
-            app.restore_aborted_draft();
             Some(SendAction::StopAgentAndQuit)
         }
         KeyCode::Enter | KeyCode::Char('l' | 'L') => {
@@ -270,6 +269,11 @@ pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Option<Sen
                     request_id: state.request_id,
                     approved: true,
                 });
+            }
+        }
+        KeyCode::Char('s' | 'S') | KeyCode::Tab => {
+            if let crate::tui::state::AppMode::PermissionConfirm(state) = &mut app.mode {
+                state.show_script = !state.show_script;
             }
         }
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
@@ -408,6 +412,13 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                     });
                 }
             }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(server) = app.config.ssh_servers.get(app.ssh_selected) {
+                    return Some(SendAction::SshToggleAttachment {
+                        name: server.name.clone(),
+                    });
+                }
+            }
             _ => {}
         },
         SshAddMode::Name => match code {
@@ -443,6 +454,58 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
             KeyCode::Char(c) => {
                 app.ssh_add_target.push(c);
             }
+            _ => {}
+        },
+    }
+    None
+}
+
+/// `/cloud`: `s` sets up Codespaces (asking for the GitHub account), `d`
+/// removes it, `n` starts a new session entirely on a codespace of a
+/// machine type picked from the catalog.
+pub fn handle_cloud_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    if let Some((machines, selected)) = app.cloud_machines.as_mut() {
+        match code {
+            KeyCode::Esc => app.cloud_machines = None,
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(machines.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let machine_type = machines.get(*selected)?.name.clone();
+                app.cloud_machines = None;
+                app.mode = crate::tui::state::AppMode::Chat;
+                return Some(SendAction::NewCloudSession(machine_type));
+            }
+            _ => {}
+        }
+        return None;
+    }
+    let set_up = app
+        .current_profile()
+        .is_some_and(|profile| profile.cloud.codespaces.is_some());
+    match app.cloud_login.as_mut() {
+        None => match code {
+            KeyCode::Esc => app.mode = crate::tui::state::AppMode::Chat,
+            KeyCode::Char('s') => app.cloud_login = Some(String::new()),
+            KeyCode::Char('n') if set_up => app.start_cloud_catalog(),
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if set_up => {
+                app.start_codespaces_removal();
+            }
+            _ => {}
+        },
+        Some(login) => match code {
+            KeyCode::Esc => app.cloud_login = None,
+            KeyCode::Enter => {
+                let login = login.trim().to_owned();
+                app.cloud_login = None;
+                app.start_codespaces_setup((!login.is_empty()).then_some(login));
+            }
+            KeyCode::Backspace => {
+                login.pop();
+            }
+            // A GitHub login is letters, digits and hyphens.
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '-' => login.push(c),
             _ => {}
         },
     }

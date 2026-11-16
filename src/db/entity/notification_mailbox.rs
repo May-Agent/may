@@ -11,10 +11,6 @@ pub struct Model {
     pub body: String,
     /// Session the notification belongs to, if any.
     pub session_id: Option<String>,
-    /// Serialized context fragment attached to the callback.
-    pub callback_context_xml: Option<String>,
-    /// Callback message delivered to the session on consumption.
-    pub callback_message: Option<String>,
     /// Delivery status string.
     pub status: String,
     /// Delivery attempts so far.
@@ -27,4 +23,6 @@ pub struct Model {
     pub created_at: String,
     /// Last update timestamp (ISO 8601).
     pub updated_at: String,
+    /// Profile of the notification's session, if any.
+    pub profile_id: Option<String>,
 }

@@ -2,6 +2,7 @@
 
 use ratatui::style::Style;
 use ratatui::text::Span;
+use unicode_segmentation::UnicodeSegmentation as _;
 
 /// Characters the highlight covers.
 const SWEEP_WIDTH: usize = 3;
@@ -15,18 +16,16 @@ const FRAMES_PER_STEP: usize = 2;
 /// alone, so painting needs no state of its own.
 #[must_use]
 pub fn sweep_spans(text: &str, frame: usize, base: Style, highlight: Style) -> Vec<Span<'static>> {
-    let len = text.chars().count();
+    // Byte offset of each grapheme: the highlight steps over whole clusters.
+    let offsets: Vec<usize> = text.grapheme_indices(true).map(|(at, _)| at).collect();
+    let len = offsets.len();
     if len == 0 {
         return Vec::new();
     }
     let head = (frame / FRAMES_PER_STEP) % (len + SWEEP_WIDTH);
     let start = head.saturating_sub(SWEEP_WIDTH).min(len);
     let end = head.min(len);
-    let byte = |chars: usize| {
-        text.char_indices()
-            .nth(chars)
-            .map_or(text.len(), |(offset, _)| offset)
-    };
+    let byte = |index: usize| offsets.get(index).copied().unwrap_or(text.len());
     let (start, end) = (byte(start), byte(end));
     [
         (&text[..start], base),
@@ -76,5 +75,13 @@ mod tests {
     #[test]
     fn an_empty_title_has_no_spans() {
         assert_eq!(sweep_spans("", 7, Style::default(), Style::default()), []);
+    }
+
+    #[test]
+    fn the_highlight_steps_over_whole_grapheme_clusters() {
+        // The skin tone modifier and the combining accent stay with their base.
+        assert_eq!(lit("a👍🏽e\u{301}b", 3 * FRAMES_PER_STEP), "a👍🏽e\u{301}");
+        assert_eq!(lit("こんにちは", 2 * FRAMES_PER_STEP), "こん");
+        assert_eq!(lit("안녕하세요", 4 * FRAMES_PER_STEP), "녕하세");
     }
 }

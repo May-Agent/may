@@ -26,7 +26,9 @@ import type { BackgroundJob, SubagentRun } from '@/lib/api/background';
 import type { ApiSession, SessionPlanState } from '@/lib/types';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { cn } from '@/lib/utils';
-import { IssueLabel, TaskTreeView } from './TaskTreeView';
+import { openCount, rootReferences } from '@/lib/tasks/rows';
+import { ReferenceLabel, TaskRowsView } from './TaskRowsView';
+import { PullRequestsView } from './PullRequestsView';
 import { PlanEditorSheet } from './PlanEditorSheet';
 import { LibraryPanel } from './LibraryPanel';
 
@@ -112,6 +114,9 @@ function DetailsPanel({ session }: { session: ApiSession }) {
   const entry = useInspectorStore((s) => s.sessions[sessionId] ?? EMPTY_INSPECTOR_ENTRY);
   const loadTasks = useInspectorStore((s) => s.loadTasks);
   const loadBackground = useInspectorStore((s) => s.loadBackground);
+  const loadPrs = useInspectorStore((s) => s.loadPrs);
+  const mergePr = useInspectorStore((s) => s.mergePr);
+  const closePr = useInspectorStore((s) => s.closePr);
   const killJob = useInspectorStore((s) => s.killJob);
   const stopSubagent = useInspectorStore((s) => s.stopSubagent);
   const rename = useSessionsStore((s) => s.rename);
@@ -125,7 +130,8 @@ function DetailsPanel({ session }: { session: ApiSession }) {
 
   useEffect(() => {
     void loadBackground(sessionId);
-  }, [sessionId, loadBackground]);
+    void loadPrs(sessionId);
+  }, [sessionId, loadBackground, loadPrs]);
 
   // tasks.md changes reach the client as `todo_update` turn events; reload
   // the document then, when a turn ends and when the plan state moves.
@@ -137,6 +143,7 @@ function DetailsPanel({ session }: { session: ApiSession }) {
   const jobs = useMemo(() => orderJobs(entry.background?.jobs ?? []), [entry.background]);
   const runningJobs = jobs.filter(isJobRunning);
   const finishedJobs = jobs.filter((job) => !isJobRunning(job));
+  const pullRequests = entry.prs ?? [];
   const subagents = entry.background?.subagents ?? [];
   const backgroundFailed = entry.backgroundError !== null && !entry.background;
 
@@ -199,7 +206,7 @@ function DetailsPanel({ session }: { session: ApiSession }) {
 
       <Section
         title={t('inspector.tasks')}
-        meta={tasks && tasks.tree.total > 0 ? `${tasks.tree.completed}/${tasks.tree.total}` : undefined}
+        meta={tasks && openCount(tasks.rows) > 0 ? String(openCount(tasks.rows)) : undefined}
         busy={entry.tasksLoading && tasks !== null}
         accessory={
           tasks && (tasks.content.trim().length > 0 || planState !== 'disabled') ? (
@@ -215,22 +222,35 @@ function DetailsPanel({ session }: { session: ApiSession }) {
           )
         ) : (
           <>
-            {tasks.tree.roots.length > 0 && (
+            {rootReferences(tasks.rows).length > 0 && (
               <p className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
                 <span>{t('inspector.linkedIssues')}</span>
-                {tasks.tree.roots.map((issue) => (
-                  <IssueLabel key={issue.label} issue={issue} />
+                {rootReferences(tasks.rows).map((reference) => (
+                  <ReferenceLabel
+                    key={`${reference.repository ?? ''}#${reference.number}${reference.pullRequest}`}
+                    reference={reference}
+                  />
                 ))}
               </p>
             )}
-            {tasks.tree.total === 0 ? (
+            {openCount(tasks.rows) === 0 ? (
               <Empty>{t('inspector.tasksEmpty')}</Empty>
             ) : (
-              <TaskTreeView tree={tasks.tree} />
+              <TaskRowsView rows={tasks.rows} />
             )}
           </>
         )}
       </Section>
+
+      {pullRequests.length > 0 && (
+        <Section title={t('inspector.pullRequests')} meta={String(pullRequests.length)}>
+          <PullRequestsView
+            prs={pullRequests}
+            onMerge={(id) => mergePr(id, sessionId)}
+            onClose={(id) => closePr(id, sessionId)}
+          />
+        </Section>
+      )}
 
       <Section
         title={t('inspector.subagents')}

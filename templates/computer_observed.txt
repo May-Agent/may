@@ -1,0 +1,7 @@
+The attached image is the session desktop's current screen, {{ width }}x{{ height }} points.
+{% if elements.is_empty() %}No actionable elements were listed on it.
+{% else %}Its actionable elements, each by the reference `computer click REF` and `computer type REF TEXT` take until the next observe:
+{% for element in elements %}{{ element.reference }} {{ element.role }}{% if let Some(name) = element.name %} {{ name }}{% endif %}{% if let Some(value) = element.value %} = {{ value }}{% else %}{% if let Some(hint) = element.placeholder %} empty, hint {{ hint }}{% endif %}{% endif %}{% if let Some(center) = element.center %} at ({{ "{:.0}"|format(center.x) }}, {{ "{:.0}"|format(center.y) }}){% else %} with no position{% endif %}{% if !element.enabled %}, disabled{% endif %}
+{% endfor %}{% endif %}{% if truncated %}The listing is incomplete: an application did not answer or the walk reached its limit{% if skipped > 0 %}, and {{ skipped }} element reads failed{% endif %}; the image shows what it left out.
+{% else if skipped > 0 %}{{ skipped }} element reads failed, so the listing may leave elements out; the image shows them.
+{% endif %}

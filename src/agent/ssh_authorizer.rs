@@ -1,50 +1,98 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
-use aither_sandbox::{SshAuthorizationError, SshSessionAuthorizer};
 use askama::Template;
+
+use super::permission::PermissionError;
 
 use crate::PermissionHistoryMode;
 use crate::ask_user::{
     AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, QuestionAnswer,
 };
 
-/// The choice a permission prompt offers: one allow option and a deny
-/// option. The live gate and the routing of a late answer both decide
-/// approval here, so they cannot disagree.
+/// The options a permission prompt offers.
+///
+/// Includes an allow-once option, an optional session-wide allow option, and a
+/// deny option so the live gate and late-answer routing agree on approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermissionChoice<'a> {
     allow: &'a str,
+    session_allow: bool,
 }
 
 impl<'a> PermissionChoice<'a> {
+    const ALWAYS_ALLOW: &'static str = "Always allow for session";
     const DENY: &'static str = "Deny";
+
+    /// The 3-way choice allowing once (`allow`), for the session, or denying.
+    #[must_use]
+    pub const fn with_session_allow(allow: &'a str) -> Self {
+        Self {
+            allow,
+            session_allow: true,
+        }
+    }
 
     /// The choice that allows with the option labelled `allow`.
     #[must_use]
     pub const fn new(allow: &'a str) -> Self {
-        Self { allow }
+        Self {
+            allow,
+            session_allow: false,
+        }
     }
 
     /// Recover the choice from the options of a prompt built by
     /// [`Self::options`].
     #[must_use]
     pub fn from_options(options: &'a [String]) -> Option<Self> {
-        options.first().map(|allow| Self::new(allow))
+        let allow = options.first()?;
+        let session_allow = options.iter().any(|option| option == Self::ALWAYS_ALLOW);
+        Some(Self {
+            allow,
+            session_allow,
+        })
     }
 
     /// The options to show, allow first.
     #[must_use]
     pub fn options(&self) -> Vec<String> {
-        vec![self.allow.to_string(), Self::DENY.to_string()]
+        if self.session_allow {
+            vec![
+                self.allow.to_string(),
+                Self::ALWAYS_ALLOW.to_string(),
+                Self::DENY.to_string(),
+            ]
+        } else {
+            vec![self.allow.to_string(), Self::DENY.to_string()]
+        }
     }
 
-    /// Whether `answers` select the allow option. Anything else, a typed
-    /// reply included, is not approval.
+    /// Whether `answers` select an allow option (once or for session).
+    /// Anything else, a typed reply included, is not approval.
     #[must_use]
     pub fn allows(&self, answers: &[QuestionAnswer]) -> bool {
         answers.iter().any(|answer| {
-            matches!(&answer.answer, AnswerValue::Selected(options) if options.iter().any(|option| option == self.allow))
+            matches!(
+                &answer.answer,
+                AnswerValue::Selected(options)
+                    if options.iter().any(|option| option == self.allow
+                        || (self.session_allow && option == Self::ALWAYS_ALLOW))
+            )
         })
+    }
+
+    /// Whether `answers` select `"Always allow for session"`.
+    #[must_use]
+    pub fn allows_for_session(&self, answers: &[QuestionAnswer]) -> bool {
+        self.session_allow
+            && answers.iter().any(|answer| {
+                matches!(
+                    &answer.answer,
+                    AnswerValue::Selected(options)
+                        if options.iter().any(|option| option == Self::ALWAYS_ALLOW)
+                )
+            })
     }
 }
 
@@ -54,20 +102,14 @@ struct SshConnectPermission<'a> {
     target: &'a str,
 }
 
-#[derive(Template)]
-#[template(path = "ssh_install_permission.txt", escape = "none")]
-struct SshInstallPermission<'a> {
-    target: &'a str,
-    details: &'a str,
-}
-
-/// Authorizes `terminal` ssh-mode targets by asking the user through the
-/// ask-user broker.
+/// Authorizes the SSH servers `terminal` commands name by asking the user through the
+/// ask-user broker and remembering session-wide grants per session.
 #[derive(Debug)]
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
     session_id: String,
     db: crate::db::ChatDb,
+    session_grants: Mutex<HashSet<String>>,
 }
 
 impl MaySshAuthorizer {
@@ -81,34 +123,99 @@ impl MaySshAuthorizer {
             broker,
             db,
             session_id: session_id.into(),
+            session_grants: Mutex::new(HashSet::new()),
         })
     }
 
-    /// Ask a yes/no permission question via the `AskUser` UI.
+    /// Whether [`Self::authorize_connect`] will wait for the user: a yolo
+    /// session or a target already granted for this session answers at once.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the yolo switch cannot be read.
+    pub async fn will_ask(&self) -> Result<bool, PermissionError> {
+        Ok(!self
+            .db
+            .session_yolo(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?)
+    }
+
+    /// Ask whether commands may run on the server at `target`.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the question cannot be put, or when the
+    /// session grant cannot be read or recorded.
+    pub async fn authorize_connect(&self, target: &str) -> Result<bool, PermissionError> {
+        self.ask_permission(SshConnectPermission { target }, "Approve", true)
+            .await
+    }
+
+    fn has_memory_grant(&self, question: &str) -> bool {
+        self.session_grants
+            .lock()
+            .expect("ssh session grants lock poisoned")
+            .contains(question)
+    }
+
+    fn record_memory_grant(&self, question: String) {
+        self.session_grants
+            .lock()
+            .expect("ssh session grants lock poisoned")
+            .insert(question);
+    }
+
+    /// Ask a permission question via the `AskUser` UI, honoring prior
+    /// session-wide grants when `session_allow` is enabled.
     async fn ask_permission<T: Template + Send>(
         &self,
         question: T,
         allow_label: &str,
-    ) -> Result<bool, SshAuthorizationError> {
+        session_allow: bool,
+    ) -> Result<bool, PermissionError> {
         let question = question
             .render()
-            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
-        // A yolo session grants at once and records it like a user approval.
-        if self
-            .db
-            .session_yolo(&self.session_id)
-            .await
-            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?
-        {
-            self.db
-                .append_granted_permission(&self.session_id, PermissionHistoryMode::Ssh, &question)
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?;
+        if session_allow {
+            if self.has_memory_grant(&question) {
+                return Ok(true);
+            }
+            if self
+                .db
+                .has_granted_permission(&self.session_id, PermissionHistoryMode::Ssh, &question)
                 .await
-                .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?
+            {
+                self.record_memory_grant(question);
+                return Ok(true);
+            }
+        }
+        // A yolo session grants at once and records it like a user approval.
+        if !self.will_ask().await? {
+            self.db
+                .append_granted_permission(
+                    &self.session_id,
+                    PermissionHistoryMode::Ssh,
+                    &question,
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?;
+            if session_allow {
+                self.record_memory_grant(question);
+            }
             return Ok(true);
         }
-        let choice = PermissionChoice::new(allow_label);
+        let choice = if session_allow {
+            PermissionChoice::with_session_allow(allow_label)
+        } else {
+            PermissionChoice::new(allow_label)
+        };
         let args = AskUserArgs {
-            question: Some(question),
+            question: Some(question.clone()),
             option: choice.options(),
             multi_select: false,
             questions: Vec::new(),
@@ -120,23 +227,21 @@ impl MaySshAuthorizer {
                 request: args,
             })
             .await
-            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+            .map_err(PermissionError::Internal)?;
+        if choice.allows_for_session(&response) {
+            self.db
+                .append_granted_permission(
+                    &self.session_id,
+                    PermissionHistoryMode::Ssh,
+                    &question,
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?;
+            self.record_memory_grant(question);
+            return Ok(true);
+        }
         Ok(choice.allows(&response))
-    }
-}
-
-impl SshSessionAuthorizer for MaySshAuthorizer {
-    async fn authorize_connect(&self, target: &str) -> Result<bool, SshAuthorizationError> {
-        self.ask_permission(SshConnectPermission { target }, "Allow")
-            .await
-    }
-
-    async fn authorize_runtime_install(
-        &self,
-        target: &str,
-        details: &str,
-    ) -> Result<bool, SshAuthorizationError> {
-        self.ask_permission(SshInstallPermission { target, details }, "Install")
-            .await
     }
 }

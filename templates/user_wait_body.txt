@@ -1,0 +1,10 @@
+{% match ask -%}
+{%- when UserAsk::Command with { mode, script } -%}
+{%- if matches!(mode, PermissionRequestMode::Ssh) %}Approve SSH access: {{ script }}{% else %}Approve running: {{ script }}{% endif %}
+{%- when UserAsk::Publication with { headline } -%}
+Approve publishing: {{ headline }}
+{%- when UserAsk::Workspace with { path } -%}
+Allow access to {{ path }}?
+{%- when UserAsk::Question with { text } -%}
+{{ text }}
+{%- endmatch %}

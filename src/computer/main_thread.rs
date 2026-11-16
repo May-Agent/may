@@ -5,11 +5,12 @@
 //! created and dropped there. So the helper's main thread does nothing but
 //! run that loop ([`host`]) while the async runtime lives on a thread of its
 //! own, and anything bound to the main thread is handed to it as a block on
-//! the main dispatch queue ([`run`], [`release`]).
+//! the main dispatch queue ([`MainThread::run`], [`release`]).
 
+use std::cell::RefCell;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use dispatch2::DispatchQueue;
 pub use dispatch2::MainThreadBound;
@@ -18,6 +19,7 @@ use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer, kCFRunLoopCommonModes,
     kCFRunLoopDefaultMode,
 };
+use waterkit_automation::DisplayHost;
 
 /// Seconds until the idle timer that keeps the run loop alive would fire:
 /// longer than any helper lives.
@@ -99,26 +101,57 @@ pub fn host<R: Send + 'static>(stack_size: usize, work: impl FnOnce() -> R + Sen
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-/// Runs `job` on the main thread and returns what it produced.
+/// The helper's access to its main thread and the owner of its one
+/// [`DisplayHost`].
 ///
-/// The caller awaits; nothing blocks. A job that returns a value the main
-/// thread owns wraps it in a [`MainThreadBound`].
+/// Every virtual display of the process is created through that host: a host
+/// shares its stand-in display only among the displays it created.
 ///
-/// # Panics
-/// Panics when the main thread no longer serves its queue.
-pub async fn run<R: Send + 'static>(job: impl FnOnce(MainThreadMarker) -> R + Send + 'static) -> R {
-    let (sender, receiver) = async_channel::bounded(1);
-    DispatchQueue::main().exec_async(move || {
-        let main =
-            MainThreadMarker::new().expect("blocks on the main queue run on the main thread");
-        // The receiver is gone when the caller stopped waiting; the result
-        // then drops here, on the main thread.
-        let _ = sender.try_send(job(main));
-    });
-    receiver
-        .recv()
-        .await
-        .expect("the main thread serves its queue")
+/// The host is not `Send`, so it is built on the main thread by the first
+/// [`run`](Self::run) and stays there, in a [`MainThreadBound`]; jobs reach
+/// it only as blocks on the main queue. Clones share the one host, and the
+/// helper makes one handle for its whole life.
+#[derive(Clone, Default)]
+pub struct MainThread {
+    host: Arc<OnceLock<MainThreadBound<RefCell<DisplayHost>>>>,
+}
+
+impl std::fmt::Debug for MainThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MainThread").finish_non_exhaustive()
+    }
+}
+
+impl MainThread {
+    /// Runs `job` on the main thread with the process's display host and
+    /// returns what it produced.
+    ///
+    /// The caller awaits; nothing blocks. A job that returns a value the
+    /// main thread owns wraps it in a [`MainThreadBound`].
+    ///
+    /// # Panics
+    /// Panics when the main thread no longer serves its queue.
+    pub async fn run<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(MainThreadMarker, &mut DisplayHost) -> R + Send + 'static,
+    ) -> R {
+        let (sender, receiver) = async_channel::bounded(1);
+        let host = self.host.clone();
+        DispatchQueue::main().exec_async(move || {
+            let main =
+                MainThreadMarker::new().expect("blocks on the main queue run on the main thread");
+            let cell = host
+                .get_or_init(|| MainThreadBound::new(RefCell::new(DisplayHost::new(main)), main));
+            let result = job(main, &mut cell.get(main).borrow_mut());
+            // The receiver is gone when the caller stopped waiting; the
+            // result then drops here, on the main thread.
+            let _ = sender.try_send(result);
+        });
+        receiver
+            .recv()
+            .await
+            .expect("the main thread serves its queue")
+    }
 }
 
 /// Drops `value` on the main thread without making the caller wait for it.

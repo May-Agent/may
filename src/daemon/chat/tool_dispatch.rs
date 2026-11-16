@@ -2,17 +2,15 @@
 //!
 //! Each `handle_*_request` maps a typed tool-call from an agent into
 //! a concrete side effect against `DaemonState` (creating a task,
-//! sending a notification, driving the managed browser, or registering
+//! driving the managed browser, or registering
 //! skills/subagents after user approval). All helpers in this file are
 //! `pub(super)` so the chat module that wires the tool-dispatch loop
 //! can invoke them without re-exporting anything.
 
 use std::sync::Arc;
 
-use aither_agent::ask_user;
-
 use crate::agent::browser_tool::BrowserToolError;
-use crate::notification::{NotificationPayload, NotificationService};
+use crate::harness::ask_user;
 use crate::ui_event_bus::UiEventTopics;
 
 use super::super::browser::ensure_browser_runtime_started;
@@ -32,26 +30,6 @@ pub(super) async fn handle_task_request(
     let funnel = state.remote_access_manager.snapshot().funnel_url;
     result.trigger = result.trigger.with_funnel_base(funnel.as_deref());
     Ok(result)
-}
-
-pub(super) async fn handle_notify_request(
-    notification_service: Arc<NotificationService>,
-    args: crate::agent::notify_tool::NotifyArgs,
-) -> Result<crate::agent::notify_tool::NotifyResult, String> {
-    let payload = NotificationPayload {
-        notification_id: None,
-        title: args.title,
-        body: args.body,
-        session_id: args.session_id,
-        callback_context_xml: args.callback_context_xml,
-        callback_message: args.callback_message,
-    };
-    let sent = notification_service
-        .send_payload(payload)
-        .await
-        .map_err(|error| format!("failed to send notification payload: {error}"))?;
-
-    Ok(crate::agent::notify_tool::NotifyResult { sent })
 }
 
 pub(super) async fn handle_browser_request(
@@ -130,9 +108,19 @@ pub(super) async fn handle_browser_request(
             let session_paths = load_session_paths(state, session_id.as_str())
                 .await
                 .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
-            let page = persist_browser_page_capture(session_id.as_str(), &session_paths, capture)
+            let session_ids = state
+                .db()
+                .session_ids(session_id.as_str())
                 .await
                 .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            let page = persist_browser_page_capture(
+                session_id.as_str(),
+                &session_paths,
+                session_ids.allocator(),
+                capture,
+            )
+            .await
+            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: true,
                 cdp_endpoint: browser_manager.cdp_endpoint(),

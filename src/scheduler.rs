@@ -10,17 +10,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aither_core::llm::CommandOutcome;
+use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
 use aither_sandbox::{
-    AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
-    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalTool,
-    ToolRegistryBuilder, permission::PermissionError,
+    AnyContainerExec, BollardContainerExec, ContainerLaunchSpec, ContainerShellRuntime,
+    DomainApprover, DomainRequest, Grants, Interpreter, RunOutcome, Script, ScriptResult,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
 use base64::Engine;
-use executor_core::DefaultExecutor;
 use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
@@ -57,12 +54,14 @@ pub struct TaskRuntime {
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
     /// Baseline tool distribution prepared for every task terminal.
-    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    tool_distribution: Arc<crate::tools::ToolDistribution>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
     /// The daemon's connectivity source; task terminals record the outages
     /// their commands ran through.
     connectivity: Option<aither_connectivity::Connectivity>,
+    /// The daemon's jobserver pool local task commands draw jobs from.
+    job_server: Option<crate::jobserver::JobServer>,
     /// Where a run's `wake` command stores its prompt.
     session_prompts: Option<crate::task_wake::SessionPrompts>,
     /// Where webhook signing secrets are read.
@@ -73,6 +72,22 @@ pub struct TaskRuntime {
 #[derive(Debug)]
 pub struct TaskScheduler {
     runtime: Arc<TaskRuntime>,
+}
+
+/// The error of a task script that exited non-zero, with what it printed.
+#[derive(Template)]
+#[template(path = "task_script_failure.txt", escape = "none")]
+struct TaskScriptFailure<'a> {
+    exit_code: i32,
+    output: &'a str,
+}
+
+/// A task script's stdout followed by its non-empty stderr.
+#[derive(Template)]
+#[template(path = "task_output_with_stderr.txt", escape = "none")]
+struct TaskOutputWithStderr<'a> {
+    stdout: &'a str,
+    stderr: &'a str,
 }
 
 #[derive(Template)]
@@ -177,21 +192,13 @@ fn task_notification_title(task_name: &str) -> String {
     format!("Task: {task_name}")
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TaskCallbackStatus {
+#[derive(Debug, Clone, Copy)]
+enum TaskOutcome {
     Completed,
     Failed,
 }
 
-impl TaskCallbackStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
-    }
-
+impl TaskOutcome {
     const fn notification_body(self) -> &'static str {
         match self {
             Self::Completed => "Completed successfully",
@@ -200,15 +207,10 @@ impl TaskCallbackStatus {
     }
 }
 
-fn task_notification_callback_message(task_name: &str, status: TaskCallbackStatus) -> String {
-    format!(
-        "Continue from scheduled task \"{task_name}\" ({}). Review the hidden task result and choose the next action.",
-        status.as_str()
-    )
-}
-
 fn task_script_failure(exit_code: i32, output: &str) -> String {
-    format!("task script failed with exit code {exit_code}\n{output}")
+    TaskScriptFailure { exit_code, output }
+        .render()
+        .expect("the task script failure template renders")
 }
 
 fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String {
@@ -230,50 +232,8 @@ fn container_profile_name(profile: &profiles::Model) -> String {
     format!("may-{}", profile_workspace_key(profile))
 }
 
-fn task_notification_callback_context(
-    task: &scheduled_tasks::Model,
-    status: TaskCallbackStatus,
-    summary: &str,
-) -> Option<crate::XmlBlock> {
-    task.session_id.as_ref()?;
-    let text = TaskCallbackReminder {
-        task_id: task.id.as_str(),
-        task_name: task.name.as_str(),
-        profile_id: task.profile_id.as_str(),
-        trigger_kind: task.trigger_kind.as_str(),
-        trigger_type: task.trigger_type.as_str(),
-        status: status.as_str(),
-        summary,
-    }
-    .render()
-    .expect("task callback reminder must render");
-    crate::XmlBlock::parse(text).ok()
-}
-
-fn task_notification_callback_payload(
-    task: &scheduled_tasks::Model,
-    status: TaskCallbackStatus,
-    summary: &str,
-) -> (Option<crate::XmlBlock>, Option<String>) {
-    if task.session_id.is_none() {
-        return (None, None);
-    }
-
-    (
-        task_notification_callback_context(task, status, summary),
-        Some(task_notification_callback_message(
-            task.name.as_str(),
-            status,
-        )),
-    )
-}
-
 const fn task_db_error(message: String) -> crate::db::ChatDbError {
     crate::db::ChatDbError::Storage(message)
-}
-
-fn task_field_error(task_id: &str, prefix: &str, field: &str) -> crate::db::ChatDbError {
-    task_db_error(format!("{prefix}{task_id} is missing {field}"))
 }
 
 fn task_value_error(
@@ -302,6 +262,18 @@ fn init_terminal_tool_error(prefix: &str, error: &impl std::fmt::Display) -> Str
 
 fn invalid_profile_component_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     prefixed_error(prefix, error)
+}
+
+/// Where a task's shell works.
+enum TaskHome {
+    /// The machine the daemon runs on.
+    Host,
+    /// The profile's container.
+    Container {
+        runtime: ContainerShellRuntime,
+        exec: AnyContainerExec,
+        id: String,
+    },
 }
 
 /// The task whose run a terminal serves, which gets the `wake` command.
@@ -414,18 +386,6 @@ struct TaskExecutionTask {
     trigger: TaskTriggerResponse,
 }
 
-#[derive(Template)]
-#[template(path = "reminder_task_callback.txt", escape = "none")]
-struct TaskCallbackReminder<'a> {
-    task_id: &'a str,
-    task_name: &'a str,
-    profile_id: &'a str,
-    trigger_kind: &'a str,
-    trigger_type: &'a str,
-    status: &'a str,
-    summary: &'a str,
-}
-
 impl TaskExecutionEnvelope {
     fn new(task: &scheduled_tasks::Model, invocation: TaskInvocation) -> Result<Self, String> {
         let trigger = task
@@ -455,16 +415,18 @@ struct SchedulerPermissionHandler {
     network_policy: Option<CompiledNetworkPolicy>,
 }
 
-impl PermissionHandler for SchedulerPermissionHandler {
-    fn check(
+impl Approver for SchedulerPermissionHandler {
+    fn approve(
         &self,
-        _mode: TerminalMode,
-        _script: &str,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-        std::future::ready(Ok(true))
+        _request: ApprovalRequest,
+    ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
+        std::future::ready(Ok(Approval::Approved))
     }
+}
 
-    async fn check_domain(&self, domain: &str, port: u16) -> bool {
+impl DomainApprover for SchedulerPermissionHandler {
+    async fn approve(&self, request: &DomainRequest) -> bool {
+        let (domain, port) = (request.host.as_str(), request.port);
         let reason = if self.allow_network {
             self.network_policy
                 .as_ref()
@@ -481,14 +443,16 @@ impl PermissionHandler for SchedulerPermissionHandler {
                 mode: NetworkAccessMode::Network,
                 domain,
                 port,
-                allowed: true,
+                allowed: self.allow_network,
                 reason,
             })
             .await;
         if let Some(ui_event_bus) = self.ui_event_bus.as_ref() {
             ui_event_bus.publish(UiEventTopics::NETWORK_ACCESS_LOGS);
         }
-        true
+        // A task that does not need the network runs in the sandbox with
+        // every connection refused.
+        self.allow_network
     }
 }
 
@@ -500,7 +464,7 @@ impl TaskRuntime {
     pub async fn load(
         db: ChatDb,
         may_dir: PathBuf,
-        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+        tool_distribution: Arc<crate::tools::ToolDistribution>,
     ) -> Result<Self, crate::db::ChatDbError> {
         let runtime = Self {
             db,
@@ -513,8 +477,10 @@ impl TaskRuntime {
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
             connectivity: None,
+            job_server: None,
             session_prompts: None,
         };
+        runtime.db.backfill_next_fire_times().await?;
         runtime.reload_active_tasks().await?;
         Ok(runtime)
     }
@@ -535,6 +501,13 @@ impl TaskRuntime {
         session_prompts: crate::task_wake::SessionPrompts,
     ) -> Self {
         self.session_prompts = Some(session_prompts);
+        self
+    }
+
+    /// Share the daemon's jobserver pool with the commands of local tasks.
+    #[must_use]
+    pub fn with_job_server(mut self, job_server: crate::jobserver::JobServer) -> Self {
+        self.job_server = Some(job_server);
         self
     }
 
@@ -659,6 +632,9 @@ impl TaskRuntime {
     ///
     /// # Errors
     /// Returns an error message when the payload is malformed, script validation fails, or the insert errors.
+    ///
+    /// # Panics
+    /// Never: a task bound to a session is named by a word of its pool.
     pub async fn create_task_from_tool_request(
         &self,
         request: TaskCreateRequest,
@@ -752,8 +728,11 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
             .response(model.run_at.clone(), model.cron_expression.clone());
 
+        let task_id = model
+            .word
+            .expect("a task bound to a session is named by a word of its pool");
         Ok(TaskCreateResult {
-            task_id: model.id,
+            task_id,
             profile_id: model.profile_id,
             trigger,
             approved: model.approved,
@@ -772,27 +751,38 @@ impl TaskRuntime {
         self.spawn_task(task, TaskInvocation::Manual).await
     }
 
-    /// Check for due tasks and execute them.
+    /// Start every enabled, approved time-triggered task whose stored next
+    /// fire time has passed. A task that cannot be read or started is
+    /// reported and skipped; the others still run.
     ///
     /// # Errors
-    /// Returns [`crate::db::ChatDbError`] when task rows fail to load or spawn.
-    ///
-    /// # Panics
-    /// Panics if `is_due` reports a non-time trigger as due (internal invariant).
+    /// Returns [`crate::db::ChatDbError`] when the task rows fail to load.
     pub async fn tick_due_tasks(&self) -> Result<(), crate::db::ChatDbError> {
-        let tasks = self.active_tasks.load();
+        let tasks = self.db.list_due_tasks().await?;
         let now = jiff::Timestamp::now();
 
-        for task in &tasks.tasks {
-            let trigger = stored_task_trigger(task)?;
-            let is_due = Self::is_due(task, &trigger, now)?;
-
-            if is_due {
-                let PersistedTaskTrigger::Time { trigger_type } = trigger else {
-                    panic!("is_due only returns true for time triggers");
-                };
-                self.spawn_task(task.clone(), TaskInvocation::Time { trigger_type })
-                    .await?;
+        for task in &tasks {
+            let Some(due) = task.next_fire_at.as_deref() else {
+                continue;
+            };
+            let trigger_type = match stored_task_trigger(task) {
+                Ok(PersistedTaskTrigger::Time { trigger_type }) => trigger_type,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::error!(task_id = %task.id, %error, "scheduled task is unreadable; skipped");
+                    continue;
+                }
+            };
+            match jiff::Timestamp::from_str(due) {
+                Ok(due_at) if due_at <= now => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::error!(task_id = %task.id, next_fire_at = due, %error, "scheduled task has an unreadable next fire time; skipped");
+                    continue;
+                }
+            }
+            if let Err(error) = self.fire_time_task(task, trigger_type, due, now).await {
+                tracing::error!(task_id = %task.id, %error, "scheduled task failed to start; skipped");
             }
         }
 
@@ -953,91 +943,38 @@ impl TaskRuntime {
         })
     }
 
-    fn is_due(
+    /// Start the run of one time-triggered task whose stored next fire time
+    /// is `due`, and advance that time past `now` in the same write; a
+    /// cron task that missed several fires runs once. Returns whether this
+    /// call started the run.
+    async fn fire_time_task(
+        &self,
         task: &scheduled_tasks::Model,
-        trigger: &PersistedTaskTrigger,
+        trigger_type: TimeTriggerType,
+        due: &str,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
-        match trigger {
-            PersistedTaskTrigger::Time {
-                trigger_type: TimeTriggerType::Cron,
-            } => Self::is_cron_due(task, now),
-            PersistedTaskTrigger::Time {
-                trigger_type: TimeTriggerType::Once,
-            } => Self::is_once_due(task, now),
-            PersistedTaskTrigger::Event { .. } | PersistedTaskTrigger::Webhook { .. } => Ok(false),
-        }
-    }
-
-    /// Check if a cron task is due.
-    fn is_cron_due(
-        task: &scheduled_tasks::Model,
-        now: jiff::Timestamp,
-    ) -> Result<bool, crate::db::ChatDbError> {
-        let Some(ref expr) = task.cron_expression else {
-            return Err(task_field_error(
-                task.id.as_str(),
-                "cron task ",
-                "cron_expression",
-            ));
+        let next = match trigger_type {
+            TimeTriggerType::Once => None,
+            TimeTriggerType::Cron => task.next_fire_after(now, false).map_err(|error| {
+                task_value_error(task.id.as_str(), "invalid schedule stored in task ", &error)
+            })?,
         };
-
-        let schedule = cron::Schedule::from_str(expr).map_err(|error| {
-            task_value_error(
-                task.id.as_str(),
-                "invalid cron expression stored in task ",
-                &error,
-            )
-        })?;
-
-        // Check if any scheduled time falls within the last 30 seconds.
-        let now_chrono = timestamp_to_chrono(now);
-        let window_start = now_chrono - chrono::Duration::seconds(30);
-
-        // Skip if we already ran within this window.
-        if let Some(ref last_run) = task.last_run_at {
-            let last = jiff::Timestamp::from_str(last_run).map_err(|error| {
-                task_value_error(
-                    task.id.as_str(),
-                    "invalid last_run_at stored in task ",
-                    &error,
-                )
-            })?;
-            let last_chrono = timestamp_to_chrono(last);
-            if last_chrono > window_start {
-                return Ok(false);
-            }
-        }
-
-        Ok(schedule
-            .after(&window_start)
-            .take(1)
-            .any(|next| next <= now_chrono))
-    }
-
-    /// Check if a one-time task is due.
-    fn is_once_due(
-        task: &scheduled_tasks::Model,
-        now: jiff::Timestamp,
-    ) -> Result<bool, crate::db::ChatDbError> {
-        let Some(ref run_at) = task.run_at else {
-            return Err(task_field_error(
-                task.id.as_str(),
-                "one-time task ",
-                "run_at",
-            ));
-        };
-
-        // Skip if already executed.
-        if task.last_run_at.is_some() {
+        let run_id = crate::id::new();
+        if !self.db.start_time_run(&run_id, task, due, next).await? {
             return Ok(false);
         }
-
-        let target = jiff::Timestamp::from_str(run_at).map_err(|error| {
-            task_value_error(task.id.as_str(), "invalid run_at stored in task ", &error)
-        })?;
-
-        Ok(now >= target)
+        let runtime = self.clone();
+        let task = task.clone();
+        tokio::spawn(async move {
+            Box::pin(runtime.execute_task(
+                run_id.as_str(),
+                &task,
+                TaskInvocation::Time { trigger_type },
+            ))
+            .await;
+        });
+        Ok(true)
     }
 
     async fn spawn_task(
@@ -1063,7 +1000,7 @@ impl TaskRuntime {
         script_inline: Option<&str>,
         timeout_secs: u32,
     ) -> Result<(), String> {
-        let timeout = TaskTimeout::new(timeout_secs)?;
+        let timeout = TaskTimeout::new(timeout_secs, self.shell_config().await?.shell.timeout_cap)?;
         let profile_info = self
             .db
             .profile_info_from_model(profile.clone())
@@ -1121,21 +1058,12 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
-                    let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(
-                            task,
-                            TaskCallbackStatus::Completed,
-                            truncated.as_str(),
-                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
-                        body: TaskCallbackStatus::Completed
-                            .notification_body()
-                            .to_string(),
+                        body: TaskOutcome::Completed.notification_body().to_string(),
                         session_id: task.session_id.clone(),
-                        callback_context_xml,
-                        callback_message,
+                        profile_id: Some(task.profile_id.clone()),
                     };
                     if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
@@ -1165,19 +1093,12 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
-                    let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(
-                            task,
-                            TaskCallbackStatus::Failed,
-                            truncated.as_str(),
-                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
-                        body: TaskCallbackStatus::Failed.notification_body().to_string(),
+                        body: TaskOutcome::Failed.notification_body().to_string(),
                         session_id: task.session_id.clone(),
-                        callback_context_xml,
-                        callback_message,
+                        profile_id: Some(task.profile_id.clone()),
                     };
                     if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
@@ -1377,9 +1298,11 @@ impl TaskRuntime {
         script: &TaskScript,
         command: String,
     ) -> Result<String, String> {
-        let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
-        let terminal_tool = self
-            .local_terminal_tool(
+        let config = self.shell_config().await?;
+        let timeout = TaskTimeout::from_stored(task.timeout_secs, config.shell.timeout_cap)?;
+        let shell = self
+            .local_shell(
+                &config,
                 &task.profile_id,
                 NetworkAccessSource::TaskLocal,
                 script,
@@ -1390,14 +1313,7 @@ impl TaskRuntime {
                 }),
             )
             .await?;
-        run_terminal_command(
-            &terminal_tool,
-            local_task_execution_mode(task.needs_network),
-            None,
-            command,
-            timeout,
-        )
-        .await
+        run_terminal_command(&shell, &script.host_working_dir, command, timeout).await
     }
 
     async fn validate_local(
@@ -1407,8 +1323,10 @@ impl TaskRuntime {
         timeout: TaskTimeout,
     ) -> Result<(), String> {
         prepare_working_dir(&script.host_working_dir).await?;
-        let terminal_tool = self
-            .local_terminal_tool(
+        let config = self.shell_config().await?;
+        let shell = self
+            .local_shell(
+                &config,
                 profile_id,
                 NetworkAccessSource::TaskValidationLocal,
                 script,
@@ -1418,9 +1336,8 @@ impl TaskRuntime {
             .await?;
 
         run_terminal_command(
-            &terminal_tool,
-            local_task_execution_mode(false),
-            None,
+            &shell,
+            &script.host_working_dir,
             build_validation_command(script),
             timeout,
         )
@@ -1428,95 +1345,130 @@ impl TaskRuntime {
         .map(|_| ())
     }
 
-    /// Builds a terminal over `shell_sessions`, grants `workspace` read-write
-    /// access and prepares the baseline tools through
-    /// [`TerminalTool::initialize_tools`], so scheduled commands run the same
-    /// verified tools — including the read-only and version checks — as agent
-    /// terminals. The command priority is read from the current config on
-    /// every launch, so a saved change reaches the next scheduled command
-    /// without global state.
-    async fn initialized_terminal_tool(
+    /// The current config, which every launch reads so a saved change to the
+    /// shell's bounds or the command priority reaches the next scheduled
+    /// command.
+    async fn shell_config(&self) -> Result<crate::config::MayConfig, String> {
+        crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+            .await
+            .map_err(|error| prefixed_error("failed to load May config: ", &error))
+    }
+
+    /// Builds the shell a task runs in, with `workspace` granted read-write,
+    /// over the home environment `tools` prepared: the same verified tools
+    /// and command policies as an agent's shell.
+    async fn task_shell(
         &self,
-        permission_handler: SchedulerPermissionHandler,
-        workspace: PathBuf,
-        shell_sessions: ShellSessionRegistry,
+        config: &crate::config::MayConfig,
+        permissions: SchedulerPermissionHandler,
+        workspace: &Path,
+        home: TaskHome,
         wake: Option<WakeScope<'_>>,
-    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let (terminal_tool, (network_audit, priority)) = futures_lite::future::try_zip(
+    ) -> Result<Arc<crate::ipc::SessionShell>, String> {
+        let tools_dir = crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir();
+        let (tools, audit_log) = futures_lite::future::try_zip(
             async {
-                TerminalTool::new_exact(&workspace, permission_handler, DefaultExecutor)
-                    .await
-                    .map_err(|error| {
-                        init_terminal_tool_error("failed to initialize terminal tool: ", &error)
-                    })
-            },
-            futures_lite::future::try_zip(
-                async {
-                    aither_sandbox::open_network_audit_log(
-                        self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
-                        crate::config::NETWORK_AUDIT_MAX_FILES,
-                    )
-                    .await
-                    .map_err(|error| {
-                        init_terminal_tool_error("failed to open network audit log: ", &error)
-                    })
-                },
-                async {
-                    crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+                match &home {
+                    TaskHome::Host => {
+                        crate::tools::ToolEnvironments::prepare_host(
+                            &self.tool_distribution,
+                            &tools_dir,
+                        )
                         .await
-                        .map(|config| config.sandbox.command_priority.process_priority())
-                        .map_err(|error| {
-                            init_terminal_tool_error(
-                                "failed to load May config for command priority: ",
-                                &error,
-                            )
-                        })
-                },
-            ),
+                    }
+                    TaskHome::Container { exec, id, .. } => {
+                        crate::tools::ToolEnvironments::prepare_container(
+                            exec.clone(),
+                            id,
+                            &self.tool_distribution,
+                            &tools_dir,
+                        )
+                        .await
+                    }
+                }
+                .map_err(|error| {
+                    init_terminal_tool_error("failed to prepare baseline tools: ", &error)
+                })
+            },
+            async {
+                aither_sandbox::open_network_audit_log(
+                    self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+                    crate::config::NETWORK_AUDIT_MAX_FILES,
+                )
+                .await
+                .map_err(|error| {
+                    init_terminal_tool_error("failed to open network audit log: ", &error)
+                })
+            },
         )
         .await?;
-        let mut commands = ToolRegistryBuilder::new();
+        let in_container = matches!(home, TaskHome::Container { .. });
+        let mut commands = crate::ipc::CommandRegistryBuilder::new();
         if let Some(scope) = wake {
             commands.configure_tool(crate::task_wake::WakeTool::new(
                 self.session_prompts.clone(),
                 scope.task.id.clone(),
                 scope.task.name.clone(),
                 scope.task.session_id.clone(),
-                workspace.clone(),
+                workspace.to_path_buf(),
                 scope
                     .in_container
-                    .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
+                    .then(|| crate::container::lifecycle::workspace_mount(workspace.to_path_buf())),
             ));
         }
-        let registry = Arc::new(commands.build(workspace.join("outputs")));
-        let terminal_tool = match &self.connectivity {
-            Some(connectivity) => terminal_tool.with_connectivity(connectivity),
-            None => terminal_tool,
+        // Only local commands can open the pool; container tasks run without
+        // one until aither brokers tokens into containers.
+        let pool = match (&self.job_server, in_container) {
+            (Some(job_server), false) => Some(job_server.connect().map_err(|error| {
+                init_terminal_tool_error("failed to connect to the jobserver: ", &error)
+            })?),
+            _ => None,
         };
-        terminal_tool
-            .with_network_audit_log(network_audit)
-            .with_shell_sessions(shell_sessions)
-            .with_writable_paths([workspace.clone()])
-            .with_readable_paths([workspace])
-            .with_process_priority(priority)
-            .initialize_tools(
-                &self.tool_distribution,
-                &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
-            )
-            .await
-            .map(|terminal_tool| terminal_tool.with_registry(registry))
-            .map_err(|error| init_terminal_tool_error("failed to prepare baseline tools: ", &error))
+        let grants = Grants::new();
+        grants.add_writable(workspace);
+        grants.add_readable(workspace);
+        crate::shell::ShellAssembly {
+            tools,
+            container: match home {
+                TaskHome::Host => None,
+                TaskHome::Container { runtime, .. } => Some(runtime),
+            },
+            working_dir: workspace.to_path_buf(),
+            grants,
+            priority: config.sandbox.command_priority.process_priority(),
+            audit_log,
+            permissions,
+            env_source: None,
+            budgets: crate::shell::ShellBudgets::of(&config.shell),
+            interpreters: vec![Interpreter::Shell],
+            policies: crate::command_policy::PolicySet {
+                managed_bash: crate::command_policy::runs_managed_bash(in_container),
+                refused: crate::command_policy::RefusedReads::default(),
+                checkout_reads: None,
+            },
+            slot: crate::ipc::ShellSlot::new(),
+            ssh_servers: Vec::new(),
+            ids: None,
+            spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
+            pool,
+            connectivity: self.connectivity.clone(),
+        }
+        .build(commands.build())
+        .await
+        .map_err(|error| init_terminal_tool_error("failed to build the task shell: ", &error))
     }
 
-    async fn local_terminal_tool(
+    async fn local_shell(
         &self,
+        config: &crate::config::MayConfig,
         profile_id: &str,
         source: NetworkAccessSource,
         script: &TaskScript,
         allow_network: bool,
         wake: Option<WakeScope<'_>>,
-    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        self.initialized_terminal_tool(
+    ) -> Result<Arc<crate::ipc::SessionShell>, String> {
+        self.task_shell(
+            config,
             SchedulerPermissionHandler {
                 db: self.db.clone(),
                 ui_event_bus: self.ui_event_bus.clone(),
@@ -1525,29 +1477,27 @@ impl TaskRuntime {
                 allow_network,
                 network_policy: self.network_policy.load().as_ref().clone(),
             },
-            script.host_working_dir.clone(),
-            ShellSessionRegistry::new(ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: false,
-            }),
+            &script.host_working_dir,
+            TaskHome::Host,
             wake,
         )
         .await
     }
 
-    /// Starts the profile's container and builds a terminal that executes in
+    /// Starts the profile's container and builds a shell that executes in
     /// it, storing outputs in the host-side task workspace mounted at
     /// [`CONTAINER_WORKSPACE`](crate::container::lifecycle::CONTAINER_WORKSPACE). Returns the container manager and container ID so callers
-    /// can record activity.
-    async fn container_terminal_tool(
+    /// can record activity, and the workspace the scripts start in.
+    async fn container_shell(
         &self,
+        config: &crate::config::MayConfig,
         profile: &profiles::Model,
         source: NetworkAccessSource,
         task: Option<&scheduled_tasks::Model>,
     ) -> Result<
         (
-            TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
+            Arc<crate::ipc::SessionShell>,
+            PathBuf,
             Arc<ContainerManager>,
             String,
         ),
@@ -1590,16 +1540,15 @@ impl TaskRuntime {
             .ipc_route(&container_id)
             .await
             .map_err(|error| prefixed_error("failed to resolve container IPC route: ", &error))?;
-        let container_runtime = ContainerShellRuntime::new(
-            container_id.clone(),
-            container_ipc_route,
-            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
-                container_manager.runtime().client.clone(),
-            )))),
-        )
-        .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
-        let terminal_tool = self
-            .initialized_terminal_tool(
+        let exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
+            container_manager.runtime().client.clone(),
+        ))));
+        let runtime =
+            ContainerShellRuntime::new(container_id.clone(), container_ipc_route, exec.clone())
+                .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
+        let shell = self
+            .task_shell(
+                config,
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
                     ui_event_bus: self.ui_event_bus.clone(),
@@ -1608,20 +1557,19 @@ impl TaskRuntime {
                     allow_network: true,
                     network_policy: self.network_policy.load().as_ref().clone(),
                 },
-                workspace_dir,
-                ShellSessionRegistry::new(ShellRuntimeAvailability {
-                    local: false,
-                    container: true,
-                    ssh: false,
-                })
-                .with_container_runtime(container_runtime),
+                &workspace_dir,
+                TaskHome::Container {
+                    runtime,
+                    exec,
+                    id: container_id.clone(),
+                },
                 task.map(|task| WakeScope {
                     task,
                     in_container: true,
                 }),
             )
             .await?;
-        Ok((terminal_tool, container_manager, container_id))
+        Ok((shell, workspace_dir, container_manager, container_id))
     }
 
     async fn execute_container(
@@ -1630,19 +1578,16 @@ impl TaskRuntime {
         profile: &profiles::Model,
         command: String,
     ) -> Result<String, String> {
-        let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
-        let (terminal_tool, container_manager, container_id) = Box::pin(
-            self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer, Some(task)),
-        )
+        let config = self.shell_config().await?;
+        let timeout = TaskTimeout::from_stored(task.timeout_secs, config.shell.timeout_cap)?;
+        let (shell, workspace, container_manager, container_id) = Box::pin(self.container_shell(
+            &config,
+            profile,
+            NetworkAccessSource::TaskContainer,
+            Some(task),
+        ))
         .await?;
-        let result = run_terminal_command(
-            &terminal_tool,
-            TerminalExecutionMode::Default,
-            None,
-            command,
-            timeout,
-        )
-        .await;
+        let result = run_terminal_command(&shell, &workspace, command, timeout).await;
         container_manager.touch_activity(&container_id);
         result
     }
@@ -1689,32 +1634,19 @@ impl TaskRuntime {
         command: String,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
-        let (terminal_tool, container_manager, container_id) =
-            Box::pin(self.container_terminal_tool(
-                profile,
-                NetworkAccessSource::TaskValidationContainer,
-                None,
-            ))
-            .await?;
-        let result = run_terminal_command(
-            &terminal_tool,
-            TerminalExecutionMode::Default,
+        let config = self.shell_config().await?;
+        let (shell, workspace, container_manager, container_id) = Box::pin(self.container_shell(
+            &config,
+            profile,
+            NetworkAccessSource::TaskValidationContainer,
             None,
-            command,
-            timeout,
-        )
-        .await
-        .map(|_| ());
+        ))
+        .await?;
+        let result = run_terminal_command(&shell, &workspace, command, timeout)
+            .await
+            .map(|_| ());
         container_manager.touch_activity(&container_id);
         result
-    }
-}
-
-const fn local_task_execution_mode(needs_network: bool) -> TerminalExecutionMode {
-    if needs_network {
-        TerminalExecutionMode::Default
-    } else {
-        TerminalExecutionMode::Sandboxed
     }
 }
 
@@ -1732,7 +1664,9 @@ impl TaskScheduler {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                if let Err(e) = self.runtime.tick_due_tasks().await {
+                if let Some(Err(e)) =
+                    crate::panic_boundary::round("scheduler", self.runtime.tick_due_tasks()).await
+                {
                     tracing::error!(error = %e, "Scheduler tick failed");
                 }
             }
@@ -1746,8 +1680,7 @@ impl TaskScheduler {
 struct TaskTimeout(std::time::Duration);
 
 impl TaskTimeout {
-    fn new(secs: u32) -> Result<Self, String> {
-        let cap = aither_sandbox::DEFAULT_TIMEOUT_CAP;
+    fn new(secs: u32, cap: std::time::Duration) -> Result<Self, String> {
         let timeout = std::time::Duration::from_secs(u64::from(secs));
         if secs == 0 || timeout > cap {
             return Err(format!(
@@ -1758,10 +1691,10 @@ impl TaskTimeout {
         Ok(Self(timeout))
     }
 
-    fn from_stored(secs: i64) -> Result<Self, String> {
+    fn from_stored(secs: i64, cap: std::time::Duration) -> Result<Self, String> {
         let secs = u32::try_from(secs)
             .map_err(|_| format!("stored task timeout_secs is out of range: {secs}"))?;
-        Self::new(secs)
+        Self::new(secs, cap)
     }
 
     const fn as_secs(self) -> u64 {
@@ -1769,74 +1702,31 @@ impl TaskTimeout {
     }
 }
 
-/// Runs `script` as a detached terminal job bounded by `timeout` and waits
-/// for its final result; the foreground window does not apply to it.
+/// Runs `script` in `dir` to its end, bounded by `timeout`; the foreground
+/// window does not apply to it.
 async fn run_terminal_command(
-    terminal_tool: &TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
-    mode: TerminalExecutionMode,
-    ssh_server_id: Option<String>,
+    shell: &crate::ipc::SessionShell,
+    dir: &Path,
     script: String,
     timeout: TaskTimeout,
 ) -> Result<String, String> {
-    let started = terminal_tool
-        .run_background(TerminalArgs {
-            description: "run the scheduled task script".to_string(),
-            script,
-            mode,
-            ssh_server_id,
-            expect: OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: 800,
-            raw: false,
-            timeout: timeout.as_secs(),
-            background: true,
-        })
+    let result = shell
+        .run(Script::new(script, dir, timeout.0))
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
-    if started.is_error() {
-        return Err(started
-            .error_message()
-            .unwrap_or("task terminal execution failed")
-            .to_string());
-    }
-    let CommandOutcome::Running { task_id, .. } = started
-        .command()
-        .ok_or_else(|| "background terminal tool did not return a command result".to_string())?
-        .outcome
-        .clone()
-    else {
-        return Err("background terminal job started without a task id".to_string());
-    };
-
-    let receiver = terminal_tool.background_receiver();
-    let completed = loop {
-        let Some(completed) = receiver.recv().await else {
-            return Err("background terminal channel closed before the task finished".to_string());
-        };
-        if completed.task_id == task_id {
-            break completed;
-        }
-    };
-
-    let killed = terminal_tool
-        .job_registry()
-        .get_by_task_id(&task_id)
-        .await
-        .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
-    if killed {
-        return Err(format!(
-            "task timed out after {} seconds and was killed",
-            timeout.as_secs()
-        ));
-    }
-    let result = completed
-        .result
-        .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
-
-    parse_terminal_result(&result)
+    parse_terminal_result(&result, timeout)
 }
 
-fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
+fn parse_terminal_result(result: &ScriptResult, timeout: TaskTimeout) -> Result<String, String> {
+    let code = match result.outcome {
+        RunOutcome::Exited { code } => code,
+        RunOutcome::Killed(_) => {
+            return Err(format!(
+                "task timed out after {} seconds and was killed",
+                timeout.as_secs()
+            ));
+        }
+    };
     let output = combine_output(
         &crate::command_output::stream_text(&result.stdout),
         result
@@ -1844,8 +1734,8 @@ fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
             .as_ref()
             .map(crate::command_output::stream_text),
     );
-    if result.exit_code != 0 {
-        return Err(task_script_failure(result.exit_code, output.as_str()));
+    if code != 0 {
+        return Err(task_script_failure(code, output.as_str()));
     }
 
     Ok(output)
@@ -1853,16 +1743,22 @@ fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
 
 fn combine_output(stdout: &str, stderr: Option<String>) -> String {
     match stderr {
-        Some(stderr_text) if !stderr_text.trim().is_empty() => {
-            format!("{stdout}\n--- stderr ---\n{stderr_text}")
+        Some(stderr_text) if !stderr_text.trim().is_empty() => TaskOutputWithStderr {
+            stdout,
+            stderr: &stderr_text,
         }
+        .render()
+        .expect("the task output template renders"),
         _ => stdout.to_string(),
     }
 }
 
 fn truncate_output(output: &str) -> String {
     if output.len() > 10240 {
-        format!("{}...(truncated)", &output[..10240])
+        format!(
+            "{}...(truncated)",
+            &output[..output.floor_char_boundary(10240)]
+        )
     } else {
         output.to_string()
     }
@@ -1879,61 +1775,47 @@ fn build_validation_command(script: &TaskScript) -> String {
     .expect("task validation template must render")
 }
 
-/// Convert a `jiff::Timestamp` to `chrono::DateTime`<chrono::Utc> for cron compatibility.
-fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(
-        ts.as_second(),
-        u32::try_from(ts.subsec_nanosecond()).expect("jiff subsecond nanos are non-negative"),
-    )
-    .expect("jiff timestamp must fit within chrono DateTime range")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::{
         SchedulerPermissionHandler, TaskFilePlacement, TaskRuntime, TaskScript, TaskTimeout,
-        local_task_execution_mode, run_terminal_command, task_execution_command,
-        task_file_validation_command,
+        run_terminal_command, task_execution_command, task_file_validation_command,
     };
-    use aither_sandbox::{Configured, TerminalExecutionMode, TerminalTool};
-    use askama::Template;
-    use executor_core::DefaultExecutor;
     use tempfile::tempdir;
-
-    #[test]
-    fn task_callback_reminder_states_the_outcome_and_summary() {
-        let text = super::TaskCallbackReminder {
-            task_id: "t1",
-            task_name: "Backup",
-            profile_id: "p1",
-            trigger_kind: "time",
-            trigger_type: "cron",
-            status: "failed",
-            summary: "disk full",
-        }
-        .render()
-        .expect("reminder must render");
-        assert_eq!(
-            text,
-            "<system-reminder>\nScheduled task \"Backup\" (id t1, profile p1, time trigger of type cron) failed.\nSummary:\ndisk full\n</system-reminder>"
-        );
-    }
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
     use crate::task_trigger::PersistedTaskTrigger;
 
-    #[test]
-    fn local_tasks_respect_needs_network_flag() {
-        assert_eq!(
-            local_task_execution_mode(true),
-            TerminalExecutionMode::Default
-        );
-        assert_eq!(
-            local_task_execution_mode(false),
-            TerminalExecutionMode::Sandboxed
-        );
+    #[tokio::test]
+    async fn local_tasks_respect_needs_network_flag() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db opens");
+        for allow_network in [true, false] {
+            let handler = SchedulerPermissionHandler {
+                db: db.clone(),
+                ui_event_bus: None,
+                profile_id: "profile".to_string(),
+                source: NetworkAccessSource::TaskLocal,
+                allow_network,
+                network_policy: None,
+            };
+            assert_eq!(
+                aither_sandbox::DomainApprover::approve(
+                    &handler,
+                    &aither_sandbox::DomainRequest {
+                        host: "example.com".to_string(),
+                        port: 443,
+                        agent: None,
+                    }
+                )
+                .await,
+                allow_network
+            );
+        }
     }
 
     #[tokio::test]
@@ -1982,9 +1864,7 @@ mod tests {
         let runtime = TaskRuntime::load(
             db.clone(),
             may_dir.clone(),
-            Arc::new(crate::tools::fixture_distribution(
-                &may_dir.join("tool-fixtures"),
-            )),
+            Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
         )
         .await
         .expect("task runtime should load");
@@ -2082,9 +1962,7 @@ mod tests {
         let runtime = TaskRuntime::load(
             db,
             may_dir.clone(),
-            Arc::new(crate::tools::fixture_distribution(
-                &may_dir.join("tool-fixtures"),
-            )),
+            Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
         )
         .await
         .expect("task runtime should load");
@@ -2153,66 +2031,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_the_database_replaces_weak_webhook_tokens() {
-        let dir = tempdir().expect("temp dir should be created");
-        let path = dir.path().join("history.db");
-        let db = ChatDb::open(&path).await.expect("db should initialize");
-        let profile_id = db
-            .ensure_default_profiles()
-            .await
-            .expect("default profiles should exist");
-        let trigger = PersistedTaskTrigger::Webhook {
-            token: "quiet-brave-mint-otter".to_string(),
-            signature: None,
-        };
-        db.create_scheduled_task(CreateScheduledTaskParams {
-            id: "old",
-            profile_id: profile_id.as_str(),
-            session_id: None,
-            name: "old",
-            trigger: &trigger,
-            cron_expression: None,
-            run_at: None,
-            script_path: None,
-            script_inline: Some("echo hi"),
-            needs_network: false,
-            timeout_secs: 60,
-        })
-        .await
-        .expect("task should persist");
-        drop(db);
-
-        let db = ChatDb::open(&path).await.expect("db should reopen");
-        let task = db
-            .get_scheduled_task("old")
-            .await
-            .expect("task should load")
-            .expect("task should exist");
-        assert!(crate::task_trigger::is_strong_webhook_token(
-            &task.trigger_type
-        ));
-    }
-
-    #[tokio::test]
     async fn local_terminal_fails_before_exec_without_prepared_tools() {
         // Terminal construction spawns its job registry on the global
         // executor, which the `may` binary installs at startup.
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempdir().expect("temp dir should be created");
         let may_dir = dir.path().join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("db should initialize");
-        let empty_distribution =
-            aither_sandbox::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
-                .expect("an empty distribution is well-formed");
+        let empty_distribution = crate::tools::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
+            .expect("an empty distribution is well-formed");
         let runtime = TaskRuntime::load(db, may_dir.clone(), Arc::new(empty_distribution))
             .await
             .expect("task runtime should load");
 
         let error = runtime
-            .local_terminal_tool(
+            .local_shell(
+                &crate::config::MayConfig::default(),
                 "profile",
                 NetworkAccessSource::TaskValidationLocal,
                 &TaskScript {
@@ -2234,8 +2071,8 @@ mod tests {
     /// way scheduled runs prepare theirs.
     async fn scheduler_test_terminal(
         dir: &std::path::Path,
-    ) -> TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    ) -> (Arc<crate::ipc::SessionShell>, std::path::PathBuf) {
+        crate::test_support::install_global_executor();
         let may_dir = dir.join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
         let workspace = dir.join("workspace");
@@ -2246,41 +2083,48 @@ mod tests {
         let runtime = TaskRuntime::load(
             db,
             may_dir.clone(),
-            Arc::new(crate::tools::fixture_distribution(
-                &may_dir.join("tool-fixtures"),
-            )),
+            Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
         )
         .await
         .expect("task runtime should load");
-        runtime
-            .local_terminal_tool(
+        let shell = runtime
+            .local_shell(
+                &crate::config::MayConfig::default(),
                 "profile",
                 NetworkAccessSource::TaskLocal,
                 &TaskScript {
                     content: String::new(),
-                    host_working_dir: workspace,
+                    host_working_dir: workspace.clone(),
                 },
                 false,
                 None,
             )
             .await
-            .expect("terminal should initialize")
+            .expect("terminal should initialize");
+        (shell, workspace)
     }
 
     #[tokio::test]
     async fn task_runs_past_the_foreground_wait() {
         let dir = tempdir().expect("temp dir should be created");
-        let terminal = scheduler_test_terminal(dir.path()).await;
-        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_WAIT.as_secs())
-            .expect("the foreground wait fits in u32 seconds")
+        let (terminal, workspace) = scheduler_test_terminal(dir.path()).await;
+        let runtime_secs = u32::try_from(
+            crate::config::ShellSettings::default()
+                .foreground_wait
+                .as_secs(),
+        )
+        .expect("the foreground wait fits in u32 seconds")
             + 2;
 
         let output = run_terminal_command(
             &terminal,
-            TerminalExecutionMode::Sandboxed,
-            None,
+            &workspace,
             format!("sleep {runtime_secs}; echo finished"),
-            TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
+            TaskTimeout::new(
+                runtime_secs + 60,
+                crate::config::ShellSettings::default().timeout_cap,
+            )
+            .expect("timeout is within the cap"),
         )
         .await
         .expect("a task longer than the foreground wait should complete");
@@ -2291,14 +2135,14 @@ mod tests {
     #[tokio::test]
     async fn task_past_its_own_timeout_fails_with_timeout_error() {
         let dir = tempdir().expect("temp dir should be created");
-        let terminal = scheduler_test_terminal(dir.path()).await;
+        let (terminal, workspace) = scheduler_test_terminal(dir.path()).await;
 
         let error = run_terminal_command(
             &terminal,
-            TerminalExecutionMode::Sandboxed,
-            None,
+            &workspace,
             "sleep 60; echo finished".to_string(),
-            TaskTimeout::new(2).expect("timeout is within the cap"),
+            TaskTimeout::new(2, crate::config::ShellSettings::default().timeout_cap)
+                .expect("timeout is within the cap"),
         )
         .await
         .expect_err("a task past its timeout must fail");
@@ -2365,13 +2209,13 @@ mod tests {
 
     #[test]
     fn task_timeout_is_bounded_by_the_background_cap() {
-        assert!(TaskTimeout::new(0).is_err());
-        assert!(TaskTimeout::new(1).is_ok());
-        let cap = u32::try_from(aither_sandbox::DEFAULT_TIMEOUT_CAP.as_secs())
-            .expect("the background cap fits in u32 seconds");
-        assert!(TaskTimeout::new(cap).is_ok());
-        assert!(TaskTimeout::new(cap + 1).is_err());
-        assert!(TaskTimeout::from_stored(-1).is_err());
+        let limit = crate::config::ShellSettings::default().timeout_cap;
+        assert!(TaskTimeout::new(0, limit).is_err());
+        assert!(TaskTimeout::new(1, limit).is_ok());
+        let cap = u32::try_from(limit.as_secs()).expect("the background cap fits in u32 seconds");
+        assert!(TaskTimeout::new(cap, limit).is_ok());
+        assert!(TaskTimeout::new(cap + 1, limit).is_err());
+        assert!(TaskTimeout::from_stored(-1, limit).is_err());
     }
 
     /// A daemon's `history.db` with a task runtime whose runs can `wake`.
@@ -2385,7 +2229,7 @@ mod tests {
 
     impl WakeHost {
         async fn new() -> Self {
-            let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+            crate::test_support::install_global_executor();
             let dir = tempdir().expect("temp dir should be created");
             let may_dir = dir.path().join(".may");
             std::fs::create_dir_all(&may_dir).expect("may dir should be created");
@@ -2399,14 +2243,13 @@ mod tests {
             let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
                 db.clone(),
                 crate::ui_event_bus::UiEventBus::new(),
+                crate::session::MayHomePaths::new(may_dir.clone()),
             ));
             let (wake_tx, wakes) = async_channel::unbounded();
             let runtime = TaskRuntime::load(
                 db,
                 may_dir.clone(),
-                Arc::new(crate::tools::fixture_distribution(
-                    &may_dir.join("tool-fixtures"),
-                )),
+                Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
             )
             .await
             .expect("task runtime should load")
@@ -2447,7 +2290,7 @@ mod tests {
                 name: "Nightly check",
                 trigger,
                 cron_expression: None,
-                run_at: None,
+                run_at: Some(FAR_FUTURE),
                 script_path: Some(script_path.to_str().expect("utf-8 path")),
                 script_inline: None,
                 needs_network: false,
@@ -2492,7 +2335,7 @@ mod tests {
             name: "Inline",
             trigger: &TIME_ONCE,
             cron_expression: None,
-            run_at: None,
+            run_at: Some(FAR_FUTURE),
             script_path: None,
             script_inline: Some("echo hi; pwd -P"),
             needs_network: false,
@@ -2542,7 +2385,7 @@ mod tests {
             name: "Inline",
             trigger: &TIME_ONCE,
             cron_expression: None,
-            run_at: None,
+            run_at: Some(FAR_FUTURE),
             script_path: None,
             script_inline: Some("echo hi"),
             needs_network: false,
@@ -2612,7 +2455,11 @@ mod tests {
         let prompt = host.stored_prompt("main").await;
         assert!(prompt.content.is_empty(), "it is not the user's text");
         let xml = prompt.hidden_context_xml.expect("task delivery");
-        assert!(xml.contains("task-1"), "the task id is named: {xml}");
+        let word = task.word.clone().expect("the task has a word");
+        assert!(
+            xml.contains(&format!("task=\"{word}\"")) && !xml.contains(&task.id),
+            "the task is named by its word: {xml}"
+        );
         assert!(xml.contains("Nightly check"), "the task is named: {xml}");
         assert!(xml.contains("check the backups"), "the prompt: {xml}");
     }
@@ -2725,5 +2572,293 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(host.wakes.is_empty());
+    }
+
+    const FAR_FUTURE: &str = "2999-01-01T00:00:00Z";
+    const TIME_CRON: PersistedTaskTrigger = PersistedTaskTrigger::Time {
+        trigger_type: crate::task_trigger::TimeTriggerType::Cron,
+    };
+
+    impl WakeHost {
+        /// An approved, enabled time task running `script`.
+        async fn time_task(
+            &self,
+            id: &str,
+            trigger: &PersistedTaskTrigger,
+            cron_expression: Option<&str>,
+            run_at: Option<&str>,
+            script: &str,
+        ) {
+            let db = self.runtime_service.db();
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id,
+                profile_id: self.profile_id.as_str(),
+                session_id: None,
+                name: id,
+                trigger,
+                cron_expression,
+                run_at,
+                script_path: None,
+                script_inline: Some(script),
+                needs_network: false,
+                timeout_secs: 60,
+            })
+            .await
+            .expect("task should persist");
+            db.approve_scheduled_task(id).await.expect("task approves");
+        }
+
+        async fn set_next_fire(&self, id: &str, next_fire_at: Option<&str>) {
+            let value = next_fire_at.map_or_else(|| "NULL".to_string(), |at| format!("'{at}'"));
+            self.runtime_service
+                .db()
+                .execute_for_test(&format!(
+                    "UPDATE scheduled_tasks SET next_fire_at = {value} WHERE id = '{id}'"
+                ))
+                .await
+                .expect("next fire time is set");
+        }
+
+        async fn task_row(&self, id: &str) -> crate::db::entity::scheduled_tasks::Model {
+            self.runtime_service
+                .db()
+                .get_scheduled_task(id)
+                .await
+                .expect("task reads")
+                .expect("task exists")
+        }
+
+        async fn runs(&self, id: &str) -> i64 {
+            self.runtime_service
+                .db()
+                .task_run_count(id)
+                .await
+                .expect("runs count")
+        }
+    }
+
+    /// A one-time task whose run outlasts several ticks is started once.
+    #[tokio::test]
+    async fn a_once_task_with_a_long_run_runs_once() {
+        let host = WakeHost::new().await;
+        host.time_task(
+            "once",
+            &TIME_ONCE,
+            None,
+            Some("2020-01-01T00:00:00Z"),
+            "sleep 5",
+        )
+        .await;
+
+        for _ in 0..4 {
+            host.runtime.tick_due_tasks().await.expect("tick");
+        }
+
+        assert_eq!(host.runs("once").await, 1);
+        assert_eq!(host.task_row("once").await.next_fire_at, None);
+    }
+
+    /// Fires missed while the daemon was stopped run once, and the next fire
+    /// is the first one after now.
+    #[tokio::test]
+    async fn missed_cron_fires_run_once_and_the_next_fire_moves_past_now() {
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+
+        host.runtime.tick_due_tasks().await.expect("tick");
+        host.runtime.tick_due_tasks().await.expect("tick");
+
+        assert_eq!(host.runs("cron").await, 1);
+        let next = host
+            .task_row("cron")
+            .await
+            .next_fire_at
+            .expect("a cron task keeps a next fire");
+        let next: jiff::Timestamp = next.parse().expect("stored as a timestamp");
+        assert!(next > jiff::Timestamp::now(), "next fire {next}");
+    }
+
+    /// A tick and a restart (a second claim of the same fire) cannot both
+    /// start it.
+    #[tokio::test]
+    async fn a_fire_is_claimed_once() {
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        let task = host.task_row("cron").await;
+        let db = host.runtime_service.db();
+        let next = Some(jiff::Timestamp::now());
+
+        assert!(
+            db.start_time_run("run-a", &task, "2020-01-01T00:00:00Z", next)
+                .await
+                .expect("claim")
+        );
+        assert!(
+            !db.start_time_run("run-b", &task, "2020-01-01T00:00:00Z", next)
+                .await
+                .expect("claim")
+        );
+        assert_eq!(host.runs("cron").await, 1);
+    }
+
+    /// A row that cannot be read does not stop the tasks after it.
+    #[tokio::test]
+    async fn an_unreadable_task_does_not_stop_the_others() {
+        let host = WakeHost::new().await;
+        host.time_task("bad-cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task("bad-trigger", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task("bad-time", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task(
+            "good",
+            &TIME_ONCE,
+            None,
+            Some("2020-01-01T00:00:00Z"),
+            "true",
+        )
+        .await;
+        let db = host.runtime_service.db();
+        db.execute_for_test(
+            "UPDATE scheduled_tasks SET cron_expression = 'not a schedule' WHERE id = 'bad-cron'",
+        )
+        .await
+        .expect("cron is broken");
+        db.execute_for_test(
+            "UPDATE scheduled_tasks SET trigger_type = 'bogus' WHERE id = 'bad-trigger'",
+        )
+        .await
+        .expect("trigger is broken");
+        for id in ["bad-cron", "bad-trigger", "bad-time"] {
+            host.set_next_fire(id, Some("2020-01-01T00:00:00Z")).await;
+        }
+        host.set_next_fire("bad-time", Some("garbage")).await;
+
+        host.runtime.tick_due_tasks().await.expect("tick");
+
+        assert_eq!(host.runs("good").await, 1);
+        for id in ["bad-cron", "bad-trigger", "bad-time"] {
+            assert_eq!(host.runs(id).await, 0, "{id}");
+        }
+    }
+
+    /// Rows without a next fire time get one when the runtime loads; a
+    /// one-time task that already ran keeps none.
+    #[tokio::test]
+    async fn existing_time_tasks_get_a_next_fire_time() {
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        host.time_task("once", &TIME_ONCE, None, Some(FAR_FUTURE), "true")
+            .await;
+        host.time_task("ran", &TIME_ONCE, None, Some(FAR_FUTURE), "true")
+            .await;
+        let db = host.runtime_service.db();
+        let ran = host.task_row("ran").await;
+        assert!(
+            db.start_time_run("run-ran", &ran, FAR_FUTURE, None)
+                .await
+                .expect("claim")
+        );
+        for id in ["cron", "once", "ran"] {
+            host.set_next_fire(id, None).await;
+        }
+
+        db.backfill_next_fire_times().await.expect("backfill");
+
+        assert!(host.task_row("cron").await.next_fire_at.is_some());
+        assert_eq!(
+            host.task_row("once").await.next_fire_at.as_deref(),
+            Some(FAR_FUTURE)
+        );
+        assert_eq!(host.task_row("ran").await.next_fire_at, None);
+    }
+
+    /// Editing the trigger, enabling and approving each recompute the next
+    /// fire time.
+    #[tokio::test]
+    async fn trigger_edits_enable_and_approve_recompute_the_next_fire() {
+        use crate::db::UpdateScheduledTaskParams;
+        let host = WakeHost::new().await;
+        host.time_task("cron", &TIME_CRON, Some("0 0 * * * *"), None, "true")
+            .await;
+        let db = host.runtime_service.db();
+
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        db.update_scheduled_task(
+            "cron",
+            UpdateScheduledTaskParams {
+                cron_expression: Some(Some("0 0 0 1 1 *")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("trigger edit");
+        let edited = host.task_row("cron").await.next_fire_at.expect("next fire");
+        assert!(edited.parse::<jiff::Timestamp>().expect("timestamp") > jiff::Timestamp::now());
+
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        db.update_scheduled_task(
+            "cron",
+            UpdateScheduledTaskParams {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enable");
+        assert_ne!(
+            host.task_row("cron").await.next_fire_at.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+
+        host.set_next_fire("cron", Some("2020-01-01T00:00:00Z"))
+            .await;
+        db.approve_scheduled_task("cron").await.expect("approve");
+        assert_ne!(
+            host.task_row("cron").await.next_fire_at.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn truncated_output_is_cut_on_a_char_boundary() {
+        for unit in ["你好世界", "こんにちは", "안녕하세요", "👍🏽"] {
+            let output = unit.repeat(4000);
+            let truncated = super::truncate_output(&output);
+            let body = truncated.strip_suffix("...(truncated)").expect("cut");
+            assert!(output.starts_with(body), "{unit}");
+            assert!(
+                body.len() <= 10240 && 10240 - body.len() < unit.len(),
+                "{unit}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::{combine_output, task_script_failure};
+
+    #[test]
+    fn script_output_names_its_stderr_and_failure() {
+        assert_eq!(
+            combine_output("out", Some("bad\n".to_string())),
+            "out\n--- stderr ---\nbad\n"
+        );
+        assert_eq!(combine_output("out", Some(" \n".to_string())), "out");
+        assert_eq!(
+            task_script_failure(3, "boom"),
+            "task script failed with exit code 3\nboom"
+        );
     }
 }

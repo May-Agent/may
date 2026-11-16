@@ -30,7 +30,8 @@ pub(super) fn spawn_worker(
 ) {
     tokio::spawn(async move {
         while let Some(task) = queue.recv().await {
-            process_task(state.clone(), task).await;
+            crate::panic_boundary::round("title generation", process_task(state.clone(), task))
+                .await;
         }
     });
 }
@@ -70,7 +71,7 @@ async fn process_task(state: Arc<DaemonState>, task: TitleGenerationTask) {
 
     let config = (*state.config_snapshot()).clone();
     let Some(generated_title) = Box::pin(generate_session_title(
-        &config,
+        crate::agent::Providers::new(&config, &state.pushed_providers),
         &task.user_message,
         &task.assistant_response,
         &crate::secrets::SecretRedactor::new(&state.may_dir),

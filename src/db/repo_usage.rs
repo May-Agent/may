@@ -13,6 +13,10 @@ pub struct RepoUsage {
     pub last_used_at: i64,
     /// Number of recorded uses.
     pub use_count: i64,
+    /// `owner/repo` of the checkout's GitHub `origin` when it was last used;
+    /// `None` for a checkout without one and for records from before this
+    /// was kept.
+    pub owner_repo: Option<String>,
 }
 
 impl RepoUsage {
@@ -41,15 +45,21 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] when the upsert fails.
     pub async fn touch_repo_usage_at(&self, worktree: &Path, at: i64) -> Result<(), ChatDbError> {
+        // Reading the remote runs git: off the executor. A checkout without a
+        // GitHub `origin` keeps whatever repository it was recorded under.
+        let owner_repo = {
+            let worktree = worktree.to_path_buf();
+            blocking::unblock(move || match crate::trust::repo_kind(&worktree) {
+                crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+                crate::trust::RepoKind::Git => None,
+            })
+            .await
+        };
         self.db
-            .query(
-                "INSERT INTO repo_usage (worktree, last_used_at, use_count) VALUES (?, ?, 1) \
-                 ON CONFLICT(worktree) DO UPDATE SET \
-                 last_used_at = MAX(last_used_at, excluded.last_used_at), \
-                 use_count = use_count + 1",
-            )
+            .query(super::db_sql::REPO_USAGE_TOUCH)
             .bind(worktree.display().to_string())
             .bind(at)
+            .bind(owner_repo)
             .execute()
             .await?;
         Ok(())
@@ -62,9 +72,7 @@ impl ChatDb {
     pub async fn repo_usage_since(&self, since: i64) -> Result<Vec<RepoUsage>, ChatDbError> {
         Ok(self
             .db
-            .query(
-                "SELECT worktree, last_used_at, use_count FROM repo_usage WHERE last_used_at >= ?",
-            )
+            .query(super::db_sql::REPO_USAGE_SINCE)
             .bind(since)
             .fetch_all::<RepoUsage>()
             .await?)

@@ -1,4 +1,4 @@
 <pasted_text>
 {{ content }}
 </pasted_text>
-{% if truncated %}The pasted text above is cut to its first {{ shown_chars }} of {{ chars }} characters.{% else %}The pasted text above is {{ chars }} characters.{% endif %}{% if let Some(path) = full_path %} The full text is saved at {{ path }}.{% endif %}
+{% if let Some(chars) = chars %}The pasted text above is {{ chars }} characters.{% else %}The pasted text above is cut to its first {{ limit }} characters.{% endif %}{% if let Some(path) = full_path %} The full text is saved at {{ path }}.{% endif %}

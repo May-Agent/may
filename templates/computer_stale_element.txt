@@ -1,0 +1,1 @@
+Refused, nothing was acted on: {{ error }}. Run `computer observe` again and act on a reference from its new listing.

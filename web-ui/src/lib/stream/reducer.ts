@@ -5,7 +5,7 @@ import type {
   ReplyTranslation,
   ToolSummary,
   ToolVariant,
-  SseTodoItem,
+  TaskRow,
 } from '../types';
 
 export interface TurnToolState {
@@ -40,7 +40,13 @@ export type TurnSegment =
 export interface TurnState {
   turnId: string;
   sessionId: string;
+  /**
+   * Names the reply while it streams; once the turn is done, the id of its
+   * first stored assistant message, which the session's messages carry too.
+   */
   assistantId: string;
+  /** Ids of the assistant messages the finished turn stored. */
+  messageIds: string[];
   text: string;
   reasoning: string;
   /**
@@ -57,13 +63,19 @@ export interface TurnState {
    * narration visually between the tool it introduces and the one after.
    */
   segments: TurnSegment[];
-  todo: { items: SseTodoItem[]; total: number; completed: number } | null;
+  todo: { rows: TaskRow[] } | null;
   error: TurnErrorState | null;
   status: 'streaming' | 'done';
   /** Latest decode-rate sample reported by the backend, in tokens/second. */
   tokensPerSecond: number | null;
   /** Set while the turn waits out a quota reset or a provider retry. */
   hold: ({ message: string } & HoldReason) | null;
+  /**
+   * Where the model responses that finished end: what follows is the
+   * response in flight, which a `retract` discards. A tool result closes the
+   * response that called it.
+   */
+  responseFloor: { reasoning: number; segments: number };
   lastSeq: number;
 }
 
@@ -76,6 +88,7 @@ export function emptyTurn(
     turnId,
     sessionId,
     assistantId,
+    messageIds: [],
     text: '',
     reasoning: '',
     reasoningMs: null,
@@ -86,6 +99,7 @@ export function emptyTurn(
     status: 'streaming',
     tokensPerSecond: null,
     hold: null,
+    responseFloor: { reasoning: 0, segments: 0 },
     lastSeq: 0,
   };
 }
@@ -105,6 +119,18 @@ function appendToolSegment(segments: TurnSegment[], toolId: string, seq: number)
   return [...segments, { kind: 'tool', toolId, seq }];
 }
 
+/**
+ * A tool event's summary replaces the stored one, except for the card: the
+ * daemon reports it on its own `tool_card` event, which later start, delta
+ * and end summaries do not repeat.
+ */
+function mergeSummary(existing: ToolSummary, incoming: ToolSummary | undefined): ToolSummary {
+  if (!incoming) return existing;
+  return incoming.card === undefined && existing.card !== undefined
+    ? { ...incoming, card: existing.card }
+    : incoming;
+}
+
 function upsertTool(tools: TurnToolState[], id: string, apply: (tool: TurnToolState) => TurnToolState, fallback: () => TurnToolState): TurnToolState[] {
   const idx = tools.findIndex((t) => t.id === id);
   if (idx < 0) {
@@ -122,6 +148,18 @@ function upsertTool(tools: TurnToolState[], id: string, apply: (tool: TurnToolSt
  * stream reducer deterministic under out-of-order or replayed events.
  */
 export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState {
+  // A card change carries no `seq`: it is not part of the turn's ordered
+  // events and applies whenever it arrives.
+  if (event.kind === 'tool_card') {
+    return {
+      ...state,
+      tools: state.tools.map((tool) =>
+        tool.id === event.id
+          ? { ...tool, summary: { ...tool.summary, card: event.card } }
+          : tool,
+      ),
+    };
+  }
   if (event.kind !== 'start' && event.seq <= state.lastSeq) {
     return state;
   }
@@ -138,6 +176,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         ...state,
         text: state.text + event.chunk,
         segments: appendTextSegment(state.segments, event.chunk, event.seq),
+        hold: null,
         lastSeq: event.seq,
       };
 
@@ -155,7 +194,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     }
 
     case 'reasoning':
-      return { ...state, reasoning: state.reasoning + event.chunk, lastSeq: event.seq };
+      return {
+        ...state,
+        reasoning: state.reasoning + event.chunk,
+        hold: null,
+        lastSeq: event.seq,
+      };
 
     case 'reasoning_end':
       return { ...state, reasoningMs: event.seconds * 1000, lastSeq: event.seq };
@@ -169,7 +213,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name,
           variant: event.variant,
           argumentsRaw: event.arguments,
-          summary: event.summary ?? existing.summary,
+          summary: mergeSummary(existing.summary, event.summary),
           status: 'streaming',
           seq: event.seq,
         }),
@@ -187,6 +231,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         ...state,
         tools,
         segments: appendToolSegment(state.segments, event.id, event.seq),
+        hold: null,
         lastSeq: event.seq,
       };
     }
@@ -200,7 +245,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name || existing.name,
           variant: event.name ? event.variant : existing.variant,
           argumentsRaw: existing.argumentsRaw + event.argumentsFragment,
-          summary: event.summary ?? existing.summary,
+          summary: mergeSummary(existing.summary, event.summary),
           seq: event.seq,
         }),
         () => ({
@@ -217,6 +262,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         ...state,
         tools,
         segments: appendToolSegment(state.segments, event.id, event.seq),
+        hold: null,
         lastSeq: event.seq,
       };
     }
@@ -228,7 +274,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         (existing) => ({
           ...existing,
           argumentsRaw: event.arguments ?? existing.argumentsRaw,
-          summary: event.summary ?? existing.summary,
+          summary: mergeSummary(existing.summary, event.summary),
           status: 'done',
           result: event.result,
           seq: event.seq,
@@ -244,10 +290,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           seq: event.seq,
         }),
       );
+      const segments = appendToolSegment(state.segments, event.id, event.seq);
       return {
         ...state,
         tools,
-        segments: appendToolSegment(state.segments, event.id, event.seq),
+        segments,
+        responseFloor: { reasoning: state.reasoning.length, segments: segments.length },
         lastSeq: event.seq,
       };
     }
@@ -255,7 +303,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     case 'todo_update':
       return {
         ...state,
-        todo: { items: event.items, total: event.total, completed: event.completed },
+        todo: { rows: event.rows },
         lastSeq: event.seq,
       };
 
@@ -269,7 +317,9 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
 
     case 'done':
     case 'paused': {
-      const finalText = event.assistant.content || state.text;
+      // A turn paused before it stored a reply has none to carry.
+      const reply = event.assistant;
+      const finalText = reply?.content || state.text;
       const hasTextSegment = state.segments.some((s) => s.kind === 'text');
       const segments =
         !hasTextSegment && finalText.length > 0
@@ -277,6 +327,8 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           : state.segments;
       return {
         ...state,
+        assistantId: reply?.id ?? state.assistantId,
+        messageIds: event.messageIds,
         text: finalText,
         segments,
         status: 'done',
@@ -298,15 +350,25 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
       return { ...state, hold, lastSeq: event.seq };
     }
 
-    case 'retract':
+    // The turn's message leaves the conversation; the stores handle it.
+    case 'withdrawn':
+      return { ...state, lastSeq: event.seq };
+
+    case 'retract': {
+      // Only the response in flight goes: its text, its reasoning and the
+      // tool calls it began to stream. Finished responses stay.
+      const segments = state.segments.slice(0, state.responseFloor.segments);
+      const kept = new Set(segments.flatMap((s) => (s.kind === 'tool' ? [s.toolId] : [])));
       return {
         ...state,
-        text: '',
-        reasoning: '',
+        text: segments.flatMap((s) => (s.kind === 'text' ? [s.text] : [])).join(''),
+        reasoning: state.reasoning.slice(0, state.responseFloor.reasoning),
         reasoningMs: null,
-        segments: state.segments.filter((s) => s.kind !== 'text'),
+        segments,
+        tools: state.tools.filter((t) => kept.has(t.id)),
         lastSeq: event.seq,
       };
+    }
   }
 }
 

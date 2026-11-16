@@ -365,6 +365,9 @@ pub struct SessionRuntimeSummary {
     /// Yolo switch: every approval request of the session is granted at once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub yolo: bool,
+    /// Memory switch: once off, the session neither reads nor contributes memories.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub memory_off: bool,
     /// Interactive-resource sub-state (browser, terminal).
     #[serde(default, skip_serializing_if = "SessionInteractionState::is_empty")]
     pub interactions: SessionInteractionState,
@@ -401,6 +404,7 @@ impl Default for SessionRuntimeSummary {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
             yolo: false,
+            memory_off: false,
             interactions: SessionInteractionState::default(),
             queued_count: 0,
             pending_immediate: None,
@@ -612,9 +616,6 @@ pub struct PersistedAttachment {
     pub attachment_type: AttachmentKind,
     /// Content URL or local path.
     pub url: String,
-    /// Inline data URL for uploaded content, when stored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_data_url: Option<String>,
     /// Extracted text content for text-like attachments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_content: Option<String>,
@@ -663,4 +664,29 @@ pub struct PersistedPermissionRequestPayload {
     /// subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// How May reads the script, for the approval prompt; absent for a
+    /// request that covers no script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::command_reading::CommandReading>,
+}
+
+impl PersistedPermissionRequestPayload {
+    /// A request for `script`, read the way the approval prompt shows it.
+    #[must_use]
+    pub fn new(
+        mode: PermissionRequestMode,
+        script: String,
+        session_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Self {
+        let reading = (mode != PermissionRequestMode::Publish)
+            .then(|| crate::command_reading::CommandReading::of(&script));
+        Self {
+            mode,
+            script,
+            session_id,
+            agent_id,
+            reading,
+        }
+    }
 }

@@ -1,0 +1,1 @@
+May can open pull requests on {{ owner_repo }}. This session has no local checkout and works in a clone of the remote. How should it work with this repository?

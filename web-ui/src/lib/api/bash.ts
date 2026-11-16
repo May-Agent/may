@@ -12,7 +12,7 @@ export interface BashOutcome {
 
 /** Run `command` on the user's behalf in the session's working directory. */
 export async function runBash(sessionId: string, command: string): Promise<BashOutcome> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/bash`, {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/actions/bash`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ command }),

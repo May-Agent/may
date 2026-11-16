@@ -1,4 +1,15 @@
+import { projectField } from './stream/partialJson';
+
 /** Typed command record carried by a terminal tool result (`kind: "command"`). */
+
+/**
+ * Name of the SSH server a terminal call runs on, read from its (possibly
+ * still streaming) arguments; `null` for the home environment.
+ */
+export function terminalLocation(argumentsRaw: string): string | null {
+  const name = projectField(argumentsRaw, 'location').trim();
+  return name === '' ? null : name;
+}
 
 export interface OutputStream {
   text: string;

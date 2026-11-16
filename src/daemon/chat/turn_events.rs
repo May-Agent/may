@@ -11,20 +11,23 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aither_agent::{AgentEvent, TimedEvent};
+use aither_agent::{AgentEvent, OutputKind, RequestOutcome, TimedEvent, ToolOrigin};
+use aither_core::LanguageModel as _;
 use aither_core::llm::Usage;
 
 use super::request_ledger::RequestLedger;
 use super::turn_persister::TurnPersister;
 use super::{
     ChatSink, PendingToolStream, SinkToolEvent, check_tasks_update, clear_terminal_runtime_state,
-    closes_reasoning_phase, emit_speed, enforce_issue_ownership, is_takeover_active_for_session,
-    log_first_agent_event, log_first_text_event, log_first_visible_tool_event, mark_run_running,
+    closes_reasoning_phase, emit_speed, enforce_issue_ownership, log_first_agent_event,
+    log_first_text_event, log_first_visible_tool_event, mark_run_running,
     normalize_tool_delta_for_sink, normalize_tool_start_for_sink, project_tool_summary_for_sink,
     record_request_log, record_tool_interval, segment_emitted_at, set_terminal_runtime_state,
 };
+use crate::command_reading::CommandReading;
 use crate::daemon::state::DaemonState;
 use crate::daemon::terminal_parsing::update_terminal_snapshot_from_tool_event;
+use crate::daemon::tool_summary::ToolSummary;
 use crate::daemon::types::{TerminalStateSnapshot, ToolEventRecord};
 use crate::db::ChatDbError;
 use crate::decode_meter::DecodeMeter;
@@ -37,8 +40,6 @@ use crate::session::{
 pub(super) enum TurnStop {
     /// The run was cancelled, or its client went away; the reason is logged.
     Cancelled(&'static str),
-    /// A browser takeover paused the session.
-    TakeoverPaused,
     /// The agent reported an error event.
     Failed(aither_agent::AgentError),
     /// The turn's state could not be stored.
@@ -53,6 +54,9 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) session_id: &'t SessionId,
     pub(super) assistant_id: &'t str,
     pub(super) session_paths: &'t SessionPaths,
+    /// Where the agent's terminal commands run: the directory a call's
+    /// reading places an edit's hunks in.
+    pub(super) workdir: &'t std::path::Path,
     pub(super) started_at: Instant,
     /// Whether the request asked the provider for reasoning text, which arms
     /// the reasoning phase at every tool-result boundary.
@@ -60,6 +64,8 @@ pub(super) struct TurnEvents<'t, 's, S> {
     /// `Some` while a model call is in its reasoning phase: the instant the
     /// phase began, measured as user-perceived wait.
     pub(super) reasoning_phase: Option<Instant>,
+    /// The model's context window, sent to clients with each usage.
+    pub(super) context_window: Option<u32>,
     /// The provider and model the turn's requests go to.
     pub(super) provider_id: &'t str,
     pub(super) model: &'t str,
@@ -70,6 +76,8 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) usage: Usage,
     pub(super) ledger: RequestLedger<'t>,
     pub(super) decode_meter: DecodeMeter,
+    /// The agent's model, whose vocabulary counts the streamed text.
+    pub(super) counting_model: crate::agent::ProviderLlm,
     pub(super) last_speed_emit: Option<Instant>,
     /// The current text segment, flushed on tool calls.
     pub(super) segment_text: String,
@@ -83,22 +91,118 @@ pub(super) struct TurnEvents<'t, 's, S> {
     /// The whole assistant text.
     pub(super) full_text: String,
     pub(super) reasoning_text: String,
+    /// How much of `reasoning_text` belongs to model responses that finished:
+    /// what follows is the response in flight, which a retry discards.
+    pub(super) reasoning_floor: usize,
     pub(super) terminal_snapshot: TerminalStateSnapshot,
     pub(super) saw_tool_activity: bool,
     pub(super) tool_arguments_by_id: HashMap<String, String>,
+    /// The tool of each local call in flight, which its end event does not
+    /// name.
+    pub(super) tool_names: HashMap<String, String>,
+    /// The calls the provider runs itself: nothing is stored or shown for
+    /// them, and their end arms the next reasoning phase.
+    pub(super) hosted_calls: std::collections::HashSet<String>,
     pub(super) tool_started_at: HashMap<String, jiff::Timestamp>,
     pub(super) pending_tool_streams: HashMap<String, PendingToolStream>,
     pub(super) last_todo_hash: Option<u64>,
     /// The tasks.md content the issue ownership rule accepted last.
     pub(super) tasks_accepted: Option<String>,
+    /// The `tasks` edit of each running terminal call and the `tasks.md` it
+    /// started from, until the call ends and its card is built.
+    pub(super) tasks_edits: HashMap<String, (crate::tasks_md::edit::Op, String)>,
     pub(super) turn_persister: TurnPersister,
     pub(super) first_agent_event_seen: bool,
     pub(super) first_visible_tool_seen: bool,
     pub(super) first_text_seen: bool,
 }
 
+/// Reads a call that edits files again in the directory it runs in, so its
+/// hunks carry absolute line numbers. The files are read before the call
+/// runs, so they are still unedited.
+async fn locate_reading(workdir: &std::path::Path, mut summary: ToolSummary) -> ToolSummary {
+    if summary
+        .reading
+        .as_ref()
+        .is_some_and(CommandReading::updates_files)
+        && let Some(script) = summary.script.clone()
+    {
+        let workdir = workdir.to_path_buf();
+        summary.reading =
+            Some(blocking::unblock(move || CommandReading::of_in(&script, &workdir)).await);
+    }
+    summary
+}
+
+impl<S: ChatSink> TurnEvents<'_, '_, S> {
+    /// Remembers the `tasks.md` a terminal call that edits it starts from. A
+    /// script with several edits has no card: its changes cannot be told
+    /// apart.
+    async fn note_tasks_edit(&mut self, id: &str, arguments: &str) {
+        let Some(script) = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("script")?.as_str().map(str::to_owned))
+        else {
+            return;
+        };
+        let reading = CommandReading::of(&script);
+        let mut edits = reading.tasks_edits();
+        let (Some(op), None) = (edits.next(), edits.next()) else {
+            return;
+        };
+        let before = self
+            .session_paths
+            .tasks_content()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.tasks_edits.insert(id.to_owned(), (op, before));
+    }
+
+    /// Builds, stores and publishes the card of a finished `tasks` call from
+    /// the rows it changed.
+    async fn finish_tasks_card(&mut self, id: &str) -> bool {
+        let Some((op, before)) = self.tasks_edits.remove(id) else {
+            return true;
+        };
+        let after = self
+            .session_paths
+            .tasks_content()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let Some(card) = crate::command_reading::Card::tasks(&op, &before, &after) else {
+            return true;
+        };
+        super::cards::store(&self.state.db(), self.session_id.as_str(), id, Some(&card)).await;
+        self.sink.on_tool_card(id, &card).await
+    }
+
+    /// Feeds streamed model output to the decode meter: counted with the
+    /// model's vocabulary where it has one, estimated from its bytes
+    /// otherwise.
+    fn note_decoded(&mut self, text: &str) {
+        match self.counting_model.count_text(text) {
+            Some(tokens) => self.decode_meter.note_counted(tokens),
+            None => self.decode_meter.note_output(text.len()),
+        }
+    }
+
+    /// Whether the turn did anything beyond thinking: it started a tool
+    /// call or produced response text.
+    pub(super) const fn took_action(&self) -> bool {
+        self.saw_tool_activity
+            || self.first_visible_tool_seen
+            || self.first_text_seen
+            || !self.terminal_snapshot.executions.is_empty()
+            || !self.full_text.is_empty()
+    }
+}
+
 /// How long `provider_id` keeps the conversation's prompt cache warm.
-fn provider_cache_lifetime(
+pub(super) fn provider_cache_lifetime(
     state: &Arc<DaemonState>,
     provider_id: &str,
 ) -> crate::cache_lifetime::CacheLifetime {
@@ -107,8 +211,25 @@ fn provider_cache_lifetime(
         .load()
         .provider
         .get(provider_id)
-        .map(|instance| instance.cache_lifetime)
-        .unwrap_or_default()
+        .map_or_default(|instance| instance.cache_lifetime)
+}
+
+/// The prompt-cache block size `provider_id` publishes, `None` where it
+/// publishes none.
+fn provider_cache_block(
+    state: &Arc<DaemonState>,
+    provider_id: &str,
+) -> Option<std::num::NonZeroU64> {
+    state
+        .config
+        .load()
+        .provider
+        .get(provider_id)
+        .map_or_else(
+            || crate::config::ProviderType::from_id(provider_id),
+            |instance| instance.resolve_type(provider_id),
+        )
+        .cache_block_tokens()
 }
 
 /// Measure a request against its route's prompt cache; a miss is logged and
@@ -136,25 +257,17 @@ async fn record_prompt_cache(state: &Arc<DaemonState>, request: crate::db::Promp
     }
 }
 
-/// The handler [`aither_agent::Run::drive`] calls with each event.
-pub(super) async fn step<'a, 't, 's, S: ChatSink>(
-    turn: &'a mut TurnEvents<'t, 's, S>,
-    timed: TimedEvent,
-) -> ControlFlow<TurnStop, &'a mut TurnEvents<'t, 's, S>> {
-    match turn.handle(timed).await {
-        ControlFlow::Continue(()) => ControlFlow::Continue(turn),
-        ControlFlow::Break(stop) => ControlFlow::Break(stop),
-    }
-}
-
 impl<S: ChatSink> TurnEvents<'_, '_, S> {
     /// Handles one event of the run.
     pub(super) async fn handle(&mut self, timed: TimedEvent) -> ControlFlow<TurnStop> {
-        let TimedEvent { at, event } = timed;
-        self.last_event_at = Some(at);
+        // A subagent's events ride its parent's stream; the subagent tracker
+        // shows them, so the turn neither stores nor streams them.
+        if !timed.agent.is_main() {
+            return ControlFlow::Continue(());
+        }
         // The first visible output of a call closes the pending reasoning
         // phase; its marker goes out before the event.
-        if closes_reasoning_phase(&event)
+        if closes_reasoning_phase(&timed.event)
             && let Some(started) = self.reasoning_phase.take()
             && !self
                 .sink
@@ -165,16 +278,56 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 "client disconnected during reasoning end",
             ));
         }
-        self.sink.on_agent_event(Ok(&event));
+        self.sink.on_agent_event(&timed, self.context_window);
+        let at = timed.at;
+        let event = timed.event;
+        self.last_event_at = Some(at);
+        // A browser takeover reaches the turn as the cancellation
+        // `browser_takeover_start` issues; the run loop classifies that stop
+        // as a takeover pause once the stream ends, so no event polls for it.
         match self.event(at, event).await {
-            Ok(ControlFlow::Continue(())) => {}
-            Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),
-            Err(error) => return ControlFlow::Break(TurnStop::Persist(error)),
+            Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
+            Ok(ControlFlow::Break(stop)) => ControlFlow::Break(stop),
+            Err(error) => ControlFlow::Break(TurnStop::Persist(error)),
         }
-        if is_takeover_active_for_session(self.state, self.session_id).await {
-            return ControlFlow::Break(TurnStop::TakeoverPaused);
+    }
+
+    /// Handles a fact about one of the session's jobs, which the agent read
+    /// before the next event of the run: a command detached, or ended and
+    /// reported to the model.
+    pub(super) async fn job_fact(&mut self, fact: crate::agent::JobFact) -> ControlFlow<TurnStop> {
+        let shown = match fact {
+            crate::agent::JobFact::Started {
+                task_id,
+                output_preview,
+                output_file,
+            } => {
+                self.saw_tool_activity = true;
+                set_terminal_runtime_state(
+                    self.state,
+                    self.session_id.as_str(),
+                    TerminalRuntimeState {
+                        task_id: Some(task_id),
+                        output_file: Some(output_file),
+                        output_preview: Some(output_preview),
+                        input_notice: None,
+                    },
+                )
+                .await
+            }
+            crate::agent::JobFact::Ended { .. } => {
+                self.saw_tool_activity = true;
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                match clear_terminal_runtime_state(self.state, self.session_id.as_str()).await {
+                    Ok(()) => mark_run_running(self.state, self.guard.fence()).await,
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match shown {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(TurnStop::Persist(error)),
         }
-        ControlFlow::Continue(())
     }
 
     /// Ends the reasoning phase a run that failed left open, the way the
@@ -229,6 +382,21 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
         }
     }
 
+    /// Forgets what the response in flight streamed so far: its text, its
+    /// reasoning and the tool calls it began to stream. The replacement
+    /// starts a reasoning phase of its own.
+    fn discard_attempt(&mut self) {
+        let kept = self.full_text.len().saturating_sub(self.segment_text.len());
+        self.full_text.truncate(kept);
+        self.segment_text.clear();
+        self.segment_at = None;
+        self.segment_translation = None;
+        self.reasoning_text.truncate(self.reasoning_floor);
+        self.pending_tool_streams.clear();
+        self.reasoning_phase = self.reasoning_display.then(Instant::now);
+        self.decode_meter.note_boundary();
+    }
+
     async fn emit_speed(&mut self, stopped: &'static str) -> ControlFlow<TurnStop> {
         if emit_speed(self.sink, &self.decode_meter, &mut self.last_speed_emit).await {
             ControlFlow::Continue(())
@@ -244,7 +412,11 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
     ) -> Result<ControlFlow<TurnStop>, ChatDbError> {
         const TOOL_STREAM: &str = "client disconnected during tool stream";
         match event {
-            AgentEvent::Reasoning(text) => {
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Reasoning,
+                text,
+                ..
+            } => {
                 self.log_first_agent_event("reasoning");
                 self.reasoning_text.push_str(&text);
                 self.turn_persister.push_reasoning(&text);
@@ -253,12 +425,16 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         "client disconnected during reasoning stream",
                     )));
                 }
-                self.decode_meter.note_output(text.len());
+                self.note_decoded(&text);
                 Ok(self
                     .emit_speed("client disconnected during reasoning stream")
                     .await)
             }
-            AgentEvent::Text(text) => {
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Text,
+                text,
+                ..
+            } => {
                 self.log_first_agent_event("text");
                 log_first_text_event(
                     &mut self.first_text_seen,
@@ -274,53 +450,58 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         "client disconnected during text stream",
                     )));
                 }
-                self.decode_meter.note_output(text.len());
+                self.note_decoded(&text);
                 Ok(self
                     .emit_speed("client disconnected during text stream")
                     .await)
             }
-            // The reply just streamed drifted from the communication
-            // language: clients show this copy, the stored message keeps it
-            // beside the original.
-            AgentEvent::ReplyTranslated { text, language } => {
-                if !self.sink.on_reply_translated(&text, &language).await {
-                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
-                        "client disconnected during reply translation",
-                    )));
-                }
-                self.segment_translation = Some(MessageTranslation { text, language });
-                Ok(ControlFlow::Continue(()))
-            }
-            AgentEvent::PromptPrefix(prefix) => {
+            AgentEvent::RequestStarted { prefix, .. } => {
                 self.request_prefix = Some(prefix);
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::Usage(usage) => {
-                self.decode_meter.note_usage(usage.completion_tokens);
-                record_request_log(self.state, self.ledger.completed(&usage, Instant::now())).await;
-                if let Some(prefix) = self.request_prefix.take() {
-                    record_prompt_cache(
-                        self.state,
-                        crate::db::PromptCacheRequest {
-                            session_id: self.session_id.as_str(),
-                            provider_id: self.provider_id,
-                            model: self.model,
-                            at: jiff::Timestamp::now(),
-                            usage: &usage,
-                            prefix,
-                            lifetime: provider_cache_lifetime(self.state, self.provider_id),
-                        },
-                    )
-                    .await;
+            AgentEvent::RequestEnded { usage, outcome, .. } => {
+                if let Some(usage) = usage {
+                    self.request_usage(usage).await;
                 }
-                self.usage = usage;
+                // The response stream broke after it opened and the same
+                // request is sent again: what streamed since it was sent is
+                // the broken attempt's, which neither the conversation nor
+                // the stored turn keeps. Clients drop what they rendered of
+                // it and show the wait.
+                if let RequestOutcome::Retrying {
+                    error,
+                    retry,
+                    delay,
+                    ..
+                } = outcome
+                {
+                    self.discard_attempt();
+                    let until = jiff::Timestamp::now()
+                        .checked_add(delay)
+                        .expect("a retry delay is far below the timestamp range");
+                    if !self.sink.on_retract().await
+                        || !self
+                            .sink
+                            .on_hold(
+                                crate::client::HoldReason::Retry { until, retry },
+                                &error.to_string(),
+                            )
+                            .await
+                    {
+                        return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                            "client disconnected during a response retry",
+                        )));
+                    }
+                }
                 Ok(ControlFlow::Continue(()))
             }
             AgentEvent::ToolCallDelta {
-                id,
+                call,
                 name,
                 arguments_fragment,
+                ..
             } => {
+                let id = call.as_str().to_owned();
                 self.log_first_agent_event("tool_delta");
                 tracing::trace!(
                     target: "may::chat::tool_delta",
@@ -329,7 +510,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     fragment = %arguments_fragment,
                     "incoming ToolCallDelta from aither"
                 );
-                self.decode_meter.note_output(arguments_fragment.len());
+                self.note_decoded(&arguments_fragment);
                 if let ControlFlow::Break(stop) = self.emit_speed(TOOL_STREAM).await {
                     return Ok(ControlFlow::Break(stop));
                 }
@@ -350,7 +531,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             &id,
                             &name,
                             Some(arguments.as_str()),
+                            false,
                         );
+                        let summary = locate_reading(self.workdir, summary).await;
                         self.sink
                             .on_tool_start(&id, &name, &arguments, summary)
                             .await
@@ -365,6 +548,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             &id,
                             &name,
                             None,
+                            false,
                         );
                         self.sink
                             .on_tool_delta(&id, &name, &arguments_fragment, summary)
@@ -377,11 +561,23 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM))
                 })
             }
-            AgentEvent::ToolCallStart {
-                id,
+            AgentEvent::ToolCallStarted {
+                origin: ToolOrigin::Hosted,
+                call,
+                ..
+            } => {
+                self.hosted_calls.insert(call.as_str().to_owned());
+                self.decode_meter.note_boundary();
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::ToolCallStarted {
+                call,
                 name,
                 arguments,
+                ..
             } => {
+                let id = call.as_str().to_owned();
+                let arguments = arguments.to_string();
                 self.log_first_agent_event("tool_start");
                 self.saw_tool_activity = true;
                 // Args that never streamed as deltas still count as decoded
@@ -402,10 +598,38 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 // Buffer accumulated text segment before the tool call.
                 self.flush_segment();
 
+                // The reading is stored with the call: a located edit's line
+                // numbers come from files the call changes.
+                let visible = match normalize_tool_start_for_sink(
+                    &mut self.pending_tool_streams,
+                    &id,
+                    &name,
+                    &arguments,
+                ) {
+                    Some(SinkToolEvent::Start {
+                        id,
+                        name,
+                        arguments,
+                    }) => {
+                        let summary = project_tool_summary_for_sink(
+                            &self.pending_tool_streams,
+                            &id,
+                            &name,
+                            Some(arguments.as_str()),
+                            false,
+                        );
+                        let summary = locate_reading(self.workdir, summary).await;
+                        Some((id, name, arguments, summary))
+                    }
+                    _ => None,
+                };
                 let record = ToolEventRecord::Start {
                     id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
+                    reading: visible
+                        .as_ref()
+                        .and_then(|(_, _, _, summary)| summary.reading.clone()),
                 };
                 let serialized = serde_json::to_string(&record)
                     .map_err(|e| ChatDbError::Storage(e.to_string()))?;
@@ -414,24 +638,13 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 update_terminal_snapshot_from_tool_event(&mut self.terminal_snapshot, &record);
                 self.tool_arguments_by_id
                     .insert(id.clone(), arguments.clone());
+                self.tool_names.insert(id.clone(), name.clone());
                 self.tool_started_at.insert(id.clone(), at);
-                if let Some(SinkToolEvent::Start {
-                    id,
-                    name,
-                    arguments,
-                }) = normalize_tool_start_for_sink(
-                    &mut self.pending_tool_streams,
-                    &id,
-                    &name,
-                    &arguments,
-                ) {
+                if name == "terminal" {
+                    self.note_tasks_edit(&id, &arguments).await;
+                }
+                if let Some((id, name, arguments, summary)) = visible {
                     self.log_first_visible_tool_event(&id, &name, "canonical_start");
-                    let summary = project_tool_summary_for_sink(
-                        &self.pending_tool_streams,
-                        &id,
-                        &name,
-                        Some(arguments.as_str()),
-                    );
                     if !self
                         .sink
                         .on_tool_start(&id, &name, &arguments, summary)
@@ -442,7 +655,15 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 }
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::ToolCallEnd { id, name, result } => {
+            // The provider reported the hosted call done; the next model
+            // call may reason again.
+            AgentEvent::ToolCallEnded { call, .. } if self.hosted_calls.remove(call.as_str()) => {
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::ToolCallEnded { call, result, .. } => {
+                let id = call.as_str().to_owned();
+                let name = self.tool_names.remove(&id).unwrap_or_default();
                 self.log_first_agent_event("tool_end");
                 self.saw_tool_activity = true;
                 let record = ToolEventRecord::End {
@@ -464,6 +685,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     &id,
                     &name,
                     arguments.as_deref(),
+                    true,
                 );
                 self.pending_tool_streams.remove(&id);
                 if !self
@@ -478,10 +700,13 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 // reverted before anyone reads it.
                 enforce_issue_ownership(self.state, self.session_id, &mut self.tasks_accepted)
                     .await;
+                if !self.finish_tasks_card(&id).await {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                }
                 // Check if tasks.md changed after tool execution.
-                if let Some(checklist) =
+                if let Some(rows) =
                     check_tasks_update(self.session_paths, &mut self.last_todo_hash).await
-                    && !self.sink.on_todo_update(&checklist).await
+                    && !self.sink.on_todo_update(rows).await
                 {
                     return Ok(ControlFlow::Break(TurnStop::Cancelled(
                         "client disconnected during todo update",
@@ -492,49 +717,45 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.reasoning_phase = self.reasoning_display.then(Instant::now);
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::BackgroundTaskStarted {
-                task_id,
-                output_preview,
-                output_file,
-            } => {
-                self.saw_tool_activity = true;
-                set_terminal_runtime_state(
-                    self.state,
-                    self.session_id.as_str(),
-                    TerminalRuntimeState {
-                        task_id: Some(task_id),
-                        output_file: Some(output_file),
-                        output_preview: Some(output_preview),
-                        input_notice: None,
-                    },
-                )
-                .await?;
-                Ok(ControlFlow::Continue(()))
-            }
-            // Delivered tool output / a resumed run arms the next call's
-            // reasoning phase.
-            AgentEvent::BuiltInToolResult { .. } | AgentEvent::RunResumed { .. } => {
+            // A resumed run arms the next call's reasoning phase.
+            AgentEvent::RunStarted { .. } => {
                 self.reasoning_phase = self.reasoning_display.then(Instant::now);
                 Ok(ControlFlow::Continue(()))
             }
             // A reply without tool calls that the run follows with another
             // reply is stored as a message of its own.
-            AgentEvent::TurnComplete {
-                has_tool_calls: false,
-                ..
-            } => {
-                self.flush_segment();
+            AgentEvent::TurnEnded { tool_calls, .. } => {
+                if tool_calls == 0 {
+                    self.flush_segment();
+                }
+                self.reasoning_floor = self.reasoning_text.len();
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::BackgroundTaskCompleted { .. } => {
-                self.saw_tool_activity = true;
-                self.reasoning_phase = self.reasoning_display.then(Instant::now);
-                clear_terminal_runtime_state(self.state, self.session_id.as_str()).await?;
-                mark_run_running(self.state, self.guard.fence()).await?;
-                Ok(ControlFlow::Continue(()))
-            }
-            AgentEvent::Error(error) => Ok(ControlFlow::Break(TurnStop::Failed(error))),
             _ => Ok(ControlFlow::Continue(())),
         }
+    }
+
+    /// Measures a finished request: its usage meters the decode, is logged
+    /// and is the context the window holds now.
+    async fn request_usage(&mut self, usage: Usage) {
+        self.decode_meter.note_usage(usage.completion_tokens);
+        record_request_log(self.state, self.ledger.completed(&usage, Instant::now())).await;
+        if let Some(prefix) = self.request_prefix.take() {
+            record_prompt_cache(
+                self.state,
+                crate::db::PromptCacheRequest {
+                    session_id: self.session_id.as_str(),
+                    provider_id: self.provider_id,
+                    model: self.model,
+                    at: jiff::Timestamp::now(),
+                    usage: &usage,
+                    prefix,
+                    lifetime: provider_cache_lifetime(self.state, self.provider_id),
+                    published_block: provider_cache_block(self.state, self.provider_id),
+                },
+            )
+            .await;
+        }
+        self.usage = usage;
     }
 }

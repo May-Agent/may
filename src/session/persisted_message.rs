@@ -43,6 +43,7 @@ pub struct PersistedMessage<'a> {
 }
 
 impl PersistedMessage<'_> {
+    #[allow(dead_code)] // only the test-only message mapper names the row in errors
     pub fn require_timestamp(&self) -> Result<&Timestamp, PersistedMessageError> {
         self.timestamp
             .as_ref()
