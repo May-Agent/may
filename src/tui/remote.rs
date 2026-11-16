@@ -275,7 +275,7 @@ fn globals_query(session_id: &str) -> String {
     query
         .append_pair(
             "topics",
-            "sleep,user_notification,session_index,cloud_session",
+            "sleep,user_notification,session_index,cloud_session,prs",
         )
         .append_pair("sessionId", session_id);
     query.finish()
@@ -334,6 +334,9 @@ async fn follow_session_globals(
                     {
                         let _ = app_events.send(AppEvent::CloudSession(step)).await;
                     }
+                }
+                "prs" => {
+                    let _ = app_events.send(AppEvent::PrsInvalidated).await;
                 }
                 _ => {}
             }

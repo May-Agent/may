@@ -467,6 +467,7 @@ fn api_routes() -> Route {
         get_profile_sessions, list_profiles, remove_profile_codespaces, set_profile_codespaces,
         set_profile_remote_servers, update_folder, update_profile,
     };
+    use super::prs::{close_pr, list_prs, merge_pr};
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
@@ -492,6 +493,11 @@ fn api_routes() -> Route {
             "/github/repos".at(super::github_repos::list_github_repos),
             "/events".at(stream_events),
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
+            "/prs".route(Route::new((
+                "".at(list_prs),
+                "/{id}/merge".post(merge_pr),
+                "/{id}/close".post(close_pr),
+            ))),
             "/session-names".post(super::sessions::issue_session_name),
             "/cloud-home/providers/{id}".put(super::cloud_home::push_provider),
             "/cloud-home/tiers".put(super::cloud_home::push_tiers),

@@ -37,6 +37,8 @@ pub enum UiEventTopic {
     UserNotification = 1 << 20,
     /// A step of bringing a cloud session's machine up.
     CloudSession = 1 << 21,
+    /// PR rows or their live checks changed.
+    Prs = 1 << 22,
 }
 
 impl UiEventTopic {
@@ -62,6 +64,7 @@ impl UiEventTopic {
             Self::Sleep => "sleep",
             Self::UserNotification => "user_notification",
             Self::CloudSession => "cloud_session",
+            Self::Prs => "prs",
         }
     }
 }
@@ -85,6 +88,7 @@ impl FromStr for UiEventTopic {
             "sleep" => Ok(Self::Sleep),
             "user_notification" => Ok(Self::UserNotification),
             "cloud_session" => Ok(Self::CloudSession),
+            "prs" => Ok(Self::Prs),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -125,6 +129,8 @@ impl UiEventTopics {
     pub const USER_NOTIFICATION: Self = Self(UiEventTopic::UserNotification.bit());
     /// `cloud_session` topic bit.
     pub const CLOUD_SESSION: Self = Self(UiEventTopic::CloudSession.bit());
+    /// `prs` topic bit.
+    pub const PRS: Self = Self(UiEventTopic::Prs.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -139,7 +145,8 @@ impl UiEventTopics {
             | Self::BROWSER_LIFECYCLE.0
             | Self::SESSION_INDEX.0
             | Self::SLEEP.0
-            | Self::CLOUD_SESSION.0,
+            | Self::CLOUD_SESSION.0
+            | Self::PRS.0,
     );
 
     /// Whether no topics are set.

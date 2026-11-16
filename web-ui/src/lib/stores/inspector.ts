@@ -6,7 +6,7 @@ import {
   type SessionBackground,
 } from '../api/background';
 import { getSessionTasks } from '../api/tasks';
-import { getSessionPrs, type ApiPr } from '../api/prs';
+import { closePr, listPrs, mergePr, type ApiPr } from '../api/prs';
 import { isDraftSessionId, useSessionsStore } from './sessions';
 import {
   NO_STOP_REQUESTS,
@@ -63,8 +63,12 @@ interface InspectorState {
   /** Apply a session background snapshot. */
   applyBackground: (snapshot: SessionBackground) => void;
   loadPrs: (sessionId: string) => Promise<void>;
-  /** Replace the session's PR list (a `prs.changed` frame). */
+  /** Replace the session's PR list. */
   applyPrs: (sessionId: string, prs: ApiPr[]) => void;
+  /** Merge an orphaned or review-required PR as user. */
+  mergePr: (prId: number, sessionId?: string) => Promise<void>;
+  /** Close an orphaned or review-required PR as user. */
+  closePr: (prId: number, sessionId?: string) => Promise<void>;
   killJob: (sessionId: string, pid: number) => Promise<void>;
   stopSubagent: (sessionId: string, runId: number) => Promise<void>;
 }
@@ -166,7 +170,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
     async loadPrs(sessionId) {
       if (isDraftSessionId(sessionId)) return;
       try {
-        get().applyPrs(sessionId, await getSessionPrs(sessionId));
+        get().applyPrs(sessionId, await listPrs({ forSession: sessionId }));
       } catch (err) {
         console.warn('session PRs failed to load', message(err));
       }
@@ -174,6 +178,20 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
 
     applyPrs(sessionId, prs) {
       patch(sessionId, () => ({ prs }));
+    },
+
+    async mergePr(prId, sessionId) {
+      await mergePr(prId);
+      if (sessionId) {
+        await get().loadPrs(sessionId);
+      }
+    },
+
+    async closePr(prId, sessionId) {
+      await closePr(prId);
+      if (sessionId) {
+        await get().loadPrs(sessionId);
+      }
     },
 
     async killJob(sessionId, pid) {

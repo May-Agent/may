@@ -166,6 +166,79 @@ pub struct PrRow {
     pub merged_at: Option<String>,
 }
 
+/// A `prs` row joined with its repository key and whether its owning session
+/// has been deleted.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub struct PrSummaryRow {
+    /// Surrogate id.
+    pub id: i64,
+    /// Owning `issue_projects` row.
+    pub project_id: i64,
+    /// Repository identity (`owner/repo` or local `.git` path).
+    pub repo_key: String,
+    /// Whether the owning session row no longer exists.
+    pub orphaned: bool,
+    /// Per-project number, like an issue number.
+    pub number: i64,
+    /// Session that opened (or last adopted) the PR.
+    pub session_id: String,
+    /// PR title.
+    pub title: String,
+    /// PR body.
+    pub body: String,
+    /// Where the PR stands.
+    pub state: PrState,
+    /// Local durable ref or GitHub remote branch.
+    pub branch: String,
+    /// Base commit the PR was opened against.
+    pub base_sha: String,
+    /// Pinned head commit.
+    pub head_sha: Option<String>,
+    /// `may` or `github`.
+    pub backend: String,
+    /// External PR number (GitHub), when the backend created one.
+    pub external_number: Option<i64>,
+    /// Merge as soon as checks pass vs. hold for explicit merge.
+    pub auto_merge: bool,
+    /// Associated issue number, when linked.
+    pub issue_number: Option<i64>,
+    /// Commit that merged the PR.
+    pub merge_commit_sha: Option<String>,
+    /// UTC creation time.
+    pub created_at: String,
+    /// UTC of the last update.
+    pub updated_at: String,
+    /// UTC of the merge.
+    pub merged_at: Option<String>,
+}
+
+impl PrSummaryRow {
+    /// Project into the plain [`PrRow`] shape.
+    #[must_use]
+    pub fn into_pr_row(self) -> PrRow {
+        PrRow {
+            id: self.id,
+            project_id: self.project_id,
+            number: self.number,
+            session_id: self.session_id,
+            title: self.title,
+            body: self.body,
+            state: self.state,
+            branch: self.branch,
+            base_sha: self.base_sha,
+            head_sha: self.head_sha,
+            backend: self.backend,
+            external_number: self.external_number,
+            auto_merge: self.auto_merge,
+            issue_number: self.issue_number,
+            merge_commit_sha: self.merge_commit_sha,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            merged_at: self.merged_at,
+        }
+    }
+}
+
 /// One `pr_events` row.
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PrEventRow {
@@ -390,6 +463,76 @@ impl ChatDb {
         .execute()
         .await?;
         Ok(())
+    }
+
+    /// Look up one PR by its surrogate row id.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn get_pr_by_id(&self, id: i64) -> Result<Option<PrRow>, ChatDbError> {
+        Ok(query!(self.db, "SELECT * FROM prs WHERE id = ?", id)
+            .fetch_optional::<PrRow>()
+            .await?)
+    }
+
+    /// PRs for a project or session (or across all projects), newest first,
+    /// joined with their `repo_key` and orphaned status.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn list_prs_with_repo(
+        &self,
+        repo_key: Option<&str>,
+        session_id: Option<&str>,
+        filter: PrFilter,
+        orphaned_only: bool,
+    ) -> Result<Vec<PrSummaryRow>, ChatDbError> {
+        let rows = match (repo_key, session_id) {
+            (Some(key), _) => {
+                query!(
+                    self.db,
+                    "SELECT p.*, ip.repo_key, (s.id IS NULL) AS orphaned \
+                 FROM prs p \
+                 JOIN issue_projects ip ON ip.id = p.project_id \
+                 LEFT JOIN sessions s ON s.id = p.session_id \
+                 WHERE ip.repo_key = ? \
+                 ORDER BY p.id DESC",
+                    key
+                )
+                .fetch_all::<PrSummaryRow>()
+                .await?
+            }
+            (None, Some(sid)) => {
+                query!(
+                    self.db,
+                    "SELECT p.*, ip.repo_key, (s.id IS NULL) AS orphaned \
+                 FROM prs p \
+                 JOIN issue_projects ip ON ip.id = p.project_id \
+                 LEFT JOIN sessions s ON s.id = p.session_id \
+                 WHERE p.session_id = ? \
+                 ORDER BY p.id DESC",
+                    sid
+                )
+                .fetch_all::<PrSummaryRow>()
+                .await?
+            }
+            (None, None) => {
+                query!(
+                    self.db,
+                    "SELECT p.*, ip.repo_key, (s.id IS NULL) AS orphaned \
+                 FROM prs p \
+                 JOIN issue_projects ip ON ip.id = p.project_id \
+                 LEFT JOIN sessions s ON s.id = p.session_id \
+                 ORDER BY p.id DESC"
+                )
+                .fetch_all::<PrSummaryRow>()
+                .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|row| filter.selects(row.state) && (!orphaned_only || row.orphaned))
+            .collect())
     }
 
     /// PRs for a project (or across all projects), newest first.

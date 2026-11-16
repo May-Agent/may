@@ -274,8 +274,14 @@ fn issue_row(issue: &IssueBrief, width: usize) -> Line<'static> {
 /// all passed. `merging` overrides with green; no rollup read yet shows
 /// the neutral open dot.
 fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
-    if pr.state == crate::db::PrState::Merging {
-        return ("●", Style::default().fg(Color::Green));
+    match pr.state {
+        crate::db::PrState::Merged => return ("✓", Style::default().fg(Color::Green)),
+        crate::db::PrState::Closed => return ("×", Style::default().fg(Color::DarkGray)),
+        crate::db::PrState::Failed | crate::db::PrState::Rejected => {
+            return ("✗", Style::default().fg(Color::Red));
+        }
+        crate::db::PrState::Merging => return ("●", Style::default().fg(Color::Green)),
+        crate::db::PrState::Open | crate::db::PrState::ChecksPending => {}
     }
     match &pr.checks {
         Some(c) if c.failed > 0 => ("●", Style::default().fg(Color::Red)),
@@ -285,9 +291,9 @@ fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
     }
 }
 
-/// A PR row and, once expanded, its checks. A row with checks (or a failed
-/// read to show) folds: its collapsed form carries the finished-of-total
-/// figure.
+/// A PR row and, once expanded, its checks, rejection detail, and provenance.
+/// Orphaned / review-required non-terminal PRs always expose Merge and Close
+/// hit targets.
 fn pr_rows(
     body: &mut Body,
     state: &SidebarState,
@@ -296,8 +302,27 @@ fn pr_rows(
     now: jiff::Timestamp,
 ) {
     let (icon, icon_style) = pr_icon(pr);
-    let foldable =
-        pr.checks.as_ref().is_some_and(|c| !c.items.is_empty()) || pr.checks_error.is_some();
+    let rejection_detail = (!pr.state.is_terminal() || pr.state == crate::db::PrState::Closed)
+        .then(|| {
+            pr.events
+                .iter()
+                .rev()
+                .find(|e| {
+                    matches!(
+                        e.kind.as_str(),
+                        "rejected" | "check_failed" | "removed_from_queue"
+                    ) && e.detail.as_ref().is_some_and(|d| !d.trim().is_empty())
+                })
+                .and_then(|e| e.detail.as_deref())
+        })
+        .flatten();
+    let foldable = pr.checks.as_ref().is_some_and(|c| !c.items.is_empty())
+        || pr.checks_error.is_some()
+        || !pr.events.is_empty()
+        || pr.orphaned
+        || pr.require_review
+        || pr.merge_commit_sha.is_some()
+        || rejection_detail.is_some();
     let open = foldable && state.shows_checks(pr.number);
     let lead = match (foldable, open) {
         (false, _) => "  ",
@@ -305,80 +330,172 @@ fn pr_rows(
         (true, false) => "▸ ",
     };
     let number = format!("#{} ", pr.number);
+    let badge = if pr.orphaned {
+        "[orphaned] ".to_string()
+    } else if pr.require_review && !pr.state.is_terminal() {
+        "[review] ".to_string()
+    } else {
+        String::new()
+    };
     let progress = pr
         .checks
         .as_ref()
         .filter(|c| c.total() > 0)
         .map_or_default(|c| format!("{}/{} ", c.finished(), c.total()));
-    let title_width =
-        width.saturating_sub(lead.width() + number.width() + progress.width() + icon.width() + 1);
+    let title_width = width.saturating_sub(
+        lead.width() + number.width() + badge.width() + progress.width() + icon.width() + 1,
+    );
     let title = truncate(&pr.title, title_width);
     let pad = width.saturating_sub(
-        lead.width() + number.width() + title.width() + progress.width() + icon.width(),
+        lead.width()
+            + number.width()
+            + badge.width()
+            + title.width()
+            + progress.width()
+            + icon.width(),
     );
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(lead, Style::default().fg(Color::DarkGray)),
         Span::styled(number, Style::default().fg(Color::Magenta)),
+    ];
+    if !badge.is_empty() {
+        spans.push(Span::styled(badge, Style::default().fg(Color::Yellow)));
+    }
+    spans.extend([
         Span::raw(title),
         Span::raw(" ".repeat(pad.max(1))),
         Span::styled(progress, Style::default().fg(Color::DarkGray)),
         Span::styled(icon, icon_style),
     ]);
-    if !foldable {
+    let line = Line::from(spans);
+    if foldable {
+        body.push_hit(line, SidebarHit::Pr(pr.number));
+    } else {
         body.push(line);
-        return;
     }
-    body.push_hit(line, SidebarHit::Pr(pr.number));
-    if !open {
-        return;
-    }
-    if let Some(error) = &pr.checks_error {
-        for part in wrap_hanging(
-            &format!("checks unreadable: {error}"),
-            width.saturating_sub(4),
-            0,
-        ) {
+    if open {
+        let state_label = if pr.orphaned {
+            format!("    state {} · orphaned", pr.state)
+        } else {
+            format!("    state {}", pr.state)
+        };
+        body.push_hit(
+            dim(truncate(&state_label, width)),
+            SidebarHit::Pr(pr.number),
+        );
+        if !pr.repo_key.is_empty() {
             body.push_hit(
-                Line::from(Span::styled(
-                    format!("    {part}"),
-                    Style::default().fg(Color::Red),
+                dim(format!(
+                    "    repo {}",
+                    truncate_tail(&pr.repo_key, width.saturating_sub(9))
                 )),
                 SidebarHit::Pr(pr.number),
             );
         }
+        if let Some(opened) = pr
+            .events
+            .iter()
+            .find(|e| e.kind == "opened")
+            .or_else(|| pr.events.first())
+        {
+            let msg_part = opened.message_id.map_or_default(|id| format!(" msg-#{id}"));
+            let prov = format!(
+                "    by {} ({}{})",
+                if opened.actor.is_empty() {
+                    "main"
+                } else {
+                    opened.actor.as_str()
+                },
+                if opened.session_id.is_empty() {
+                    pr.session_id.as_str()
+                } else {
+                    opened.session_id.as_str()
+                },
+                msg_part
+            );
+            body.push_hit(dim(truncate(&prov, width)), SidebarHit::Pr(pr.number));
+        }
+        if let Some(sha) = &pr.merge_commit_sha {
+            body.push_hit(
+                dim(truncate(&format!("    merged → {sha}"), width)),
+                SidebarHit::Pr(pr.number),
+            );
+        }
+        if let Some(detail) = rejection_detail {
+            for part in wrap_hanging(detail, width.saturating_sub(4), 0) {
+                body.push_hit(
+                    Line::from(Span::styled(
+                        format!("    {part}"),
+                        Style::default().fg(Color::Red),
+                    )),
+                    SidebarHit::Pr(pr.number),
+                );
+            }
+        }
+        if let Some(error) = &pr.checks_error {
+            for part in wrap_hanging(
+                &format!("checks unreadable: {error}"),
+                width.saturating_sub(4),
+                0,
+            ) {
+                body.push_hit(
+                    Line::from(Span::styled(
+                        format!("    {part}"),
+                        Style::default().fg(Color::Red),
+                    )),
+                    SidebarHit::Pr(pr.number),
+                );
+            }
+        }
+        for check in pr.checks.iter().flat_map(|c| &c.items) {
+            let (mark, style) = match check.state.as_str() {
+                "passed" => ("✓", Style::default().fg(Color::Green)),
+                "failed" => ("✗", Style::default().fg(Color::Red)),
+                "running" => ("●", Style::default().fg(Color::Yellow)),
+                _ => ("○", Style::default().fg(Color::DarkGray)),
+            };
+            let time = check.duration_secs(now).map_or_default(format_elapsed);
+            let name_width = width.saturating_sub(4 + 2 + time.width() + 1);
+            let name = truncate(&check.name, name_width);
+            let pad = width.saturating_sub(4 + 2 + name.width() + time.width());
+            body.push_hit(
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{mark} "), style),
+                    Span::raw(name),
+                    Span::raw(" ".repeat(pad.max(1))),
+                    Span::styled(time, Style::default().fg(Color::DarkGray)),
+                ]),
+                SidebarHit::Pr(pr.number),
+            );
+            if check.state == "failed"
+                && let Some(url) = &check.url
+            {
+                body.push_hit(
+                    dim(format!(
+                        "      {}",
+                        truncate_tail(url, width.saturating_sub(6))
+                    )),
+                    SidebarHit::Pr(pr.number),
+                );
+            }
+        }
     }
-    for check in pr.checks.iter().flat_map(|c| &c.items) {
-        let (mark, style) = match check.state.as_str() {
-            "passed" => ("✓", Style::default().fg(Color::Green)),
-            "failed" => ("✗", Style::default().fg(Color::Red)),
-            "running" => ("●", Style::default().fg(Color::Yellow)),
-            _ => ("○", Style::default().fg(Color::DarkGray)),
-        };
-        let time = check.duration_secs(now).map_or_default(format_elapsed);
-        let name_width = width.saturating_sub(4 + 2 + time.width() + 1);
-        let name = truncate(&check.name, name_width);
-        let pad = width.saturating_sub(4 + 2 + name.width() + time.width());
+    if (pr.orphaned || pr.require_review) && !pr.state.is_terminal() && pr.id > 0 {
         body.push_hit(
             Line::from(vec![
                 Span::raw("    "),
-                Span::styled(format!("{mark} "), style),
-                Span::raw(name),
-                Span::raw(" ".repeat(pad.max(1))),
-                Span::styled(time, Style::default().fg(Color::DarkGray)),
+                Span::styled("[Merge PR]", Style::default().fg(Color::Green)),
             ]),
-            SidebarHit::Pr(pr.number),
+            SidebarHit::PrMerge(pr.id),
         );
-        if check.state == "failed"
-            && let Some(url) = &check.url
-        {
-            body.push_hit(
-                dim(format!(
-                    "      {}",
-                    truncate_tail(url, width.saturating_sub(6))
-                )),
-                SidebarHit::Pr(pr.number),
-            );
-        }
+        body.push_hit(
+            Line::from(vec![
+                Span::raw("    "),
+                Span::styled("[Close PR]", Style::default().fg(Color::Red)),
+            ]),
+            SidebarHit::PrClose(pr.id),
+        );
     }
 }
 
@@ -554,17 +671,21 @@ fn build_body(app: &App, width: usize) -> Body {
             }
         }
     }
-    let live_prs: Vec<_> = state
-        .prs
-        .iter()
-        .filter(|pr| pr.state.is_in_flight())
-        .collect();
-    if !live_prs.is_empty() {
+    if !state.prs.is_empty() {
         body.gap();
         if body.heading(state, SidebarSection::PullRequests, "Pull requests") {
             let now = jiff::Timestamp::now();
-            for pr in live_prs {
+            let expanded =
+                state.expand_all || state.listed_all.contains(&SidebarSection::PullRequests);
+            let limit = if expanded { state.prs.len() } else { 8 };
+            for pr in state.prs.iter().take(limit) {
                 pr_rows(&mut body, state, pr, width, now);
+            }
+            if state.prs.len() > limit {
+                body.push_hit(
+                    dim(format!("  … {} more", state.prs.len() - limit)),
+                    SidebarHit::More(SidebarSection::PullRequests),
+                );
             }
         }
     }
@@ -736,6 +857,11 @@ mod tests {
 
     fn wire_pr(state: PrState, checks: Option<WirePrChecks>) -> WirePr {
         WirePr {
+            id: 0,
+            repo_key: String::new(),
+            session_id: String::new(),
+            orphaned: false,
+            require_review: false,
             number: 1,
             title: "title".to_string(),
             state,
@@ -743,8 +869,12 @@ mod tests {
             external_number: Some(1),
             issue_number: None,
             auto_merge: false,
+            base_sha: String::new(),
+            head_sha: None,
+            merge_commit_sha: None,
             checks,
             checks_error: None,
+            events: Vec::new(),
             updated_at: String::new(),
         }
     }
@@ -822,6 +952,7 @@ mod tests {
             render(&state, &pr),
             vec![
                 "▾ #1 wire it 2/4 ●",
+                "state open",
                 "✓ fmt 42s",
                 "✗ 测试 テスト 테스트 2m05s",
                 "…thub.com/o/r/actions/runs/9/job/8",
@@ -859,5 +990,51 @@ mod tests {
         assert_eq!((icon, style.fg), ("●", Some(Color::Yellow)));
         let (icon, style) = pr_icon(&wire_pr(PrState::Open, Some(rollup(0, 4, 0))));
         assert_eq!((icon, style.fg), ("✓", Some(Color::Green)));
+    }
+
+    #[test]
+    fn pr_rows_render_rejected_detail_and_orphaned_user_action_hits() {
+        use crate::client::WirePrEvent;
+        use crate::tui::sidebar::{SidebarHit, SidebarState};
+
+        let mut pr = wire_pr(PrState::Rejected, None);
+        pr.id = 99;
+        pr.orphaned = true;
+        pr.events.push(WirePrEvent {
+            session_id: "gone".to_string(),
+            actor: "main".to_string(),
+            message_id: Some(5),
+            kind: "rejected".to_string(),
+            detail: Some("conflict on src/lib.rs".to_string()),
+            created_at: "2026-11-15T10:00:00Z".to_string(),
+        });
+
+        let state = SidebarState::default();
+        let now: jiff::Timestamp = "2026-11-15T10:05:00Z".parse().unwrap();
+        let mut body = super::Body::default();
+        super::pr_rows(&mut body, &state, &pr, 50, now);
+        let text: Vec<String> = body
+            .lines
+            .iter()
+            .map(|l| {
+                l.to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        assert!(text.iter().any(|l| l.contains("[orphaned]")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("[Merge PR]")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("[Close PR]")), "{text:?}");
+        assert!(
+            body.hits.iter().any(|(_, h)| *h == SidebarHit::PrMerge(99)),
+            "{:?}",
+            body.hits
+        );
+        assert!(
+            body.hits.iter().any(|(_, h)| *h == SidebarHit::PrClose(99)),
+            "{:?}",
+            body.hits
+        );
     }
 }

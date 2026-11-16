@@ -1,16 +1,30 @@
 import { useEffect, useState } from 'react';
 import { Check, ChevronRight, Circle, ExternalLink, X } from 'lucide-react';
-import { useTranslation } from '@/lib/i18n';
+import { useTranslation, type MessageKey } from '@/lib/i18n';
 import type { ApiPr, ApiPrCheck } from '@/lib/api/prs';
+import { Button } from '@/components/ui/button';
 import { formatElapsed } from '@/lib/inspector/model';
 import {
   checkDurationMs,
   checkProgress,
-  hasCheckDetail,
+  hasPrDetail,
+  isPrTerminal,
+  prFailureDetail,
+  prOpenedProvenance,
   prRollup,
   type PrRollup,
 } from '@/lib/inspector/prChecks';
 import { cn } from '@/lib/utils';
+
+const PR_STATE_KEY: Partial<Record<string, MessageKey>> = {
+  open: 'inspector.prStates.open',
+  checks_pending: 'inspector.prStates.checks_pending',
+  merging: 'inspector.prStates.merging',
+  merged: 'inspector.prStates.merged',
+  closed: 'inspector.prStates.closed',
+  failed: 'inspector.prStates.failed',
+  rejected: 'inspector.prStates.rejected',
+};
 
 const ROLLUP_TONE: Record<PrRollup, string> = {
   unknown: 'bg-emerald-500',
@@ -38,29 +52,72 @@ function useNow(active: boolean): number {
   return now;
 }
 
+export interface PullRequestsViewProps {
+  prs: ApiPr[];
+  onMerge?: (prId: number) => Promise<void> | void;
+  onClose?: (prId: number) => Promise<void> | void;
+}
+
 /**
- * The session's in-flight PRs. A row shows the rollup and the finished-of-
- * total figure; a row with checks expands into each check's state and
- * duration, a failed one linking to its detail on GitHub.
+ * The repository's PRs. A row shows state, orphaned/review badges, rollup and
+ * progress, failure/rejection detail, and expands into provenance and checks.
  */
-export function PullRequestsView({ prs }: { prs: ApiPr[] }) {
+export function PullRequestsView({ prs, onMerge, onClose }: PullRequestsViewProps) {
   const running = prs.some((pr) => pr.checks?.items.some((c) => c.state === 'running'));
   const now = useNow(running);
   return (
-    <ul className="-mx-2">
+    <ul className="-mx-2 space-y-1">
       {prs.map((pr) => (
-        <PullRequestRow key={pr.number} pr={pr} now={now} />
+        <PullRequestRow
+          key={pr.id > 0 ? pr.id : `${pr.repoKey}-${pr.number}`}
+          pr={pr}
+          now={now}
+          onMerge={onMerge}
+          onClose={onClose}
+        />
       ))}
     </ul>
   );
 }
 
-function PullRequestRow({ pr, now }: { pr: ApiPr; now: number }) {
+function PullRequestRow({
+  pr,
+  now,
+  onMerge,
+  onClose,
+}: {
+  pr: ApiPr;
+  now: number;
+  onMerge?: (prId: number) => Promise<void> | void;
+  onClose?: (prId: number) => Promise<void> | void;
+}) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const foldable = hasCheckDetail(pr);
+  const [busyAction, setBusyAction] = useState<'merge' | 'close' | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const foldable = hasPrDetail(pr);
   const rollup = prRollup(pr);
   const progress = pr.checks ? checkProgress(pr.checks) : null;
+  const failureDetail = prFailureDetail(pr);
+  const opened = prOpenedProvenance(pr);
+  const terminal = isPrTerminal(pr.state);
+  const canUserAct = (pr.orphaned || pr.requireReview) && !terminal && pr.id > 0;
+
+  const runAction = async (kind: 'merge' | 'close') => {
+    const fn = kind === 'merge' ? onMerge : onClose;
+    if (!fn) return;
+    setBusyAction(kind);
+    setActionError(null);
+    try {
+      await fn(pr.id);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const head = (
     <>
       {foldable ? (
@@ -75,6 +132,24 @@ function PullRequestRow({ pr, now }: { pr: ApiPr; now: number }) {
       <span className="min-w-0 flex-1 truncate text-[13px]" title={pr.title}>
         {pr.title}
       </span>
+      {pr.orphaned && (
+        <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+          {t('inspector.prOrphaned')}
+        </span>
+      )}
+      {!pr.orphaned && pr.requireReview && !terminal && (
+        <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">
+          {t('inspector.prReviewRequired')}
+        </span>
+      )}
+      {pr.state !== 'open' && (
+        <span className="shrink-0 text-[11px] text-muted-foreground">
+          {(() => {
+            const key = PR_STATE_KEY[pr.state];
+            return key ? t(key) : pr.state;
+          })()}
+        </span>
+      )}
       {progress && progress.total > 0 && (
         <span
           className="shrink-0 text-xs tabular-nums text-muted-foreground"
@@ -91,6 +166,7 @@ function PullRequestRow({ pr, now }: { pr: ApiPr; now: number }) {
       />
     </>
   );
+
   return (
     <li>
       {foldable ? (
@@ -107,8 +183,57 @@ function PullRequestRow({ pr, now }: { pr: ApiPr; now: number }) {
           {head}
         </div>
       )}
+
+      {failureDetail && (
+        <p className="px-7 py-0.5 text-xs text-destructive break-words">{failureDetail}</p>
+      )}
+
+      {canUserAct && (onMerge || onClose) && (
+        <div className="flex flex-wrap items-center gap-1.5 px-7 py-1">
+          {onMerge && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 text-xs"
+              disabled={busyAction !== null}
+              onClick={() => void runAction('merge')}
+            >
+              {busyAction === 'merge' ? t('inspector.prMerging') : t('inspector.prMerge')}
+            </Button>
+          )}
+          {onClose && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-xs text-destructive hover:text-destructive"
+              disabled={busyAction !== null}
+              onClick={() => void runAction('close')}
+            >
+              {busyAction === 'close' ? t('inspector.prClosing') : t('inspector.prClose')}
+            </Button>
+          )}
+          {actionError && <span className="text-xs text-destructive">{actionError}</span>}
+        </div>
+      )}
+
       {foldable && open && (
-        <div className="pb-1 pl-7 pr-2">
+        <div className="pb-1 pl-7 pr-2 space-y-1">
+          {(pr.repoKey || opened || pr.mergeCommitSha) && (
+            <div className="space-y-0.5 text-[11px] text-muted-foreground">
+              {pr.repoKey && <p className="truncate">{pr.repoKey}</p>}
+              {opened && (
+                <p className="break-words">
+                  {t('inspector.prOpenedBy', {
+                    actor: opened.actor || 'main',
+                    session: opened.sessionId || pr.sessionId,
+                    message: opened.messageId ? ` (msg-#${opened.messageId})` : '',
+                    time: opened.createdAt,
+                  })}
+                </p>
+              )}
+              {pr.mergeCommitSha && <p className="font-mono">merge {pr.mergeCommitSha}</p>}
+            </div>
+          )}
           {pr.checksError && (
             <p className="py-1 text-xs text-destructive">
               {t('inspector.prChecksUnreadable', { message: pr.checksError })}

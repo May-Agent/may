@@ -393,6 +393,7 @@ where
             may_dir: config.may_dir.clone(),
             ui_events: runtime.ui_events(),
         }),
+        ui_events: config.ask_user.as_ref().map(|runtime| runtime.ui_events()),
     };
     let ci_tool = crate::agent::ci_tool::CiTool::new(
         config.db.clone(),

@@ -673,7 +673,8 @@ export type UiEvent =
   | { kind: 'sleep'; payload: SleepStatus }
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
-  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse };
+  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
+  | { kind: 'prs'; payload: { prs: import('./api/prs').ApiPr[] } };
 
 // ── Artifacts ──────────────────────────────────────────────
 

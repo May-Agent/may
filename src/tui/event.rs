@@ -117,6 +117,8 @@ pub enum AppEvent {
         /// PR list entries.
         prs: Vec<crate::client::WirePr>,
     },
+    /// Daemon announced on `/api/events` (`topic = "prs"`) that PRs changed.
+    PrsInvalidated,
     /// Lookups of issues the session's tasks link.
     SidebarIssues {
         /// Session the tasks belong to.
@@ -290,6 +292,7 @@ impl AppEvent {
             Self::ImageDecoded { .. } => "image_decoded",
             Self::SidebarTasks { .. } => "sidebar_tasks",
             Self::SidebarPrs { .. } => "sidebar_prs",
+            Self::PrsInvalidated => "prs_invalidated",
             Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",

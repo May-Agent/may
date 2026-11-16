@@ -3523,7 +3523,9 @@ impl App {
                     return Ok(None);
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    self.sidebar.click(mouse.row);
+                    if let Some(action) = self.sidebar.click_action(mouse.row) {
+                        self.trigger_sidebar_pr_action(action);
+                    }
                     return Ok(None);
                 }
                 _ => {}
@@ -4410,31 +4412,70 @@ impl App {
         }
     }
 
-    /// Fetch the current session's PRs for the sidebar from the daemon
-    /// (`GET /api/sessions/{id}/prs`); the answer arrives as
-    /// [`AppEvent::SidebarPrs`].
+    /// Fetch the session/repo/orphaned PRs for the sidebar from the daemon
+    /// (`GET /api/prs?forSession={id}` or `/api/prs?orphaned=true&state=open`);
+    /// the answer arrives as [`AppEvent::SidebarPrs`].
     pub fn request_sidebar_prs(&mut self) {
-        let Some(session_id) = self
-            .session_manager
-            .current()
-            .map(|session| session.id.as_str().to_string())
-        else {
-            return;
-        };
         let Some(client) = self.btw_daemon.clone() else {
             return;
         };
+        let session_id = self
+            .session_manager
+            .current()
+            .filter(|session| session.persisted)
+            .map(|session| session.id.as_str().to_string());
+        let path = session_id.as_deref().map_or_else(
+            || "/api/prs?orphaned=true&state=open".to_string(),
+            |id| {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                query.append_pair("forSession", id);
+                format!("/api/prs?{}", query.finish())
+            },
+        );
+        let session_id = session_id.unwrap_or_default();
         let tx = self.event_tx.clone();
         spawn(async move {
-            match client
-                .get::<Vec<crate::client::WirePr>>(&format!("/api/sessions/{session_id}/prs"))
-                .await
-            {
+            match client.get::<Vec<crate::client::WirePr>>(&path).await {
                 Ok(prs) => {
                     let _ = tx.send(AppEvent::SidebarPrs { session_id, prs }).await;
                 }
                 Err(error) => {
                     tracing::debug!(%error, "sidebar: failed to fetch PRs");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn trigger_sidebar_pr_action(&self, action: crate::tui::sidebar::SidebarPrAction) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let (pr_id, op) = match action {
+            crate::tui::sidebar::SidebarPrAction::Merge(id) => (id, "merge"),
+            crate::tui::sidebar::SidebarPrAction::Close(id) => (id, "close"),
+        };
+        let session_id = self
+            .session_manager
+            .current()
+            .map_or_default(|session| session.id.as_str().to_string());
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let path = format!("/api/prs/{pr_id}/{op}");
+            match client
+                .post::<_, crate::daemon::types::ApiPr>(&path, &serde_json::json!({}))
+                .await
+            {
+                Ok(_) => {
+                    let _ = tx.send(AppEvent::PrsInvalidated).await;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(AppEvent::Warning {
+                            session_id,
+                            message: format!("Failed to {op} PR: {error}"),
+                        })
+                        .await;
                 }
             }
         })

@@ -17,7 +17,9 @@ import { useSessionsStore } from './sessions';
 import { useModelsStore } from './models';
 import { useConfigStore } from './config';
 import { useBrowserViewStore } from './browserView';
+import { useInspectorStore } from './inspector';
 import type { NotificationMailboxEntry } from '../api/notifications';
+import type { ApiPr } from '../api/prs';
 
 /// Aggregated browser lifecycle snapshot: the runtime store keeps the
 /// most recent lifecycle event plus a few derived counters so consumers
@@ -61,6 +63,10 @@ interface RuntimeState {
   sleep: SleepStatus | null;
   /** Health reminders to show, counted since this client attached. */
   sleepReminders: number;
+  /** All tracked PRs pushed over `/api/events` (`topic = "prs"`). */
+  prs: ApiPr[];
+  /** Open PRs whose owning session was deleted. */
+  orphanedPrs: ApiPr[];
   abort: (() => void) | null;
 
   connect: (profileId?: string | null) => Promise<void>;
@@ -81,6 +87,7 @@ const SUBSCRIBED_TOPICS = [
   'notification_mailbox',
   'network_access_logs',
   'request_logs',
+  'prs',
 ];
 
 function updateProfileSessionRuntimes(
@@ -173,6 +180,8 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   remoteAccess: null,
   sleep: null,
   sleepReminders: 0,
+  prs: [],
+  orphanedPrs: [],
   abort: null,
 
   async connect(profileId = null) {
@@ -269,6 +278,16 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
                 sleep: evt.payload,
                 sleepReminders: state.sleepReminders + (remind ? 1 : 0),
               }));
+              break;
+            }
+            case 'prs': {
+              const prs = evt.payload.prs ?? [];
+              const orphanedPrs = prs.filter((pr) => pr.orphaned && pr.state === 'open');
+              set({ prs, orphanedPrs });
+              const activeId = useSessionsStore.getState().active?.id;
+              if (activeId) {
+                void useInspectorStore.getState().loadPrs(activeId);
+              }
               break;
             }
             default:

@@ -90,6 +90,19 @@ pub enum SidebarHit {
     Task(String),
     /// A PR row with checks: shows or hides them. Keyed by the PR number.
     Pr(i64),
+    /// Merge an orphaned or review-required PR as `"user"`.
+    PrMerge(i64),
+    /// Close an orphaned or review-required PR as `"user"`.
+    PrClose(i64),
+}
+
+/// An asynchronous action triggered by clicking a PR control in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPrAction {
+    /// Merge the PR identified by its database ID as `"user"`.
+    Merge(i64),
+    /// Close the PR identified by its database ID as `"user"`.
+    Close(i64),
 }
 
 /// What the last frame drew, so input can act on it.
@@ -206,7 +219,10 @@ impl SidebarState {
 
     /// Store the session's PR list from the daemon.
     pub fn set_prs(&mut self, session_id: &str, prs: Vec<crate::client::WirePr>) {
-        if self.session_id.as_deref() == Some(session_id) {
+        if session_id.is_empty()
+            || self.session_id.is_none()
+            || self.session_id.as_deref() == Some(session_id)
+        {
             self.prs = prs;
         }
     }
@@ -278,19 +294,22 @@ impl SidebarState {
 
     /// Act on a click at screen row `row`.
     pub fn click(&mut self, row: u16) {
-        let Some(hit) = self
+        let _ = self.click_action(row);
+    }
+
+    /// Act on a click at screen row `row` and return any async PR action triggered.
+    pub fn click_action(&mut self, row: u16) -> Option<SidebarPrAction> {
+        let hit = self
             .view
             .hits
             .iter()
-            .find_map(|(y, hit)| (*y == row).then(|| hit.clone()))
-        else {
-            return;
-        };
+            .find_map(|(y, hit)| (*y == row).then(|| hit.clone()))?;
         match hit {
             SidebarHit::Heading(section) => {
                 if !self.collapsed.remove(&section) {
                     self.collapsed.insert(section);
                 }
+                None
             }
             SidebarHit::More(section) => {
                 if self.expand_all {
@@ -300,6 +319,7 @@ impl SidebarState {
                 } else if !self.listed_all.remove(&section) {
                     self.listed_all.insert(section);
                 }
+                None
             }
             SidebarHit::Task(key) => {
                 if self.expand_all {
@@ -310,6 +330,7 @@ impl SidebarState {
                 } else if !self.detailed.remove(&key) {
                     self.detailed.insert(key);
                 }
+                None
             }
             SidebarHit::Pr(number) => {
                 if self.expand_all {
@@ -319,7 +340,10 @@ impl SidebarState {
                 } else if !self.checked.remove(&number) {
                     self.checked.insert(number);
                 }
+                None
             }
+            SidebarHit::PrMerge(id) => Some(SidebarPrAction::Merge(id)),
+            SidebarHit::PrClose(id) => Some(SidebarPrAction::Close(id)),
         }
     }
 
@@ -335,6 +359,7 @@ impl SidebarState {
         self.title = None;
         self.tasks = None;
         self.issues.clear();
+        self.prs.clear();
     }
 }
 
@@ -414,5 +439,39 @@ mod tests {
         assert!(!state.visible_at(119));
         state.enabled = false;
         assert!(!state.visible_at(200));
+    }
+
+    #[test]
+    fn reset_clears_prs_and_click_action_dispatches_pr_controls() {
+        let mut state = SidebarState::default();
+        state.prs.push(crate::client::WirePr {
+            id: 42,
+            repo_key: "org/repo".to_string(),
+            session_id: "s1".to_string(),
+            orphaned: true,
+            require_review: false,
+            number: 1,
+            title: "t".to_string(),
+            state: crate::db::PrState::Open,
+            backend: "may".to_string(),
+            external_number: None,
+            issue_number: None,
+            auto_merge: false,
+            base_sha: String::new(),
+            head_sha: None,
+            merge_commit_sha: None,
+            checks: None,
+            checks_error: None,
+            events: Vec::new(),
+            updated_at: String::new(),
+        });
+        state.view.hits.push((3, SidebarHit::PrMerge(42)));
+        state.view.hits.push((4, SidebarHit::PrClose(42)));
+
+        assert_eq!(state.click_action(3), Some(SidebarPrAction::Merge(42)));
+        assert_eq!(state.click_action(4), Some(SidebarPrAction::Close(42)));
+
+        state.reset();
+        assert!(state.prs.is_empty());
     }
 }

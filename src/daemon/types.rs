@@ -468,6 +468,16 @@ pub struct SessionTasksPayload {
 #[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiPr {
+    /// Global database PR row id (used by `POST /api/prs/{id}/merge` and `/close`).
+    pub(crate) id: i64,
+    /// Repository identity key (local checkout identity or GitHub URL).
+    pub(crate) repo_key: String,
+    /// Owning session id when opened (or last adopted).
+    pub(crate) session_id: String,
+    /// Whether the owning session no longer exists.
+    pub(crate) orphaned: bool,
+    /// Whether repository policy requires user review before landing.
+    pub(crate) require_review: bool,
     /// Per-repository PR number.
     pub(crate) number: i64,
     /// PR title.
@@ -482,6 +492,12 @@ pub struct ApiPr {
     pub(crate) issue_number: Option<i64>,
     /// Whether the PR merges itself once checks pass.
     pub(crate) auto_merge: bool,
+    /// Base commit SHA at open.
+    pub(crate) base_sha: String,
+    /// Pinned head commit SHA, if set.
+    pub(crate) head_sha: Option<String>,
+    /// Merge commit SHA when merged locally.
+    pub(crate) merge_commit_sha: Option<String>,
     /// UTC timestamps.
     pub(crate) created_at: String,
     /// Latest update.
@@ -558,6 +574,12 @@ impl ApiPrChecks {
 #[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiPrEvent {
+    /// Session recording the transition.
+    pub(crate) session_id: String,
+    /// Actor attribution (`main`, `user`, or subagent id).
+    pub(crate) actor: String,
+    /// Associated message id in `messages`, if any.
+    pub(crate) message_id: Option<i64>,
     /// Transition kind (`opened`, `queued`, `merged`, ...).
     pub(crate) kind: String,
     /// Event payload (failure excerpt, merge sha, conflict list).

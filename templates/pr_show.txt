@@ -1,0 +1,18 @@
+PR #{{ number }} [{{ state }}] {{ title }}
+{%- if let Some(ext) = external_number %} (GitHub #{{ ext }}){% endif %}
+repo {{ repo_key }} · session {{ session_id }}{% if orphaned %} (orphaned){% endif %} · backend {{ backend }} · base {{ base_sha }} · head {{ head_sha }}
+{%- if let Some(sha) = merge_commit_sha %}
+merge {{ sha }}
+{%- endif %}
+{%- if let Some(open) = opened %}
+opened by {{ open.agent_id }} in session {{ open.session_id }}{% if let Some(msg) = open.message_id %} (msg-#{{ msg }}){% endif %} at {{ open.created_at }}
+{%- endif %}
+{%- if let Some(checks) = checks %}
+{{ checks }}
+{%- endif %}
+{%- if let Some(detail) = detail %}
+detail: {{ detail }}
+{%- endif %}
+{%- for event in events %}
+  {{ event.created_at }} {{ event.kind }} {{ event.agent_id }} (session {{ event.session_id }}{% if let Some(msg) = event.message_id %}, msg-#{{ msg }}{% endif %}){% if let Some(d) = event.detail %} — {{ d }}{% endif %}
+{%- endfor -%}
