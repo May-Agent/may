@@ -800,6 +800,14 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
+                close_linked_may_issue(
+                    self.db()?,
+                    &self.context.workspace_config,
+                    &resolved.record.repo_key,
+                    &pr,
+                    self.project_for_record(&resolved.record),
+                )
+                .await;
                 self.task_event(
                     &pr,
                     crate::harness::working_document::WorkEvent::PullRequestMerged,
@@ -1329,6 +1337,14 @@ impl PrStore {
                     )
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
+                close_linked_may_issue(
+                    self.db()?,
+                    &self.context.workspace_config,
+                    &resolved.record.repo_key,
+                    pr,
+                    self.project_for_record(&resolved.record),
+                )
+                .await;
                 self.record_queue_wait(pr).await;
                 self.task_event(
                     pr,
@@ -1907,6 +1923,7 @@ pub async fn user_merge_pr(context: &PrContext, pr_id: i64) -> Result<crate::db:
                 )
                 .await?;
             record_user_event(db, context, &updated, "merged", Some(&merge_sha)).await;
+            close_linked_may_issue(db, &context.workspace_config, &repo_key, &updated, None).await;
             Ok(updated)
         }
         Err(reason) => {
@@ -2038,6 +2055,7 @@ async fn user_merge_github(
                 )
                 .await?;
             record_user_event(db, context, &updated, "merged", Some(head_sha)).await;
+            close_linked_may_issue(db, &context.workspace_config, repo_key, &updated, None).await;
             let disabled = context
                 .workspace_config
                 .projects
@@ -2094,6 +2112,74 @@ async fn user_merge_github(
                 }
             }
         }
+    }
+}
+
+async fn close_linked_may_issue(
+    db: &ChatDb,
+    workspace_config: &crate::workspace::WorkspaceConfig,
+    repo_key: &str,
+    pr: &crate::db::PrRow,
+    project: Option<&crate::workspace::ProjectConfig>,
+) {
+    let Some(issue_number) = pr.issue_number else {
+        return;
+    };
+    let uses_github_issues = project
+        .or_else(|| {
+            workspace_config.projects.iter().find(|p| {
+                p.has_identity(Path::new(repo_key))
+                    || github_owner_repo(repo_key)
+                        == p.github_repository()
+                            .map(|r| format!("{}/{}", r.owner(), r.repo()))
+            })
+        })
+        .is_some_and(|p| p.github_repository().is_some());
+    if uses_github_issues {
+        return;
+    }
+    let Ok(Some(_)) = db.get_issue(repo_key, issue_number).await else {
+        return;
+    };
+    let relation_note = format!("landed_by PR #{}", pr.number);
+    if let Err(error) = db
+        .add_issue_comment(repo_key, issue_number, &relation_note)
+        .await
+    {
+        tracing::warn!(
+            %error,
+            pr = pr.number,
+            issue = issue_number,
+            "failed to record landed_by comment on May issue"
+        );
+    }
+    if let Err(error) = db
+        .update_issue(
+            repo_key,
+            issue_number,
+            None,
+            None,
+            Some(crate::issue::IssueState::Closed),
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            pr = pr.number,
+            issue = issue_number,
+            "failed to close linked May issue on PR merge"
+        );
+    } else {
+        let _ = db
+            .add_pr_event(
+                pr.id,
+                "issue_closed",
+                &pr.session_id,
+                "pr",
+                None,
+                Some(&relation_note),
+            )
+            .await;
     }
 }
 
@@ -5207,6 +5293,44 @@ mod tests {
             evs2.iter()
                 .any(|e| e.agent_id == "user" && e.kind == "closed"),
             "{evs2:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merging_pr_with_linked_may_issue_records_landed_by_and_closes_issue() {
+        let fx = Fixture::new().await;
+        fx.db.create_session("s1", None, None).await.unwrap();
+        let repo_key = fx.repo_key.to_string_lossy().to_string();
+        let issue = fx
+            .db
+            .create_issue(&repo_key, "Fix bug", "Details", &[])
+            .await
+            .unwrap();
+        assert_eq!(issue.state, crate::issue::IssueState::Open);
+
+        let (store, clone) = fx.store("s1", None).await;
+        fx.user.identify(&clone);
+        commit_file(&clone, "fix.txt");
+        let out = store
+            .open(None, Some("Fix bug"), Some(issue.number), false)
+            .await
+            .unwrap();
+        assert!(out.contains("merged"), "{out}");
+
+        let refreshed = fx
+            .db
+            .get_issue(&repo_key, issue.number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.state, crate::issue::IssueState::Closed);
+        assert!(
+            refreshed
+                .comments
+                .iter()
+                .any(|c| c.body.contains("landed_by PR #1")),
+            "{:?}",
+            refreshed.comments
         );
     }
 }
