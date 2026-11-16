@@ -1749,7 +1749,9 @@ async fn share_and_warm_tool_cache(may_dir: &Path) {
 /// first search request reuses a hash-verified executable instead of
 /// downloading it again for every home.
 async fn share_and_warm_host_programs(may_dir: &Path) {
-    let shared = shared_download_root().join("may-tools").join("host-programs");
+    let shared = shared_download_root()
+        .join("may-tools")
+        .join("host-programs");
     tokio::fs::create_dir_all(&shared)
         .await
         .expect("shared host-program cache dir should be created");
