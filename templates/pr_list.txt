@@ -1,0 +1,16 @@
+{% for pr in prs -%}
+PR #{{ pr.number }} [{{ pr.state }}] {{ pr.title }}
+{%- if let Some(ext) = pr.external_number %} (GitHub #{{ ext }}){% endif %}
+{%- if let Some(sha) = pr.merge_commit_sha %} → {{ sha }}{% endif %}
+{%- if pr.orphaned %} — orphaned{% endif %}
+  repo {{ pr.repo_key }} · backend {{ pr.backend }} · session {{ pr.session_id }}
+{%- if let Some(open) = pr.opened %} · opened by {{ open.agent_id }}{% if let Some(msg) = open.message_id %} (msg-#{{ msg }}){% endif %} at {{ open.created_at }}{% endif %}
+{%- if let Some(checks) = pr.checks %}
+  checks: {{ checks }}
+{%- endif %}
+{%- if let Some(detail) = pr.detail %}
+  detail: {{ detail }}
+{%- endif %}
+{% if !loop.last %}
+{% endif -%}
+{% endfor -%}

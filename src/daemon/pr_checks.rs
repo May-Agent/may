@@ -15,7 +15,6 @@ use std::time::Duration;
 use askama::Template;
 use futures_util::StreamExt;
 
-use super::session_events::SessionChange;
 use super::state::DaemonState;
 use super::types::PrChecksRead;
 use crate::db::{PrCheckState, PrRow};
@@ -176,9 +175,7 @@ async fn read_checks(state: &DaemonState, row: &PrRow) -> PrChecksRead {
 
 async fn apply(state: &DaemonState, row: &PrRow, read: PrChecksRead) {
     if state.pr_checks.set(row.id, &read) {
-        state
-            .ui_event_bus
-            .publish_session_change(&row.session_id, SessionChange::Prs);
+        crate::pr::notify_prs_bus(&state.ui_event_bus, &row.session_id);
     }
     let db = state.db();
     let previous = match db.pr_check_state(row.id).await {

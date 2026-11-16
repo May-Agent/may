@@ -16,8 +16,8 @@ use super::model_resolution::{
 };
 use super::state::DaemonState;
 use super::types::{
-    ApiHealth, ApiPr, ApiPrEvent, ApiSession, ContextDebugMessage, CreateSessionRequest,
-    RewindRequest, SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    ApiHealth, ApiPr, ApiSession, ContextDebugMessage, CreateSessionRequest, RewindRequest,
+    SessionContextDebugResponse, SessionContextWindowMetricsResponse,
     SessionContextWindowSnapshotResponse, SessionTasksPayload,
 };
 
@@ -356,42 +356,11 @@ pub(super) async fn session_prs(
     state: &DaemonState,
     session_id: &str,
 ) -> Result<Vec<ApiPr>, crate::db::ChatDbError> {
-    let rows = state.db().list_session_prs(session_id).await?;
-    let mut prs = Vec::with_capacity(rows.len());
-    for row in rows {
-        let (checks, checks_error) = match state.pr_checks.get(row.id) {
-            Some(Ok(report)) => (Some(super::types::ApiPrChecks::of(&report)), None),
-            Some(Err(error)) => (None, Some(error)),
-            None => (None, None),
-        };
-        let events = state
-            .db()
-            .pr_events(row.id)
-            .await?
-            .into_iter()
-            .map(|e| ApiPrEvent {
-                kind: e.kind,
-                detail: e.detail,
-                created_at: e.created_at,
-            })
-            .collect();
-        prs.push(ApiPr {
-            number: row.number,
-            title: row.title,
-            state: row.state,
-            backend: row.backend,
-            external_number: row.external_number,
-            issue_number: row.issue_number,
-            auto_merge: row.auto_merge,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            merged_at: row.merged_at,
-            checks,
-            checks_error,
-            events,
-        });
-    }
-    Ok(prs)
+    let rows = state
+        .db()
+        .list_prs_with_repo(None, Some(session_id), crate::db::PrFilter::All, false)
+        .await?;
+    super::prs::build_api_prs(state, rows).await
 }
 
 /// Atomically set the plan state for a session without touching task content.
@@ -808,7 +777,9 @@ pub(super) async fn delete_session(
         .delete_session(&id, profile_id.as_deref(), &db)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
+    state.notify_ui_events(
+        UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES | UiEventTopics::PRS,
+    );
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -868,7 +839,9 @@ pub(super) async fn delete_all_sessions(
         .delete_all_session_dirs()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
+    state.notify_ui_events(
+        UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES | UiEventTopics::PRS,
+    );
     Ok(Json(ApiHealth { ok: true }))
 }
 

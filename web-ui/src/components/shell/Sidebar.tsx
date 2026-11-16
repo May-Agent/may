@@ -28,6 +28,7 @@ import { githubBinding, groupByRepo, parseRepo, repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
+import { closePr, mergePr } from '@/lib/api/prs';
 import type { ProfileSessions } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -43,6 +44,9 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const toggleSidebar = useUiStore((s) => s.toggleSidebar);
   const setSidebarSheetOpen = useUiStore((s) => s.setSidebarSheetOpen);
   const profileSessions = useRuntimeStore((s) => s.profileSessions);
+  const orphanedPrs = useRuntimeStore((s) => s.orphanedPrs);
+  const [prBusy, setPrBusy] = useState<Record<number, 'merge' | 'close'>>({});
+  const [prError, setPrError] = useState<string | null>(null);
   const { profileId: activeProfileId } = useActiveProfile();
   const { start: startNewChat, creating, enabled: canCreate } = useNewChat();
   const { t } = useTranslation();
@@ -255,6 +259,77 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       ))}
                     </RepoGroup>
                   ))}
+                </Section>
+              )}
+
+              {orphanedPrs.length > 0 && (
+                <Section label={t('sidebar.orphanedPrs')}>
+                  {orphanedPrs.map((pr) => {
+                    const busy = prBusy[pr.id];
+                    const repo = repoLabel(pr.repoKey);
+                    return (
+                      <li key={pr.id} className="rounded-md px-2 py-1.5 text-xs hover:bg-accent/50">
+                        <div className="flex items-center gap-1.5 font-medium">
+                          <span className="tabular-nums text-muted-foreground">#{pr.number}</span>
+                          <span className="min-w-0 flex-1 truncate" title={pr.title}>
+                            {pr.title}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 truncate text-[11px] text-muted-foreground" title={pr.repoKey}>
+                          {repo}
+                        </p>
+                        <div className="mt-1 flex items-center gap-1.5">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[11px]"
+                            disabled={Boolean(busy)}
+                            onClick={() => {
+                              setPrError(null);
+                              setPrBusy((prev) => ({ ...prev, [pr.id]: 'merge' }));
+                              void mergePr(pr.id)
+                                .catch((err) =>
+                                  setPrError(err instanceof Error ? err.message : String(err)),
+                                )
+                                .finally(() =>
+                                  setPrBusy((prev) => {
+                                    const next = { ...prev };
+                                    delete next[pr.id];
+                                    return next;
+                                  }),
+                                );
+                            }}
+                          >
+                            {busy === 'merge' ? t('inspector.prMerging') : t('inspector.prMerge')}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-[11px] text-destructive hover:text-destructive"
+                            disabled={Boolean(busy)}
+                            onClick={() => {
+                              setPrError(null);
+                              setPrBusy((prev) => ({ ...prev, [pr.id]: 'close' }));
+                              void closePr(pr.id)
+                                .catch((err) =>
+                                  setPrError(err instanceof Error ? err.message : String(err)),
+                                )
+                                .finally(() =>
+                                  setPrBusy((prev) => {
+                                    const next = { ...prev };
+                                    delete next[pr.id];
+                                    return next;
+                                  }),
+                                );
+                            }}
+                          >
+                            {busy === 'close' ? t('inspector.prClosing') : t('inspector.prClose')}
+                          </Button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                  {prError && <li className="px-2 text-[11px] text-destructive">{prError}</li>}
                 </Section>
               )}
 

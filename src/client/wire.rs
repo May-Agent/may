@@ -695,10 +695,47 @@ pub struct WireSession {
     pub location: Option<crate::daemon::types::SessionLocation>,
 }
 
+/// One `pr_events` entry over the wire, mirroring `ApiPrEvent`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePrEvent {
+    /// Session identifier that recorded this event.
+    #[serde(default)]
+    pub session_id: String,
+    /// Actor (`"main"`, subagent name, or `"user"`) that performed the event.
+    #[serde(default)]
+    pub actor: String,
+    /// Last message ID in the session when the event was recorded.
+    #[serde(default)]
+    pub message_id: Option<i64>,
+    /// Event kind (for example `"opened"`, `"rejected"`, `"merged"`, `"closed"`).
+    pub kind: String,
+    /// Optional human-readable event detail such as rejection or failure output.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// UTC timestamp when the event was recorded.
+    pub created_at: String,
+}
+
 /// One session PR over the wire, mirroring the daemon's `ApiPr`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WirePr {
+    /// Global database row id (for `POST /api/prs/{id}/merge` and `/close`).
+    #[serde(default)]
+    pub id: i64,
+    /// Repository identity key.
+    #[serde(default)]
+    pub repo_key: String,
+    /// Owning session id.
+    #[serde(default)]
+    pub session_id: String,
+    /// Whether the owning session was deleted.
+    #[serde(default)]
+    pub orphaned: bool,
+    /// Whether repository policy requires user review before landing.
+    #[serde(default)]
+    pub require_review: bool,
     /// Per-repository PR number.
     pub number: i64,
     /// PR title.
@@ -716,12 +753,24 @@ pub struct WirePr {
     /// Whether the PR merges itself once checks pass.
     #[serde(default)]
     pub auto_merge: bool,
+    /// Base commit SHA.
+    #[serde(default)]
+    pub base_sha: String,
+    /// Pinned head commit SHA, if any.
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    /// Merge commit SHA, when merged locally.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
     /// Live check rollup of the PR's head, when the daemon read one.
     #[serde(default)]
     pub checks: Option<WirePrChecks>,
     /// Why the daemon's last read of the checks failed, when it did.
     #[serde(default)]
     pub checks_error: Option<String>,
+    /// Transition events, oldest first.
+    #[serde(default)]
+    pub events: Vec<WirePrEvent>,
     /// Latest update timestamp.
     pub updated_at: String,
 }

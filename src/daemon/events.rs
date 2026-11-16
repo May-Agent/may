@@ -55,6 +55,7 @@ struct EventSignatures {
     profile_sessions: String,
     remote_access: String,
     sleep: String,
+    prs: String,
     session_index: String,
 }
 
@@ -307,6 +308,11 @@ async fn emit_topics_if_changed(
     }
     if topics.contains(UiEventTopics::SLEEP)
         && !emit_sleep_if_changed(state, sender, &mut signatures.sleep).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::PRS)
+        && !emit_prs_if_changed(state, sender, &mut signatures.prs).await
     {
         return false;
     }
@@ -683,6 +689,30 @@ async fn emit_profile_sessions_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "profile_sessions", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_prs_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let prs = match super::prs::load_all_api_prs(state).await {
+        Ok(prs) => prs,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load PR snapshot for SSE stream");
+            return true;
+        }
+    };
+    let payload = super::prs::PrsEventPayload { prs };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "prs", &payload).await {
             return false;
         }
         *last_sig = sig;

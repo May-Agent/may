@@ -294,6 +294,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.sidebar.set_prs(&session_id, prs);
             Ok(None)
         }
+        AppEvent::PrsInvalidated => {
+            app.request_sidebar_prs();
+            Ok(None)
+        }
         AppEvent::BackgroundLoaded { jobs, subagents } => {
             app.jobs = jobs;
             app.subagents = subagents;

@@ -43,6 +43,7 @@ mod notifications;
 mod pr_checks;
 mod process_session;
 mod profiles;
+mod prs;
 mod remote_access;
 mod rules_import;
 mod server;

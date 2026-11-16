@@ -27,7 +27,6 @@ import type { ApiSession, SessionPlanState } from '@/lib/types';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { cn } from '@/lib/utils';
 import { openCount, rootReferences } from '@/lib/tasks/rows';
-import { livePrs } from '@/lib/inspector/prChecks';
 import { ReferenceLabel, TaskRowsView } from './TaskRowsView';
 import { PullRequestsView } from './PullRequestsView';
 import { PlanEditorSheet } from './PlanEditorSheet';
@@ -115,6 +114,9 @@ function DetailsPanel({ session }: { session: ApiSession }) {
   const entry = useInspectorStore((s) => s.sessions[sessionId] ?? EMPTY_INSPECTOR_ENTRY);
   const loadTasks = useInspectorStore((s) => s.loadTasks);
   const loadBackground = useInspectorStore((s) => s.loadBackground);
+  const loadPrs = useInspectorStore((s) => s.loadPrs);
+  const mergePr = useInspectorStore((s) => s.mergePr);
+  const closePr = useInspectorStore((s) => s.closePr);
   const killJob = useInspectorStore((s) => s.killJob);
   const stopSubagent = useInspectorStore((s) => s.stopSubagent);
   const rename = useSessionsStore((s) => s.rename);
@@ -128,7 +130,8 @@ function DetailsPanel({ session }: { session: ApiSession }) {
 
   useEffect(() => {
     void loadBackground(sessionId);
-  }, [sessionId, loadBackground]);
+    void loadPrs(sessionId);
+  }, [sessionId, loadBackground, loadPrs]);
 
   // tasks.md changes reach the client as `todo_update` turn events; reload
   // the document then, when a turn ends and when the plan state moves.
@@ -140,7 +143,7 @@ function DetailsPanel({ session }: { session: ApiSession }) {
   const jobs = useMemo(() => orderJobs(entry.background?.jobs ?? []), [entry.background]);
   const runningJobs = jobs.filter(isJobRunning);
   const finishedJobs = jobs.filter((job) => !isJobRunning(job));
-  const livePullRequests = useMemo(() => livePrs(entry.prs ?? []), [entry.prs]);
+  const pullRequests = entry.prs ?? [];
   const subagents = entry.background?.subagents ?? [];
   const backgroundFailed = entry.backgroundError !== null && !entry.background;
 
@@ -239,9 +242,13 @@ function DetailsPanel({ session }: { session: ApiSession }) {
         )}
       </Section>
 
-      {livePullRequests.length > 0 && (
-        <Section title={t('inspector.pullRequests')} meta={String(livePullRequests.length)}>
-          <PullRequestsView prs={livePullRequests} />
+      {pullRequests.length > 0 && (
+        <Section title={t('inspector.pullRequests')} meta={String(pullRequests.length)}>
+          <PullRequestsView
+            prs={pullRequests}
+            onMerge={(id) => mergePr(id, sessionId)}
+            onClose={(id) => closePr(id, sessionId)}
+          />
         </Section>
       )}
 
