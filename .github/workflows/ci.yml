@@ -220,6 +220,9 @@ jobs:
         with:
           name: cargo-timings-verify-tools-${{ matrix.os }}
           path: target/cargo-timings/
+      - name: Drop test-written shims before saving cache
+        if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+        run: rm -rf "${{ steps.downloads.outputs.tools-path }}"/runtimes/*/shims
       - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
@@ -272,6 +275,9 @@ jobs:
         with:
           name: cargo-timings-container-acceptance
           path: target/cargo-timings/
+      - name: Drop test-written shims before saving cache
+        if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+        run: rm -rf "${{ steps.downloads.outputs.tools-path }}"/runtimes/*/shims
       - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
