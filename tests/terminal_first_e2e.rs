@@ -25,7 +25,7 @@ use may_agent::model_selector::ModelSelector;
 use may_agent::session::{
     SandboxResourceLayout, SessionId, SessionStore, initialize_session_persistence,
 };
-use may_agent::tools::ToolTarget;
+use may_agent::tools::{HostProgram, ToolTarget};
 use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
 use serial_test::file_serial;
@@ -1435,7 +1435,10 @@ impl TestHarness {
         .expect("host gitconfig should be written");
 
         futures_lite::future::zip(
-            share_and_warm_tool_cache(&may_dir),
+            futures_lite::future::zip(
+                share_and_warm_tool_cache(&may_dir),
+                share_and_warm_host_programs(&may_dir),
+            ),
             warm_may_binary(&home_path),
         )
         .await;
@@ -1739,6 +1742,40 @@ async fn share_and_warm_tool_cache(may_dir: &Path) {
         .prepare_local(&home_paths.tool_runtimes_dir())
         .await
         .expect("baseline tools should prepare");
+}
+
+/// Points the test home's host-program cache at one cache shared by every
+/// test run and prepares the pinned repo-search binary in it, so a daemon's
+/// first search request reuses a hash-verified executable instead of
+/// downloading it again for every home.
+async fn share_and_warm_host_programs(may_dir: &Path) {
+    let shared = shared_download_root()
+        .join("may-tools")
+        .join("host-programs");
+    tokio::fs::create_dir_all(&shared)
+        .await
+        .expect("shared host-program cache dir should be created");
+    let cache = MayHomePaths::new(may_dir.to_path_buf()).host_programs_dir();
+    tokio::fs::create_dir_all(cache.parent().expect("host-program cache has a parent"))
+        .await
+        .expect("test home cache dir should be created");
+    #[cfg(unix)]
+    tokio::fs::symlink(&shared, &cache)
+        .await
+        .expect("test home host-program cache should link to the shared cache");
+    #[cfg(windows)]
+    tokio::fs::symlink_dir(&shared, &cache)
+        .await
+        .expect("test home host-program cache should link to the shared cache");
+    may_agent::tools::embedded_distribution()
+        .expect("embedded distribution should validate")
+        .prepare_host_program(
+            HostProgram::RepoSearch,
+            &ToolTarget::native().expect("test host should have a tool target"),
+            &cache,
+        )
+        .await
+        .expect("the repo-search host program should download and verify");
 }
 
 /// The daemon's shutdown drains runs for up to 30 s and settles cancelled

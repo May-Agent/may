@@ -87,6 +87,13 @@ impl MayHomePaths {
         self.root.join("history.db")
     }
 
+    /// Cache root for the pinned host programs May executes itself, such as
+    /// the repo-search daemon.
+    #[must_use]
+    pub fn host_programs_dir(&self) -> PathBuf {
+        self.root.join("cache").join("host-programs")
+    }
+
     /// Cache root for the baseline tool distribution, shared by every backend.
     #[must_use]
     pub fn tools_dir(&self) -> PathBuf {
