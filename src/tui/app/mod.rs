@@ -3772,6 +3772,11 @@ impl App {
                 None
             }
             SlashCommand::New => Some(SendAction::NewSession),
+            SlashCommand::Chat => {
+                self.session_manager
+                    .set_launch(crate::session::SessionLaunch::RepoLess);
+                Some(SendAction::NewSession)
+            }
             SlashCommand::Profile => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
