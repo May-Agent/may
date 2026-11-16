@@ -19,6 +19,9 @@ pub struct Run {
     pub name: Option<String>,
     /// `completed` once it has finished.
     pub status: String,
+    /// Trigger event (`pull_request`, `merge_group`, `push`, etc.).
+    #[serde(default)]
+    pub event: String,
 }
 
 /// One job of a run.
@@ -78,11 +81,13 @@ pub trait Actions: Sync {
     fn runs_for_sha(&self, sha: &str) -> impl Future<Output = Result<Vec<Run>, CiError>> + Send;
     /// The latest attempt's jobs of a run.
     fn jobs(&self, run_id: u64) -> impl Future<Output = Result<Vec<Job>, CiError>> + Send;
-    /// The most recent successful runs of a workflow on `branch`.
+    /// The most recent successful runs of a workflow for `event` (scoped to
+    /// `branch` for branch-push events).
     fn successful_runs(
         &self,
         workflow_id: u64,
         branch: &str,
+        event: &str,
         count: usize,
     ) -> impl Future<Output = Result<Vec<Run>, CiError>> + Send;
     /// The log of one job.
@@ -174,14 +179,36 @@ impl Actions for GhActions {
         &self,
         workflow_id: u64,
         branch: &str,
+        event: &str,
         count: usize,
     ) -> Result<Vec<Run>, CiError> {
-        let runs: Runs = self
-            .get_json(format!(
+        let query = match event {
+            // `branch=` filters `head_branch`, which is the PR or merge-group
+            // ref rather than `branch`; scope PR/merge-queue baselines by
+            // `event` so they never mix with `push` runs that skip tests.
+            "pull_request" | "merge_group" => format!(
+                "repos/{}/actions/workflows/{workflow_id}/runs?status=success&event={event}&per_page={count}",
+                self.owner_repo
+            ),
+            "" => format!(
                 "repos/{}/actions/workflows/{workflow_id}/runs?branch={branch}&status=success&per_page={count}",
                 self.owner_repo
-            ))
-            .await?;
+            ),
+            other => format!(
+                "repos/{}/actions/workflows/{workflow_id}/runs?branch={branch}&status=success&event={other}&per_page={count}",
+                self.owner_repo
+            ),
+        };
+        let runs: Runs = self.get_json(query).await?;
+        if event == "merge_group" && runs.workflow_runs.is_empty() {
+            let fallback: Runs = self
+                .get_json(format!(
+                    "repos/{}/actions/workflows/{workflow_id}/runs?status=success&event=pull_request&per_page={count}",
+                    self.owner_repo
+                ))
+                .await?;
+            return Ok(fallback.workflow_runs);
+        }
         Ok(runs.workflow_runs)
     }
 
