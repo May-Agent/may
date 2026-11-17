@@ -8,10 +8,8 @@
 /// upstream release.
 pub const THIRD_PARTY_TOOLS: &[u8] = include_bytes!("third-party-tools.json");
 
-/// The artifacts May builds and releases itself (`bash` from
-/// `patch/v<version>`, or aither's `patch-v0.24.0` until a May release carries
-/// it, `apply_patch` from `patch/v<version>`, `aither-sed` from
-/// `sed/v<version>`).
+/// The artifacts May builds and releases itself (`bash` and `apply_patch` from
+/// `patch/v<version>`, `aither-sed` from `sed/v<version>`).
 pub const MAY_ARTIFACTS: &[u8] = include_bytes!("tool-artifacts.json");
 
 /// May's own host-program pins.

@@ -7,9 +7,9 @@
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-aarch64-apple-darwin.tar.gz",
-      "sha256": "07b49e55b50199b44fda9a15e5ed426746273abb588cba020557cb52834d476c",
-      "size": 519355,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.2/bash-5.3.20-aarch64-apple-darwin.tar.gz",
+      "sha256": "0c12bb71994fd70522fe32aad4bacce4d258ae9dd1a596edecc0821858ffd9f3",
+      "size": 519354,
       "encoding": {
         "format": "tar_gzip",
         "executable": "bash"
@@ -22,8 +22,8 @@
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "0cfa24664dbdfd7398961882ad30c339a9d60f0ed89155e222eea817d2c8fff4",
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.2/bash-5.3.20-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "da7e2f5ca290e824ef27d1fe9f85d3122235f89831790769095d91872a54f517",
       "size": 791333,
       "encoding": {
         "format": "tar_gzip",
@@ -37,9 +37,9 @@
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "f0daed3763a8ab69c11fe05ad105e989171fb5a5ccaf8715092338ce8ecdb043",
-      "size": 788216,
+      "url": "https://github.com/May-Agent/may/releases/download/patch/v0.1.2/bash-5.3.20-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "e994d788dd84fe9ed0062fbbb89f9c296a3c26dfaa94b34882e34f16749c0be0",
+      "size": 788215,
       "encoding": {
         "format": "tar_gzip",
         "executable": "bash"
