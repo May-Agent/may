@@ -26,6 +26,9 @@ use crate::tui::event::{AppEvent, EventSender};
 
 /// Wait before reopening a dropped event stream.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// How often a running TUI looks at whether an update replaced its
+/// executable under it.
+const BUILD_RECHECK: Duration = Duration::from_secs(5);
 /// How long a send waits for the event stream to be attached.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -177,6 +180,27 @@ impl ForwardedTurn {
         }
         let _ = self.events.send(TuiEvent::Complete).await;
     }
+}
+
+/// Tell the TUI once the daemon runs the build the executable on disk holds
+/// and this process does not.
+///
+/// An update replaced the executable and restarted the daemon; the TUI then
+/// starts that executable in its place.
+pub fn spawn_build_watch(
+    client: DaemonClient,
+    build: crate::daemon::lifecycle::ClientBuild,
+    app_events: EventSender,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(BUILD_RECHECK).await;
+            if build.superseded_by(&client).await {
+                let _ = app_events.send(AppEvent::DaemonSuperseded).await;
+                return;
+            }
+        }
+    });
 }
 
 /// Follow worktree index coverage for `cwd` for as long as the TUI runs.

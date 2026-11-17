@@ -5074,6 +5074,9 @@ fn pretty_arguments(arguments: &str) -> Vec<String> {
 pub enum SendAction {
     /// User wants to quit.
     Quit,
+    /// The daemon runs a newer build than this process: leave the screen and
+    /// start the executable on disk in the same session.
+    Relaunch,
     /// User wants the session's running agent stopped, then to quit.
     StopAgentAndQuit,
     /// User wants to create a new session.

@@ -321,6 +321,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::DaemonSuperseded => Ok(Some(SendAction::Relaunch)),
         AppEvent::TurnStarted { message_id } => {
             app.request_prompt_mark(i64::from(message_id));
             Ok(None)

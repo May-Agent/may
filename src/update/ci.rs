@@ -10,9 +10,9 @@ use std::io::{Cursor, Read as _};
 use std::path::Path;
 
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 use super::UpdateError;
+use super::github::{GitHub, verify_sha256};
 
 /// The repository whose CI builds are the dev channel.
 pub(super) const REPOSITORY: &str = "May-Agent/may";
@@ -108,48 +108,19 @@ pub(super) fn parse_artifact(body: &[u8]) -> Result<Option<Artifact>, UpdateErro
 }
 
 /// A located artifact and the commit its run built.
+#[derive(Debug)]
 pub(super) struct Found {
     pub(super) head_sha: String,
     pub(super) artifact: Artifact,
 }
 
-/// The GitHub REST client of the dev path.
-pub(super) struct GitHub {
-    client: reqwest::Client,
-    api_base: String,
-    token: String,
-}
-
 impl GitHub {
-    pub(super) fn new(api_base: &str, token: String) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .user_agent(concat!("may-agent/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("the HTTP client builds with its default configuration"),
-            api_base: api_base.trim_end_matches('/').to_owned(),
-            token,
-        }
-    }
-
-    async fn get(&self, url: &str) -> Result<reqwest::Response, UpdateError> {
-        Ok(self
-            .client
-            .get(url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?
-            .error_for_status()?)
-    }
-
     /// The artifact `name` of the latest successful CI run on `main` that
     /// has one.
     pub(super) async fn latest_artifact(&self, name: &str) -> Result<Found, UpdateError> {
         let runs_url = format!(
             "{}/repos/{REPOSITORY}/actions/workflows/ci.yml/runs?branch={BRANCH}&event=push&status=success&per_page={RUNS_SCANNED}",
-            self.api_base
+            self.api_base()
         );
         self.first_artifact(&runs_url, name)
             .await?
@@ -167,7 +138,7 @@ impl GitHub {
     ) -> Result<Found, UpdateError> {
         let runs_url = format!(
             "{}/repos/{REPOSITORY}/actions/workflows/ci.yml/runs?head_sha={commit}&status=success&per_page={RUNS_SCANNED}",
-            self.api_base
+            self.api_base()
         );
         self.first_artifact(&runs_url, name)
             .await?
@@ -188,7 +159,8 @@ impl GitHub {
         for run in runs {
             let url = format!(
                 "{}/repos/{REPOSITORY}/actions/runs/{}/artifacts?name={name}",
-                self.api_base, run.id
+                self.api_base(),
+                run.id
             );
             if let Some(artifact) = parse_artifact(&self.get(&url).await?.bytes().await?)? {
                 return Ok(Some(Found {
@@ -212,25 +184,10 @@ impl GitHub {
             .as_deref()
             .and_then(|d| d.strip_prefix("sha256:"))
         {
-            let actual = hex(&Sha256::digest(&bytes));
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(UpdateError::DigestMismatch {
-                    expected: expected.to_owned(),
-                    actual,
-                });
-            }
+            verify_sha256(&bytes, expected)?;
         }
         Ok(bytes.into())
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    bytes.iter().fold(String::new(), |mut text, byte| {
-        write!(text, "{byte:02x}").expect("writing to a String cannot fail");
-        text
-    })
 }
 
 /// The `may` executable inside an artifact zip.
@@ -261,24 +218,6 @@ pub(super) fn extract_tarball(zip: &[u8]) -> Result<Vec<u8>, UpdateError> {
         }
     }
     Err(UpdateError::MissingMember(TARBALL))
-}
-
-/// Replaces the executable at `target` with `bytes`: written beside it and
-/// renamed over it, so a running process keeps its old image.
-pub(super) fn replace_executable(target: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let directory = target
-        .parent()
-        .ok_or_else(|| std::io::Error::other("the executable has no directory"))?;
-    let mut staged = tempfile::NamedTempFile::new_in(directory)?;
-    staged.write_all(bytes)?;
-    staged
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o755))?;
-    staged.persist(target).map_err(|error| error.error)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -327,7 +266,7 @@ mod tests {
             _ => ApiReply::json(404, r#"{"message":"Not Found"}"#),
         })
         .await;
-        let github = GitHub::new(&base, "test-token".into());
+        let github = GitHub::new(&base, Some("test-token".into()));
 
         let found = github
             .artifact_of_commit(CiPlatform::LinuxX64.artifact(), commit)
@@ -356,13 +295,12 @@ mod tests {
 
         let (base, _) =
             serve_api(|_, _| ApiReply::json(200, r#"{"total_count":0,"workflow_runs":[]}"#)).await;
-        let github = GitHub::new(&base, "test-token".into());
+        let github = GitHub::new(&base, Some("test-token".into()));
 
         let error = github
             .artifact_of_commit(CiPlatform::LinuxX64.artifact(), "0123abc")
             .await
-            .err()
-            .expect("no build");
+            .expect_err("no build");
 
         assert!(
             matches!(&error, UpdateError::NoCommitBuild { name, commit }
@@ -448,22 +386,5 @@ mod tests {
             extract_executable(&zip),
             Err(UpdateError::MissingMember(TARBALL))
         ));
-    }
-
-    #[test]
-    fn replacing_swaps_the_file_and_makes_it_executable() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let target = dir.path().join("may");
-        std::fs::write(&target, b"old").expect("the old executable is written");
-        replace_executable(&target, b"new").expect("the executable is replaced");
-        assert_eq!(std::fs::read(&target).expect("it reads"), b"new");
-        let mode = std::fs::metadata(&target)
-            .expect("it has metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755);
-        assert_eq!(std::fs::read_dir(dir.path()).expect("it lists").count(), 1);
     }
 }

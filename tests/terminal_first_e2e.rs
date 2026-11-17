@@ -1394,6 +1394,9 @@ impl TestHarness {
         // Aux generation would fire an unscripted request per completed
         // turn into the mock provider and starve the scripted responses.
         config.suggestions.enabled = false;
+        // CI runs these tests on a CI build, which would otherwise replace
+        // the executable under test with the newest build of `main`.
+        config.update.auto = false;
         // A port of its own, so a daemon a `may exec` of the test starts
         // meets no other.
         config.daemon.port = Some(
@@ -2400,6 +2403,21 @@ fn extract_stored_output_path(text: &str) -> Option<PathBuf> {
     let remainder = &text[start + marker.len()..];
     let end = remainder.find(").")?;
     Some(PathBuf::from(&remainder[..end]))
+}
+
+#[tokio::test]
+#[file_serial]
+async fn the_harness_config_never_lets_a_daemon_update_itself() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
+        .await
+        .expect("the harness config should load");
+    assert!(!config.update.auto);
 }
 
 #[tokio::test]

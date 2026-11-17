@@ -13,6 +13,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 use may_agent::session::SessionLaunch;
+use may_agent::update::Channel;
 
 /// Top-level CLI mode the binary resolves from argv.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,8 +35,11 @@ pub enum CliMode {
     OneShot(OneShotArgs),
     /// Print the completion script of a shell.
     Completion(Shell),
-    /// Replace this binary with the newest build and restart the daemon.
-    Update,
+    /// Replace this binary with the newest build of its channel and restart
+    /// the daemon; the channel is switched first when one is given.
+    Update {
+        channel: Option<Channel>,
+    },
 }
 
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
@@ -183,9 +187,15 @@ enum Command {
         #[arg(long)]
         stderr: Option<PathBuf>,
     },
-    /// Update May: a release build to the latest GitHub release, a dev build
-    /// to the latest successful CI build of main.
-    Update,
+    /// Update May to the newest build of its channel: `stable` is the latest
+    /// GitHub release, `dev` the latest successful CI build of main.
+    Update {
+        /// Switch to this channel, keep it, and update to it. Without it the
+        /// configured `[update] channel` applies, by default the kind of
+        /// this build.
+        #[arg(long, value_enum)]
+        channel: Option<Channel>,
+    },
     /// Print the completion script of a shell.
     Completion {
         /// The shell to complete for.
@@ -464,7 +474,7 @@ impl Cli {
                 }),
                 stderr,
             },
-            Some(Command::Update) => CliMode::Update,
+            Some(Command::Update { channel }) => CliMode::Update { channel },
             Some(Command::Completion { shell }) => CliMode::Completion(shell),
         })
     }
@@ -773,7 +783,24 @@ mod tests {
 
     #[test]
     fn update_is_a_subcommand() {
-        assert_eq!(parse(&["may", "update"]), CliMode::Update);
+        assert_eq!(parse(&["may", "update"]), CliMode::Update { channel: None });
+    }
+
+    #[test]
+    fn update_takes_the_channel_to_switch_to() {
+        assert_eq!(
+            parse(&["may", "update", "--channel", "dev"]),
+            CliMode::Update {
+                channel: Some(Channel::Dev)
+            }
+        );
+        assert_eq!(
+            parse(&["may", "update", "--channel", "stable"]),
+            CliMode::Update {
+                channel: Some(Channel::Stable)
+            }
+        );
+        assert!(parse_cli_mode(["may", "update", "--channel", "nightly"]).is_err());
     }
 
     #[test]

@@ -1552,30 +1552,42 @@ impl Default for CiConfig {
     }
 }
 
-/// `[update]` section: whether a release build updates itself.
+/// `[update]` section: which build `may update` and the daemon follow, and
+/// whether the daemon installs it on its own.
 ///
-/// Read by the daemon on every check, so a change applies without a restart.
-/// A dev build never updates on its own, whatever this says; it updates on
-/// `may update`.
+/// The daemon reads it on every round, so a change applies without a
+/// restart. `check_interval` is written as `"1h"`, `"30m"`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct UpdateConfig {
-    /// Whether a release build checks GitHub releases and installs a newer
-    /// one in the background.
+    /// The channel to follow; unset, the running build's kind (a release
+    /// build is `stable`, any other `dev`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<crate::update::Channel>,
+    /// Whether the daemon installs a newer build of the channel in the
+    /// background and restarts once idle.
     pub auto: bool,
-    /// Hours between two automatic checks.
-    pub check_interval_hours: u64,
+    /// Time between two automatic checks.
+    #[serde(with = "duration_text")]
+    pub check_interval: Duration,
 }
 
 impl UpdateConfig {
+    /// The channel to follow: the configured one, else the build's kind.
+    #[must_use]
+    pub fn channel(&self) -> crate::update::Channel {
+        self.channel
+            .unwrap_or_else(crate::update::Channel::of_build)
+    }
+
     /// Check the interval can elapse.
     ///
     /// # Errors
     /// Returns [`ConfigError::InvalidUpdateConfig`] when the interval is zero.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.check_interval_hours == 0 {
+        if self.check_interval.is_zero() {
             return Err(ConfigError::InvalidUpdateConfig(
-                "update.check_interval_hours must be above 0".to_string(),
+                "update.check_interval must be above 0".to_string(),
             ));
         }
         Ok(())
@@ -1585,8 +1597,9 @@ impl UpdateConfig {
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
+            channel: None,
             auto: true,
-            check_interval_hours: 6,
+            check_interval: Duration::from_hours(1),
         }
     }
 }
@@ -2406,6 +2419,40 @@ pub struct AvailableModel {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_update_section_defaults_to_the_builds_channel_and_an_hourly_check() {
+        let update = MayConfig::default().update;
+        assert_eq!(update.channel, None);
+        assert_eq!(update.channel(), crate::update::Channel::of_build());
+        assert!(update.auto);
+        assert_eq!(update.check_interval, Duration::from_hours(1));
+        // An unset channel is not written, so the build's kind keeps deciding.
+        let saved = toml::to_string(&MayConfig::default()).unwrap();
+        assert!(!saved.contains("channel"), "{saved}");
+    }
+
+    #[test]
+    fn the_update_section_reads_a_channel_and_an_interval() {
+        let config: MayConfig =
+            toml::from_str("[update]\nchannel = \"stable\"\ncheck_interval = \"30m\"\n").unwrap();
+        assert_eq!(config.update.channel(), crate::update::Channel::Stable);
+        assert_eq!(config.update.check_interval, Duration::from_mins(30));
+        assert!(config.update.auto);
+        let saved: MayConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(saved.update, config.update);
+        let dev: MayConfig = toml::from_str("[update]\nchannel = \"dev\"\n").unwrap();
+        assert_eq!(dev.update.channel(), crate::update::Channel::Dev);
+    }
+
+    #[test]
+    fn a_zero_check_interval_is_refused() {
+        let config: MayConfig = toml::from_str("[update]\ncheck_interval = \"0s\"\n").unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidUpdateConfig(_))
+        ));
+    }
 
     #[test]
     fn the_language_section_names_the_communication_language() {

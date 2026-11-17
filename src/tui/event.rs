@@ -142,6 +142,9 @@ pub enum AppEvent {
     SessionRuntime(Box<crate::client::SessionRuntimeEvent>),
     /// The session's worktree index coverage, from the `session_index` stream.
     IndexCoverage(crate::client::SessionIndexSnapshot),
+    /// The daemon runs the build the executable on disk holds, which is not
+    /// the one this process started from: an update replaced it.
+    DaemonSuperseded,
     /// A turn started in the daemon (this client's or another's), carrying
     /// the stored user-message row id — the prompt-mark key file rewind
     /// checkpoints hang on.
@@ -298,6 +301,7 @@ impl AppEvent {
             Self::Status(_) => "status",
             Self::SessionRuntime(_) => "session_runtime",
             Self::IndexCoverage(_) => "index_coverage",
+            Self::DaemonSuperseded => "daemon_superseded",
             Self::TurnStarted { .. } => "turn_started",
             Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
