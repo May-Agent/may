@@ -262,6 +262,9 @@ pub enum AppEvent {
         /// Store outcome.
         result: Result<(), String>,
     },
+
+    /// Opening the session sandbox directory failed.
+    SandboxOpenFailed(String),
 }
 
 impl AppEvent {
@@ -323,6 +326,7 @@ impl AppEvent {
             Self::ProgressFailed(_) => "progress_failed",
             Self::BashFinished(_) => "bash_finished",
             Self::SecretStored { .. } => "secret_stored",
+            Self::SandboxOpenFailed(_) => "sandbox_open_failed",
         }
     }
 }
