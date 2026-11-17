@@ -9,6 +9,10 @@ inputs:
     description: Whether to pack and upload target/debug/may as an artifact.
     required: false
     default: 'true'
+  verify-baseline-tools:
+    description: Whether to run the ignored baseline tools acceptance test after nextest.
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -86,6 +90,13 @@ runs:
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
       run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+    - name: Verify baseline tools
+      if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
+      shell: bash
+      run: >
+        cargo nextest run --locked --test terminal_first_e2e --run-ignored only
+        -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
+        --no-capture
     - name: Upload cargo timings
       if: always()
       uses: actions/upload-artifact@v4
