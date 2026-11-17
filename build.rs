@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
 
     emit_git_sha();
+    emit_built_by_ci();
     let heel_lib_version = emit_heel_lib_version();
     emit_image_refs(&heel_lib_version);
     watch_web_ui_inputs();
@@ -93,6 +94,15 @@ fn emit_git_sha() {
     }
     let sha = git(&["rev-parse", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=MAY_GIT_SHA={sha}");
+}
+
+/// Whether GitHub Actions compiles the binary, which `update::BuildKind`
+/// tells from a local build. Actions sets `GITHUB_ACTIONS=true` in every
+/// step.
+fn emit_built_by_ci() {
+    println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
+    let built_by_ci = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
+    println!("cargo:rustc-env=MAY_BUILT_BY_CI={built_by_ci}");
 }
 
 /// The version of the `heel` library `Cargo.lock` pins, which the

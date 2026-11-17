@@ -98,8 +98,8 @@ impl MayBuild {
     /// [`CloudError::Install`] for a dev build without its commit id, which
     /// no CI artifact can be found for.
     pub fn this_build() -> Result<Self, CloudError> {
-        match Channel::current() {
-            Channel::Release => Ok(Self::Release {
+        match Channel::of_build() {
+            Channel::Stable => Ok(Self::Release {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             }),
             Channel::Dev => crate::update::built_from()

@@ -25,7 +25,7 @@ default-members = [".", "tasks", "patch", "sed"]
 default = ["vision-ocr"]
 ui = []
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
-# release and updates from GitHub releases instead of CI artifacts.
+# release, so its update channel defaults to `stable` instead of `dev`.
 release-build = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
@@ -234,7 +234,6 @@ linkify = { version = "0.11.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 clap_complete = { version = "4.6.11", default-features = false }
-axoupdater = { version = "0.10.3", default-features = false, features = ["github_releases"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip

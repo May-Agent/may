@@ -455,7 +455,7 @@ fn api_routes() -> Route {
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
         list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server, save_full_config,
-        save_memory, set_job_pool, set_last_model,
+        save_memory, set_job_pool, set_last_model, set_update_channel,
     };
     use super::events::stream_events;
     use super::notifications::{
@@ -597,6 +597,7 @@ fn api_routes() -> Route {
                 "/full".post(save_full_config),
                 "/last-model".post(set_last_model),
                 "/job-pool".put(set_job_pool),
+                "/update-channel".put(set_update_channel),
             ))),
         )),
         Route::new((

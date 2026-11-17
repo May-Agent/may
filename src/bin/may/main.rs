@@ -271,7 +271,7 @@ async fn async_main() -> anyhow::Result<()> {
             .await;
         }
         CliMode::Daemon(command) => return run_daemon_command(command).await,
-        CliMode::Update => return run_update().await,
+        CliMode::Update { channel } => return run_update(channel).await,
         CliMode::ComputerAgent { may_dir, .. } => {
             #[cfg(target_os = "macos")]
             {
@@ -332,6 +332,9 @@ async fn async_main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // The build this process starts from: an update replaces its file.
+    let build = may_agent::daemon::lifecycle::ClientBuild::current()?;
+
     // Create app and run
     let result = run_app(
         &mut terminal,
@@ -340,6 +343,7 @@ async fn async_main() -> anyhow::Result<()> {
         log_ring,
         resume,
         tui_launch,
+        build.clone(),
     )
     .await;
 
@@ -355,7 +359,14 @@ async fn async_main() -> anyhow::Result<()> {
     terminal.show_cursor()?;
 
     match result {
-        Ok(Some(exit)) => {
+        Ok(LoopExit {
+            relaunch: true,
+            summary,
+        }) => relaunch(&build, summary.as_ref()),
+        Ok(LoopExit {
+            summary: Some(exit),
+            ..
+        }) => {
             let mut stdout = io::stdout();
             if exit.agent_running {
                 writeln!(
@@ -370,7 +381,7 @@ async fn async_main() -> anyhow::Result<()> {
             )?;
             Ok(())
         }
-        Ok(None) => Ok(()),
+        Ok(LoopExit { summary: None, .. }) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -389,6 +400,36 @@ struct ExitSummary {
     agent_running: bool,
 }
 
+/// How the main loop ended.
+struct LoopExit {
+    /// The session the TUI leaves behind, when it reached the daemon.
+    summary: Option<ExitSummary>,
+    /// Whether the daemon runs a newer build than this process, whose
+    /// executable on disk replaces it.
+    relaunch: bool,
+}
+
+/// Replaces this process with the executable `build` started from, which an
+/// update replaced: in the session it left, else with its own arguments. The
+/// terminal is already restored. Returns only when starting it failed.
+fn relaunch(
+    build: &may_agent::daemon::lifecycle::ClientBuild,
+    summary: Option<&ExitSummary>,
+) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = std::process::Command::new(build.executable());
+    match summary {
+        Some(summary) => command.args(["resume", &summary.session_id]),
+        None => command.args(std::env::args_os().skip(1)),
+    };
+    let error = command.exec();
+    Err(anyhow::Error::new(error).context(format!(
+        "May was updated but its new build could not be started from {}",
+        build.executable().display()
+    )))
+}
+
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
@@ -396,7 +437,8 @@ async fn run_app<B: Backend>(
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
     tui_launch: may_agent::session::SessionLaunch,
-) -> anyhow::Result<Option<ExitSummary>>
+    build: may_agent::daemon::lifecycle::ClientBuild,
+) -> anyhow::Result<LoopExit>
 where
     B::Error: Send + Sync + 'static,
 {
@@ -438,6 +480,11 @@ where
         Ok(client) => {
             app.status = None;
             app.btw_daemon = Some(client.clone());
+            may_agent::tui::remote::spawn_build_watch(
+                client.clone(),
+                build.clone(),
+                events.sender(),
+            );
             app.session_manager.attach_daemon(client.clone());
             app.index_loading = true;
             may_agent::tui::remote::spawn_index_coverage(
@@ -844,10 +891,12 @@ async fn main_event_loop<B: Backend>(
     log_ring: may_agent::log_ring::LogRingHandle,
     mut startup_gate: Option<StartupGate>,
     mut pending_resume: Option<may_agent::SessionId>,
-) -> anyhow::Result<Option<ExitSummary>>
+) -> anyhow::Result<LoopExit>
 where
     B::Error: Send + Sync + 'static,
 {
+    // Set when the daemon runs a newer build than this process.
+    let mut relaunching = false;
     // Handle to a running agent task (if any)
     let mut agent_handle: Option<AgentHandle> = None;
 
@@ -1458,6 +1507,10 @@ where
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => {
                         agent_left_running = agent_handle.is_some() || app.agent_working();
+                        return Ok(LoopFlow::Quit);
+                    }
+                    Some(SendAction::Relaunch) => {
+                        relaunching = true;
                         return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::StopAgentAndQuit) => {
@@ -2422,19 +2475,23 @@ where
     }
 
     let session = app.session_manager.current();
-    match session {
-        Some(session) if session.persisted => Ok(Some(ExitSummary {
+    let summary = match session {
+        Some(session) if session.persisted => Some(ExitSummary {
             session_id: session.id.as_str().to_string(),
             agent_running: agent_left_running,
-        })),
+        }),
         Some(_) => {
             // The session never reached the daemon: nothing to resume, and its
             // scratch dirs go with it.
             discard_ephemeral_session(app).await;
-            Ok(None)
+            None
         }
-        None => Ok(None),
-    }
+        None => None,
+    };
+    Ok(LoopExit {
+        summary,
+        relaunch: relaunching,
+    })
 }
 
 /// Run the GitHub Copilot OAuth device flow.
@@ -3137,21 +3194,42 @@ async fn open_web_ui() -> anyhow::Result<()> {
 
 /// `may daemon [install|uninstall|status|stop]`.
 /// `may update`: replaces this binary on its channel, then restarts a
-/// running daemon onto the new one. The restart is the new binary's own
+/// running daemon onto the new one, gracefully, at once. A daemon that is
+/// not running is not started. The restart is the new binary's own
 /// `daemon restart`: this process is still the old build.
-async fn run_update() -> anyhow::Result<()> {
-    use may_agent::update::{Channel, Outcome, update};
+///
+/// `channel` switches the channel first and keeps the choice in the
+/// configuration, through the daemon when one runs, which applies it live.
+async fn run_update(channel: Option<may_agent::update::Channel>) -> anyhow::Result<()> {
+    use may_agent::update::{Outcome, running_executable, update};
 
-    match update(Channel::current(), |step| eprintln!("{step}")).await? {
+    let paths = may_agent::daemon::DaemonPaths::user()?;
+    let daemon = may_agent::client::DaemonClient::new(paths.socket());
+    let channel = match channel {
+        Some(channel) => {
+            if daemon.health().await.is_ok() {
+                let _: serde_json::Value = daemon
+                    .put(
+                        "/api/config/update-channel",
+                        &serde_json::json!({ "channel": channel }),
+                    )
+                    .await?;
+            } else {
+                let mut config = may_agent::config::MayConfig::load().await?;
+                config.update.channel = Some(channel);
+                config.save().await?;
+            }
+            eprintln!("Following the {channel} channel.");
+            channel
+        }
+        None => may_agent::config::MayConfig::load().await?.update.channel(),
+    };
+    let target = running_executable()?;
+    match update(channel, &target, |step| eprintln!("{step}")).await? {
         Outcome::UpToDate => eprintln!("May is up to date."),
         Outcome::Updated { executable, to } => {
             eprintln!("Updated May to {to}.");
-            let paths = may_agent::daemon::DaemonPaths::user()?;
-            let running = may_agent::client::DaemonClient::new(paths.socket())
-                .health()
-                .await
-                .is_ok();
-            if running {
+            if daemon.health().await.is_ok() {
                 eprintln!("Restarting the May daemon…");
                 let status = async_process::Command::new(&executable)
                     .args(["daemon", "restart"])

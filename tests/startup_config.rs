@@ -42,7 +42,9 @@ struct ConfigFile {
 const CONFIG_TOML: ConfigFile = ConfigFile {
     name: "config.toml",
     profile: false,
-    valid: "",
+    // CI runs these tests on a CI build, whose daemon would otherwise
+    // replace the executable under test with the newest build of `main`.
+    valid: "[update]\nauto = false\n",
     parse: "this is = = not toml\n",
     // `api` is only supported for custom providers.
     validation: "[provider.openai]\napi = \"responses\"\n",
@@ -352,6 +354,13 @@ async fn absence_for(file: ConfigFile) {
     for entry in ENTRY_POINTS {
         assert_starts_without_file(entry, file).await;
     }
+}
+
+#[test]
+fn the_valid_config_never_lets_a_daemon_update_itself() {
+    let config: may_agent::MayConfig =
+        toml::from_str(CONFIG_TOML.valid).expect("the valid config.toml should parse");
+    assert!(!config.update.auto);
 }
 
 #[tokio::test]

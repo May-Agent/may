@@ -368,6 +368,29 @@ async fn restart_service() -> Result<(), LifecycleError> {
 }
 
 fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
+    spawn_detached(paths, &current_exe()?, &["daemon"])
+}
+
+/// Replaces the running daemon with one of the build at `executable`, from
+/// the daemon itself.
+///
+/// The new build's `daemon restart` runs in a process session of its own, so
+/// it outlives the daemon it stops. It drains the daemon like any restart
+/// (`stop`, then `ensure_running`).
+///
+/// # Errors
+/// Fails when the process cannot be spawned.
+pub fn spawn_restart(paths: &DaemonPaths, executable: &Path) -> Result<(), LifecycleError> {
+    spawn_detached(paths, executable, &["daemon", "restart"])?;
+    Ok(())
+}
+
+/// Runs `executable` with `args` detached, logging to the daemon log.
+fn spawn_detached(
+    paths: &DaemonPaths,
+    executable: &Path,
+    args: &[&str],
+) -> Result<std::process::Child, LifecycleError> {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
 
@@ -379,9 +402,9 @@ fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
         .create(true)
         .append(true)
         .open(&log_path)?;
-    let mut command = std::process::Command::new(current_exe()?);
+    let mut command = std::process::Command::new(executable);
     command
-        .arg("daemon")
+        .args(args)
         .env("PATH", path_with_bin_dir(paths)?)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -662,6 +685,53 @@ pub async fn stop(paths: &DaemonPaths) -> Result<bool, LifecycleError> {
     client.shutdown().await?;
     wait_until_gone(&client, health.pid).await?;
     Ok(true)
+}
+
+/// The build a client process started from: its executable and that file's
+/// build id at the start. An update replaces the file under a running client,
+/// which keeps its old image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBuild {
+    executable: PathBuf,
+    id: String,
+}
+
+impl ClientBuild {
+    /// The build this process is, read at its start.
+    ///
+    /// # Errors
+    /// Fails when the executable or its metadata cannot be read.
+    pub fn current() -> std::io::Result<Self> {
+        let executable = current_exe()?;
+        let id = super::build_id_of(&executable)?;
+        Ok(Self { executable, id })
+    }
+
+    /// The executable this process started from, which an update replaces.
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    /// Whether the daemon runs the build the executable holds now, and that
+    /// is not the build this process started from. Such a client does not
+    /// replace the daemon: it starts the executable in its place.
+    pub async fn superseded_by(&self, client: &DaemonClient) -> bool {
+        let Ok(on_disk) = super::build_id_of(&self.executable) else {
+            return false;
+        };
+        // Only a replaced executable is worth asking the daemon about.
+        on_disk != self.id
+            && client
+                .health()
+                .await
+                .is_ok_and(|health| Self::is_superseded(&self.id, &on_disk, &health.build))
+    }
+
+    /// Whether `daemon` runs the build `on_disk`, which is not `own`.
+    fn is_superseded(own: &str, on_disk: &str, daemon: &str) -> bool {
+        on_disk != own && daemon == on_disk
+    }
 }
 
 /// Makes sure a daemon of this build answers on the socket, starting or
@@ -1029,7 +1099,7 @@ mod stale_job_tests {
 
 #[cfg(test)]
 mod start_failure_tests {
-    use super::last_error_line;
+    use super::{ClientBuild, last_error_line};
 
     #[test]
     fn reports_the_error_and_its_first_cause() {
@@ -1046,5 +1116,26 @@ mod start_failure_tests {
         );
         std::fs::write(&log, "just a line\n").expect("log written");
         assert_eq!(last_error_line(&log), "just a line");
+    }
+
+    #[test]
+    fn a_client_is_superseded_only_by_a_daemon_on_the_replaced_executable() {
+        // The executable was replaced and the daemon restarted onto it.
+        assert!(ClientBuild::is_superseded("old", "new", "new"));
+        // The daemon still runs the old build: nothing to follow yet.
+        assert!(!ClientBuild::is_superseded("old", "new", "old"));
+        // The executable is the client's own: the daemon is not its business.
+        assert!(!ClientBuild::is_superseded("old", "old", "old"));
+        // Another build entirely: the client neither follows nor replaces it.
+        assert!(!ClientBuild::is_superseded("old", "new", "other"));
+    }
+
+    #[test]
+    fn the_client_build_reads_the_running_executable() {
+        let build = ClientBuild::current().expect("the test binary is readable");
+        assert_eq!(
+            super::super::build_id_of(build.executable()).expect("it has metadata"),
+            build.id
+        );
     }
 }

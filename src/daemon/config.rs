@@ -27,7 +27,7 @@ use super::types::{
     SkillInfoDto, SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig,
     UiBrowserConfig, UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig,
     UiPreferencesConfig, UiProviderConfig, UiRecapConfig, UiRemoteAccessConfig, UiSandboxConfig,
-    UiSessionsConfig, UiStreamConfig, UiSuggestionsConfig,
+    UiSessionsConfig, UiStreamConfig, UiSuggestionsConfig, UpdateChannelRequest,
 };
 use crate::computer::proto::{AgentRequest, AgentResponse};
 
@@ -457,6 +457,16 @@ pub(super) async fn set_job_pool(
     let updated = state.update_config(|config| config.sandbox.job_pool_size = size);
     state.save_config(&updated).await.map_err(internal_error)?;
     state.job_server.resize(updated.sandbox.job_pool_size());
+    state.notify_ui_events(UiEventTopics::CONFIG);
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+pub(super) async fn set_update_channel(
+    Json(req): Json<UpdateChannelRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let updated = state.update_config(|config| config.update.channel = Some(req.channel));
+    state.save_config(&updated).await.map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }

@@ -1956,6 +1956,14 @@ pub struct LastModelRequest {
     pub(crate) model: String,
 }
 
+/// Body of `PUT /api/config/update-channel`: the channel `may update` and the
+/// daemon follow.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateChannelRequest {
+    pub channel: crate::update::Channel,
+}
+
 /// Body of `PUT /api/config/job-pool`: the machine-wide jobserver pool size,
 /// `None` for the host's available parallelism.
 #[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
