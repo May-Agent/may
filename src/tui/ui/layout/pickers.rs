@@ -94,25 +94,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     // Render search input
-    let search_line = if app.session_search.is_empty() {
-        Line::from(Span::styled(
-            "Type to search...",
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
-            Span::styled(&app.session_search, Style::default().fg(Color::Yellow)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[1]);
-    let caret_x = chunks[1].x
-        + 8
-        + u16::try_from(UnicodeWidthStr::width(app.session_search.as_str())).unwrap_or(u16::MAX);
-    frame.set_cursor_position((
-        caret_x.min(chunks[1].right().saturating_sub(1)),
-        chunks[1].y,
-    ));
+    super::render_search_line(frame, chunks[1], &app.session_search);
 
     // Build display lines with section headers
     let list_height = chunks[2].height as usize;
@@ -635,28 +617,7 @@ pub(super) fn render_resume_picker(
         ])
         .split(inner);
 
-    let search_line = if state.search.is_empty() {
-        Line::from(Span::styled(
-            "Type to search...",
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
-            Span::styled(&state.search, Style::default().fg(Color::Yellow)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
-    let caret_col = if state.search.is_empty() {
-        0
-    } else {
-        8 + UnicodeWidthStr::width(state.search.as_str())
-    };
-    let caret_x = chunks[0].x + u16::try_from(caret_col).unwrap_or(u16::MAX);
-    frame.set_cursor_position((
-        caret_x.min(chunks[0].right().saturating_sub(1)),
-        chunks[0].y,
-    ));
+    super::render_search_line(frame, chunks[0], &state.search);
 
     let mut lines = Vec::new();
     if state.loading {
