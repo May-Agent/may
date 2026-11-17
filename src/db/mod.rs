@@ -1686,4 +1686,92 @@ mod tests {
             "the committed input lands in the transcript exactly once"
         );
     }
+
+    #[tokio::test]
+    async fn sessions_requiring_pending_dispatch_filters_to_idle_pending_sessions_newest_first() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+
+        db.create_session("idle-empty", Some("empty"), Some("model"))
+            .await
+            .expect("idle-empty");
+        db.create_session("idle-committed", Some("committed"), Some("model"))
+            .await
+            .expect("idle-committed");
+        db.set_pending_immediate_message(
+            "idle-committed",
+            test_pending_message("done", PendingUserMessageMode::Queue),
+        )
+        .await
+        .expect("enqueue committed");
+        let committed_fence = queue_entry_fence("idle-committed");
+        assert!(db.claim_session_run(&committed_fence).await.expect("run"));
+        let committed = db
+            .claim_next_pending_message(&committed_fence, "idle-committed")
+            .await
+            .expect("claim")
+            .expect("entry");
+        db.append_chat_message_as_run_and_commit_pending(
+            &committed_fence,
+            committed.id.expect("id"),
+            &crate::session::ChatMessage::user("done"),
+        )
+        .await
+        .expect("commit");
+        db.finish_session_run(&committed_fence)
+            .await
+            .expect("finish");
+
+        db.create_session("older-ready", Some("older"), Some("model"))
+            .await
+            .expect("older-ready");
+        db.set_pending_immediate_message(
+            "older-ready",
+            test_pending_message("run me first", PendingUserMessageMode::Queue),
+        )
+        .await
+        .expect("enqueue older");
+
+        db.create_session("blocked-running", Some("running"), Some("model"))
+            .await
+            .expect("blocked-running");
+        db.set_pending_immediate_message(
+            "blocked-running",
+            test_pending_message("wait", PendingUserMessageMode::Queue),
+        )
+        .await
+        .expect("enqueue running");
+        db.set_session_runtime_state("blocked-running", SessionRuntimeState::Running)
+            .await
+            .expect("running");
+
+        db.create_session("newer-ready", Some("newer"), Some("model"))
+            .await
+            .expect("newer-ready");
+        db.set_pending_immediate_message(
+            "newer-ready",
+            test_pending_message("run me too", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("enqueue newer");
+
+        db.execute_for_test(
+            "UPDATE sessions SET updated_at = '2026-11-01T00:00:00Z' WHERE id = 'older-ready'",
+        )
+        .await
+        .expect("set older updated_at");
+        db.execute_for_test(
+            "UPDATE sessions SET updated_at = '2026-11-02T00:00:00Z' WHERE id = 'newer-ready'",
+        )
+        .await
+        .expect("set newer updated_at");
+
+        let resumable = db
+            .sessions_requiring_pending_dispatch()
+            .await
+            .expect("pending dispatch lookup");
+        assert_eq!(resumable, vec!["newer-ready", "older-ready"]);
+    }
 }

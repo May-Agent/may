@@ -90,12 +90,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // The right sidebar takes a column of wide terminals; the chat and its
-    // sheets live in the rest.
+    // sheets live in the rest, separated by a gap matching the band padding so
+    // the input band and sheets do not fuse flush into the sidebar.
     let (column, sidebar_area) = if app.sidebar.visible_at(area.width) {
         let width = crate::tui::sidebar::SidebarState::width_for(area.width);
+        let gap = super::band::H_PADDING;
         (
             Rect {
-                width: area.width - width,
+                width: area.width.saturating_sub(width + gap),
                 ..area
             },
             Some(Rect {

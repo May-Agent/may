@@ -3775,6 +3775,37 @@ impl App {
         Ok(true)
     }
 
+    /// Whether `/sandbox` is available for the current session: an active
+    /// session with at least one conversation message.
+    #[must_use]
+    pub fn sandbox_available(&self) -> bool {
+        self.session_manager.current().is_some() && self.chat.has_messages()
+    }
+
+    fn open_sandbox(&mut self) {
+        let Some(session) = self.session_manager.current() else {
+            self.chat
+                .push_error("No active session — sandbox unavailable");
+            self.scroll = usize::MAX;
+            return;
+        };
+        if !self.chat.has_messages() {
+            self.chat
+                .push_error("No sandbox exists before the session has messages");
+            self.scroll = usize::MAX;
+            return;
+        }
+        let sandbox_dir = session.sandbox_dir.clone();
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let outcome = blocking::unblock(move || open_sandbox_dir(&sandbox_dir)).await;
+            if let Err(error) = outcome {
+                let _ = tx.send(AppEvent::SandboxOpenFailed(error)).await;
+            }
+        })
+        .detach();
+    }
+
     /// Execute a slash command directly (from menu selection only).
     fn execute_slash_command(&mut self, command: SlashCommand) -> Option<SendAction> {
         match command {
@@ -3809,25 +3840,7 @@ impl App {
                 None
             }
             SlashCommand::Sandbox => {
-                if let Some(session) = self.session_manager.current() {
-                    let sandbox_dir = &session.sandbox_dir;
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = std::process::Command::new("open").arg(sandbox_dir).spawn();
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg(sandbox_dir)
-                            .spawn();
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(sandbox_dir)
-                            .spawn();
-                    }
-                }
+                self.open_sandbox();
                 None
             }
             SlashCommand::Help => {
@@ -4218,6 +4231,10 @@ impl App {
         }
         if trimmed == SlashCommand::Bug.name() && attachments.is_empty() {
             return Some(SendAction::BugReport);
+        }
+        if trimmed == SlashCommand::Sandbox.name() && attachments.is_empty() {
+            self.open_sandbox();
+            return None;
         }
         if let Some(rest) = trimmed.strip_prefix(SlashCommand::Compact.name())
             && attachments.is_empty()
@@ -5342,6 +5359,50 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
     }
 }
 
+fn open_sandbox_dir(dir: &std::path::Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Err(format!(
+            "Sandbox directory does not exist: {}",
+            dir.display()
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let output = std::process::Command::new(program)
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("Failed to open sandbox folder: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exited with {}", output.status)
+        };
+        Err(format!("Failed to open sandbox folder: {detail}"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(format!(
+            "Opening folders is not supported on this platform: {}",
+            dir.display()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5607,8 +5668,23 @@ mod tests {
         }
         // Inner padding: the first column of the block stays empty.
         assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
-        // The chat beside it is not painted with the block colour.
-        assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+        // The gap beside the sidebar stays unpainted on every row, including
+        // the input band at the bottom, while the input band ends right before it.
+        let gap = crate::tui::ui::band::H_PADDING;
+        for y in 0..height {
+            for x in (left - gap)..left {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    BLOCK_BG,
+                    "gap column {x} on row {y} must not fuse with sidebar"
+                );
+            }
+        }
+        assert_eq!(
+            buffer[(left - gap - 1, height - 1)].bg,
+            BLOCK_BG,
+            "input band reaches the left side of the sidebar gap"
+        );
     }
 
     fn sidebar_screen(app: &mut App, width: u16, height: u16) -> String {
@@ -7384,6 +7460,74 @@ mod tests {
                 .as_ref()
                 .map(|(c, _)| c.as_str()),
             Some("Hi")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_slash_command_is_hidden_until_session_has_messages() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        assert!(!app.sandbox_available());
+
+        for c in "/sand".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(
+            !app.completion.labels().contains(&"/sandbox"),
+            "empty session must not offer /sandbox: {:?}",
+            app.completion.labels()
+        );
+
+        app.input.clear();
+        app.cursor = 0;
+        app.update_completion_state();
+        app.chat.push_user("hello", Vec::new(), 0);
+        assert!(app.sandbox_available());
+
+        for c in "/sand".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(
+            app.completion.labels().contains(&"/sandbox"),
+            "session with messages must offer /sandbox: {:?}",
+            app.completion.labels()
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_errors_land_in_chat_stream() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+
+        app.input = "/sandbox".to_string();
+        app.cursor = app.input.len();
+        let action = app.handle_chat_key(KeyCode::Enter);
+        assert!(action.is_none());
+        let rows = draw_rows(
+            &mut ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+                .expect("terminal"),
+            &mut app,
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("No sandbox exists before the session has messages")),
+            "error should render in chat stream: {rows:#?}"
+        );
+
+        let missing = dir.path().join("does-not-exist");
+        let err = super::open_sandbox_dir(&missing).expect_err("missing dir must fail");
+        assert!(err.contains("does-not-exist"), "{err}");
+
+        app.handle_event(AppEvent::SandboxOpenFailed(err))
+            .expect("handle event");
+        let rows = draw_rows(
+            &mut ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+                .expect("terminal"),
+            &mut app,
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("does-not-exist")),
+            "async sandbox open error should render in chat stream: {rows:#?}"
         );
     }
 }

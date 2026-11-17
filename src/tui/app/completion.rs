@@ -9,6 +9,8 @@ impl App {
         // Check for slash command at start
         if self.input.starts_with('/') {
             let query = &self.input[1..]; // Skip the /
+            self.completion
+                .set_sandbox_available(self.sandbox_available());
             if self.completion.mode == CompletionMode::Slash {
                 self.completion.update_query(query);
             } else {

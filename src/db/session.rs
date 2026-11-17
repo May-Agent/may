@@ -1576,12 +1576,17 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn sessions_requiring_pending_dispatch(&self) -> Result<Vec<String>, ChatDbError> {
-        let sessions = self.list_sessions().await?;
+        let candidate_ids = query!(
+            self.db,
+            "SELECT s.id AS session_id FROM sessions AS s WHERE s.id IN (SELECT session_id FROM session_pending_message_entries WHERE state = 'pending') ORDER BY s.updated_at DESC"
+        )
+        .fetch_all::<SessionIdRow>()
+        .await?;
         let mut session_ids = Vec::new();
-        for session in sessions {
-            let summary = self.load_session_runtime_summary(&session.id).await?;
+        for row in candidate_ids {
+            let summary = self.load_session_runtime_summary(&row.session_id).await?;
             if summary.can_dispatch_follow_up() {
-                session_ids.push(session.id);
+                session_ids.push(row.session_id);
             }
         }
         Ok(session_ids)

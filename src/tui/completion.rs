@@ -45,6 +45,8 @@ pub struct Completion {
     workdir: PathBuf,
     /// Sandbox directory (lower priority).
     sandbox: PathBuf,
+    /// Whether `/sandbox` is available for the current session.
+    sandbox_available: bool,
 }
 
 impl std::fmt::Debug for Completion {
@@ -68,7 +70,13 @@ impl Completion {
             file_matcher: None,
             workdir: PathBuf::new(),
             sandbox: PathBuf::new(),
+            sandbox_available: true,
         }
+    }
+
+    /// Set whether `/sandbox` should appear in slash completion.
+    pub const fn set_sandbox_available(&mut self, available: bool) {
+        self.sandbox_available = available;
     }
 
     /// Set directories for file completion.
@@ -184,6 +192,7 @@ impl Completion {
         let query_lower = self.query.to_lowercase();
         self.items = SlashCommand::ALL
             .into_iter()
+            .filter(|&command| self.sandbox_available || command != SlashCommand::Sandbox)
             .map(SlashCommand::spec)
             .filter(|spec| {
                 query_lower.is_empty() || spec.name.to_lowercase().contains(&query_lower)
