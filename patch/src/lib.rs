@@ -177,8 +177,9 @@ fn load_file(
 ///
 /// Add and Delete semantics live here: a bare `*** Delete File:` directive
 /// removes the file unconditionally, and every key is the literal patch path.
-/// Update hunks are matched strictly first and leniently on failure; a hunk
-/// matching more than one place is an error rather than a guess.
+/// Update hunks are matched exactly first and, when the exact text is absent,
+/// with all whitespace removed; a hunk matching more than one place in the
+/// step that runs is an error rather than a guess.
 fn apply_actions(
     actions: &[Action],
     files: &HashMap<String, String>,
@@ -670,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_leniently_when_whitespace_differs() {
+    fn matches_without_whitespace_when_whitespace_differs() {
         let dir = tempdir().expect("tempdir");
         write(dir.path(), "ws.txt", "line   \nnext\n");
         let patch = "*** Begin Patch\n*** Update File: ws.txt\n@@\n-line\n+LINE\n*** End Patch";
@@ -710,7 +711,7 @@ mod tests {
         write(dir.path(), "a.txt", content);
         let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n two\n-three\n+THREE\n@@\n-five\n+FIVE\n*** End Patch";
         let located = locate(patch, content);
-        assert_eq!(located.whitespace, super::Whitespace::Strict);
+        assert_eq!(located.whitespace, Some(super::Whitespace::Strict));
         assert_eq!(located.ranges, [Some(1..3), Some(4..5)]);
         assert_eq!(
             located_lines(content, &located),
@@ -741,10 +742,60 @@ mod tests {
         write(dir.path(), "ws.txt", content);
         let patch = "*** Begin Patch\n*** Update File: ws.txt\n@@\n-line\n+LINE\n*** End Patch";
         let located = locate(patch, content);
-        assert_eq!(located.whitespace, super::Whitespace::Lenient);
+        assert_eq!(located.whitespace, Some(super::Whitespace::Free));
         assert_eq!(located.ranges, [Some(1..2)]);
 
         apply_patch_text(patch, dir.path()).expect("patch applies");
         assert_eq!(read(dir.path(), "ws.txt"), "keep\nLINE\nnext\n");
+    }
+
+    #[test]
+    fn rewrapped_hunk_locates_the_whole_region_and_applies() {
+        let dir = tempdir().expect("tempdir");
+        let content =
+            "fn main() {\n    call(\n        alpha,\n        beta,\n    );\n    done();\n}\n";
+        write(dir.path(), "wrap.rs", content);
+        let patch = "*** Begin Patch\n*** Update File: wrap.rs\n@@\n-    call(alpha, beta,);\n+    call(alpha, gamma);\n*** End Patch";
+        let located = locate(patch, content);
+        assert_eq!(located.whitespace, Some(super::Whitespace::Free));
+        assert_eq!(located.ranges, [Some(1..5)]);
+
+        apply_patch_text(patch, dir.path()).expect("patch applies");
+        assert_eq!(
+            read(dir.path(), "wrap.rs"),
+            "fn main() {\n    call(alpha, gamma);\n    done();\n}\n"
+        );
+    }
+
+    #[test]
+    fn exact_ambiguity_is_reported_and_changes_nothing() {
+        let dir = tempdir().expect("tempdir");
+        write(dir.path(), "dup.txt", "x\n x\nx\n");
+        let patch = "*** Begin Patch\n*** Update File: dup.txt\n@@\n-x\n+y\n*** End Patch";
+        let error = apply_patch_text(patch, dir.path()).expect_err("ambiguous");
+        assert!(matches!(error, PatchError::Ambiguous { .. }), "{error}");
+        assert_eq!(read(dir.path(), "dup.txt"), "x\n x\nx\n");
+    }
+
+    #[test]
+    fn whitespace_free_ambiguity_is_its_own_error() {
+        let dir = tempdir().expect("tempdir");
+        write(dir.path(), "dup.txt", "f(a,b)\nf(a,  b)\n");
+        let patch = "*** Begin Patch\n*** Update File: dup.txt\n@@\n-f(a, b)\n+g()\n*** End Patch";
+        let error = apply_patch_text(patch, dir.path()).expect_err("ambiguous");
+        assert!(
+            matches!(error, PatchError::AmbiguousIgnoringWhitespace { .. }),
+            "{error}"
+        );
+        assert_eq!(read(dir.path(), "dup.txt"), "f(a,b)\nf(a,  b)\n");
+    }
+
+    #[test]
+    fn absent_text_is_a_conflict() {
+        let dir = tempdir().expect("tempdir");
+        write(dir.path(), "none.txt", "a\nb\n");
+        let patch = "*** Begin Patch\n*** Update File: none.txt\n@@\n-c d\n+x\n*** End Patch";
+        let error = apply_patch_text(patch, dir.path()).expect_err("conflict");
+        assert!(matches!(error, PatchError::Conflict { .. }), "{error}");
     }
 }

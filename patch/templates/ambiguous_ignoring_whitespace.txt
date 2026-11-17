@@ -1,0 +1,2 @@
+Ambiguous patch: in {{ path }}: hunk {{ hunk }}: the exact text was not found, and the text with all whitespace removed matches at {{ matches.len() }} places; add surrounding context or an `@@ anchor` line to select one. Lines marked `>` are the matched ones:
+{% include "excerpts.txt" %}

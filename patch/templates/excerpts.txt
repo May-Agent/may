@@ -1,0 +1,4 @@
+{% for found in matches %}
+match {{ loop.index }}, file lines {{ found.first }}-{{ found.last }}:
+{% for line in found.lines %}{{ line.marker() }} {{ line.number }}| {{ line.text }}
+{% endfor %}{% endfor %}
