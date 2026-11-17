@@ -62,10 +62,10 @@ heel = { version = "0.10.1", default-features = false }
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
 acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
 
-# repo-search daemon client; its crate version is 0.0.9 inside the
-# v0.0.14 binary pinned in `src/tools/host-programs.json`. Not published
-# past 0.0.4 on crates.io.
-repo-search-client = { git = "https://github.com/May-Agent/repo-search", branch = "main", default-features = false, features = ["launcher"] }
+# repo-search daemon client; the daemon refuses a client of another version,
+# so it is the version inside the v0.0.15 binary pinned in
+# `src/tools/host-programs.json`.
+repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
 async-lock = "3"
 
 # Container runtime (Docker/OrbStack/Podman)

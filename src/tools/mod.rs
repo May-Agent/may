@@ -48,7 +48,7 @@ const MAY_ARTIFACTS_SHA256: &str =
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
-    "3377752efbdf34537d47c97d4474c2204df07cc7e735380ba631e28265b513fe";
+    "319ba5ad1f768fd22dca750d2b77bf22d626bc1ef367542c10b61ece42d90fb7";
 
 /// Loads the distribution: May's embedded, hash-pinned tools, assembled from
 /// `third-party-tools.json`, `tool-artifacts.json` (`bash`, `apply_patch` and
