@@ -5651,8 +5651,23 @@ mod tests {
         }
         // Inner padding: the first column of the block stays empty.
         assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
-        // The chat beside it is not painted with the block colour.
-        assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+        // The gap beside the sidebar stays unpainted on every row, including
+        // the input band at the bottom, while the input band ends right before it.
+        let gap = crate::tui::ui::band::H_PADDING;
+        for y in 0..height {
+            for x in (left - gap)..left {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    BLOCK_BG,
+                    "gap column {x} on row {y} must not fuse with sidebar"
+                );
+            }
+        }
+        assert_eq!(
+            buffer[(left - gap - 1, height - 1)].bg,
+            BLOCK_BG,
+            "input band reaches the left side of the sidebar gap"
+        );
     }
 
     fn sidebar_screen(app: &mut App, width: u16, height: u16) -> String {
