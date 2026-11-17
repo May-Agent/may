@@ -2154,6 +2154,66 @@ fn run_agent_loop<'a>(
     })
 }
 
+/// Delete all rows a turn wrote after `turn_boundary`, restore alerts it
+/// consumed, and notify attached clients that its prompt was withdrawn.
+async fn withdraw_unanswered_turn(
+    state: &Arc<DaemonState>,
+    req: &ChatRequest,
+    sink: &mut impl ChatSink,
+    turn_boundary: i32,
+    turn_consumed_alerts: ConsumedAlerts,
+) -> Result<(), AgentLoopError> {
+    state
+        .db()
+        .delete_messages_from(req.session_id.as_str(), i64::from(turn_boundary) + 1)
+        .await?;
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    turn_consumed_alerts
+        .restore(state, req.session_id.as_str())
+        .await?;
+    sink.on_prepared(None);
+    sink.on_withdrawn(&req.content, &req.attachments).await;
+    Ok(())
+}
+
+/// Settle a turn cancelled while `prepare_agent_for_request` was running
+/// (for instance, blocked on repo trust or checkout preflight `ask_user`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors run_agent_loop_attempts state"
+)]
+async fn finish_cancelled_preparation(
+    state: &Arc<DaemonState>,
+    req: &ChatRequest,
+    sink: &mut impl ChatSink,
+    guard: &SessionRunGuard,
+    kind: &TurnKind,
+    turn_boundary: i32,
+    continue_from_transcript: bool,
+    turn_consumed_alerts: ConsumedAlerts,
+    reason: &'static str,
+) -> Result<AgentRunResult, AgentLoopError> {
+    state
+        .ask_user_approver
+        .interrupt_session(req.session_id.as_str())
+        .await;
+    if reason == USER_CANCELLED
+        && !continue_from_transcript
+        && !kind.is_resume()
+        && req.pending_entry_id.is_none()
+    {
+        withdraw_unanswered_turn(state, req, sink, turn_boundary, turn_consumed_alerts).await?;
+        return Err(AgentLoopError::Cancelled(reason));
+    }
+    if let Some(entry_id) = req.pending_entry_id {
+        let _ = state
+            .db()
+            .release_pending_claim(entry_id, guard.fence())
+            .await;
+    }
+    Err(AgentLoopError::Cancelled(reason))
+}
+
 /// Shared agent event loop used by both streaming and non-streaming chat.
 ///
 /// Handles: retry logic, agent event processing, history persistence,
@@ -2227,6 +2287,43 @@ fn run_agent_loop_attempts<'a>(
                 "chat stream start sent"
             );
 
+            let prepared = tokio::select! {
+                biased;
+                cancel = guard.cancellation().recv() => {
+                    return finish_cancelled_preparation(
+                        state,
+                        req,
+                        &mut *sink,
+                        guard,
+                        kind,
+                        turn_boundary,
+                        continue_from_transcript,
+                        turn_consumed_alerts,
+                        cancellation_reason_of(&cancel),
+                    )
+                    .await;
+                }
+                result = prepare_agent_for_request(
+                    state,
+                    req,
+                    guard.fence(),
+                    persist_user_message && attempt == 0 && !kind.is_resume(),
+                    use_persisted_context_snapshot,
+                    TurnAttempt {
+                        provider_attempt: candidate,
+                        // A resubmitting retry rebuilds context only up to the
+                        // turn boundary; a resume retry replays the committed
+                        // transcript in full.
+                        turn_boundary: if continue_from_transcript {
+                            None
+                        } else {
+                            Some(turn_boundary)
+                        },
+                        retained_agent: retained_agent.take(),
+                    },
+                    kind,
+                ) => result,
+            };
             let PreparedAgent {
                 session_id,
                 mut agent,
@@ -2241,30 +2338,24 @@ fn run_agent_loop_attempts<'a>(
                 consumed_alerts,
                 reasoning_effort,
                 cwd,
-            } = match prepare_agent_for_request(
-                state,
-                req,
-                guard.fence(),
-                persist_user_message && attempt == 0 && !kind.is_resume(),
-                use_persisted_context_snapshot,
-                TurnAttempt {
-                    provider_attempt: candidate,
-                    // A resubmitting retry rebuilds context only up to the
-                    // turn boundary; a resume retry replays the committed
-                    // transcript in full.
-                    turn_boundary: if continue_from_transcript {
-                        None
-                    } else {
-                        Some(turn_boundary)
-                    },
-                    retained_agent: retained_agent.take(),
-                },
-                kind,
-            )
-            .await
-            {
+            } = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
+                    if !guard.cancellation().is_empty() {
+                        let cancel = guard.cancellation().try_recv();
+                        return finish_cancelled_preparation(
+                            state,
+                            req,
+                            &mut *sink,
+                            guard,
+                            kind,
+                            turn_boundary,
+                            continue_from_transcript,
+                            turn_consumed_alerts,
+                            cancellation_reason_of(&cancel),
+                        )
+                        .await;
+                    }
                     // Clients waiting for the run's start see it fail.
                     sink.on_prepared(turn_user_message_id);
                     let _ = sink
@@ -2655,24 +2746,14 @@ fn run_agent_loop_attempts<'a>(
                     && req.pending_entry_id.is_none()
                     && turn_user_message_id.is_some()
                 {
-                    // The rows the turn added, the user message and the
-                    // hidden context before it. The model transcript holds
-                    // nothing of the turn: checkpoints are written only at
-                    // a tool-cycle boundary or a finished run, and this
-                    // run reached neither. The agent is dropped with the
-                    // cancelled run, so the next turn rebuilds its context
-                    // from that transcript.
-                    state
-                        .db()
-                        .delete_messages_from(session_id.as_str(), i64::from(turn_boundary) + 1)
-                        .await?;
-                    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-                    // The alert's row went with the turn; the model has yet
-                    // to see it, so the next turn delivers it.
-                    turn_consumed_alerts
-                        .restore(state, session_id.as_str())
-                        .await?;
-                    sink.on_withdrawn(&req.content, &req.attachments).await;
+                    withdraw_unanswered_turn(
+                        state,
+                        req,
+                        &mut *sink,
+                        turn_boundary,
+                        turn_consumed_alerts,
+                    )
+                    .await?;
                     record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
                     return Err(AgentLoopError::Cancelled(reason));
                 }
@@ -7474,6 +7555,105 @@ mod tests {
         assert!(
             stopped_recorded,
             "client disconnect must persist ToolEventRecord::Stopped for active terminal calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_run_blocked_in_repo_gate_ask_user_settles_and_withdraws() {
+        let provider = stub_provider(vec![sse_text("ok")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        state
+            .db()
+            .set_session_repo("session", Some("github:acme/app"))
+            .await
+            .expect("bind repo");
+
+        let mut sink = TestSink::default();
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::Steer,
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire");
+
+        let run_and_release = async {
+            let result = super::run_agent_loop(
+                &state,
+                &req,
+                &mut sink,
+                &guard,
+                true,
+                false,
+                &super::TurnKind::Prompt,
+            )
+            .await;
+            guard
+                .finish_idle(crate::session::RunOutcome::Cancelled)
+                .await
+                .expect("finish idle");
+            result
+        };
+
+        let stop_future = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if state
+                        .runtime_service
+                        .get("session")
+                        .await
+                        .expect("runtime")
+                        .waiting_ask_user
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("repo gate should register blocking ask_user");
+
+            let runtime = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::stop_session(&state, "session", crate::session::CancelReason::User),
+            )
+            .await
+            .expect("stop_session must not hang while repo gate waits")
+            .expect("stop_session succeeds");
+            assert_eq!(runtime.state, crate::session::SessionRuntimeState::Idle);
+        };
+
+        let (result, ()) = tokio::join!(run_and_release, stop_future);
+        assert!(matches!(
+            result,
+            Err(super::AgentLoopError::Cancelled(reason)) if reason == super::USER_CANCELLED
+        ));
+        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
+
+        let runtime = state
+            .runtime_service
+            .get("session")
+            .await
+            .expect("runtime after stop");
+        assert_eq!(runtime.state, crate::session::SessionRuntimeState::Idle);
+        assert!(runtime.waiting_ask_user.is_none());
+
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert!(
+            history.messages().is_empty(),
+            "ask_user_request written during cancelled preparation must be removed: {:?}",
+            history.messages()
         );
     }
 }

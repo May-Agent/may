@@ -1008,6 +1008,15 @@ impl AskUserApprover {
             }
         }
 
+        if request.is_closed() {
+            if let Some(session_id) = request_session_id.as_deref() {
+                self.interrupt(session_id, &request_id).await;
+            } else {
+                self.live_responses.take(&request_id);
+            }
+            return;
+        }
+
         // A closed registry means the server is going down; dropping the
         // request tells the asking run it was interrupted.
         if let Ok(answers) = rx.recv().await {
@@ -1102,6 +1111,28 @@ impl AskUserApprover {
                 .await
         {
             tracing::warn!(%error, "failed to clear an interrupted ask-user request");
+        }
+    }
+
+    /// Interrupt any blocking pending question for `session_id`: closes its
+    /// live response waiter and clears the persisted blocking request.
+    pub(crate) async fn interrupt_session(&self, session_id: &str) {
+        let Some(runtime) = &self.runtime_service else {
+            return;
+        };
+        match runtime.get(session_id).await {
+            Ok(summary) => {
+                if let Some(pending) = summary.waiting_ask_user {
+                    self.interrupt(session_id, &pending.id).await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    %error,
+                    "failed to load runtime while interrupting session ask-user"
+                );
+            }
         }
     }
 }
