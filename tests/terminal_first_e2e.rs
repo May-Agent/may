@@ -3832,10 +3832,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
 
 #[tokio::test]
 #[file_serial]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "container runtimes are expected only on Linux"
-)]
+#[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn ui_stream_stop_mid_response_persists_partial_assistant_text_in_container() {
     stream_stop_mid_response_persists_partial_assistant_text(ChatEnvironment::Container).await;
 }
@@ -3953,10 +3950,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
 /// context.
 #[tokio::test]
 #[file_serial]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "container runtimes are expected only on Linux"
-)]
+#[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn ui_chat_executes_terminal_and_terminal_input_round_trip_in_container() {
     terminal_and_terminal_input_round_trip(ChatEnvironment::Container).await;
 }
@@ -4205,10 +4199,7 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
 
 #[tokio::test]
 #[file_serial]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "container runtimes are expected only on Linux"
-)]
+#[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn ui_chat_turns_on_one_session_prepare_tools_once_in_container() {
     chat_turns_on_one_session_prepare_tools_once(ChatEnvironment::Container).await;
 }
@@ -4909,20 +4900,14 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
 
 #[tokio::test]
 #[file_serial]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "container runtimes are expected only on Linux"
-)]
+#[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn container_profile_inline_script_task_reads_its_trigger_file() {
     container_task_reads_its_trigger_file(TaskScriptSource::Inline).await;
 }
 
 #[tokio::test]
 #[file_serial]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "container runtimes are expected only on Linux"
-)]
+#[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn container_profile_script_file_task_reads_its_trigger_file() {
     container_task_reads_its_trigger_file(TaskScriptSource::File).await;
 }
@@ -6162,10 +6147,7 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
 /// gets none.
 #[tokio::test]
 #[file_serial]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "container runtimes are expected only on Linux"
-)]
+#[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn container_and_local_commands_share_the_daemons_job_pool() {
     const POOL: i64 = 3;
     let mock = MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(
