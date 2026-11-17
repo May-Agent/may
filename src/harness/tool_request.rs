@@ -32,6 +32,12 @@ impl<Args, Response> ToolRequest<Args, Response> {
     pub fn respond(self, response: Response) -> Result<(), async_channel::TrySendError<Response>> {
         self.response_tx.try_send(response)
     }
+
+    /// Whether the requester has dropped its response receiver.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.response_tx.is_closed()
+    }
 }
 
 /// Request broker for UI-mediated tools.
