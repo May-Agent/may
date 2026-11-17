@@ -750,6 +750,23 @@ impl ChatStream {
         self.push_element(ChatElement::UsageReport(report));
     }
 
+    /// Whether the stream holds at least one conversation message or turn
+    /// element (excluding the welcome banner, notices, warnings, and errors).
+    #[must_use]
+    pub fn has_messages(&self) -> bool {
+        self.elements.iter().any(|elem| {
+            matches!(
+                elem,
+                ChatElement::UserMessage { .. }
+                    | ChatElement::AssistantText { .. }
+                    | ChatElement::ToolCall { .. }
+                    | ChatElement::Recap { .. }
+                    | ChatElement::Thinking { .. }
+                    | ChatElement::WorkedFor { .. }
+            )
+        })
+    }
+
     /// User prompts that can be rewound to, oldest first, each carrying
     /// the file changes attributed to the turn it started (tool calls
     /// between this prompt and the next).

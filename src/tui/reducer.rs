@@ -574,6 +574,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::SandboxOpenFailed(error) => {
+            app.chat.push_error(&error);
+            app.scroll = usize::MAX;
+            Ok(None)
+        }
     }
 }
 
