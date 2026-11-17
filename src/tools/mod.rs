@@ -43,7 +43,7 @@ const THIRD_PARTY_TOOLS_SHA256: &str =
 /// SHA-256 of `tool-artifacts.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const MAY_ARTIFACTS_SHA256: &str =
-    "8542ed633092dbbab94e323824dda3f40b33da81b8875f00e387a90808257d81";
+    "4f7a5cb418ab7f02bc009199ea8e86388d78297010224c098dce57edec735642";
 
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]

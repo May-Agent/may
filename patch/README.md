@@ -26,8 +26,9 @@ PATCH
 
 Supported operations: `Add File`, `Update File` (with `*** Move to:`),
 `Delete File`, `*** End of File` anchors and `@@` context. Context lines
-must match the file verbatim (the engine retries in whitespace-lenient
-mode before failing). Ambiguous context is diagnosed, never guessed; every
+must match the file verbatim; only when the exact text is absent does the
+engine match with all whitespace removed, line breaks included, over whole
+file lines. Ambiguous context is diagnosed in either step, never guessed; every
 file is validated before any write, so a bad patch leaves the tree
 untouched — a validation guarantee, not a crash-atomicity promise.
 
@@ -36,10 +37,11 @@ untouched — a validation guarantee, not a crash-atomicity promise.
 This crate owns the whole engine. `src/parse.rs` parses the patch into typed
 actions; `src/matcher.rs` places each hunk: its old side (context and `-`
 lines) must match the file contiguously at or after the previous hunk's end
-and after the `@@` anchor line, first with exact whitespace, then
-whitespace-insensitively. Zero matches is a conflict naming the hunk and the
-first line that did not match; several matches is an ambiguity error listing
-the lines. File-level semantics — unconditional delete, literal paths, mode
+and after the `@@` anchor line, first with exact whitespace, then, only when
+the exact text matches nowhere, with all whitespace removed. Zero matches is a
+conflict naming the hunk and the first line that did not match; several
+matches in the step that runs is an ambiguity error listing the lines, and an
+exact ambiguity never falls through to the whitespace-free step. File-level semantics — unconditional delete, literal paths, mode
 preservation, all-or-nothing validation — live in `src/lib.rs`.
 
 ## Artifact build

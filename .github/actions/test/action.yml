@@ -51,9 +51,13 @@ runs:
     - name: Install nasm
       if: runner.os == 'Linux' && runner.arch == 'X64'
       uses: ./.github/actions/install-nasm
+    # Builds the test targets the nextest step runs, so that step compiles
+    # nothing; `cargo build` would build the non-test libraries instead, which
+    # no test uses. The integration tests and `--all-targets` still build the
+    # `may` binary the next steps upload.
     - name: cargo build
       shell: bash
-      run: cargo build --locked ${{ inputs.cargo-flags }} --timings
+      run: cargo test --locked ${{ inputs.cargo-flags }} --no-run --timings
     # Every run keeps the debug may it built, so a commit can be tested on
     # another machine without building it there. It is packed as a tarball
     # because artifacts drop the executable bit.

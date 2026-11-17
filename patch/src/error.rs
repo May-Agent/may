@@ -45,6 +45,19 @@ pub enum PatchError {
         matches: Vec<Excerpt>,
     },
 
+    /// A hunk's context and deleted lines are absent exactly, and match in
+    /// more than one place once all whitespace is removed.
+    #[error("{}", AmbiguousIgnoringWhitespaceMessage::new(.path, .hunk, .matches))]
+    AmbiguousIgnoringWhitespace {
+        /// The patch-relative path of the file being updated.
+        path: String,
+        /// The 1-based number of the ambiguous hunk within that file's update.
+        hunk: usize,
+        /// Each run of whole file lines the hunk's old side matches without
+        /// whitespace, with the lines around it.
+        matches: Vec<Excerpt>,
+    },
+
     /// A `Delete File` directive's content lines differ from the file.
     #[error("Patch conflict: in {0}: content to delete does not match the file's content")]
     DeleteMismatch(String),
@@ -113,6 +126,24 @@ struct AmbiguousMessage<'a> {
 }
 
 impl<'a> AmbiguousMessage<'a> {
+    const fn new(path: &'a str, hunk: &usize, matches: &'a [Excerpt]) -> Self {
+        Self {
+            path,
+            hunk: *hunk,
+            matches,
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "ambiguous_ignoring_whitespace.txt")]
+struct AmbiguousIgnoringWhitespaceMessage<'a> {
+    path: &'a str,
+    hunk: usize,
+    matches: &'a [Excerpt],
+}
+
+impl<'a> AmbiguousIgnoringWhitespaceMessage<'a> {
     const fn new(path: &'a str, hunk: &usize, matches: &'a [Excerpt]) -> Self {
         Self {
             path,

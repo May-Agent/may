@@ -62,9 +62,9 @@ jobs:
             git diff --name-only "${range}" | tee /dev/stderr | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
           fi
 
-  # The container tests in test-ubuntu pull the workspace image, whose tag is a
-  # content hash of its inputs; it is built and pushed here first, and skipped
-  # when that tag already exists. Same scope gate as the tests.
+  # The container tests in container-acceptance pull the workspace image, whose
+  # tag is a content hash of its inputs; it is built and pushed here first, and
+  # skipped when that tag already exists. Same scope gate as the tests.
   container-image:
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
@@ -250,8 +250,10 @@ jobs:
   # Runs a command of a container session through `may exec` in a real
   # Docker container of the workspace image, and checks it runs at the
   # configured nice level, runs a prepared tool from the tools mount and
-  # reaches May's IPC commands through the relayed endpoint. The test is
-  # ignored in the plain test jobs, which only compile it.
+  # reaches May's IPC commands through the relayed endpoint, along with every
+  # other test that pulls the workspace image. They run here, after
+  # container-image has pushed the image for their tag; the plain test jobs
+  # start without waiting for it and only compile them.
   container-acceptance:
     name: Container Acceptance
     needs: [scope, container-image]
@@ -282,11 +284,17 @@ jobs:
       - name: Install nasm
         if: runner.arch == 'X64'
         uses: ./.github/actions/install-nasm
-      - name: Run the container acceptance test
+      - name: Run the container tests
         run: >
           cargo test --locked --timings --test terminal_first_e2e
           -- --ignored --exact --nocapture
           a_container_command_runs_at_the_configured_nice_and_reaches_ipc
+          ui_stream_stop_mid_response_persists_partial_assistant_text_in_container
+          ui_chat_executes_terminal_and_terminal_input_round_trip_in_container
+          ui_chat_turns_on_one_session_prepare_tools_once_in_container
+          container_profile_inline_script_task_reads_its_trigger_file
+          container_profile_script_file_task_reads_its_trigger_file
+          container_and_local_commands_share_the_daemons_job_pool
       - name: Upload cargo timings
         if: always()
         uses: actions/upload-artifact@v4
