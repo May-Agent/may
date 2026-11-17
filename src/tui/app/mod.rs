@@ -7347,7 +7347,7 @@ mod tests {
 
         // Unpersisted prompt while DB only holds an ask_user_request row at index 0.
         app.chat.push_user("Hi", Vec::new(), 0);
-        app.session_manager.record_unpersisted(ChatMessage {
+        app.session_manager.record_unpersisted(crate::ChatMessage {
             id: Some(1),
             role: MessageRole::AskUserRequest,
             content: String::new(),
@@ -7369,7 +7369,7 @@ mod tests {
 
         // Once the daemon persists ask_user_response + user("Hi") + extra unpersisted prompt:
         app.session_manager
-            .record_unpersisted(ChatMessage::user("Hi"));
+            .record_unpersisted(crate::ChatMessage::user("Hi"));
         app.chat.push_user("pending", Vec::new(), 0);
         assert!(app.open_rewind_picker());
         let AppMode::Rewind(state) = &app.mode else {
