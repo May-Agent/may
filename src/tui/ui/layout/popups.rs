@@ -464,26 +464,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 .split(inner_area);
 
             // Render search input
-            let search_line = if app.skill_search.is_empty() {
-                Line::from(Span::styled(
-                    "Type to search...",
-                    Style::default().fg(Color::DarkGray),
-                ))
-            } else {
-                Line::from(vec![
-                    Span::styled("Search: ", Style::default().fg(Color::Cyan)),
-                    Span::styled(&app.skill_search, Style::default().fg(Color::Yellow)),
-                ])
-            };
-            frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
-            let caret_x = chunks[0].x
-                + 8
-                + u16::try_from(UnicodeWidthStr::width(app.skill_search.as_str()))
-                    .unwrap_or(u16::MAX);
-            frame.set_cursor_position((
-                caret_x.min(chunks[0].right().saturating_sub(1)),
-                chunks[0].y,
-            ));
+            super::render_search_line(frame, chunks[0], &app.skill_search);
 
             // Render skill list
             let filtered = app.filtered_skills();

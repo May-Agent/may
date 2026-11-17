@@ -894,6 +894,32 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Render a picker's search prompt (`"Type to search..."` when empty, or
+/// `"Search: <query>"` otherwise) into `area` and place the terminal cursor at
+/// the active insertion column.
+pub(super) fn render_search_line(frame: &mut Frame, area: Rect, query: &str) {
+    const PREFIX: &str = "Search: ";
+    let search_line = if query.is_empty() {
+        Line::from(Span::styled(
+            "Type to search...",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(PREFIX, Style::default().fg(Color::Cyan)),
+            Span::styled(query, Style::default().fg(Color::Yellow)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), area);
+    let caret_col = if query.is_empty() {
+        0
+    } else {
+        PREFIX.len() + UnicodeWidthStr::width(query)
+    };
+    let caret_x = area.x + u16::try_from(caret_col).unwrap_or(u16::MAX);
+    frame.set_cursor_position((caret_x.min(area.right().saturating_sub(1)), area.y));
+}
+
 /// Render model select popup (anchored near input area): a search line, the
 /// filtered selector list and a hint footer. A catalog refresh in flight is
 /// named in the title so the list is never mistaken for final.
@@ -929,26 +955,7 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(inner_area);
 
-    let search_line = if app.model_select_query.is_empty() {
-        Line::from(Span::styled(
-            "Type to search...",
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
-            Span::styled(&app.model_select_query, Style::default().fg(Color::Yellow)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
-    let caret_x = chunks[0].x
-        + 8
-        + u16::try_from(UnicodeWidthStr::width(app.model_select_query.as_str()))
-            .unwrap_or(u16::MAX);
-    frame.set_cursor_position((
-        caret_x.min(chunks[0].right().saturating_sub(1)),
-        chunks[0].y,
-    ));
+    render_search_line(frame, chunks[0], &app.model_select_query);
 
     // Keep the highlighted row inside the visible window as the selection
     // moves past either edge of the sheet.
@@ -3697,5 +3704,36 @@ mod tests {
             assert!(preview.width() <= 72, "{unit}: {preview}");
         }
         assert_eq!(super::prompt_preview("  你好\n世界"), "你好");
+    }
+
+    #[test]
+    fn search_line_places_cursor_at_start_when_empty_and_after_query() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        let area = Rect::new(5, 2, 40, 2);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+
+        terminal
+            .draw(|frame| super::render_search_line(frame, area, ""))
+            .unwrap();
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(area.x, area.y)
+        );
+        let buf = terminal.backend().buffer();
+        let row: String = (area.x..area.right())
+            .map(|x| buf[(x, area.y)].symbol())
+            .collect();
+        assert!(row.starts_with("Type to search..."), "{row:?}");
+
+        let query = "模型 モデル 모델";
+        terminal
+            .draw(|frame| super::render_search_line(frame, area, query))
+            .unwrap();
+        let expected_x = area.x + 8 + u16::try_from(query.width()).unwrap();
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(expected_x, area.y)
+        );
     }
 }
