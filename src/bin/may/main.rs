@@ -580,10 +580,8 @@ where
                 report_startup_failure(&mut app, &e);
             }
         }
-        app.status = None;
-    } else {
-        app.status = None;
     }
+    app.status = None;
 
     // Main event loop - only receives from channels, never blocks on agent processing
     main_event_loop(
