@@ -648,6 +648,7 @@ impl App {
             &crate::secrets::SecretStore::new(session_manager.may_dir()),
             &config,
         );
+        let current_model = config.last_model.as_ref().map(ToString::to_string);
 
         Self {
             secret_patterns: crate::secrets::SecretPatterns::default(),
@@ -725,7 +726,7 @@ impl App {
             activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
             compaction: crate::tui::state::CompactionMeter::default(),
-            current_model: None,
+            current_model,
             mcp_servers: Vec::new(),
             mcp_selected: 0,
             mcp_add_mode: McpAddMode::None,

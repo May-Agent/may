@@ -478,7 +478,8 @@ where
     let paths = may_agent::daemon::DaemonPaths::user()?;
     let runtime_deps = match may_agent::daemon::lifecycle::ensure_running(&paths, |_| {}).await {
         Ok(client) => {
-            app.status = None;
+            app.set_status("Loading profiles…");
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
             app.btw_daemon = Some(client.clone());
             may_agent::tui::remote::spawn_build_watch(
                 client.clone(),
@@ -563,6 +564,8 @@ where
     }
     if startup_gate.is_none() {
         if let Some(session_id) = pending_resume.take() {
+            app.set_status("Resuming session…");
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
             let build = resume_into_session(&mut app, &mut worker, &runtime_deps, &session_id)
                 .await
                 .with_context(|| format!("cannot resume session {}", session_id.as_str()))?;
@@ -570,11 +573,16 @@ where
                 purpose: WorkerBuildPurpose::Session,
                 build,
             });
-        } else if app.is_configured()
-            && let Err(e) = runtime_deps.begin_new_session(&mut app, &mut worker).await
-        {
-            report_startup_failure(&mut app, &e);
+        } else if app.is_configured() {
+            app.set_status("Starting session…");
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            if let Err(e) = runtime_deps.begin_new_session(&mut app, &mut worker).await {
+                report_startup_failure(&mut app, &e);
+            }
         }
+        app.status = None;
+    } else {
+        app.status = None;
     }
 
     // Main event loop - only receives from channels, never blocks on agent processing
