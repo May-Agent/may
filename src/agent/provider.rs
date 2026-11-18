@@ -148,6 +148,10 @@ fn resolve_model_selector(
     Ok(provider)
 }
 
+/// Maximum silence allowed between consecutive events on a model response
+/// stream before aborting so a hanging upstream cannot wedge a session.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Why a [`RedactedModel`] request failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RedactedError<E> {
@@ -157,6 +161,9 @@ pub enum RedactedError<E> {
     /// The inner model failed.
     #[error(transparent)]
     Model(E),
+    /// The model response stream produced no event within the idle timeout.
+    #[error("model stream timed out after {}s without a response", .0.as_secs())]
+    StreamTimeout(std::time::Duration),
 }
 
 impl<E: Classify> Classify for RedactedError<E> {
@@ -164,6 +171,7 @@ impl<E: Classify> Classify for RedactedError<E> {
         match self {
             Self::Secrets(_) => Failure::permanent(),
             Self::Model(error) => error.failure(),
+            Self::StreamTimeout(_) => Failure::transient(),
         }
     }
 }
@@ -216,6 +224,30 @@ impl<M> RedactedModel<M> {
     }
 }
 
+/// Aborts `stream` with [`RedactedError::StreamTimeout`] if no item arrives
+/// within `timeout`.
+fn with_stream_idle_timeout<S, E>(
+    stream: Pin<Box<S>>,
+    timeout: std::time::Duration,
+) -> impl Stream<Item = Result<LlmEvent, RedactedError<E>>> + Send
+where
+    S: Stream<Item = Result<LlmEvent, RedactedError<E>>> + Send + ?Sized,
+    E: Send,
+{
+    futures_lite::stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+        let next = futures_lite::future::race(async { stream.next().await.map(Ok) }, async {
+            async_io::Timer::after(timeout).await;
+            Some(Err(RedactedError::StreamTimeout(timeout)))
+        })
+        .await?;
+        match next {
+            Ok(item) => Some((item, Some(stream))),
+            Err(timeout_err) => Some((Err(timeout_err), None)),
+        }
+    })
+}
+
 impl<M> LanguageModel for RedactedModel<M>
 where
     M: LanguageModel,
@@ -235,11 +267,12 @@ where
                     match self.redactor.current().await {
                         Ok(redactions) => {
                             redactions.redact_request(&mut request);
-                            Box::pin(
+                            let inner = Box::pin(
                                 self.inner
                                     .respond(request)
                                     .map(|event| event.map_err(RedactedError::Model)),
-                            )
+                            );
+                            Box::pin(with_stream_idle_timeout(inner, STREAM_IDLE_TIMEOUT))
                         }
                         Err(error) => Box::pin(futures_lite::stream::once(Err(
                             RedactedError::Secrets(error),
@@ -1137,5 +1170,28 @@ mod tests {
         assert!(message.contains("Fast"), "{message}");
         assert!(message.contains("ghost"), "{message}");
         assert!(message.contains("some-model"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_aborts_stalled_stream() {
+        let pending = Box::pin(futures_lite::stream::pending::<
+            Result<LlmEvent, RedactedError<std::convert::Infallible>>,
+        >());
+        let mut timed = Box::pin(with_stream_idle_timeout(
+            pending,
+            std::time::Duration::from_millis(20),
+        ));
+        let item = timed
+            .next()
+            .await
+            .expect("timed stream must yield a timeout error");
+        assert!(
+            matches!(item, Err(RedactedError::StreamTimeout(_))),
+            "expected StreamTimeout, got {item:?}"
+        );
+        assert!(
+            timed.next().await.is_none(),
+            "stream must terminate after timeout"
+        );
     }
 }

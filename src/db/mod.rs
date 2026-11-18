@@ -103,7 +103,11 @@ impl ChatDb {
         let options = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .pragma("synchronous", "NORMAL")
+            .pragma("temp_store", "MEMORY")
+            .pragma("cache_size", "-32000");
         Ok(SkyDb::connect_sqlite_with(options).await?)
     }
 

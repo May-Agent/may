@@ -354,6 +354,9 @@ impl App {
     /// Collect all unique models from config for model select.
     pub(super) fn collect_all_models(&self) -> Vec<String> {
         let mut models = Vec::new();
+        if let Some(last) = &self.config.last_model {
+            models.push(last.to_string());
+        }
         for m in &self.config.models.advanced {
             let selector = m.to_string();
             if !models.contains(&selector) {
