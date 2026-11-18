@@ -836,6 +836,27 @@ impl ChatStream {
         true
     }
 
+    /// Align each rendered [`ChatElement::UserMessage`]'s `history_index` with
+    /// the authoritative user rows of `messages`.
+    ///
+    /// Turns preceded by daemon-persisted rows (`ask_user_request`,
+    /// `hidden_context`) land at a higher index than `start_processing`
+    /// guessed before the daemon ran.
+    pub fn sync_user_history_indices(&mut self, messages: &[crate::session::ChatMessage]) {
+        let mut persisted = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, msg)| msg.role == crate::session::MessageRole::User)
+            .map(|(index, _)| index);
+        for elem in &mut self.elements {
+            if let ChatElement::UserMessage { history_index, .. } = elem
+                && let Some(index) = persisted.next()
+            {
+                *history_index = index;
+            }
+        }
+    }
+
     /// Drop the latest user message whose text is `content`, with everything
     /// after it (the turn's output and markers) — the stream's half of a
     /// withdrawn turn. Returns that message's attachments, `None` when no

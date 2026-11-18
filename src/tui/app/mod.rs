@@ -1215,7 +1215,24 @@ impl App {
     /// Open the rewind picker listing the session's user prompts.
     /// Returns `false` when there is nothing to rewind to.
     pub fn open_rewind_picker(&mut self) -> bool {
-        let targets = self.chat.rewind_targets();
+        let targets = if let Some(session) = self.session_manager.current() {
+            let messages = session.history.messages();
+            self.chat.sync_user_history_indices(messages);
+            let persisted_users = messages
+                .iter()
+                .filter(|msg| msg.role == MessageRole::User)
+                .count();
+            let mut targets = self.chat.rewind_targets();
+            targets.truncate(persisted_users);
+            targets.retain(|target| {
+                messages
+                    .get(target.history_index)
+                    .is_some_and(|msg| msg.role == MessageRole::User)
+            });
+            targets
+        } else {
+            self.chat.rewind_targets()
+        };
         if targets.is_empty() {
             return false;
         }
@@ -7397,6 +7414,53 @@ mod tests {
         assert!(!same_click_spot(line, 0, 6));
         // Off a char boundary there is no spot.
         assert!(!same_click_spot(line, 1, 3));
+    }
+
+    #[tokio::test]
+    async fn open_rewind_picker_syncs_indices_past_pre_user_rows_and_skips_unpersisted() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+
+        // Unpersisted prompt while DB only holds an ask_user_request row at index 0.
+        app.chat.push_user("Hi", Vec::new(), 0);
+        app.session_manager.record_unpersisted(crate::ChatMessage {
+            id: Some(1),
+            role: MessageRole::AskUserRequest,
+            content: String::new(),
+            attachments: Vec::new(),
+            timestamp: None,
+            tool_call_id: None,
+            stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
+            translation: None,
+            reading: None,
+            card: None,
+            thinking: None,
+        });
+        assert!(
+            !app.open_rewind_picker(),
+            "unpersisted prompt must not be offered as a rewind target"
+        );
+
+        // Once the daemon persists ask_user_response + user("Hi") + extra unpersisted prompt:
+        app.session_manager
+            .record_unpersisted(crate::ChatMessage::user("Hi"));
+        app.chat.push_user("pending", Vec::new(), 0);
+        assert!(app.open_rewind_picker());
+        let AppMode::Rewind(state) = &app.mode else {
+            panic!("expected rewind mode");
+        };
+        assert_eq!(state.targets.len(), 1);
+        assert_eq!(state.targets[0].content, "Hi");
+        assert_eq!(state.targets[0].history_index, 1);
+        assert_eq!(
+            app.chat
+                .prompt_rewind_payload(1)
+                .as_ref()
+                .map(|(c, _)| c.as_str()),
+            Some("Hi")
+        );
     }
 
     #[tokio::test]

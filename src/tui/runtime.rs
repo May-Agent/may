@@ -881,6 +881,9 @@ impl RuntimeDeps {
         // The daemon persisted the turn and names the session.
         if let Err(error) = app.session_manager.refresh_history().await {
             tracing::warn!(%error, "failed to reload the session history");
+        } else if let Some(session) = app.session_manager.current() {
+            app.chat
+                .sync_user_history_indices(session.history.messages());
         }
         title_gen.take();
     }
