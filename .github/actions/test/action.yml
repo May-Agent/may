@@ -83,8 +83,8 @@ runs:
       if: inputs.upload-e2e-bin == 'true'
       shell: bash
       run: |
-        bin="$(basename "$(find target/debug/deps -maxdepth 1 -type f -name 'terminal_first_e2e-*' | head -1)")"
-        tar -czf e2e-test-bin.tar.gz -C target/debug/deps "$bin"
+        path="$(find target/debug -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
+        tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
     - name: Upload the e2e test binary
       if: inputs.upload-e2e-bin == 'true'
       uses: actions/upload-artifact@v4
