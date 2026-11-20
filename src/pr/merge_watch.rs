@@ -155,7 +155,8 @@ pub struct FailedCheck {
 }
 
 impl CheckContext {
-    fn failed_required(&self) -> Option<FailedCheck> {
+    /// The check when it ended badly, required or not.
+    fn failed(&self) -> Option<FailedCheck> {
         match self {
             Self::CheckRun {
                 name,
@@ -167,7 +168,6 @@ impl CheckContext {
                         | CheckConclusion::Cancelled
                         | CheckConclusion::StartupFailure,
                     ),
-                is_required: true,
                 ..
             } => Some(FailedCheck {
                 name: name.clone(),
@@ -177,7 +177,6 @@ impl CheckContext {
                 context,
                 target_url,
                 state: StatusState::Failure | StatusState::Error,
-                is_required: true,
                 ..
             } => Some(FailedCheck {
                 name: context.clone(),
@@ -185,6 +184,16 @@ impl CheckContext {
             }),
             _ => None,
         }
+    }
+
+    /// The check when it ended badly and a merge gate requires it.
+    fn failed_required(&self) -> Option<FailedCheck> {
+        let required = match self {
+            Self::CheckRun { is_required, .. } | Self::StatusContext { is_required, .. } => {
+                *is_required
+            }
+        };
+        required.then(|| self.failed()).flatten()
     }
 }
 
@@ -198,6 +207,8 @@ pub struct Snapshot {
     pub(crate) removals: usize,
     /// The reason GitHub gave for the latest removal.
     pub(crate) last_removal: Option<String>,
+    /// The PR's mergeability as GitHub summarizes it.
+    pub(crate) merge_state: Option<String>,
     /// The commit the checks ran on.
     pub(crate) head_sha: String,
     pub(crate) checks: Vec<CheckContext>,
@@ -206,6 +217,18 @@ pub struct Snapshot {
 impl Snapshot {
     pub(crate) fn failed_check(&self) -> Option<FailedCheck> {
         self.checks.iter().find_map(CheckContext::failed_required)
+    }
+
+    /// Why a removal GitHub gave no reason for happened, read from the PR's
+    /// own state: `None` when nothing explains it.
+    fn removal_cause(&self) -> Option<String> {
+        if matches!(self.merge_state.as_deref(), Some("DIRTY" | "CONFLICTING")) {
+            return Some("the pull request has a merge conflict".to_string());
+        }
+        self.checks
+            .iter()
+            .find_map(CheckContext::failed)
+            .map(|check| format!("check {} failed", check.name))
     }
 }
 
@@ -220,6 +243,17 @@ pub struct CheckSummary {
     pub(crate) failed: u32,
 }
 
+/// A merge-queue removal: the reason GitHub gave, or one read off the PR's
+/// check and mergeability state when GitHub gave none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Removal {
+    /// The reason, in words — GitHub's, or derived.
+    pub reason: String,
+    /// `true` when neither GitHub nor the PR's state explains the removal:
+    /// such removals tend to be transient, unlike a named cause.
+    pub unexplained: bool,
+}
+
 /// Why the watch ended without a merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Stopped {
@@ -228,7 +262,7 @@ pub(super) enum Stopped {
     /// A required check failed.
     CheckFailed(FailedCheck),
     /// The merge queue removed the PR, for the reason GitHub gave.
-    Removed(String),
+    Removed(Removal),
     /// The PR was still open when the bound passed.
     TimedOut { waited: Duration, bound: Duration },
 }
@@ -296,10 +330,25 @@ pub(super) async fn watch<U: Upstream + Sync, C: Clock + Sync>(
             return Ok(Outcome::Stopped(Stopped::CheckFailed(check)));
         }
         if snapshot.removals > removals {
-            let reason = snapshot
-                .last_removal
-                .unwrap_or_else(|| "no reason given".to_string());
-            return Ok(Outcome::Stopped(Stopped::Removed(reason)));
+            let removal = snapshot.last_removal.as_ref().map_or_else(
+                || {
+                    snapshot.removal_cause().map_or_else(
+                        || Removal {
+                            reason: "no reason given".to_string(),
+                            unexplained: true,
+                        },
+                        |reason| Removal {
+                            reason,
+                            unexplained: false,
+                        },
+                    )
+                },
+                |reason| Removal {
+                    reason: reason.clone(),
+                    unexplained: false,
+                },
+            );
+            return Ok(Outcome::Stopped(Stopped::Removed(removal)));
         }
         let bound = expected * (2 + snapshot.queue_position.unwrap_or(0));
         let waited = clock.elapsed().saturating_sub(started);
@@ -554,6 +603,8 @@ struct GraphRepository {
 #[derive(Deserialize)]
 struct GraphPullRequest {
     state: PullRequestState,
+    #[serde(rename = "mergeStateStatus")]
+    merge_state: Option<String>,
     #[serde(rename = "mergeQueueEntry")]
     merge_queue_entry: Option<GraphQueueEntry>,
     #[serde(rename = "timelineItems")]
@@ -653,6 +704,7 @@ impl GraphResponse {
                 .into_iter()
                 .next_back()
                 .and_then(|node| node.reason),
+            merge_state: pr.merge_state,
             head_sha,
             checks,
         };
@@ -737,6 +789,7 @@ mod tests {
             queue_position: position,
             removals: 0,
             last_removal: None,
+            merge_state: None,
             head_sha: "abc123".to_string(),
             checks: vec![CheckContext::CheckRun {
                 name: "clippy".to_string(),
@@ -868,7 +921,10 @@ mod tests {
             (Duration::ZERO, snapshot(PullRequestState::Open, Some(1))),
             (minutes(20), removed),
         ]));
-        let stopped = Stopped::Removed("failed status checks".to_string());
+        let stopped = Stopped::Removed(Removal {
+            reason: "failed status checks".to_string(),
+            unexplained: false,
+        });
         assert_eq!(outcome, Outcome::Stopped(stopped.clone()));
         let text = StoppedReport::new('#', 7, &stopped).render().unwrap();
         assert!(text.contains("failed status checks"), "{text}");

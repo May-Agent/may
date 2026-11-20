@@ -24,16 +24,27 @@ if [ "${AITHER_GIT_WORKTREES_COUNT:-0}" = 0 ]; then
     exec "$real" "$@"
 fi
 
-# Explicit repository plumbing takes precedence over this wrapper.
+# Explicit repository plumbing takes precedence over this wrapper. The
+# scan stops at `--`, where paths begin, and skips the arguments of
+# options that take one, so a `--git-dir` that is an option's value or a
+# pathspec never bypasses the pinning.
+pending=
 for argument in "$@"; do
+    if [ -n "$pending" ]; then
+        pending=
+        continue
+    fi
     case $argument in
         --git-dir|--work-tree|--git-dir=*|--work-tree=*|--bare)
             exec "$real" "$@" ;;
+        -C|-c|--config-env|--exec-path|--namespace) pending=skip ;;
+        --) break ;;
     esac
 done
 
 # The directory git resolves the repository from: this shell's working
-# directory with every -C applied in order, as git applies them.
+# directory with every -C applied in order, as git applies them, whether
+# `-C dir` or `-Cdir`.
 directory=$(pwd -P)
 pending=
 for argument in "$@"; do
@@ -49,6 +60,11 @@ for argument in "$@"; do
     fi
     case $argument in
         -C) pending=dir ;;
+        -C?*)
+            resolved=$(cd -P -- "$directory" 2>/dev/null && cd -P -- "${argument#-C}" 2>/dev/null && pwd -P)
+            if [ -n "$resolved" ]; then
+                directory=$resolved
+            fi ;;
         -c|--config-env|--exec-path|--namespace) pending=skip ;;
         --) break ;;
     esac
@@ -59,6 +75,9 @@ git_dir=
 work_tree=
 while [ "$i" -lt "$AITHER_GIT_WORKTREES_COUNT" ]; do
     eval "worktree=\$AITHER_GIT_WORKTREE_PATH_$i"
+    # Resolve the map's spelling too, so `directory`'s canonical path and
+    # it name the same object.
+    worktree=$(cd -P -- "$worktree" 2>/dev/null && pwd -P)
     case $directory in
         "$worktree"|"$worktree"/*)
             eval "git_dir=\$AITHER_GIT_WORKTREE_GITDIR_$i"

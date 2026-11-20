@@ -500,6 +500,37 @@ struct SignerScript {
     command: &'static str,
 }
 
+/// The working directories a host granted signing to.
+///
+/// Held only in memory and canonicalized on the host: a subagent space
+/// provisioned a working copy and signer is granted here, and a path a
+/// subagent can write never decides signing.
+#[derive(Debug, Clone, Default)]
+pub struct SignerRoots(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
+
+impl SignerRoots {
+    /// Grants signing under `dir`, canonicalized so a symlinked path and the
+    /// path git reports are one.
+    pub fn grant(&self, dir: &Path) {
+        let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dir);
+    }
+
+    /// Whether `dir` — canonicalized — lies under a granted root.
+    #[must_use]
+    pub fn covers(&self, dir: &Path) -> bool {
+        let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|root| dir.starts_with(root))
+    }
+}
+
 /// The harness: signs the user's commits for one session's sandbox, records
 /// each signing, and verifies the signatures of a range.
 #[derive(Debug, Clone)]
@@ -507,6 +538,7 @@ pub struct CommitSigning {
     host: HostGit,
     audit_log: PathBuf,
     session_id: String,
+    roots: SignerRoots,
 }
 
 impl CommitSigning {
@@ -518,7 +550,22 @@ impl CommitSigning {
             host,
             audit_log: may_dir.join(AUDIT_LOG_SUBDIR).join(AUDIT_LOG_FILE),
             session_id: session_id.into(),
+            roots: SignerRoots::default(),
         }
+    }
+
+    /// The harness sharing `roots`, so a signer provisioned through one
+    /// handle is authorized at another.
+    #[must_use]
+    pub fn with_signing_roots(mut self, roots: SignerRoots) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    /// The granted working directories: provisioned spaces add theirs.
+    #[must_use]
+    pub const fn signing_roots(&self) -> &SignerRoots {
+        &self.roots
     }
 
     /// The host git the user's configuration is read through: every host git
@@ -804,22 +851,19 @@ impl Tool for SignCommitTool {
             .input
             .ok_or_else(|| anyhow::anyhow!("no commit object on stdin"))?;
         if let Some(AgentIdentity::Subagent(subagent)) = cx.identity().map(CallIdentity::agent) {
-            // A subagent signs where the harness installed a signer: in its
-            // own provisioned space, or in a worktree it was granted under
-            // the session's. A run's space that sits under a provisioned
-            // directory's `subagent-spaces` but was given no signer of its
-            // own — a run granted no repository — may not sign.
-            let dir = cx.working_dir().map(Path::new);
-            let root = dir.and_then(|dir| {
-                dir.ancestors()
-                    .find(|dir| dir.join(SIGNER_DIR).join(SIGNER_FILE).is_file())
-            });
-            let granted = root.is_some_and(|root| {
-                dir.is_some_and(|dir| !dir.starts_with(root.join("subagent-spaces")))
-            });
+            // A subagent signs only under a root the host granted its space
+            // when its working copy was provisioned — state the host holds,
+            // never a marker the subagent could write itself.
+            let granted = match cx.working_dir().map(PathBuf::from) {
+                Some(dir) => {
+                    let roots = self.signing.signing_roots().clone();
+                    blocking::unblock(move || roots.covers(&dir)).await
+                }
+                None => false,
+            };
             if !granted {
                 return Err(anyhow::anyhow!(
-                    "subagent {} may not sign commits: no signer was provisioned where it works",
+                    "subagent {} may not sign commits: it was provisioned no repository",
                     subagent.name()
                 ));
             }

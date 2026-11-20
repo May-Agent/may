@@ -753,7 +753,8 @@ impl MayAgent {
                     config.session_id.as_str(),
                     config.db.clone(),
                 )
-                .with_host(crate::host_git::HostGit::inherit()),
+                .with_host(crate::host_git::HostGit::inherit())
+                .with_signer_roots(config.services.signer_roots.clone()),
             ),
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),

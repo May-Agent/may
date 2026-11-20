@@ -403,6 +403,7 @@ mod tests {
             queue_position: None,
             removals: 0,
             last_removal: None,
+            merge_state: None,
             head_sha: "abc".to_string(),
             checks,
         }

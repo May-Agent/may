@@ -320,4 +320,124 @@ mod tests {
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         });
     }
+
+    /// Runs the `git` shim traced (`sh -x`) with `args` from `cwd`, pinned
+    /// to `worktree`'s host-owned `gitdir`, and returns `(stdout, stderr)`:
+    /// the trace on stderr shows the `GIT_DIR=... exec` a pin applies.
+    fn git_shim(
+        args: &[&str],
+        cwd: &std::path::Path,
+        worktree: &std::path::Path,
+        gitdir: &std::path::Path,
+    ) -> (String, String) {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("git");
+        std::fs::write(&shim, super::GIT_SHIM).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new("sh")
+            .arg("-x")
+            .arg(&shim)
+            .args(args)
+            .current_dir(cwd)
+            .env("AITHER_GIT_WORKTREES_COUNT", "1")
+            .env("AITHER_GIT_WORKTREE_PATH_0", worktree)
+            .env("AITHER_GIT_WORKTREE_GITDIR_0", gitdir)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// `-C <dir>` names the directory git resolves from: under a committing
+    /// worktree the repository it runs is the host-owned one.
+    #[test]
+    fn the_git_shim_pins_the_repository_under_dash_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("worktree");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        let gitdir = repo.join(".git");
+        // rev-parse reports the canonical path.
+        let pinned = dunce::canonicalize(&gitdir).unwrap();
+        let pinned = pinned.to_str().unwrap();
+
+        let (resolved, trace) = git_shim(
+            &[
+                "-C",
+                worktree.to_str().unwrap(),
+                "rev-parse",
+                "--absolute-git-dir",
+            ],
+            &elsewhere,
+            &worktree,
+            &gitdir,
+        );
+        assert_eq!(resolved, pinned, "{trace}");
+        // `-C<dir>` — the attached spelling — resolves the same directory,
+        // so the pin is applied to the exec it forwards.
+        let (_, trace) = git_shim(
+            &[
+                &format!("-C{}", worktree.display()),
+                "rev-parse",
+                "--absolute-git-dir",
+            ],
+            &elsewhere,
+            &worktree,
+            &gitdir,
+        );
+        assert!(
+            trace.contains("GIT_DIR="),
+            "-C<dir> did not resolve to the pinned worktree:\n{trace}"
+        );
+    }
+
+    /// A `--git-dir` after `--` is a pathspec, not plumbing: the shim still
+    /// pins the worktree's repository.
+    #[test]
+    fn the_git_shim_keeps_pinning_past_the_option_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        let gitdir = repo.join(".git");
+
+        let (resolved, trace) = git_shim(
+            &[
+                "-C",
+                worktree.to_str().unwrap(),
+                "rev-parse",
+                "--absolute-git-dir",
+                "--",
+                "--git-dir",
+            ],
+            dir.path(),
+            &worktree,
+            &gitdir,
+        );
+        // rev-parse answers --absolute-git-dir first; the args after `--`
+        // are echoed too, so the pin is its first line.
+        let pinned = dunce::canonicalize(&gitdir).unwrap();
+        assert_eq!(
+            resolved.lines().next().unwrap_or_default(),
+            pinned.to_str().unwrap(),
+            "{trace}"
+        );
+    }
 }

@@ -133,11 +133,11 @@ impl SubagentSpaces for SessionSubagentSpaces {
         repos.child_clone(&source, &copy).await?;
         // A run with a working copy may commit in it, so its `HOME` gets
         // the session's git configuration: its commits are signed through
-        // the same harness, and `sign-commit` lets its space sign.
-        repos
-            .commit_signing()
-            .install_sandbox_git(run.space, None)
-            .await?;
+        // the same harness, and `sign-commit` lets its space sign — the
+        // grant is host-held memory, not a file the run could write.
+        let signing = repos.commit_signing();
+        signing.install_sandbox_git(run.space, None).await?;
+        signing.signing_roots().grant(run.space);
         Ok(prepared.with_working_copy(copy))
     }
 }

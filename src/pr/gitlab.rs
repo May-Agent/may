@@ -222,6 +222,7 @@ impl<T: GitLabTokenSource + Sync> Upstream for GitLabMr<'_, T> {
             queue_position,
             removals: 0,
             last_removal: None,
+            merge_state: None,
             head_sha,
             checks,
         })

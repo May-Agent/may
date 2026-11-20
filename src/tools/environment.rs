@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use askama::Template as _;
+use sha2::Digest as _;
+
 use aither_sandbox::{
     AnyContainerExec, ContainerLaunch, ContainerPath, HostLaunch, PrepareSsh, PreparedSsh,
     SshServer,
@@ -248,34 +251,62 @@ impl PrepareSsh for ToolEnvironments {
     }
 }
 
-/// The server's `heel`: the one it has, or the distribution's pinned `heel`
-/// for the server's own target, installed there.
+/// `ssh_heel_probe.sh`, rendered with the pinned executable's SHA-256.
+#[derive(askama::Template)]
+#[template(path = "ssh_heel_probe.sh", escape = "none")]
+struct HeelProbe<'a> {
+    expected: &'a str,
+}
+
+/// `ssh_heel_install.sh`, rendered with the pinned executable's SHA-256.
+#[derive(askama::Template)]
+#[template(path = "ssh_heel_install.sh", escape = "none")]
+struct HeelInstall<'a> {
+    expected: &'a str,
+}
+
+/// The server's `heel`: a heel it already has when that heel is the
+/// distribution's pinned binary — by version and SHA-256, never by name —
+/// or the pinned `heel` for the server's own target, installed
+/// digest-addressed.
 ///
 /// # Errors
-/// Fails when the server has no `heel` and the distribution pins none for its
-/// target.
+/// Fails when the server has no pinned `heel` and the distribution pins
+/// none for its target.
 async fn remote_heel(
     transport: &SshToolTransport,
     target: &ToolTarget,
     source: &ToolSource,
 ) -> Result<Option<String>, ToolRuntimeError> {
-    let found = successful_output(
-        transport
-            .run(include_str!("../../templates/ssh_heel_probe.sh"), None)
-            .await?,
-    )?;
-    if let Some(path) = found.lines().next() {
-        return Ok(Some(path.to_string()));
-    }
     let local = source
         .distribution
         .prepare_host_program(HostProgram::Heel, target, &source.cache_root)
         .await?;
     let binary = async_fs::read(local.path()).await?;
+    let expected = hex::encode(sha2::Sha256::digest(&binary));
+    let found = successful_output(
+        transport
+            .run(
+                &HeelProbe {
+                    expected: &expected,
+                }
+                .render()
+                .expect("the heel probe template renders typed input"),
+                None,
+            )
+            .await?,
+    )?;
+    if let Some(path) = found.lines().next() {
+        return Ok(Some(path.to_string()));
+    }
     let installed = successful_output(
         transport
             .run(
-                include_str!("../../templates/ssh_heel_install.sh"),
+                &HeelInstall {
+                    expected: &expected,
+                }
+                .render()
+                .expect("the heel install template renders typed input"),
                 Some(binary),
             )
             .await?,
@@ -285,4 +316,118 @@ async fn remote_heel(
         .next()
         .ok_or(ToolRuntimeError::InvalidProbe)?;
     Ok(Some(path.to_string()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    use sha2::Digest as _;
+
+    use super::{HeelInstall, HeelProbe};
+    use askama::Template as _;
+
+    /// A `heel` look-alike: a script that answers `--version`.
+    fn fake_heel(dir: &Path) -> std::path::PathBuf {
+        let heel = dir.join("heel");
+        std::fs::write(
+            &heel,
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 'heel 9.9.9'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&heel, std::fs::Permissions::from_mode(0o755)).unwrap();
+        heel
+    }
+
+    fn run(script: &str, home: &Path, stdin: &[u8]) -> String {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success() || script.contains("probe"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A `heel` on the server is trusted only when its digest is the pinned
+    /// one; any other binary named `heel` is rejected.
+    #[test]
+    fn the_probe_accepts_only_the_pinned_heel() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let planted = fake_heel(&bin);
+        // The server has a `heel` whose digest is not the pin's.
+        let rejected = run(
+            &HeelProbe {
+                expected: &"0".repeat(64),
+            }
+            .render()
+            .unwrap(),
+            home.path(),
+            &[],
+        );
+        assert!(rejected.is_empty(), "{rejected}");
+        // When it is, the probe names it.
+        let digest = hex::encode(sha2::Sha256::digest(std::fs::read(&planted).unwrap()));
+        let accepted = run(
+            &HeelProbe { expected: &digest }.render().unwrap(),
+            home.path(),
+            &[],
+        );
+        assert_eq!(accepted, planted.to_str().unwrap(), "{accepted}");
+    }
+
+    /// The upload is staged through `mktemp` and lands, digest-addressed,
+    /// only after its version and digest check out.
+    #[test]
+    fn the_install_stages_and_addresses_the_pinned_heel() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let binary = std::fs::read(fake_heel(work.path())).unwrap();
+        let digest = hex::encode(sha2::Sha256::digest(&binary));
+        let installed = run(
+            &HeelInstall { expected: &digest }.render().unwrap(),
+            home.path(),
+            &binary,
+        );
+        let expected_path = home
+            .path()
+            .join(".local/bin")
+            .join(format!("heel-{digest}"));
+        assert_eq!(installed, expected_path.to_str().unwrap(), "{installed}");
+        assert_eq!(std::fs::read(&expected_path).unwrap(), binary);
+        // No staging file is left behind.
+        assert_eq!(
+            std::fs::read_dir(expected_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        // A corrupted upload never lands.
+        let mut bad = binary;
+        bad[0] = b'!';
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(HeelInstall { expected: &digest }.render().unwrap())
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&bad).unwrap();
+        assert!(!child.wait().unwrap().success());
+    }
 }

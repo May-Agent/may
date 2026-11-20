@@ -360,6 +360,9 @@ pub struct SessionRepos {
     /// Daemon-held default-branch checkouts used to derive workspaces
     /// copy-on-write without re-cloning over the network.
     checkouts: Option<DaemonCheckouts>,
+    /// Working directories granted signing, shared with the session's
+    /// `sign-commit` tool so provisioning and authorization agree.
+    signer_roots: crate::commit_signing::SignerRoots,
 }
 
 impl SessionRepos {
@@ -375,7 +378,16 @@ impl SessionRepos {
             may_config: std::sync::Arc::new(crate::config::MayConfig::default()),
             forge: None,
             checkouts: None,
+            signer_roots: crate::commit_signing::SignerRoots::default(),
         }
+    }
+
+    /// Grants signing under the roots `signer_roots` shares with the
+    /// session's `sign-commit` tool.
+    #[must_use]
+    pub fn with_signer_roots(mut self, signer_roots: crate::commit_signing::SignerRoots) -> Self {
+        self.signer_roots = signer_roots;
+        self
     }
 
     /// Makes clones with `host` instead of the environment's git.
@@ -1178,6 +1190,7 @@ impl SessionRepos {
             &crate::session::SessionPaths::new(self.session_root.clone()).home_root(),
             self.session_id.clone(),
         )
+        .with_signing_roots(self.signer_roots.clone())
     }
 
     /// The checkout the session is bound to and `caller` (already

@@ -1456,6 +1456,9 @@ impl PrStore {
         pr: &crate::db::PrRow,
         head_sha: &str,
     ) -> Result<String, PrError> {
+        /// How long before an unexplained removal is tried again; multiplied
+        /// by the attempt so the wait grows.
+        const REQUEUE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
         let repo = self
             .forge_of(&resolved.record)
             .ok_or_else(|| PrError::Resolve("remote PR without a repo".to_string()))?;
@@ -1481,11 +1484,12 @@ impl PrStore {
             }),
         };
         let expected = merge_watch::Upstream::expected_checks(&upstream).await?;
-        // A merge queue can drop an entry with no reason and no failed
-        // check: a removal is transient, so the queue-and-watch cycle
-        // re-queues a bounded number of times before the agent is told.
-        let max_requeues = 3usize;
-        let mut requeues = 0usize;
+        // A merge queue can drop an entry with no reason and nothing
+        // failing: such a removal is transient, so the queue-and-watch
+        // cycle re-queues a bounded number of times before the agent is
+        // told. A removal with a cause is reported instead.
+        let max_requeues = 3u32;
+        let mut requeues = 0u32;
         let outcome = loop {
             // Read before queueing: the removals that predate it.
             let before = merge_watch::Upstream::snapshot(&upstream).await?;
@@ -1542,11 +1546,17 @@ impl PrStore {
             )
             .await?;
             watching.tell_if_unheard().await;
-            if let merge_watch::Outcome::Stopped(merge_watch::Stopped::Removed(reason)) = &outcome
+            if let merge_watch::Outcome::Stopped(merge_watch::Stopped::Removed(removal)) = &outcome
+                && removal.unexplained
                 && requeues < max_requeues
             {
                 requeues += 1;
-                self.event(pr, "requeued", Some(reason)).await;
+                // A removal nothing explains tends to be a queue flap:
+                // wait for it to settle, longer each time, before the PR
+                // goes back on the queue. A removal with a cause — a
+                // failed check, a conflict — is terminal and is reported.
+                async_io::Timer::after(REQUEUE_BACKOFF * requeues).await;
+                self.event(pr, "requeued", Some(&removal.reason)).await;
                 continue;
             }
             break outcome;
