@@ -23,12 +23,15 @@ use askama::Template;
 use zenwave::ResponseExt as _;
 
 use crate::db::{ChatDb, PrFilter, PrState};
+use crate::forge::{ForgeKind, ForgeRepo};
 use crate::host_git::HostGit;
 use crate::issue::IssueError;
 use crate::issue::github::{ForgeTokenSource, GitHubRest, GitHubTokenSource};
+use crate::issue::gitlab::{ForgeGitLabAuth, GitLabRest, GitLabTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
 pub(crate) mod checks;
+pub(crate) mod gitlab;
 pub(crate) mod merge_watch;
 mod pull_sync;
 
@@ -67,6 +70,9 @@ pub enum PrError {
     /// A GitHub API call failed.
     #[error("github {0}")]
     Gh(String),
+    /// A GitLab API call failed.
+    #[error("gitlab {0}")]
+    Gl(String),
     /// A commit of the PR's range is not signed by the user.
     #[error(transparent)]
     Signing(#[from] crate::commit_signing::SigningError),
@@ -104,6 +110,9 @@ pub struct PrContext {
     pub signing: crate::commit_signing::CommitSigning,
     /// GitHub REST client the GitHub backend's direct calls go through.
     pub github_api: GitHubRest<PrTokenSource>,
+    /// A GitLab REST client override, for tests; `None` builds one per
+    /// repository host from `forge_auth`.
+    pub gitlab_api: Option<GitLabRest<PrGitLabToken>>,
     /// The live forge authenticator; HTTPS pushes carry its credential.
     pub forge_auth: crate::forge::LiveForgeAuth,
     /// The per-repository land locks every session of the daemon shares.
@@ -158,12 +167,51 @@ impl GitHubTokenSource for PrTokenSource {
     }
 }
 
+/// Token source for the GitLab backend's REST client.
+#[derive(Debug, Clone)]
+pub enum PrGitLabToken {
+    /// The host's credential in the live [`crate::forge::LiveForgeAuth`].
+    Forge(ForgeGitLabAuth),
+    /// A fixed token, for tests.
+    #[cfg(test)]
+    Fixed(String),
+    /// No GitLab login, for tests.
+    #[cfg(test)]
+    Unauthenticated,
+}
+
+impl GitLabTokenSource for PrGitLabToken {
+    async fn token(&self) -> Result<String, IssueError> {
+        match self {
+            Self::Forge(source) => source.token().await,
+            #[cfg(test)]
+            Self::Fixed(token) => Ok(token.clone()),
+            #[cfg(test)]
+            Self::Unauthenticated => Err(IssueError::GitLabAuth("not logged in".to_string())),
+        }
+    }
+}
+
 impl PrContext {
     /// The production REST client: `api.github.com` with the live forge
     /// authenticator's `github.com` credential.
     #[must_use]
     pub fn default_github_api(auth: crate::forge::LiveForgeAuth) -> GitHubRest<PrTokenSource> {
         GitHubRest::new(PrTokenSource::Forge(ForgeTokenSource::new(auth)))
+    }
+
+    /// The REST client of GitLab `host`: `gitlab_api` for tests, else the
+    /// host's `api/v4` endpoint with its `[forge]` credential.
+    pub(crate) fn gitlab_rest(&self, host: &str) -> GitLabRest<PrGitLabToken> {
+        self.gitlab_api.clone().unwrap_or_else(|| {
+            GitLabRest::new(
+                PrGitLabToken::Forge(ForgeGitLabAuth::new(
+                    self.forge_auth.clone(),
+                    host.to_string(),
+                )),
+                host,
+            )
+        })
     }
 }
 
@@ -175,18 +223,59 @@ impl std::fmt::Debug for PrContext {
     }
 }
 
-/// Records a GitHub PR's check durations when its checks finish.
+/// The forge a remote backend's merge path talks to.
+enum Remote {
+    /// A GitHub repository.
+    GitHub(ForgeRepo),
+    /// A GitLab project.
+    GitLab(ForgeRepo),
+}
+
+/// The upstream a remote merge watches, per forge.
+enum AnyUpstream<'a> {
+    /// GitHub's PR through its REST and GraphQL APIs.
+    GitHub(merge_watch::GithubPr<'a, PrTokenSource>),
+    /// GitLab's MR through its REST API.
+    GitLab(gitlab::GitLabMr<'a, PrGitLabToken>),
+}
+
+impl merge_watch::Upstream for AnyUpstream<'_> {
+    async fn snapshot(&self) -> Result<merge_watch::Snapshot, PrError> {
+        match self {
+            Self::GitHub(upstream) => merge_watch::Upstream::snapshot(upstream).await,
+            Self::GitLab(upstream) => merge_watch::Upstream::snapshot(upstream).await,
+        }
+    }
+
+    async fn expected_checks(&self) -> Result<std::time::Duration, PrError> {
+        match self {
+            Self::GitHub(upstream) => merge_watch::Upstream::expected_checks(upstream).await,
+            Self::GitLab(upstream) => merge_watch::Upstream::expected_checks(upstream).await,
+        }
+    }
+}
+
+impl Remote {
+    /// The repository behind either forge.
+    const fn repo(&self) -> &ForgeRepo {
+        match self {
+            Self::GitHub(repo) | Self::GitLab(repo) => repo,
+        }
+    }
+}
+
+/// Records a remote PR's check durations when its checks finish.
 struct CiObserver<'a> {
     store: &'a PrStore,
     pr: &'a crate::db::PrRow,
-    owner_repo: &'a str,
+    remote: &'a Remote,
     head_sha: &'a str,
 }
 
 impl merge_watch::ChecksObserver for CiObserver<'_> {
     async fn finished(&self) {
         self.store
-            .observe_github_checks(self.pr, self.owner_repo, self.head_sha)
+            .observe_remote_checks(self.pr, self.remote, self.head_sha)
             .await;
     }
 }
@@ -514,7 +603,10 @@ impl PrStore {
                     .list_prs_with_repo(None, None, PrFilter::All, false)
                     .await?;
                 if let Some(found) = summaries.into_iter().find(|pr| {
-                    pr.repo_key == name || github_owner_repo(&pr.repo_key).as_deref() == Some(name)
+                    pr.repo_key == name
+                        || github_owner_repo(&pr.repo_key).as_deref() == Some(name)
+                        || ForgeRepo::parse_stored(name)
+                            .is_ok_and(|repo| repo.cache_key() == pr.repo_key)
                 }) {
                     return Ok(found.repo_key);
                 }
@@ -619,16 +711,19 @@ impl PrStore {
         if resolved.record.local && head_sha == base_sha {
             return Err(PrError::State("no committed work in the clone".to_string()));
         }
-        self.check_pinned_backend(&resolved.record)?;
-        let (backend, github_repo) = Self::backend_for(&resolved.record);
+        let (detected, forge_repo) = self.backend_for(&resolved.record);
+        self.check_pinned_backend(&resolved.record, detected)?;
+        let backend = detected;
         let subjects = self
             .commit_subjects(&resolved, &base_sha, &head_sha)
             .await?;
-        // Only a GitHub issue is linked in published text: a May issue
+        // Only a forge issue is linked in published text: a May issue
         // number is internal and never leaves the machine.
         let github_issue = issue_number.filter(|_| {
-            self.project_for_record(&resolved.record)
-                .is_some_and(|p| p.github_repository().is_some())
+            self.project_for_record(&resolved.record).is_some_and(|p| {
+                p.forge_repository(&crate::config::MayConfig::default())
+                    .is_some()
+            })
         });
         let text = pr_text(title, &subjects, github_issue)?;
         let (title, body) = (text.title.as_str(), text.body.as_str());
@@ -636,11 +731,11 @@ impl PrStore {
         let branch = if resolved.record.local {
             String::new()
         } else {
-            github_branch(&self.context.session_id, &head_sha)
+            remote_branch(&self.context.session_id, &head_sha)
         };
         // Review outbound PR title, body, and commit messages before anything
         // leaves the machine.
-        if backend == "github" {
+        if forge_repo.is_some() {
             let commits = self
                 .commit_messages(&resolved, &base_sha, &head_sha)
                 .await?;
@@ -652,23 +747,24 @@ impl PrStore {
             ))
             .await?;
         }
-        if backend == "github"
-            && let (Some(gate), Some(owner_repo)) = (&self.context.publish, github_repo.as_deref())
-        {
-            let repository = owner_repo
-                .parse::<crate::workspace::GitHubRepository>()
-                .map_err(|error| PrError::Resolve(error.to_string()))?;
-            gate.approve_pull_request(&self.context.github_api, &repository, title, body)
-                .await?;
+        if let (Some(gate), Some(repo)) = (&self.context.publish, &forge_repo) {
+            match repo.kind() {
+                ForgeKind::GitHub => {
+                    gate.approve_forge_pull_request(&self.context.github_api, repo, title, body)
+                        .await?;
+                }
+                ForgeKind::GitLab => {
+                    let rest = self.context.gitlab_rest(repo.host().as_str());
+                    gate.approve_forge_pull_request(&rest, repo, title, body)
+                        .await?;
+                }
+            }
         }
-        // GitHub-bound: push the session branch before recording, so the
+        // Forge-bound: push the session branch before recording, so the
         // row never points at a PR that failed to exist upstream.
-        let upstream_number = if backend == "github" {
-            let owner_repo = github_repo
-                .as_deref()
-                .ok_or_else(|| PrError::Resolve("github backend without a repo".to_string()))?;
+        let upstream_number = if let Some(repo) = &forge_repo {
             Some(
-                self.push_and_create(&resolved, &branch, &base_sha, &head_sha, &text, owner_repo)
+                self.push_and_create(&resolved, &branch, &base_sha, &head_sha, &text, repo)
                     .await?,
             )
         } else {
@@ -712,8 +808,11 @@ impl PrStore {
             crate::harness::working_document::WorkEvent::PullRequestOpened,
         );
         if let Some(n) = upstream_number {
-            self.event(&pr, "opened", Some(&format!("github PR #{n}")))
-                .await;
+            let label = match forge_repo.map(|repo| repo.kind()) {
+                Some(ForgeKind::GitLab) => format!("gitlab MR !{n}"),
+                _ => format!("github PR #{n}"),
+            };
+            self.event(&pr, "opened", Some(&label)).await;
         }
         if let Some(n) = issue_number {
             self.event(&pr, "issue_linked", Some(&format!("issue #{n}")))
@@ -779,8 +878,8 @@ impl PrStore {
             .update_pr(pr.id, PrState::ChecksPending, Some(&head_sha), None, None)
             .await?;
         self.event(&pr, "checks_pending", None).await;
-        if pr.backend == "github" {
-            return self.merge_github(&resolved, &pr, &head_sha).await;
+        if matches!(pr.backend.as_str(), "github" | "gitlab") {
+            return self.merge_remote(&resolved, &pr, &head_sha).await;
         }
         // `[[projects]] checks` — the local check command runs on a detached
         // checkout of the pinned commit.
@@ -833,6 +932,7 @@ impl PrStore {
                 );
                 let clone = self.retire_clone(&resolved, &head_sha).await?;
                 Ok(PrMerged {
+                    sigil: pr.sigil(),
                     number,
                     merge_sha: Some(&merge_sha),
                     clone_dir: resolved.record.dir.as_str(),
@@ -878,10 +978,20 @@ impl PrStore {
         }
         // Closing upstream first disables auto-merge; if it fails the local
         // row stays as it was.
-        if pr.backend == "github" {
-            let owner_repo = github_owner_repo(&resolved.record.source)
-                .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
-            self.close_github(&owner_repo, pr.number).await?;
+        match pr.backend.as_str() {
+            "github" => {
+                let owner_repo = github_owner_repo(&resolved.record.source)
+                    .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+                self.close_github(&owner_repo, pr.number).await?;
+            }
+            "gitlab" => {
+                let repo = self
+                    .forge_of(&resolved.record)
+                    .ok_or_else(|| PrError::Resolve("gitlab MR without a repo".to_string()))?;
+                let rest = self.context.gitlab_rest(repo.host().as_str());
+                gitlab::close_mr(&rest, &repo, pr.number).await?;
+            }
+            _ => {}
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
@@ -922,7 +1032,7 @@ impl PrStore {
             return Err(PrError::DirtyClone(dirty.join(", ")));
         }
         let head_sha = self.head_sha(&resolved).await?;
-        if pr.backend == "github" {
+        if matches!(pr.backend.as_str(), "github" | "gitlab") {
             let since = pr.head_sha.as_deref().unwrap_or(&pr.base_sha);
             let commits = match self.commit_messages(&resolved, since, &head_sha).await {
                 Ok(commits) => commits,
@@ -1085,9 +1195,9 @@ impl PrStore {
         let check_state = db.pr_check_state(pr.id).await?;
         let opened = pr_opened_provenance(&events);
         let detail = pr_failure_detail(&events, pr.state, check_state.as_ref());
-        // The live check rollup for a GitHub PR still in flight — one
+        // The live check rollup for a remote PR still in flight — one
         // snapshot, best-effort, skipped for the may backend and for
-        // states GitHub no longer reports checks on.
+        // states the forge no longer reports checks on.
         let checks = if pr.backend == "github"
             && pr.state.is_in_flight()
             && let Some(owner_repo) = github_owner_repo(&pr.repo_key)
@@ -1097,19 +1207,54 @@ impl PrStore {
                 owner_repo: &owner_repo,
                 number: pr.number,
             };
+            let actions = crate::ci::github::GhActions::new(
+                self.context.github_api.clone(),
+                &owner_repo,
+                pr.number,
+            );
             let section = match merge_watch::Upstream::snapshot(&github).await {
                 Ok(snapshot) => {
                     let report = checks::ChecksReport::of(&snapshot);
-                    let failures = checks::failure_details(
-                        &self.context.github_api,
-                        &owner_repo,
-                        pr.number,
-                        &report,
-                    )
-                    .await;
+                    let failures = checks::failure_details(&actions, &report).await;
                     checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
                 }
-                Err(error) => checks::ChecksSection::Unreadable(error.to_string()),
+                Err(error) => checks::ChecksSection::Unreadable {
+                    forge: "GitHub",
+                    error: error.to_string(),
+                },
+            };
+            Some(
+                section
+                    .render()
+                    .map_err(|e| PrError::State(e.to_string()))?,
+            )
+        } else if pr.backend == "gitlab" && pr.state.is_in_flight() {
+            let section = match ForgeRepo::from_cache_key(ForgeKind::GitLab, &pr.repo_key) {
+                Ok(repo) => {
+                    let rest = self.context.gitlab_rest(repo.host().as_str());
+                    let mr = gitlab::GitLabMr {
+                        rest: &rest,
+                        repo: &repo,
+                        iid: pr.number,
+                    };
+                    let ci =
+                        crate::ci::gitlab::GitLabCi::new(rest.clone(), repo.clone(), pr.number);
+                    match merge_watch::Upstream::snapshot(&mr).await {
+                        Ok(snapshot) => {
+                            let report = checks::ChecksReport::of(&snapshot);
+                            let failures = checks::failure_details(&ci, &report).await;
+                            checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
+                        }
+                        Err(error) => checks::ChecksSection::Unreadable {
+                            forge: "GitLab",
+                            error: error.to_string(),
+                        },
+                    }
+                }
+                Err(error) => checks::ChecksSection::Unreadable {
+                    forge: "GitLab",
+                    error: error.to_string(),
+                },
             };
             Some(
                 section
@@ -1152,42 +1297,52 @@ impl PrStore {
         .map_err(|e| PrError::State(e.to_string()))
     }
 
+    /// The forge repository a remote clone's `origin` names, resolved by
+    /// the live `[forge]` map so self-hosted kinds count.
+    fn forge_of(&self, record: &CloneRecord) -> Option<ForgeRepo> {
+        if record.local {
+            return None;
+        }
+        let auth = self.context.forge_auth.get();
+        ForgeRepo::from_remote_url_with(&record.source, |host| auth.kind_of(host)).ok()
+    }
+
     /// Which backend lands this record: local-bound clones merge into the
     /// checkout through the may backend; remote clones publish through
-    /// GitHub. `[[projects]] pr.backend = "may"` pins a remote clone to
+    /// their forge. `[[projects]] pr.backend = "may"` pins a remote clone to
     /// local landing — rejected, there is no checkout to land into.
-    fn backend_for(record: &CloneRecord) -> (&'static str, Option<String>) {
+    fn backend_for(&self, record: &CloneRecord) -> (&'static str, Option<ForgeRepo>) {
         if record.local {
             return ("may", None);
         }
-        github_owner_repo(&record.source).map_or(("may", None), |repo| ("github", Some(repo)))
+        self.forge_of(record).map_or(("may", None), |repo| {
+            (repo.kind().binding_prefix(), Some(repo))
+        })
     }
 
-    /// `[[projects]] pr.backend = "may"` pins landing to the checkout. A
-    /// clone made from the remote has no checkout to land into, so the pin
-    /// and the clone disagree and the PR is refused.
-    fn check_pinned_backend(&self, record: &CloneRecord) -> Result<(), PrError> {
+    /// `[[projects]] pr.backend` pins landing to one backend; the pin and
+    /// the clone disagreeing means the PR is refused.
+    fn check_pinned_backend(&self, record: &CloneRecord, detected: &str) -> Result<(), PrError> {
         let pinned = self
             .project_for_record(record)
             .and_then(|project| project.pr.backend.as_deref());
-        if !record.local && pinned == Some("may") {
-            return Err(PrError::Resolve(
-                "this project pins pr.backend to \"may\" but the session clone comes from the GitHub remote; re-run `repo trust set` to settle one backend".to_string(),
-            ));
+        if let Some(pinned) = pinned.filter(|pinned| *pinned != detected) {
+            return Err(PrError::Resolve(format!(
+                "this project pins pr.backend to \"{pinned}\" but the session clone resolves to the \"{detected}\" backend; re-run `repo trust set` to settle one backend"
+            )));
         }
         Ok(())
     }
 
     /// The `[[projects]]` entry covering this record, by repository
-    /// identity for local clones and by `owner/repo` for remote ones.
+    /// identity for local clones and by forge repository for remote ones.
     fn project_for_record(&self, record: &CloneRecord) -> Option<&crate::workspace::ProjectConfig> {
         self.context.workspace_config.projects.iter().find(|p| {
             if record.local {
                 p.has_identity(Path::new(&record.repo_key))
             } else {
-                github_owner_repo(&record.source)
-                    == p.github_repository()
-                        .map(|r| format!("{}/{}", r.owner(), r.repo()))
+                self.forge_of(record)
+                    .is_some_and(|repo| p.covers_forge(&repo, &crate::config::MayConfig::default()))
             }
         })
     }
@@ -1242,8 +1397,8 @@ impl PrStore {
             .map_err(|error| PrError::Screened(error.to_string()))
     }
 
-    /// Push the session branch to the GitHub remote and open a real PR.
-    /// Returns the upstream PR number.
+    /// Push the session branch to the remote and open a real PR or MR.
+    /// Returns the upstream number (`iid` for GitLab).
     async fn push_and_create(
         &self,
         resolved: &Resolved,
@@ -1251,7 +1406,7 @@ impl PrStore {
         base_sha: &str,
         head_sha: &str,
         text: &PrText,
-        owner_repo: &str,
+        repo: &ForgeRepo,
     ) -> Result<i64, PrError> {
         push_pinned(
             &self.context.scratch_root,
@@ -1267,60 +1422,112 @@ impl PrStore {
             push_https_auth(&self.context.forge_auth, &resolved.record.source).await,
         )
         .await?;
-        create_github_pr(
-            &self.context.github_api,
-            owner_repo,
-            branch,
-            &text.title,
-            &text.body,
-        )
-        .await
+        match repo.kind() {
+            ForgeKind::GitHub => {
+                create_github_pr(
+                    &self.context.github_api,
+                    &repo.full_path(),
+                    branch,
+                    &text.title,
+                    &text.body,
+                )
+                .await
+            }
+            ForgeKind::GitLab => {
+                gitlab::create_mr(
+                    &self.context.gitlab_rest(repo.host().as_str()),
+                    repo,
+                    branch,
+                    &text.title,
+                    &text.body,
+                )
+                .await
+            }
+        }
     }
 
-    /// GitHub landing: the pinned commit is already on the upstream branch
-    /// (pushed at open or update); `gh pr merge --auto`, watch until the
+    /// Remote landing: the pinned commit is already on the upstream branch
+    /// (pushed at open or update); queue the forge's merge, watch until the
     /// upstream state is terminal, then best-effort pull-sync the recorded
     /// checkout and retire the clone.
-    async fn merge_github(
+    async fn merge_remote(
         &self,
         resolved: &Resolved,
         pr: &crate::db::PrRow,
         head_sha: &str,
     ) -> Result<String, PrError> {
-        let owner_repo = github_owner_repo(&resolved.record.source)
-            .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+        let repo = self
+            .forge_of(&resolved.record)
+            .ok_or_else(|| PrError::Resolve("remote PR without a repo".to_string()))?;
+        let remote = match repo.kind() {
+            ForgeKind::GitHub => Remote::GitHub(repo.clone()),
+            ForgeKind::GitLab => Remote::GitLab(repo.clone()),
+        };
         let upstream_number = pr.number;
         let lock = self.context.land_locks.get(&resolved.record.repo_key);
-        let github = merge_watch::GithubPr {
-            api: &self.context.github_api,
-            owner_repo: &owner_repo,
-            number: upstream_number,
+        let owner_repo = repo.full_path();
+        let gitlab_rest = (repo.kind() == ForgeKind::GitLab)
+            .then(|| self.context.gitlab_rest(repo.host().as_str()));
+        let upstream: AnyUpstream<'_> = match &remote {
+            Remote::GitHub(_) => AnyUpstream::GitHub(merge_watch::GithubPr {
+                api: &self.context.github_api,
+                owner_repo: &owner_repo,
+                number: upstream_number,
+            }),
+            Remote::GitLab(repo) => AnyUpstream::GitLab(gitlab::GitLabMr {
+                rest: gitlab_rest.as_ref().expect("gitlab backend has a client"),
+                repo,
+                iid: upstream_number,
+            }),
         };
         // Read before queueing: the bound and the removals that predate it.
-        let before = merge_watch::Upstream::snapshot(&github).await?;
-        ensure_head_pinned(upstream_number, head_sha, &before.head_sha)?;
-        let expected = merge_watch::Upstream::expected_checks(&github).await?;
+        let before = merge_watch::Upstream::snapshot(&upstream).await?;
+        ensure_head_pinned(upstream_number, head_sha, &before.head_sha, pr.sigil())?;
+        let expected = merge_watch::Upstream::expected_checks(&upstream).await?;
         self.event(pr, "queued", None).await;
         // Serialized land: the lock covers queueing the PR, not the wait for
         // it to land.
         {
             let _guard = lock.lock().await;
-            queue_github_merge(
-                &self.context.github_api,
-                &owner_repo,
-                upstream_number,
-                head_sha,
-            )
-            .await?;
+            match &remote {
+                Remote::GitHub(_) => {
+                    queue_github_merge(
+                        &self.context.github_api,
+                        &owner_repo,
+                        upstream_number,
+                        head_sha,
+                    )
+                    .await?;
+                }
+                Remote::GitLab(repo) => {
+                    let pipeline_running = before.checks.iter().any(|check| {
+                        matches!(
+                            check,
+                            merge_watch::CheckContext::CheckRun {
+                                conclusion: None,
+                                ..
+                            }
+                        )
+                    });
+                    gitlab::queue_merge(
+                        gitlab_rest.as_ref().expect("gitlab backend has a client"),
+                        repo,
+                        upstream_number,
+                        head_sha,
+                        pipeline_running,
+                    )
+                    .await?;
+                }
+            }
         }
         // The checks are timed the moment they finish, not when the PR lands.
         let observer = CiObserver {
             store: self,
             pr,
-            owner_repo: &owner_repo,
+            remote: &remote,
             head_sha,
         };
-        let watching = merge_watch::Observing::new(&github, &observer);
+        let watching = merge_watch::Observing::new(&upstream, &observer);
         let outcome = merge_watch::watch(
             &watching,
             &merge_watch::SystemClock::new(),
@@ -1355,19 +1562,22 @@ impl PrStore {
                     pr,
                     crate::harness::working_document::WorkEvent::PullRequestMerged,
                 );
-                let pull_sync = self.pull_sync(&resolved.record, &owner_repo).await;
+                let pull_sync = self
+                    .pull_sync(&resolved.record, &remote.repo().cache_key())
+                    .await;
                 if let Some(checkouts) = &self.context.checkouts
                     && let Err(error) = checkouts.refresh_existing(&resolved.record.repo_key).await
                 {
                     tracing::warn!(
                         %error,
                         repo = %resolved.record.repo_key,
-                        "failed to refresh daemon checkout after GitHub PR merged"
+                        "failed to refresh daemon checkout after remote PR merged"
                     );
                 }
                 let clone = self.retire_clone(resolved, head_sha).await?;
-                let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
+                let remote_branch = self.delete_remote_branch(&remote, &pr.branch).await;
                 Ok(PrMerged {
+                    sigil: pr.sigil(),
                     number: pr.number,
                     merge_sha: None,
                     clone_dir: resolved.record.dir.as_str(),
@@ -1379,7 +1589,7 @@ impl PrStore {
                 .expect("the merge result renders"))
             }
             merge_watch::Outcome::Stopped(stopped) => {
-                let report = merge_watch::StoppedReport::new(pr.number, &stopped)
+                let report = merge_watch::StoppedReport::new(pr.sigil(), pr.number, &stopped)
                     .render()
                     .expect("the watch report renders");
                 let report = report.trim_end().to_string();
@@ -1427,11 +1637,23 @@ impl PrStore {
         close_github_api(&self.context.github_api, owner_repo, external).await
     }
 
-    /// Delete a merged PR's `may/*` branch on GitHub. A branch already gone
-    /// (the repository deletes head branches on merge) counts as deleted;
-    /// any other failure is reported, since the merge itself has landed.
-    async fn delete_remote_branch(&self, owner_repo: &str, branch: &str) -> RemoteBranch {
-        delete_remote_branch_api(&self.context.github_api, owner_repo, branch).await
+    /// Delete a merged PR's `may/*` branch on the remote. A branch already
+    /// gone (the repository deletes head branches on merge) counts as
+    /// deleted; any other failure is reported, since the merge has landed.
+    async fn delete_remote_branch(&self, remote: &Remote, branch: &str) -> RemoteBranch {
+        match remote {
+            Remote::GitHub(repo) => {
+                delete_remote_branch_api(&self.context.github_api, &repo.full_path(), branch).await
+            }
+            Remote::GitLab(repo) => {
+                gitlab::delete_branch(
+                    &self.context.gitlab_rest(repo.host().as_str()),
+                    repo,
+                    branch,
+                )
+                .await
+            }
+        }
     }
 
     /// Best-effort `git pull --ff-only` on every local checkout recorded
@@ -1742,24 +1964,42 @@ impl PrStore {
         }
     }
 
-    /// Records the GitHub checks of `head_sha` and warns the user about an
+    /// Records the remote checks of `head_sha` and warns the user about an
     /// abnormally long job. A recording failure is reported, never fatal: the
     /// PR lands or fails on its checks, not on their timing.
-    async fn observe_github_checks(&self, pr: &crate::db::PrRow, owner_repo: &str, head_sha: &str) {
+    async fn observe_remote_checks(&self, pr: &crate::db::PrRow, remote: &Remote, head_sha: &str) {
         let (Some((watch, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
             return;
         };
-        let actions = crate::ci::github::GhActions::new(
-            self.context.github_api.clone(),
-            owner_repo,
-            pr.number,
-        );
-        let recorder = crate::ci::record::Recorder {
-            db,
-            actions: &actions,
-            limits,
+        let outcome = match remote {
+            Remote::GitHub(repo) => {
+                let actions = crate::ci::github::GhActions::new(
+                    self.context.github_api.clone(),
+                    repo.full_path(),
+                    pr.number,
+                );
+                let recorder = crate::ci::record::Recorder {
+                    db,
+                    actions: &actions,
+                    limits,
+                };
+                recorder.observe_remote(pr, head_sha).await
+            }
+            Remote::GitLab(repo) => {
+                let actions = crate::ci::gitlab::GitLabCi::new(
+                    self.context.gitlab_rest(repo.host().as_str()),
+                    repo.clone(),
+                    pr.number,
+                );
+                let recorder = crate::ci::record::Recorder {
+                    db,
+                    actions: &actions,
+                    limits,
+                };
+                recorder.observe_remote(pr, head_sha).await
+            }
         };
-        match recorder.observe_github(pr, head_sha).await {
+        match outcome {
             Ok(Some(_)) => {
                 watch.ui_events.publish_session_change(
                     &pr.session_id,
@@ -1848,14 +2088,16 @@ pub(crate) fn pr_requires_review(
         .projects
         .iter()
         .find(|project| {
-            if backend == "github" {
-                github_owner_repo(repo_key)
-                    == project
-                        .github_repository()
-                        .map(|repo| format!("{}/{}", repo.owner(), repo.repo()))
-            } else {
-                project.has_identity(Path::new(repo_key))
-            }
+            let kind = match backend {
+                "gitlab" => Some(ForgeKind::GitLab),
+                "github" => Some(ForgeKind::GitHub),
+                _ => None,
+            };
+            kind.and_then(|kind| ForgeRepo::from_cache_key(kind, repo_key).ok())
+                .map_or_else(
+                    || project.has_identity(Path::new(repo_key)),
+                    |repo| project.covers_forge(&repo, &crate::config::MayConfig::default()),
+                )
         })
         .is_some_and(|project| project.pr.require_review == Some(true))
 }
@@ -1901,8 +2143,8 @@ pub async fn user_merge_pr(context: &PrContext, pr_id: i64) -> Result<crate::db:
         .update_pr(pr.id, PrState::ChecksPending, Some(&head_sha), None, None)
         .await?;
     record_user_event(db, context, &pr, "checks_pending", None).await;
-    if pr.backend == "github" {
-        return user_merge_github(db, context, &pr, &repo_key, &head_sha).await;
+    if matches!(pr.backend.as_str(), "github" | "gitlab") {
+        return user_merge_remote(db, context, &pr, &repo_key, &head_sha).await;
     }
     let checkout = resolve_host_checkout(db, &context.workspace_config, &repo_key).await?;
     let lock = context.land_locks.get(&repo_key);
@@ -1977,10 +2219,19 @@ pub async fn user_close_pr(context: &PrContext, pr_id: i64) -> Result<crate::db:
             pr.number, pr.state
         )));
     }
-    if pr.backend == "github" {
-        let owner_repo = github_owner_repo(&repo_key)
-            .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
-        close_github_api(&context.github_api, &owner_repo, pr.number).await?;
+    match pr.backend.as_str() {
+        "github" => {
+            let owner_repo = github_owner_repo(&repo_key)
+                .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+            close_github_api(&context.github_api, &owner_repo, pr.number).await?;
+        }
+        "gitlab" => {
+            let repo = ForgeRepo::from_cache_key(ForgeKind::GitLab, &repo_key)
+                .map_err(|error| PrError::Resolve(error.to_string()))?;
+            let rest = context.gitlab_rest(repo.host().as_str());
+            gitlab::close_mr(&rest, &repo, pr.number).await?;
+        }
+        _ => {}
     }
     let updated = db.close_pr(pr.id).await?;
     record_user_event(db, context, &updated, "closed", None).await;
@@ -2003,32 +2254,70 @@ impl merge_watch::ChecksObserver for NoopChecksObserver {
     async fn finished(&self) {}
 }
 
-async fn user_merge_github(
+async fn user_merge_remote(
     db: &ChatDb,
     context: &PrContext,
     pr: &crate::db::PrRow,
     repo_key: &str,
     head_sha: &str,
 ) -> Result<crate::db::PrRow, PrError> {
-    let owner_repo = github_owner_repo(repo_key)
-        .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+    let kind = match pr.backend.as_str() {
+        "gitlab" => ForgeKind::GitLab,
+        _ => ForgeKind::GitHub,
+    };
+    let repo = ForgeRepo::from_cache_key(kind, repo_key)
+        .map_err(|error| PrError::Resolve(error.to_string()))?;
+    let owner_repo = repo.full_path();
     let upstream_number = pr.number;
     let lock = context.land_locks.get(repo_key);
-    let github = merge_watch::GithubPr {
-        api: &context.github_api,
-        owner_repo: &owner_repo,
-        number: upstream_number,
+    let gitlab_rest =
+        (kind == ForgeKind::GitLab).then(|| context.gitlab_rest(repo.host().as_str()));
+    let upstream: AnyUpstream<'_> = match kind {
+        ForgeKind::GitHub => AnyUpstream::GitHub(merge_watch::GithubPr {
+            api: &context.github_api,
+            owner_repo: &owner_repo,
+            number: upstream_number,
+        }),
+        ForgeKind::GitLab => AnyUpstream::GitLab(gitlab::GitLabMr {
+            rest: gitlab_rest.as_ref().expect("gitlab backend has a client"),
+            repo: &repo,
+            iid: upstream_number,
+        }),
     };
-    let before = merge_watch::Upstream::snapshot(&github).await?;
-    ensure_head_pinned(upstream_number, head_sha, &before.head_sha)?;
-    let expected = merge_watch::Upstream::expected_checks(&github).await?;
+    let before = merge_watch::Upstream::snapshot(&upstream).await?;
+    ensure_head_pinned(upstream_number, head_sha, &before.head_sha, pr.sigil())?;
+    let expected = merge_watch::Upstream::expected_checks(&upstream).await?;
     record_user_event(db, context, pr, "queued", None).await;
     {
         let _guard = lock.lock().await;
-        queue_github_merge(&context.github_api, &owner_repo, upstream_number, head_sha).await?;
+        match kind {
+            ForgeKind::GitHub => {
+                queue_github_merge(&context.github_api, &owner_repo, upstream_number, head_sha)
+                    .await?;
+            }
+            ForgeKind::GitLab => {
+                let pipeline_running = before.checks.iter().any(|check| {
+                    matches!(
+                        check,
+                        merge_watch::CheckContext::CheckRun {
+                            conclusion: None,
+                            ..
+                        }
+                    )
+                });
+                gitlab::queue_merge(
+                    gitlab_rest.as_ref().expect("gitlab backend has a client"),
+                    &repo,
+                    upstream_number,
+                    head_sha,
+                    pipeline_running,
+                )
+                .await?;
+            }
+        }
     }
     let observer = NoopChecksObserver;
-    let watching = merge_watch::Observing::new(&github, &observer);
+    let watching = merge_watch::Observing::new(&upstream, &observer);
     let outcome = merge_watch::watch(
         &watching,
         &merge_watch::SystemClock::new(),
@@ -2054,14 +2343,10 @@ async fn user_merge_github(
                 .workspace_config
                 .projects
                 .iter()
-                .find(|project| {
-                    project.github_repository().is_some_and(|repo| {
-                        format!("{}/{}", repo.owner(), repo.repo()) == owner_repo
-                    })
-                })
+                .find(|project| project.covers_forge(&repo, &crate::config::MayConfig::default()))
                 .is_some_and(|project| !project.pr.pulls_after_merge());
             if !disabled {
-                let checkouts = pull_sync::recorded_checkouts(db, &owner_repo).await;
+                let checkouts = pull_sync::recorded_checkouts(db, &repo.cache_key()).await;
                 pull_sync::sync(context.signing.host(), checkouts, pull_sync::PULL_TIMEOUT).await;
             }
             if let Some(checkouts) = &context.checkouts
@@ -2070,14 +2355,35 @@ async fn user_merge_github(
                 tracing::warn!(
                     %error,
                     repo = %repo_key,
-                    "failed to refresh daemon checkout after user merged GitHub PR"
+                    "failed to refresh daemon checkout after user merged remote PR"
                 );
             }
-            let _ = delete_remote_branch_api(&context.github_api, &owner_repo, &pr.branch).await;
+            let remote = match kind {
+                ForgeKind::GitHub => Remote::GitHub(repo.clone()),
+                ForgeKind::GitLab => Remote::GitLab(repo.clone()),
+            };
+            match &remote {
+                Remote::GitHub(repo) => {
+                    let _ = delete_remote_branch_api(
+                        &context.github_api,
+                        &repo.full_path(),
+                        &pr.branch,
+                    )
+                    .await;
+                }
+                Remote::GitLab(repo) => {
+                    let _ = gitlab::delete_branch(
+                        gitlab_rest.as_ref().expect("gitlab backend has a client"),
+                        repo,
+                        &pr.branch,
+                    )
+                    .await;
+                }
+            }
             Ok(updated)
         }
         merge_watch::Outcome::Stopped(stopped) => {
-            let report = merge_watch::StoppedReport::new(pr.number, &stopped)
+            let report = merge_watch::StoppedReport::new(pr.sigil(), pr.number, &stopped)
                 .render()
                 .expect("the watch report renders");
             let report = report.trim_end().to_string();
@@ -2443,7 +2749,7 @@ fn pr_failure_detail(
         return Some(detail);
     }
     if check_state.is_some_and(|c| c.unreadable) {
-        return Some("latest GitHub check poll could not read check status".to_string());
+        return Some("latest check poll could not read check status".to_string());
     }
     None
 }
@@ -2461,11 +2767,11 @@ fn format_cached_checks(check_state: Option<&crate::db::PrCheckState>) -> Option
     Some(format!("{status} ({})", check_state.head_sha))
 }
 
-/// The remote branch of a GitHub PR, named from its session and the commit it
+/// The remote branch of a remote PR, named from its session and the commit it
 /// is first opened at, so two PRs of one session never share a branch and a
 /// retried open of the same work reuses its branch. The name is stored in the
 /// PR row; `update`, close and adoption read it from there.
-fn github_branch(session_id: &str, head_sha: &str) -> String {
+fn remote_branch(session_id: &str, head_sha: &str) -> String {
     let short = head_sha.get(..12).unwrap_or(head_sha);
     format!("may/{session_id}-{short}")
 }
@@ -3004,6 +3310,7 @@ struct PrBody<'a> {
 #[derive(Template)]
 #[template(path = "pr_merged.txt", escape = "none")]
 struct PrMerged<'a> {
+    sigil: char,
     number: i64,
     /// The merge commit in the checkout; `None` for a PR merged upstream.
     merge_sha: Option<&'a str>,
@@ -3025,7 +3332,7 @@ enum CloneFate {
 
 /// What became of a merged PR's branch on the remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RemoteBranch {
+pub(crate) enum RemoteBranch {
     /// A local PR has no remote branch.
     Local,
     /// The branch is gone from the remote.
@@ -3108,13 +3415,18 @@ pub(crate) fn github_owner_repo(url: &str) -> Option<String> {
     Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
 
-/// Fails when the PR's head on GitHub is not the commit pinned at `pr update`.
-fn ensure_head_pinned(number: i64, pinned: &str, upstream: &str) -> Result<(), PrError> {
+/// Fails when the PR's head upstream is not the commit pinned at `pr update`.
+fn ensure_head_pinned(
+    number: i64,
+    pinned: &str,
+    upstream: &str,
+    sigil: char,
+) -> Result<(), PrError> {
     if pinned == upstream {
         return Ok(());
     }
     Err(PrError::State(format!(
-        "PR #{number}'s head moved: GitHub holds {upstream}, the checked commit is {pinned} — \
+        "PR {sigil}{number}'s head moved: upstream holds {upstream}, the checked commit is {pinned} — \
          run `pr update {number}` to pin the current head and check it again"
     )))
 }
@@ -3139,8 +3451,8 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchState, GitHubRest, LandLocks, PrContext, PrStore, PrTokenSource, git, github_branch,
-        github_owner_repo, host_git, push_pinned,
+        BranchState, GitHubRest, LandLocks, PrContext, PrStore, PrTokenSource, git,
+        github_owner_repo, host_git, push_pinned, remote_branch,
     };
     use crate::commit_signing::test_user::TestUser;
     use crate::db::{PrFilter, PrState};
@@ -3266,6 +3578,7 @@ mod tests {
                     github_api: PrContext::default_github_api(
                         crate::forge::LiveForgeAuth::default(),
                     ),
+                    gitlab_api: None,
                     forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
@@ -3335,6 +3648,7 @@ mod tests {
                         PrTokenSource::Fixed("test-token".to_string()),
                         base,
                     ),
+                    gitlab_api: None,
                     forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
@@ -3798,6 +4112,7 @@ mod tests {
                 review,
                 signing: fx.signing(id),
                 github_api,
+                gitlab_api: None,
                 forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
@@ -3852,7 +4167,9 @@ mod tests {
 
         let resolved = store.resolve(None).await.unwrap();
         assert!(resolved.record.local);
-        assert_eq!(PrStore::backend_for(&resolved.record), ("may", None));
+        let (backend, repo) = store.backend_for(&resolved.record);
+        assert_eq!(backend, "may");
+        assert!(repo.is_none());
         fx.user.identify(&resolved.dir);
         commit_file(&resolved.dir, "work.txt");
         store.open(None, Some("work"), None, true).await.unwrap();
@@ -3958,9 +4275,10 @@ mod tests {
         let resolved = store.resolve(None).await.unwrap();
         assert_eq!(resolved.dir, seeded);
         assert!(!resolved.record.local);
+        assert_eq!(store.backend_for(&resolved.record).0, "github");
         assert_eq!(
-            PrStore::backend_for(&resolved.record),
-            ("github", Some("o/r".to_string()))
+            store.backend_for(&resolved.record).1.map(|r| r.full_path()),
+            Some("o/r".to_string())
         );
         let project = store.project_for_record(&resolved.record).unwrap();
         assert!(matches!(project.issues, ProjectIssues::May));
@@ -4018,8 +4336,8 @@ mod tests {
 
     #[test]
     fn a_merge_names_the_checked_commit_and_fails_when_the_head_moved() {
-        assert!(super::ensure_head_pinned(7, "abc123", "abc123").is_ok());
-        let err = super::ensure_head_pinned(7, "abc123", "def456").unwrap_err();
+        assert!(super::ensure_head_pinned(7, "abc123", "abc123", '#').is_ok());
+        let err = super::ensure_head_pinned(7, "abc123", "def456", '#').unwrap_err();
         assert!(matches!(err, super::PrError::State(_)), "{err}");
         assert!(err.to_string().contains("head moved"), "{err}");
     }
@@ -4043,6 +4361,7 @@ mod tests {
                 review: None,
                 signing: fx.signing(id),
                 github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                gitlab_api: None,
                 forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
@@ -4078,9 +4397,10 @@ mod tests {
 
         assert_eq!(resolved.dir, seeded);
         assert!(!resolved.record.local);
+        assert_eq!(store.backend_for(&resolved.record).0, "github");
         assert_eq!(
-            PrStore::backend_for(&resolved.record),
-            ("github", Some("o/r".to_string()))
+            store.backend_for(&resolved.record).1.map(|r| r.full_path()),
+            Some("o/r".to_string())
         );
         let project = store.project_for_record(&resolved.record).unwrap();
         assert!(project.path.is_none(), "the project has no checkout");
@@ -4173,9 +4493,9 @@ mod tests {
             }],
         };
         let pinned = store_without_checkout(&fx, "s1", project("may")).await;
-        assert!(pinned.check_pinned_backend(&record).is_err());
+        assert!(pinned.check_pinned_backend(&record, "github").is_err());
         let github = store_without_checkout(&fx, "s2", project("github")).await;
-        assert!(github.check_pinned_backend(&record).is_ok());
+        assert!(github.check_pinned_backend(&record, "github").is_ok());
     }
 
     #[tokio::test]
@@ -4265,7 +4585,7 @@ mod tests {
         // its branch left on the remote.
         commit_file(&clone, "one.txt");
         let first_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
-        let first = github_branch("s1", &first_sha);
+        let first = remote_branch("s1", &first_sha);
         push_pinned(
             &scratch,
             &clone,
@@ -4294,7 +4614,7 @@ mod tests {
         let base = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         commit_file(&clone, "two.txt");
         let second_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
-        let second = github_branch("s1", &second_sha);
+        let second = remote_branch("s1", &second_sha);
         assert_ne!(first, second);
         push_pinned(
             &scratch,
@@ -4765,8 +5085,12 @@ mod tests {
             let fx = Fixture::new().await;
             let (base, requests) = mock_api(status).await;
             let store = fx.github_store("s1", &base, PrState::Merged).await;
+            let repo =
+                crate::forge::ForgeRepo::from_cache_key(crate::forge::ForgeKind::GitHub, "o/r")
+                    .unwrap();
+            let remote = super::Remote::GitHub(repo);
 
-            assert_eq!(store.delete_remote_branch("o/r", "may/s").await, expected);
+            assert_eq!(store.delete_remote_branch(&remote, "may/s").await, expected);
             assert_eq!(
                 requests.lock().unwrap().clone(),
                 vec![(
@@ -4777,7 +5101,7 @@ mod tests {
                 )]
             );
 
-            let refused = store.delete_remote_branch("o/r", "main").await;
+            let refused = store.delete_remote_branch(&remote, "main").await;
             assert!(
                 matches!(refused, super::RemoteBranch::NotDeleted(ref b, _) if b == "main"),
                 "{refused:?}"
@@ -4792,6 +5116,7 @@ mod tests {
         use askama::Template as _;
         let render = |merge_sha, clone, remote_branch| {
             super::PrMerged {
+                sigil: '#',
                 number: 3,
                 merge_sha,
                 clone_dir: "r-1a2b3c4d",
@@ -4876,6 +5201,7 @@ mod tests {
                 review: None,
                 signing: fx.signing("s1"),
                 github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                gitlab_api: None,
                 forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
@@ -5208,6 +5534,7 @@ mod tests {
                     github_api: PrContext::default_github_api(
                         crate::forge::LiveForgeAuth::default(),
                     ),
+                    gitlab_api: None,
                     forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
@@ -5424,6 +5751,7 @@ mod tests {
                 review: None,
                 signing: fx.signing("s1"),
                 github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                gitlab_api: None,
                 forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
@@ -5464,6 +5792,7 @@ mod tests {
             review: None,
             signing: fx.user.signing(&fx.tmp.path().join("may"), "user"),
             github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+            gitlab_api: None,
             forge_auth: crate::forge::LiveForgeAuth::default(),
             land_locks: LandLocks::default(),
             checkouts: None,
@@ -5510,6 +5839,7 @@ mod tests {
                 review: None,
                 signing: fx.signing("s2"),
                 github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                gitlab_api: None,
                 forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,

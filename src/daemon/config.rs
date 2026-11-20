@@ -686,9 +686,16 @@ pub(super) async fn install_skill(
     Json(req): Json<SkillInstallRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<SkillInfoDto>>> {
-    let (owner, repo) = SkillManager::parse_github_repo(&req.repo).map_err(bad_request_error)?;
+    let repo = SkillManager::parse_skill_repo(&req.repo, &state.config_snapshot())
+        .map_err(bad_request_error)?;
+    let auth = match state.forge_auth.git_https_auth(repo.host().as_str()).await {
+        Ok(auth) => Some(auth),
+        // An unauthenticated host still installs public repositories.
+        Err(crate::forge::ForgeAuthError::Unauthenticated { .. }) => None,
+        Err(error) => return Err(internal_error(error)),
+    };
     let installed = scoped_skill_manager(&state, query.profile_id.as_str())
-        .install_from_github(owner, repo)
+        .install_from_forge(&repo, auth)
         .await
         .map_err(internal_error)?;
     Ok(Json(installed.into_iter().map(map_skill).collect()))

@@ -1975,7 +1975,9 @@ pub struct SkillInfoDto {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) dir_name: String,
-    pub(crate) source: crate::skill::SkillSource,
+    /// The skill's origin as its canonical binding (`github:owner/repo`,
+    /// `gitlab:<host>/<path>`, `bundled`, `local:<path>`).
+    pub(crate) source: String,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -2064,16 +2066,26 @@ pub struct TunnelInfoResponse {
     pub target: String,
 }
 
-// ── GitHub repository picker ────────────────────────────────
+// ── Forge repository picker ────────────────────────────────
 
-/// One GitHub repository a new chat can be bound to.
+/// One forge repository a new chat can be bound to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiGithubRepo {
-    /// `owner/repo`.
+    /// `owner/repo` on `github.com`, `<host>/<path>` elsewhere.
     pub(crate) full_name: String,
     /// Whether a local checkout of it was used recently.
     pub(crate) recent: bool,
+    /// The canonical session binding (`github:owner/repo`,
+    /// `gitlab:<host>/<path>`).
+    #[serde(default)]
+    pub(crate) binding: String,
+    /// The forge kind: `github` or `gitlab`.
+    #[serde(default)]
+    pub(crate) forge: String,
+    /// The forge host (`github.com`, `gitlab.com`, a self-hosted name).
+    #[serde(default)]
+    pub(crate) host: String,
 }
 
 /// The picker's list: recently used repositories first.

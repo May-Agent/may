@@ -2164,12 +2164,7 @@ where
                             let manager = SkillManager::from_profile_home(
                                 &home_paths.profile_home(profile_id.as_str()),
                             );
-                            let result = match SkillManager::parse_github_repo(&repo) {
-                                Ok((owner, repo_name)) => {
-                                    manager.install_from_github(owner, repo_name).await
-                                }
-                                Err(e) => Err(e),
-                            };
+                            let result = manager.install_from_spec(&repo).await;
                             // Refresh skill list after install
                             let final_result = match result {
                                 Ok(_) => manager.list_skills().await,

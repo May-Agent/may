@@ -3,6 +3,6 @@ No merge-queue waits are recorded for this session's PRs yet; one is recorded wh
 {%- else -%}
 Merge-queue wait against run time, newest PR first:
 {% for row in rows -%}
-- PR #{{ row.pr_number }}: waited {{ row.wait }} in the queue after a {{ row.run }} run.
+- PR {{ row.sigil }}{{ row.pr_number }}: waited {{ row.wait }} in the queue after a {{ row.run }} run.
 {% endfor -%}
 {%- endif %}

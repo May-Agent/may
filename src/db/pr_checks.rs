@@ -122,19 +122,20 @@ impl ChatDb {
         Ok(rows.into_iter().map(|row| row.text).collect())
     }
 
-    /// Every GitHub PR still in flight, across sessions.
+    /// Every forge-backed PR still in flight, across sessions.
     ///
     /// # Errors
     /// Fails on database errors.
-    pub async fn live_github_prs(&self) -> Result<Vec<super::pr::PrRow>, ChatDbError> {
-        Ok(
-            query!(self.db, "SELECT * FROM prs WHERE backend = 'github'")
-                .fetch_all::<super::pr::PrRow>()
-                .await?
-                .into_iter()
-                .filter(|row| row.state.is_in_flight())
-                .collect(),
+    pub async fn live_remote_prs(&self) -> Result<Vec<super::pr::PrRow>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM prs WHERE backend IN ('github', 'gitlab')"
         )
+        .fetch_all::<super::pr::PrRow>()
+        .await?
+        .into_iter()
+        .filter(|row| row.state.is_in_flight())
+        .collect())
     }
 }
 

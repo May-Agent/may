@@ -2,13 +2,20 @@ import { describe, expect, test } from 'bun:test';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { GithubRepo } from '@/lib/api/githubRepos';
-import { filterRepos, githubBinding } from '@/lib/repo';
+import { filterRepos } from '@/lib/repo';
 import { RepoPickerList, type RepoListState, type RepoPickerLabels } from './RepoPickerList';
 
 const REPOS: GithubRepo[] = [
-  { fullName: 'May-Agent/may', recent: true },
-  { fullName: 'lexoliu/aither', recent: false },
-  { fullName: 'lexoliu/waterui', recent: false },
+  { fullName: 'May-Agent/may', recent: true, binding: 'github:May-Agent/may', forge: 'github', host: 'github.com' },
+  { fullName: 'lexoliu/aither', recent: false, binding: 'github:lexoliu/aither', forge: 'github', host: 'github.com' },
+  { fullName: 'lexoliu/waterui', recent: false, binding: 'github:lexoliu/waterui', forge: 'github', host: 'github.com' },
+  {
+    fullName: 'gitlab.com/研究/プロジェクト/한국어',
+    recent: false,
+    binding: 'gitlab:gitlab.com/研究/プロジェクト/한국어',
+    forge: 'gitlab',
+    host: 'gitlab.com',
+  },
 ];
 
 const LABELS: RepoPickerLabels = {
@@ -37,6 +44,12 @@ describe('filterRepos', () => {
     expect(filterRepos(REPOS, 'lexoliu water')).toEqual([REPOS[2]]);
     expect(filterRepos(REPOS, '  ')).toEqual(REPOS);
     expect(filterRepos(REPOS, 'nope')).toEqual([]);
+  });
+
+  test('matches CJK and nested GitLab subgroup paths', () => {
+    expect(filterRepos(REPOS, '研究')).toEqual([REPOS[3]]);
+    expect(filterRepos(REPOS, 'gitlab.com プロジェクト')).toEqual([REPOS[3]]);
+    expect(filterRepos(REPOS, '한국어')).toEqual([REPOS[3]]);
   });
 });
 
@@ -78,13 +91,28 @@ describe('RepoPickerList', () => {
       state: ready,
       query: 'waterui',
       onQueryChange: () => {},
-      onPick: (repo) => started.push(githubBinding(repo)),
+      onPick: (repo) => started.push(repo),
       labels: LABELS,
     });
     const handlers = selectHandlers(element);
     expect(handlers).toHaveLength(1);
     handlers[0]();
     expect(started).toEqual(['github:lexoliu/waterui']);
+  });
+
+  test('a GitLab entry binds its canonical gitlab: binding', () => {
+    const started: string[] = [];
+    const element = RepoPickerList({
+      state: ready,
+      query: '研究',
+      onQueryChange: () => {},
+      onPick: (repo) => started.push(repo),
+      labels: LABELS,
+    });
+    const handlers = selectHandlers(element);
+    expect(handlers).toHaveLength(1);
+    handlers[0]();
+    expect(started).toEqual(['gitlab:gitlab.com/研究/プロジェクト/한국어']);
   });
 
   test('offers no entry while loading or unauthenticated', () => {

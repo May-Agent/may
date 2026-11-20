@@ -46,13 +46,14 @@ export const ja: Messages = {
   sidebar: {
     newChat: '新しいチャット',
     newChatRepo: {
-      title: 'GitHub リポジトリで新規チャット',
+      title: 'リポジトリで新規チャット',
       description: 'リポジトリに紐付いたセッションを開始 — ローカル checkout は不要です。',
       search: 'リポジトリを検索…',
       empty: '一致するリポジトリがありません',
       recent: '最近使用',
       all: 'あなたのリポジトリ',
-      unauthenticated: 'このマシンでは GitHub にサインインしていません。`gh auth login` を実行してから一覧を開き直してください。',
+      unauthenticated:
+        'このマシンにはサインイン済みの forge ホストがありません。設定 → Forge（または `/login`）で GitHub / GitLab を設定してから一覧を開き直してください。',
     },
     newChatInRepo: '{repo} で新規チャット',
     orphanedPrs: '孤立した PR',

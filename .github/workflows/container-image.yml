@@ -18,12 +18,18 @@ env:
   CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
+  # `may-container-image` computes the two content-addressed references in
+  # seconds, and probing GHCR here short-circuits the whole chain when the
+  # tags already exist, which is the common case: nothing the image's inputs
+  # hash changed.
   refs:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
     outputs:
       base: ${{ steps.refs.outputs.base }}
       workspace: ${{ steps.refs.outputs.workspace }}
+      base_exists: ${{ steps.exists.outputs.base }}
+      workspace_exists: ${{ steps.exists.outputs.workspace }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,12 +38,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # rav1e's x86_64 assembly is built with nasm.
-      - name: Install nasm
-        if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: ./.github/actions/install-nasm
       - id: refs
-        run: cargo run --locked --example container_image --timings -- refs >> "$GITHUB_OUTPUT"
+        run: cargo run --locked -p may-container-image --timings -- refs >> "$GITHUB_OUTPUT"
+      - id: exists
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          WORKSPACE: ${{ steps.refs.outputs.workspace }}
+        run: |
+          probe() { docker buildx imagetools inspect "$1" > /dev/null 2>&1 && echo true || echo false; }
+          echo "base=$(probe "$BASE")" >> "$GITHUB_OUTPUT"
+          echo "workspace=$(probe "$WORKSPACE")" >> "$GITHUB_OUTPUT"
       - name: Upload cargo timings
         if: always()
         uses: actions/upload-artifact@v4
@@ -47,6 +57,7 @@ jobs:
 
   base:
     needs: refs
+    if: needs.refs.outputs.base_exists != 'true'
     strategy:
       matrix:
         include:
@@ -93,7 +104,7 @@ jobs:
     needs: [refs, base]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.refs.outputs.base_exists != 'true'
     permissions:
       contents: read
       packages: write
@@ -125,6 +136,7 @@ jobs:
 
   workspace:
     needs: [refs, base-manifest]
+    if: always() && needs.refs.outputs.workspace_exists != 'true'
     strategy:
       matrix:
         include:
@@ -192,7 +204,7 @@ jobs:
     needs: [refs, workspace]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.refs.outputs.workspace_exists != 'true'
     permissions:
       contents: read
       packages: write

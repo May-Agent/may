@@ -1,4 +1,4 @@
-PR #{{ pr_number }}'s checks finished with {{ jobs.len() }} abnormally long job{% if jobs.len() != 1 %}s{% endif %}:
+PR {{ sigil }}{{ pr_number }}'s checks finished with {{ jobs.len() }} abnormally long job{% if jobs.len() != 1 %}s{% endif %}:
 {% for job in jobs -%}
 - {{ job.workflow }} / {{ job.name }} ran {{ job.duration }}: {% for reason in job.exceeded %}{{ reason }}{% if !loop.last %}; {% endif %}{% endfor %}.
 {%- if !job.steps.is_empty() %}

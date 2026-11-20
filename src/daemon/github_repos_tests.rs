@@ -17,7 +17,9 @@ use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use super::types::{ApiGithubRepo, ApiGithubRepos};
 use crate::config::MayConfig;
+use crate::issue::IssueError;
 use crate::issue::github::GitHubRest;
+use crate::issue::gitlab::{GitLabRest, GitLabTokenSource};
 use crate::pr::PrTokenSource;
 
 type Seen = Arc<Mutex<Vec<String>>>;
@@ -172,9 +174,102 @@ async fn pages_are_followed_when_the_count_is_unknown() {
         ["org/repo1", "org/repo2", "org/repo3"].map(|full_name| ApiGithubRepo {
             full_name: full_name.to_string(),
             recent: false,
+            binding: format!("github:{full_name}"),
+            forge: "github".to_string(),
+            host: "github.com".to_string(),
         })
     );
     assert_eq!(seen.lock().expect("seen").len(), 3);
+}
+
+/// A fixed GitLab credential for [`GitLabRest`].
+#[derive(Debug)]
+struct FixedGitLabToken;
+
+impl GitLabTokenSource for FixedGitLabToken {
+    fn token(&self) -> impl Future<Output = Result<String, IssueError>> + Send {
+        std::future::ready(Ok("glpat-t".to_string()))
+    }
+}
+
+/// A loopback GitLab API serving `/api/v4/projects` in `pages` pages of one
+/// project each, paginated by `x-next-page`.
+async fn mock_gitlab_api(pages: u32) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| async move {
+                let uri = request.uri().to_string();
+                assert!(uri.starts_with("/projects?"), "{uri}");
+                assert!(uri.contains("membership=true"), "{uri}");
+                let page: u32 = uri
+                    .split(['?', '&'])
+                    .find_map(|part| part.strip_prefix("page=")?.parse().ok())
+                    .unwrap_or(1);
+                let mut response = Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json");
+                if page < pages {
+                    response = response.header("x-next-page", (page + 1).to_string());
+                }
+                let body = serde_json::json!([{
+                    "path_with_namespace": format!("org/team/repo{page}")
+                }]);
+                Ok::<_, Infallible>(
+                    response
+                        .body(http_body_util::Full::new(Bytes::from(body.to_string())))
+                        .expect("response"),
+                )
+            });
+            tokio::spawn(async move {
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn gitlab_projects_lists_nested_paths_as_forge_bindings() {
+    let api = mock_gitlab_api(2).await;
+    let rest = GitLabRest::with_api_base(FixedGitLabToken, &api);
+    let repos = super::github_repos::gitlab_projects(&rest, "gitlab.example.com")
+        .await
+        .expect("projects listed");
+    let items: Vec<(&str, &str, &str, &str)> = repos
+        .iter()
+        .map(|repo| {
+            (
+                repo.binding.as_str(),
+                repo.full_name.as_str(),
+                repo.forge,
+                repo.host.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        items,
+        [
+            (
+                "gitlab:gitlab.example.com/org/team/repo1",
+                "gitlab.example.com/org/team/repo1",
+                "gitlab",
+                "gitlab.example.com",
+            ),
+            (
+                "gitlab:gitlab.example.com/org/team/repo2",
+                "gitlab.example.com/org/team/repo2",
+                "gitlab",
+                "gitlab.example.com",
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

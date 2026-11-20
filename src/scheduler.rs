@@ -1936,6 +1936,7 @@ mod tests {
                 Some(WebhookSignature {
                     secret: "HOOK_SECRET".to_string(),
                     header: "x-hub-signature-256".to_string(),
+                    scheme: None,
                 }),
             ),
         ] {

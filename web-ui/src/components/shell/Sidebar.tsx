@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Folder,
   Github,
+  Gitlab,
   Loader2,
   PanelLeftClose,
   Plus,
@@ -24,7 +25,7 @@ import { isWorking } from '@/lib/sessionLists';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
-import { githubBinding, groupByRepo, parseRepo, repoLabel } from '@/lib/repo';
+import { groupByRepo, parseRepo, repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
@@ -167,7 +168,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
         busy={creating}
         onPick={(repo) => {
           setRepoDialogOpen(false);
-          void startNewChat({ repo: githubBinding(repo) });
+          void startNewChat({ repo });
         }}
       />
 
@@ -405,7 +406,7 @@ function RepoGroup({ repo, count, disabled, onNewChat, children }: RepoGroupProp
   const { t } = useTranslation();
   const [open, setOpen] = useState(true);
   const label = repoLabel(repo);
-  const github = parseRepo(repo).kind === 'github';
+  const forge = parseRepo(repo).kind;
   return (
     <li>
       <div className="group/repo flex h-7 items-center rounded-md text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11">
@@ -420,8 +421,10 @@ function RepoGroup({ repo, count, disabled, onNewChat, children }: RepoGroupProp
           ) : (
             <ChevronRight className="size-3.5 shrink-0" aria-hidden />
           )}
-          {github ? (
+          {forge === 'github' ? (
             <Github className="size-3.5 shrink-0" aria-hidden />
+          ) : forge === 'gitlab' ? (
+            <Gitlab className="size-3.5 shrink-0" aria-hidden />
           ) : (
             <Folder className="size-3.5 shrink-0" aria-hidden />
           )}

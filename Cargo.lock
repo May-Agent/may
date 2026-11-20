@@ -5975,6 +5975,7 @@ dependencies = [
  "libc",
  "linkify",
  "lzma-rust2 0.24.0",
+ "may-container-image",
  "may-patch",
  "may-tasks",
  "mediax-codec",
@@ -6047,6 +6048,16 @@ dependencies = [
  "yuv",
  "zenwave",
  "zip 9.5.0",
+]
+
+[[package]]
+name = "may-container-image"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]

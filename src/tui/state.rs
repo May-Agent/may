@@ -721,8 +721,9 @@ pub enum PasteFilter {
     Any,
     /// Only alphanumeric, dash, underscore (for identifiers)
     Identifier,
-    /// Alphanumeric, dash, underscore, slash (for GitHub repos)
-    GitHubRepo,
+    /// Alphanumeric, dash, underscore, slash, colon, dot, at-sign (forge
+    /// repository specs: `owner/repo`, `gitlab:host/path`, clone URLs)
+    ForgeRepo,
 }
 
 impl PasteFilter {
@@ -735,9 +736,9 @@ impl PasteFilter {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect(),
-            Self::GitHubRepo => s
+            Self::ForgeRepo => s
                 .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
+                .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | ':' | '.' | '@'))
                 .collect(),
         }
     }
@@ -985,8 +986,9 @@ pub enum SkillAddMode {
     /// Not adding a skill
     #[default]
     None,
-    /// Entering GitHub repo (owner/repo format)
-    GitHubRepo,
+    /// Entering a forge repository spec (`owner/repo`, `github:`/`gitlab:`
+    /// binding or clone URL)
+    ForgeRepo,
 }
 
 /// Config section tabs (like Claude Code's /config).

@@ -1,4 +1,4 @@
-//! The poller that follows the checks of every in-flight GitHub PR.
+//! The poller that follows the checks of every in-flight remote PR.
 //!
 //! Each tick reads every live PR's checks once. The newest read of each PR is
 //! kept for the clients' PR rows (and pushed to them when it changes), and a
@@ -67,9 +67,15 @@ impl PrChecksCache {
 /// the state stored before.
 fn advance(
     previous: Option<&PrCheckState>,
+    backend: &str,
     pr_number: i64,
     read: &PrChecksRead,
 ) -> (PrCheckState, Option<ChecksEvent>) {
+    let sigil = crate::db::pr_sigil(backend);
+    let forge: &'static str = match backend {
+        "gitlab" => "GitLab",
+        _ => "GitHub",
+    };
     match read {
         Ok(report) => {
             let rollup = report.rollup();
@@ -81,7 +87,7 @@ fn advance(
                 unreadable: false,
             };
             let event = if moved {
-                ChecksEvent::for_rollup(pr_number, report)
+                ChecksEvent::for_rollup(sigil, pr_number, report)
             } else {
                 None
             };
@@ -98,7 +104,9 @@ fn advance(
                 })
             };
             let event = (!was_unreadable).then(|| ChecksEvent::Unreadable {
+                sigil,
                 pr_number,
+                forge,
                 error: error.clone(),
             });
             (state, event)
@@ -119,7 +127,7 @@ pub(super) fn spawn(state: Arc<DaemonState>) {
 }
 
 async fn poll(state: &DaemonState) {
-    let rows = match state.db().live_github_prs().await {
+    let rows = match state.db().live_remote_prs().await {
         Ok(rows) => rows,
         Err(error) => {
             tracing::error!(%error, "could not list the in-flight PRs to follow their checks");
@@ -158,16 +166,38 @@ async fn read_checks(state: &DaemonState, row: &PrRow) -> PrChecksRead {
                 row.number
             )
         })?;
-    let github = GithubPr {
-        api: &state.github_api,
-        owner_repo: &repo_key,
-        number: row.number,
-    };
-    github
-        .snapshot()
-        .await
-        .map(|snapshot| ChecksReport::of(&snapshot))
-        .map_err(|e| e.to_string())
+    if row.backend == "gitlab" {
+        let repo =
+            crate::forge::ForgeRepo::from_cache_key(crate::forge::ForgeKind::GitLab, &repo_key)
+                .map_err(|error| error.to_string())?;
+        let rest = crate::issue::gitlab::GitLabRest::new(
+            crate::pr::PrGitLabToken::Forge(crate::issue::gitlab::ForgeGitLabAuth::new(
+                state.forge_auth.clone(),
+                repo.host().as_str().to_string(),
+            )),
+            repo.host().as_str(),
+        );
+        let mr = crate::pr::gitlab::GitLabMr {
+            rest: &rest,
+            repo: &repo,
+            iid: row.number,
+        };
+        mr.snapshot()
+            .await
+            .map(|snapshot| ChecksReport::of(&snapshot))
+            .map_err(|e| e.to_string())
+    } else {
+        let github = GithubPr {
+            api: &state.github_api,
+            owner_repo: &repo_key,
+            number: row.number,
+        };
+        github
+            .snapshot()
+            .await
+            .map(|snapshot| ChecksReport::of(&snapshot))
+            .map_err(|e| e.to_string())
+    }
 }
 
 async fn apply(state: &DaemonState, row: &PrRow, read: PrChecksRead) {
@@ -182,7 +212,7 @@ async fn apply(state: &DaemonState, row: &PrRow, read: PrChecksRead) {
             return;
         }
     };
-    let (next, event) = advance(previous.as_ref(), row.number, &read);
+    let (next, event) = advance(previous.as_ref(), &row.backend, row.number, &read);
     if previous.as_ref() == Some(&next) && event.is_none() {
         return;
     }
@@ -243,7 +273,7 @@ mod tests {
         let mut state: Option<PrCheckState> = None;
         let mut raised = Vec::new();
         for read in reads {
-            let (next, event) = advance(state.as_ref(), 7, read);
+            let (next, event) = advance(state.as_ref(), "github", 7, read);
             state = Some(next);
             raised.extend(event);
         }
@@ -265,6 +295,7 @@ mod tests {
         assert_eq!(
             raised,
             [ChecksEvent::Failed {
+                sigil: '#',
                 pr_number: 7,
                 names: vec!["测试1".to_string()]
             }]
@@ -281,6 +312,7 @@ mod tests {
         assert_eq!(
             raised,
             [ChecksEvent::Passed {
+                sigil: '#',
                 pr_number: 7,
                 total: 2
             }]
@@ -312,15 +344,20 @@ mod tests {
             raised,
             [
                 ChecksEvent::Failed {
+                    sigil: '#',
                     pr_number: 7,
                     names: vec!["测试0".to_string()]
                 },
                 ChecksEvent::Unreadable {
+                    sigil: '#',
                     pr_number: 7,
+                    forge: "GitHub",
                     error: "GitHub 502".to_string()
                 },
                 ChecksEvent::Unreadable {
+                    sigil: '#',
                     pr_number: 7,
+                    forge: "GitHub",
                     error: "GitHub 502".to_string()
                 },
             ]

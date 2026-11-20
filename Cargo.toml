@@ -17,9 +17,9 @@ path = "src/bin/may/main.rs"
 dist = true
 
 [workspace]
-members = [".", "tasks", "patch", "sed"]
+members = [".", "tasks", "patch", "sed", "container-image"]
 # `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
-default-members = [".", "tasks", "patch", "sed"]
+default-members = [".", "tasks", "patch", "sed", "container-image"]
 
 [features]
 default = ["vision-ocr"]
@@ -35,6 +35,8 @@ vision-ocr = ["dep:waterkit-vision"]
 # The `tasks.md` parser and the `tasks` command; the container image tag is
 # derived from this crate's directory.
 may-tasks = { path = "tasks" }
+# The content-addressed container image references.
+may-container-image = { path = "container-image" }
 libc = "0.2.191"
 # Aither framework
 aither-core = { version = "0.31.0" }
@@ -252,8 +254,7 @@ waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 
 [build-dependencies]
-sha2 = "0.10"
-serde_json = { version = "1.0", default-features = false, features = ["std"] }
+may-container-image = { path = "container-image" }
 
 [dev-dependencies]
 # Builds the tar.xz artifacts the distribution tests extract.

@@ -34,9 +34,13 @@ pub enum SkillError {
     /// Repository has no skills/ directory.
     #[error("Repository has no skills/ directory")]
     NoSkillsDirectory,
-    /// Invalid repo format, expected owner/repo.
-    #[error("Invalid repo format, expected owner/repo")]
-    InvalidRepoFormat,
+    /// Invalid repository spec, expected `owner/repo`, a `github:`/`gitlab:`
+    /// binding or a forge clone URL.
+    #[error("invalid repository spec '{0}': {1}")]
+    InvalidRepoSpec(String, String),
+    /// The May configuration could not be read.
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
     /// Skill not found.
     #[error("Skill not found: {0}")]
     NotFound(String),
@@ -63,6 +67,16 @@ pub enum SkillSource {
         owner: String,
         /// Repository name.
         repo: String,
+        /// The GitHub Enterprise host; absent for `github.com`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+    },
+    /// Installed from GitLab (`gitlab.com` or a self-hosted host).
+    GitLab {
+        /// The forge host.
+        host: String,
+        /// The `group/sub/.../repo` namespace path.
+        path: String,
     },
     /// Registered from a local project path.
     LocalPath {
@@ -72,12 +86,35 @@ pub enum SkillSource {
 }
 
 impl std::fmt::Display for SkillSource {
+    /// The canonical binding form: `github:owner/repo`,
+    /// `github:<host>/owner/repo`, `gitlab:<host>/<path>` or `local:<path>`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bundled => write!(f, "bundled"),
-            Self::GitHub { owner, repo } => write!(f, "github:{owner}/{repo}"),
+            Self::GitHub { owner, repo, host } => match host {
+                Some(host) => write!(f, "github:{host}/{owner}/{repo}"),
+                None => write!(f, "github:{owner}/{repo}"),
+            },
+            Self::GitLab { host, path } => write!(f, "gitlab:{host}/{path}"),
             Self::LocalPath { path } => write!(f, "local:{path}"),
         }
+    }
+}
+
+/// The [`SkillSource`] recording the forge repository a skill was installed
+/// from.
+fn skill_source_for(repo: &crate::forge::ForgeRepo) -> SkillSource {
+    match repo.kind() {
+        crate::forge::ForgeKind::GitHub => SkillSource::GitHub {
+            owner: repo.namespace().to_string(),
+            repo: repo.name().to_string(),
+            host: (repo.host().as_str() != crate::forge::GITHUB_HOST)
+                .then(|| repo.host().as_str().to_string()),
+        },
+        crate::forge::ForgeKind::GitLab => SkillSource::GitLab {
+            host: repo.host().as_str().to_string(),
+            path: repo.full_path(),
+        },
     }
 }
 
@@ -220,17 +257,13 @@ impl SkillManager {
         SkillSource::Bundled
     }
 
-    /// Install skills from a GitHub repository.
+    /// Install skills from a forge repository (GitHub or GitLab, hosted or
+    /// self-hosted).
     ///
-    /// The repo should have a `skills/` directory containing skill folders.
-    /// Uses git2 for cloning (non-blocking via unblock).
-    ///
-    /// # Arguments
-    /// * `owner` - GitHub repository owner
-    /// * `repo` - GitHub repository name
-    ///
-    /// # Returns
-    /// List of installed skills
+    /// The repository's `skills/` directory is cloned over HTTPS — shallow,
+    /// with the one-shot `auth` credential when given — and each skill
+    /// directory it holds is copied into the skills directory with a
+    /// `.source.json` recording the repository's canonical binding.
     ///
     /// # Errors
     ///
@@ -241,32 +274,55 @@ impl SkillManager {
     /// # Panics
     ///
     /// Panics if a cloned skills directory entry has no file name.
-    pub async fn install_from_github(
+    pub async fn install_from_forge(
         &self,
-        owner: &str,
-        repo: &str,
+        repo: &crate::forge::ForgeRepo,
+        auth: Option<crate::host_git::HttpsAuth>,
     ) -> Result<Vec<SkillInfo>, SkillError> {
-        let repo_url = format!("https://github.com/{owner}/{repo}.git");
+        let clone_url = repo.https_clone_url();
+        self.install_from_git_url(&clone_url, repo, auth).await
+    }
+
+    /// Clone `clone_url` and install its `skills` directory, recording
+    /// `repo` as the source. `install_from_forge` is this with the
+    /// repository's own HTTPS URL; the split exists so tests can clone a
+    /// local `file://` origin.
+    ///
+    /// # Errors
+    /// As [`Self::install_from_forge`].
+    async fn install_from_git_url(
+        &self,
+        clone_url: &str,
+        repo: &crate::forge::ForgeRepo,
+        auth: Option<crate::host_git::HttpsAuth>,
+    ) -> Result<Vec<SkillInfo>, SkillError> {
+        let clone_url = clone_url.to_string();
+        let source = skill_source_for(repo);
         let skills_dir = self.skills_dir.clone();
-        let owner = owner.to_string();
-        let repo_name = repo.to_string();
+        let mut git = crate::host_git::HostGit::inherit();
+        if let Some(auth) = auth {
+            git = git.with_https_auth(auth);
+        }
 
         // Run blocking git operations in background thread
         let installed = unblock(move || -> Result<Vec<SkillInfo>, SkillError> {
             let temp_dir = tempfile::tempdir()?;
             let temp_path = temp_dir.path();
 
-            // Configure fetch options for shallow clone
-            let mut fetch_opts = git2::FetchOptions::new();
-            fetch_opts.depth(1);
-
-            // Clone the repository (shallow)
-            let mut builder = git2::build::RepoBuilder::new();
-            builder.fetch_options(fetch_opts);
-
-            builder
-                .clone(&repo_url, temp_path)
-                .map_err(|_| SkillError::GitCloneFailed(repo_url.clone()))?;
+            let mut command = git.command();
+            // A skill install may never stop at a credential prompt.
+            command.env("GIT_TERMINAL_PROMPT", "0");
+            let output = command
+                .args(["clone", "--depth", "1", &clone_url])
+                .arg(temp_path)
+                .output()
+                .map_err(|error| SkillError::GitCloneFailed(format!("{clone_url}: {error}")))?;
+            if !output.status.success() {
+                return Err(SkillError::GitCloneFailed(format!(
+                    "{clone_url}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
 
             // Check for skills directory
             let skills_source = temp_path.join("skills");
@@ -276,11 +332,6 @@ impl SkillManager {
 
             // Ensure target skills directory exists
             std::fs::create_dir_all(&skills_dir)?;
-
-            let source = SkillSource::GitHub {
-                owner: owner.clone(),
-                repo: repo_name.clone(),
-            };
 
             let mut installed = Vec::new();
             for entry in std::fs::read_dir(&skills_source)? {
@@ -310,6 +361,27 @@ impl SkillManager {
         .await?;
 
         Ok(installed)
+    }
+
+    /// Install the skills the spec names, using `config`'s `[forge]`
+    /// credentials when the repository's host has them.
+    ///
+    /// # Errors
+    /// Returns [`SkillError::Config`] when the configuration cannot be read,
+    /// and as [`Self::install_from_forge`] otherwise.
+    pub async fn install_from_spec(&self, input: &str) -> Result<Vec<SkillInfo>, SkillError> {
+        let config = crate::config::MayConfig::load().await?;
+        let repo = Self::parse_skill_repo(input, &config)?;
+        let auth = match crate::forge::ForgeAuth::new(&config)
+            .git_https_auth(repo.host().as_str())
+            .await
+        {
+            Ok(auth) => Some(auth),
+            // An unauthenticated host still installs public repositories.
+            Err(crate::forge::ForgeAuthError::Unauthenticated { .. }) => None,
+            Err(error) => return Err(SkillError::GitCloneFailed(error.to_string())),
+        };
+        self.install_from_forge(&repo, auth).await
     }
 
     /// Delete a skill by directory name.
@@ -392,18 +464,51 @@ impl SkillManager {
         .await
     }
 
-    /// Parse a GitHub repo string in "owner/repo" format.
+    /// The forge repository a skill install spec names.
+    ///
+    /// Accepts `owner/repo` (GitHub.com), `github:owner/repo`,
+    /// `github:<host>/owner/repo`, `gitlab:<group/.../repo>` (gitlab.com),
+    /// `gitlab:<host>/<group/.../repo>`, a bare `host/path` (kind from the
+    /// configured `[forge]` entry, GitLab when unset) and `https://`,
+    /// `ssh://` or `git@host:path` clone URLs.
     ///
     /// # Errors
     ///
-    /// Returns [`SkillError::InvalidRepoFormat`] when `input` is not in
-    /// `owner/repo` form.
-    pub fn parse_github_repo(input: &str) -> Result<(&str, &str), SkillError> {
+    /// Returns [`SkillError::InvalidRepoSpec`] when the spec names no forge
+    /// repository.
+    pub fn parse_skill_repo(
+        input: &str,
+        config: &crate::config::MayConfig,
+    ) -> Result<crate::forge::ForgeRepo, SkillError> {
         let input = input.trim();
-        match input.split_once('/') {
-            Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() => Ok((owner, repo)),
-            _ => Err(SkillError::InvalidRepoFormat),
+        let invalid = |error: &dyn std::fmt::Display| {
+            SkillError::InvalidRepoSpec(input.to_string(), error.to_string())
+        };
+        if input.starts_with("github:") || input.starts_with("gitlab:") {
+            return crate::forge::ForgeRepo::parse_binding(input).map_err(|e| invalid(&e));
         }
+        if input.contains("://") || input.contains('@') {
+            return crate::forge::ForgeRepo::from_remote_url(input, config)
+                .map_err(|e| invalid(&e));
+        }
+        let binding = match input.split('/').count() {
+            2 => format!("github:{input}"),
+            n if n >= 3 => {
+                let Some(first) = input.split('/').next() else {
+                    return Err(invalid(&"empty repository spec"));
+                };
+                match config.forge_kind(first) {
+                    Some(crate::forge::ForgeKind::GitHub) => format!("github:{input}"),
+                    _ => format!("gitlab:{input}"),
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    &"expected owner/repo, a github:/gitlab: binding or a clone URL",
+                ));
+            }
+        };
+        crate::forge::ForgeRepo::parse_binding(&binding).map_err(|e| invalid(&e))
     }
 }
 
@@ -425,6 +530,133 @@ fn parse_skill_sync(skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SKILL_MD: &str = "---\nname: Test Skill\ndescription: test\n---\n\n# Test Skill";
+
+    #[test]
+    fn skill_source_serializes_and_displays_forge_bindings() {
+        let cases = [
+            (
+                SkillSource::GitHub {
+                    owner: "acme".to_string(),
+                    repo: "skills".to_string(),
+                    host: None,
+                },
+                "github:acme/skills",
+            ),
+            (
+                SkillSource::GitHub {
+                    owner: "acme".to_string(),
+                    repo: "skills".to_string(),
+                    host: Some("ghe.corp.example".to_string()),
+                },
+                "github:ghe.corp.example/acme/skills",
+            ),
+            (
+                SkillSource::GitLab {
+                    host: "gitlab.com".to_string(),
+                    path: "org/team/skills".to_string(),
+                },
+                "gitlab:gitlab.com/org/team/skills",
+            ),
+            (
+                SkillSource::LocalPath {
+                    path: "/tmp/x".to_string(),
+                },
+                "local:/tmp/x",
+            ),
+        ];
+        for (source, text) in cases {
+            assert_eq!(source.to_string(), text);
+            let json = serde_json::to_string(&source).expect("serialize");
+            let parsed: SkillSource = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, source);
+        }
+        // A `.source.json` written before the forge work still reads.
+        let old: SkillSource =
+            serde_json::from_str(r#"{"type":"GitHub","owner":"acme","repo":"skills"}"#)
+                .expect("old metadata parses");
+        assert_eq!(old.to_string(), "github:acme/skills");
+    }
+
+    #[test]
+    fn skill_repo_specs_parse_to_forge_repositories() {
+        let config = crate::config::MayConfig::default();
+        let expect = |spec: &str, binding: &str| {
+            let repo = SkillManager::parse_skill_repo(spec, &config).expect(spec);
+            assert_eq!(repo.canonical_binding(), binding, "{spec}");
+        };
+        expect("acme/skills", "github:acme/skills");
+        expect("github:acme/skills", "github:acme/skills");
+        expect(
+            "github:ghe.corp.example/acme/skills",
+            "github:ghe.corp.example/acme/skills",
+        );
+        expect(
+            "gitlab:org/team/skills",
+            "gitlab:gitlab.com/org/team/skills",
+        );
+        expect(
+            "gitlab:gitlab.com/org/team/skills",
+            "gitlab:gitlab.com/org/team/skills",
+        );
+        expect(
+            "gitlab:git.corp.example/ai/skills",
+            "gitlab:git.corp.example/ai/skills",
+        );
+        expect(
+            "https://gitlab.com/org/team/skills.git",
+            "gitlab:gitlab.com/org/team/skills",
+        );
+        expect(
+            "git@gitlab.com:org/team/skills.git",
+            "gitlab:gitlab.com/org/team/skills",
+        );
+        expect(
+            "git.corp.example/ai/skills",
+            "gitlab:git.corp.example/ai/skills",
+        );
+        assert!(SkillManager::parse_skill_repo("", &config).is_err());
+        assert!(SkillManager::parse_skill_repo("nonsense", &config).is_err());
+    }
+
+    #[tokio::test]
+    async fn install_from_forge_clones_and_records_the_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let may_dir = temp.path().join(".may");
+        let origin = temp.path().join("origin");
+        std::fs::create_dir_all(origin.join("skills/demo")).expect("skills dir");
+        std::fs::write(origin.join("skills/demo/SKILL.md"), SKILL_MD).expect("SKILL.md");
+        let git = crate::host_git::HostGit::inherit();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        ] {
+            git.output(Some(&origin), &args).expect("git setup");
+        }
+        let url = format!("file://{}", origin.display());
+        // The clone path is exercised through a local `git clone` of the
+        // origin; the binding still records the parsed forge repository.
+        let repo =
+            crate::forge::ForgeRepo::parse_binding("gitlab:gitlab.com/org/demo").expect("binding");
+        let manager = SkillManager::new(&may_dir);
+        let skills = manager
+            .install_from_git_url(&url, &repo, None)
+            .await
+            .expect("install");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].source.to_string(), "gitlab:gitlab.com/org/demo");
+        assert!(may_dir.join("skills/demo/.source.json").exists());
+    }
 
     #[tokio::test]
     async fn register_skill_from_local_path_works() {

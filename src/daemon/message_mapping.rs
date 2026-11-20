@@ -258,6 +258,6 @@ pub(super) fn map_skill(skill: crate::skill::SkillInfo) -> SkillInfoDto {
         name: skill.name,
         description: skill.description,
         dir_name: skill.dir_name,
-        source: skill.source,
+        source: skill.source.to_string(),
     }
 }

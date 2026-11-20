@@ -19,4 +19,5 @@ pub(crate) use coord::looks_like_host;
 
 pub use coord::{
     ForgeHost, ForgeHostError, ForgeKind, ForgeRepo, ForgeRepoError, GITHUB_HOST, GITLAB_HOST,
+    url_path_encode,
 };

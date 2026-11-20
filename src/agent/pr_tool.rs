@@ -298,6 +298,7 @@ mod tests {
                     github_api: PrContext::default_github_api(
                         crate::forge::LiveForgeAuth::default(),
                     ),
+                    gitlab_api: None,
                     forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
@@ -411,6 +412,7 @@ mod tests {
                     github_api: PrContext::default_github_api(
                         crate::forge::LiveForgeAuth::default(),
                     ),
+                    gitlab_api: None,
                     forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
