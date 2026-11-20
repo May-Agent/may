@@ -9,6 +9,9 @@ cargo-dist-version = "0.34.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
+# The pull_request trigger in release.yml is narrowed to the files
+# `dist plan` reads, which differs from what `dist init` would generate.
+allow-dirty = ["ci"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
