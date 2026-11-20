@@ -672,6 +672,26 @@ impl ChatDb {
             .await?)
     }
 
+    /// The PR's recorded fork point advances to `base_sha`: the base an
+    /// update actually verified and pushed over, so the next `pr show`
+    /// and `pr update` read the true base, not the one `pr open` pinned.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub async fn update_pr_base(&self, id: i64, base_sha: &str) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "UPDATE prs SET base_sha = ?, updated_at = ? WHERE id = ?",
+            base_sha,
+            now,
+            id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Close a PR: the only transition to `closed` that abandons work, and
     /// the one place that refuses a terminal PR. The state check and the
     /// write share one transaction.

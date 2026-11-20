@@ -122,7 +122,9 @@ pub enum CheckContext {
         #[serde(rename = "completedAt")]
         completed_at: Option<jiff::Timestamp>,
         conclusion: Option<CheckConclusion>,
-        #[serde(rename = "isRequired")]
+        /// Missing on the merge-group commit's rollup, where `isRequired`
+        /// takes no pull request.
+        #[serde(rename = "isRequired", default)]
         is_required: bool,
     },
     StatusContext {
@@ -132,7 +134,8 @@ pub enum CheckContext {
         state: StatusState,
         #[serde(rename = "createdAt")]
         created_at: Option<jiff::Timestamp>,
-        #[serde(rename = "isRequired")]
+        /// Missing on the merge-group commit's rollup.
+        #[serde(rename = "isRequired", default)]
         is_required: bool,
     },
 }
@@ -155,7 +158,8 @@ pub struct FailedCheck {
 }
 
 impl CheckContext {
-    fn failed_required(&self) -> Option<FailedCheck> {
+    /// The check when it ended badly, required or not.
+    fn failed(&self) -> Option<FailedCheck> {
         match self {
             Self::CheckRun {
                 name,
@@ -167,7 +171,6 @@ impl CheckContext {
                         | CheckConclusion::Cancelled
                         | CheckConclusion::StartupFailure,
                     ),
-                is_required: true,
                 ..
             } => Some(FailedCheck {
                 name: name.clone(),
@@ -177,7 +180,6 @@ impl CheckContext {
                 context,
                 target_url,
                 state: StatusState::Failure | StatusState::Error,
-                is_required: true,
                 ..
             } => Some(FailedCheck {
                 name: context.clone(),
@@ -185,6 +187,16 @@ impl CheckContext {
             }),
             _ => None,
         }
+    }
+
+    /// The check when it ended badly and a merge gate requires it.
+    fn failed_required(&self) -> Option<FailedCheck> {
+        let required = match self {
+            Self::CheckRun { is_required, .. } | Self::StatusContext { is_required, .. } => {
+                *is_required
+            }
+        };
+        required.then(|| self.failed()).flatten()
     }
 }
 
@@ -198,6 +210,11 @@ pub struct Snapshot {
     pub(crate) removals: usize,
     /// The reason GitHub gave for the latest removal.
     pub(crate) last_removal: Option<String>,
+    /// The checks that ran on the temporary merge-group commit the latest
+    /// removal dropped: they fail for the merge itself, not the PR's head.
+    pub(crate) removal_checks: Vec<CheckContext>,
+    /// The PR's mergeability as GitHub summarizes it.
+    pub(crate) merge_state: Option<String>,
     /// The commit the checks ran on.
     pub(crate) head_sha: String,
     pub(crate) checks: Vec<CheckContext>,
@@ -206,6 +223,22 @@ pub struct Snapshot {
 impl Snapshot {
     pub(crate) fn failed_check(&self) -> Option<FailedCheck> {
         self.checks.iter().find_map(CheckContext::failed_required)
+    }
+
+    /// Why a removal GitHub gave no reason for happened, read from the PR's
+    /// own state: `None` when nothing explains it.
+    fn removal_cause(&self) -> Option<String> {
+        if matches!(self.merge_state.as_deref(), Some("DIRTY" | "CONFLICTING")) {
+            return Some("the pull request has a merge conflict".to_string());
+        }
+        // A failed check on the PR's head, or on the merge-group commit
+        // the removal was part of — the queue reports the second kind
+        // with no reason.
+        self.checks
+            .iter()
+            .chain(&self.removal_checks)
+            .find_map(CheckContext::failed)
+            .map(|check| format!("check {} failed", check.name))
     }
 }
 
@@ -220,6 +253,17 @@ pub struct CheckSummary {
     pub(crate) failed: u32,
 }
 
+/// A merge-queue removal: the reason GitHub gave, or one read off the PR's
+/// check and mergeability state when GitHub gave none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Removal {
+    /// The reason, in words — GitHub's, or derived.
+    pub reason: String,
+    /// `true` when neither GitHub nor the PR's state explains the removal:
+    /// such removals tend to be transient, unlike a named cause.
+    pub unexplained: bool,
+}
+
 /// Why the watch ended without a merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Stopped {
@@ -228,7 +272,7 @@ pub(super) enum Stopped {
     /// A required check failed.
     CheckFailed(FailedCheck),
     /// The merge queue removed the PR, for the reason GitHub gave.
-    Removed(String),
+    Removed(Removal),
     /// The PR was still open when the bound passed.
     TimedOut { waited: Duration, bound: Duration },
 }
@@ -296,10 +340,25 @@ pub(super) async fn watch<U: Upstream + Sync, C: Clock + Sync>(
             return Ok(Outcome::Stopped(Stopped::CheckFailed(check)));
         }
         if snapshot.removals > removals {
-            let reason = snapshot
-                .last_removal
-                .unwrap_or_else(|| "no reason given".to_string());
-            return Ok(Outcome::Stopped(Stopped::Removed(reason)));
+            let removal = snapshot.last_removal.as_ref().map_or_else(
+                || {
+                    snapshot.removal_cause().map_or_else(
+                        || Removal {
+                            reason: "no reason given".to_string(),
+                            unexplained: true,
+                        },
+                        |reason| Removal {
+                            reason,
+                            unexplained: false,
+                        },
+                    )
+                },
+                |reason| Removal {
+                    reason: reason.clone(),
+                    unexplained: false,
+                },
+            );
+            return Ok(Outcome::Stopped(Stopped::Removed(removal)));
         }
         let bound = expected * (2 + snapshot.queue_position.unwrap_or(0));
         let waited = clock.elapsed().saturating_sub(started);
@@ -554,6 +613,8 @@ struct GraphRepository {
 #[derive(Deserialize)]
 struct GraphPullRequest {
     state: PullRequestState,
+    #[serde(rename = "mergeStateStatus")]
+    merge_state: Option<String>,
     #[serde(rename = "mergeQueueEntry")]
     merge_queue_entry: Option<GraphQueueEntry>,
     #[serde(rename = "timelineItems")]
@@ -576,6 +637,26 @@ struct GraphRemovals {
 #[derive(Deserialize)]
 struct GraphRemoval {
     reason: Option<String>,
+    /// The merge-group commit the removal dropped, with the checks that
+    /// ran on it — absent outside a merge queue's run.
+    #[serde(rename = "beforeCommit")]
+    before_commit: Option<GraphBeforeCommit>,
+}
+
+#[derive(Deserialize)]
+struct GraphBeforeCommit {
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<GraphRemovalRollup>,
+}
+
+#[derive(Deserialize)]
+struct GraphRemovalRollup {
+    contexts: GraphRemovalContexts,
+}
+
+#[derive(Deserialize)]
+struct GraphRemovalContexts {
+    nodes: Vec<CheckContext>,
 }
 
 #[derive(Deserialize)]
@@ -643,16 +724,17 @@ impl GraphResponse {
             .filter(|c| c.page_info.has_next_page)
             .and_then(|c| c.page_info.end_cursor.clone());
         let checks = contexts.map_or_default(|c| c.nodes);
+        let removal = pr.timeline_items.nodes.into_iter().next_back();
         let snapshot = Snapshot {
             state: pr.state,
             queue_position: pr.merge_queue_entry.map(|entry| entry.position),
             removals: pr.timeline_items.total_count,
-            last_removal: pr
-                .timeline_items
-                .nodes
-                .into_iter()
-                .next_back()
-                .and_then(|node| node.reason),
+            last_removal: removal.as_ref().and_then(|node| node.reason.clone()),
+            removal_checks: removal
+                .and_then(|node| node.before_commit)
+                .and_then(|commit| commit.status_check_rollup)
+                .map_or_else(Vec::new, |rollup| rollup.contexts.nodes),
+            merge_state: pr.merge_state,
             head_sha,
             checks,
         };
@@ -737,6 +819,8 @@ mod tests {
             queue_position: position,
             removals: 0,
             last_removal: None,
+            removal_checks: Vec::new(),
+            merge_state: None,
             head_sha: "abc123".to_string(),
             checks: vec![CheckContext::CheckRun {
                 name: "clippy".to_string(),
@@ -868,10 +952,62 @@ mod tests {
             (Duration::ZERO, snapshot(PullRequestState::Open, Some(1))),
             (minutes(20), removed),
         ]));
-        let stopped = Stopped::Removed("failed status checks".to_string());
+        let stopped = Stopped::Removed(Removal {
+            reason: "failed status checks".to_string(),
+            unexplained: false,
+        });
         assert_eq!(outcome, Outcome::Stopped(stopped.clone()));
         let text = StoppedReport::new('#', 7, &stopped).render().unwrap();
         assert!(text.contains("failed status checks"), "{text}");
+    }
+
+    /// A removal GitHub gives no reason for still names its cause: a check
+    /// that failed on the merge-group commit — reported by the removal's
+    /// own rollup, not the PR head's — explains it and is not retried.
+    #[test]
+    fn an_unexplained_removal_reads_the_merge_group_checks() {
+        let mut removed = snapshot(PullRequestState::Open, None);
+        removed.removals = 1;
+        // The PR's own check passed; the merge-group run's did not.
+        removed.removal_checks = vec![CheckContext::CheckRun {
+            name: "merge_group".to_string(),
+            details_url: None,
+            status: Some(RunStatus::Completed),
+            started_at: None,
+            completed_at: None,
+            conclusion: Some(CheckConclusion::Failure),
+            is_required: false,
+        }];
+        let (outcome, _, _) = futures_lite::future::block_on(run(vec![
+            (Duration::ZERO, snapshot(PullRequestState::Open, Some(1))),
+            (minutes(20), removed),
+        ]));
+        assert_eq!(
+            outcome,
+            Outcome::Stopped(Stopped::Removed(Removal {
+                reason: "check merge_group failed".to_string(),
+                unexplained: false,
+            }))
+        );
+    }
+
+    /// A removal nothing explains — no reason, no merge state, no failed
+    /// check anywhere — is the transient kind the caller retries.
+    #[test]
+    fn a_removal_nothing_explains_is_unexplained() {
+        let mut removed = snapshot(PullRequestState::Open, None);
+        removed.removals = 1;
+        let (outcome, _, _) = futures_lite::future::block_on(run(vec![
+            (Duration::ZERO, snapshot(PullRequestState::Open, Some(1))),
+            (minutes(20), removed),
+        ]));
+        assert_eq!(
+            outcome,
+            Outcome::Stopped(Stopped::Removed(Removal {
+                reason: "no reason given".to_string(),
+                unexplained: true,
+            }))
+        );
     }
 
     #[test]

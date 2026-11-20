@@ -737,7 +737,7 @@ impl PrStore {
         // leaves the machine.
         if forge_repo.is_some() {
             let commits = self
-                .commit_messages(&resolved, &base_sha, &head_sha)
+                .commit_messages(&resolved, std::slice::from_ref(&base_sha), &head_sha)
                 .await?;
             let commit_refs: Vec<_> = commits.iter().map(OwnedCommit::as_ref).collect();
             self.review_outbound(crate::harness::publish_review::Publication::pull_request(
@@ -1032,12 +1032,22 @@ impl PrStore {
             return Err(PrError::DirtyClone(dirty.join(", ")));
         }
         let head_sha = self.head_sha(&resolved).await?;
-        if matches!(pr.backend.as_str(), "github" | "gitlab") {
-            let since = pr.head_sha.as_deref().unwrap_or(&pr.base_sha);
-            let commits = match self.commit_messages(&resolved, since, &head_sha).await {
+        let pushed_base = if matches!(pr.backend.as_str(), "github" | "gitlab") {
+            // The commits reviewed are the PR's own — what its branch adds
+            // over the upstream tip now, not everything since the base
+            // recorded at `pr open` (a rebase or a moved upstream would
+            // sweep upstream's commits into the review).
+            let base = self.fork_point(&resolved, &pr, &head_sha).await?;
+            let mut excludes = vec![base.clone()];
+            if let Some(old) = pr.head_sha.clone() {
+                excludes.push(old);
+            }
+            let commits = match self.commit_messages(&resolved, &excludes, &head_sha).await {
                 Ok(commits) => commits,
+                // The last pushed head is gone from the clone after a
+                // rebase and a collection: review the whole own range.
                 Err(_) if pr.head_sha.is_some() => {
-                    self.commit_messages(&resolved, &pr.base_sha, &head_sha)
+                    self.commit_messages(&resolved, std::slice::from_ref(&base), &head_sha)
                         .await?
                 }
                 Err(error) => return Err(error),
@@ -1062,15 +1072,20 @@ impl PrStore {
                 },
                 push_https_auth(&self.context.forge_auth, &resolved.record.source).await,
             )
-            .await?;
+            .await?
         } else {
-            self.verify_local(&resolved, &pr.base_sha, &head_sha)
+            let fork = self
+                .verify_local(&resolved, &pr.base_sha, &head_sha)
                 .await?;
             self.pin(&resolved, pr.number, &head_sha).await?;
-        }
+            fork
+        };
         self.db()?
             .update_pr(pr.id, PrState::Open, Some(&head_sha), None, None)
             .await?;
+        if pushed_base != pr.base_sha {
+            self.db()?.update_pr_base(pr.id, &pushed_base).await?;
+        }
         self.event(&pr, "updated", Some(&head_sha)).await;
         Ok(format!("PR #{number} now holds {head_sha}"))
     }
@@ -1364,21 +1379,73 @@ impl PrStore {
         Ok(log.lines().map(str::to_string).collect())
     }
 
-    /// Commits in `base..head`, oldest first, with abbreviated hash and full message.
+    /// The commit messages reachable from `head` but from no commit in
+    /// `excludes` — the PR's own commits when `excludes` names the fork
+    /// point with upstream and the head the last update pushed.
     async fn commit_messages(
         &self,
         resolved: &Resolved,
-        base: &str,
+        excludes: &[String],
         head: &str,
     ) -> Result<Vec<OwnedCommit>, PrError> {
+        let excludes = excludes
+            .iter()
+            .map(|sha| ShellWord::new(sha).map_err(PrError::State))
+            .collect::<Result<Vec<_>, _>>()?;
         let script = CommitMessages {
-            base: ShellWord::new(base).map_err(PrError::State)?,
             head: ShellWord::new(head).map_err(PrError::State)?,
+            excludes,
         }
         .render()
         .expect("the commit messages script renders");
         let log = self.sandbox.run(&resolved.dir, &script).await?;
         Ok(parse_commit_messages(&log))
+    }
+
+    /// The fork point of `head` with the remote's default branch as a
+    /// staging fetch sees it now, or `pr.base_sha` when the histories
+    /// share no commit. It is the base the commits of an update are
+    /// reviewed over, so a rebase or an upstream that moved does not put
+    /// upstream's own commits in front of the reviewer.
+    async fn fork_point(
+        &self,
+        resolved: &Resolved,
+        pr: &crate::db::PrRow,
+        head: &str,
+    ) -> Result<String, PrError> {
+        let scratch_root = self.context.scratch_root.clone();
+        let clone = resolved.dir.to_string_lossy().into_owned();
+        let url = resolved.record.source.clone();
+        let branch = pr.branch.clone();
+        let sha = head.to_string();
+        let fallback = pr.base_sha.clone();
+        let signing = self.context.signing.clone();
+        let https_auth = push_https_auth(&self.context.forge_auth, &url).await;
+        blocking::unblock(move || {
+            std::fs::create_dir_all(&scratch_root)?;
+            let staging = tempfile::Builder::new()
+                .prefix("base-")
+                .tempdir_in(&scratch_root)?;
+            let repo = staging.path();
+            let host = https_auth.map_or_else(
+                || signing.host().clone(),
+                |auth| signing.host().clone().with_https_auth(auth),
+            );
+            host_git(
+                &host,
+                None,
+                &["init", "--quiet", "--bare", &repo.to_string_lossy()],
+            )?;
+            fetch_from_clone(&host, repo, &clone, &sha)?;
+            fetch_upstream(&host, repo, &url, BranchState::Pushed, &branch)?;
+            Ok(host_git(
+                &host,
+                Some(repo),
+                &["merge-base", "refs/remotes/origin/default", &sha],
+            )
+            .map_or(fallback, |out| out.trim().to_string()))
+        })
+        .await
     }
 
     /// Run outbound publish review for external text before it leaves May.
@@ -1456,6 +1523,9 @@ impl PrStore {
         pr: &crate::db::PrRow,
         head_sha: &str,
     ) -> Result<String, PrError> {
+        /// How long before an unexplained removal is tried again; multiplied
+        /// by the attempt so the wait grows.
+        const REQUEUE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
         let repo = self
             .forge_of(&resolved.record)
             .ok_or_else(|| PrError::Resolve("remote PR without a repo".to_string()))?;
@@ -1480,62 +1550,84 @@ impl PrStore {
                 iid: upstream_number,
             }),
         };
-        // Read before queueing: the bound and the removals that predate it.
-        let before = merge_watch::Upstream::snapshot(&upstream).await?;
-        ensure_head_pinned(upstream_number, head_sha, &before.head_sha, pr.sigil())?;
         let expected = merge_watch::Upstream::expected_checks(&upstream).await?;
-        self.event(pr, "queued", None).await;
-        // Serialized land: the lock covers queueing the PR, not the wait for
-        // it to land.
-        {
-            let _guard = lock.lock().await;
-            match &remote {
-                Remote::GitHub(_) => {
-                    queue_github_merge(
-                        &self.context.github_api,
-                        &owner_repo,
-                        upstream_number,
-                        head_sha,
-                    )
-                    .await?;
-                }
-                Remote::GitLab(repo) => {
-                    let pipeline_running = before.checks.iter().any(|check| {
-                        matches!(
-                            check,
-                            merge_watch::CheckContext::CheckRun {
-                                conclusion: None,
-                                ..
-                            }
+        // A merge queue can drop an entry with no reason and nothing
+        // failing: such a removal is transient, so the queue-and-watch
+        // cycle re-queues a bounded number of times before the agent is
+        // told. A removal with a cause is reported instead.
+        let max_requeues = 3u32;
+        let mut requeues = 0u32;
+        let outcome = loop {
+            // Read before queueing: the removals that predate it.
+            let before = merge_watch::Upstream::snapshot(&upstream).await?;
+            ensure_head_pinned(upstream_number, head_sha, &before.head_sha, pr.sigil())?;
+            self.event(pr, "queued", None).await;
+            // Serialized land: the lock covers queueing the PR, not the wait
+            // for it to land.
+            {
+                let _guard = lock.lock().await;
+                match &remote {
+                    Remote::GitHub(_) => {
+                        queue_github_merge(
+                            &self.context.github_api,
+                            &owner_repo,
+                            upstream_number,
+                            head_sha,
                         )
-                    });
-                    gitlab::queue_merge(
-                        gitlab_rest.as_ref().expect("gitlab backend has a client"),
-                        repo,
-                        upstream_number,
-                        head_sha,
-                        pipeline_running,
-                    )
-                    .await?;
+                        .await?;
+                    }
+                    Remote::GitLab(repo) => {
+                        let pipeline_running = before.checks.iter().any(|check| {
+                            matches!(
+                                check,
+                                merge_watch::CheckContext::CheckRun {
+                                    conclusion: None,
+                                    ..
+                                }
+                            )
+                        });
+                        gitlab::queue_merge(
+                            gitlab_rest.as_ref().expect("gitlab backend has a client"),
+                            repo,
+                            upstream_number,
+                            head_sha,
+                            pipeline_running,
+                        )
+                        .await?;
+                    }
                 }
             }
-        }
-        // The checks are timed the moment they finish, not when the PR lands.
-        let observer = CiObserver {
-            store: self,
-            pr,
-            remote: &remote,
-            head_sha,
+            // The checks are timed the moment they finish, not when the PR lands.
+            let observer = CiObserver {
+                store: self,
+                pr,
+                remote: &remote,
+                head_sha,
+            };
+            let watching = merge_watch::Observing::new(&upstream, &observer);
+            let outcome = merge_watch::watch(
+                &watching,
+                &merge_watch::SystemClock::new(),
+                before.removals,
+                expected,
+            )
+            .await?;
+            watching.tell_if_unheard().await;
+            if let merge_watch::Outcome::Stopped(merge_watch::Stopped::Removed(removal)) = &outcome
+                && removal.unexplained
+                && requeues < max_requeues
+            {
+                requeues += 1;
+                // A removal nothing explains tends to be a queue flap:
+                // wait for it to settle, longer each time, before the PR
+                // goes back on the queue. A removal with a cause — a
+                // failed check, a conflict — is terminal and is reported.
+                async_io::Timer::after(REQUEUE_BACKOFF * requeues).await;
+                self.event(pr, "requeued", Some(&removal.reason)).await;
+                continue;
+            }
+            break outcome;
         };
-        let watching = merge_watch::Observing::new(&upstream, &observer);
-        let outcome = merge_watch::watch(
-            &watching,
-            &merge_watch::SystemClock::new(),
-            before.removals,
-            expected,
-        )
-        .await?;
-        watching.tell_if_unheard().await;
         let now = jiff::Timestamp::now().to_string();
         match outcome {
             merge_watch::Outcome::Merged => {
@@ -1726,12 +1818,14 @@ impl PrStore {
     /// signature. The commits are read from a scratch repository that borrows
     /// the checkout's objects and fetches only what the clone added, so the
     /// check reads the host's copy and runs nothing the clone configures.
+    /// The fork point of `head` with the checkout's tip when one exists,
+    /// `base` otherwise — the range verification covers `fork..head`.
     async fn verify_local(
         &self,
         resolved: &Resolved,
         base: &str,
         head: &str,
-    ) -> Result<(), PrError> {
+    ) -> Result<String, PrError> {
         let scratch_root = self.context.scratch_root.clone();
         let checkout = resolved.record.source.clone();
         let clone = resolved.dir.to_string_lossy().into_owned();
@@ -1761,9 +1855,18 @@ impl PrStore {
             )?;
             std::fs::write(repo.join("objects/info/alternates"), format!("{objects}\n"))?;
             fetch_from_clone(host, repo, &clone, &head)?;
-            signing
-                .verify_range_blocking(repo, &base, &head)
-                .map_err(PrError::from)
+            // The signature check covers the PR's own commits. After a
+            // rebase or merge onto a checkout that moved since the recorded
+            // base was pinned, `base..head` would span unsigned checkout
+            // commits already made: verify from the fork point with the
+            // checkout's tip instead — the objects the alternates line
+            // shares — and fall back to `base` when no fork point exists.
+            let fork = host_git(host, Some(Path::new(&checkout)), &["rev-parse", "HEAD"])
+                .ok()
+                .and_then(|tip| host_git(host, Some(repo), &["merge-base", tip.trim(), &head]).ok())
+                .map_or_else(|| base.clone(), |out| out.trim().to_string());
+            signing.verify_range_blocking(repo, &fork, &head)?;
+            Ok(fork)
         })
         .await
     }
@@ -2807,6 +2910,9 @@ fn clone_head(
 /// refs, so a `pre-push` hook that scans what is not yet on a remote sees
 /// only the PR's commits.
 #[allow(clippy::too_many_arguments)]
+/// Push `sha` to `branch` on `url` after verifying its own commits are
+/// signed; returns the fork point with the upstream tip the verification
+/// read — `signed.base` when the histories share no commit.
 async fn push_pinned(
     scratch_root: &Path,
     clone: &Path,
@@ -2816,7 +2922,7 @@ async fn push_pinned(
     branch_state: BranchState,
     signed: SignedRange<'_>,
     https_auth: Option<crate::host_git::HttpsAuth>,
-) -> Result<(), PrError> {
+) -> Result<String, PrError> {
     let scratch_root = scratch_root.to_path_buf();
     let clone = clone.to_string_lossy().into_owned();
     let url = url.to_string();
@@ -2846,11 +2952,20 @@ async fn push_pinned(
         )?;
         fetch_from_clone(&host, repo, &clone, &sha)?;
         fetch_upstream(&host, repo, &url, branch_state, &branch)?;
+        // The signature check covers the PR's own commits. After a rebase
+        // onto an upstream that moved since the recorded base was pinned,
+        // `base..sha` would span unsigned upstream commits already merged:
+        // verify from the fork point with the upstream tip instead.
+        let base = host_git(
+            &host,
+            Some(repo),
+            &["merge-base", "refs/remotes/origin/default", &sha],
+        )
+        .map_or(base, |output| output.trim().to_string());
         // What is pushed is what was verified: both read the host's copy.
         signing.verify_range_blocking(repo, &base, &sha)?;
-        host_git(&host, Some(repo), &["push", "--quiet", &url, &spec])
-            .map(drop)
-            .map_err(PrError::from)
+        host_git(&host, Some(repo), &["push", "--quiet", &url, &spec])?;
+        Ok(base)
     })
     .await
 }
@@ -3387,13 +3502,14 @@ struct CommitSubjects {
     head: ShellWord,
 }
 
-/// Prints the short hashes and raw commit messages `base..head`, oldest first,
-/// NUL-separated; run in the session clone.
+/// Prints the short hashes and raw commit messages reachable from `head`
+/// but none of `excludes`, oldest first, NUL-separated; run in the session
+/// clone.
 #[derive(Template)]
 #[template(path = "pr_commit_messages.sh", escape = "none")]
 struct CommitMessages {
-    base: ShellWord,
     head: ShellWord,
+    excludes: Vec<ShellWord>,
 }
 
 /// Removes a check's checkout; run in the session root.
@@ -5644,6 +5760,255 @@ mod tests {
             .unwrap(),
             second_sha
         );
+    }
+
+    /// A local-backend PR whose checkout moved since `pr open` verifies
+    /// only the commits after the fork point — the checkout's own unsigned
+    /// work — and records the advanced base.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_update_after_the_checkout_moves_verifies_the_fork() {
+        let fx = Fixture::new().await;
+        let base_sha = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        let session_root = fx.session_root("s-loc");
+        let clone = session_root.join("repos/r-loc");
+        std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                &fx.checkout.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        let sandbox = fx.signing_sandbox("s-loc").await;
+        std::fs::write(clone.join("one.txt"), "one").unwrap();
+        sandbox
+            .run(&clone, "git add . && git commit -m 'own change'")
+            .await
+            .unwrap();
+        // The checkout moves on its own with an unsigned commit; the PR
+        // branch merges it, so `base..head` spans that commit.
+        std::fs::write(fx.checkout.join("other.txt"), "other").unwrap();
+        git(Some(&fx.checkout), &["add", "."]).unwrap();
+        git(Some(&fx.checkout), &["commit", "-m", "checkout change"]).unwrap();
+        let tip = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        sandbox
+            .run(
+                &clone,
+                &format!("git fetch -q origin && git merge --no-edit {tip}"),
+            )
+            .await
+            .unwrap();
+        fx.db
+            .insert_repo_clone(
+                "s-loc",
+                &crate::db::RepoCloneRow {
+                    repo_key: "local".to_string(),
+                    dir: "r-loc".to_string(),
+                    source: fx.checkout.to_string_lossy().into_owned(),
+                    local: true,
+                    base_sha: Some(base_sha.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let pr = fx
+            .db
+            .create_pr(
+                "local",
+                "s-loc",
+                "Local PR",
+                "",
+                "may/s-loc",
+                &base_sha,
+                "may",
+                true,
+                None,
+                Some(3),
+            )
+            .await
+            .unwrap();
+        let store = PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: "s-loc".to_string(),
+                session_root: session_root.clone(),
+                scratch_root: fx.scratch_root(),
+                cwd: fx.tmp.path().to_path_buf(),
+                workspace_config: WorkspaceConfig::default(),
+                review: None,
+                signing: fx.signing("s-loc"),
+                github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                gitlab_api: None,
+                forge_auth: crate::forge::LiveForgeAuth::default(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+                ui_events: None,
+            },
+            sandbox,
+        );
+        store
+            .update(pr.number, None)
+            .await
+            .expect("the checkout's unsigned commits are behind the fork");
+        let row = fx.db.get_pr("local", 3).await.unwrap().unwrap();
+        assert_eq!(row.base_sha, tip, "the advanced base is on record");
+    }
+
+    /// An update after upstream moved puts only the PR's own commits in
+    /// front of the reviewer — the stale recorded base would sweep
+    /// upstream's history into it — and the PR row's base follows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_after_upstream_moves_reviews_only_own_commits() {
+        let fx = Fixture::new().await;
+        let env = crate::harness::publish_review::LocalEnvironment {
+            system_hosts: vec![],
+            ..Default::default()
+        };
+        let remote = fx.tmp.path().join("adv-remote.git");
+        let base_sha = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        seed_remote(&remote, &fx.checkout, &base_sha);
+        let session_root = fx.session_root("s-adv");
+        let clone = session_root.join("repos/r-adv");
+        std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                &remote.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        let sandbox = fx.signing_sandbox("s-adv").await;
+        std::fs::write(clone.join("one.txt"), "one").unwrap();
+        sandbox
+            .run(&clone, "git add . && git commit -m 'own change'")
+            .await
+            .unwrap();
+        let first_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        let branch = "may/s-adv";
+        push_pinned(
+            &fx.scratch_root(),
+            &clone,
+            &remote.to_string_lossy(),
+            &first_sha,
+            branch,
+            BranchState::New,
+            range_of(&fx.signing("s-adv"), &base_sha),
+            None,
+        )
+        .await
+        .unwrap();
+        // Upstream moves on its own — unsigned, the way every upstream is.
+        let other = fx.tmp.path().join("adv-other");
+        git(
+            None,
+            &[
+                "clone",
+                "-q",
+                &remote.to_string_lossy(),
+                &other.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        fx.user.identify(&other);
+        std::fs::write(other.join("up.txt"), "up").unwrap();
+        git(Some(&other), &["add", "."]).unwrap();
+        git(Some(&other), &["commit", "-m", "upstream change"]).unwrap();
+        git(
+            Some(&other),
+            &["push", "-q", &remote.to_string_lossy(), "HEAD:main"],
+        )
+        .unwrap();
+        // The branch takes the new upstream tip in — merging keeps the
+        // push a fast-forward.
+        sandbox
+            .run(
+                &clone,
+                "git fetch -q origin main && git merge --no-edit origin/main",
+            )
+            .await
+            .unwrap();
+        fx.db
+            .insert_repo_clone(
+                "s-adv",
+                &crate::db::RepoCloneRow {
+                    repo_key: "adv".to_string(),
+                    dir: "r-adv".to_string(),
+                    source: remote.to_string_lossy().into_owned(),
+                    local: false,
+                    base_sha: Some(base_sha.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let pr = fx
+            .db
+            .create_pr(
+                "adv",
+                "s-adv",
+                "PR",
+                "",
+                branch,
+                &base_sha,
+                "github",
+                true,
+                None,
+                Some(21),
+            )
+            .await
+            .unwrap();
+        fx.db
+            .update_pr(pr.id, PrState::Open, Some(&first_sha), None, None)
+            .await
+            .unwrap();
+        let (review, calls, captured) =
+            mock_review(r#"{"decision":"publish","findings":[]}"#, env.clone(), None);
+        PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: "s-adv".to_string(),
+                session_root: session_root.clone(),
+                scratch_root: fx.scratch_root(),
+                cwd: fx.tmp.path().to_path_buf(),
+                workspace_config: WorkspaceConfig::default(),
+                review: Some(review),
+                signing: fx.signing("s-adv"),
+                github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                gitlab_api: None,
+                forge_auth: crate::forge::LiveForgeAuth::default(),
+                land_locks: LandLocks::default(),
+                checkouts: None,
+                task_events: None,
+                ci: None,
+                publish: None,
+                ui_events: None,
+            },
+            sandbox,
+        )
+        .update(pr.number, None)
+        .await
+        .expect("update after upstream moved");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let sent = captured.lock().unwrap()[0].clone();
+        // Only the merge commit is new since the last push: upstream's
+        // commit is outside the fork and the first change was reviewed
+        // then.
+        assert!(sent.contains("Merge remote-tracking branch"), "{sent}");
+        assert!(
+            !sent.contains("upstream change") && !sent.contains("own change"),
+            "the review saw commits that are not new own work: {sent}"
+        );
+        let upstream_tip = git(Some(&remote), &["rev-parse", "refs/heads/main"]).unwrap();
+        let row = fx.db.get_pr("adv", 21).await.unwrap().unwrap();
+        assert_eq!(row.base_sha, upstream_tip);
     }
 
     #[tokio::test(flavor = "multi_thread")]

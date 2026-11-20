@@ -63,31 +63,49 @@ impl<B: CollectionBackend> IssueSearch<B> {
     /// # Errors
     /// Fails when the backend, repo-search or the database fails.
     pub async fn sync<S: IssueStore>(&self, store: &S) -> Result<(), IssueError> {
+        use futures_util::StreamExt as _;
         let collection = collection_name(&store.search_key());
         for _ in 0..SYNC_PAGES_PER_QUERY {
             let since = self.db.issue_search_watermark(&collection).await?;
             let fetched = store.updated_since(since.as_deref(), SYNC_PAGE).await?;
-            let mut updated = Vec::with_capacity(fetched.len());
-            for summary in fetched {
-                let indexed = self
-                    .db
-                    .issue_search_doc(&collection, summary.number)
-                    .await?;
-                if indexed.is_none_or(|doc| doc.updated_at != summary.updated_at) {
-                    updated.push(summary);
-                }
-            }
+            // The indexed-at lookups go to the database as one batch.
+            let indexed = futures_util::future::try_join_all(
+                fetched
+                    .iter()
+                    .map(|summary| self.db.issue_search_doc(&collection, summary.number)),
+            )
+            .await?;
+            let updated: Vec<_> = fetched
+                .into_iter()
+                .zip(indexed)
+                .filter_map(|(summary, indexed)| {
+                    indexed
+                        .is_none_or(|doc| doc.updated_at != summary.updated_at)
+                        .then_some(summary)
+                })
+                .collect();
             if updated.is_empty() {
                 return Ok(());
             }
-            let mut documents = Vec::with_capacity(updated.len());
-            let mut records = Vec::with_capacity(updated.len());
-            for summary in &updated {
-                let detail = store.get(summary.number).await?;
+            // Detail reads parallelize at a bounded fan-out; a huge page
+            // never becomes a sequential walk of the executor's round trips.
+            let gets: Vec<_> = updated
+                .iter()
+                .map(|summary| store.get(summary.number))
+                .collect();
+            let details = futures_util::stream::iter(gets)
+                .buffered(8)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut documents = Vec::with_capacity(details.len());
+            let mut records = Vec::with_capacity(details.len());
+            for (summary, detail) in updated.iter().zip(&details) {
                 documents.push(Document {
                     id: detail.number.to_string(),
                     title: detail.title.clone(),
-                    text: IssueDocumentText { detail: &detail }
+                    text: IssueDocumentText { detail }
                         .render()
                         .map_err(|error| IssueError::Search(error.to_string()))?,
                 });
@@ -130,12 +148,25 @@ impl<B: CollectionBackend> IssueSearch<B> {
             .search(&collection, query)
             .await
             .map_err(|error| IssueError::Search(error.to_string()))?;
+        let lookups: Vec<(i64, Option<String>)> = hits
+            .into_iter()
+            .filter_map(|hit| {
+                hit.id
+                    .parse::<i64>()
+                    .ok()
+                    .map(|number| (number, hit.excerpt))
+            })
+            .collect();
+        // The state checks go to the database as one batch.
+        let docs = futures_util::future::try_join_all(
+            lookups
+                .iter()
+                .map(|(number, _)| self.db.issue_search_doc(&collection, *number)),
+        )
+        .await?;
         let mut results = Vec::new();
-        for hit in hits {
-            let Ok(number) = hit.id.parse::<i64>() else {
-                continue;
-            };
-            let Some(doc) = self.db.issue_search_doc(&collection, number).await? else {
+        for ((number, excerpt), doc) in lookups.into_iter().zip(docs) {
+            let Some(doc) = doc else {
                 continue;
             };
             let wanted = match state {
@@ -147,7 +178,7 @@ impl<B: CollectionBackend> IssueSearch<B> {
                     number,
                     title: doc.title,
                     state: doc.state,
-                    excerpt: hit.excerpt,
+                    excerpt,
                 });
             }
             if results.len() >= limit {

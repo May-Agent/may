@@ -765,7 +765,8 @@ impl MayAgent {
                         config.session_id.as_str(),
                         config.db.clone(),
                     )
-                    .with_host(crate::host_git::HostGit::inherit()),
+                    .with_host(crate::host_git::HostGit::inherit())
+                    .with_signer_roots(config.services.signer_roots.clone()),
                 );
                 // A container's subagent names its working directory by the
                 // container path the agent sees, not a host path.
