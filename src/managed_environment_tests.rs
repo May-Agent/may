@@ -63,7 +63,7 @@ async fn base_commands_resolve_to_the_managed_directory_and_the_toolchain_to_the
 }
 
 /// Credential directories inside the user's home that aither's read policy denies.
-const CREDENTIALS: &[&str] = &[".ssh", ".config/gh"];
+const CREDENTIALS: &[&str] = &[".ssh", ".config/gh", ".config/glab-cli"];
 
 /// Removes a directory entry created by a test when the host had none.
 struct CreatedDir(Option<PathBuf>);
@@ -100,8 +100,8 @@ fn ensure_test_dir(path: &Path) -> Vec<CreatedDir> {
 }
 
 /// Reads are allowed everywhere but the credential stores: a file outside
-/// the session and its grants reads, while the user's `~/.ssh` and
-/// `~/.config/gh` stay unreadable.
+/// the session and its grants reads, while the user's `~/.ssh`,
+/// `~/.config/gh` and `~/.config/glab-cli` stay unreadable.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sandbox_reads_ordinary_paths_and_not_credential_stores() {
     let session = tempfile::tempdir().expect("session dir");
@@ -109,8 +109,9 @@ async fn the_sandbox_reads_ordinary_paths_and_not_credential_stores() {
     let ordinary = outside.path().join("ordinary.txt");
     std::fs::write(&ordinary, "readable").expect("ordinary file");
     let home = std::env::home_dir().expect("home");
-    // A CI runner's home may lack `~/.ssh` or `~/.config/gh`; the policy
-    // denies each path whether or not it holds files.
+    // A CI runner's home may lack `~/.ssh`, `~/.config/gh` or
+    // `~/.config/glab-cli`; the policy denies each path whether or not it
+    // holds files.
     let created_dirs: Vec<CreatedDir> = CREDENTIALS
         .iter()
         .flat_map(|rel| ensure_test_dir(&home.join(rel)))

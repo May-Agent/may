@@ -130,6 +130,14 @@ pub enum ConfigError {
         /// What is wrong with the configuration.
         reason: String,
     },
+    /// Invalid `[forge."<host>"]` config.
+    #[error("invalid forge config for {host:?}: {reason}")]
+    InvalidForgeConfig {
+        /// The `[forge]` map key.
+        host: String,
+        /// What is wrong with the configuration.
+        reason: String,
+    },
 }
 
 /// Wire API a `custom` provider speaks.
@@ -1401,6 +1409,12 @@ pub struct MayConfig {
     /// When the agent's issues, pull requests and comments need approval.
     #[serde(default)]
     pub issue_approval: IssueApprovalConfig,
+    /// Forge hosts May authenticates to, keyed by normalized hostname:
+    /// `[forge."github.com"]`, `[forge."gitlab.com"]`,
+    /// `[forge."gitlab.corp.com"]`. A host with no entry is unauthenticated
+    /// — no CLI, keychain or environment is probed for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub forge: BTreeMap<String, crate::forge::ForgeHostConfig>,
 }
 
 /// What publishing one kind of text asks of the user.
@@ -2099,6 +2113,7 @@ impl Default for MayConfig {
             ssh_servers: Vec::new(),
             acp_agents: BTreeMap::new(),
             issue_approval: IssueApprovalConfig::default(),
+            forge: BTreeMap::new(),
         }
     }
 }
@@ -2200,7 +2215,52 @@ impl MayConfig {
         for name in self.acp_agents.keys() {
             check_acp_agent_name(name)?;
         }
+        for (host, entry) in &self.forge {
+            Self::validate_forge_entry(host, entry)?;
+        }
         Ok(())
+    }
+
+    /// A `[forge."<host>"]` key must be the host's canonical form and its
+    /// `kind` must resolve — implied for `github.com`/`gitlab.com`,
+    /// required everywhere else.
+    fn validate_forge_entry(
+        host: &str,
+        entry: &crate::forge::ForgeHostConfig,
+    ) -> Result<(), ConfigError> {
+        let invalid = |reason: &str| ConfigError::InvalidForgeConfig {
+            host: host.to_string(),
+            reason: reason.to_string(),
+        };
+        let parsed =
+            crate::forge::ForgeHost::new(host).map_err(|_| invalid("not a valid host[:port]"))?;
+        if parsed.as_str() != host {
+            return Err(invalid("the key must be the normalized lowercase hostname"));
+        }
+        if entry.kind_for(host).is_none() {
+            return Err(invalid(
+                "`kind` is required for a host that is neither github.com nor gitlab.com",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `[forge]` entry of `host`, looked up by its canonical form.
+    #[must_use]
+    pub fn forge_config(&self, host: &str) -> Option<&crate::forge::ForgeHostConfig> {
+        let host = crate::forge::ForgeHost::new(host).ok()?;
+        self.forge.get(host.as_str())
+    }
+
+    /// The kind `host` forges: its entry's `kind`, or the kind a well-known
+    /// hostname implies.
+    #[must_use]
+    pub fn forge_kind(&self, host: &str) -> Option<crate::forge::ForgeKind> {
+        let host = crate::forge::ForgeHost::new(host).ok()?;
+        self.forge
+            .get(host.as_str())
+            .and_then(|entry| entry.kind_for(host.as_str()))
+            .or_else(|| crate::forge::ForgeKind::of_host(host.as_str()))
     }
 
     /// Connect an ACP agent as a subagent type, replacing the connection

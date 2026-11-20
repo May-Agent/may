@@ -15,6 +15,12 @@ use super::{SecretGuard, SecretKind, SecretShape};
 const OPENAI_KEY: &str = concat!("sk-", "proj-", "T3BlbkFJ7xQm2Vd9Lp4Rz8Kc1Wn6Yh5Gs0Aa");
 const ANTHROPIC_KEY: &str = concat!("sk-", "ant-api03-", "Zq8vR2mK9xL4pN7wT1yB6cD3fG5hJ0sAeUi");
 const GITHUB_TOKEN: &str = concat!("gh", "p_", "R7mK2xQ9vL4pN8wT1yB6cD3fG5hJ0sAeUiZo");
+const GITLAB_PAT: &str = concat!("gl", "pat-", "R7mK2xQ9vL4pN8wT1yB6c");
+const GITLAB_OAUTH_SECRET: &str = concat!(
+    "gl",
+    "oas-",
+    "d1e5f3a9b8c4e2f6a7b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2"
+);
 /// AWS's own documentation example.
 const AWS_KEY_ID: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
 const GOOGLE_KEY: &str = concat!("AI", "za", "SyD4x9Qm2Vd7Lp4Rz8Kc1Wn6Yh5Gs0AaBb3");
@@ -217,6 +223,36 @@ fn key_shaped_strings_are_replaced() {
         (OPENAI_KEY.to_string(), SecretShape::ProviderKey),
         (ANTHROPIC_KEY.to_string(), SecretShape::ProviderKey),
         (GITHUB_TOKEN.to_string(), SecretShape::ProviderKey),
+        (GITLAB_PAT.to_string(), SecretShape::ProviderKey),
+        (GITLAB_OAUTH_SECRET.to_string(), SecretShape::ProviderKey),
+        (
+            concat!("gl", "rt-", "Q2wE4rT6yU8iO0pA3sD5fG7h").to_string(),
+            SecretShape::ProviderKey,
+        ),
+        (
+            concat!("gl", "dt-", "J9kL8mN7bV6cX5zA4sD3fG2h").to_string(),
+            SecretShape::ProviderKey,
+        ),
+        (
+            concat!("gl", "ptt-", "P1oI2uY3tR4eW5qA6sD7fG8h").to_string(),
+            SecretShape::ProviderKey,
+        ),
+        (
+            concat!("gl", "cbt-", "Z1xC2vB3nM4kL5jH6gF7dS8a").to_string(),
+            SecretShape::ProviderKey,
+        ),
+        (
+            concat!("gl", "agent-", "A1b2C3d4E5f6G7h8I9j0K1l2M3").to_string(),
+            SecretShape::ProviderKey,
+        ),
+        (
+            concat!("gl", "soat-", "N4m5B6v7C8x9Z0a1S2d3F4g5H6").to_string(),
+            SecretShape::ProviderKey,
+        ),
+        (
+            concat!("gl", "ffct-", "L6k7J8h9G0f1D2s3A4p5O6i7U8").to_string(),
+            SecretShape::ProviderKey,
+        ),
         (GOOGLE_KEY.to_string(), SecretShape::ProviderKey),
         (AWS_KEY_ID.to_string(), SecretShape::AwsAccessKeyId),
         (JWT.to_string(), SecretShape::Jwt),

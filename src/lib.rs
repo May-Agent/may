@@ -46,6 +46,8 @@ pub mod db;
 /// Live decode-speed measurement for streamed model output.
 pub mod decode_meter;
 mod file_tracker;
+/// Forge coordinates and per-host authentication (GitHub, GitLab).
+pub mod forge;
 mod fs_utils;
 /// xAI Grok subscription OAuth flow.
 pub mod grok;
