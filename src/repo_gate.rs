@@ -101,6 +101,27 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
     /// Fails when the session, its configuration or its checkout cannot be
     /// read, a clone cannot be made, or the user cannot be asked.
     pub async fn run(&self, session_id: &str) -> Result<Verdict, GateError> {
+        let started = std::time::Instant::now();
+        tracing::debug!(session_id, "repo gate: start");
+        let verdict = self.gate(session_id).await;
+        match &verdict {
+            Ok(verdict) => tracing::info!(
+                session_id,
+                ?verdict,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "repo gate: done"
+            ),
+            Err(error) => tracing::info!(
+                session_id,
+                %error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "repo gate: failed"
+            ),
+        }
+        verdict
+    }
+
+    async fn gate(&self, session_id: &str) -> Result<Verdict, GateError> {
         let Some(row) = self.db.get_session(session_id).await? else {
             return Ok(Verdict::Proceed);
         };
@@ -256,10 +277,17 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
                 worktree.to_path_buf(),
                 self.remote.to_string(),
             );
-            blocking::unblock(move || {
+            let started = std::time::Instant::now();
+            let inspected = blocking::unblock(move || {
                 crate::repo_preflight::inspect_against(&host, &worktree, &remote)
             })
-            .await
+            .await;
+            tracing::debug!(
+                session_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "repo gate: checkout state inspected"
+            );
+            inspected
         };
         let state = match inspected {
             Ok(state) => state,
@@ -274,6 +302,12 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         if !state.needs_choice() {
             return Ok(None);
         }
+        tracing::info!(
+            session_id,
+            worktree = %worktree.display(),
+            ?state,
+            "repo gate: checkout state needs a choice; asking"
+        );
         let answers = self
             .asker
             .ask(crate::repo_preflight::question(

@@ -1017,10 +1017,35 @@ impl AskUserApprover {
             return;
         }
 
-        // A closed registry means the server is going down; dropping the
-        // request tells the asking run it was interrupted.
-        if let Ok(answers) = rx.recv().await {
-            let _ = request.respond(answers);
+        // The wait ends on an answer, on the registry closing (the server is
+        // going down), or on the requester itself going away — a stopped turn
+        // or a lost client can never answer, and its persisted request is
+        // cleared the way a drain clears it, or it would pin the session in
+        // waiting_ask_user forever.
+        enum Wait {
+            Answers(Vec<QuestionAnswer>),
+            Gone,
+        }
+        let wait = {
+            let recv = rx.recv();
+            let gone = request.closed();
+            futures::pin_mut!(recv, gone);
+            match futures::future::select(recv, gone).await {
+                futures::future::Either::Left((Ok(answers), _)) => Wait::Answers(answers),
+                _ => Wait::Gone,
+            }
+        };
+        match wait {
+            Wait::Answers(answers) => {
+                let _ = request.respond(answers);
+            }
+            Wait::Gone => {
+                if let Some(session_id) = request_session_id.as_deref() {
+                    self.interrupt(session_id, &request_id).await;
+                } else {
+                    self.live_responses.take(&request_id);
+                }
+            }
         }
     }
 

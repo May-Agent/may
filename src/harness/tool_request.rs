@@ -38,6 +38,11 @@ impl<Args, Response> ToolRequest<Args, Response> {
     pub fn is_closed(&self) -> bool {
         self.response_tx.is_closed()
     }
+
+    /// Resolves once the requester has dropped its response receiver.
+    pub async fn closed(&self) {
+        self.response_tx.closed().await;
+    }
 }
 
 /// Request broker for UI-mediated tools.
