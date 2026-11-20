@@ -295,7 +295,9 @@ mod tests {
     /// tag moves with anything the binary is built from.
     #[test]
     fn tasks_tag_inputs_cover_the_binarys_sources() {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("crate dir has a parent");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a parent");
         let sources = tasks_sources(repository).unwrap();
 
         let mut on_disk = Vec::new();
@@ -345,7 +347,9 @@ mod tests {
     /// `/root/.local/bin/uv` and `/usr/bin/python3` the shim then finds.
     #[test]
     fn the_workspace_image_installs_the_python_shim_first_on_the_path() {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("crate dir has a parent");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a parent");
         let dockerfile = fs::read_to_string(repository.join("container/workspace/Dockerfile"))
             .expect("workspace Dockerfile");
         for command in ["python3", "python", "uv"] {
