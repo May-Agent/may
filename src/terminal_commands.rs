@@ -616,38 +616,52 @@ where
     }
 
     if let Some(tunnel_broker) = config.tunnel_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            crate::agent::tunnel_tool::TunnelTool::new(
-                config.session_id.clone(),
-                Some(tunnel_broker),
-            ),
-        );
+        // A tunnel exposes the session to the outside: main-agent authority.
+        builder.main_only(|reserved| {
+            register_tool_with_description(
+                reserved,
+                &mut descriptions,
+                crate::agent::tunnel_tool::TunnelTool::new(
+                    config.session_id.clone(),
+                    Some(tunnel_broker),
+                ),
+            );
+        });
     }
 
     if let Some(browser_broker) = config.browser_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            BrowserTool::new(config.session_id.clone(), Some(browser_broker)),
-        );
+        let tool = BrowserTool::new(config.session_id.clone(), Some(browser_broker))
+            .with_sandbox_dir(config.sandbox_dir.clone());
+        describe_tool(&mut descriptions, &tool);
+        builder.configure_image_tool(tool);
     }
 
     if let Some(register_skills_broker) = config.register_skills_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            RegisterTool::<Skills>::new(config.session_id.clone(), Some(register_skills_broker)),
-        );
+        // Registering skills reshapes the session: main-agent authority.
+        builder.main_only(|reserved| {
+            register_tool_with_description(
+                reserved,
+                &mut descriptions,
+                RegisterTool::<Skills>::new(
+                    config.session_id.clone(),
+                    Some(register_skills_broker),
+                ),
+            );
+        });
     }
 
     if let Some(workspace_request_broker) = config.workspace_request_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            RequestWorkspaceTool::new(config.session_id.clone(), workspace_request_broker),
-        );
+        // A workspace request asks the user to widen the session's view of
+        // the host: main-agent authority.
+        let approval_pause = builder.approval_pause();
+        builder.main_only(|reserved| {
+            register_tool_with_description(
+                reserved,
+                &mut descriptions,
+                RequestWorkspaceTool::new(config.session_id.clone(), workspace_request_broker)
+                    .with_approval_pause(approval_pause.clone()),
+            );
+        });
     }
 
     // A subagent runs on the model of its definition's tier: the models `ask`
@@ -680,16 +694,32 @@ where
             .into_iter()
             .map(|definition| (definition.name.clone(), definition))
             .collect(),
-        files: PromptFiles::new(
-            config.sandbox_dir.clone(),
-            [
-                SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
-                SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
-            ],
-        ),
+        files: {
+            let files = PromptFiles::new(
+                config.sandbox_dir.clone(),
+                [
+                    SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
+                    SubagentFileMount::new(
+                        PathBuf::from("skills"),
+                        config.sandbox_dir.join("skills"),
+                    ),
+                ],
+            );
+            // A container session's prompt files are named by container
+            // paths: the session directory sits at the workspace mount.
+            if matches!(config.task_runtime, TaskRuntimeKind::Container) {
+                files.with_container_root(crate::container::lifecycle::CONTAINER_WORKSPACE)
+            } else {
+                files
+            }
+        },
         base_dir: config.sandbox_dir.clone(),
         fork_source: fork_source.clone(),
         toolkit,
+        redactor: crate::secrets::SecretRedactor::for_session(
+            &config.may_dir,
+            config.session_id.as_str(),
+        ),
         languages: config.languages.clone(),
         externals,
         work: config.task_events.clone(),

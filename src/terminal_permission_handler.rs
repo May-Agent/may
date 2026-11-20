@@ -34,6 +34,10 @@ enum SshLocations {
 pub struct TerminalPermissionHandler {
     ssh: SshLocations,
     approver: Option<PermissionApprover>,
+    /// The approver a subagent's escalation goes through, derived once: the
+    /// subagent shells a session builds share the handler aither hands them,
+    /// so the boundary is enforced per request by the call's agent identity.
+    subagent_approver: Arc<std::sync::OnceLock<Option<PermissionApprover>>>,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
@@ -59,6 +63,7 @@ impl TerminalPermissionHandler {
         Self {
             ssh: SshLocations::Deny,
             approver,
+            subagent_approver: Arc::new(std::sync::OnceLock::new()),
             runtime_service,
             session_id,
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
@@ -86,6 +91,7 @@ impl TerminalPermissionHandler {
         Self {
             ssh: SshLocations::Allow,
             approver: None,
+            subagent_approver: Arc::new(std::sync::OnceLock::new()),
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
@@ -185,11 +191,32 @@ impl TerminalPermissionHandler {
 
 impl Approver for TerminalPermissionHandler {
     async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        // A subagent never reaches the session's approver directly: its
+        // escalation waits on the subagent deadline and agent id, and it
+        // cannot put a new SSH server to the user at all.
+        let subagent = request.call().is_some_and(|identity| {
+            matches!(
+                identity.agent(),
+                aither_core::llm::AgentIdentity::Subagent(_)
+            )
+        });
         match request.kind().as_str() {
+            UNSANDBOXED_KIND if subagent => {
+                let approver = self
+                    .subagent_approver
+                    .get_or_init(|| self.approver.clone().map(PermissionApprover::for_subagent));
+                match approver {
+                    Some(approver) => approver.approve(request).await,
+                    None => Ok(Approval::Approved),
+                }
+            }
             UNSANDBOXED_KIND => match &self.approver {
                 Some(approver) => approver.approve(request).await,
                 None => Ok(Approval::Approved),
             },
+            SSH_KIND if subagent => Ok(Approval::Denied {
+                reason: "a subagent cannot open a new SSH server".to_string(),
+            }),
             SSH_KIND => {
                 let target = request.reason().unwrap_or_default();
                 match self.authorize_server(target).await {

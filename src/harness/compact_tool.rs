@@ -67,6 +67,19 @@ pub struct CompactSignal {
 }
 
 impl CompactSignal {
+    /// Creates a signal initialized with `floor`, so a `compact` call before
+    /// the first request boundary checks against the policy's real floor rather
+    /// than zero.
+    #[must_use]
+    pub const fn with_floor(floor: usize) -> Self {
+        Self {
+            state: AtomicU8::new(IDLE),
+            tokens: AtomicUsize::new(0),
+            floor: AtomicUsize::new(floor),
+            settled: AtomicBool::new(false),
+        }
+    }
+
     /// Records a request unless the valve refuses it, and says what was found.
     ///
     /// The reasons are checked in order: a compaction in flight, a compaction
@@ -258,6 +271,17 @@ mod tests {
             CompactRequest::BelowFloor { floor: 20_000 }
         );
         signal.sync(false, 20_000, 20_000);
+        assert_eq!(signal.request(), CompactRequest::Started);
+    }
+
+    #[test]
+    fn with_floor_refuses_calls_before_first_sync() {
+        let signal = CompactSignal::with_floor(10_000);
+        assert_eq!(
+            signal.request(),
+            CompactRequest::BelowFloor { floor: 10_000 }
+        );
+        signal.sync(false, 10_000, 10_000);
         assert_eq!(signal.request(), CompactRequest::Started);
     }
 

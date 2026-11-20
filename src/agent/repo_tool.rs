@@ -115,7 +115,7 @@ async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -
     if let Some(checkouts) = &context.checkouts {
         repos = repos.with_checkouts(checkouts.clone());
     }
-    let (worktree_display, outcome) = match worktree_and_key(dir) {
+    let (worktree_display, outcome) = match worktree_and_key(dir).await {
         Ok((worktree, _key)) => {
             let display = worktree.to_string_lossy().into_owned();
             let level = match trust::resolve_checkout(&config_path, &worktree, &context.probe).await
@@ -133,7 +133,7 @@ async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -
             }
             // The resolution may have persisted a level: read the config
             // afresh so a GitHub level picks the remote clone.
-            let config = match crate::workspace::WorkspaceConfig::load(&config_path) {
+            let config = match load_workspace_config(&config_path).await {
                 Ok(config) => config,
                 Err(e) => return format!("failed to read the workspace config: {e}"),
             };
@@ -150,7 +150,7 @@ async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -
             (display, outcome)
         }
         Err(err) => {
-            let config = match crate::workspace::WorkspaceConfig::load(&config_path) {
+            let config = match load_workspace_config(&config_path).await {
                 Ok(config) => config,
                 Err(e) => return format!("failed to read the workspace config: {e}"),
             };
@@ -242,12 +242,24 @@ impl RepoTool {
     }
 }
 
-fn worktree_and_key(dir: &Path) -> Result<(PathBuf, PathBuf), String> {
-    let worktree = crate::repo_search::worktree_root(dir)
-        .ok_or_else(|| format!("{} is not inside a repository", dir.display()))?;
-    let key = crate::issue::repository_identity(&worktree)
-        .map_err(|e| format!("repository identity: {e}"))?;
-    Ok((worktree, key))
+async fn worktree_and_key(dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let dir = dir.to_path_buf();
+    blocking::unblock(move || {
+        let worktree = crate::repo_search::worktree_root(&dir)
+            .ok_or_else(|| format!("{} is not inside a repository", dir.display()))?;
+        let key = crate::issue::repository_identity(&worktree)
+            .map_err(|e| format!("repository identity: {e}"))?;
+        Ok((worktree, key))
+    })
+    .await
+}
+
+/// The workspace config, read off the executor.
+async fn load_workspace_config(
+    config_path: &Path,
+) -> Result<crate::workspace::WorkspaceConfig, crate::workspace::WorkspaceConfigError> {
+    let config_path = config_path.to_path_buf();
+    blocking::unblock(move || crate::workspace::WorkspaceConfig::load(&config_path)).await
 }
 
 fn config_path(context: &RepoContext) -> PathBuf {
@@ -273,11 +285,11 @@ impl Tool for RepoTool {
                 .await
             }
             RepoArgs::Trust { set } => {
-                let (worktree, _key) = match worktree_and_key(&target_dir(&self.context, &cx, None))
-                {
-                    Ok(v) => v,
-                    Err(e) => return Ok(ToolResult::text(e)),
-                };
+                let (worktree, _key) =
+                    match worktree_and_key(&target_dir(&self.context, &cx, None)).await {
+                        Ok(v) => v,
+                        Err(e) => return Ok(ToolResult::text(e)),
+                    };
                 let Some(value) = set else {
                     let level = match trust::resolve_checkout(
                         &config_path(&self.context),
@@ -333,7 +345,6 @@ impl Tool for SubagentRepoTool {
     type Arguments = RepoArgs;
     type Res = ToolResult;
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         Ok(ToolResult::text(match args {
             RepoArgs::Trust { set: Some(_) } => "trust decisions are the main agent's".to_string(),
@@ -341,11 +352,11 @@ impl Tool for SubagentRepoTool {
                 "session clones are the main agent's; work where `subagent` granted you".to_string()
             }
             RepoArgs::Trust { set: None } => {
-                let (_worktree, key) = match worktree_and_key(&target_dir(&self.context, &cx, None))
-                {
-                    Ok(v) => v,
-                    Err(e) => return Ok(ToolResult::text(e)),
-                };
+                let (_worktree, key) =
+                    match worktree_and_key(&target_dir(&self.context, &cx, None)).await {
+                        Ok(v) => v,
+                        Err(e) => return Ok(ToolResult::text(e)),
+                    };
                 format!(
                     "trust: {}",
                     trust::effective_for(&self.context.workspace_config, &key).as_str()

@@ -6,7 +6,9 @@
 //! process at launch, so only a fresh process sees a fresh grant).
 
 #[cfg(target_os = "macos")]
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
@@ -21,6 +23,15 @@ use arc_swap::ArcSwap;
 use super::proto::{AgentRequest, AgentResponse};
 use crate::config::MayConfig;
 
+/// How long a socket read or write may take before the helper is
+/// considered wedged. Screenshots and element listings are the slowest
+/// replies and still land in seconds.
+#[cfg(target_os = "macos")]
+const ROUND_TRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The most bytes one reply line may carry — the largest reply is a
+/// display PNG, which stays well inside this.
+#[cfg(target_os = "macos")]
+const MAX_RESPONSE_LINE: u64 = 64 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// How long a launched helper has to start answering.
@@ -179,6 +190,8 @@ impl Helper {
     }
 
     /// SIGTERM the pid-file helper and wait for that process to exit.
+    /// Runs on a blocking-pool thread (`request` and the daemon's callers
+    /// move it there); the poll waits on a timer, not `thread::sleep`.
     fn stop_helper(&self) -> Result<(), String> {
         let Some(pid) = self.helper_pid() else {
             return Ok(());
@@ -189,12 +202,13 @@ impl Helper {
             if std::time::Instant::now() >= deadline {
                 return Err(format!("computer-agent (pid {pid}) did not exit"));
             }
-            std::thread::sleep(POLL_INTERVAL);
+            futures_lite::future::block_on(async_io::Timer::after(POLL_INTERVAL));
         }
         Ok(())
     }
 
-    /// A stale pid file or a dead pid both mean "not running".
+    /// A stale pid file, a dead pid or a pid that does not run our helper
+    /// bundle all mean "not running".
     #[cfg(target_os = "macos")]
     fn helper_pid(&self) -> Option<libc::pid_t> {
         let pid: libc::pid_t = std::fs::read_to_string(self.may_dir.join("computer-agent.pid"))
@@ -202,7 +216,39 @@ impl Helper {
             .trim()
             .parse()
             .ok()?;
-        (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
+        // The pid file is plain text and outlives its writer: before
+        // SIGTERM, prove the pid really is this bundle's helper and not a
+        // recycled pid.
+        (unsafe { libc::kill(pid, 0) } == 0 && self.is_helper_process(pid)).then_some(pid)
+    }
+
+    /// The pid runs the helper binary inside this May dir's bundle.
+    #[cfg(target_os = "macos")]
+    fn is_helper_process(&self, pid: libc::pid_t) -> bool {
+        // PROC_PIDPATHINFO_MAXSIZE
+        let mut path = vec![0u8; 4096];
+        let len = unsafe {
+            libc::proc_pidpath(
+                pid,
+                path.as_mut_ptr().cast(),
+                u32::try_from(path.len()).unwrap_or(u32::MAX),
+            )
+        };
+        let Ok(len) = usize::try_from(len) else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        path.truncate(len);
+        let expected = self.may_dir.join("MayComputerAgent.app/Contents/MacOS/may");
+        // `proc_pidpath` resolves links; the bundle path must be compared in
+        // the same canonical form — and a bundle that cannot be resolved
+        // proves nothing, so fail closed.
+        let Ok(executable) = dunce::canonicalize(&expected) else {
+            return false;
+        };
+        std::ffi::OsStr::from_bytes(&path) == executable.as_os_str()
     }
 
     /// `~/.may/MayComputerAgent.app` — the bundle screen recording needs.
@@ -293,7 +339,7 @@ impl Helper {
             if self.responds() {
                 return Ok(());
             }
-            std::thread::sleep(POLL_INTERVAL);
+            futures_lite::future::block_on(async_io::Timer::after(POLL_INTERVAL));
         }
         Err("computer-agent did not start answering on its socket".to_owned())
     }
@@ -361,11 +407,18 @@ fn sign_bundle(app: &std::path::Path, identity: Option<&str>) -> Result<(), Stri
 #[cfg(target_os = "macos")]
 fn round_trip(socket: &PathBuf, payload: &[u8]) -> Result<AgentResponse, String> {
     let mut conn = UnixStream::connect(socket).map_err(|e| format!("connect: {e}"))?;
+    // A wedged helper must not pin the caller's thread forever.
+    conn.set_read_timeout(Some(ROUND_TRIP_TIMEOUT))
+        .and_then(|()| conn.set_write_timeout(Some(ROUND_TRIP_TIMEOUT)))
+        .map_err(|e| format!("socket timeouts: {e}"))?;
     conn.write_all(payload).map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(&conn)
+    BufReader::new((&conn).take(MAX_RESPONSE_LINE + 1))
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
+    if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_RESPONSE_LINE {
+        return Err("helper reply is over the line length limit".to_owned());
+    }
     serde_json::from_str(&line).map_err(|e| format!("bad reply: {e}"))
 }
 

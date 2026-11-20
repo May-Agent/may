@@ -9,6 +9,7 @@ use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::approval_pause::ApprovalPause;
 use super::tool_request::{
     ToolRequest, ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
@@ -71,6 +72,7 @@ pub fn channel() -> (WorkspaceRequestBroker, WorkspaceRequestQueue) {
 pub struct RequestWorkspaceTool {
     broker: WorkspaceRequestBroker,
     session_id: String,
+    approval_pause: Option<ApprovalPause>,
 }
 
 impl RequestWorkspaceTool {
@@ -80,7 +82,15 @@ impl RequestWorkspaceTool {
         Self {
             broker,
             session_id: session_id.into(),
+            approval_pause: None,
         }
+    }
+
+    /// Pauses active command timeout clocks while awaiting the user's answer.
+    #[must_use]
+    pub fn with_approval_pause(mut self, pause: ApprovalPause) -> Self {
+        self.approval_pause = Some(pause);
+        self
     }
 }
 
@@ -92,11 +102,11 @@ impl Tool for RequestWorkspaceTool {
     type Arguments = RequestWorkspaceArgs;
     type Res = ToolResult;
 
-    async fn call(
-        &self,
-        args: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+        let _pause_guard = self
+            .approval_pause
+            .as_ref()
+            .map(|pause| pause.hold(cx.identity().map(|id| id.call().clone())));
         let approved = self
             .broker
             .request(WorkspaceRequestPayload {

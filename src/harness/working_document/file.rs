@@ -39,9 +39,11 @@ impl DocumentFile {
         &self.name
     }
 
-    /// What it holds now; absent when it cannot be read, which is logged.
+    /// What it holds now; absent when the file does not exist, is empty, or
+    /// cannot be read (which is logged).
     pub async fn read(&self) -> Snapshot {
         match async_fs::read_to_string(&self.path).await {
+            Ok(content) if content.is_empty() => Snapshot(None),
             Ok(content) => Snapshot(Some(content)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Snapshot(None),
             Err(error) => {
@@ -103,4 +105,20 @@ pub fn added(previous: &Snapshot, current: &Snapshot) -> Option<String> {
         .map(|change| change.value())
         .collect();
     (!added.trim().is_empty()).then_some(added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_file_reads_as_absent_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("tasks.md"), "").expect("write empty tasks.md");
+        let file = DocumentFile::new(dir.path(), "tasks.md");
+        assert_eq!(file.read().await, Snapshot(None));
+
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] one\n").expect("write tasks.md");
+        assert_eq!(file.read().await, Snapshot(Some("- [ ] one\n".to_string())));
+    }
 }

@@ -235,6 +235,12 @@ pub struct PermissionApprover {
     /// The interpreter of each `terminal` call's script, so a request's
     /// prompt highlights the script in its language.
     interpreters: crate::agent::hooks::CallInterpreters,
+    /// Holds a command's timeout clock open while a prompt of this approver
+    /// waits on the user.
+    approval_pause: crate::harness::approval_pause::ApprovalPause,
+    /// One prompt at a time: a second request waits for the first's answer
+    /// rather than replacing the row the user is deciding on.
+    prompt_slot: Arc<async_lock::Mutex<()>>,
 }
 
 impl PermissionApprover {
@@ -249,6 +255,8 @@ impl PermissionApprover {
             approval_mode: ApprovalMode::Interactive,
             timeout: MAIN_APPROVAL_TIMEOUT,
             interpreters: crate::agent::hooks::CallInterpreters::default(),
+            approval_pause: crate::harness::approval_pause::ApprovalPause::new(),
+            prompt_slot: Arc::new(async_lock::Mutex::new(())),
         }
     }
 
@@ -269,7 +277,27 @@ impl PermissionApprover {
             approval_mode: self.approval_mode,
             timeout: self.timeout,
             interpreters: self.interpreters.clone(),
+            approval_pause: self.approval_pause.clone(),
+            prompt_slot: self.prompt_slot.clone(),
         }
+    }
+
+    /// The pause the approver holds its prompts on: commands awaiting the
+    /// answer must not count the wait against their own timeout.
+    #[must_use]
+    pub fn approval_pause(&self) -> crate::harness::approval_pause::ApprovalPause {
+        self.approval_pause.clone()
+    }
+
+    /// Holds the prompts of this approver on `pause`, shared with the other
+    /// waits the session's command timeouts honor.
+    #[must_use]
+    pub fn with_approval_pause(
+        mut self,
+        pause: crate::harness::approval_pause::ApprovalPause,
+    ) -> Self {
+        self.approval_pause = pause;
+        self
     }
 
     /// Return a copy whose pending requests auto-deny after `timeout`.
@@ -427,6 +455,22 @@ impl PermissionApprover {
         script: String,
         interpreter: Option<aither_sandbox::Interpreter>,
     ) -> Result<bool, PermissionError> {
+        self.request_and_wait_for_call(mode, script, interpreter, None)
+            .await
+    }
+
+    /// [`Self::request_and_wait`] attributing the timeout hold to `call`:
+    /// the tool call the request came from; `None` holds the whole session.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the request cannot be delivered or the wait is interrupted.
+    pub async fn request_and_wait_for_call(
+        &self,
+        mode: SandboxMode,
+        script: String,
+        interpreter: Option<aither_sandbox::Interpreter>,
+        call: Option<aither_core::llm::ToolCallId>,
+    ) -> Result<bool, PermissionError> {
         if self.yolo().await? {
             self.record_yolo_grant(mode.into(), &script).await?;
             return Ok(true);
@@ -440,6 +484,7 @@ impl PermissionApprover {
             &format!("{} mode", mode.description()),
             script,
             interpreter,
+            call,
             OnTimeout::Deny,
         )
         .await
@@ -458,6 +503,21 @@ impl PermissionApprover {
         &self,
         text: String,
         on_timeout: OnTimeout,
+    ) -> Result<bool, PermissionError> {
+        self.request_publication_for_call(text, on_timeout, None)
+            .await
+    }
+
+    /// [`Self::request_publication`] attributing the timeout hold to `call`.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the request cannot be delivered, the
+    /// wait is interrupted, or an unanswered request is denied.
+    pub async fn request_publication_for_call(
+        &self,
+        text: String,
+        on_timeout: OnTimeout,
+        call: Option<aither_core::llm::ToolCallId>,
     ) -> Result<bool, PermissionError> {
         if self.yolo().await? {
             self.record_yolo_grant(PermissionHistoryMode::Publish, &text)
@@ -478,12 +538,20 @@ impl PermissionApprover {
             "publishing",
             text,
             None,
+            call,
             on_timeout,
         )
         .await
     }
 
     /// Persist the request, surface it to the UI and wait for the answer.
+    ///
+    /// `call` attributes the timeout hold to the tool call the request came
+    /// from; `None` holds the whole session while the prompt is open.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the request's parts are passed as they are"
+    )]
     async fn wait(
         &self,
         mode: PermissionRequestMode,
@@ -491,8 +559,16 @@ impl PermissionApprover {
         what: &str,
         script: String,
         interpreter: Option<aither_sandbox::Interpreter>,
+        call: Option<aither_core::llm::ToolCallId>,
         on_timeout: OnTimeout,
     ) -> Result<bool, PermissionError> {
+        enum Outcome {
+            Answered(Result<bool, async_channel::RecvError>),
+            Expired,
+        }
+        // The user is being asked: whatever command waits on this answer
+        // must not count the wait against its own timeout.
+        let _pause = self.approval_pause.hold(call);
         let Some(session_id) = self.session_id.clone() else {
             return Err(PermissionError::Internal(anyhow::anyhow!(
                 "permission approval requires a bound session id"
@@ -511,6 +587,19 @@ impl PermissionApprover {
         };
         let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
+
+        // One prompt at a time: the storage a request lands in is
+        // session-wide, so a second prompt is queued rather than replacing
+        // the one the user is deciding on.
+        let _slot = self.prompt_slot.lock().await;
+        // Drops before `_slot`: the request row is cleared first, then the
+        // next queued prompt surfaces.
+        let _pending = PendingPrompt {
+            request_id: request_id.clone(),
+            live_responses: Arc::clone(&self.live_responses),
+            runtime_service: self.runtime_service.clone(),
+            session_id: session_id.clone(),
+        };
 
         if let Some(runtime_service) = self.runtime_service.clone() {
             runtime_service
@@ -537,7 +626,13 @@ impl PermissionApprover {
             });
         }
 
-        if let Ok(decision) = tokio::time::timeout(self.timeout, rx.recv()).await {
+        let outcome =
+            futures_lite::future::race(async { Outcome::Answered(rx.recv().await) }, async {
+                async_io::Timer::after(self.timeout).await;
+                Outcome::Expired
+            })
+            .await;
+        if let Outcome::Answered(decision) = outcome {
             return decision.map_err(|_| PermissionError::Interrupted);
         }
         // The operator never answered: resolve the pending request as
@@ -611,6 +706,38 @@ impl Default for PermissionApprover {
     }
 }
 
+/// A pending permission prompt: on drop — an answer, a timeout or a
+/// cancelled wait — the live response slot frees and the request row clears,
+/// so nothing waits on a prompt nobody will see.
+struct PendingPrompt {
+    request_id: String,
+    live_responses: Arc<LiveResponseRegistry<bool>>,
+    runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
+    session_id: String,
+}
+
+impl Drop for PendingPrompt {
+    fn drop(&mut self) {
+        self.live_responses.take(&self.request_id);
+        let Some(runtime_service) = self.runtime_service.clone() else {
+            return;
+        };
+        let session_id = self.session_id.clone();
+        let request_id = self.request_id.clone();
+        let clear = async move {
+            if let Err(error) = runtime_service
+                .clear_waiting_permission_request(&session_id, &request_id)
+                .await
+            {
+                tracing::warn!(%error, "failed to clear a dropped permission request");
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(clear);
+        }
+    }
+}
+
 impl Approver for PermissionApprover {
     /// Asks the user about a script that runs outside the sandbox. Every
     /// other kind of request reaches the approver only through a surface
@@ -622,11 +749,13 @@ impl Approver for PermissionApprover {
             "the permission approver answers scripts that run outside the sandbox"
         );
         let interpreter = request.call().and_then(|call| self.interpreters.get(call));
+        let call = request.call().map(|identity| identity.call().clone());
         match self
-            .request_and_wait(
+            .request_and_wait_for_call(
                 SandboxMode::Unsandboxed,
                 request.subject().to_string(),
                 interpreter,
+                call,
             )
             .await
         {
