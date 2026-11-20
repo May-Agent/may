@@ -38,6 +38,9 @@ pub struct TerminalPermissionHandler {
     /// subagent shells a session builds share the handler aither hands them,
     /// so the boundary is enforced per request by the call's agent identity.
     subagent_approver: Arc<std::sync::OnceLock<Option<PermissionApprover>>>,
+    /// The shell this handler serves never leaves the sandbox: a read-only
+    /// subagent's, whose every request is refused without asking.
+    confined: bool,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
@@ -64,6 +67,7 @@ impl TerminalPermissionHandler {
             ssh: SshLocations::Deny,
             approver,
             subagent_approver: Arc::new(std::sync::OnceLock::new()),
+            confined: false,
             runtime_service,
             session_id,
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
@@ -92,6 +96,7 @@ impl TerminalPermissionHandler {
             ssh: SshLocations::Allow,
             approver: None,
             subagent_approver: Arc::new(std::sync::OnceLock::new()),
+            confined: false,
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
@@ -111,6 +116,16 @@ impl TerminalPermissionHandler {
     pub fn for_subagent(&self) -> Self {
         Self {
             approver: self.approver.clone().map(PermissionApprover::for_subagent),
+            ..self.clone()
+        }
+    }
+
+    /// The handler a read-only subagent's shell gets: its scripts stay
+    /// inside the sandbox, so nothing they run may be escalated.
+    #[must_use]
+    pub fn for_read_only_subagent(&self) -> Self {
+        Self {
+            confined: true,
             ..self.clone()
         }
     }
@@ -191,6 +206,11 @@ impl TerminalPermissionHandler {
 
 impl Approver for TerminalPermissionHandler {
     async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        if self.confined {
+            return Ok(Approval::Denied {
+                reason: "a read-only subagent cannot run outside the sandbox".to_string(),
+            });
+        }
         // A subagent never reaches the session's approver directly: its
         // escalation waits on the subagent deadline and agent id, and it
         // cannot put a new SSH server to the user at all.

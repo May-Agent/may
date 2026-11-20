@@ -59,6 +59,9 @@ pub struct SubagentAssembly {
     pub instructions: Vec<String>,
     /// Shared native OCR runtime for subagents launched in this session.
     pub vision_ocr: crate::vision_ocr::VisionOcr,
+    /// The session's permission handler: a read-only subagent's shell is
+    /// given its confined variant.
+    pub permissions: crate::terminal_permission_handler::TerminalPermissionHandler,
 }
 
 /// Dependencies every shared terminal IPC command needs from the host runtime.
@@ -679,6 +682,7 @@ where
         keep_alive,
         instructions,
         vision_ocr,
+        permissions,
     } = config.subagents;
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
@@ -710,6 +714,7 @@ where
         base_dir: config.sandbox_dir.clone(),
         fork_source: fork_source.clone(),
         toolkit,
+        read_only_permissions: permissions.for_read_only_subagent(),
         redactor: crate::secrets::SecretRedactor::for_session(
             &config.may_dir,
             config.session_id.as_str(),
@@ -888,6 +893,9 @@ mod tests {
             keep_alive: None,
             instructions: Vec::new(),
             vision_ocr: crate::vision_ocr::VisionOcr::new(),
+            permissions: crate::terminal_permission_handler::TerminalPermissionHandler::for_agent(
+                None, None, None,
+            ),
         }
     }
 

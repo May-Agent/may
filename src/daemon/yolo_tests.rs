@@ -169,6 +169,30 @@ async fn ssh_connect_is_granted_without_asking_in_a_yolo_session() {
 }
 
 #[tokio::test]
+async fn a_read_only_subagents_escalation_is_refused_even_in_a_yolo_session() {
+    let fixture = Fixture::new().await;
+    fixture.yolo(true).await;
+    let handler = TerminalPermissionHandler::for_agent(Some(fixture.approver()), None, None)
+        .for_read_only_subagent();
+
+    let denied = handler
+        .approve(unsandboxed("make install"))
+        .await
+        .expect("decided");
+    let Approval::Denied { reason } = denied else {
+        panic!("expected a denial, got {denied:?}");
+    };
+    assert!(reason.contains("read-only"), "{reason}");
+
+    let ssh = ApprovalRequest::new(ApprovalKind::new(SSH_KIND), "uname").with_reason("ops@prod");
+    assert!(matches!(
+        handler.approve(ssh).await.expect("decided"),
+        Approval::Denied { .. }
+    ));
+    assert_eq!(fixture.history("permission_request").await, 0);
+}
+
+#[tokio::test]
 async fn a_workspace_request_is_granted_at_once_in_a_yolo_session() {
     let fixture = Fixture::new().await;
     fixture.yolo(true).await;
