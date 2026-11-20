@@ -46,16 +46,26 @@ impl GitHub {
     }
 
     /// `GET url` of a public download, which carries no credentials.
-    pub(super) async fn get_public(&self, url: &str) -> Result<bytes::Bytes, UpdateError> {
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?)
+    pub(super) async fn get_public(&self, url: &str) -> Result<reqwest::Response, UpdateError> {
+        Ok(self.client.get(url).send().await?.error_for_status()?)
     }
+}
+
+/// The response's body as `bytes`, reporting each chunk's running total to
+/// `progress` as `downloaded`/`total`; `total` is the response's announced
+/// length, or `announced` when it sent none.
+pub(super) async fn body_bytes(
+    mut response: reqwest::Response,
+    announced: Option<u64>,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<bytes::Bytes, UpdateError> {
+    let total = response.content_length().or(announced);
+    let mut bytes = Vec::with_capacity(usize::try_from(total.unwrap_or_default()).unwrap_or(0));
+    while let Some(chunk) = response.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        progress(bytes.len() as u64, total);
+    }
+    Ok(bytes.into())
 }
 
 /// Checks `bytes` against the hex sha256 `expected`.

@@ -3231,7 +3231,38 @@ async fn run_update(channel: Option<may_agent::update::Channel>) -> anyhow::Resu
         None => may_agent::config::MayConfig::load().await?.update.channel(),
     };
     let target = running_executable()?;
-    match update(channel, &target, |step| eprintln!("{step}")).await? {
+    let mut bar: Option<indicatif::ProgressBar> = None;
+    let outcome = update(channel, &target, |progress| match progress {
+        may_agent::update::Progress::Step(text) => {
+            if let Some(bar) = bar.take() {
+                bar.finish_and_clear();
+            }
+            eprintln!("{text}");
+        }
+        may_agent::update::Progress::Download { downloaded, total } => {
+            let bar = bar.get_or_insert_with(|| {
+                let bar = indicatif::ProgressBar::new(total.unwrap_or(0));
+                bar.set_style(
+                    indicatif::ProgressStyle::with_template(if total.is_some() {
+                        "  {wide_bar} {decimal_bytes}/{decimal_total_bytes}"
+                    } else {
+                        "  {decimal_bytes} downloaded"
+                    })
+                    .expect("a literal template parses"),
+                );
+                bar
+            });
+            if let Some(total) = total {
+                bar.set_length(total);
+            }
+            bar.set_position(downloaded);
+        }
+    })
+    .await?;
+    if let Some(bar) = bar {
+        bar.finish_and_clear();
+    }
+    match outcome {
         Outcome::UpToDate => eprintln!("May is up to date."),
         Outcome::Updated { executable, to } => {
             eprintln!("Updated May to {to}.");

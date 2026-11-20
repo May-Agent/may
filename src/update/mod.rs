@@ -127,6 +127,28 @@ impl std::fmt::Display for Channel {
     }
 }
 
+/// What an update reports to its `progress` callback.
+#[derive(Debug, Clone)]
+pub enum Progress {
+    /// A step began; `text` is the line to show.
+    Step(String),
+    /// `downloaded` of `total` bytes of the build have arrived; `total` is
+    /// `None` when the server announced no length.
+    Download {
+        /// Bytes received so far.
+        downloaded: u64,
+        /// The announced body length.
+        total: Option<u64>,
+    },
+}
+
+impl Progress {
+    /// The step line `text`.
+    fn step(text: impl Into<String>) -> Self {
+        Self::Step(text.into())
+    }
+}
+
 /// What an update did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -270,27 +292,42 @@ impl Available {
 
     /// Downloads the build, checks it and replaces the executable at
     /// `target` with it. Nothing is written unless the download passed its
-    /// check. `progress` receives one line per step.
+    /// check. `progress` receives one [`Progress::Step`] line per step and
+    /// [`Progress::Download`] events as the body arrives.
     ///
     /// # Errors
     /// Fails when the download, its verification or the replacement fails.
     pub async fn install(
         self,
         target: &Path,
-        progress: &mut impl FnMut(&str),
+        progress: &mut impl FnMut(Progress),
     ) -> Result<(), UpdateError> {
         let executable = match self.source {
             Source::Release { latest, platform } => {
-                progress(&format!("Downloading May {}…", latest.version));
-                let archive = self.github.download_release(&latest).await?;
+                progress(Progress::step(format!(
+                    "Downloading May {}…",
+                    latest.version
+                )));
+                let archive = self
+                    .github
+                    .download_release(&latest, &mut |downloaded, total| {
+                        progress(Progress::Download { downloaded, total });
+                    })
+                    .await?;
                 blocking::unblock(move || release::extract_executable(&archive, platform)).await?
             }
             Source::Ci { found } => {
-                progress(&format!(
-                    "Downloading the CI build ({} MB)…",
+                progress(Progress::step(format!(
+                    "Downloading the CI build of {} ({} MB)…",
+                    short(&found.head_sha),
                     found.artifact.size_in_bytes / 1_000_000
-                ));
-                let zip = self.github.download(&found.artifact).await?;
+                )));
+                let zip = self
+                    .github
+                    .download(&found.artifact, &mut |downloaded, total| {
+                        progress(Progress::Download { downloaded, total });
+                    })
+                    .await?;
                 blocking::unblock(move || ci::extract_executable(&zip)).await?
             }
         };
@@ -309,13 +346,14 @@ pub fn running_executable() -> std::io::Result<PathBuf> {
 }
 
 /// Looks for a newer build on `channel`; `None` when the running build is
-/// the channel's newest. `progress` receives one line per step.
+/// the channel's newest. `progress` receives one [`Progress::Step`] line
+/// per step.
 ///
 /// # Errors
 /// Fails when the channel's newest build cannot be found.
 pub async fn check(
     channel: Channel,
-    progress: &mut impl FnMut(&str),
+    progress: &mut impl FnMut(Progress),
 ) -> Result<Option<Available>, UpdateError> {
     let token = GhCliTokenSource
         .token()
@@ -329,13 +367,13 @@ async fn check_at(
     channel: Channel,
     build: &Build,
     token: Result<String, String>,
-    progress: &mut impl FnMut(&str),
+    progress: &mut impl FnMut(Progress),
 ) -> Result<Option<Available>, UpdateError> {
     match channel {
         Channel::Stable => {
             let platform = ReleasePlatform::current()?;
             let github = GitHub::new(api_base, token.ok());
-            progress("Looking for the latest release…");
+            progress(Progress::step("Looking for the latest release…"));
             let latest = github.latest_release(platform).await?;
             if build.is_release(&latest.version) {
                 return Ok(None);
@@ -351,7 +389,9 @@ async fn check_at(
             let platform = CiPlatform::current()?;
             let token = token.map_err(UpdateError::Token)?;
             let github = GitHub::new(api_base, Some(token));
-            progress("Looking for the latest successful CI build…");
+            progress(Progress::step(
+                "Looking for the latest successful CI build…",
+            ));
             let found = github.latest_artifact(platform.artifact()).await?;
             if build.is_ci_build_of(&found.head_sha) {
                 return Ok(None);
@@ -367,7 +407,8 @@ async fn check_at(
 }
 
 /// Updates the executable at `target` on `channel`. `progress` receives one
-/// line per step, for the caller's loading indicator.
+/// [`Progress::Step`] line per step and [`Progress::Download`] events as
+/// the download arrives, for the caller's loading indicator.
 ///
 /// # Errors
 /// Fails when the newest build cannot be found, downloaded, verified or
@@ -375,7 +416,7 @@ async fn check_at(
 pub async fn update(
     channel: Channel,
     target: &Path,
-    mut progress: impl FnMut(&str),
+    mut progress: impl FnMut(Progress),
 ) -> Result<Outcome, UpdateError> {
     let Some(available) = check(channel, &mut progress).await? else {
         return Ok(Outcome::UpToDate);
@@ -412,7 +453,7 @@ pub const fn built_from() -> Option<&'static str> {
 pub async fn this_build_tarball_for(
     platform: CiPlatform,
     token: String,
-    mut progress: impl FnMut(&str),
+    mut progress: impl FnMut(Progress),
 ) -> Result<Vec<u8>, UpdateError> {
     let commit = built_from().ok_or(UpdateError::UnknownCommit)?;
     this_commit_from(GITHUB_API, platform, commit, token, &mut progress).await
@@ -423,17 +464,24 @@ async fn this_commit_from(
     platform: CiPlatform,
     commit: &str,
     token: String,
-    progress: &mut impl FnMut(&str),
+    progress: &mut impl FnMut(Progress),
 ) -> Result<Vec<u8>, UpdateError> {
     let name = platform.artifact();
     let github = GitHub::new(api_base, Some(token));
-    progress(&format!("Looking for the CI build of {}…", short(commit)));
+    progress(Progress::step(format!(
+        "Looking for the CI build of {}…",
+        short(commit)
+    )));
     let found = github.artifact_of_commit(name, commit).await?;
-    progress(&format!(
+    progress(Progress::step(format!(
         "Downloading {name} ({} MB)…",
         found.artifact.size_in_bytes / 1_000_000
-    ));
-    let zip = github.download(&found.artifact).await?;
+    )));
+    let zip = github
+        .download(&found.artifact, &mut |downloaded, total| {
+            progress(Progress::Download { downloaded, total });
+        })
+        .await?;
     blocking::unblock(move || ci::extract_tarball(&zip)).await
 }
 
@@ -546,7 +594,7 @@ mod tests {
         };
         let base = serve_listings("").await;
         let token = || Err("no login".to_owned());
-        let mut ignore = |_: &str| {};
+        let mut ignore = |_: Progress| {};
 
         let current = build(BuildKind::Release, "0.1.1", None);
         let found = check_at(&base, Channel::Stable, &current, token(), &mut ignore)
@@ -583,7 +631,7 @@ mod tests {
         };
         let base = serve_listings(platform.artifact()).await;
         let token = || Ok("test-token".to_owned());
-        let mut ignore = |_: &str| {};
+        let mut ignore = |_: Progress| {};
 
         let current = build(BuildKind::Local, "0.1.1", Some(HEAD));
         let found = check_at(&base, Channel::Dev, &current, token(), &mut ignore)
@@ -606,7 +654,7 @@ mod tests {
             return;
         };
         let base = serve_listings(platform.artifact()).await;
-        let mut ignore = |_: &str| {};
+        let mut ignore = |_: Progress| {};
         let error = check_at(
             &base,
             Channel::Dev,

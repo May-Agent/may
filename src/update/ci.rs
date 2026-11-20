@@ -173,12 +173,18 @@ impl GitHub {
     }
 
     /// The artifact's zip, checked against the digest GitHub reports.
-    pub(super) async fn download(&self, artifact: &Artifact) -> Result<Vec<u8>, UpdateError> {
-        let bytes = self
-            .get(&artifact.archive_download_url)
-            .await?
-            .bytes()
-            .await?;
+    /// `progress` reports each chunk's running `downloaded`/`total` bytes.
+    pub(super) async fn download(
+        &self,
+        artifact: &Artifact,
+        progress: &mut impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, UpdateError> {
+        let bytes = super::github::body_bytes(
+            self.get(&artifact.archive_download_url).await?,
+            Some(artifact.size_in_bytes),
+            progress,
+        )
+        .await?;
         if let Some(expected) = artifact
             .digest
             .as_deref()

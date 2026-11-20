@@ -154,7 +154,11 @@ impl Worker {
     }
 
     async fn install(&self, channel: crate::update::Channel) {
-        let mut progress = |step: &str| tracing::debug!(step, "auto update");
+        let mut progress = |progress: crate::update::Progress| {
+            if let crate::update::Progress::Step(step) = progress {
+                tracing::debug!(step, "auto update");
+            }
+        };
         let available = match check(channel, &mut progress).await {
             Ok(Some(available)) => available,
             Ok(None) => {
