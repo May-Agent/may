@@ -137,7 +137,7 @@ runs:
       if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
       shell: bash
       run: |
-        bin="$(find target/debug/deps -maxdepth 1 -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
+        bin="$(find target/debug -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
         "$bin" --ignored --exact --nocapture \
           the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
     - name: Upload cargo timings
