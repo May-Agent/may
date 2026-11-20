@@ -10,9 +10,9 @@ failed {{ failure.name }}{% if let Some(url) = failure.url %} ({{ url }}){% endi
 {%- endfor %}
 {%- when LogExcerpt::NoErrorLines %}: its log has no error line
 {%- when LogExcerpt::Unavailable(reason) %}: its log could not be read ({{ reason }})
-{%- when LogExcerpt::NoLog %}: it is not an Actions job, so it has no log
+{%- when LogExcerpt::NoLog %}: it is not a CI job, so it has no log
 {%- endmatch %}
 {%- endfor %}
-{%- when Self::Unreadable(error) -%}
-checks: could not be read from GitHub ({{ error }})
+{%- when Self::Unreadable { forge, error } -%}
+checks: could not be read from {{ forge }} ({{ error }})
 {%- endmatch %}

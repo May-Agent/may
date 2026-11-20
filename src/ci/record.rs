@@ -45,13 +45,13 @@ pub struct Recorder<'a, A> {
 }
 
 impl<A: Actions> Recorder<'_, A> {
-    /// Records every job of the workflow runs on `head_sha`, refreshes their
+    /// Records every job of the remote CI runs on `head_sha`, refreshes their
     /// baselines, and stores a finding when a job ran abnormally long. The
     /// finding is returned only the first time the commit produces one.
     ///
     /// # Errors
-    /// Fails when GitHub or the database cannot be read or written.
-    pub async fn observe_github(
+    /// Fails when the forge or the database cannot be read or written.
+    pub async fn observe_remote(
         &self,
         pr: &PrRow,
         head_sha: &str,
@@ -113,7 +113,7 @@ impl<A: Actions> Recorder<'_, A> {
                             project_id: pr.project_id,
                             pr_id: pr.id,
                             session_id: pr.session_id.clone(),
-                            source: "github".into(),
+                            source: A::SOURCE.into(),
                             external_id: to_i64(job.id),
                             run_id: to_i64(run.id),
                             workflow: workflow.clone(),
@@ -348,11 +348,13 @@ impl<A: Sync> Recorder<'_, A> {
             return Ok(None);
         }
         let warning = CiWarning {
+            sigil: pr.sigil(),
             pr_number: pr.number,
             jobs: views,
         }
         .render()?;
         let alert = CiAlert {
+            sigil: pr.sigil(),
             pr_number: pr.number,
             jobs: views,
         }
@@ -402,6 +404,8 @@ mod tests {
 
     #[allow(clippy::unused_async_trait_impl)]
     impl Actions for Fake {
+        const SOURCE: &'static str = "github";
+
         async fn base_branch(&self) -> Result<String, CiError> {
             Ok("dev".to_string())
         }
@@ -508,7 +512,7 @@ mod tests {
             actions: &actions,
             limits: limits(),
         };
-        let finding = recorder.observe_github(&pr, "abc").await.unwrap().unwrap();
+        let finding = recorder.observe_remote(&pr, "abc").await.unwrap().unwrap();
         assert!(
             finding.warning.contains("CI / test ran 11m 00s"),
             "{}",
@@ -524,7 +528,7 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].contains("ci-optimise"));
         // The same commit observed again is not a new event.
-        assert_eq!(recorder.observe_github(&pr, "abc").await.unwrap(), None);
+        assert_eq!(recorder.observe_remote(&pr, "abc").await.unwrap(), None);
         assert_eq!(db.take_ci_alerts("s").await.unwrap(), [] as [String; 0]);
         let jobs = db.ci_jobs_for_pr(pr.id).await.unwrap();
         assert_eq!(jobs.len(), 1);
@@ -545,7 +549,7 @@ mod tests {
             actions: &actions,
             limits: limits(),
         };
-        let finding = recorder.observe_github(&pr, "abc").await.unwrap().unwrap();
+        let finding = recorder.observe_remote(&pr, "abc").await.unwrap().unwrap();
         assert!(
             finding.warning.contains("past the 40m 00s limit"),
             "{}",
@@ -562,7 +566,7 @@ mod tests {
             actions: &actions,
             limits: limits(),
         };
-        assert_eq!(recorder.observe_github(&pr, "abc").await.unwrap(), None);
+        assert_eq!(recorder.observe_remote(&pr, "abc").await.unwrap(), None);
         assert_eq!(db.take_ci_alerts("s").await.unwrap(), [] as [String; 0]);
         assert_eq!(db.ci_jobs_for_pr(pr.id).await.unwrap().len(), 1);
         let baseline = db
@@ -627,7 +631,7 @@ mod tests {
             actions: &actions,
             limits: limits(),
         };
-        let finding = recorder.observe_github(&pr, "sha1").await.unwrap();
+        let finding = recorder.observe_remote(&pr, "sha1").await.unwrap();
         assert!(finding.is_some());
         assert_eq!(*actions.seen_events.lock().unwrap(), vec!["pull_request"]);
     }

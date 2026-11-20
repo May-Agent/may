@@ -244,6 +244,7 @@ pub(super) enum Outcome {
 #[derive(Template)]
 #[template(path = "pr_watch_stopped.txt", escape = "none")]
 pub(super) struct StoppedReport<'a> {
+    pub(super) sigil: char,
     pub(super) number: i64,
     pub(super) stopped: &'a Stopped,
     waited_minutes: u64,
@@ -251,12 +252,13 @@ pub(super) struct StoppedReport<'a> {
 }
 
 impl<'a> StoppedReport<'a> {
-    pub(super) const fn new(number: i64, stopped: &'a Stopped) -> Self {
+    pub(super) const fn new(sigil: char, number: i64, stopped: &'a Stopped) -> Self {
         let (waited, bound) = match stopped {
             Stopped::TimedOut { waited, bound } => (*waited, *bound),
             _ => (Duration::ZERO, Duration::ZERO),
         };
         Self {
+            sigil,
             number,
             stopped,
             waited_minutes: waited.as_secs() / 60,
@@ -849,7 +851,7 @@ mod tests {
             url: Some("https://github.com/o/r/actions/runs/9/job/8".to_string()),
         });
         assert_eq!(outcome, Outcome::Stopped(stopped.clone()));
-        let text = StoppedReport::new(7, &stopped).render().unwrap();
+        let text = StoppedReport::new('#', 7, &stopped).render().unwrap();
         assert!(text.contains("test (ubuntu-latest)"), "{text}");
         assert!(
             text.contains("https://github.com/o/r/actions/runs/9/job/8"),
@@ -868,7 +870,7 @@ mod tests {
         ]));
         let stopped = Stopped::Removed("failed status checks".to_string());
         assert_eq!(outcome, Outcome::Stopped(stopped.clone()));
-        let text = StoppedReport::new(7, &stopped).render().unwrap();
+        let text = StoppedReport::new('#', 7, &stopped).render().unwrap();
         assert!(text.contains("failed status checks"), "{text}");
     }
 
@@ -901,7 +903,7 @@ mod tests {
         };
         assert_eq!(bound, EXPECTED * 2);
         assert!(waited >= bound);
-        let text = StoppedReport::new(7, &Stopped::TimedOut { waited, bound })
+        let text = StoppedReport::new('#', 7, &Stopped::TimedOut { waited, bound })
             .render()
             .unwrap();
         assert!(text.contains("within 24"), "{text}");

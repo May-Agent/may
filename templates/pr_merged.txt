@@ -1,4 +1,4 @@
-merged PR #{{ number }}{% if let Some(sha) = merge_sha %} as {{ sha }}{% else %} upstream{% endif %}
+merged PR {{ sigil }}{{ number }}{% if let Some(sha) = merge_sha %} as {{ sha }}{% else %} upstream{% endif %}
 {% match clone -%}
 {% when CloneFate::Deleted -%}
 The session clone repos/{{ clone_dir }} was deleted, ignored files included; the next `repo clone` or `pr open` for this repository clones it again at the new HEAD.
