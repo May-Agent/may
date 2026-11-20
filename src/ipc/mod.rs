@@ -26,9 +26,10 @@ pub use bridge::{CommandBridge, ShellSlot};
 pub use cli::{POSITIONAL_KEYWORD, cli_to_json, schema_to_help, validate_positional_layout};
 pub use command_set::{AnyCommandSet, CommandSet};
 pub use payload::{
-    CallImageStore, CommandEnvelope, CommandPayload, RecordedCallImage, tool_output_to_payload,
+    ActiveCallImageScopes, CallImageScope, CallImageStore, CommandEnvelope, CommandPayload,
+    HandlerOutput, RecordedCallImage, tool_output_to_payload,
 };
 pub use registry::{
     AnyCommandObserver, Binding, Caller, CommandCall, CommandObserver, CommandRegistry,
-    CommandRegistryBuilder, CommandUsage, KeptExchangeReceiver, Role,
+    CommandRegistryBuilder, CommandUsage, IpcImageTool, KeptExchangeReceiver, Role,
 };

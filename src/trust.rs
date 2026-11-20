@@ -19,6 +19,8 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
+use askama::Template;
+
 use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::issue::github::RepositoryAccess;
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
@@ -706,7 +708,17 @@ pub(crate) fn config_at(dir: &Path, worktree: &Path, level: TrustLevel) -> Works
     WorkspaceConfig::load(&path).expect("load trust")
 }
 
+#[derive(askama::Template)]
+#[template(path = "repo_trust_question.txt", escape = "none")]
+struct RepoTrustQuestion {
+    forge_repo: Option<String>,
+    worktree: String,
+}
+
 /// The `/permission` `ask_user` request for one repository.
+///
+/// # Panics
+/// Panics if the question template fails to render, which typed input prevents.
 #[must_use]
 pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest {
     let options = match kind {
@@ -730,15 +742,15 @@ pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest
             "local — Write the checkout directly (not recommended)".to_string(),
         ],
     };
-    let question = match kind {
-        RepoKind::Forge { repo } => {
-            format!(
-                "May can open pull requests on {}. How should it work with this repository?",
-                repo.host_and_path()
-            )
-        }
-        RepoKind::Git => format!("How should May work with {}?", worktree.display()),
-    };
+    let question = RepoTrustQuestion {
+        forge_repo: match kind {
+            RepoKind::Forge { repo } => Some(repo.host_and_path()),
+            RepoKind::Git => None,
+        },
+        worktree: worktree.display().to_string(),
+    }
+    .render()
+    .expect("a repo trust question renders typed input");
     PersistedAskUserRequest {
         id: crate::id::new(),
         questions: vec![PersistedAskUserQuestion {

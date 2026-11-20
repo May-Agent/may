@@ -7,7 +7,8 @@ use std::sync::Arc;
 use aither_cloud::{CloudError, CloudProvider, codex::Codex, copilot::Copilot, openai::OpenAI};
 use aither_core::LanguageModel;
 use aither_core::llm::{
-    Event as LlmEvent, GenerateError, LLMRequest, TokenCounting, model::Profile as ModelProfile,
+    Event as LlmEvent, GenerateError, LLMRequest, RetryPolicy, TokenCounting,
+    model::Profile as ModelProfile,
 };
 use arc_swap::ArcSwapOption;
 use futures_lite::{Stream, StreamExt as _};
@@ -64,6 +65,17 @@ impl LanguageModel for SessionModel {
                 yield event;
             }
         }
+    }
+
+    async fn generate<T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static>(
+        &self,
+        request: LLMRequest,
+    ) -> Result<T, GenerateError<Self::Error>> {
+        Box::pin(self.client().generate(request)).await
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.client().retry_policy()
     }
 
     fn token_counting(&self) -> TokenCounting {
