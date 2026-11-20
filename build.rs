@@ -5,13 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[path = "src/container/image_ref.rs"]
-mod image_ref;
-
-/// The same combined manifest `embedded_distribution` loads; a build script
-/// cannot call the crate it builds, so it includes the module that holds it.
-#[path = "src/tools/manifest.rs"]
-mod manifest;
+use may_container_image::{combined_manifest_bytes, heel_version_in_lockfile, image_ref};
 
 /// The manifest files the workspace image's tag hashes, through
 /// `manifest::combined_manifest_bytes`.
@@ -122,8 +116,8 @@ fn emit_heel_lib_version() -> String {
 fn emit_image_refs(heel_lib_version: &str) {
     let base_dir = Path::new("container/base");
     let workspace_dir = Path::new("container/workspace");
-    let manifest = manifest::combined_manifest_bytes()
-        .expect("tool distribution manifests must be valid JSON");
+    let manifest =
+        combined_manifest_bytes().expect("tool distribution manifests must be valid JSON");
     let base_ref = image_ref::base_image_ref(base_dir).expect("base context must be readable");
     let workspace_ref = image_ref::workspace_image_ref(
         workspace_dir,
@@ -168,26 +162,6 @@ fn watch_context_inputs(context_dir: &Path) {
             }
         }
     }
-}
-
-/// Extract the `version` field of the `heel` package entry.
-fn heel_version_in_lockfile(lockfile: &str) -> Option<String> {
-    let mut in_heel_package = false;
-    for line in lockfile.lines() {
-        if line.starts_with("[[") {
-            in_heel_package = false;
-        }
-        if line == "name = \"heel\"" {
-            in_heel_package = true;
-        } else if in_heel_package
-            && let Some(version) = line
-                .strip_prefix("version = \"")
-                .and_then(|rest| rest.strip_suffix('"'))
-        {
-            return Some(version.to_string());
-        }
-    }
-    None
 }
 
 fn watch_web_ui_inputs() {

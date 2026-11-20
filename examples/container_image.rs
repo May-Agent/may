@@ -1,39 +1,20 @@
-#![doc = "CI helper for the GHCR container images: print their content-addressed refs and stage the workspace build context."]
+#![doc = "CI helper for the GHCR workspace image: stage its generated build context. `may-container-image refs` prints the content-addressed references without compiling this crate."]
 
 use std::path::{Path, PathBuf};
 
-use may_agent::container::image_ref;
 use may_agent::container::stage::stage_workspace_context;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
-        [command] if command == "refs" => refs(),
         [command, arch, context] if command == "stage" => stage(arch, Path::new(context)).await,
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage: container_image refs | container_image stage <amd64|arm64> <context-dir>",
+            "usage: container_image stage <amd64|arm64> <context-dir>",
         )
         .into()),
     }
-}
-
-/// Prints `base=<ref>` and `workspace=<ref>` for `$GITHUB_OUTPUT`.
-fn refs() -> Result<(), Box<dyn std::error::Error>> {
-    let base = image_ref::base_image_ref(Path::new("container/base"))?;
-    // The manifest `embedded_distribution` loads, one of the reference's hash inputs.
-    let distribution = may_agent::tools::manifest::combined_manifest_bytes()?;
-    let workspace = image_ref::workspace_image_ref(
-        Path::new("container/workspace"),
-        &base,
-        &distribution,
-        Path::new("."),
-        env!("MAY_HEEL_LIB_VERSION"),
-    )?;
-    println!("base={base}");
-    println!("workspace={workspace}");
-    Ok(())
 }
 
 /// Builds the `tasks` binary for the host architecture, which is the image's.
