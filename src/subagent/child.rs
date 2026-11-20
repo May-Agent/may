@@ -44,6 +44,7 @@ pub struct ChildHooks {
     vision_ocr: VisionOcr,
     call_images: Option<CallImageStore>,
     outputs_dir: Option<PathBuf>,
+    redactor: crate::secrets::SecretRedactor,
 }
 
 impl ChildHooks {
@@ -58,6 +59,7 @@ impl ChildHooks {
             vision_ocr: VisionOcr::new(),
             call_images: None,
             outputs_dir: None,
+            redactor: crate::secrets::SecretRedactor::new(std::path::Path::new("")),
         }
     }
 
@@ -71,6 +73,7 @@ impl ChildHooks {
             vision_ocr: VisionOcr::new(),
             call_images: None,
             outputs_dir: None,
+            redactor: crate::secrets::SecretRedactor::new(std::path::Path::new("")),
         }
     }
 
@@ -85,6 +88,14 @@ impl ChildHooks {
         self.vision_ocr = vision_ocr;
         self.call_images = Some(call_images);
         self.outputs_dir = Some(outputs_dir);
+        self
+    }
+
+    /// Redacts the run's secrets from tool results, the same fail-closed way
+    /// the session's own hooks do.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: crate::secrets::SecretRedactor) -> Self {
+        self.redactor = redactor;
         self
     }
 }
@@ -103,21 +114,36 @@ impl Hooks for ChildHooks {
         {
             valve.acted();
         }
-        match augment_tool_outcome(
+        // A tool result is never shown to the model unredacted: when the
+        // stored secrets cannot be read, the run ends with that error.
+        let redactions = match self.redactor.current().await {
+            Ok(redactions) => redactions,
+            Err(error) => return AfterTool::Abort(error.to_string()),
+        };
+        let shown = outcome.for_model();
+        let mut result = shown.clone();
+        redactions.redact_tool_result(&mut result);
+        let redacted = result != shown;
+        if let Some((mut augmented, attachments)) = augment_tool_outcome(
             &self.vision_ocr,
             self.call_images.as_ref(),
             self.outputs_dir.as_deref(),
             outcome.call.call(),
             &outcome.name,
-            outcome.for_model(),
+            result.clone(),
         )
         .await
         {
-            Some((result, attachments)) => AfterTool::ReplaceWithAttachments {
-                result,
+            redactions.redact_tool_result(&mut augmented);
+            return AfterTool::ReplaceWithAttachments {
+                result: augmented,
                 attachments,
-            },
-            None => AfterTool::Keep,
+            };
+        }
+        if redacted {
+            AfterTool::Replace(result)
+        } else {
+            AfterTool::Keep
         }
     }
 
@@ -167,6 +193,9 @@ struct Credit {
     floor: usize,
     usage: Option<RunUsage>,
     read_epochs: crate::command_policy::FileReadEpochs,
+    /// The last reported prompt tokens, so compaction events can keep the
+    /// valve's accounting current.
+    tokens: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What a wait for background commands ended on.
@@ -281,6 +310,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
     fn credit(&self) -> Credit {
         Credit {
             valve: self.parts.valve.clone(),
+            tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             floor: self.parts.floor,
             usage: self.parts.usage.clone(),
             read_epochs: self.parts.read_epochs.clone(),
@@ -314,18 +344,39 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
                             }
                             if let Some(valve) = &credit.valve {
                                 let tokens = reported.prompt_tokens.unwrap_or(0);
+                                let tokens = usize::try_from(tokens).unwrap_or(usize::MAX);
+                                credit.tokens.store(tokens, Ordering::Relaxed);
+                                valve.sync(false, tokens, credit.floor);
+                            }
+                        }
+                        AgentEvent::CompactionStarted { .. } => {
+                            if let Some(valve) = &credit.valve {
                                 valve.sync(
-                                    false,
-                                    usize::try_from(tokens).unwrap_or(usize::MAX),
+                                    true,
+                                    credit.tokens.load(Ordering::Relaxed),
                                     credit.floor,
                                 );
                             }
                         }
-                        AgentEvent::CompactionEnded {
-                            outcome: CompactionOutcome::Applied(_),
-                            ..
-                        } => {
-                            credit.read_epochs.bump(own);
+                        AgentEvent::CompactionEnded { outcome, .. } => {
+                            let applied = matches!(outcome, CompactionOutcome::Applied(_));
+                            if applied {
+                                credit.read_epochs.bump(own);
+                            }
+                            if let Some(valve) = &credit.valve {
+                                if applied {
+                                    valve.sync(false, 0, credit.floor);
+                                    valve.landed();
+                                } else {
+                                    // Nothing applied: the valve returns to
+                                    // idle at the last reported token count.
+                                    valve.sync(
+                                        false,
+                                        credit.tokens.load(Ordering::Relaxed),
+                                        credit.floor,
+                                    );
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -372,13 +423,19 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
         Self::outcome(driven)
     }
 
-    /// Compacts the agent's context, then lets the valve know it landed.
+    /// Compacts the agent's context; the [`AgentEvent::CompactionEnded`] its
+    /// run emits settles the valve — `landed` only when the compaction was
+    /// actually applied.
     async fn compact(&mut self, events: &ChildEvents, cancel: &CancelSignal) -> Option<RunOutcome> {
         let own = AgentPath::of(self.agent.identity());
         let credit = self.credit();
         let driven = Self::drive(self.agent.compact(None), &own, &credit, events, cancel).await;
-        if let Some(valve) = &self.parts.valve {
-            valve.landed();
+        // A drive that failed before its end event still leaves the valve
+        // running: it goes back to idle at the last reported count.
+        if driven.is_err()
+            && let Some(valve) = &self.parts.valve
+        {
+            valve.sync(false, credit.tokens.load(Ordering::Relaxed), credit.floor);
         }
         match driven {
             Ok(Some(RunOutcome::Cancelled)) => Some(RunOutcome::Cancelled),

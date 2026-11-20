@@ -91,9 +91,9 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **aither-agent**: Core `Agent` abstraction, `TerminalAgentBuilder`, event streaming (`AgentEvent`), subagents (`subagent` command and built-in types), skill loading, compaction
+- **aither-agent**: Core `Agent` abstraction, `AgentBuilder`, event streaming (`AgentEvent`), subagents (`subagent` command and built-in types), skill loading, compaction
 - **aither-cloud**: Provider implementations (Claude, Gemini, OpenAI) via `CloudProvider` enum; `aither-copilot` and `aither-codex` add the Copilot and ChatGPT-subscription backends
-- **aither-sandbox**: `TerminalTool`/`TerminalMode` (legacy names for terminal-command execution), `PermissionHandler` trait, the `monitor` tool, background jobs, stdin watch, output overflow
+- **aither-sandbox**: `Shell`/`ShellBuilder` (terminal-command execution), the `Approver`/`DomainApprover` traits, the `monitor` tool, background jobs, stdin watch, output overflow
 - **aither-models**: Model metadata database for tier lookups
 - **aither-mcp**, **aither-browser**, **aither-acp**, **aither-connectivity**: MCP servers as terminal commands, the managed browser, ACP agents as subagent types, connectivity checks
 - **heel**: Native sandbox for isolated command execution; its binary is a host program of May's tool distribution (`src/tools/host-programs.json`), pinned at the linked library's version
@@ -102,9 +102,9 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/agent/`** - MayAgent wrapper
 - `may.rs`: Wraps `aither_agent::Agent`: skill and subagent registration, compaction model, host load monitor, permission handling, and session context
-- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `tunnel`, `browser`, `computer`, `register-skills`)
+- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode — its approval wait holds the caller's command timeout through the session `ApprovalPause`, persists the request, and serializes prompts so concurrent waits cannot clobber the persisted row; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `tunnel`, `browser`, `computer`, `register-skills`)
 
-**`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
+**`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; commands only the main agent may run (`tunnel`, `register-skills`, `request_workspace`) are marked `main_only` on the registry builder, which also carries the session `ApprovalPause` shared with the permission approver and SSH authorizer; `src/terminal_permission_handler.rs` applies the network policy and audit log — a subagent's unsandboxed escalation asks through a derived approver with its own id and shorter deadline, and a subagent's SSH request is refused rather than forwarded to the main agent's prompt
 
 **`src/command_policy/`** - aither command policies that refuse a terminal script before it runs (kill by name, foreground `sleep`, unchanged re-reads and, in the managed bash, host `grep`/`awk`/`find`); `register` installs them
 
@@ -114,7 +114,9 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/tasks_md/`** - re-exports `may-tasks` and holds `schema.rs`: `tasks.md` as an aither working document with the schema, the stop rule and the line limit
 
-**`src/agent/notices.rs`** - `MayNotices`, May's wording of aither's alerts, notices and refusals, `tasks.md` alerts included
+**`src/agent/notices.rs`** - `language_refused` / `subagent_language_refused`: the language-guard refusal text commands and subagent prompts read
+
+**`src/harness/`** - the agent-facing machinery the session shares: `approval_pause` (holds command timeout clocks while a prompt awaits the user, per call id or session-wide), `ask_user`, `workspace_request`, `compact_tool`, `subagent_file` (the embedded subagent definitions), `working_document`, `host_load`, `pressure`, `runaway`, `secret_guard`, `publish_review`
 
 **Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `tools` (the pinned tool distribution, `heel` and repo-search included), `cache_lifetime` (provider prompt-cache lifetime)
 
@@ -186,7 +188,7 @@ During streaming:
 ```
 
 # Terminal-first tool calling
-The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (aither's `TerminalAgentBuilder` registers it and arms the one-shot pre-compaction alert; its description carries the when-to-compact rule, so May's prompt does not repeat it). This describes command execution capability and does not imply a specific shell implementation.
+The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (aither's `AgentBuilder` registers it and arms the one-shot pre-compaction alert; its description carries the when-to-compact rule, so May's prompt does not repeat it). This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
 A tool the model provider executes server-side is the exception: it is passed to the provider natively and, while enabled, replaces the corresponding terminal command. Web search is always that hosted tool (`web_search` / `google_search`); May does not register a `websearch` command or a client-side search engine. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.
@@ -200,7 +202,7 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 - **Streaming priority**: Agent events drained before terminal events to ensure responsive streaming display
 - **Scroll sentinel**: `scroll = usize::MAX` means "follow bottom", normalized lazily
 - **Provider abstraction**: All providers unified through `CloudProvider` enum from aither-cloud
-- **Permission handler**: `TerminalPermissionHandler` implements `aither_sandbox::PermissionHandler` and delegates `unsafe` approvals to `PermissionApprover`
+- **Permission handler**: `TerminalPermissionHandler` implements `aither_core`'s `Approver` and `aither_sandbox`'s `DomainApprover`, and delegates `unsafe` approvals to `PermissionApprover`
 
 
 # Bad smell
@@ -219,7 +221,7 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 - Runtime prompt/context rendering must use static typed template inputs. Do not branch on enabled/disabled states to hand-build prompt strings in Rust and then pass those strings into templates.
 - Text the model reads — tool results, notices, alerts and reminders — is natural language rendered from a typed template; no serializer output (JSON, XML) reaches the model, except data a command or an external tool itself produced and the schema of output the model must emit.
 - Prefer runtime-agnostic async primitives. Do not introduce new `tokio::*` filesystem, timer, task, process, or networking usage when an existing runtime-neutral abstraction already fits this codebase (for example `async_fs`, `futures-lite`, `blocking`, `zenwave`, or existing executor abstractions). If a path must work outside a Tokio reactor, keep it Tokio-free.
-- **Native tools.** The agent's native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. Every other capability is an IPC CLI command registered through `register_shared_terminal_commands` and invoked from `terminal`, never passed to `TerminalAgentBuilder::tool(...)`. The one exception is a tool the model provider executes server-side, which is passed to the provider natively and, while enabled, replaces the corresponding terminal command. Web search is always hosted; there is no `websearch` IPC command.
+- **Native tools.** The agent's native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. Every other capability is an IPC CLI command registered through `register_shared_terminal_commands` and invoked from `terminal`, never passed to `AgentBuilder::tool(...)`. The one exception is a tool the model provider executes server-side, which is passed to the provider natively and, while enabled, replaces the corresponding terminal command. Web search is always hosted; there is no `websearch` IPC command.
 - **Sandbox and `unsafe`.** The sandbox exists to help the user and the agent work well and safely and to guard against misalignment, never to stop a task. May keeps `unsafe` as narrow as it can by adding IPC commands and widening what the sandbox covers, but `unsafe` cannot be eliminated: a pattern becomes an IPC command only once it is observed to need `unsafe` frequently, and until then a step the user authorized that the sandbox blocks runs in `unsafe` mode.
 - May has no setting that needs a restart to apply; configuration updates live.
 - Anything that can block meaningfully — clipboard reads, decode/encode, IO, large terminal payloads — runs off the event loop and off the draw path (`unblock`/`spawn`); the render path only paints prepared state.

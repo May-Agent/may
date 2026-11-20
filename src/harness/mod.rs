@@ -6,6 +6,7 @@
 
 use askama::Template;
 
+pub mod approval_pause;
 pub mod ask_user;
 pub mod compact_tool;
 pub mod disk;

@@ -27,7 +27,6 @@ ui = []
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
 # release, so its update channel defaults to `stable` instead of `dev`.
 release-build = []
-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
 vision-ocr = ["dep:waterkit-vision"]
 
@@ -181,11 +180,6 @@ mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "dev", def
 # RGB/BGRA to NV12 for the frames that cannot go to the encoder as surfaces;
 # already in the lockfile through mediax-codec.
 yuv = { version = "0.8", default-features = false }
-
-# GStreamer encoding (optional, runtime-detected, user installs GStreamer)
-gstreamer = { version = "0.23", optional = true }
-gstreamer-app = { version = "0.23", optional = true }
-gstreamer-video = { version = "0.23", optional = true }
 
 # Web server for `may gui`/`may rest`
 skyzen = { version = "0.5.1", features = ["hyper"] }

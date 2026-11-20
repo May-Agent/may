@@ -144,6 +144,9 @@ pub struct SubagentSettings<LLM> {
     pub call_images: Option<crate::ipc::CallImageStore>,
     /// Shared native OCR runtime so subagents reuse the session's initialized backend.
     pub vision_ocr: crate::vision_ocr::VisionOcr,
+    /// The session's secrets: tool results a subagent sees and the output it
+    /// returns are redacted with it, fail closed.
+    pub redactor: crate::secrets::SecretRedactor,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -556,9 +559,16 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             shell,
             source,
         } = pending;
-        let valve = Arc::new(CompactSignal::default());
+        let floor = match &source {
+            Source::Definition(_) => ContextPolicy::default().compaction_floor,
+            Source::Fork(snapshot) => snapshot.policy().compaction_floor,
+        };
+        // The valve starts at the same floor the policy reports, so the first
+        // sync does not see a zero floor where the context never was empty.
+        let valve = Arc::new(CompactSignal::with_floor(floor));
         let requested = Arc::new(AtomicBool::new(false));
-        let child_hooks = ChildHooks::compacting(Some(valve.clone()), requested.clone());
+        let child_hooks = ChildHooks::compacting(Some(valve.clone()), requested.clone())
+            .with_redactor(settings.redactor.clone());
         let child_hooks = match settings.call_images.clone() {
             Some(call_images) => child_hooks.with_image_ocr(
                 settings.vision_ocr.clone(),
@@ -570,7 +580,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let mut builder = AgentBuilder::new(slot.llm.clone())
             .hooks(child_hooks)
             .identity(identity);
-        let floor = match &source {
+        match &source {
             Source::Definition(definition) => {
                 builder = builder
                     .request_parameters(slot.parameters)
@@ -579,13 +589,11 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                 for block in &settings.instructions {
                     builder = builder.instruction(block.clone());
                 }
-                ContextPolicy::default().compaction_floor
             }
             Source::Fork(snapshot) => {
                 builder = builder.forked_from(snapshot);
-                snapshot.policy().compaction_floor
             }
-        };
+        }
         if settings.keep_alive.is_some() {
             builder = builder.claude_cache_ttl(ClaudePromptCacheTtl::FiveMinutes);
         }
@@ -789,6 +797,12 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
                 let (tier, model) = (held.tier, held.model.clone());
                 checkout.id = None;
                 service.finished.store(lease.clone(), held);
+                // What the run returns is output of its commands too: the
+                // session's secrets are redacted from it, fail closed.
+                let redactions = settings.redactor.current().await.map_err(|error| {
+                    anyhow::anyhow!("failed to load the session's secrets: {error}")
+                })?;
+                let final_text = redactions.redact(&final_text);
                 let text = render(&SubagentResult {
                     subagent: &name,
                     outcome: SubagentReport::Completed {
