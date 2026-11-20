@@ -18,7 +18,7 @@ import {
   Network,
   Video,
 } from 'lucide-react';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronLeft, ChevronRight, GitBranch } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { SidebarToggle } from '@/components/shell/SidebarToggle';
@@ -29,6 +29,7 @@ import { LanguageSection } from '@/components/settings/LanguageSection';
 import { ProfilesSection } from '@/components/settings/ProfilesSection';
 import { ModelsSection } from '@/components/settings/ModelsSection';
 import { ProvidersSection } from '@/components/settings/ProvidersSection';
+import { ForgeSection } from '@/components/settings/ForgeSection';
 import { McpSection } from '@/components/settings/McpSection';
 import { SkillsSection } from '@/components/settings/SkillsSection';
 import { BrowserSection } from '@/components/settings/BrowserSection';
@@ -49,6 +50,7 @@ type SectionId =
   | 'profiles'
   | 'models'
   | 'providers'
+  | 'forge'
   | 'mcp'
   | 'skills'
   | 'browser'
@@ -90,6 +92,7 @@ const GROUPS: SectionGroup[] = [
       { id: 'profiles', icon: Users, labelKey: 'settings.sections.profiles', Component: ProfilesSection },
       { id: 'models', icon: Cpu, labelKey: 'settings.sections.models', Component: ModelsSection },
       { id: 'providers', icon: KeyRound, labelKey: 'settings.sections.providers', Component: ProvidersSection },
+      { id: 'forge', icon: GitBranch, labelKey: 'settings.sections.forge', Component: ForgeSection },
       { id: 'mcp', icon: Server, labelKey: 'settings.sections.mcp', Component: McpSection },
       { id: 'skills', icon: Sparkles, labelKey: 'settings.sections.skills', Component: SkillsSection },
       { id: 'memory', icon: Brain, labelKey: 'settings.sections.memory', Component: MemorySection },

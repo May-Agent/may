@@ -27,60 +27,73 @@ pub trait GitHubTokenSource: Send + Sync + std::fmt::Debug {
     fn token(&self) -> impl Future<Output = Result<String, IssueError>> + Send;
 }
 
-/// Token source running `gh auth token` on the host.
+/// Token source resolving `github.com`'s credential through the saved
+/// configuration's [`crate::forge::ForgeAuth`].
+///
+/// The `[forge."github.com"]` entry decides the mode — `oauth`, `token` or
+/// `cli` — and a host without an entry fails fast instead of silently
+/// running `gh`.
 #[derive(Debug, Clone, Copy)]
 pub struct GhCliTokenSource;
 
 impl GitHubTokenSource for GhCliTokenSource {
     async fn token(&self) -> Result<String, IssueError> {
-        gh_auth_token(None).await
-    }
-}
-
-/// Token source running `gh auth token --user <login>` on the host: one
-/// named account of the `gh` login, whichever account is active.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GhAccountTokenSource {
-    login: String,
-}
-
-impl GhAccountTokenSource {
-    /// The `gh` account signed in as `login` on `github.com`.
-    #[must_use]
-    pub const fn new(login: String) -> Self {
-        Self { login }
-    }
-}
-
-impl GitHubTokenSource for GhAccountTokenSource {
-    async fn token(&self) -> Result<String, IssueError> {
-        gh_auth_token(Some(&self.login)).await
-    }
-}
-
-/// `gh auth token` for `github.com`, for `login` or the active account.
-async fn gh_auth_token(login: Option<&str>) -> Result<String, IssueError> {
-    let mut command = std::process::Command::new("gh");
-    command.args(["auth", "token", "--hostname", "github.com"]);
-    if let Some(login) = login {
-        command.arg("--user").arg(login);
-    }
-    let output = blocking::unblock(move || command.output())
+        Box::pin(async {
+            let config = crate::config::MayConfig::load()
+                .await
+                .map_err(|error| IssueError::GitHubAuth(error.to_string()))?;
+            crate::forge::ForgeAuth::new(&config)
+                .token_for(crate::forge::GITHUB_HOST)
+                .await
+                .map_err(|error| IssueError::GitHubAuth(error.to_string()))
+        })
         .await
-        .map_err(|error| IssueError::GitHubAuth(format!("failed to run gh auth token: {error}")))?;
-    if !output.status.success() {
-        return Err(IssueError::GitHubAuth(format!(
-            "gh auth token failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
     }
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err(IssueError::GitHubAuth(
-            "gh auth token returned an empty token".to_string(),
-        ));
+}
+
+/// Token source over a shared live [`crate::forge::LiveForgeAuth`]: it
+/// follows the daemon's `MayConfig` as it changes, so OAuth refreshes and
+/// config edits apply without a rebuild.
+#[derive(Debug, Clone)]
+pub struct ForgeTokenSource {
+    auth: crate::forge::LiveForgeAuth,
+    /// A `gh` account's login, honored only under `mode = "cli"`.
+    account: Option<String>,
+}
+
+impl ForgeTokenSource {
+    /// `github.com`'s configured credential.
+    #[must_use]
+    pub const fn new(auth: crate::forge::LiveForgeAuth) -> Self {
+        Self {
+            auth,
+            account: None,
+        }
     }
-    Ok(token)
+
+    /// The `gh` account `login`'s credential under `mode = "cli"`;
+    /// `github.com`'s own credential under every other mode.
+    #[must_use]
+    pub const fn for_account(auth: crate::forge::LiveForgeAuth, login: String) -> Self {
+        Self {
+            auth,
+            account: Some(login),
+        }
+    }
+}
+
+impl GitHubTokenSource for ForgeTokenSource {
+    async fn token(&self) -> Result<String, IssueError> {
+        let result = match &self.account {
+            Some(login) => {
+                self.auth
+                    .token_for_account(crate::forge::GITHUB_HOST, login)
+                    .await
+            }
+            None => self.auth.token_for(crate::forge::GITHUB_HOST).await,
+        };
+        result.map_err(|error| IssueError::GitHubAuth(error.to_string()))
+    }
 }
 
 /// Authenticated GitHub REST client shared by the issue and pull request

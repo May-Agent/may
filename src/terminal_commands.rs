@@ -169,6 +169,9 @@ pub struct SharedServices {
     pub land_locks: crate::pr::LandLocks,
     /// Daemon-held per-repo default-branch checkouts.
     pub checkouts: crate::repo_clone::DaemonCheckouts,
+    /// The forge authenticator `pr` pushes and GitHub calls read; the daemon
+    /// keeps it in step with its live config.
+    pub forge_auth: crate::forge::LiveForgeAuth,
 }
 
 impl SharedServices {
@@ -181,7 +184,14 @@ impl SharedServices {
             checkouts: crate::repo_clone::DaemonCheckouts::new(
                 crate::session::MayHomePaths::new(may_dir.to_path_buf()).checkouts_dir(),
             ),
+            forge_auth: crate::forge::LiveForgeAuth::default(),
         }
+    }
+
+    /// The services with `forge_auth` — the daemon's live authenticator.
+    #[must_use]
+    pub fn with_forge_auth(self, forge_auth: crate::forge::LiveForgeAuth) -> Self {
+        Self { forge_auth, ..self }
     }
 }
 
@@ -391,7 +401,8 @@ where
         workspace_config: config.workspace_config.clone(),
         review: Some(publish_review),
         signing,
-        github_api: crate::pr::PrContext::default_github_api(),
+        github_api: crate::pr::PrContext::default_github_api(config.services.forge_auth.clone()),
+        forge_auth: config.services.forge_auth.clone(),
         land_locks: config.services.land_locks.clone(),
         checkouts: Some(config.services.checkouts.clone()),
         task_events: Some(config.task_events.clone()),
@@ -427,7 +438,7 @@ where
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         host: config.git.clone(),
         checkouts: Some(config.services.checkouts.clone()),
-        github: crate::pr::PrContext::default_github_api(),
+        github: crate::pr::PrContext::default_github_api(config.services.forge_auth),
         host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());

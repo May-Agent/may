@@ -15,7 +15,7 @@ use zenwave::{Method, ResponseExt};
 use super::{
     CloudError, CloudMachine, CloudProvider, MachineId, MachineState, MachineType, NewMachine,
 };
-use crate::issue::github::{GhAccountTokenSource, GitHubRest, GitHubTokenSource};
+use crate::issue::github::{ForgeTokenSource, GitHubRest, GitHubTokenSource};
 use crate::workspace::GitHubRepository;
 
 /// The provider's name in errors.
@@ -87,11 +87,13 @@ pub struct Codespaces<T> {
     account: CodespacesAccount,
 }
 
-impl Codespaces<GhAccountTokenSource> {
-    /// Codespaces of `account`, authenticated by its `gh` token.
+impl Codespaces<ForgeTokenSource> {
+    /// Codespaces of `account`, authenticated by `auth`'s `github.com`
+    /// credential: the account's `gh` token under `mode = "cli"`, the host's
+    /// own credential under every other mode.
     #[must_use]
-    pub fn for_account(account: CodespacesAccount) -> Self {
-        let rest = GitHubRest::new(GhAccountTokenSource::new(account.login.clone()));
+    pub fn for_account(auth: crate::forge::LiveForgeAuth, account: CodespacesAccount) -> Self {
+        let rest = GitHubRest::new(ForgeTokenSource::for_account(auth, account.login.clone()));
         Self::new(rest, account)
     }
 }

@@ -20,11 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use askama::Template;
+use zenwave::ResponseExt as _;
 
 use crate::db::{ChatDb, PrFilter, PrState};
 use crate::host_git::HostGit;
 use crate::issue::IssueError;
-use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
+use crate::issue::github::{ForgeTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
 pub(crate) mod checks;
@@ -63,8 +64,8 @@ pub enum PrError {
     /// The outbound screen blocked published text.
     #[error("outbound screen blocked: {0}")]
     Screened(String),
-    /// A GitHub CLI call failed.
-    #[error("gh {0}")]
+    /// A GitHub API call failed.
+    #[error("github {0}")]
     Gh(String),
     /// A commit of the PR's range is not signed by the user.
     #[error(transparent)]
@@ -103,6 +104,8 @@ pub struct PrContext {
     pub signing: crate::commit_signing::CommitSigning,
     /// GitHub REST client the GitHub backend's direct calls go through.
     pub github_api: GitHubRest<PrTokenSource>,
+    /// The live forge authenticator; HTTPS pushes carry its credential.
+    pub forge_auth: crate::forge::LiveForgeAuth,
     /// The per-repository land locks every session of the daemon shares.
     pub land_locks: LandLocks,
     /// Daemon-held per-repo default-branch checkouts updated when GitHub PRs merge.
@@ -133,8 +136,8 @@ pub struct CiWatch {
 /// Token source for the GitHub backend's REST client.
 #[derive(Debug, Clone)]
 pub enum PrTokenSource {
-    /// The `gh` CLI login.
-    Gh(GhCliTokenSource),
+    /// `github.com`'s credential in the live [`crate::forge::LiveForgeAuth`].
+    Forge(ForgeTokenSource),
     /// A fixed token, for tests.
     #[cfg(test)]
     Fixed(String),
@@ -146,7 +149,7 @@ pub enum PrTokenSource {
 impl GitHubTokenSource for PrTokenSource {
     async fn token(&self) -> Result<String, IssueError> {
         match self {
-            Self::Gh(source) => source.token().await,
+            Self::Forge(source) => source.token().await,
             #[cfg(test)]
             Self::Fixed(token) => Ok(token.clone()),
             #[cfg(test)]
@@ -156,10 +159,11 @@ impl GitHubTokenSource for PrTokenSource {
 }
 
 impl PrContext {
-    /// The production REST client: `api.github.com` with the `gh` login.
+    /// The production REST client: `api.github.com` with the live forge
+    /// authenticator's `github.com` credential.
     #[must_use]
-    pub fn default_github_api() -> GitHubRest<PrTokenSource> {
-        GitHubRest::new(PrTokenSource::Gh(GhCliTokenSource))
+    pub fn default_github_api(auth: crate::forge::LiveForgeAuth) -> GitHubRest<PrTokenSource> {
+        GitHubRest::new(PrTokenSource::Forge(ForgeTokenSource::new(auth)))
     }
 }
 
@@ -191,11 +195,12 @@ impl merge_watch::ChecksObserver for CiObserver<'_> {
 ///
 /// Cloning shares the locks, so the daemon hands one set to every session and
 /// a land in one session excludes a land of the same repository in another.
+/// The async locks let the GitHub queue/merge calls hold them across `.await`.
 #[derive(Clone, Debug, Default)]
-pub struct LandLocks(Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>);
+pub struct LandLocks(Arc<Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>>);
 
 impl LandLocks {
-    fn get(&self, repo_key: &str) -> Arc<Mutex<()>> {
+    fn get(&self, repo_key: &str) -> Arc<async_lock::Mutex<()>> {
         let mut locks = self
             .0
             .lock()
@@ -928,6 +933,7 @@ impl PrStore {
                     signing: &self.context.signing,
                     base: &pr.base_sha,
                 },
+                push_https_auth(&self.context.forge_auth, &resolved.record.source).await,
             )
             .await?;
         } else {
@@ -1074,7 +1080,13 @@ impl PrStore {
             let section = match merge_watch::Upstream::snapshot(&github).await {
                 Ok(snapshot) => {
                     let report = checks::ChecksReport::of(&snapshot);
-                    let failures = checks::failure_details(&owner_repo, pr.number, &report).await;
+                    let failures = checks::failure_details(
+                        &self.context.github_api,
+                        &owner_repo,
+                        pr.number,
+                        &report,
+                    )
+                    .await;
                     checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
                 }
                 Err(error) => checks::ChecksSection::Unreadable(error.to_string()),
@@ -1232,33 +1244,17 @@ impl PrStore {
                 signing: &self.context.signing,
                 base: base_sha,
             },
+            push_https_auth(&self.context.forge_auth, &resolved.record.source).await,
         )
         .await?;
-        let url = blocking::unblock({
-            let owner_repo = owner_repo.to_string();
-            let branch = branch.to_string();
-            let title = text.title.clone();
-            let body = text.body.clone();
-            move || {
-                gh(&[
-                    "pr",
-                    "create",
-                    "--repo",
-                    &owner_repo,
-                    "--head",
-                    &branch,
-                    "--title",
-                    &title,
-                    "--body",
-                    &body,
-                ])
-            }
-        })
-        .await?;
-        url.rsplit('/')
-            .next()
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(|| PrError::Gh(format!("unexpected gh pr create output: {url}")))
+        create_github_pr(
+            &self.context.github_api,
+            owner_repo,
+            branch,
+            &text.title,
+            &text.body,
+        )
+        .await
     }
 
     /// GitHub landing: the pinned commit is already on the upstream branch
@@ -1287,18 +1283,16 @@ impl PrStore {
         self.event(pr, "queued", None).await;
         // Serialized land: the lock covers queueing the PR, not the wait for
         // it to land.
-        blocking::unblock({
-            let owner_repo = owner_repo.clone();
-            let head_sha = head_sha.to_string();
-            move || -> Result<(), String> {
-                let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
-                let args = merge_args(upstream_number, &owner_repo, &head_sha);
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                gh(&args).map(drop).map_err(|e| e.to_string())
-            }
-        })
-        .await
-        .map_err(PrError::Gh)?;
+        {
+            let _guard = lock.lock().await;
+            queue_github_merge(
+                &self.context.github_api,
+                &owner_repo,
+                upstream_number,
+                head_sha,
+            )
+            .await?;
+        }
         // The checks are timed the moment they finish, not when the PR lands.
         let observer = CiObserver {
             store: self,
@@ -1735,7 +1729,11 @@ impl PrStore {
         let (Some((watch, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
             return;
         };
-        let actions = crate::ci::github::GhActions::new(owner_repo, pr.number);
+        let actions = crate::ci::github::GhActions::new(
+            self.context.github_api.clone(),
+            owner_repo,
+            pr.number,
+        );
         let recorder = crate::ci::record::Recorder {
             db,
             actions: &actions,
@@ -2005,18 +2003,10 @@ async fn user_merge_github(
     ensure_head_pinned(upstream_number, head_sha, &before.head_sha)?;
     let expected = merge_watch::Upstream::expected_checks(&github).await?;
     record_user_event(db, context, pr, "queued", None).await;
-    blocking::unblock({
-        let owner_repo = owner_repo.clone();
-        let head_sha = head_sha.to_string();
-        move || -> Result<(), String> {
-            let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
-            let args = merge_args(upstream_number, &owner_repo, &head_sha);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            gh(&args).map(drop).map_err(|e| e.to_string())
-        }
-    })
-    .await
-    .map_err(PrError::Gh)?;
+    {
+        let _guard = lock.lock().await;
+        queue_github_merge(&context.github_api, &owner_repo, upstream_number, head_sha).await?;
+    }
     let observer = NoopChecksObserver;
     let watching = merge_watch::Observing::new(&github, &observer);
     let outcome = merge_watch::watch(
@@ -2490,6 +2480,7 @@ fn clone_head(
 /// staging repository also holds the remote's own state as remote-tracking
 /// refs, so a `pre-push` hook that scans what is not yet on a remote sees
 /// only the PR's commits.
+#[allow(clippy::too_many_arguments)]
 async fn push_pinned(
     scratch_root: &Path,
     clone: &Path,
@@ -2498,6 +2489,7 @@ async fn push_pinned(
     branch: &str,
     branch_state: BranchState,
     signed: SignedRange<'_>,
+    https_auth: Option<crate::host_git::HttpsAuth>,
 ) -> Result<(), PrError> {
     let scratch_root = scratch_root.to_path_buf();
     let clone = clone.to_string_lossy().into_owned();
@@ -2513,21 +2505,230 @@ async fn push_pinned(
             .prefix("push-")
             .tempdir_in(&scratch_root)?;
         let repo = staging.path();
-        let host = signing.host();
+        let host = signing.host().clone();
+        // The credential rides in git's environment, scoped to its own
+        // origin: it reaches the fetch and the push of an `https://` remote
+        // and nothing else.
+        let host = match https_auth {
+            Some(auth) => host.with_https_auth(auth),
+            None => host,
+        };
         host_git(
-            host,
+            &host,
             None,
             &["init", "--quiet", "--bare", &repo.to_string_lossy()],
         )?;
-        fetch_from_clone(host, repo, &clone, &sha)?;
-        fetch_upstream(host, repo, &url, branch_state, &branch)?;
+        fetch_from_clone(&host, repo, &clone, &sha)?;
+        fetch_upstream(&host, repo, &url, branch_state, &branch)?;
         // What is pushed is what was verified: both read the host's copy.
         signing.verify_range_blocking(repo, &base, &sha)?;
-        host_git(host, Some(repo), &["push", "--quiet", &url, &spec])
+        host_git(&host, Some(repo), &["push", "--quiet", &url, &spec])
             .map(drop)
             .map_err(PrError::from)
     })
     .await
+}
+
+/// The HTTPS credential `push_pinned` carries for `url`: when the remote is
+/// an `https://` URL on a forge host `forge_auth` authenticates, that host's
+/// token scoped to its origin. SSH, `file://` and unauthenticated remotes
+/// keep git exactly as it was, so local and SSH pushes need no login.
+async fn push_https_auth(
+    forge_auth: &crate::forge::LiveForgeAuth,
+    url: &str,
+) -> Option<crate::host_git::HttpsAuth> {
+    let authority = url
+        .trim()
+        .strip_prefix("https://")?
+        .split('/')
+        .next()
+        .filter(|host| !host.is_empty() && !host.contains('@'))?;
+    forge_auth.git_https_auth(authority).await.ok()
+}
+
+/// Open the pull request of `branch` on `owner_repo` over the REST API:
+/// the repository's `default_branch` is the base. Returns its number.
+async fn create_github_pr<T: GitHubTokenSource + Sync>(
+    api: &GitHubRest<T>,
+    owner_repo: &str,
+    branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<i64, PrError> {
+    let repository: RepositoryRef = api
+        .request(
+            zenwave::Method::GET,
+            format!("{}/repos/{owner_repo}", api.api_base()),
+            None,
+        )
+        .await
+        .map_err(|e| PrError::Gh(e.to_string()))?
+        .into_json()
+        .await
+        .map_err(|e| PrError::Gh(e.to_string()))?;
+    let base = repository
+        .default_branch
+        .ok_or_else(|| PrError::Gh(format!("{owner_repo} names no default branch")))?;
+    let created: CreatedPull = api
+        .request(
+            zenwave::Method::POST,
+            format!("{}/repos/{owner_repo}/pulls", api.api_base()),
+            Some(serde_json::json!({
+                "title": title,
+                "body": body,
+                "head": branch,
+                "base": base,
+            })),
+        )
+        .await
+        .map_err(|e| PrError::Gh(e.to_string()))?
+        .into_json()
+        .await
+        .map_err(|e| PrError::Gh(e.to_string()))?;
+    Ok(created.number)
+}
+
+/// `GET /repos/{owner}/{repo}`, to the field May reads.
+#[derive(serde::Deserialize)]
+struct RepositoryRef {
+    default_branch: Option<String>,
+}
+
+/// `POST /repos/{owner}/{repo}/pulls`, to the field May reads.
+#[derive(serde::Deserialize)]
+struct CreatedPull {
+    number: i64,
+}
+
+/// Queue the PR for GitHub to merge: `enablePullRequestAutoMerge` with the
+/// pinned head, what `gh pr merge --auto --squash --match-head-commit`
+/// ran. When GitHub refuses auto-merge — the repository does not allow it,
+/// or the PR is already clean and mergeable — the same pinned squash merge
+/// runs at once through `PUT /pulls/{number}/merge`.
+async fn queue_github_merge<T: GitHubTokenSource + Sync>(
+    api: &GitHubRest<T>,
+    owner_repo: &str,
+    number: i64,
+    head_sha: &str,
+) -> Result<(), PrError> {
+    match enable_auto_merge(api, owner_repo, number, head_sha).await {
+        Ok(()) => Ok(()),
+        // A GraphQL refusal is GitHub understanding and declining the
+        // auto-merge; the pinned merge runs directly instead.
+        Err(AutoMergeError::Refused(message)) => {
+            tracing::debug!(%message, "auto-merge refused; merging directly");
+            merge_now(api, owner_repo, number, head_sha).await
+        }
+        Err(AutoMergeError::Call(error)) => Err(error),
+    }
+}
+
+/// Why the auto-merge mutation did not queue the PR.
+enum AutoMergeError {
+    /// GitHub answered with GraphQL `errors`: auto-merge is not enabled on
+    /// the repository or the PR is already mergeable.
+    Refused(String),
+    /// The call itself failed.
+    Call(PrError),
+}
+
+/// `enablePullRequestAutoMerge` on `number`, expecting head `head_sha`.
+async fn enable_auto_merge<T: GitHubTokenSource + Sync>(
+    api: &GitHubRest<T>,
+    owner_repo: &str,
+    number: i64,
+    head_sha: &str,
+) -> Result<(), AutoMergeError> {
+    let (owner, name) = owner_repo.split_once('/').ok_or_else(|| {
+        AutoMergeError::Call(PrError::Resolve(format!("not an owner/repo: {owner_repo}")))
+    })?;
+    let graphql = |body: serde_json::Value| async move {
+        api.request(
+            zenwave::Method::POST,
+            format!("{}/graphql", api.api_base()),
+            Some(body),
+        )
+        .await
+        .map_err(|e| AutoMergeError::Call(PrError::Gh(e.to_string())))?
+        .into_json::<GraphReply>()
+        .await
+        .map_err(|e| AutoMergeError::Call(PrError::Gh(e.to_string())))
+    };
+    let reply = graphql(serde_json::json!({
+        "query": "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id}}}",
+        "variables": { "owner": owner, "name": name, "number": number },
+    }))
+    .await?;
+    if let Some(message) = reply.error_message() {
+        return Err(AutoMergeError::Refused(message));
+    }
+    let pull_request_id = reply
+        .pull_request_id()
+        .ok_or_else(|| AutoMergeError::Call(PrError::Gh(format!("GitHub has no PR #{number}"))))?;
+    let reply = graphql(serde_json::json!({
+        "query": "mutation($id:ID!,$oid:GitObjectID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH,expectedHeadOid:$oid}){pullRequest{number}}}",
+        "variables": { "id": pull_request_id, "oid": head_sha },
+    }))
+    .await?;
+    if let Some(message) = reply.error_message() {
+        return Err(AutoMergeError::Refused(message));
+    }
+    Ok(())
+}
+
+/// A GraphQL reply: `errors` first, then the little `data` May reads.
+#[derive(serde::Deserialize)]
+struct GraphReply {
+    data: Option<serde_json::Value>,
+    #[serde(default)]
+    errors: Vec<GraphIssue>,
+}
+
+#[derive(serde::Deserialize)]
+struct GraphIssue {
+    message: String,
+}
+
+impl GraphReply {
+    /// The joined GraphQL error messages, when any arrived.
+    fn error_message(&self) -> Option<String> {
+        (!self.errors.is_empty()).then(|| {
+            self.errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
+    /// `data.repository.pullRequest.id`.
+    fn pull_request_id(&self) -> Option<String> {
+        self.data
+            .as_ref()?
+            .pointer("/repository/pullRequest/id")?
+            .as_str()
+            .map(str::to_string)
+    }
+}
+
+/// The immediate pinned squash merge of `number`, the auto-merge fallback.
+async fn merge_now<T: GitHubTokenSource + Sync>(
+    api: &GitHubRest<T>,
+    owner_repo: &str,
+    number: i64,
+    head_sha: &str,
+) -> Result<(), PrError> {
+    api.request(
+        zenwave::Method::PUT,
+        format!("{}/repos/{owner_repo}/pulls/{number}/merge", api.api_base()),
+        Some(serde_json::json!({
+            "sha": head_sha,
+            "merge_method": "squash",
+        })),
+    )
+    .await
+    .map_err(|e| PrError::Gh(e.to_string()))?;
+    Ok(())
 }
 
 /// Whether a PR's branch is already on the remote.
@@ -2635,10 +2836,10 @@ fn land(
     base: &str,
     sha: &str,
     number: i64,
-    lock: &Mutex<()>,
+    lock: &async_lock::Mutex<()>,
 ) -> Result<String, String> {
     let git = |dir: Option<&Path>, args: &[&str]| host_git(host, dir, args);
-    let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
+    let _guard = lock.lock_blocking();
     let checkout_path = Path::new(checkout);
     let pinned = git(
         Some(checkout_path),
@@ -2875,20 +3076,6 @@ struct RemoveCheckClone {
     target: ShellWord,
 }
 
-/// `gh` with the same error contract as [`git`].
-pub(crate) fn gh(args: &[&str]) -> Result<String, PrError> {
-    let output = std::process::Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| PrError::Gh(e.to_string()))?;
-    if !output.status.success() {
-        return Err(PrError::Gh(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// `owner/repo` from a GitHub remote URL (https or ssh), or `None`.
 pub(crate) fn github_owner_repo(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches(".git");
@@ -2899,24 +3086,6 @@ pub(crate) fn github_owner_repo(url: &str) -> Option<String> {
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
     let mut parts = tail.split('/');
     Some(format!("{}/{}", parts.next()?, parts.next()?))
-}
-
-/// The `gh pr merge` arguments of a merge that names the commit it checked:
-/// GitHub refuses it when the PR's head is any other commit.
-fn merge_args(number: i64, owner_repo: &str, head_sha: &str) -> Vec<String> {
-    [
-        "pr",
-        "merge",
-        &number.to_string(),
-        "--repo",
-        owner_repo,
-        "--auto",
-        "--squash",
-        "--match-head-commit",
-        head_sha,
-    ]
-    .map(str::to_string)
-    .to_vec()
 }
 
 /// Fails when the PR's head on GitHub is not the commit pinned at `pr update`.
@@ -3074,7 +3243,10 @@ mod tests {
                     },
                     review: None,
                     signing: self.signing(id),
-                    github_api: PrContext::default_github_api(),
+                    github_api: PrContext::default_github_api(
+                        crate::forge::LiveForgeAuth::default(),
+                    ),
+                    forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
                     task_events: None,
@@ -3143,6 +3315,7 @@ mod tests {
                         PrTokenSource::Fixed("test-token".to_string()),
                         base,
                     ),
+                    forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
                     task_events: None,
@@ -3287,7 +3460,7 @@ mod tests {
         std::fs::write(repo.join("wip.txt"), "wip").unwrap();
 
         let host = crate::host_git::HostGit::from_file("/dev/null");
-        let lock = Mutex::new(());
+        let lock = async_lock::Mutex::new(());
         let outcome = super::land(
             &host,
             repo.to_str().unwrap(),
@@ -3605,6 +3778,7 @@ mod tests {
                 review,
                 signing: fx.signing(id),
                 github_api,
+                forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
                 task_events: None,
@@ -3750,7 +3924,7 @@ mod tests {
             &fx,
             "s1",
             config,
-            PrContext::default_github_api(),
+            PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
             Some(review),
         )
         .await;
@@ -3803,7 +3977,14 @@ mod tests {
         )
         .unwrap();
         let config = WorkspaceConfig::load(&config_path).unwrap();
-        let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
+        let store = trusted_store(
+            &fx,
+            "s1",
+            config,
+            PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+            None,
+        )
+        .await;
         let err = store
             .review_outbound(crate::harness::publish_review::Publication::pull_request(
                 "a title",
@@ -3817,21 +3998,6 @@ mod tests {
 
     #[test]
     fn a_merge_names_the_checked_commit_and_fails_when_the_head_moved() {
-        let args = super::merge_args(7, "o/r", "abc123");
-        assert_eq!(
-            args,
-            [
-                "pr",
-                "merge",
-                "7",
-                "--repo",
-                "o/r",
-                "--auto",
-                "--squash",
-                "--match-head-commit",
-                "abc123"
-            ]
-        );
         assert!(super::ensure_head_pinned(7, "abc123", "abc123").is_ok());
         let err = super::ensure_head_pinned(7, "abc123", "def456").unwrap_err();
         assert!(matches!(err, super::PrError::State(_)), "{err}");
@@ -3856,7 +4022,8 @@ mod tests {
                 workspace_config,
                 review: None,
                 signing: fx.signing(id),
-                github_api: PrContext::default_github_api(),
+                github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
                 task_events: None,
@@ -3923,7 +4090,14 @@ mod tests {
             &fx.checkout,
             crate::trust::TrustLevel::LocalBranch,
         );
-        let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
+        let store = trusted_store(
+            &fx,
+            "s1",
+            config,
+            PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+            None,
+        )
+        .await;
         let first = store.resolve(None).await.unwrap();
         // A second clone, of another repository, joins the session.
         let other = store
@@ -4080,6 +4254,7 @@ mod tests {
             &first,
             BranchState::New,
             range(&base),
+            None,
         )
         .await
         .unwrap();
@@ -4109,6 +4284,7 @@ mod tests {
             &second,
             BranchState::New,
             range(&base),
+            None,
         )
         .await
         .unwrap();
@@ -4129,7 +4305,8 @@ mod tests {
                 &second_sha,
                 &first,
                 BranchState::Pushed,
-                range(&base)
+                range(&base),
+                None,
             )
             .await
             .is_err(),
@@ -4144,6 +4321,7 @@ mod tests {
             &second,
             BranchState::Pushed,
             range(&base),
+            None,
         )
         .await
         .unwrap();
@@ -4219,6 +4397,7 @@ mod tests {
                 signing: &signing,
                 base: &base,
             },
+            None,
         )
         .await
         .unwrap();
@@ -4375,6 +4554,7 @@ mod tests {
             "may/unsigned",
             BranchState::New,
             range(),
+            None,
         )
         .await
         .unwrap_err();
@@ -4390,6 +4570,7 @@ mod tests {
             "may/signed",
             BranchState::New,
             range(),
+            None,
         )
         .await
         .unwrap();
@@ -4453,6 +4634,7 @@ mod tests {
             "may/s1-work",
             BranchState::New,
             range(),
+            None,
         )
         .await
         .unwrap();
@@ -4472,6 +4654,7 @@ mod tests {
             "may/s1-work",
             BranchState::Pushed,
             range(),
+            None,
         )
         .await
         .unwrap();
@@ -4672,7 +4855,8 @@ mod tests {
                 workspace_config: config,
                 review: None,
                 signing: fx.signing("s1"),
-                github_api: PrContext::default_github_api(),
+                github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
                 task_events: None,
@@ -4813,7 +4997,7 @@ mod tests {
             &fx,
             "s-open",
             config.clone(),
-            PrContext::default_github_api(),
+            PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
             Some(refuse_review),
         )
         .await;
@@ -4898,7 +5082,7 @@ mod tests {
             &fx,
             "s-open",
             config,
-            PrContext::default_github_api(),
+            PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
             Some(pre_review),
         )
         .await;
@@ -4951,6 +5135,7 @@ mod tests {
             branch,
             BranchState::New,
             range_of(&fx.signing("s-upd"), &base_sha),
+            None,
         )
         .await
         .unwrap();
@@ -5000,7 +5185,10 @@ mod tests {
                     workspace_config: WorkspaceConfig::default(),
                     review: Some(review),
                     signing: fx.signing("s-upd"),
-                    github_api: PrContext::default_github_api(),
+                    github_api: PrContext::default_github_api(
+                        crate::forge::LiveForgeAuth::default(),
+                    ),
+                    forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
                     task_events: None,
@@ -5215,7 +5403,8 @@ mod tests {
                 },
                 review: None,
                 signing: fx.signing("s1"),
-                github_api: PrContext::default_github_api(),
+                github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
                 task_events: None,
@@ -5254,7 +5443,8 @@ mod tests {
             },
             review: None,
             signing: fx.user.signing(&fx.tmp.path().join("may"), "user"),
-            github_api: PrContext::default_github_api(),
+            github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+            forge_auth: crate::forge::LiveForgeAuth::default(),
             land_locks: LandLocks::default(),
             checkouts: None,
             task_events: None,
@@ -5299,7 +5489,8 @@ mod tests {
                 workspace_config: host_ctx.workspace_config.clone(),
                 review: None,
                 signing: fx.signing("s2"),
-                github_api: PrContext::default_github_api(),
+                github_api: PrContext::default_github_api(crate::forge::LiveForgeAuth::default()),
+                forge_auth: crate::forge::LiveForgeAuth::default(),
                 land_locks: LandLocks::default(),
                 checkouts: None,
                 task_events: None,
