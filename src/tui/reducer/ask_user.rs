@@ -64,9 +64,9 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     }
 }
 
-/// Apply `code` to the launch gate's repo-trust sheet: the same option
+/// Apply `code` to the `/permission` repo-trust sheet: the same option
 /// list as an answer modal, but the answer goes to the client, which
-/// persists the level — `None` means bind nothing this launch.
+/// persists the level — `None` leaves the decision unchanged.
 pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let AppMode::RepoTrust(state) = &mut app.mode else {
         return None;
@@ -84,27 +84,21 @@ pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction>
             *cursor = (*cursor + 1) % count;
             None
         }
-        // Esc cancels a `/permission` re-ask; on the launch gate it stays —
-        // the only way out is answering or quitting.
+        // Esc cancels: the decision in force stays.
         KeyCode::Esc => {
-            if state.redecide {
-                let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat)
-                else {
-                    unreachable!("the key was handled in the repo-trust gate");
-                };
-                Some(SendAction::RespondRepoTrust {
-                    worktree: state.worktree,
-                    kind: state.kind,
-                    config_path: state.config_path,
-                    level: None,
-                })
-            } else {
-                None
-            }
+            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
+                unreachable!("the key was handled in the repo-trust sheet");
+            };
+            Some(SendAction::RespondRepoTrust {
+                worktree: state.worktree,
+                kind: state.kind,
+                config_path: state.config_path,
+                level: None,
+            })
         }
         KeyCode::Enter => {
             let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
-                unreachable!("the key was handled in the repo-trust gate");
+                unreachable!("the key was handled in the repo-trust sheet");
             };
             let qi = state.ask.current_question;
             let question = &state.ask.questions[qi];
@@ -113,16 +107,12 @@ pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction>
                 section: question.section.clone(),
                 answer: AnswerValue::Selected(vec![question.option[cursor].clone()]),
             };
-            match crate::trust::level_for_answer(&answer) {
-                // "exit — Do not bind this repository" quits for real.
-                None => Some(SendAction::Quit),
-                level => Some(SendAction::RespondRepoTrust {
-                    worktree: state.worktree,
-                    kind: state.kind,
-                    config_path: state.config_path,
-                    level,
-                }),
-            }
+            Some(SendAction::RespondRepoTrust {
+                worktree: state.worktree,
+                kind: state.kind,
+                config_path: state.config_path,
+                level: crate::trust::level_for_answer(&answer),
+            })
         }
         _ => None,
     }
