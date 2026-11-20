@@ -647,20 +647,25 @@ impl MayAgent {
         let catalog = tools.catalog().clone();
 
         let call_interpreters = super::hooks::CallInterpreters::default();
+        // Every wait on the user holds the same pause: a command's own
+        // timeout never counts the time it waited on an answer.
+        let approval_pause = crate::harness::approval_pause::ApprovalPause::new();
         // Every derived approver clone shares the call→interpreter record.
-        let permission_approver = config
-            .permission_approver
-            .clone()
-            .map(|approver| approver.with_interpreters(call_interpreters.clone()));
+        let permission_approver = config.permission_approver.clone().map(|approver| {
+            approver
+                .with_interpreters(call_interpreters.clone())
+                .with_approval_pause(approval_pause.clone())
+        });
         let permissions = TerminalPermissionHandler::for_agent(
             permission_approver.clone(),
             config.network_policy.clone(),
             config.profile_id.clone(),
         )
-        .with_ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
+        .with_ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new_with_pause(
             config.session_id.as_str().to_string(),
             config.ask_user_broker.clone(),
             config.db.clone(),
+            approval_pause.clone(),
         ));
         // Local and container commands draw from the pool: a container
         // command's fifo is made in the container's kernel and brokered by
@@ -747,14 +752,23 @@ impl MayAgent {
             ids: Some(session_ids.allocator().clone()),
             // A subagent launched from inside a session clone works in a
             // child clone of it.
-            spaces: super::subagent_spaces::SessionSubagentSpaces::new(
-                crate::repo_clone::SessionRepos::new(
-                    &config.sandbox_dir,
-                    config.session_id.as_str(),
-                    config.db.clone(),
-                )
-                .with_host(crate::host_git::HostGit::inherit()),
-            ),
+            spaces: {
+                let spaces = super::subagent_spaces::SessionSubagentSpaces::new(
+                    crate::repo_clone::SessionRepos::new(
+                        &config.sandbox_dir,
+                        config.session_id.as_str(),
+                        config.db.clone(),
+                    )
+                    .with_host(crate::host_git::HostGit::inherit()),
+                );
+                // A container's subagent names its working directory by the
+                // container path the agent sees, not a host path.
+                if is_container {
+                    spaces.for_container()
+                } else {
+                    spaces
+                }
+            },
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),
         };
@@ -1079,6 +1093,7 @@ impl MayAgent {
 
         let vision_ocr = crate::vision_ocr::VisionOcr::new();
         let mut commands = CommandRegistryBuilder::new();
+        commands.with_approval_pause(approval_pause.clone());
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
             &mut commands,
             SharedTerminalCommandConfig {
@@ -1192,7 +1207,9 @@ impl MayAgent {
         let runtime_system_context =
             runtime_system_context.with_instruction(tag::BROWSER, browser_blocks);
 
-        let valve = Arc::new(CompactSignal::default());
+        let valve = Arc::new(CompactSignal::with_floor(
+            config.context_policy.compaction_floor,
+        ));
         let compaction_requested = Arc::new(AtomicBool::new(false));
         let loops = LoopWatch::new(config.limits.loops());
         let hooks = MayHooks {
@@ -2387,6 +2404,13 @@ impl MayAgent {
     }
 }
 
+#[derive(askama::Template)]
+#[template(path = "session_title_prompt.txt", escape = "none")]
+struct SessionTitlePrompt<'a> {
+    user: &'a str,
+    assistant: &'a str,
+}
+
 /// Returns None if title generation fails.
 pub async fn generate_session_title(
     providers: super::Providers<'_>,
@@ -2396,6 +2420,7 @@ pub async fn generate_session_title(
 ) -> Option<String> {
     use aither_core::LanguageModel;
     use aither_core::llm::{LLMRequest, Message};
+    use askama::Template;
     use futures_lite::StreamExt;
 
     // A fast model, else the model last chosen.
@@ -2421,9 +2446,12 @@ pub async fn generate_session_title(
     let user_truncated = truncate_at_char_boundary(user_message, 200);
     let assistant_truncated = truncate_at_char_boundary(assistant_response, 300);
 
-    let prompt = format!(
-        "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: {user_truncated}\n\nAssistant: {assistant_truncated}"
-    );
+    let prompt = SessionTitlePrompt {
+        user: user_truncated,
+        assistant: assistant_truncated,
+    }
+    .render()
+    .ok()?;
 
     let request = LLMRequest::new(vec![Message::user(&prompt)]);
     let mut stream = std::pin::pin!(llm.respond(request));

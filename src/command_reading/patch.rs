@@ -163,11 +163,12 @@ fn edit(action: &Action, dir: Option<&Path>) -> FileEdit {
 /// (zero-based `start`); `shift` is how many lines the earlier hunks of the
 /// file added net. A hunk that was not located is left unnumbered.
 fn number(hunk: &may_patch::Hunk, start: Option<usize>, shift: i64) -> Vec<DiffLine> {
-    let mut position = start.map(|start| {
+    let mut position = start.and_then(|start| {
         let old = u32::try_from(start + 1).expect("a file has fewer than 2^32 lines");
-        let new = u32::try_from(i64::from(old) + shift)
-            .expect("a located hunk's new line number is positive");
-        (old, new)
+        // A malformed input can shift the hunk before the file's first line:
+        // it is left unnumbered rather than panicking.
+        let new = u32::try_from(i64::from(old) + shift).ok()?;
+        (new > 0).then_some((old, new))
     });
     hunk.lines
         .iter()

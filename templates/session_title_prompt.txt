@@ -1,3 +1,5 @@
-Generate a concise title (3-6 words) for a conversation starting with this user message. Reply with ONLY the title in the same language as the user message, no quotes, no punctuation at the end.
+Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.
 
-User message: {{ first_message }}
+User: {{ user }}
+
+Assistant: {{ assistant }}

@@ -66,7 +66,10 @@ impl BrowserTool {
     }
 
     fn structured_screenshots(&self, result: &BrowserResult) -> Vec<RecordedCallImage> {
-        let Some(screenshot) = result.page.as_ref().and_then(|page| page.screenshot.as_ref())
+        let Some(screenshot) = result
+            .page
+            .as_ref()
+            .and_then(|page| page.screenshot.as_ref())
         else {
             return Vec::new();
         };
@@ -124,10 +127,9 @@ impl Tool for BrowserTool {
                 args,
             })
             .await?;
-        let images = response.as_ref().map_or_else(
-            |_| Vec::new(),
-            |result| self.structured_screenshots(result),
-        );
+        let images = response
+            .as_ref()
+            .map_or_else(|_| Vec::new(), |result| self.structured_screenshots(result));
         Ok(BrowserCommandOutput {
             output: BrowserToolOutput::from(response),
             images,

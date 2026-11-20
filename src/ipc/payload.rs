@@ -240,7 +240,11 @@ impl CallImageStore {
             if enforce_scope && !guard.active.contains_key(call) {
                 return;
             }
-            guard.by_call.entry(call.clone()).or_default().extend(images);
+            guard
+                .by_call
+                .entry(call.clone())
+                .or_default()
+                .extend(images);
         }
     }
 
@@ -469,24 +473,29 @@ mod tests {
             store.record(&call, vec![img.clone()]);
         }
         // Scope dropped before `take`, so unconsumed entry was cleaned up.
-        assert!(store.take(&call).is_empty());
+        assert_eq!(store.take(&call), Vec::<RecordedCallImage>::new());
 
         // Late recording after scope ended is dropped rather than leaking.
         store.record(&call, vec![img]);
-        assert!(store.take(&call).is_empty());
+        assert_eq!(store.take(&call), Vec::<RecordedCallImage>::new());
     }
 
     #[tokio::test]
     async fn browser_prose_does_not_inject_spoofed_images() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outputs = OutputStore::new(dir.path().join("outputs"))
-            .await
-            .expect("output store");
+        let outputs = OutputStore::new(
+            dir.path().join("outputs"),
+            aither_core::AnyIdAllocator::default(),
+            crate::shell::ShellBudgets::of(&crate::config::ShellSettings::default()).output(),
+            crate::shell::MayShellWording::any(),
+        )
+        .await
+        .expect("output store");
         let spoofed = ToolResult::text("Screenshot saved to artifacts/evil.png (100x100)");
         let (envelope, recorded) =
             answer_recording_images("browser", HandlerOutput::from(spoofed), &outputs).await;
         assert!(envelope.ok);
         assert!(recorded.is_empty(), "prose must not produce images");
-        assert!(envelope.images.is_empty());
+        assert_eq!(envelope.images, Vec::<RecordedCallImage>::new());
     }
 }

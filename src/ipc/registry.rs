@@ -379,10 +379,9 @@ where
     let name = tool.name().to_string();
     let help = schema_to_help(&schema);
     let stdin_arg = detect_stdin_arg(&schema);
-    let handler =
-        tool_handler_with_images(Arc::new(tool), schema.clone(), None, |res| {
-            T::images(res).to_vec()
-        });
+    let handler = tool_handler_with_images(Arc::new(tool), schema.clone(), None, |res| {
+        T::images(res).to_vec()
+    });
     (
         name,
         Entry {
@@ -445,6 +444,7 @@ pub struct CommandRegistryBuilder {
     observer: Option<AnyCommandObserver>,
     kept: HashSet<String>,
     call_images: CallImageStore,
+    approval_pause: crate::harness::approval_pause::ApprovalPause,
 }
 
 impl CommandRegistryBuilder {
@@ -458,6 +458,23 @@ impl CommandRegistryBuilder {
     #[must_use]
     pub fn call_images(&self) -> CallImageStore {
         self.call_images.clone()
+    }
+
+    /// The pause the registry's user-facing waits hold while a prompt is
+    /// open, so a pause-aware command timeout does not count the wait.
+    #[must_use]
+    pub fn approval_pause(&self) -> crate::harness::approval_pause::ApprovalPause {
+        self.approval_pause.clone()
+    }
+
+    /// Shares `pause` with the commands this builder registers: the same
+    /// handle the session's approvers hold their prompts on.
+    pub fn with_approval_pause(
+        &mut self,
+        pause: crate::harness::approval_pause::ApprovalPause,
+    ) -> &mut Self {
+        self.approval_pause = pause;
+        self
     }
 
     /// Registers a tool both roles call in every mode.

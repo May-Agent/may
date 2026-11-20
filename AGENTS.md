@@ -102,9 +102,9 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/agent/`** - MayAgent wrapper
 - `may.rs`: Wraps `aither_agent::Agent`: skill and subagent registration, compaction model, host load monitor, permission handling, and session context
-- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `tunnel`, `browser`, `computer`, `register-skills`)
+- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode — its approval wait holds the caller's command timeout through the session `ApprovalPause`, persists the request, and serializes prompts so concurrent waits cannot clobber the persisted row; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `tunnel`, `browser`, `computer`, `register-skills`)
 
-**`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
+**`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; commands only the main agent may run (`tunnel`, `register-skills`, `request_workspace`) are marked `main_only` on the registry builder, which also carries the session `ApprovalPause` shared with the permission approver and SSH authorizer; `src/terminal_permission_handler.rs` applies the network policy and audit log — a subagent's unsandboxed escalation asks through a derived approver with its own id and shorter deadline, and a subagent's SSH request is refused rather than forwarded to the main agent's prompt
 
 **`src/command_policy/`** - aither command policies that refuse a terminal script before it runs (kill by name, foreground `sleep`, unchanged re-reads and, in the managed bash, host `grep`/`awk`/`find`); `register` installs them
 
@@ -115,6 +115,8 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 **`src/tasks_md/`** - re-exports `may-tasks` and holds `schema.rs`: `tasks.md` as an aither working document with the schema, the stop rule and the line limit
 
 **`src/agent/notices.rs`** - `MayNotices`, May's wording of aither's alerts, notices and refusals, `tasks.md` alerts included
+
+**`src/harness/`** - the agent-facing machinery the session shares: `approval_pause` (holds command timeout clocks while a prompt awaits the user, per call id or session-wide), `ask_user`, `workspace_request`, `compact_tool`, `subagent_file` (the embedded subagent definitions), `working_document`, `host_load`, `pressure`, `runaway`, `secret_guard`, `publish_review`
 
 **Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `tools` (the pinned tool distribution, `heel` and repo-search included), `cache_lifetime` (provider prompt-cache lifetime)
 

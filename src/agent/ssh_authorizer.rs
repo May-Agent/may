@@ -110,6 +110,9 @@ pub struct MaySshAuthorizer {
     session_id: String,
     db: crate::db::ChatDb,
     session_grants: Mutex<HashSet<String>>,
+    /// Held while a question waits on the user so a command's own timeout
+    /// does not count the wait.
+    approval_pause: crate::harness::approval_pause::ApprovalPause,
 }
 
 impl MaySshAuthorizer {
@@ -119,11 +122,27 @@ impl MaySshAuthorizer {
         broker: AskUserBroker,
         db: crate::db::ChatDb,
     ) -> Arc<Self> {
+        Self::new_with_pause(
+            session_id,
+            broker,
+            db,
+            crate::harness::approval_pause::ApprovalPause::new(),
+        )
+    }
+
+    /// [`Self::new`] whose questions hold `pause` while the user decides.
+    pub fn new_with_pause(
+        session_id: impl Into<String>,
+        broker: AskUserBroker,
+        db: crate::db::ChatDb,
+        approval_pause: crate::harness::approval_pause::ApprovalPause,
+    ) -> Arc<Self> {
         Arc::new(Self {
             broker,
             db,
             session_id: session_id.into(),
             session_grants: Mutex::new(HashSet::new()),
+            approval_pause,
         })
     }
 
@@ -220,6 +239,9 @@ impl MaySshAuthorizer {
             multi_select: false,
             questions: Vec::new(),
         };
+        // The question waits on the user session-wide: the call it came
+        // through has no hold of its own to give.
+        let _pause = self.approval_pause.hold_session();
         let response = self
             .broker
             .request(AskUserRequestPayload {

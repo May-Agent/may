@@ -82,10 +82,7 @@ impl ApprovalPause {
     /// Holds timeout clocks for `call` when present, or session-wide otherwise.
     #[must_use]
     pub fn hold(&self, call: Option<ToolCallId>) -> ApprovalHoldGuard {
-        match call {
-            Some(id) => self.hold_call(id),
-            None => self.hold_session(),
-        }
+        call.map_or_else(|| self.hold_session(), |id| self.hold_call(id))
     }
 
     /// Whether timeout clocks for `call` are currently paused.
@@ -135,9 +132,9 @@ impl Drop for ApprovalHoldGuard {
     }
 }
 
-/// Detached job ids that the pause-aware shell watchdog explicitly timed out
-/// (and killed), so completion reports can tell a timeout kill from an external
-/// signal even when the inner shell ran with an uncapped timeout.
+/// Job ids the pause-aware watchdog explicitly timed out and killed, so a
+/// completion report tells a timeout kill from an external signal even when
+/// the inner shell ran with an uncapped timeout.
 #[derive(Debug, Clone, Default)]
 pub struct TimedOutJobs {
     jobs: Arc<Mutex<HashSet<String>>>,

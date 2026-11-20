@@ -1,6 +1,6 @@
 {% match forge_repo -%}
 {% when Some with (repo) -%}
-Trust {{ repo }} at {{ worktree }}? Trusting lets the agent read and write files in this checkout without asking again.
+May can open pull requests on {{ repo }}. How should it work with this repository?
 {% when None -%}
-Trust git repository at {{ worktree }}? Trusting lets the agent read and write files in this checkout without asking again.
+How should May work with {{ worktree }}?
 {% endmatch -%}

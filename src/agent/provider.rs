@@ -1281,10 +1281,10 @@ mod tests {
 
     #[tokio::test]
     async fn redacted_model_forwards_generate_and_retry_policy_with_redaction() {
-        use std::sync::{Arc, Mutex};
         use aither_core::llm::{Message, RetryPolicy};
         use schemars::JsonSchema;
         use serde::{Deserialize, Serialize};
+        use std::sync::{Arc, Mutex};
 
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
         struct Echo {
@@ -1307,6 +1307,7 @@ mod tests {
                 futures_lite::stream::empty()
             }
 
+            #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
             async fn generate<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
                 &self,
                 request: LLMRequest,
@@ -1318,21 +1319,28 @@ mod tests {
             }
 
             fn retry_policy(&self) -> RetryPolicy {
-                self.policy.clone()
+                self.policy
+            }
+
+            #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
+            async fn profile(&self) -> Result<aither_core::llm::model::Profile, Self::Error> {
+                Ok(aither_core::llm::model::Profile::new(
+                    "test", "test", "test", "test", 8192,
+                ))
             }
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let store = crate::secrets::SecretStore::new(dir.path());
         store
-            .set_global("API_TOKEN", "super-secret-value-12345")
+            .set("API_TOKEN", "super-secret-value-12345")
             .expect("store secret");
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let policy = RetryPolicy::default();
         let inner = CapturingModel {
             seen: seen.clone(),
-            policy: policy.clone(),
+            policy,
         };
         let redacted = RedactedModel::new(inner, SecretRedactor::new(dir.path()));
         assert_eq!(redacted.retry_policy(), policy);
@@ -1343,7 +1351,11 @@ mod tests {
             )]))
             .await
             .expect("generate succeeds");
-        assert!(!echo.seen.contains("super-secret-value-12345"), "{}", echo.seen);
+        assert!(
+            !echo.seen.contains("super-secret-value-12345"),
+            "{}",
+            echo.seen
+        );
         assert!(echo.seen.contains("API_TOKEN"), "{}", echo.seen);
         assert_eq!(seen.lock().expect("lock").len(), 1);
     }

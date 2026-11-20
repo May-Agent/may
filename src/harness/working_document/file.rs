@@ -119,9 +119,6 @@ mod tests {
         assert_eq!(file.read().await, Snapshot(None));
 
         std::fs::write(dir.path().join("tasks.md"), "- [ ] one\n").expect("write tasks.md");
-        assert_eq!(
-            file.read().await,
-            Snapshot(Some("- [ ] one\n".to_string()))
-        );
+        assert_eq!(file.read().await, Snapshot(Some("- [ ] one\n".to_string())));
     }
 }
