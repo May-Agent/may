@@ -127,8 +127,13 @@ pub struct Session {
 #[must_use]
 pub fn cloud_repository(repo: Option<&str>, cwd: Option<&Path>) -> Option<String> {
     let github_of = |path: &Path| match crate::trust::repo_kind(path) {
-        crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
-        crate::trust::RepoKind::Git => None,
+        crate::trust::RepoKind::Forge { repo }
+            if repo.kind() == crate::forge::ForgeKind::GitHub
+                && repo.host().as_str() == crate::forge::GITHUB_HOST =>
+        {
+            Some(repo.full_path())
+        }
+        _ => None,
     };
     match repo {
         Some(spec) if Path::new(spec).is_dir() => github_of(Path::new(spec)),

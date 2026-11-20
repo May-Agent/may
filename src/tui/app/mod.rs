@@ -5994,8 +5994,8 @@ mod tests {
             |id| home.profile_home(id).workspace_config(),
         );
         std::fs::create_dir_all(config_path.parent().expect("parent")).expect("profile dir");
-        let kind = RepoKind::Github {
-            owner_repo: "acme/app".to_string(),
+        let kind = RepoKind::Forge {
+            repo: crate::forge::ForgeRepo::parse_binding("github:acme/app").expect("repository"),
         };
         crate::trust::persist(&config_path, repo.path(), Some(&kind), TrustLevel::Local)
             .expect("persist");

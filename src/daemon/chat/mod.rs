@@ -3629,11 +3629,13 @@ async fn gate_session_repo(
         session_id: session_id.as_str().to_string(),
     };
     let host = crate::host_git::HostGit::inherit();
+    let may_config = state.config_snapshot();
     let verdict = crate::repo_gate::RepoGate {
         db: &db,
         host: &host,
         asker: &asker,
         config_path: &config_path,
+        may_config: &may_config,
         session_root: &sandbox,
         staging: &staging,
         remote: "origin",
@@ -4696,6 +4698,7 @@ async fn enforce_issue_ownership(
 
     let directory = agent_messaging(state).directory;
     match IssueOwners::new(directory.clone())
+        .with_may_config(state.config_snapshot())
         .admit(session_id.as_str(), accepted)
         .await
     {

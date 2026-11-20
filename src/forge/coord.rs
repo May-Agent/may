@@ -500,11 +500,57 @@ impl ForgeRepo {
             ),
         }
     }
+
+    /// The key clone registries and daemon checkouts use for this
+    /// repository: `owner/repo` on `github.com` (unchanged from before),
+    /// `host/path` everywhere else.
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        match self.kind {
+            ForgeKind::GitHub if self.host.as_str() == GITHUB_HOST => self.full_path(),
+            _ => self.host_and_path(),
+        }
+    }
+
+    /// The binding `parse_binding` accepts, plus the bare `owner/repo`
+    /// `workspace.toml` and session rows wrote before the canonical form:
+    /// it means `github:owner/repo`. A bare `host/ns/repo` names the GitLab
+    /// repository when it cannot be a GitHub `owner/repo`.
+    ///
+    /// # Errors
+    /// As [`Self::parse_binding`].
+    pub fn parse_stored(value: &str) -> Result<Self, ForgeRepoError> {
+        Self::parse_binding(value)
+            .or_else(|_| Self::parse_binding(&format!("github:{value}")))
+            .or_else(|_| Self::parse_binding(&format!("gitlab:{value}")))
+    }
+}
+
+impl std::str::FromStr for ForgeRepo {
+    type Err = ForgeRepoError;
+
+    /// The stored form [`Self::parse_stored`] accepts.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_stored(value)
+    }
+}
+
+impl Serialize for ForgeRepo {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.canonical_binding())
+    }
+}
+
+impl<'de> Deserialize<'de> for ForgeRepo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_stored(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Whether `segment` reads as a host rather than a namespace segment: it
 /// carries a dot or a port, or is `localhost`.
-fn looks_like_host(segment: &str) -> bool {
+pub fn looks_like_host(segment: &str) -> bool {
     segment == "localhost" || segment.contains('.') || segment.contains(':')
 }
 

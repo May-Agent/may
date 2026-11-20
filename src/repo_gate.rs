@@ -80,6 +80,9 @@ pub struct RepoGate<'a, A> {
     pub asker: &'a A,
     /// The `workspace.toml` that holds the trust decisions.
     pub config_path: &'a Path,
+    /// The daemon configuration: its `[forge]` map resolves a self-hosted
+    /// remote's kind.
+    pub may_config: &'a crate::config::MayConfig,
     /// The session's sandbox root, where its clones live.
     pub session_root: &'a Path,
     /// Host scratch space new clones are made in.
@@ -108,8 +111,8 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         let config = blocking::unblock(move || WorkspaceConfig::load(&path)).await?;
         let non_interactive = row.non_interactive;
         match row.repo.as_deref().map(RepoBinding::parse).transpose()? {
-            Some(RepoBinding::Github(repository)) => {
-                self.decide_remote_trust(&config, &repository.to_string(), non_interactive)
+            Some(RepoBinding::Forge(repository)) => {
+                self.decide_remote_trust(&config, &repository, non_interactive)
                     .await
             }
             Some(RepoBinding::Local(identity)) => match row.cwd {
@@ -136,31 +139,35 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         }
     }
 
-    /// First contact with a GitHub repository that has no checkout: ask for
+    /// First contact with a forge repository that has no checkout: ask for
     /// the trust level once.
     async fn decide_remote_trust(
         &self,
         config: &WorkspaceConfig,
-        owner_repo: &str,
+        repository: &crate::forge::ForgeRepo,
         non_interactive: bool,
     ) -> Result<Verdict, GateError> {
         // Matching a project reads its checkout's remote: off the executor.
         let decided = {
-            let (config, owner_repo) = (config.clone(), owner_repo.to_string());
-            blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo)).await
+            let (config, repository, may_config) =
+                (config.clone(), repository.clone(), self.may_config.clone());
+            blocking::unblock(move || {
+                crate::trust::trust_for_forge(&config, &repository, &may_config)
+            })
+            .await
         };
         if decided.is_some() || non_interactive {
             return Ok(Verdict::Proceed);
         }
         let answers = self
             .asker
-            .ask(crate::trust::remote_question(owner_repo))
+            .ask(crate::trust::remote_question(&repository.host_and_path()))
             .await?;
         let Some(level) = answers.first().and_then(crate::trust::level_for_answer) else {
             return Ok(Verdict::Exit);
         };
-        let (path, owner_repo) = (self.config_path.to_path_buf(), owner_repo.to_string());
-        blocking::unblock(move || crate::trust::persist_github(&path, &owner_repo, level)).await?;
+        let (path, repository) = (self.config_path.to_path_buf(), repository.clone());
+        blocking::unblock(move || crate::trust::persist_forge(&path, &repository, level)).await?;
         Ok(Verdict::Proceed)
     }
 
@@ -190,8 +197,11 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             return Ok(Verdict::Proceed);
         } else {
             let kind = {
-                let worktree = worktree.clone();
-                blocking::unblock(move || crate::trust::repo_kind(&worktree)).await
+                let (worktree, may_config) = (worktree.clone(), self.may_config.clone());
+                blocking::unblock(move || {
+                    crate::trust::repo_kind_with_config(&worktree, &may_config)
+                })
+                .await
             };
             let request = crate::trust::question_for(&kind, &worktree, true);
             let Some(q) = request.questions.into_iter().next() else {
@@ -218,10 +228,12 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             return Ok(verdict);
         }
         let binding = {
-            let worktree = worktree.clone();
-            blocking::unblock(move || RepoBinding::for_trust(&worktree, level))
-                .await
-                .map_err(|error| GateError::Identity(error.to_string()))?
+            let (worktree, may_config) = (worktree.clone(), self.may_config.clone());
+            blocking::unblock(move || {
+                RepoBinding::for_trust_with_config(&worktree, level, &may_config)
+            })
+            .await
+            .map_err(|error| GateError::Identity(error.to_string()))?
         };
         self.bind(session_id, &binding).await?;
         Ok(Verdict::Proceed)
@@ -236,16 +248,20 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         worktree: &Path,
         identity: &Path,
     ) -> Result<Option<Verdict>, GateError> {
-        let RepoKind::Github { owner_repo } = ({
-            let worktree = worktree.to_path_buf();
-            blocking::unblock(move || crate::trust::repo_kind(&worktree)).await
+        let RepoKind::Forge { repo } = ({
+            let (worktree, may_config) = (worktree.to_path_buf(), self.may_config.clone());
+            blocking::unblock(move || crate::trust::repo_kind_with_config(&worktree, &may_config))
+                .await
         }) else {
             return Ok(None);
         };
+        let owner_repo = repo.host_and_path();
         let repos = SessionRepos::new(self.session_root, session_id, self.db.clone())
-            .with_host(self.host.clone());
+            .with_host(self.host.clone())
+            .with_may_config(self.may_config.clone())
+            .with_forge_auth(crate::forge::ForgeAuth::new(self.may_config));
         let identity_key = identity.to_string_lossy();
-        if repos.clone_for(&owner_repo).await?.is_some()
+        if repos.clone_for(&repo.cache_key()).await?.is_some()
             || repos.clone_for(&identity_key).await?.is_some()
         {
             return Ok(None);
@@ -284,12 +300,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             .await?;
         match answers.first().and_then(Choice::of_answer) {
             Some(Choice::Remote) => {
-                let repository = owner_repo.parse().map_err(
-                    |error: crate::workspace::GitHubRepositoryError| {
-                        GateError::Identity(error.to_string())
-                    },
-                )?;
-                self.bind(session_id, &RepoBinding::Github(repository))
+                self.bind(session_id, &RepoBinding::Forge(repo.clone()))
                     .await?;
                 Ok(Some(Verdict::Proceed))
             }
@@ -318,14 +329,9 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
                     .map_err(|error| GateError::Identity(error.to_string()))?
                 };
                 repos
-                    .ensure_remote_wip_clone(url.trim(), &owner_repo, self.staging, worktree)
+                    .ensure_remote_wip_clone(url.trim(), &repo.cache_key(), self.staging, worktree)
                     .await?;
-                let repository = owner_repo.parse().map_err(
-                    |error: crate::workspace::GitHubRepositoryError| {
-                        GateError::Identity(error.to_string())
-                    },
-                )?;
-                self.bind(session_id, &RepoBinding::Github(repository))
+                self.bind(session_id, &RepoBinding::Forge(repo.clone()))
                     .await?;
                 Ok(Some(Verdict::Proceed))
             }
@@ -520,8 +526,8 @@ mod tests {
             crate::trust::persist(
                 &self.config_path,
                 &self.checkout,
-                Some(&RepoKind::Github {
-                    owner_repo: "acme/app".to_string(),
+                Some(&RepoKind::Forge {
+                    repo: crate::forge::ForgeRepo::parse_binding("github:acme/app").unwrap(),
                 }),
                 level,
             )
@@ -536,11 +542,13 @@ mod tests {
             let host = HostGit::from_file(config);
             let staging = self.root().join("staging");
             let remote = self.origin.to_str().unwrap().to_string();
+            let may_config = crate::config::MayConfig::default();
             RepoGate {
                 db: &self.db,
                 host: &host,
                 asker,
                 config_path: &self.config_path,
+                may_config: &may_config,
                 session_root: &self.root().join("session"),
                 staging: &staging,
                 remote: &remote,

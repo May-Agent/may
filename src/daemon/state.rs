@@ -1523,7 +1523,8 @@ impl DaemonState {
             .await
             .expect("test jobserver starts"),
             may_dir: may_dir.to_path_buf(),
-            services: crate::terminal_commands::SharedServices::new(may_dir),
+            services: crate::terminal_commands::SharedServices::new(may_dir)
+                .with_forge_auth(&config.load()),
             quota_patterns: crate::quota::QuotaPatterns::default(),
             vision_ocr: crate::vision_ocr::VisionOcr::new(),
             secret_patterns: crate::secrets::SecretPatterns::default(),

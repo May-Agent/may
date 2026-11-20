@@ -828,13 +828,21 @@ impl MayAgent {
         // Session repo workspaces: writable working copies live under
         // `<session>/repos/<dir>`, derived lazily on `repo clone` rather than
         // eagerly at session creation. Existing workspaces from earlier turns
-        // remain listed in `<repo_clones>`, while GitHub repositories mount
+        // remain listed in `<repo_clones>`, while forge repositories mount
         // the daemon's read-only default-branch checkout.
+        let may_config = config
+            .live_config
+            .as_ref()
+            .map_or_else(crate::config::MayConfig::default, |live| {
+                (**live.load()).clone()
+            });
         let session_repos = crate::repo_clone::SessionRepos::new(
             session_paths.root(),
             config.session_id.as_str(),
             config.db.clone(),
         )
+        .with_may_config(may_config.clone())
+        .with_forge_auth(crate::forge::ForgeAuth::new(&may_config))
         .with_checkouts(config.services.checkouts.clone());
         let repo_clones: Vec<RepoCloneEntry> = session_repos
             .clones()
@@ -854,26 +862,22 @@ impl MayAgent {
             .map(|stored| crate::session::RepoBinding::parse(&stored))
             .transpose()?;
         let worktree = crate::repo_search::worktree_root(&config.cwd);
-        let github_target = match (&binding, &worktree) {
-            (Some(crate::session::RepoBinding::Github(repo)), _) => {
-                let owner_repo = repo.to_string();
+        let forge_target = match (&binding, &worktree) {
+            (Some(crate::session::RepoBinding::Forge(repo)), _) => {
                 let cfg = workspace.config.clone();
-                let key = owner_repo.clone();
+                let (repo, may_cfg) = (repo.clone(), may_config.clone());
+                let key = repo.cache_key();
+                let url = repo.https_clone_url();
                 let publishes =
-                    blocking::unblock(move || crate::trust::trust_for_github(&cfg, &key))
+                    blocking::unblock(move || crate::trust::trust_for_forge(&cfg, &repo, &may_cfg))
                         .await
                         .is_some_and(crate::trust::TrustLevel::publishes_to_github);
-                publishes.then(|| {
-                    (
-                        owner_repo.clone(),
-                        format!("https://github.com/{owner_repo}.git"),
-                    )
-                })
+                publishes.then_some((key, url))
             }
             (None, Some(worktree)) => {
-                match crate::repo_clone::CloneSource::of(worktree, &workspace.config) {
-                    Ok(Some(crate::repo_clone::CloneSource::Remote { url, owner_repo })) => {
-                        Some((owner_repo, url))
+                match crate::repo_clone::CloneSource::of(worktree, &workspace.config, &may_config) {
+                    Ok(Some(crate::repo_clone::CloneSource::Remote { url, repo })) => {
+                        Some((repo.cache_key(), url))
                     }
                     Ok(_) => None,
                     Err(error) => {
@@ -903,19 +907,19 @@ impl MayAgent {
                     .await
                     .is_some_and(crate::trust::TrustLevel::clones_work)
             }
-            (Some(crate::session::RepoBinding::Github(_)), _) => github_target.is_some(),
+            (Some(crate::session::RepoBinding::Forge(_)), _) => forge_target.is_some(),
             (None, Some(worktree)) => matches!(
-                crate::repo_clone::CloneSource::of(worktree, &workspace.config),
+                crate::repo_clone::CloneSource::of(worktree, &workspace.config, &may_config),
                 Ok(Some(_))
             ),
             (None, None) => false,
         };
-        if let Some((owner_repo, remote_url)) = github_target {
+        if let Some((repo_key, remote_url)) = forge_target {
             clones_work = true;
             match config
                 .services
                 .checkouts
-                .ensure_present(&owner_repo, &remote_url)
+                .ensure_present(&repo_key, &remote_url)
                 .await
             {
                 Ok(snapshot) => {
@@ -925,14 +929,14 @@ impl MayAgent {
                         .db
                         .seed_seen_checkout_commit(
                             config.session_id.as_str(),
-                            &owner_repo,
+                            &repo_key,
                             &snapshot.head_sha,
                         )
                         .await
                     {
                         tracing::warn!(
                             session_id = %config.session_id,
-                            repo = %owner_repo,
+                            repo = %repo_key,
                             %error,
                             "failed to record initial checkout commit"
                         );
@@ -943,13 +947,28 @@ impl MayAgent {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        repo = %owner_repo,
+                        repo = %repo_key,
                         %error,
                         "failed to prepare daemon default-branch checkout"
                     );
                 }
             }
         }
+        // The remote forge repository the session is bound to or launched
+        // in, so the system prompt names it even in prs-only mode, which
+        // tracks issues in may and holds no clone yet.
+        let remote_repo = match (&binding, &worktree) {
+            (Some(crate::session::RepoBinding::Forge(repo)), _) => Some(repo.host_and_path()),
+            (None, Some(worktree)) => {
+                match crate::repo_clone::CloneSource::of(worktree, &workspace.config, &may_config) {
+                    Ok(Some(crate::repo_clone::CloneSource::Remote { repo, .. })) => {
+                        Some(repo.host_and_path())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let works_in_clone = !repo_clones.is_empty() || clones_work;
         if let Some(repo_clones) =
             build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
@@ -997,6 +1016,7 @@ impl MayAgent {
             binding.as_ref(),
             &config.cwd,
             &session_paths.workspace_config(),
+            &may_config,
             config.db.clone(),
         )?;
         let publish_gate = config
@@ -1123,6 +1143,7 @@ impl MayAgent {
                     &session_paths,
                     (!is_container).then(|| config.cwd.display().to_string()),
                     readonly_checkout,
+                    remote_repo.as_deref(),
                     &crate::issue::IssueStore::info(&issue_store),
                 ),
             );

@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use super::github::{GitHubRest, GitHubTokenSource};
 use super::{
-    GitHubIssueStore, IssueError, MayIssueStore, project_github_repository, repository_identity,
+    ForgeGitLabAuth, GitHubIssueStore, GitLabIssueStore, IssueError, MayIssueStore,
+    repository_identity,
 };
 use crate::db::ChatDb;
+use crate::forge::{ForgeHost, ForgeKind, ForgeRepo};
 use crate::workspace::GitHubRepository;
 
 /// A project's issue store, named by a `--repo` target.
@@ -17,78 +19,144 @@ pub enum TargetStore<T: GitHubTokenSource> {
     May(MayIssueStore),
     /// Issues of a GitHub repository.
     GitHub(GitHubIssueStore<T>),
+    /// Issues of a GitLab project.
+    GitLab(GitLabIssueStore<ForgeGitLabAuth>),
 }
 
 /// Resolves `--repo` targets to issue stores.
 ///
 /// A target is a filesystem path (absolute, or starting with `.`, `..` or
 /// `~`, relative to the session's working directory) naming a local
-/// repository, or `OWNER/REPO` naming a GitHub repository. A path whose
-/// project the workspace config keeps on GitHub resolves to that repository's
+/// repository, or a forge coordinate naming a remote repository:
+/// `OWNER/REPO` (GitHub on `github.com`), `group/sub/repo` (GitLab on
+/// `gitlab.com`), a `github:`/`gitlab:` binding, or `host/namespace/repo`
+/// whose kind the `[forge]` configuration declares. A path whose project
+/// the workspace config keeps on a forge resolves to that repository's
 /// store, as the session's own store does.
 #[derive(Debug, Clone)]
 pub struct IssueTargets<T> {
     db: ChatDb,
     cwd: PathBuf,
     workspace_config: PathBuf,
+    may_config: std::sync::Arc<crate::config::MayConfig>,
     rest: GitHubRest<T>,
 }
 
 impl<T: GitHubTokenSource + Clone> IssueTargets<T> {
-    /// Targets whose local repositories read through `db` and whose GitHub
-    /// repositories read through `rest`; relative paths resolve against `cwd`,
-    /// and the project at a path is looked up in the workspace config at
-    /// `workspace_config`.
+    /// Targets whose local repositories read through `db`, whose GitHub
+    /// repositories read through `rest`, and whose GitLab repositories read
+    /// through the `[forge]` credentials of `may_config`; relative paths
+    /// resolve against `cwd`, and the project at a path is looked up in the
+    /// workspace config at `workspace_config`.
     #[must_use]
     pub const fn new(
         db: ChatDb,
         cwd: PathBuf,
         workspace_config: PathBuf,
+        may_config: std::sync::Arc<crate::config::MayConfig>,
         rest: GitHubRest<T>,
     ) -> Self {
         Self {
             db,
             cwd,
             workspace_config,
+            may_config,
             rest,
         }
+    }
+
+    fn gitlab_store(&self, repository: ForgeRepo) -> GitLabIssueStore<ForgeGitLabAuth> {
+        let auth = ForgeGitLabAuth::new(
+            crate::forge::ForgeAuth::new(self.may_config.as_ref()),
+            repository.host().as_str().to_string(),
+        );
+        GitLabIssueStore::new(repository, auth)
+    }
+
+    fn github_store(&self, repository: &ForgeRepo) -> Result<TargetStore<T>, IssueError> {
+        let github: GitHubRepository = repository.full_path().parse().map_err(
+            |error: crate::workspace::GitHubRepositoryError| {
+                IssueError::Invalid(format!("--repo {}: {error}", repository.host_and_path()))
+            },
+        )?;
+        let rest = if repository.host().as_str() == crate::forge::GITHUB_HOST {
+            self.rest.clone()
+        } else {
+            GitHubRest::with_api_base(
+                self.rest.token_source().clone(),
+                &format!("https://{}/api/v3", repository.host().as_str()),
+            )
+        };
+        Ok(TargetStore::GitHub(GitHubIssueStore::with_rest(
+            github, rest,
+        )))
     }
 
     /// The store `target` names.
     ///
     /// # Errors
-    /// Returns [`IssueError::Invalid`] when `target` is neither a path nor
-    /// `OWNER/REPO`, and [`IssueError::Identity`] when a named path is not
-    /// a directory.
+    /// Returns [`IssueError::Invalid`] when `target` is neither a path nor a
+    /// forge coordinate, and [`IssueError::Identity`] when a named path is
+    /// not a directory.
     pub async fn resolve(&self, target: &str) -> Result<TargetStore<T>, IssueError> {
         if is_path(target) {
             let path = self.cwd.join(expand_home(target)?);
             let workspace_config = self.workspace_config.clone();
-            let (identity, repository) = blocking::unblock(move || {
+            let (identity, backend) = blocking::unblock(move || {
                 let identity = repository_identity(&path)?;
-                let repository = project_github_repository(&identity, &workspace_config)?;
-                Ok::<_, IssueError>((identity, repository))
+                let config = crate::workspace::WorkspaceConfig::load(&workspace_config)?;
+                let backend = config
+                    .project_for_identity(&identity)
+                    .map(|project| project.issues.clone());
+                Ok::<_, IssueError>((identity, backend))
             })
             .await?;
-            return Ok(repository.map_or_else(
-                || {
-                    TargetStore::May(MayIssueStore::new(
-                        self.db.clone(),
-                        identity.display().to_string(),
-                    ))
-                },
-                |repository| {
-                    TargetStore::GitHub(GitHubIssueStore::with_rest(repository, self.rest.clone()))
-                },
-            ));
+            return Ok(match backend {
+                Some(crate::workspace::ProjectIssues::Github { repository }) => {
+                    self.github_store(&repository.forge_repo())?
+                }
+                Some(crate::workspace::ProjectIssues::Gitlab { repository }) => {
+                    TargetStore::GitLab(self.gitlab_store(repository))
+                }
+                _ => TargetStore::May(MayIssueStore::new(
+                    self.db.clone(),
+                    identity.display().to_string(),
+                )),
+            });
         }
-        let repository: GitHubRepository = target
-            .parse()
+        let repository = ForgeRepo::parse_binding(target)
+            .or_else(|_| parse_unprefixed(target, self.may_config.as_ref()))
             .map_err(|error| IssueError::Invalid(format!("--repo {target}: {error}")))?;
-        Ok(TargetStore::GitHub(GitHubIssueStore::with_rest(
-            repository,
-            self.rest.clone(),
-        )))
+        match repository.kind() {
+            ForgeKind::GitHub => self.github_store(&repository),
+            ForgeKind::GitLab => Ok(TargetStore::GitLab(self.gitlab_store(repository))),
+        }
+    }
+}
+
+/// The forge repository an unprefixed `--repo` target names: `owner/repo`
+/// is GitHub on `github.com`, `host/namespace/repo` the configured forge of
+/// `host`, and any other multi-segment path a `gitlab.com` namespace.
+fn parse_unprefixed(
+    target: &str,
+    may_config: &crate::config::MayConfig,
+) -> Result<ForgeRepo, crate::forge::ForgeRepoError> {
+    let segments: Vec<&str> = target.split('/').collect();
+    match segments.as_slice() {
+        [owner, repo] => ForgeRepo::parse_binding(&format!("github:{owner}/{repo}")),
+        [first, rest @ ..] if rest.len() >= 2 && crate::forge::looks_like_host(first) => {
+            let host = ForgeHost::new(first).map_err(|source| {
+                crate::forge::ForgeRepoError::Host((*first).to_string(), source)
+            })?;
+            let kind = may_config
+                .forge_kind(host.as_str())
+                .ok_or_else(|| crate::forge::ForgeRepoError::UnknownKind(first.to_string()))?;
+            let (name, namespace) = rest
+                .split_last()
+                .ok_or_else(|| crate::forge::ForgeRepoError::Binding(target.to_string()))?;
+            ForgeRepo::new(kind, host, &namespace.join("/"), name)
+        }
+        _ => ForgeRepo::parse_binding(&format!("gitlab:{target}")),
     }
 }
 
@@ -152,6 +220,7 @@ mod tests {
             db,
             dir.path().to_path_buf(),
             config_path,
+            std::sync::Arc::new(crate::config::MayConfig::default()),
             GitHubRest::new(GhCliTokenSource),
         );
 
@@ -169,5 +238,64 @@ mod tests {
             .await
             .expect("unconfigured path");
         assert!(matches!(resolved, TargetStore::May(_)));
+    }
+
+    /// `OWNER/REPO`, a `gitlab:` binding and a `host/namespace/repo`
+    /// coordinate resolve to the remote store of their forge.
+    #[tokio::test]
+    async fn forge_targets_resolve_to_their_backend() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let mut may_config = crate::config::MayConfig::default();
+        may_config.forge.insert(
+            "git.acme.example".to_string(),
+            crate::forge::ForgeHostConfig {
+                kind: Some(crate::forge::ForgeKind::GitLab),
+                mode: crate::forge::ForgeAuthMode::Cli,
+                client_id: None,
+            },
+        );
+        let targets = IssueTargets::new(
+            db,
+            dir.path().to_path_buf(),
+            dir.path().join("workspace.toml"),
+            std::sync::Arc::new(may_config),
+            GitHubRest::new(GhCliTokenSource),
+        );
+
+        let resolved = targets.resolve("owner/repo").await.expect("github");
+        let TargetStore::GitHub(store) = resolved else {
+            panic!("owner/repo resolves to a GitHub store");
+        };
+        assert_eq!(store.repository().to_string(), "owner/repo");
+
+        let resolved = targets
+            .resolve("gitlab:gitlab.example/group/sub/repo")
+            .await
+            .expect("gitlab binding");
+        let TargetStore::GitLab(store) = resolved else {
+            panic!("a gitlab: binding resolves to a GitLab store");
+        };
+        assert_eq!(
+            store.repository().host_and_path(),
+            "gitlab.example/group/sub/repo"
+        );
+
+        let resolved = targets
+            .resolve("git.acme.example/team/app")
+            .await
+            .expect("configured host");
+        assert!(
+            matches!(resolved, TargetStore::GitLab(_)),
+            "a configured host's coordinate resolves to its forge store"
+        );
+
+        let resolved = targets
+            .resolve("group/sub/repo")
+            .await
+            .expect("gitlab.com namespace");
+        assert!(matches!(resolved, TargetStore::GitLab(_)));
     }
 }

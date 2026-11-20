@@ -53,7 +53,7 @@ pub async fn recorded_checkouts(db: &crate::db::ChatDb, owner_repo: &str) -> Vec
                 if path.is_dir() {
                     matches!(
                         crate::trust::repo_kind(&path),
-                        crate::trust::RepoKind::Github { owner_repo: found } if found == owner_repo
+                        crate::trust::RepoKind::Forge { repo: found } if found.cache_key() == owner_repo
                     )
                     .then_some(Checkout::Present(path))
                 } else {

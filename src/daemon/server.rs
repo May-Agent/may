@@ -298,6 +298,7 @@ pub async fn start(
         tokio::runtime::Handle::current(),
     ));
 
+    let forge_config = config.load_full();
     let state = Arc::new(DaemonState {
         acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
@@ -338,7 +339,8 @@ pub async fn start(
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         job_server,
-        services: crate::terminal_commands::SharedServices::new(&may_dir),
+        services: crate::terminal_commands::SharedServices::new(&may_dir)
+            .with_forge_auth(&forge_config),
         quota_patterns: crate::quota::QuotaPatterns::default(),
         vision_ocr: crate::vision_ocr::VisionOcr::new(),
         secret_patterns: crate::secrets::SecretPatterns::default(),

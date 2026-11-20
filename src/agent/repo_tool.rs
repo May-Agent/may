@@ -28,6 +28,9 @@ pub struct RepoContext {
     pub scratch_root: PathBuf,
     /// The git that makes clones.
     pub host: crate::host_git::HostGit,
+    /// The daemon configuration: its `[forge]` map resolves a self-hosted
+    /// remote's kind and credentials.
+    pub may_config: std::sync::Arc<crate::config::MayConfig>,
     /// Daemon-held default-branch checkouts used to derive GitHub workspaces.
     pub checkouts: Option<crate::repo_clone::DaemonCheckouts>,
     /// Whether the directory a command runs in is a host path. A container
@@ -194,13 +197,21 @@ impl RepoTool {
     /// agent fingerprint covers, so the next turn rebuilds the agent whether
     /// or not the binding moved.
     async fn set_trust(&self, worktree: &Path, level: TrustLevel) -> String {
-        let (config, worktree) = (config_path(&self.context), worktree.to_path_buf());
+        let (config, worktree, may_config) = (
+            config_path(&self.context),
+            worktree.to_path_buf(),
+            self.context.may_config.clone(),
+        );
         let bound = blocking::unblock(move || {
-            let kind = trust::repo_kind(&worktree);
+            let kind = trust::repo_kind_with_config(&worktree, may_config.as_ref());
             trust::persist(&config, &worktree, Some(&kind), level)
                 .map_err(|error| format!("failed to persist: {error}"))?;
-            crate::session::RepoBinding::for_trust(&worktree, level)
-                .map_err(|error| format!("repository identity: {error}"))
+            crate::session::RepoBinding::for_trust_with_config(
+                &worktree,
+                level,
+                may_config.as_ref(),
+            )
+            .map_err(|error| format!("repository identity: {error}"))
         })
         .await;
         let binding = match bound {
@@ -344,6 +355,7 @@ pub mod tests {
             session_id: "s1".to_string(),
             scratch_root: scratch.join("staging"),
             host: crate::host_git::HostGit::inherit(),
+            may_config: std::sync::Arc::new(crate::config::MayConfig::default()),
             checkouts: None,
             host_paths: true,
         }

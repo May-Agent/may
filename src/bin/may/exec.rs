@@ -486,6 +486,7 @@ where
     let issue_store = may_agent::issue::resolve_issue_store(
         &cwd,
         &session_paths.workspace_config(),
+        may_config,
         context.db.clone(),
     )
     .map_err(ExecError::ResolveIssueBackend)?;
@@ -495,7 +496,7 @@ where
             #[cfg(target_os = "macos")]
             computer: None,
             rules_import: None,
-            services: may_agent::SharedServices::new(&context.may_dir),
+            services: may_agent::SharedServices::new(&context.may_dir).with_forge_auth(may_config),
             llm,
             ask_flagship: None,
             ask_balanced: None,

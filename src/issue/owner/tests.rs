@@ -58,6 +58,7 @@ impl Host {
             db.clone(),
             work.path().to_path_buf(),
             may_dir.path().join("workspace.toml"),
+            std::sync::Arc::new(crate::config::MayConfig::default()),
             GitHubRest::new(GhCliTokenSource),
         );
         let tool = IssueTool::new(store, IssueProvenance::new(db.clone(), "a1".to_string()))
@@ -263,8 +264,10 @@ fn only_the_subject_of_an_unfinished_item_is_listed() {
             (Some("May-Agent/may"), 144),
             (None, 10),
             (None, 634),
-            (Some("May-Agent/may"), 12)
+            (Some("May-Agent/may"), 12),
+            (Some("a/b/c"), 5)
         ],
-        "a mention inside an item's text, a finished item and a bare line claim nothing"
+        "a mention inside an item's text, a finished item, a bare line and a \
+         single-segment prefix claim nothing; a nested namespace does"
     );
 }
