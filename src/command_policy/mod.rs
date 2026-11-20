@@ -107,7 +107,7 @@ impl PolicySet {
         builder: ShellBuilder<I, L, O, W, T>,
     ) -> ShellBuilder<I, L, O, W, T> {
         let builder = builder
-            .policy(KillByName)
+            .policy(KillByName::new())
             .policy(ForegroundSleep)
             .policy(UnchangedFileReads {
                 refused: self.refused,
@@ -159,8 +159,34 @@ struct UnparsableRefused<'a> {
 /// Refuses a script that signals processes selected by name or pattern,
 /// which may hit processes the session did not start, and a shell script
 /// that does not parse, which cannot be checked for that.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct KillByName;
+#[derive(Debug, Clone)]
+pub struct KillByName {
+    /// `subprocess`/`os.system` calls whose arguments name a kill command.
+    python_kill_run: regex::Regex,
+}
+
+impl KillByName {
+    /// The policy with its Python patterns compiled.
+    ///
+    /// # Panics
+    /// Panics if the fixed kill-command pattern fails to compile, which it
+    /// cannot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            python_kill_run: regex::Regex::new(
+                r"(?:os\.system|subprocess\.\w+)\s*\([^)]*\b(?:pkill|killall|kill)\b",
+            )
+            .expect("python kill pattern compiles"),
+        }
+    }
+}
+
+impl Default for KillByName {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Programs that signal processes selected by name, user or other pattern.
 const KILLERS: &[&str] = &["pkill", "killall", "killall5", "skill"];
@@ -214,6 +240,32 @@ fn kill_by_name(script: &ShellScript) -> Option<String> {
     None
 }
 
+/// The process-kill a Python script reaches for, when it does: `os.kill`
+/// and `os.killpg` name no pid the script can justify from its own tree,
+/// and a `kill`/`pkill`/`killall` run through `os.system` or `subprocess`
+/// is the shell builtin the script was refused.
+fn python_kill_by_name(source: &str, run: &regex::Regex) -> Option<String> {
+    for call in ["os.killpg(", "os.kill(", "os.abort("] {
+        if source.contains(call) {
+            return Some(call.trim_end_matches('(').to_string());
+        }
+    }
+    let found = run.find(source)?;
+    Some(
+        ["pkill", "killall", "kill"]
+            .iter()
+            .find(|command| found.as_str().contains(*command))
+            .expect("a matched pattern contains one of the commands")
+            .to_string(),
+    )
+}
+
+/// `time.sleep`/`asyncio.sleep` in a foreground Python script waits like the
+/// shell's `sleep` does.
+fn python_sleeps(source: &str) -> bool {
+    source.contains("time.sleep(") || source.contains("asyncio.sleep(")
+}
+
 impl ScriptPolicy for KillByName {
     type State = ();
 
@@ -223,7 +275,16 @@ impl ScriptPolicy for KillByName {
         (): &(),
     ) -> impl Future<Output = ScriptDecision> + Send {
         let decision = match script.shell {
-            None => ScriptDecision::Pass,
+            None => {
+                if script.interpreter == aither_sandbox::Interpreter::Python {
+                    python_kill_by_name(script.script, &self.python_kill_run)
+                        .map_or(ScriptDecision::Pass, |program| {
+                            refuse(&KillByNameRefused { program: &program })
+                        })
+                } else {
+                    ScriptDecision::Pass
+                }
+            }
             Some(Err(error)) => refuse(&UnparsableRefused {
                 reason: error.reason(),
             }),
@@ -255,12 +316,13 @@ impl ScriptPolicy for ForegroundSleep {
         (): &(),
     ) -> impl Future<Output = ScriptDecision> + Send {
         let sleeps = script.origin == ScriptOrigin::Foreground
-            && parsed(script).is_some_and(|shell| {
+            && (parsed(script).is_some_and(|shell| {
                 shell
                     .commands()
                     .iter()
                     .any(|command| !command.is_background() && command.program() == "sleep")
-            });
+            }) || (script.interpreter == aither_sandbox::Interpreter::Python
+                && python_sleeps(script.script)));
         std::future::ready(if sleeps {
             refuse(&SleepRefused)
         } else {
@@ -911,6 +973,11 @@ impl ScriptPolicy for CheckoutFileReads {
         let Some(start) = script.start.host() else {
             return ScriptDecision::Pass;
         };
+        // The reading is a shell parser: a non-shell script's source has no
+        // commands to read from it.
+        if script.shell.is_none() {
+            return ScriptDecision::Pass;
+        }
         let reading = CommandReading::of(script.script);
         let mut reads_by_repo: HashMap<String, Vec<String>> = HashMap::new();
         for step in &reading.steps {
@@ -931,12 +998,16 @@ impl ScriptPolicy for CheckoutFileReads {
         if lease_repos.is_empty() && reads_by_repo.is_empty() {
             return ScriptDecision::Pass;
         }
-        let mut leases = Vec::with_capacity(lease_repos.len());
-        for repo_key in lease_repos {
-            if let Some(lease) = self.tracker.checkouts.acquire_lease(&repo_key).await {
-                leases.push(lease);
-            }
-        }
+        let checkouts = &self.tracker.checkouts;
+        let leases = futures_util::future::join_all(
+            lease_repos
+                .into_iter()
+                .map(|repo_key| async move { checkouts.acquire_lease(&repo_key).await }),
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         state
             .pending
             .lock()

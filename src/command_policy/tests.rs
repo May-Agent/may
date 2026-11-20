@@ -68,7 +68,7 @@ async fn kills_by_name_are_refused_and_kills_by_pid_run() {
         "kill $(pgrep foo)",
         "pgrep -f foo | xargs -r kill -9",
     ] {
-        let decision = decide(&KillByName, &(), script, ScriptOrigin::Foreground).await;
+        let decision = decide(&KillByName::new(), &(), script, ScriptOrigin::Foreground).await;
         let text = refusal(&decision).unwrap_or_else(|| panic!("`{script}` is refused"));
         assert!(
             text.contains("signals processes by name or pattern"),
@@ -81,7 +81,7 @@ async fn kills_by_name_are_refused_and_kills_by_pid_run() {
         "echo pkill",
         "pgrep foo | wc -l",
     ] {
-        let decision = decide(&KillByName, &(), script, ScriptOrigin::Run).await;
+        let decision = decide(&KillByName::new(), &(), script, ScriptOrigin::Run).await;
         assert_eq!(decision, ScriptDecision::Pass, "`{script}` runs");
     }
 }
@@ -89,7 +89,7 @@ async fn kills_by_name_are_refused_and_kills_by_pid_run() {
 #[tokio::test]
 async fn a_shell_script_that_does_not_parse_is_refused_and_python_is_not_checked() {
     let decision = decide(
-        &KillByName,
+        &KillByName::new(),
         &(),
         "echo 'unterminated",
         ScriptOrigin::Foreground,
@@ -108,7 +108,10 @@ async fn a_shell_script_that_does_not_parse_is_refused_and_python_is_not_checked
         &start,
     );
     python.interpreter = Interpreter::Python;
-    assert_eq!(KillByName.check(&python, &()).await, ScriptDecision::Pass);
+    assert_eq!(
+        KillByName::new().check(&python, &()).await,
+        ScriptDecision::Pass
+    );
 }
 
 #[tokio::test]

@@ -191,11 +191,14 @@ impl Hooks for MayHooks {
     async fn on_turn_boundary(&self, cx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
         // Every tool turn is counted, whichever rule ends the run.
         let looped = self.loops.observe_turn(cx.outcomes);
-        if self.steer_pending().await {
+        // Take the request before steering can end the turn: a request left
+        // pending across an early return would sit in `REQUESTED` forever.
+        let compact = self.valve.take_request();
+        if compact {
+            self.compaction.store(true, Ordering::Release);
             return TurnBoundaryAction::EndTurn;
         }
-        if self.valve.take_request() {
-            self.compaction.store(true, Ordering::Release);
+        if self.steer_pending().await {
             return TurnBoundaryAction::EndTurn;
         }
         if self.only_unchanged_reads(cx.outcomes)

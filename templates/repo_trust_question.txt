@@ -1,0 +1,6 @@
+{% match forge_repo -%}
+{% when Some with (repo) -%}
+May can open pull requests on {{ repo }}. How should it work with this repository?
+{% when None -%}
+How should May work with {{ worktree }}?
+{% endmatch -%}

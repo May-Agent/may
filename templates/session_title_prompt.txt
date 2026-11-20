@@ -1,0 +1,5 @@
+Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.
+
+User: {{ user }}
+
+Assistant: {{ assistant }}

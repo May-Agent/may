@@ -41,6 +41,9 @@ pub enum InputError {
     /// A click count that is not a positive number.
     #[error("invalid click count {0}")]
     ClickCount(i32),
+    /// A point off the display: non-finite or negative coordinates.
+    #[error("coordinate ({0}, {1}) is not on the display")]
+    Coordinate(f64, f64),
     /// The task that owns the display's input has ended.
     #[error("the display's input owner is gone")]
     OwnerGone,
@@ -222,8 +225,17 @@ fn pixels(delta: Option<f64>) -> i32 {
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
+/// A point on the display: non-finite or negative coordinates never reach
+/// the window server.
+fn display_point(x: f64, y: f64) -> Result<Point, InputError> {
+    if !(x.is_finite() && y.is_finite()) || x < 0.0 || y < 0.0 {
+        return Err(InputError::Coordinate(x, y));
+    }
+    Ok(Point::new(x, y))
+}
+
 fn mouse_event(input: &MouseInput) -> Result<MouseEvent, InputError> {
-    let at = Point::new(input.x, input.y);
+    let at = display_point(input.x, input.y)?;
     let modifiers = modifiers(input.modifiers)?;
     Ok(match input.event_type {
         MouseEventKind::Pressed => MouseEvent::Down(
@@ -358,6 +370,22 @@ mod tests {
         let event = keyboard(r#"{"type":"keyboard","eventType":"keyUp","code":"KeyA","text":"a"}"#)
             .unwrap();
         assert_eq!(event, KeyEvent::Up(KeyUp::new(Code::KeyA)));
+    }
+
+    #[test]
+    fn a_point_off_the_display_is_an_error() {
+        assert!(matches!(
+            mouse(r#"{"type":"mouse","eventType":"mouseMoved","x":-1.0,"y":0}"#),
+            Err(InputError::Coordinate(-1.0, 0.0))
+        ));
+        assert!(matches!(
+            display_point(f64::NAN, 0.0),
+            Err(InputError::Coordinate(..))
+        ));
+        assert!(matches!(
+            display_point(f64::INFINITY, 0.0),
+            Err(InputError::Coordinate(..))
+        ));
     }
 
     #[test]
