@@ -198,6 +198,11 @@ pub struct PermissionRequest {
     /// How May reads the script; absent for a request that covers no script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reading: Option<crate::command_reading::CommandReading>,
+    /// The interpreter the script runs under, so the prompt highlights it in
+    /// its language; absent for a request that covers no script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub interpreter: Option<aither_sandbox::Interpreter>,
 }
 
 /// What an approval request nobody answers resolves to.
@@ -227,6 +232,9 @@ pub struct PermissionApprover {
     pub(crate) runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
     approval_mode: ApprovalMode,
     timeout: std::time::Duration,
+    /// The interpreter of each `terminal` call's script, so a request's
+    /// prompt highlights the script in its language.
+    interpreters: crate::agent::hooks::CallInterpreters,
 }
 
 impl PermissionApprover {
@@ -240,6 +248,7 @@ impl PermissionApprover {
             runtime_service: None,
             approval_mode: ApprovalMode::Interactive,
             timeout: MAIN_APPROVAL_TIMEOUT,
+            interpreters: crate::agent::hooks::CallInterpreters::default(),
         }
     }
 
@@ -259,6 +268,7 @@ impl PermissionApprover {
             runtime_service: self.runtime_service.clone(),
             approval_mode: self.approval_mode,
             timeout: self.timeout,
+            interpreters: self.interpreters.clone(),
         }
     }
 
@@ -294,6 +304,14 @@ impl PermissionApprover {
         runtime_service: Arc<crate::session::SessionRuntimeService>,
     ) -> Self {
         self.runtime_service = Some(runtime_service);
+        self
+    }
+
+    /// Share the record of each `terminal` call's interpreter, so a request
+    /// for a call shows its script in that call's language.
+    #[must_use]
+    pub fn with_interpreters(mut self, interpreters: crate::agent::hooks::CallInterpreters) -> Self {
+        self.interpreters = interpreters;
         self
     }
 
@@ -335,6 +353,7 @@ impl PermissionApprover {
                 session_id: payload.session_id,
                 agent_id: payload.agent_id,
                 reading: payload.reading,
+                interpreter: payload.interpreter,
             },
         }
     }
@@ -403,6 +422,7 @@ impl PermissionApprover {
         &self,
         mode: SandboxMode,
         script: String,
+        interpreter: Option<aither_sandbox::Interpreter>,
     ) -> Result<bool, PermissionError> {
         if self.yolo().await? {
             self.record_yolo_grant(mode.into(), &script).await?;
@@ -416,6 +436,7 @@ impl PermissionApprover {
             mode.into(),
             &format!("{} mode", mode.description()),
             script,
+            interpreter,
             OnTimeout::Deny,
         )
         .await
@@ -453,6 +474,7 @@ impl PermissionApprover {
             PermissionHistoryMode::Publish,
             "publishing",
             text,
+            None,
             on_timeout,
         )
         .await
@@ -465,6 +487,7 @@ impl PermissionApprover {
         history: PermissionHistoryMode,
         what: &str,
         script: String,
+        interpreter: Option<aither_sandbox::Interpreter>,
         on_timeout: OnTimeout,
     ) -> Result<bool, PermissionError> {
         let Some(session_id) = self.session_id.clone() else {
@@ -481,6 +504,7 @@ impl PermissionApprover {
             session_id: Some(session_id.clone()),
             agent_id: Some(self.agent_id.clone()),
             reading,
+            interpreter,
         };
         let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
@@ -594,8 +618,15 @@ impl Approver for PermissionApprover {
             UNSANDBOXED_KIND,
             "the permission approver answers scripts that run outside the sandbox"
         );
+        let interpreter = request
+            .call()
+            .and_then(|call| self.interpreters.get(call));
         match self
-            .request_and_wait(SandboxMode::Unsandboxed, request.subject().to_string())
+            .request_and_wait(
+                SandboxMode::Unsandboxed,
+                request.subject().to_string(),
+                interpreter,
+            )
             .await
         {
             Ok(true) => Ok(Approval::Approved),
@@ -675,7 +706,7 @@ mod tests {
             .with_approval_timeout(std::time::Duration::from_millis(50))
             .for_session("session-1");
         let error = approver
-            .request_and_wait(SandboxMode::Unsandboxed, "cargo build".to_string())
+            .request_and_wait(SandboxMode::Unsandboxed, "cargo build".to_string(), None)
             .await
             .expect_err("an unanswered request must not succeed");
         let PermissionError::Denied(message) = error else {
@@ -692,7 +723,7 @@ mod tests {
         let responder = approver.clone();
         let wait = tokio::spawn(async move {
             approver
-                .request_and_wait(SandboxMode::Unsandboxed, "cargo build".to_string())
+                .request_and_wait(SandboxMode::Unsandboxed, "cargo build".to_string(), None)
                 .await
         });
         // The request id is internal; approve whatever is pending.

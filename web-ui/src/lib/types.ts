@@ -144,6 +144,8 @@ export interface PersistedPermissionRequest {
   sessionId?: string | null;
   /** How the daemon read the script; absent for a request with no script. */
   reading?: CommandReading | null;
+  /** The interpreter the script runs under; absent means shell. */
+  interpreter?: string | null;
 }
 
 export type DiffOp = 'context' | 'added' | 'removed';
@@ -399,6 +401,8 @@ export interface ToolSummary {
   prompt?: string | null;
   /** How the daemon read a terminal call's script, once the call is complete. */
   reading?: CommandReading | null;
+  /** The interpreter a terminal call's script runs under; absent means shell. */
+  interpreter?: string | null;
   /** Why a terminal-family call's complete arguments do not match the tool's schema. */
   argumentsError?: string | null;
   /** The card of a call that ran one of May's commands, once the daemon built it. */

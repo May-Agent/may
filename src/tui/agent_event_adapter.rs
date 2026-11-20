@@ -1,7 +1,7 @@
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, ToolResult, tool::ToolResultPart,
 };
-use aither_sandbox::{JobInputArgs, JobKillArgs, JobReadArgs, SandboxMode, ShellArgs};
+use aither_sandbox::{Interpreter, JobInputArgs, JobKillArgs, JobReadArgs, SandboxMode, ShellArgs};
 use partial_json_fixer::fix_json;
 
 /// Frontend-agnostic start event for a tool call.
@@ -18,6 +18,8 @@ pub enum ToolStartKind {
         /// Name of the SSH server the command runs on; `None` for the home
         /// environment.
         location: Option<String>,
+        /// Interpreter the script runs under; decides its highlighting.
+        interpreter: Interpreter,
     },
     /// A `terminal_input` invocation: text written to a background task's
     /// stdin. The task id is kept for the frontend to resolve into a
@@ -142,6 +144,7 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
             script: args.script,
             mode: args.sandbox,
             location: location_name(args.location.as_deref()),
+            interpreter: args.interpreter,
         }),
         "terminal_input" => parse(name, arguments, |args: JobInputArgs| ToolStartKind::Stdin {
             task_id: args.task_id,
@@ -188,6 +191,10 @@ pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
                 .and_then(|mode| serde_json::from_value(mode.clone()).ok())
                 .unwrap_or_default(),
             location: location_name(value.get("location").and_then(serde_json::Value::as_str)),
+            interpreter: value
+                .get("interpreter")
+                .and_then(|interpreter| serde_json::from_value(interpreter.clone()).ok())
+                .unwrap_or_default(),
         },
         "terminal_input" => ToolStartKind::Stdin {
             task_id: pick(&value, "task_id"),
@@ -411,6 +418,51 @@ mod tests {
             };
             assert_eq!(name, tool);
             assert_ne!(error, "");
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_reads_interpreter() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"echo hi","sandbox":"sandboxed","timeout":5,"interpreter":"shell"}"#,
+                aither_sandbox::Interpreter::Shell,
+            ),
+            (
+                r#"{"description":"d","script":"print(1)","sandbox":"sandboxed","timeout":5,"interpreter":"python"}"#,
+                aither_sandbox::Interpreter::Python,
+            ),
+            (
+                r#"{"description":"d","script":"echo hi","sandbox":"sandboxed","timeout":5}"#,
+                aither_sandbox::Interpreter::Shell,
+            ),
+        ] {
+            let ToolStartKind::Terminal { interpreter, .. } = parse_tool_start("terminal", arguments)
+            else {
+                panic!("expected terminal start event");
+            };
+            assert_eq!(interpreter, expected, "{arguments}");
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_partial_reads_interpreter() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"print(1)","interpreter":"python""#,
+                aither_sandbox::Interpreter::Python,
+            ),
+            (
+                r#"{"description":"d","script":"echo hi"}"#,
+                aither_sandbox::Interpreter::Shell,
+            ),
+        ] {
+            let ToolStartKind::Terminal { interpreter, .. } =
+                parse_tool_start_partial("terminal", arguments)
+            else {
+                panic!("expected terminal start kind for {arguments}");
+            };
+            assert_eq!(interpreter, expected, "{arguments}");
         }
     }
 

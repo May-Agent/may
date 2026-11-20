@@ -46,6 +46,12 @@ pub struct ToolSummary {
     /// arguments are complete, so a half-streamed script is never read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading: Option<CommandReading>,
+    /// The interpreter a `terminal` call's script runs under; decides its
+    /// highlighting. Present once the arguments are complete and carry a
+    /// valid interpreter; absent for a call whose model wrote none, which
+    /// is shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<String>,
     /// Why a `terminal`, `terminal_input`, `terminal_kill` or `terminal_read`
     /// call's complete arguments do not deserialize into the tool's argument
     /// type. Present only once the arguments are complete.
@@ -58,6 +64,7 @@ impl ToolSummary {
     #[must_use]
     pub const fn has_any(&self) -> bool {
         self.reading.is_some()
+            || self.interpreter.is_some()
             || self.arguments_error.is_some()
             || self.description.is_some()
             || self.script.is_some()
@@ -82,6 +89,14 @@ fn pick(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// The wire name of an interpreter, as it serializes in the arguments.
+const fn interpreter_name(interpreter: aither_sandbox::Interpreter) -> &'static str {
+    match interpreter {
+        aither_sandbox::Interpreter::Shell => "shell",
+        aither_sandbox::Interpreter::Python => "python",
+    }
 }
 
 /// Why `arguments` do not deserialize into the argument type of a native
@@ -158,10 +173,22 @@ fn project_fields(fields: &Value, variant: ToolVariant, complete: bool) -> ToolS
                 .as_deref()
                 .filter(|_| complete)
                 .map(CommandReading::of);
+            let interpreter = complete
+                .then(|| {
+                    fields
+                        .get("interpreter")
+                        .and_then(|value| {
+                            serde_json::from_value::<aither_sandbox::Interpreter>(value.clone())
+                                .ok()
+                        })
+                })
+                .flatten()
+                .map(|interpreter| interpreter_name(interpreter).to_string());
             ToolSummary {
                 description: pick("description"),
                 script,
                 reading,
+                interpreter,
                 ..ToolSummary::default()
             }
         }
@@ -239,6 +266,41 @@ mod tests {
             Some("Get current local time")
         );
         assert_eq!(final_summary.script.as_deref(), Some("date +%s"));
+    }
+
+    /// The interpreter is projected only once the arguments are complete:
+    /// a half-streamed `"interpreter"` token never flips a call's language.
+    #[test]
+    fn a_terminal_call_projects_its_interpreter_once_complete() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"print(1)","interpreter":"python"}"#,
+                Some("python"),
+            ),
+            (
+                r#"{"description":"d","script":"echo hi","interpreter":"shell"}"#,
+                Some("shell"),
+            ),
+            (r#"{"description":"d","script":"echo hi"}"#, None),
+            // A value no Interpreter deserializes stays absent → shell.
+            (r#"{"description":"d","script":"x","interpreter":"node"}"#, None),
+        ] {
+            assert_eq!(
+                project_tool_summary(arguments, ToolVariant::Terminal)
+                    .interpreter
+                    .as_deref(),
+                expected,
+                "{arguments}"
+            );
+        }
+        // Incomplete arguments project no interpreter even when the value
+        // already streamed through.
+        let streaming = r#"{"description":"d","script":"print(1)","interpreter":"python""#;
+        assert!(
+            project_tool_summary(streaming, ToolVariant::Terminal)
+                .interpreter
+                .is_none()
+        );
     }
 
     #[test]
