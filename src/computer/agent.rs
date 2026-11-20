@@ -6,12 +6,12 @@
 //! Accessibility grants per process at launch, and a helper the daemon
 //! respawns picks up a fresh grant while the daemon itself never restarts.
 
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use waterkit_permission::{Permission, PermissionError, PermissionStatus};
@@ -42,6 +42,11 @@ impl AgentState {
 /// its May dir.
 const SOCKET_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The most bytes one request line may carry. The largest request is an
+/// SDP offer of a few KiB; the cap stops a peer from growing the buffer
+/// without bound.
+const MAX_REQUEST_LINE: u64 = 64 * 1024;
+
 /// Serve requests on `<may_dir>/computer-agent.sock` until killed, or
 /// until the socket in the May dir is gone or replaced.
 ///
@@ -59,6 +64,9 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
     }
     let listener =
         UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
+    // The socket carries every session's input and screenshots: owner only.
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
     // The daemon reads this to know the helper is alive and to kill it
     // after permission grants — `open` gives no child handle.
     let _ = std::fs::write(
@@ -96,7 +104,16 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
         tokio::spawn(async move {
             let (mut reader, mut writer) = conn.into_split();
             let mut line = String::new();
-            let response = match BufReader::new(&mut reader).read_line(&mut line).await {
+            let read = BufReader::new(&mut reader)
+                .take(MAX_REQUEST_LINE + 1)
+                .read_line(&mut line)
+                .await;
+            let response = match read {
+                Ok(_) if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_REQUEST_LINE => {
+                    AgentResponse::Error {
+                        error: "request is over the line length limit".to_owned(),
+                    }
+                }
                 Ok(_) => match serde_json::from_str(&line) {
                     Ok(request) => dispatch(request, &state).await,
                     Err(e) => AgentResponse::Error {
