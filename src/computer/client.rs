@@ -242,7 +242,12 @@ impl Helper {
         }
         path.truncate(len);
         let expected = self.may_dir.join("MayComputerAgent.app/Contents/MacOS/may");
-        let executable = dunce::canonicalize(&expected).unwrap_or(expected);
+        // `proc_pidpath` resolves links; the bundle path must be compared in
+        // the same canonical form — and a bundle that cannot be resolved
+        // proves nothing, so fail closed.
+        let Ok(executable) = dunce::canonicalize(&expected) else {
+            return false;
+        };
         std::ffi::OsStr::from_bytes(&path) == executable.as_os_str()
     }
 

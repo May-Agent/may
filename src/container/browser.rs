@@ -1568,13 +1568,10 @@ impl BrowserRuntime {
             .await
             .map_err(|error| BrowserError::web_rtc_operation("set local description", error))?;
 
-        futures_lite::future::or(
-            async { gather_complete.recv().await.ok_or(()) },
-            async {
-                async_io::Timer::after(Duration::from_secs(10)).await;
-                Err(())
-            },
-        )
+        futures_lite::future::or(async { gather_complete.recv().await.ok_or(()) }, async {
+            async_io::Timer::after(Duration::from_secs(10)).await;
+            Err(())
+        })
         .await
         .map_err(|()| {
             BrowserError::web_rtc_operation(
@@ -1817,14 +1814,7 @@ async fn shutdown_managed_browser_session(
     }
 
     match futures_lite::future::or(
-        async {
-            Some(
-                browser
-                    .wait()
-                    .await
-                    .map_err(|error| error.to_string()),
-            )
-        },
+        async { Some(browser.wait().await.map_err(|error| error.to_string())) },
         async {
             async_io::Timer::after(Duration::from_secs(3)).await;
             None
