@@ -61,7 +61,7 @@ pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessag
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, NamedAskUserQuestion, PendingAskUserQuestion};
-pub use pr::{PrEventRow, PrFilter, PrRow, PrState, PrSummaryRow};
+pub use pr::{PrEventRow, PrFilter, PrRow, PrState, PrSummaryRow, pr_sigil};
 pub use pr_checks::PrCheckState;
 pub use repo_clone::RepoCloneRow;
 pub use repo_usage::RepoUsage;
@@ -141,6 +141,7 @@ impl ChatDb {
     async fn apply_schema(db: &SkyDb) -> Result<(), ChatDbError> {
         Self::initialize_schema(db).await?;
         Self::migrate_session_repo_clones(db).await?;
+        Self::migrate_pr_external_numbers(db).await?;
         Self::ensure_session_context_snapshot_table(db).await?;
         Self::ensure_search_outbox(db).await?;
         Self::ensure_session_interval_triggers(db).await

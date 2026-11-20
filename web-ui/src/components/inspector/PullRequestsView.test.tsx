@@ -13,7 +13,6 @@ const pr: ApiPr = {
   title: '修复图片渲染 画像 이미지',
   state: 'open',
   backend: 'github',
-  externalNumber: 12,
   issueNumber: null,
   autoMerge: false,
   baseSha: 'abc1234',
@@ -96,5 +95,16 @@ describe('PullRequestsView', () => {
     );
     expect(markup).not.toContain('Merge PR');
     expect(markup).not.toContain('Close PR');
+  });
+
+  test('renders GitLab merge requests with !iid prefix', () => {
+    const gitlabMr: ApiPr = {
+      ...pr,
+      backend: 'gitlab',
+      number: 765,
+    };
+    const markup = renderToStaticMarkup(<PullRequestsView prs={[gitlabMr]} />);
+    expect(markup).toContain('!765');
+    expect(markup).not.toContain('#765');
   });
 });

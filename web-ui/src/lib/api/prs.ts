@@ -44,7 +44,6 @@ export interface ApiPr {
   title: string;
   state: string;
   backend: string;
-  externalNumber: number | null;
   issueNumber: number | null;
   autoMerge: boolean;
   baseSha: string;

@@ -28,7 +28,6 @@ const pr = (state: string, pending: number, passed: number, failed: number): Api
   title: 'wire it',
   state,
   backend: 'github',
-  externalNumber: 1,
   issueNumber: null,
   autoMerge: false,
   baseSha: 'abc1234',
