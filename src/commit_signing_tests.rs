@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::test_user::{EMAIL, NAME, TestUser};
-use super::{CommitSigning, SigningError};
+use super::{CommitSigning, SIGNER_DIR, SIGNER_FILE, SignCommitArgs, SignCommitTool, SigningError};
 use crate::repo_clone::test_sandbox::TestTerminal;
 
 fn canonical_tempdir() -> tempfile::TempDir {
@@ -410,4 +410,91 @@ async fn the_harness_signs_only_the_users_commit_objects() {
     // Only the first signing is on record.
     let log = std::fs::read_to_string(signing.audit_log()).unwrap();
     assert_eq!(log.lines().count(), 1, "{log}");
+}
+
+/// `sign-commit` checks a subagent against spaces the host granted at
+/// provisioning, not a signer file — a `.config/may/ssh-sign` the run wrote
+/// inside its own space grants nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_signs_only_where_the_host_granted_signing() {
+    use aither_core::llm::tool::{AgentIdentity, CallIdentity, SubagentIdentity, ToolCallId};
+    use aither_core::llm::{Tool as _, ToolContext};
+
+    let tmp = canonical_tempdir();
+    let user = TestUser::new(&tmp.path().join("user"));
+    let signing = user.signing(&tmp.path().join("may"), "s1");
+    let tool = SignCommitTool::new(signing.clone());
+    let space = tmp.path().join("session/subagent-spaces/explore");
+    // What a subagent could write in its space: the file provisioning puts
+    // under its HOME, whose presence once meant "may sign".
+    let forged = space.join(SIGNER_DIR).join(SIGNER_FILE);
+    std::fs::create_dir_all(forged.parent().unwrap()).unwrap();
+    std::fs::write(&forged, "#!/bin/sh\n").unwrap();
+    let working = space.join("clone");
+    std::fs::create_dir_all(&working).unwrap();
+    let context = |dir: &Path| {
+        ToolContext::new()
+            .with_working_dir(dir.to_string_lossy().into_owned())
+            .with_identity(CallIdentity::new(
+                ToolCallId::new("c1"),
+                AgentIdentity::Subagent(SubagentIdentity::new("explore", None)),
+            ))
+    };
+    let me = format!("{NAME} <{EMAIL}>");
+    let buffer = || String::from_utf8(commit_buffer(&me, &me, "")).unwrap();
+    let call = |dir: &Path| {
+        tool.call(
+            SignCommitArgs {
+                input: Some(buffer()),
+            },
+            context(dir),
+        )
+    };
+
+    let error = call(&working).await.unwrap_err();
+    assert!(error.to_string().contains("may not sign"), "{error}");
+
+    // The host granting the space — what provisioning its working copy
+    // does — lets work under it sign, in memory the subagent cannot write.
+    signing.signing_roots().grant(&space);
+    let signed = call(&working).await.unwrap();
+    assert!(
+        format!("{signed:?}").contains("SSH SIGNATURE"),
+        "{signed:?}"
+    );
+}
+
+/// `sign-commit` signs commit objects only: a malformed buffer is refused
+/// before the host is asked to sign it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tool_signs_only_well_formed_commit_objects() {
+    use aither_core::llm::{Tool as _, ToolContext};
+
+    let tmp = canonical_tempdir();
+    let user = TestUser::new(&tmp.path().join("user"));
+    let tool = SignCommitTool::new(user.signing(&tmp.path().join("may"), "s1"));
+    for bad in [
+        "",
+        "arbitrary data\n\n",
+        // No `tree` line.
+        "author a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nmessage\n",
+        // A `tree` that is not an object id.
+        "tree nothex\nauthor a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nm\n",
+        // No `author`/`committer`.
+        "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nmessage\n",
+    ] {
+        let error = tool
+            .call(
+                SignCommitArgs {
+                    input: Some(bad.to_string()),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a commit object"),
+            "{error} for {bad:?}"
+        );
+    }
 }

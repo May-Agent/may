@@ -92,7 +92,13 @@ impl AutoIndexer {
         let mut due = Vec::new();
         for entry in hot_set(usage, now) {
             let path = entry.path();
-            if worktree_root(&path).as_ref() != Some(&path) {
+            // `git2`'s discovery is synchronous, so it leaves the executor.
+            let root = blocking::unblock({
+                let path = path.clone();
+                move || worktree_root(&path)
+            })
+            .await;
+            if root.as_ref() != Some(&path) {
                 // The record stays until it expires: the post-merge sync
                 // reports a checkout that is gone.
                 self.touched.remove(&path);

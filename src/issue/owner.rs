@@ -280,38 +280,45 @@ impl IssueOwners {
     }
 
     /// What each agent lists. An agent whose backend cannot be resolved (its
-    /// directory is gone) lists nothing.
+    /// directory is gone) lists nothing. Backend resolution runs in
+    /// parallel, bounded so many agents cannot stampede it.
     async fn claims_of(&self, agents: &[AgentTasks]) -> Vec<Claims> {
-        let mut claims = Vec::new();
-        for agent in agents {
-            let Some(tasks) = agent.tasks.as_deref() else {
-                continue;
-            };
-            if references(tasks).is_empty() {
-                continue;
-            }
-            let store = match self.store_of(agent).await {
-                Ok(store) => store,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %agent.status.session_id,
-                        %error,
-                        "issue ownership skips a session whose issue backend cannot be resolved"
-                    );
-                    continue;
-                }
-            };
-            let key = store.search_key();
-            claims.push(Claims {
-                owner: IssueOwner {
-                    session_id: agent.status.session_id.clone(),
-                    name: agent.status.name.clone(),
-                },
-                numbers: numbers_in(tasks, &key),
-                key,
-            });
+        use futures_util::StreamExt as _;
+        let claims: Vec<_> = agents.iter().map(|agent| self.claims_one(agent)).collect();
+        futures_util::stream::iter(claims)
+            .buffered(4)
+            .filter_map(async |claims| claims)
+            .collect()
+            .await
+    }
+
+    /// The claims of one agent; `None` when it lists none or its backend
+    /// cannot be resolved.
+    async fn claims_one(&self, agent: &AgentTasks) -> Option<Claims> {
+        let tasks = agent.tasks.as_deref()?;
+        if references(tasks).is_empty() {
+            return None;
         }
-        claims
+        let store = match self.store_of(agent).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %agent.status.session_id,
+                    %error,
+                    "issue ownership skips a session whose issue backend cannot be resolved"
+                );
+                return None;
+            }
+        };
+        let key = store.search_key();
+        Some(Claims {
+            owner: IssueOwner {
+                session_id: agent.status.session_id.clone(),
+                name: agent.status.name.clone(),
+            },
+            numbers: numbers_in(tasks, &key),
+            key,
+        })
     }
 }
 
@@ -343,15 +350,72 @@ fn numbers_in(tasks: &str, key: &str) -> BTreeSet<i64> {
 }
 
 /// The issues `tasks` lists: the subject of each unfinished list item, which
-/// is the first token of a `- ` item (after an optional `[ ]`). Finished
-/// `- [x]` items and references elsewhere in a line are mentions, not claims.
+/// is the first token of a `- ` or `* ` item, nested items and `- [ ]` items
+/// included, anywhere but inside a free-text section. The sections come from
+/// [`may_tasks::TasksFile::parse`], so `## Notes` and `## Decisions` prose,
+/// fenced code included, never reads as a claim, and references elsewhere in
+/// a line are mentions, not claims.
 fn references(tasks: &str) -> Vec<Reference> {
-    tasks.lines().filter_map(subject).collect()
+    let file = may_tasks::TasksFile::parse(tasks);
+    let lines: Vec<&str> = tasks.lines().collect();
+    // A free-text span's lines run to the next recorded heading.
+    let mut excluded = Vec::new();
+    for (index, span) in file.spans().iter().enumerate() {
+        if matches!(
+            span.section,
+            may_tasks::Section::Notes | may_tasks::Section::Decisions
+        ) {
+            let end = file
+                .spans()
+                .get(index + 1)
+                .map_or(lines.len() + 1, |next| next.heading);
+            excluded.extend(span.heading + 1..end);
+        }
+    }
+    let mut excluded = excluded.into_iter().peekable();
+    let mut found = Vec::new();
+    // A fenced code block keeps its `- #N` lines from claiming, wherever
+    // it sits — the list items inside are literals, not task rows.
+    let mut fence: Option<&str> = None;
+    for (number, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let marker = trimmed
+            .strip_prefix("```")
+            .map(|_| "```")
+            .or_else(|| trimmed.strip_prefix("~~~").map(|_| "~~~"));
+        match (fence, marker) {
+            (Some(mark), Some(m)) if m == mark => fence = None,
+            (Some(_), _) => continue,
+            (None, Some(m)) => {
+                fence = Some(m);
+                continue;
+            }
+            (None, None) => {}
+        }
+        let at = number + 1;
+        while excluded.peek().is_some_and(|next| *next < at) {
+            excluded.next();
+        }
+        if excluded.peek() == Some(&at) {
+            continue;
+        }
+        if let Some(reference) = item(line).and_then(subject) {
+            found.push(reference);
+        }
+    }
+    found
 }
 
-/// The issue an unfinished list item is about.
-fn subject(line: &str) -> Option<Reference> {
-    let item = line.trim_start().strip_prefix("- ")?.trim_start();
+/// The item text of a `- ` or `* ` line, wherever indented.
+fn item(line: &str) -> Option<&str> {
+    line.trim_start()
+        .strip_prefix("- ")
+        .or_else(|| line.trim_start().strip_prefix("* "))
+}
+
+/// The issue an unfinished list item is about: the first token of its text,
+/// after an optional `[ ]`.
+fn subject(item: &str) -> Option<Reference> {
     let item = item.strip_prefix("[ ]").map_or(item, str::trim_start);
     let token = item.split_whitespace().next()?;
     let (prefix, rest) = token.split_once('#')?;

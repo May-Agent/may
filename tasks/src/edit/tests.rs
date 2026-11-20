@@ -230,3 +230,37 @@ fn clear_question_removes_marks_on_detail_and_title_lines_and_names_the_rows() {
     let none = clear_question(content, "q9").expect("clears");
     assert_eq!((none.content.as_str(), none.rows.len()), (content, 0));
 }
+
+/// Concurrent `tasks` processes serialize their read-modify-write cycles
+/// on the directory's advisory lock, so no edit is lost.
+#[test]
+fn concurrent_edits_do_not_clobber_one_another() {
+    let (_directory, path) = file(DOCUMENT);
+    let mut handles = Vec::new();
+    for index in 0..16 {
+        let path = path.clone();
+        handles.push(std::thread::spawn(move || {
+            run_on(
+                &path,
+                &[
+                    "add",
+                    "--title",
+                    &format!("task {index}"),
+                    "--section",
+                    "queued",
+                ],
+            )
+            .expect("adds")
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("no edit panics");
+    }
+    let document = read(&path);
+    for index in 0..16 {
+        assert!(
+            document.contains(&format!("- task {index}\n")),
+            "task {index} is missing:\n{document}"
+        );
+    }
+}

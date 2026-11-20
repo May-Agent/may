@@ -159,23 +159,30 @@ impl<B: SearchBackend> CodeSearchTool<B> {
                 .await
                 .map_err(|error| RepoSearchError::Io(std::io::Error::other(error)))?
         {
-            return worktree_root(&clone).ok_or_else(|| {
-                RepoSearchError::Io(std::io::Error::other(format!(
-                    "session clone {} is not a git worktree",
-                    clone.display()
-                )))
-            });
+            // `git2`'s discovery is synchronous, so it leaves the executor.
+            return blocking::unblock(move || {
+                worktree_root(&clone).ok_or_else(|| {
+                    RepoSearchError::Io(std::io::Error::other(format!(
+                        "session clone {} is not a git worktree",
+                        clone.display()
+                    )))
+                })
+            })
+            .await;
         }
-        if let Some(checkouts) = &self.checkouts
-            && let Ok(Some(CloneSource::Remote { repo, .. })) = CloneSource::of(
-                &worktree,
-                &self.workspace,
-                &crate::config::MayConfig::default(),
-            )
-        {
-            let link = checkouts.current_link(&repo.cache_key());
-            if let Some(root) = worktree_root(&link) {
-                return Ok(root);
+        if let Some(checkouts) = &self.checkouts {
+            // `CloneSource::of` runs synchronous git against the worktree.
+            let source = blocking::unblock({
+                let worktree = worktree.clone();
+                let workspace = self.workspace.clone();
+                move || CloneSource::of(&worktree, &workspace, &crate::config::MayConfig::default())
+            })
+            .await;
+            if let Ok(Some(CloneSource::Remote { repo, .. })) = source {
+                let link = checkouts.current_link(&repo.cache_key());
+                if let Some(root) = blocking::unblock(move || worktree_root(&link)).await {
+                    return Ok(root);
+                }
             }
         }
         Ok(worktree)
@@ -183,7 +190,12 @@ impl<B: SearchBackend> CodeSearchTool<B> {
 
     async fn run(&self, args: CodeSearchArgs) -> Result<String, RepoSearchError> {
         let dir = args.repo.clone().unwrap_or_else(|| self.cwd.clone());
-        let Some(worktree) = worktree_root(&dir) else {
+        let Some(worktree) = blocking::unblock({
+            let dir = dir.clone();
+            move || worktree_root(&dir)
+        })
+        .await
+        else {
             return NotWorktree {
                 dir: &crate::fs_utils::display_path(&dir),
             }

@@ -42,6 +42,9 @@ pub enum SubagentSpaceError {
     /// A writable directory of the space could not be created.
     #[error("cannot create the run's writable directories: {0}")]
     Directories(#[source] std::io::Error),
+    /// The space's git configuration could not be written.
+    #[error(transparent)]
+    Signing(#[from] crate::commit_signing::SigningError),
 }
 
 /// Prepares each subagent run's space of a shell: the writable directories
@@ -137,6 +140,12 @@ impl SessionSubagentSpaces {
         if run.launcher != resolve(repos.session_root()).await? {
             sources.push(run.launcher.join(WORKING_COPY));
         }
+        // A session bound to a local checkout it writes, or whose clone is
+        // not made yet, still gives the run an isolated clone of that
+        // checkout rather than letting it write the user's checkout.
+        if let Some(checkout) = repos.bound_checkout(&caller).await? {
+            sources.push(checkout);
+        }
         Ok(sources
             .into_iter()
             .find(|source| caller.starts_with(source)))
@@ -191,6 +200,13 @@ impl SubagentSpaces for SessionSubagentSpaces {
         };
         let copy = run.space.join(WORKING_COPY);
         repos.child_clone(&source, &copy).await?;
+        // A run with a working copy may commit in it, so its `HOME` gets
+        // the session's git configuration: its commits are signed through
+        // the same harness, and `sign-commit` lets its space sign — the
+        // grant is host-held memory, not a file the run could write.
+        let signing = repos.commit_signing();
+        signing.install_sandbox_git(run.space, None).await?;
+        signing.signing_roots().grant(run.space);
         Ok(prepared.with_working_copy(copy))
     }
 }
