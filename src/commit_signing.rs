@@ -799,9 +799,31 @@ impl Tool for SignCommitTool {
     type Res = ToolResult;
 
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+        use aither_core::llm::tool::AgentIdentity;
         let buffer = args
             .input
             .ok_or_else(|| anyhow::anyhow!("no commit object on stdin"))?;
+        if let Some(AgentIdentity::Subagent(subagent)) = cx.identity().map(CallIdentity::agent) {
+            // A subagent signs where the harness installed a signer: in its
+            // own provisioned space, or in a worktree it was granted under
+            // the session's. A run's space that sits under a provisioned
+            // directory's `subagent-spaces` but was given no signer of its
+            // own — a run granted no repository — may not sign.
+            let dir = cx.working_dir().map(Path::new);
+            let root = dir.and_then(|dir| {
+                dir.ancestors()
+                    .find(|dir| dir.join(SIGNER_DIR).join(SIGNER_FILE).is_file())
+            });
+            let granted = root.is_some_and(|root| {
+                dir.is_some_and(|dir| !dir.starts_with(root.join("subagent-spaces")))
+            });
+            if !granted {
+                return Err(anyhow::anyhow!(
+                    "subagent {} may not sign commits: no signer was provisioned where it works",
+                    subagent.name()
+                ));
+            }
+        }
         let signature = self
             .signing
             .sign(buffer.into_bytes(), &requester(cx.identity()))

@@ -146,11 +146,11 @@ pub fn parse(text: &str) -> Result<Vec<Action>, PatchError> {
         let line = lines[index].trim();
         index += 1;
         if let Some(path) = line.strip_prefix(ADD) {
-            actions.push(parse_add(path.trim(), &lines, &mut index));
+            actions.push(parse_add(path.trim(), &lines, &mut index)?);
         } else if let Some(path) = line.strip_prefix(UPDATE) {
-            actions.push(parse_update(path.trim(), &lines, &mut index));
+            actions.push(parse_update(path.trim(), &lines, &mut index)?);
         } else if let Some(path) = line.strip_prefix(DELETE) {
-            actions.push(parse_delete(path.trim(), &lines, &mut index));
+            actions.push(parse_delete(path.trim(), &lines, &mut index)?);
         }
     }
     if actions.is_empty() {
@@ -182,7 +182,7 @@ fn unwrap_fence(text: &str) -> String {
 }
 
 /// Parses the body of an Add directive; `index` ends on the next `*** ` line.
-fn parse_add(path: &str, lines: &[&str], index: &mut usize) -> Action {
+fn parse_add(path: &str, lines: &[&str], index: &mut usize) -> Result<Action, PatchError> {
     let mut content = Vec::new();
     // A bare empty line is a blank line of the new file whose `+` was
     // omitted; only a trailing run of them (a separator) is not content.
@@ -195,31 +195,40 @@ fn parse_add(path: &str, lines: &[&str], index: &mut usize) -> Action {
         } else if line.is_empty() {
             content.push(String::new());
             trailing_blank += 1;
+        } else {
+            return Err(format_error(&format!(
+                "Malformed Add File body of {path}: a line must start with '+' or be empty."
+            )));
         }
         *index += 1;
     }
     content.truncate(content.len() - trailing_blank);
-    Action::Add {
+    Ok(Action::Add {
         path: path.to_owned(),
         lines: content,
-    }
+    })
 }
 
-fn parse_delete(path: &str, lines: &[&str], index: &mut usize) -> Action {
+fn parse_delete(path: &str, lines: &[&str], index: &mut usize) -> Result<Action, PatchError> {
     let mut expected = Vec::new();
     while *index < lines.len() && !lines[*index].starts_with("*** ") {
-        if let Some(text) = lines[*index].strip_prefix('-') {
+        let line = lines[*index];
+        if let Some(text) = line.strip_prefix('-') {
             expected.push(text.to_owned());
+        } else if !line.is_empty() {
+            return Err(format_error(&format!(
+                "Malformed Delete File body of {path}: a line must start with '-' or be empty."
+            )));
         }
         *index += 1;
     }
-    Action::Delete {
+    Ok(Action::Delete {
         path: path.to_owned(),
         expected,
-    }
+    })
 }
 
-fn parse_update(path: &str, lines: &[&str], index: &mut usize) -> Action {
+fn parse_update(path: &str, lines: &[&str], index: &mut usize) -> Result<Action, PatchError> {
     let mut hunks = Vec::new();
     let mut new_path = None;
     let mut current = Hunk::default();
@@ -249,14 +258,18 @@ fn parse_update(path: &str, lines: &[&str], index: &mut usize) -> Action {
             current.lines.push(HunkLine::Insert(text.to_owned()));
         } else if let Some(text) = line.strip_prefix('-') {
             current.lines.push(HunkLine::Delete(text.to_owned()));
+        } else {
+            return Err(format_error(&format!(
+                "Malformed Update File body of {path}: a line must be '@@', '*** Move to:', '*** End of File', or start with ' ', '+' or '-'."
+            )));
         }
     }
     hunks.extend(current.finish());
-    Action::Update {
+    Ok(Action::Update {
         path: path.to_owned(),
         new_path,
         hunks,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -316,5 +329,20 @@ mod tests {
         assert!(parse("```\n*** Update File: a.txt\n@@\n-a\n+b\n```").is_ok());
         assert!(parse("*** Begin Patch\n*** Update File: a.txt\n@@\n ctx\n+new").is_err());
         assert!(parse("*** Update File: a.txt\n@@\n ctx\n+new\n*** End Patch").is_err());
+    }
+
+    /// A line inside an Add, Delete or Update block that carries no prefix
+    /// is malformed, not dropped.
+    #[test]
+    fn malformed_block_lines_are_rejected() {
+        for patch in [
+            "*** Begin Patch\n*** Add File: a\n+ok\noops\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: a\n-gone\noops\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a\n@@\n ctx\noops\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a\n@@\n*** Nonsense\n*** End Patch",
+        ] {
+            let error = parse(patch).expect_err("malformed lines must not parse");
+            assert!(error.to_string().contains("Malformed"), "{error}");
+        }
     }
 }

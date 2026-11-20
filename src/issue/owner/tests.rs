@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use aither_core::llm::{Tool, ToolContext};
 
-use super::{IssueOwners, OwnershipError, references};
+use super::{IssueOwners, OwnershipError, numbers_in, references};
 use crate::agent::issue_tool::{IssueArgs, IssueTool};
 use crate::db::ChatDb;
 use crate::issue::GhCliTokenSource;
@@ -271,4 +271,27 @@ fn only_the_subject_of_an_unfinished_item_is_listed() {
         "a mention inside an item's text, a finished item, a bare line and a \
          single-segment prefix claim nothing; a nested namespace does"
     );
+}
+
+/// `*` items claim like `-` items, while `## Notes` prose and fenced code
+/// claim nothing.
+#[test]
+fn star_items_claim_and_notes_and_code_do_not() {
+    let found = references(
+        "## Doing\n* #7 starred\n- #9\n## Notes\n- #11 prose\n```\n- #13 in code\n```\n## Queued\n* acme/app#17\n",
+    );
+    let found = found
+        .iter()
+        .map(|reference| (reference.repository.as_deref(), reference.number))
+        .collect::<Vec<_>>();
+    assert_eq!(found, [(None, 7), (None, 9), (Some("acme/app"), 17)]);
+}
+
+/// A repository key matches a claim's coordinate without regard to ASCII case.
+#[test]
+fn repository_keys_match_case_insensitively() {
+    let numbers = numbers_in("## Doing\n- May-Agent/MAY#42 x\n", "github:may-agent/may");
+    assert!(numbers.contains(&42), "{numbers:?}");
+    let numbers = numbers_in("## Doing\n- may-agent/may#42 x\n", "github:May-Agent/May");
+    assert!(numbers.contains(&42), "{numbers:?}");
 }

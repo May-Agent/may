@@ -636,34 +636,57 @@ impl SessionRepos {
         let host = self.host.clone();
         let dir_check = dir.clone();
         let clean_and_current = blocking::unblock(move || -> bool {
-            let Ok(status) = host.output(Some(&dir_check), &["status", "--porcelain"]) else {
+            // The clone is agent-writable, so host git never runs inside it
+            // (`-C` would): `status` names the repository with `--git-dir`
+            // and `--work-tree`, and the one configured command `status`
+            // could run — `core.fsmonitor` — is forced off. Refs are
+            // inspected from outside the clone: `ls-remote` reads them
+            // through upload-pack's advertisement, which executes nothing
+            // the clone configures.
+            let git_dir = dir_check.join(".git").to_string_lossy().into_owned();
+            let work_tree = dir_check.to_string_lossy().into_owned();
+            let Ok(status) = host.output(
+                None,
+                &[
+                    &format!("--git-dir={git_dir}"),
+                    &format!("--work-tree={work_tree}"),
+                    "-c",
+                    "core.fsmonitor=false",
+                    "status",
+                    "--porcelain",
+                ],
+            ) else {
                 return false;
             };
             if !status.trim().is_empty() {
                 return false;
             }
-            let Ok(head) = host.output(Some(&dir_check), &["rev-parse", "HEAD"]) else {
+            let Ok(refs) = host.output(
+                None,
+                &[
+                    "ls-remote",
+                    &work_tree,
+                    "HEAD",
+                    "refs/remotes/upstream/HEAD",
+                    "refs/remotes/origin/HEAD",
+                ],
+            ) else {
                 return false;
             };
-            let head = head.trim();
+            let refs: std::collections::HashMap<&str, &str> = refs
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .map(|(sha, name)| (name, sha))
+                .collect();
+            let Some(head) = refs.get("HEAD").copied() else {
+                return false;
+            };
             if let Some(expected) = expected_head {
                 return head == expected;
             }
-            let upstream_ref = if host
-                .output(
-                    Some(&dir_check),
-                    &["rev-parse", "--verify", "upstream/HEAD"],
-                )
-                .is_ok()
-            {
-                "upstream/HEAD"
-            } else {
-                "origin/HEAD"
-            };
-            if let Ok(upstream_head) = host.output(Some(&dir_check), &["rev-parse", upstream_ref]) {
-                return head == upstream_head.trim();
-            }
-            true
+            refs.get("refs/remotes/upstream/HEAD")
+                .or_else(|| refs.get("refs/remotes/origin/HEAD"))
+                .is_none_or(|sha| head == *sha)
         })
         .await;
         Ok(clean_and_current.then_some(dir))
@@ -1144,6 +1167,46 @@ impl SessionRepos {
         Ok(child_dir.to_path_buf())
     }
 
+    /// The session's commit-signing harness, for provisioning the git
+    /// configuration of a run's space that may commit. The audit log lands
+    /// under the session's home root, the same place the session's own
+    /// harness appends to.
+    #[must_use]
+    pub fn commit_signing(&self) -> crate::commit_signing::CommitSigning {
+        crate::commit_signing::CommitSigning::new(
+            self.host.clone(),
+            &crate::session::SessionPaths::new(self.session_root.clone()).home_root(),
+            self.session_id.clone(),
+        )
+    }
+
+    /// The checkout the session is bound to and `caller` (already
+    /// canonicalized) sits inside, for a session clone that does not cover
+    /// it: a session bound to a local checkout it writes (`local` trust) or
+    /// whose clone is not made yet still gives a run launched from the
+    /// checkout an isolated clone of it rather than letting the run write
+    /// the user's checkout. `None` for a forge binding, no binding, or a
+    /// `caller` outside the bound checkout.
+    ///
+    /// # Errors
+    /// Fails when the session row or the checkout cannot be read.
+    pub async fn bound_checkout(&self, caller: &Path) -> Result<Option<PathBuf>, RepoCloneError> {
+        let Some(checkout) = self
+            .db
+            .get_session(&self.session_id)
+            .await?
+            .and_then(|row| row.repo)
+            .and_then(|stored| crate::session::RepoBinding::parse(&stored).ok())
+            .and_then(|binding| binding.checkout())
+        else {
+            return Ok(None);
+        };
+        let checkout = async_fs::canonicalize(&checkout)
+            .await
+            .map_err(RepoCloneError::Io)?;
+        Ok(caller.starts_with(&checkout).then_some(checkout))
+    }
+
     /// Remove the registered clone in `dir`. The `refs/may/pr/*` refs in the
     /// source checkout belong to their PRs and are left to them.
     ///
@@ -1595,7 +1658,10 @@ pub(crate) mod test_sandbox {
         for (key, value) in settings {
             super::git(Some(clone), &["config", &key, &value]).unwrap();
         }
-        std::fs::write(clone.join(".gitattributes"), "* filter=hostile\n").unwrap();
+        // `.git/info/attributes` applies the filter too, and leaves the
+        // worktree clean so a reuse check still runs against the armed
+        // configuration.
+        std::fs::write(clone.join(".git/info/attributes"), "* filter=hostile\n").unwrap();
         host
     }
 
@@ -1844,6 +1910,32 @@ mod tests {
             .unwrap();
         assert!(changes.iter().any(|l| l.contains("file.txt")));
         assert!(changes.iter().any(|l| l.contains("new.txt")));
+    }
+
+    /// A clone an agent armed with hostile configuration — fsmonitor,
+    /// filters, hooks, a credential helper — is still judged by host git
+    /// that honors none of it: nothing the clone configures executes, and
+    /// the untouched clone is reused.
+    #[tokio::test]
+    async fn a_hostile_clone_configuration_runs_nothing_during_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dunce::canonicalize(tmp.path()).unwrap();
+        let checkout = tmp.join("checkout");
+        init_repo(&checkout);
+        let repos = session_repos(&tmp).await;
+        let clone = repos
+            .ensure_local_clone(&checkout, &repo_key(&checkout), &staging(&tmp))
+            .await
+            .unwrap();
+        let host =
+            test_sandbox::arm_hostile_config(repos.session_root(), &clone, &tmp.join("outside"));
+        let again = repos
+            .ensure_local_clone(&checkout, &repo_key(&checkout), &staging(&tmp))
+            .await
+            .unwrap();
+        assert_eq!(clone, again);
+        let fired = test_sandbox::markers(&host);
+        assert!(fired.is_empty(), "hostile configuration ran: {fired:?}");
     }
 
     #[tokio::test]

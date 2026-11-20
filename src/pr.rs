@@ -1480,62 +1480,77 @@ impl PrStore {
                 iid: upstream_number,
             }),
         };
-        // Read before queueing: the bound and the removals that predate it.
-        let before = merge_watch::Upstream::snapshot(&upstream).await?;
-        ensure_head_pinned(upstream_number, head_sha, &before.head_sha, pr.sigil())?;
         let expected = merge_watch::Upstream::expected_checks(&upstream).await?;
-        self.event(pr, "queued", None).await;
-        // Serialized land: the lock covers queueing the PR, not the wait for
-        // it to land.
-        {
-            let _guard = lock.lock().await;
-            match &remote {
-                Remote::GitHub(_) => {
-                    queue_github_merge(
-                        &self.context.github_api,
-                        &owner_repo,
-                        upstream_number,
-                        head_sha,
-                    )
-                    .await?;
-                }
-                Remote::GitLab(repo) => {
-                    let pipeline_running = before.checks.iter().any(|check| {
-                        matches!(
-                            check,
-                            merge_watch::CheckContext::CheckRun {
-                                conclusion: None,
-                                ..
-                            }
+        // A merge queue can drop an entry with no reason and no failed
+        // check: a removal is transient, so the queue-and-watch cycle
+        // re-queues a bounded number of times before the agent is told.
+        let max_requeues = 3usize;
+        let mut requeues = 0usize;
+        let outcome = loop {
+            // Read before queueing: the removals that predate it.
+            let before = merge_watch::Upstream::snapshot(&upstream).await?;
+            ensure_head_pinned(upstream_number, head_sha, &before.head_sha, pr.sigil())?;
+            self.event(pr, "queued", None).await;
+            // Serialized land: the lock covers queueing the PR, not the wait
+            // for it to land.
+            {
+                let _guard = lock.lock().await;
+                match &remote {
+                    Remote::GitHub(_) => {
+                        queue_github_merge(
+                            &self.context.github_api,
+                            &owner_repo,
+                            upstream_number,
+                            head_sha,
                         )
-                    });
-                    gitlab::queue_merge(
-                        gitlab_rest.as_ref().expect("gitlab backend has a client"),
-                        repo,
-                        upstream_number,
-                        head_sha,
-                        pipeline_running,
-                    )
-                    .await?;
+                        .await?;
+                    }
+                    Remote::GitLab(repo) => {
+                        let pipeline_running = before.checks.iter().any(|check| {
+                            matches!(
+                                check,
+                                merge_watch::CheckContext::CheckRun {
+                                    conclusion: None,
+                                    ..
+                                }
+                            )
+                        });
+                        gitlab::queue_merge(
+                            gitlab_rest.as_ref().expect("gitlab backend has a client"),
+                            repo,
+                            upstream_number,
+                            head_sha,
+                            pipeline_running,
+                        )
+                        .await?;
+                    }
                 }
             }
-        }
-        // The checks are timed the moment they finish, not when the PR lands.
-        let observer = CiObserver {
-            store: self,
-            pr,
-            remote: &remote,
-            head_sha,
+            // The checks are timed the moment they finish, not when the PR lands.
+            let observer = CiObserver {
+                store: self,
+                pr,
+                remote: &remote,
+                head_sha,
+            };
+            let watching = merge_watch::Observing::new(&upstream, &observer);
+            let outcome = merge_watch::watch(
+                &watching,
+                &merge_watch::SystemClock::new(),
+                before.removals,
+                expected,
+            )
+            .await?;
+            watching.tell_if_unheard().await;
+            if let merge_watch::Outcome::Stopped(merge_watch::Stopped::Removed(reason)) = &outcome
+                && requeues < max_requeues
+            {
+                requeues += 1;
+                self.event(pr, "requeued", Some(reason)).await;
+                continue;
+            }
+            break outcome;
         };
-        let watching = merge_watch::Observing::new(&upstream, &observer);
-        let outcome = merge_watch::watch(
-            &watching,
-            &merge_watch::SystemClock::new(),
-            before.removals,
-            expected,
-        )
-        .await?;
-        watching.tell_if_unheard().await;
         let now = jiff::Timestamp::now().to_string();
         match outcome {
             merge_watch::Outcome::Merged => {
@@ -2846,6 +2861,16 @@ async fn push_pinned(
         )?;
         fetch_from_clone(&host, repo, &clone, &sha)?;
         fetch_upstream(&host, repo, &url, branch_state, &branch)?;
+        // The signature check covers the PR's own commits. After a rebase
+        // onto an upstream that moved since the recorded base was pinned,
+        // `base..sha` would span unsigned upstream commits already merged:
+        // verify from the fork point with the upstream tip instead.
+        let base = host_git(
+            &host,
+            Some(repo),
+            &["merge-base", "refs/remotes/origin/default", &sha],
+        )
+        .map_or(base, |output| output.trim().to_string());
         // What is pushed is what was verified: both read the host's copy.
         signing.verify_range_blocking(repo, &base, &sha)?;
         host_git(&host, Some(repo), &["push", "--quiet", &url, &spec])

@@ -731,6 +731,17 @@ pub fn clear_question(content: &str, request_id: &str) -> Result<Cleared, Refusa
     })
 }
 
+/// The advisory lock an edit of `path` holds for its whole
+/// read-modify-write cycle: the parent directory's `flock`, whose inode
+/// outlives the file's atomic replacement and so serializes concurrent
+/// writers that each replace `path`.
+fn edit_lock(path: &Path, io: &impl Fn(std::io::Error) -> Error) -> Result<std::fs::File, Error> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let lock = std::fs::File::open(directory).map_err(io)?;
+    lock.lock().map_err(io)?;
+    Ok(lock)
+}
+
 /// [`clear_question`] on the file at `path`, written back whole when a mark
 /// went; an absent file has none.
 ///
@@ -742,6 +753,7 @@ pub fn clear_question_in(path: &Path, request_id: &str) -> Result<Vec<Unblocked>
         path: path.display().to_string(),
         source,
     };
+    let _lock = edit_lock(path, &io)?;
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -757,9 +769,11 @@ pub fn clear_question_in(path: &Path, request_id: &str) -> Result<Vec<Unblocked>
     Ok(cleared.rows)
 }
 
-/// Runs the command on the file at `path`: reads it (an absent file is an
-/// empty document), applies the arguments' operation and, when it changed
-/// the document, writes it back whole.
+/// Runs the command on the file at `path`.
+///
+/// The parent directory's advisory lock is held for the whole cycle: the
+/// file is read (an absent file is an empty document), the arguments'
+/// operation applied, and the document written back whole when it changed.
 ///
 /// Returns the text the command prints.
 ///
@@ -778,6 +792,7 @@ pub fn run(path: &Path, args: &[String]) -> Result<String, Error> {
         return Ok(usage());
     }
     let op = parse(args).map_err(Error::Usage)?;
+    let _lock = edit_lock(path, &io)?;
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
