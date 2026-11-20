@@ -325,10 +325,15 @@ fn the_work_section_names_the_issue_backend() {
         &session_paths(&dir),
         None,
         None,
+        Some("gitlab.com/group/sub/repo"),
         &github,
     );
     assert!(
         session.contains("Issue repository: May-Agent/may."),
+        "{session}"
+    );
+    assert!(
+        session.contains("Remote repository: gitlab.com/group/sub/repo."),
         "{session}"
     );
 }
@@ -671,6 +676,7 @@ fn rendered_instructions(
                 &AgentEnvironment::Local,
                 &paths,
                 Some(launch_dir.to_string()),
+                None,
                 None,
                 &issues,
             ),

@@ -167,10 +167,13 @@ impl<B: SearchBackend> CodeSearchTool<B> {
             });
         }
         if let Some(checkouts) = &self.checkouts
-            && let Ok(Some(CloneSource::Remote { owner_repo, .. })) =
-                CloneSource::of(&worktree, &self.workspace)
+            && let Ok(Some(CloneSource::Remote { repo, .. })) = CloneSource::of(
+                &worktree,
+                &self.workspace,
+                &crate::config::MayConfig::default(),
+            )
         {
-            let link = checkouts.current_link(&owner_repo);
+            let link = checkouts.current_link(&repo.cache_key());
             if let Some(root) = worktree_root(&link) {
                 return Ok(root);
             }

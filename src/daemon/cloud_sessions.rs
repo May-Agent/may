@@ -43,7 +43,7 @@ use crate::cloud::{
 use crate::config::{MayConfig, ProviderType};
 use crate::db::{ChatDb, CloudSessionRow};
 use crate::issue::GitHubTokenSource as _;
-use crate::issue::github::GhAccountTokenSource;
+use crate::issue::github::ForgeTokenSource;
 use crate::model_selector::ModelSelector;
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::workspace::GitHubRepository;
@@ -282,23 +282,35 @@ impl Forward for PortForward {
     }
 }
 
-/// GitHub Codespaces through the REST API and the `gh` login.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GitHubCloud;
+/// GitHub Codespaces through the REST API and the live forge auth.
+#[derive(Debug, Clone)]
+pub struct GitHubCloud {
+    forge_auth: crate::forge::LiveForgeAuth,
+}
+
+impl GitHubCloud {
+    /// Codespaces authenticated through `forge_auth`.
+    #[must_use]
+    pub const fn new(forge_auth: crate::forge::LiveForgeAuth) -> Self {
+        Self { forge_auth }
+    }
+}
 
 impl CloudBackend for GitHubCloud {
-    type Provider = Codespaces<GhAccountTokenSource>;
+    type Provider = Codespaces<ForgeTokenSource>;
     type Shell = CodespaceShell;
     type Forward = PortForward;
 
     fn provider(&self, account: &CodespacesAccount) -> Self::Provider {
-        Codespaces::for_account(account.clone())
+        Codespaces::for_account(self.forge_auth.clone(), account.clone())
     }
 
     async fn github_token(&self, account: &CodespacesAccount) -> Result<String, CloudError> {
-        Ok(GhAccountTokenSource::new(account.login.clone())
-            .token()
-            .await?)
+        Ok(
+            ForgeTokenSource::for_account(self.forge_auth.clone(), account.login.clone())
+                .token()
+                .await?,
+        )
     }
 
     fn shell(&self, machine: &MachineId, token: &str) -> Self::Shell {

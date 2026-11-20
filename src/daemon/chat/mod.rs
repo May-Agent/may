@@ -3636,13 +3636,19 @@ async fn gate_session_repo(
         session_id: session_id.as_str().to_string(),
     };
     let host = crate::host_git::HostGit::inherit();
-    let github = crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource);
+    let may_config = state.config_snapshot();
+    let probe = crate::trust::ForgeProbes::new(
+        crate::pr::PrContext::default_github_api(state.forge_auth.clone()),
+        state.forge_auth.clone(),
+    );
     let verdict = crate::repo_gate::RepoGate {
         db: &db,
         host: &host,
         asker: &asker,
-        github: &github,
+        probe: &probe,
+        forge_auth: &state.forge_auth,
         config_path: &config_path,
+        may_config: &may_config,
         session_root: &sandbox,
         staging: &staging,
         remote: "origin",
@@ -4705,6 +4711,7 @@ async fn enforce_issue_ownership(
 
     let directory = agent_messaging(state).directory;
     match IssueOwners::new(directory.clone())
+        .with_may_config(state.config_snapshot())
         .admit(session_id.as_str(), accepted)
         .await
     {
@@ -7682,8 +7689,9 @@ mod tests {
         crate::trust::persist(
             &config_path,
             &checkout,
-            Some(&crate::trust::RepoKind::Github {
-                owner_repo: "acme/app".to_string(),
+            Some(&crate::trust::RepoKind::Forge {
+                repo: crate::forge::ForgeRepo::parse_binding("github:acme/app")
+                    .expect("github binding"),
             }),
             crate::trust::TrustLevel::Full,
         )

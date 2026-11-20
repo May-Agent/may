@@ -1,63 +1,71 @@
 //! The repository a session is bound to.
 //!
 //! A binding is stored on the session row beside `cwd`, keyed by repository
-//! identity. A GitHub-bound session attaches to the abstract repository: its
+//! identity. A forge-bound session attaches to the abstract repository: its
 //! clone comes from the remote and a local checkout is only a sync target. A
 //! local-bound session attaches to a checkout's repository identity. A
 //! session with no binding is a repo-less chat, a first-class bucket that
 //! stays ungrouped.
+//!
+//! The stored form is the repository's canonical binding —
+//! `github:owner/repo`, `github:<host>/owner/repo` or
+//! `gitlab:<host>/<namespace/...>/<repo>` — beside `local:<identity>`.
 
 use std::path::{Path, PathBuf};
 
 use crate::trust::{RepoKind, TrustLevel};
-use crate::workspace::GitHubRepository;
 
 /// What a session is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoBinding {
-    /// The GitHub repository itself (`github:owner/repo`).
-    Github(GitHubRepository),
+    /// The forge repository itself (its canonical binding).
+    Forge(crate::forge::ForgeRepo),
     /// The repository a local checkout belongs to (`local:<identity>`), where
     /// the identity is [`crate::issue::repository_identity`].
     Local(PathBuf),
 }
 
-/// A stored binding that is neither `github:owner/repo` nor `local:<path>`.
+/// A stored binding that is neither a forge binding nor `local:<path>`.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid repository binding '{0}'")]
 pub struct BindingError(String);
 
 impl RepoBinding {
-    /// Parses the stored form.
+    /// Parses the stored form: a canonical forge binding or
+    /// `local:<identity>`.
     ///
     /// # Errors
     /// Fails when `stored` is not a binding.
     pub fn parse(stored: &str) -> Result<Self, BindingError> {
         let invalid = || BindingError(stored.to_string());
-        if let Some(github) = stored.strip_prefix("github:") {
-            return github.parse().map(Self::Github).map_err(|_| invalid());
+        if let Some(identity) = stored.strip_prefix("local:") {
+            return if identity.is_empty() {
+                Err(invalid())
+            } else {
+                Ok(Self::Local(PathBuf::from(identity)))
+            };
         }
-        match stored.strip_prefix("local:") {
-            Some(identity) if !identity.is_empty() => Ok(Self::Local(PathBuf::from(identity))),
-            _ => Err(invalid()),
-        }
+        crate::forge::ForgeRepo::parse_binding(stored)
+            .map(Self::Forge)
+            .map_err(|_| invalid())
     }
 
     /// The stored form.
     #[must_use]
     pub fn to_stored(&self) -> String {
         match self {
-            Self::Github(repository) => format!("github:{repository}"),
+            Self::Forge(repo) => repo.canonical_binding(),
             Self::Local(identity) => format!("local:{}", identity.display()),
         }
     }
 
-    /// How a client names the project: `owner/repo` for GitHub, never a
-    /// path, and the checkout's path for a local binding.
+    /// How a client names the project: `owner/repo` for `github.com`,
+    /// `<host>/<namespace>/<repo>` everywhere else, and the checkout's path
+    /// for a local binding.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            Self::Github(repository) => repository.to_string(),
+            Self::Forge(repo) => repo.cache_key(),
             Self::Local(_) => self
                 .checkout()
                 .map_or_else(String::new, |path| path.display().to_string()),
@@ -65,7 +73,7 @@ impl RepoBinding {
     }
 
     /// What a client passes to start a new session on this binding: the
-    /// stored form for a GitHub repository, the checkout's path for a local
+    /// stored form for a forge repository, the checkout's path for a local
     /// one.
     #[must_use]
     pub fn launch_spec(&self) -> String {
@@ -80,14 +88,23 @@ impl RepoBinding {
     #[must_use]
     pub fn clone_key(&self) -> String {
         match self {
-            Self::Github(repository) => repository.to_string(),
+            Self::Forge(repo) => repo.cache_key(),
             Self::Local(identity) => identity.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// The forge repository of a forge binding.
+    #[must_use]
+    pub const fn forge_repo(&self) -> Option<&crate::forge::ForgeRepo> {
+        match self {
+            Self::Forge(repo) => Some(repo),
+            Self::Local(_) => None,
         }
     }
 
     /// The checkout a local binding names. The identity is the git common
     /// directory: `<checkout>/.git` for a worktree-bearing repository, the
-    /// directory itself for a bare or non-git one. A GitHub binding names
+    /// directory itself for a bare or non-git one. A forge binding names
     /// none.
     #[must_use]
     pub fn checkout(&self) -> Option<PathBuf> {
@@ -101,22 +118,37 @@ impl RepoBinding {
         }
     }
 
-    /// The binding `level` gives the repository of `worktree`: GitHub for the
-    /// levels that publish to a GitHub remote, the checkout's repository
-    /// identity otherwise.
+    /// The binding `level` gives the repository of `worktree`: the forge
+    /// repository for the levels that publish to its remote, the checkout's
+    /// repository identity otherwise. `may_config` resolves a self-hosted
+    /// remote's kind.
     ///
     /// # Errors
     /// Fails when the checkout's repository identity cannot be read.
-    pub fn for_trust(worktree: &Path, level: TrustLevel) -> Result<Self, std::io::Error> {
-        if level.publishes_to_github()
-            && let RepoKind::Github { owner_repo } = crate::trust::repo_kind(worktree)
-            && let Ok(repository) = owner_repo.parse()
+    pub fn for_trust_with_config(
+        worktree: &Path,
+        level: TrustLevel,
+        may_config: &crate::config::MayConfig,
+    ) -> Result<Self, std::io::Error> {
+        if level.publishes_to_forge()
+            && let RepoKind::Forge { repo } =
+                crate::trust::repo_kind_with_config(worktree, may_config)
         {
-            return Ok(Self::Github(repository));
+            return Ok(Self::Forge(repo));
         }
         crate::issue::repository_identity(worktree)
             .map(Self::Local)
             .map_err(std::io::Error::other)
+    }
+
+    /// [`for_trust_with_config`](Self::for_trust_with_config) without a
+    /// `[forge]` map: `github.com` and `gitlab.com` remotes are still
+    /// recognized.
+    ///
+    /// # Errors
+    /// Fails when the checkout's repository identity cannot be read.
+    pub fn for_trust(worktree: &Path, level: TrustLevel) -> Result<Self, std::io::Error> {
+        Self::for_trust_with_config(worktree, level, &crate::config::MayConfig::default())
     }
 }
 
@@ -166,15 +198,43 @@ mod tests {
     }
 
     #[test]
+    fn a_gitlab_project_is_labelled_by_its_coordinate() {
+        assert_eq!(
+            project_label("gitlab:gitlab.com/group/sub/repo"),
+            "gitlab.com/group/sub/repo"
+        );
+        assert_eq!(
+            project_label("gitlab:git.corp.example.com/team/app"),
+            "git.corp.example.com/team/app"
+        );
+    }
+
+    #[test]
     fn stored_form_round_trips() {
-        for stored in ["github:acme/app", "local:/work/app/.git"] {
-            assert_eq!(RepoBinding::parse(stored).unwrap().to_stored(), stored);
+        for stored in [
+            "github:acme/app",
+            "github:ghe.corp.example.com/acme/app",
+            "gitlab:gitlab.com/group/sub/repo",
+            "gitlab:localhost:8443/team/app",
+            "local:/work/app/.git",
+        ] {
+            assert_eq!(
+                RepoBinding::parse(stored).unwrap().to_stored(),
+                stored,
+                "{stored}"
+            );
         }
     }
 
     #[test]
     fn malformed_bindings_are_refused() {
-        for stored in ["acme/app", "github:acme", "local:", "github:a/b/c"] {
+        for stored in [
+            "acme/app",
+            "github:acme",
+            "local:",
+            "github:a/b/c/d",
+            "gitlab:only",
+        ] {
             assert!(RepoBinding::parse(stored).is_err(), "{stored}");
         }
     }
@@ -184,6 +244,12 @@ mod tests {
         assert_eq!(
             RepoBinding::parse("github:acme/app").unwrap().clone_key(),
             "acme/app"
+        );
+        assert_eq!(
+            RepoBinding::parse("gitlab:gitlab.com/group/sub/repo")
+                .unwrap()
+                .clone_key(),
+            "gitlab.com/group/sub/repo"
         );
         assert_eq!(
             RepoBinding::parse("local:/w/.git").unwrap().clone_key(),
@@ -196,6 +262,12 @@ mod tests {
         assert_eq!(
             RepoBinding::parse("github:acme/app").unwrap().launch_spec(),
             "github:acme/app"
+        );
+        assert_eq!(
+            RepoBinding::parse("gitlab:gitlab.com/group/repo")
+                .unwrap()
+                .launch_spec(),
+            "gitlab:gitlab.com/group/repo"
         );
         assert_eq!(
             RepoBinding::parse("local:/w/app/.git")

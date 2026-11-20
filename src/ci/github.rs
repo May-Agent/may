@@ -1,12 +1,14 @@
 //! What the GitHub Actions API reports about a commit's workflow runs, read
-//! through the `gh` CLI.
+//! through the GitHub REST API.
 
 use std::future::Future;
 use std::time::Duration;
 
 use serde::Deserialize;
+use zenwave::{Client as _, Method, ResponseExt as _, header::LOCATION};
 
 use super::CiError;
+use crate::issue::github::{GitHubRest, GitHubTokenSource};
 
 /// A workflow run.
 #[derive(Debug, Clone, Deserialize)]
@@ -94,32 +96,87 @@ pub trait Actions: Sync {
     fn log(&self, job_id: u64) -> impl Future<Output = Result<String, CiError>> + Send;
 }
 
-/// The Actions API of one repository through `gh api`.
+/// The Actions API of one repository through `api`'s REST client.
 #[derive(Debug, Clone)]
-pub struct GhActions {
+pub struct GhActions<T> {
+    api: GitHubRest<T>,
     owner_repo: String,
     pr_number: i64,
 }
 
-impl GhActions {
+impl<T: GitHubTokenSource> GhActions<T> {
     /// The API of `owner_repo`, for GitHub PR `pr_number`.
     #[must_use]
-    pub fn new(owner_repo: impl Into<String>, pr_number: i64) -> Self {
+    pub fn new(api: GitHubRest<T>, owner_repo: impl Into<String>, pr_number: i64) -> Self {
         Self {
+            api,
             owner_repo: owner_repo.into(),
             pr_number,
         }
     }
 
     async fn get(&self, path: String) -> Result<String, CiError> {
-        blocking::unblock(move || crate::pr::gh(&["api", &path]))
+        self.api
+            .request(Method::GET, format!("{}/{path}", self.api.api_base()), None)
+            .await
+            .map_err(|e| CiError::Github(e.to_string()))?
+            .into_string()
             .await
             .map_err(|e| CiError::Github(e.to_string()))
+            .map(|text| text.to_string())
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: String) -> Result<T, CiError> {
+    async fn get_json<R: serde::de::DeserializeOwned>(&self, path: String) -> Result<R, CiError> {
         let body = self.get(path).await?;
         serde_json::from_str(&body).map_err(|e| CiError::Github(e.to_string()))
+    }
+
+    /// The job log's text: GitHub answers the logs endpoint with a 302 to a
+    /// signed third-party URL. The signed URL embeds its own credential, so
+    /// the follow-up request goes out with no `Authorization` header at all
+    /// — GitHub's token never leaves for another origin.
+    async fn log_text(&self, path: String) -> Result<String, CiError> {
+        let response = self
+            .api
+            .request_unchecked(Method::GET, format!("{}/{path}", self.api.api_base()), None)
+            .await
+            .map_err(|e| CiError::Github(e.to_string()))?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| CiError::Github("a log redirect named no location".to_string()))?
+                .to_string();
+            let mut client = zenwave::client().follow_redirect();
+            let response = client
+                .method(Method::GET, location.as_str())
+                .map_err(|e| CiError::Github(e.to_string()))?
+                .await
+                .map_err(|e| CiError::Github(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(CiError::Github(format!(
+                    "{} fetching the job log",
+                    response.status()
+                )));
+            }
+            return response
+                .into_string()
+                .await
+                .map_err(|e| CiError::Github(e.to_string()))
+                .map(|text| text.to_string());
+        }
+        if !response.status().is_success() {
+            return Err(CiError::Github(format!(
+                "{} fetching the job log",
+                response.status()
+            )));
+        }
+        response
+            .into_string()
+            .await
+            .map_err(|e| CiError::Github(e.to_string()))
+            .map(|text| (*text).to_owned())
     }
 }
 
@@ -144,7 +201,7 @@ struct Base {
     branch: String,
 }
 
-impl Actions for GhActions {
+impl<T: GitHubTokenSource + Sync> Actions for GhActions<T> {
     async fn base_branch(&self) -> Result<String, CiError> {
         let pr: PullRequest = self
             .get_json(format!(
@@ -213,7 +270,7 @@ impl Actions for GhActions {
     }
 
     async fn log(&self, job_id: u64) -> Result<String, CiError> {
-        self.get(format!(
+        self.log_text(format!(
             "repos/{}/actions/jobs/{job_id}/logs",
             self.owner_repo
         ))

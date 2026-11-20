@@ -244,7 +244,11 @@ async fn session_repo_key(
             crate::session::MayHomePaths::new(state.may_dir.clone()).workspace_config();
         let workspace_config =
             crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default();
-        if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(checkout, &workspace_config) {
+        if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
+            checkout,
+            &workspace_config,
+            &crate::config::MayConfig::default(),
+        ) {
             return Ok(Some(source.key()));
         }
     }
@@ -312,6 +316,7 @@ fn host_pr_context(state: &DaemonState) -> crate::pr::PrContext {
         review: None,
         signing: crate::commit_signing::CommitSigning::new(host_git, &state.may_dir, "user"),
         github_api: state.github_api.clone(),
+        forge_auth: state.forge_auth.clone(),
         land_locks: state.services.land_locks.clone(),
         checkouts: Some(state.services.checkouts.clone()),
         task_events: None,

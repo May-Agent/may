@@ -117,13 +117,38 @@ struct Claims {
 #[derive(Debug, Clone)]
 pub struct IssueOwners {
     directory: AgentDirectory,
+    may_config: std::sync::Arc<crate::config::MayConfig>,
+    forge_auth: crate::forge::LiveForgeAuth,
 }
 
 impl IssueOwners {
     /// Ownership over the sessions of `directory`.
     #[must_use]
-    pub const fn new(directory: AgentDirectory) -> Self {
-        Self { directory }
+    pub fn new(directory: AgentDirectory) -> Self {
+        Self {
+            directory,
+            may_config: std::sync::Arc::new(crate::config::MayConfig::default()),
+            forge_auth: crate::forge::LiveForgeAuth::default(),
+        }
+    }
+
+    /// Resolve agents' remote issue backends with the `[forge]`
+    /// configuration `may_config` holds.
+    #[must_use]
+    pub fn with_may_config(
+        mut self,
+        may_config: impl Into<std::sync::Arc<crate::config::MayConfig>>,
+    ) -> Self {
+        self.may_config = may_config.into();
+        self
+    }
+
+    /// Resolve agents' GitLab stores with the live authenticator
+    /// `forge_auth`.
+    #[must_use]
+    pub fn with_forge_auth(mut self, forge_auth: crate::forge::LiveForgeAuth) -> Self {
+        self.forge_auth = forge_auth;
+        self
     }
 
     /// Owners of the issues of the backend named `key` (its
@@ -239,8 +264,17 @@ impl IssueOwners {
         let workspace_config = agent.workspace_config.clone();
         let binding = agent.binding.clone();
         let db = self.directory.db();
+        let may_config = self.may_config.clone();
+        let forge_auth = self.forge_auth.clone();
         blocking::unblock(move || {
-            resolve_bound_issue_store(binding.as_ref(), &cwd, &workspace_config, db)
+            resolve_bound_issue_store(
+                binding.as_ref(),
+                &cwd,
+                &workspace_config,
+                may_config.as_ref(),
+                &forge_auth,
+                db,
+            )
         })
         .await
     }
@@ -282,7 +316,8 @@ impl IssueOwners {
 }
 
 /// An issue reference of a `tasks.md`: `#N` in the agent's own backend, or
-/// `owner/repo#N` for a GitHub repository.
+/// `namespace/…/repo#N` naming a forge repository, with or without its
+/// host.
 #[derive(Debug, PartialEq, Eq)]
 struct Reference {
     repository: Option<String>,
@@ -291,13 +326,17 @@ struct Reference {
 
 /// The numbers `tasks` lists in the backend named `key`.
 fn numbers_in(tasks: &str, key: &str) -> BTreeSet<i64> {
+    let coordinate = key
+        .strip_prefix("github:")
+        .or_else(|| key.strip_prefix("gitlab:"))
+        .unwrap_or(key);
     references(tasks)
         .into_iter()
         .filter(|reference| {
             reference
                 .repository
                 .as_ref()
-                .is_none_or(|repository| key.strip_prefix("github:") == Some(repository))
+                .is_none_or(|repository| super::repository_matches(repository, coordinate))
         })
         .map(|reference| reference.number)
         .collect()
@@ -325,8 +364,9 @@ fn subject(line: &str) -> Option<Reference> {
     let repository = if prefix.is_empty() {
         None
     } else {
-        let (owner, repo) = prefix.split_once('/')?;
-        if !is_name(owner) || !is_name(repo) {
+        // A repository coordinate is two or more `name` segments joined by
+        // `/`: `owner/repo` or `gitlab.example/group/sub/repo`.
+        if !prefix.contains('/') || !prefix.split('/').all(is_name) {
             return None;
         }
         Some(prefix.to_string())

@@ -15,8 +15,39 @@ use askama::Template;
 use crate::agent::permission::{OnTimeout, PermissionApprover};
 use crate::config::{ApprovalPolicy, IssueApprovalConfig, MayConfig};
 use crate::issue::github::{GitHubRest, GitHubTokenSource};
+use crate::issue::gitlab::{GitLabRest, GitLabTokenSource};
 use crate::issue::{IssueError, IssueKind, IssueStore};
 use crate::workspace::GitHubRepository;
+
+/// Ownership lookup over a forge's REST client, for the publish gate.
+pub trait RemoteOwnership: std::fmt::Debug + Sync {
+    /// Whether the authenticated user owns `repository`.
+    fn repository_owned(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> impl std::future::Future<Output = Result<bool, IssueError>> + Send;
+}
+
+impl<T: GitHubTokenSource> RemoteOwnership for GitHubRest<T> {
+    async fn repository_owned(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> Result<bool, IssueError> {
+        let github: GitHubRepository = repository.full_path().parse().map_err(
+            |error: crate::workspace::GitHubRepositoryError| IssueError::Invalid(error.to_string()),
+        )?;
+        Self::repository_owned(self, &github).await
+    }
+}
+
+impl<T: GitLabTokenSource> RemoteOwnership for GitLabRest<T> {
+    async fn repository_owned(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> Result<bool, IssueError> {
+        Self::repository_owned(self, repository).await
+    }
+}
 
 /// What the agent is about to publish.
 #[derive(Debug, Clone, Copy)]
@@ -223,16 +254,33 @@ impl PublishGate {
         title: &str,
         body: &str,
     ) -> Result<(), PublishError> {
+        self.approve_forge_pull_request(github, &repository.forge_repo(), title, body)
+            .await
+    }
+
+    /// Approve opening a pull request on the forge repository `repository`,
+    /// whose ownership `rest` looks up — `GitHubRest` or `GitLabRest`.
+    ///
+    /// # Errors
+    /// Fails when the ownership lookup fails or the user denies (or, for a
+    /// `required` entry, does not answer).
+    pub async fn approve_forge_pull_request<R: RemoteOwnership>(
+        &self,
+        rest: &R,
+        repository: &crate::forge::ForgeRepo,
+        title: &str,
+        body: &str,
+    ) -> Result<(), PublishError> {
         if (Publication::PullRequest { title, body }).policy(&self.settings(), true)
             == ApprovalPolicy::None
         {
             return Ok(());
         }
-        let external = !github.repository_owned(repository).await?;
+        let external = !rest.repository_owned(repository).await?;
         self.decide(
             Publication::PullRequest { title, body },
             external,
-            &repository.to_string(),
+            &repository.host_and_path(),
         )
         .await
         .map_err(PublishError::Denied)

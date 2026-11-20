@@ -257,9 +257,6 @@ dispatch2 = { version = "0.3", default-features = false, features = ["std", "obj
 may-container-image = { path = "container-image" }
 
 [dev-dependencies]
-# File locks, so the E2E tests that share host state stay serial across the
-# processes nextest runs them in.
-serial_test = { version = "3.5.0", default-features = false, features = ["async", "file_locks"] }
 # Builds the tar.xz artifacts the distribution tests extract.
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 # Checks that every model-facing id word is one o200k_base token.
@@ -345,6 +342,14 @@ opt-level = 3
 
 [profile.dev.package.lzma-rust2]
 opt-level = 3
+
+# syntect parses and highlights each fenced code line of the TUI markdown
+# tests through fancy-regex; at opt-level 0 those tests take 20-30 s each.
+[profile.dev.package.syntect]
+opt-level = 2
+
+[profile.dev.package.fancy-regex]
+opt-level = 2
 
 # The profile that 'dist' will build with
 [profile.dist]

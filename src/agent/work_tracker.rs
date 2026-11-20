@@ -50,12 +50,13 @@ impl MayWorkTracker {
     }
 
     /// Refuses a reference qualified by a repository other than the issue
-    /// store's own; owner and repository names compare without case.
+    /// store's own; repository names compare without case, and a written
+    /// `namespace/repo` also matches its host-qualified form.
     fn issue_number(&self, reference: &WorkRef) -> Result<i64, WorkTrackerError> {
         if let Some(repository) = reference.repository()
             && !self
                 .our_repository()
-                .is_some_and(|ours| ours.eq_ignore_ascii_case(repository))
+                .is_some_and(|ours| crate::issue::repository_matches(repository, &ours))
         {
             return Err(unavailable(
                 reference,
@@ -106,7 +107,7 @@ impl MayWorkTracker {
             .map_err(|error| unavailable(reference, &error.to_string()))?;
         let keys: Vec<String> = match reference.repository() {
             Some(repository) => {
-                // Which GitHub repository each local clone, and the working
+                // Which forge repository each local clone, and the working
                 // directory, comes from is read from git, off the executor.
                 let local: Vec<(String, PathBuf)> = clones
                     .iter()
@@ -117,32 +118,37 @@ impl MayWorkTracker {
                 let (local, cwd) = blocking::unblock(move || {
                     let local: Vec<(String, Option<String>)> = local
                         .into_iter()
-                        .map(|(key, source)| (key, github_repository(&source)))
+                        .map(|(key, source)| (key, forge_coordinate(&source)))
                         .collect();
                     let cwd = crate::repo_search::worktree_root(&cwd)
-                        .and_then(|worktree| github_repository(&worktree));
+                        .and_then(|worktree| forge_coordinate(&worktree));
                     (local, cwd)
                 })
                 .await;
                 let mut keys: Vec<String> = clones
                     .iter()
-                    .filter(|clone| !clone.local && clone.repo_key.eq_ignore_ascii_case(repository))
+                    .filter(|clone| {
+                        !clone.local
+                            && crate::issue::repository_matches(repository, &clone.repo_key)
+                    })
                     .map(|clone| clone.repo_key.clone())
                     .chain(
                         local
                             .into_iter()
-                            .filter(|(_, github)| {
-                                github
-                                    .as_deref()
-                                    .is_some_and(|github| github.eq_ignore_ascii_case(repository))
+                            .filter(|(_, forge)| {
+                                forge.as_deref().is_some_and(|forge| {
+                                    crate::issue::repository_matches(repository, forge)
+                                })
                             })
                             .map(|(key, _)| key),
                     )
                     .collect();
                 // Uncloned, the working directory's PRs are recorded under
                 // the key its clone would get: the remote's or its identity.
-                if let Some(github) = cwd.filter(|github| github.eq_ignore_ascii_case(repository)) {
-                    keys.push(github);
+                if let Some(forge) =
+                    cwd.filter(|forge| crate::issue::repository_matches(repository, forge))
+                {
+                    keys.push(forge);
                     keys.push(self.cwd_identity(reference)?);
                 }
                 keys
@@ -226,10 +232,11 @@ impl crate::harness::working_document::WorkTracker for MayWorkTracker {
     }
 }
 
-/// `owner/repo` of the GitHub `origin` of the checkout at `dir`.
-fn github_repository(dir: &Path) -> Option<String> {
+/// The forge coordinate (`owner/repo`, or `<host>/<namespace>/<repo>` off
+/// the default host) of the `origin` of the checkout at `dir`.
+fn forge_coordinate(dir: &Path) -> Option<String> {
     match crate::trust::repo_kind(dir) {
-        crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+        crate::trust::RepoKind::Forge { repo } => Some(repo.cache_key()),
         crate::trust::RepoKind::Git => None,
     }
 }

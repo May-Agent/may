@@ -28,10 +28,13 @@ pub struct RepoContext {
     pub scratch_root: PathBuf,
     /// The git that makes clones.
     pub host: crate::host_git::HostGit,
+    /// The daemon configuration: its `[forge]` map resolves a self-hosted
+    /// remote's kind and credentials.
+    pub may_config: std::sync::Arc<crate::config::MayConfig>,
     /// Daemon-held default-branch checkouts used to derive GitHub workspaces.
     pub checkouts: Option<crate::repo_clone::DaemonCheckouts>,
-    /// Reads GitHub repository access while default trust is derived.
-    pub github: crate::issue::github::GitHubRest<crate::pr::PrTokenSource>,
+    /// Reads forge repository access while default trust is derived.
+    pub probe: crate::trust::ForgeProbes<crate::pr::PrTokenSource>,
     /// Whether the directory a command runs in is a host path. A container
     /// session's commands run under the container's paths, so its `repo`
     /// acts on the launch repository alone.
@@ -115,11 +118,11 @@ async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -
     let (worktree_display, outcome) = match worktree_and_key(dir) {
         Ok((worktree, _key)) => {
             let display = worktree.to_string_lossy().into_owned();
-            let level =
-                match trust::resolve_checkout(&config_path, &worktree, &context.github).await {
-                    Ok(level) => level,
-                    Err(e) => return format!("failed to resolve the repository trust: {e}"),
-                };
+            let level = match trust::resolve_checkout(&config_path, &worktree, &context.probe).await
+            {
+                Ok(level) => level,
+                Err(e) => return format!("failed to resolve the repository trust: {e}"),
+            };
             if !level.clones_work() {
                 return RepoCloneReport {
                     worktree: &display,
@@ -206,13 +209,21 @@ impl RepoTool {
     /// agent fingerprint covers, so the next turn rebuilds the agent whether
     /// or not the binding moved.
     async fn set_trust(&self, worktree: &Path, level: TrustLevel) -> String {
-        let (config, worktree) = (config_path(&self.context), worktree.to_path_buf());
+        let (config, worktree, may_config) = (
+            config_path(&self.context),
+            worktree.to_path_buf(),
+            self.context.may_config.clone(),
+        );
         let bound = blocking::unblock(move || {
-            let kind = trust::repo_kind(&worktree);
+            let kind = trust::repo_kind_with_config(&worktree, may_config.as_ref());
             trust::persist(&config, &worktree, Some(&kind), level)
                 .map_err(|error| format!("failed to persist: {error}"))?;
-            crate::session::RepoBinding::for_trust(&worktree, level)
-                .map_err(|error| format!("repository identity: {error}"))
+            crate::session::RepoBinding::for_trust_with_config(
+                &worktree,
+                level,
+                may_config.as_ref(),
+            )
+            .map_err(|error| format!("repository identity: {error}"))
         })
         .await;
         let binding = match bound {
@@ -271,7 +282,7 @@ impl Tool for RepoTool {
                     let level = match trust::resolve_checkout(
                         &config_path(&self.context),
                         &worktree,
-                        &self.context.github,
+                        &self.context.probe,
                     )
                     .await
                     {
@@ -364,11 +375,13 @@ pub mod tests {
             session_id: "s1".to_string(),
             scratch_root: scratch.join("staging"),
             host: crate::host_git::HostGit::inherit(),
+            may_config: std::sync::Arc::new(crate::config::MayConfig::default()),
             checkouts: None,
             // The probe always fails like an offline `gh`: resolution
             // falls back without persisting.
-            github: crate::issue::github::GitHubRest::new(
-                crate::pr::PrTokenSource::Unauthenticated,
+            probe: crate::trust::ForgeProbes::new(
+                crate::issue::github::GitHubRest::new(crate::pr::PrTokenSource::Unauthenticated),
+                crate::forge::LiveForgeAuth::default(),
             ),
             host_paths: true,
         }
