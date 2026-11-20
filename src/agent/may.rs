@@ -666,8 +666,9 @@ impl MayAgent {
             .permission_approver
             .as_ref()
             .and_then(|approver| approver.runtime_service.clone())
-            .map(|runtime| runtime.refused_reads())
-            .unwrap_or_default();
+            .map_or_else(crate::command_policy::RefusedReads::default, |runtime| {
+                runtime.refused_reads()
+            });
         let budgets = config.limits.shell();
         let assembly = ShellAssembly {
             tools: tools.clone(),

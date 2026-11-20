@@ -41,7 +41,7 @@ pub const fn runs_managed_bash(in_container: bool) -> bool {
 pub struct RefusedReads(Arc<Mutex<HashSet<ToolCallId>>>);
 
 impl RefusedReads {
-    fn record(&self, call: CallIdentity) {
+    fn record(&self, call: &CallIdentity) {
         self.0
             .lock()
             .expect("the refused read record is never held across a panic")
@@ -396,7 +396,7 @@ impl ScriptPolicy for UnchangedFileReads {
         if unchanged {
             let paths: Vec<&Path> = stamps.iter().map(|(path, _)| path.as_path()).collect();
             if let Some(call) = script.call {
-                self.refused.record(call.clone());
+                self.refused.record(call);
             }
             return refuse(&UnchangedFileReadRefused { paths: &paths });
         }
