@@ -202,15 +202,18 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                     prev_repo = None;
                 }
                 // Regular sessions run in project groups: a header names the
-                // project, GitHub ones by `owner/repo` and local ones by path.
+                // project, forge ones by their binding and local ones by path.
                 if section == "regular" && summary.repo.as_deref() != prev_repo {
                     if let Some(repo) = summary.repo.as_deref() {
-                        let github = repo.starts_with("github:");
+                        let forge = if repo.starts_with("github:") {
+                            "  GitHub "
+                        } else if repo.starts_with("gitlab:") {
+                            "  GitLab "
+                        } else {
+                            "  "
+                        };
                         session_lines.push(Line::from(vec![
-                            Span::styled(
-                                if github { "  GitHub " } else { "  " },
-                                Style::default().fg(Color::DarkGray),
-                            ),
+                            Span::styled(forge, Style::default().fg(Color::DarkGray)),
                             Span::styled(
                                 crate::session::project_label(repo),
                                 Style::default()

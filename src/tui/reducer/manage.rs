@@ -698,8 +698,8 @@ pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                 app.skill_scroll = 0;
             }
             KeyCode::Char('a') if app.skill_search.is_empty() => {
-                app.skill_add_mode = SkillAddMode::GitHubRepo;
-                app.skill_github_input.clear();
+                app.skill_add_mode = SkillAddMode::ForgeRepo;
+                app.skill_repo_input.clear();
             }
             KeyCode::Char('d') if app.skill_search.is_empty() => {
                 let filtered = app.filtered_skills();
@@ -730,23 +730,23 @@ pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
             }
             _ => {}
         },
-        SkillAddMode::GitHubRepo => match code {
+        SkillAddMode::ForgeRepo => match code {
             KeyCode::Esc => {
                 app.skill_add_mode = SkillAddMode::None;
-                app.skill_github_input.clear();
+                app.skill_repo_input.clear();
             }
             KeyCode::Enter => {
-                if !app.skill_github_input.is_empty() {
-                    let input = std::mem::take(&mut app.skill_github_input);
+                if !app.skill_repo_input.is_empty() {
+                    let input = std::mem::take(&mut app.skill_repo_input);
                     app.skill_add_mode = SkillAddMode::None;
                     return Some(SendAction::SkillInstall { repo: input });
                 }
             }
             KeyCode::Backspace => {
-                app.skill_github_input.pop();
+                app.skill_repo_input.pop();
             }
             KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_' || c == '/') => {
-                app.skill_github_input.push(c);
+                app.skill_repo_input.push(c);
             }
             _ => {}
         },

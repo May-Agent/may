@@ -349,6 +349,7 @@ mod tests {
                     signature: Some(crate::task_trigger::WebhookSignature {
                         secret: "GH_SECRET".to_string(),
                         header: "x-hub-signature-256".to_string(),
+                        scheme: None,
                     }),
                 },
                 true,

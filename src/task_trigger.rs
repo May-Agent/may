@@ -34,16 +34,67 @@ const WEBHOOK_TOKEN_BYTES: usize = 32;
 /// Prefix GitHub-style senders put before the hex digest.
 const SIGNATURE_PREFIX: &str = "sha256=";
 
+/// The header GitLab webhooks carry their shared secret token in.
+pub const GITLAB_TOKEN_HEADER: &str = "x-gitlab-token";
+
+/// How a webhook signature requirement reads the delivery's credential.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebhookSignatureScheme {
+    /// The HMAC-SHA256 of the request body, keyed by the stored secret,
+    /// hex-encoded (optionally prefixed `sha256=`) — `X-Hub-Signature-256`.
+    HmacSha256,
+    /// The shared secret itself, sent verbatim — `X-Gitlab-Token`.
+    Token,
+}
+
+impl WebhookSignatureScheme {
+    /// The scheme `header` implies when the signature requirement names
+    /// none: `x-gitlab-token` is a token, every other header an HMAC.
+    const fn default_for(header: &str) -> Self {
+        if header.eq_ignore_ascii_case(GITLAB_TOKEN_HEADER) {
+            Self::Token
+        } else {
+            Self::HmacSha256
+        }
+    }
+
+    /// Serialized form (`hmac-sha256` or `token`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HmacSha256 => "hmac-sha256",
+            Self::Token => "token",
+        }
+    }
+}
+
 /// A signed-delivery requirement on a webhook trigger.
 ///
-/// The HMAC-SHA256 of the request body, keyed by the stored secret `secret`,
-/// must arrive hex-encoded (optionally prefixed `sha256=`) in `header`.
+/// By default the HMAC-SHA256 of the request body, keyed by the stored
+/// secret `secret`, must arrive hex-encoded (optionally prefixed `sha256=`)
+/// in `header`; a `header` of `X-Gitlab-Token` instead asks for the secret
+/// verbatim, compared in constant time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
 pub struct WebhookSignature {
     /// Name of a secret stored through `/secret`.
     pub secret: String,
     /// Request header the sender puts the signature in, such as `X-Hub-Signature-256`.
     pub header: String,
+    /// The scheme `header` is read under; unset, `x-gitlab-token` means a
+    /// shared token and every other header an HMAC-SHA256 of the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<WebhookSignatureScheme>,
+}
+
+impl WebhookSignature {
+    /// The scheme the delivery's credential is read under.
+    fn scheme(&self) -> WebhookSignatureScheme {
+        self.scheme
+            .unwrap_or_else(|| WebhookSignatureScheme::default_for(&self.header))
+    }
 }
 
 /// Why a delivery's signature was refused.
@@ -71,13 +122,29 @@ impl WebhookSignature {
             .to_string();
         let header = skyzen::header::HeaderName::from_bytes(self.header.trim().as_bytes())
             .map_err(|_| format!("'{}' is not a valid HTTP header name", self.header))?;
+        // The task store keeps only secret and header: an explicit scheme
+        // must match the one the header implies, or a reload would verify
+        // under a different scheme.
+        if let Some(scheme) = self.scheme
+            && scheme != WebhookSignatureScheme::default_for(header.as_str())
+        {
+            return Err(format!(
+                "scheme '{}' does not match the scheme '{}' implied by header '{}'",
+                scheme.as_str(),
+                WebhookSignatureScheme::default_for(header.as_str()).as_str(),
+                self.header,
+            ));
+        }
         Ok(Self {
             secret,
             header: header.as_str().to_string(),
+            scheme: self.scheme,
         })
     }
 
-    /// Check the request's signature header against HMAC-SHA256 of its body keyed by `secret`.
+    /// Check the request's signature header under the requirement's scheme:
+    /// the HMAC-SHA256 of its body keyed by `secret`, or the shared secret
+    /// itself (`X-Gitlab-Token`).
     ///
     /// # Errors
     /// Returns [`WebhookSignatureError`] when the header is missing, malformed or does not match.
@@ -89,8 +156,6 @@ impl WebhookSignature {
         secret: &str,
         request: &TaskWebhookRequest,
     ) -> Result<(), WebhookSignatureError> {
-        use hmac::{Hmac, Mac};
-
         let values = request
             .headers
             .get(&self.header)
@@ -98,17 +163,35 @@ impl WebhookSignature {
         let [value] = values.as_slice() else {
             return Err(WebhookSignatureError::Missing);
         };
-        let digest = value.trim();
-        let digest = digest.strip_prefix(SIGNATURE_PREFIX).unwrap_or(digest);
-        let digest = hex::decode(digest).map_err(|_| WebhookSignatureError::Malformed)?;
-        let body = request
-            .body_bytes()
-            .map_err(|_| WebhookSignatureError::Malformed)?;
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts keys of any length");
-        mac.update(&body);
-        mac.verify_slice(&digest)
-            .map_err(|_| WebhookSignatureError::Mismatch)
+        match self.scheme() {
+            WebhookSignatureScheme::Token => {
+                let presented = value.trim();
+                if presented.is_empty() {
+                    return Err(WebhookSignatureError::Missing);
+                }
+                // Different-length secrets mismatch, never panic or leak.
+                if webhook_tokens_match(secret, presented) {
+                    Ok(())
+                } else {
+                    Err(WebhookSignatureError::Mismatch)
+                }
+            }
+            WebhookSignatureScheme::HmacSha256 => {
+                use hmac::{Hmac, Mac};
+
+                let digest = value.trim();
+                let digest = digest.strip_prefix(SIGNATURE_PREFIX).unwrap_or(digest);
+                let digest = hex::decode(digest).map_err(|_| WebhookSignatureError::Malformed)?;
+                let body = request
+                    .body_bytes()
+                    .map_err(|_| WebhookSignatureError::Malformed)?;
+                let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+                    .expect("HMAC accepts keys of any length");
+                mac.update(&body);
+                mac.verify_slice(&digest)
+                    .map_err(|_| WebhookSignatureError::Mismatch)
+            }
+        }
     }
 }
 
@@ -1148,6 +1231,7 @@ mod tests {
         let requirement = super::WebhookSignature {
             secret: "HOOK_SECRET".to_string(),
             header: "X-Hub-Signature-256".to_string(),
+            scheme: None,
         }
         .normalized()
         .expect("signature requirement is valid");
@@ -1184,17 +1268,139 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_token_header_verifies_the_shared_secret() {
+        let requirement = super::WebhookSignature {
+            secret: "GITLAB_HOOK".to_string(),
+            header: "X-Gitlab-Token".to_string(),
+            scheme: None,
+        }
+        .normalized()
+        .expect("signature requirement is valid");
+        assert_eq!(requirement.header, "x-gitlab-token");
+        let verify = |signature: Option<String>| {
+            requirement.verify(
+                "s3cret",
+                &signed_request("x-gitlab-token", signature, br#"{"a":1}"#),
+            )
+        };
+        assert_eq!(verify(Some("s3cret".to_string())), Ok(()));
+        assert_eq!(verify(Some("s3cret ".to_string())), Ok(()));
+        assert_eq!(
+            verify(Some("other".to_string())),
+            Err(super::WebhookSignatureError::Mismatch)
+        );
+        // A different-length secret mismatches, never panics.
+        assert_eq!(
+            verify(Some("s3cret-longer".to_string())),
+            Err(super::WebhookSignatureError::Mismatch)
+        );
+        assert_eq!(
+            verify(Some("s3".to_string())),
+            Err(super::WebhookSignatureError::Mismatch)
+        );
+        assert_eq!(verify(None), Err(super::WebhookSignatureError::Missing));
+        assert_eq!(
+            verify(Some(String::new())),
+            Err(super::WebhookSignatureError::Missing)
+        );
+        assert_eq!(
+            verify(Some("   ".to_string())),
+            Err(super::WebhookSignatureError::Missing)
+        );
+    }
+
+    #[test]
+    fn a_repeated_signature_header_is_missing() {
+        let requirement = super::WebhookSignature {
+            secret: "GITLAB_HOOK".to_string(),
+            header: "x-gitlab-token".to_string(),
+            scheme: None,
+        };
+        let mut request = signed_request("x-gitlab-token", None, b"{}");
+        request.headers.insert(
+            "x-gitlab-token".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(
+            requirement.verify("a", &request),
+            Err(super::WebhookSignatureError::Missing)
+        );
+    }
+
+    #[test]
+    fn an_explicit_scheme_overrides_the_header_default() {
+        // A token scheme on another header compares secrets verbatim;
+        // hmac-sha256 on the GitLab header verifies the body digest.
+        let token = super::WebhookSignature {
+            secret: "S".to_string(),
+            header: "x-hook".to_string(),
+            scheme: Some(super::WebhookSignatureScheme::Token),
+        };
+        let request = signed_request("x-hook", Some("s3cret".to_string()), b"{}");
+        assert_eq!(token.verify("s3cret", &request), Ok(()));
+
+        let hmac = super::WebhookSignature {
+            secret: "S".to_string(),
+            header: "x-gitlab-token".to_string(),
+            scheme: Some(super::WebhookSignatureScheme::HmacSha256),
+        };
+        let body = b"{}";
+        let request = signed_request("x-gitlab-token", Some(sign("s3cret", body)), body);
+        assert_eq!(hmac.verify("s3cret", &request), Ok(()));
+    }
+
+    #[test]
+    fn the_scheme_round_trips_and_defaults_from_the_header() {
+        for (header, scheme) in [
+            ("x-gitlab-token", super::WebhookSignatureScheme::Token),
+            ("X-Gitlab-Token", super::WebhookSignatureScheme::Token),
+            (
+                "x-hub-signature-256",
+                super::WebhookSignatureScheme::HmacSha256,
+            ),
+        ] {
+            let requirement = super::WebhookSignature {
+                secret: "S".to_string(),
+                header: header.to_string(),
+                scheme: None,
+            };
+            assert_eq!(requirement.scheme(), scheme, "{header}");
+            // Serialized without a scheme, older rows keep their meaning.
+            let json = serde_json::to_string(&requirement).expect("serialize");
+            assert!(!json.contains("scheme"), "{json}");
+            let parsed: super::WebhookSignature = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, requirement);
+        }
+        for (text, scheme) in [
+            ("token", super::WebhookSignatureScheme::Token),
+            ("hmac-sha256", super::WebhookSignatureScheme::HmacSha256),
+        ] {
+            let json = format!(r#"{{"secret":"S","header":"x-hook","scheme":"{text}"}}"#);
+            let parsed: super::WebhookSignature = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed.scheme, Some(scheme));
+        }
+    }
+
+    #[test]
     fn signature_requirement_rejects_bad_names() {
         let bad_secret = super::WebhookSignature {
             secret: "not a name".to_string(),
             header: "x-sig".to_string(),
+            scheme: None,
         };
         assert!(bad_secret.normalized().is_err());
         let bad_header = super::WebhookSignature {
             secret: "OK".to_string(),
             header: "bad header".to_string(),
+            scheme: None,
         };
         assert!(bad_header.normalized().is_err());
+        let bad_scheme = super::WebhookSignature {
+            secret: "OK".to_string(),
+            header: "x-hook".to_string(),
+            scheme: Some(super::WebhookSignatureScheme::Token),
+        };
+        assert!(bad_scheme.normalized().is_err());
     }
 
     #[test]

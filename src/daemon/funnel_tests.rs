@@ -172,6 +172,7 @@ async fn create_signed_webhook(state: &DaemonState) -> String {
         signature: Some(WebhookSignature {
             secret: "MAY_TEST_FUNNEL_SECRET_526".to_string(),
             header: "x-hub-signature-256".to_string(),
+            scheme: None,
         }),
     };
     state
