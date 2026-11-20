@@ -699,7 +699,10 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     ));
     tokio::spawn(AutoIndexer::new(state.db.clone(), repo_search.clone()).run());
 
-    wait_for_shutdown(&state.daemon_shutdown).await;
+    wait_for_shutdown(&state).await;
+    // Signal-triggered shutdowns never pass through the endpoint's broadcast,
+    // so release the background loops now that the drain has begun.
+    state.daemon_shutdown.notify_waiters();
     tracing::info!("May daemon shutting down");
     // A pending interaction can never be answered during the drain — release
     // it now so the waiting run settles inside the grace instead of being
@@ -740,9 +743,17 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn wait_for_shutdown(requested: &tokio::sync::Notify) {
+async fn wait_for_shutdown(state: &state::DaemonState) {
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    // Register the waiter before reading `draining` so a shutdown that lands
+    // between the endpoint's flag set and its broadcast cannot slip past.
+    let requested = state.daemon_shutdown.notified();
+    tokio::pin!(requested);
+    requested.as_mut().enable();
+    if state.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         () = async {
@@ -751,7 +762,7 @@ async fn wait_for_shutdown(requested: &tokio::sync::Notify) {
                 None => std::future::pending::<()>().await,
             }
         } => {}
-        () = requested.notified() => {}
+        () = requested => {}
     }
 }
 

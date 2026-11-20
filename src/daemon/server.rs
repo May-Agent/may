@@ -805,7 +805,10 @@ async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Jso
     state
         .draining
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    state.daemon_shutdown.notify_one();
+    // Wake every shutdown waiter — the drain task and the background loops —
+    // not just one; the `draining` flag latches shutdown for waiters that
+    // have not registered yet.
+    state.daemon_shutdown.notify_waiters();
     Ok(Json(super::types::API_OK))
 }
 
