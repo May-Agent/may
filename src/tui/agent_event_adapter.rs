@@ -437,7 +437,8 @@ mod tests {
                 aither_sandbox::Interpreter::Shell,
             ),
         ] {
-            let ToolStartKind::Terminal { interpreter, .. } = parse_tool_start("terminal", arguments)
+            let ToolStartKind::Terminal { interpreter, .. } =
+                parse_tool_start("terminal", arguments)
             else {
                 panic!("expected terminal start event");
             };

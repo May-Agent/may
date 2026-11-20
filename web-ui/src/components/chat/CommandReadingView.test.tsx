@@ -138,6 +138,7 @@ describe('PermissionBody', () => {
     const markup = renderToStaticMarkup(
       <PermissionBody request={{ ...request, script: 'echo hi', reading: unrecognised }} showScript={false} />,
     );
-    expect(markup).toContain('echo hi');
+    // The script highlights as bash; compare the text, not the markup.
+    expect(markup.replace(/<[^>]+>/g, '')).toContain('echo hi');
   });
 });

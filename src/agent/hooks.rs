@@ -136,7 +136,10 @@ impl MayHooks {
 }
 
 impl Hooks for MayHooks {
-    async fn before_tool(&self, call: &ToolInvocation<'_>) -> ToolDecision {
+    fn before_tool(
+        &self,
+        call: &ToolInvocation<'_>,
+    ) -> impl std::future::Future<Output = ToolDecision> + Send {
         if call.name == "terminal"
             && let Some(interpreter) = call
                 .arguments
@@ -145,7 +148,7 @@ impl Hooks for MayHooks {
         {
             self.interpreters.record(call.call.clone(), interpreter);
         }
-        ToolDecision::Allow
+        std::future::ready(ToolDecision::Allow)
     }
 
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {

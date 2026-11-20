@@ -463,7 +463,13 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         }
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
         AppMode::JobDetail(state) => {
-            render_job_detail(frame, sheet, state, &app.chat.assets().highlighting, app.band_bg);
+            render_job_detail(
+                frame,
+                sheet,
+                state,
+                &app.chat.assets().highlighting,
+                app.band_bg,
+            );
         }
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state, app.band_bg),
         AppMode::Progress(state) => render_progress_popup(frame, sheet, state, app.band_bg),
@@ -3669,7 +3675,7 @@ mod tests {
                     state,
                     &super::super::highlight::Highlighting::default(),
                     None,
-                )
+                );
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();

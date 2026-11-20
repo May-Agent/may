@@ -175,12 +175,9 @@ fn project_fields(fields: &Value, variant: ToolVariant, complete: bool) -> ToolS
                 .map(CommandReading::of);
             let interpreter = complete
                 .then(|| {
-                    fields
-                        .get("interpreter")
-                        .and_then(|value| {
-                            serde_json::from_value::<aither_sandbox::Interpreter>(value.clone())
-                                .ok()
-                        })
+                    fields.get("interpreter").and_then(|value| {
+                        serde_json::from_value::<aither_sandbox::Interpreter>(value.clone()).ok()
+                    })
                 })
                 .flatten()
                 .map(|interpreter| interpreter_name(interpreter).to_string());
@@ -283,7 +280,10 @@ mod tests {
             ),
             (r#"{"description":"d","script":"echo hi"}"#, None),
             // A value no Interpreter deserializes stays absent → shell.
-            (r#"{"description":"d","script":"x","interpreter":"node"}"#, None),
+            (
+                r#"{"description":"d","script":"x","interpreter":"node"}"#,
+                None,
+            ),
         ] {
             assert_eq!(
                 project_tool_summary(arguments, ToolVariant::Terminal)

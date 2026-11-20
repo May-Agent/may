@@ -310,7 +310,10 @@ impl PermissionApprover {
     /// Share the record of each `terminal` call's interpreter, so a request
     /// for a call shows its script in that call's language.
     #[must_use]
-    pub fn with_interpreters(mut self, interpreters: crate::agent::hooks::CallInterpreters) -> Self {
+    pub fn with_interpreters(
+        mut self,
+        interpreters: crate::agent::hooks::CallInterpreters,
+    ) -> Self {
         self.interpreters = interpreters;
         self
     }
@@ -618,9 +621,7 @@ impl Approver for PermissionApprover {
             UNSANDBOXED_KIND,
             "the permission approver answers scripts that run outside the sandbox"
         );
-        let interpreter = request
-            .call()
-            .and_then(|call| self.interpreters.get(call));
+        let interpreter = request.call().and_then(|call| self.interpreters.get(call));
         match self
             .request_and_wait(
                 SandboxMode::Unsandboxed,
