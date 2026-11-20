@@ -152,6 +152,11 @@ fn resolve_model_selector(
 /// stream before aborting so a hanging upstream cannot wedge a session.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Longest a provider's non-stream wait — building a client (auth refresh,
+/// discovery) or answering a profile or token-count call — may run before
+/// it is failed: none of it is bounded downstream like the response stream.
+const PROVIDER_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Why a [`RedactedModel`] request failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RedactedError<E> {
@@ -224,6 +229,27 @@ impl<M> RedactedModel<M> {
     }
 }
 
+/// Fails `fut` with `on_timeout` when it has not finished within `timeout`.
+pub async fn bounded<T, E>(
+    timeout: std::time::Duration,
+    fut: impl Future<Output = Result<T, E>>,
+    on_timeout: impl FnOnce(std::time::Duration) -> E,
+) -> Result<T, E> {
+    enum Out<T, E> {
+        Value(Result<T, E>),
+        Timeout,
+    }
+    match futures_lite::future::race(async { Out::Value(fut.await) }, async {
+        async_io::Timer::after(timeout).await;
+        Out::Timeout
+    })
+    .await
+    {
+        Out::Value(result) => result,
+        Out::Timeout => Err(on_timeout(timeout)),
+    }
+}
+
 /// Aborts `stream` with [`RedactedError::StreamTimeout`] if no item arrives
 /// within `timeout`.
 fn with_stream_idle_timeout<S, E>(
@@ -285,7 +311,12 @@ where
     }
 
     async fn profile(&self) -> Result<ModelProfile, Self::Error> {
-        let mut profile = self.inner.profile().await.map_err(RedactedError::Model)?;
+        let mut profile = bounded(
+            PROVIDER_SETUP_TIMEOUT,
+            Box::pin(async { self.inner.profile().await.map_err(RedactedError::Model) }),
+            RedactedError::StreamTimeout,
+        )
+        .await?;
         if let Some(window) = self.context_window {
             profile.context_length = window;
         }
@@ -310,10 +341,17 @@ where
                 .await
                 .map_err(|error| GenerateError::Provider(RedactedError::Secrets(error)))?;
             redactions.redact_request(&mut request);
-            self.inner
-                .count_tokens(&request)
-                .await
-                .map_err(RedactedError::of_count)
+            bounded(
+                PROVIDER_SETUP_TIMEOUT,
+                Box::pin(async {
+                    self.inner
+                        .count_tokens(&request)
+                        .await
+                        .map_err(RedactedError::of_count)
+                }),
+                |timeout| GenerateError::Provider(RedactedError::StreamTimeout(timeout)),
+            )
+            .await
         }
     }
 
@@ -786,6 +824,26 @@ pub async fn build_fast_provider_chain(
 /// Build a `CloudProvider` from a resolved provider directly, behind the
 /// secret redaction of `redactor`.
 pub(super) async fn build_cloud_provider_from_instance(
+    id: &str,
+    provider: &ResolvedProvider,
+    model: &str,
+    redactor: &SecretRedactor,
+) -> Result<ProviderLlm, MayAgentError> {
+    bounded(
+        PROVIDER_SETUP_TIMEOUT,
+        Box::pin(build_cloud_provider_from_instance_inner(
+            id, provider, model, redactor,
+        )),
+        |timeout| MayAgentError::ProviderTimeout {
+            provider_id: id.to_string(),
+            timeout,
+        },
+    )
+    .await
+}
+
+/// [`build_cloud_provider_from_instance`] under its setup bound.
+async fn build_cloud_provider_from_instance_inner(
     id: &str,
     provider: &ResolvedProvider,
     model: &str,

@@ -207,8 +207,15 @@ pub fn has_credentials() -> bool {
     token_path().is_ok_and(|p| p.exists())
 }
 
+/// Longest one xAI auth call may take: it runs before the response stream
+/// exists, so nothing downstream bounds it.
+const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn http() -> reqwest::Client {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .timeout(AUTH_REQUEST_TIMEOUT)
+        .build()
+        .expect("the HTTP client builds with its default configuration")
 }
 
 async fn read_json_or_error<T: serde::de::DeserializeOwned>(

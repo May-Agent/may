@@ -732,9 +732,10 @@ enum RetryKind {
 }
 
 /// What a retried attempt waits out before resubmitting.
+#[derive(Clone, Copy)]
 enum RetryWait {
     /// The short backoff before the next provider candidate.
-    Failover,
+    Failover { wait: Duration },
     /// The backoff before resubmitting to the same provider candidate;
     /// `retry` counts the retries on it, this one included.
     SameProvider { wait: Duration, retry: u32 },
@@ -742,6 +743,44 @@ enum RetryWait {
     QuotaReset(jiff::Timestamp),
     /// The network's return, on the same provider candidate.
     Network,
+}
+
+/// Announces `wait`'s hold on `sink`, then waits it out against run
+/// cancellation. `Err` is why the run was cancelled while held.
+async fn hold_retry_wait(
+    state: &Arc<DaemonState>,
+    sink: &mut impl ChatSink,
+    guard: &SessionRunGuard,
+    wait: RetryWait,
+    err_msg: &str,
+) -> Result<(), &'static str> {
+    match wait {
+        RetryWait::Failover { wait } => {
+            tokio::time::sleep(wait).await;
+            Ok(())
+        }
+        RetryWait::SameProvider { wait, retry } => {
+            let until = jiff::Timestamp::now()
+                .checked_add(wait)
+                .expect("a retry wait is far below the timestamp range");
+            let _ = sink
+                .on_hold(crate::client::HoldReason::Retry { until, retry }, err_msg)
+                .await;
+            wait_or_cancel(guard, wait).await
+        }
+        RetryWait::QuotaReset(until) => {
+            let _ = sink
+                .on_hold(crate::client::HoldReason::Quota { until }, err_msg)
+                .await;
+            wait_quota_reset(guard, until).await
+        }
+        RetryWait::Network => {
+            let _ = sink
+                .on_hold(crate::client::HoldReason::Network, err_msg)
+                .await;
+            wait_online_or_cancel(guard, &state.connectivity).await
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2356,6 +2395,59 @@ fn run_agent_loop_attempts<'a>(
                         )
                         .await;
                     }
+                    // A provider wait that timed out or failed at the
+                    // transport is the same failure a request would meet:
+                    // it holds and resubmits like one — nothing was
+                    // submitted, so the resubmit loses nothing.
+                    if let Some(failure) = error.provider_failure() {
+                        let retry_wait = match retry::decide(
+                            Some(&failure),
+                            // Nothing ran: no cache state is known and no
+                            // other candidate was tried, so the resubmit
+                            // stays on this candidate.
+                            aither_agent::CacheState::Cold,
+                            false,
+                            same_provider_retries,
+                            state.connectivity.is_online(),
+                        ) {
+                            retry::RetryDecision::SameProvider { wait } => {
+                                Some(RetryWait::SameProvider {
+                                    wait,
+                                    retry: same_provider_retries + 1,
+                                })
+                            }
+                            retry::RetryDecision::WaitForNetwork => Some(RetryWait::Network),
+                            _ => None,
+                        };
+                        if let Some(wait) = retry_wait {
+                            sink.on_prepared(turn_user_message_id);
+                            let err_msg = error.to_string();
+                            match hold_retry_wait(state, &mut *sink, guard, wait, &err_msg).await {
+                                Ok(()) => {
+                                    same_provider_retries = match wait {
+                                        RetryWait::SameProvider { retry, .. } => retry,
+                                        _ => 0,
+                                    };
+                                    attempt += 1;
+                                    continue;
+                                }
+                                Err(reason) => {
+                                    return finish_cancelled_preparation(
+                                        state,
+                                        req,
+                                        &mut *sink,
+                                        guard,
+                                        kind,
+                                        turn_boundary,
+                                        continue_from_transcript,
+                                        turn_consumed_alerts,
+                                        reason,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
                     // Clients waiting for the run's start see it fail.
                     sink.on_prepared(turn_user_message_id);
                     let _ = sink
@@ -2611,7 +2703,9 @@ fn run_agent_loop_attempts<'a>(
                         wait,
                         retry: same_provider_retries + 1,
                     }),
-                    retry::RetryDecision::NextProvider => Some(RetryWait::Failover),
+                    retry::RetryDecision::NextProvider => Some(RetryWait::Failover {
+                        wait: Duration::from_millis(RETRY_BACKOFF_MS * (candidate as u64 + 1)),
+                    }),
                     retry::RetryDecision::QuotaReset => state
                         .config_snapshot()
                         .preferences
@@ -2633,50 +2727,24 @@ fn run_agent_loop_attempts<'a>(
                     if kind == RetryKind::Resubmit && !full_text.is_empty() {
                         let _ = sink.on_retract().await;
                     }
+                    if let Err(reason) =
+                        hold_retry_wait(state, &mut *sink, guard, wait, &err_msg).await
+                    {
+                        cancellation_reason = Some(reason);
+                    }
                     match wait {
-                        RetryWait::Failover => {
-                            tokio::time::sleep(Duration::from_millis(
-                                RETRY_BACKOFF_MS * (candidate as u64 + 1),
-                            ))
-                            .await;
+                        RetryWait::Failover { .. } => {
                             candidate += 1;
                             same_provider_retries = 0;
                             candidate_warmth = None;
                         }
-                        RetryWait::SameProvider { wait, retry } => {
-                            let until = jiff::Timestamp::now()
-                                .checked_add(wait)
-                                .expect("a retry wait is far below the timestamp range");
-                            let _ = sink
-                                .on_hold(
-                                    crate::client::HoldReason::Retry { until, retry },
-                                    &err_msg,
-                                )
-                                .await;
-                            if let Err(reason) = wait_or_cancel(guard, wait).await {
-                                cancellation_reason = Some(reason);
-                            }
+                        RetryWait::SameProvider { retry, .. } => {
                             same_provider_retries = retry;
                         }
-                        RetryWait::QuotaReset(until) => {
-                            let _ = sink
-                                .on_hold(crate::client::HoldReason::Quota { until }, &err_msg)
-                                .await;
-                            if let Err(reason) = wait_quota_reset(guard, until).await {
-                                cancellation_reason = Some(reason);
-                            }
-                        }
+                        RetryWait::QuotaReset(_) => {}
+                        // The outage says nothing about the provider: the
+                        // next failure starts its backoff afresh.
                         RetryWait::Network => {
-                            let _ = sink
-                                .on_hold(crate::client::HoldReason::Network, &err_msg)
-                                .await;
-                            if let Err(reason) =
-                                wait_online_or_cancel(guard, &state.connectivity).await
-                            {
-                                cancellation_reason = Some(reason);
-                            }
-                            // The outage says nothing about the provider: the
-                            // next failure starts its backoff afresh.
                             same_provider_retries = 0;
                         }
                     }
@@ -3484,6 +3552,28 @@ pub(super) enum UiChatPreparationError {
     RepoGate(#[source] crate::repo_gate::GateError),
     #[error("the session did not start: it was not allowed to work in this repository")]
     RepoGateDeclined,
+}
+
+impl UiChatPreparationError {
+    /// The provider-facing wait that failed this preparation — an auth
+    /// refresh or a discovery request that timed out or never connected —
+    /// as the failure a request would have produced. `None` when the turn
+    /// failed for a reason a resubmit cannot fix: configuration, storage,
+    /// or a refusal.
+    fn provider_failure(&self) -> Option<Failure> {
+        match self {
+            Self::BuildAgent(crate::agent::MayAgentError::ProviderTimeout { .. }) => {
+                Some(Failure::transient())
+            }
+            Self::BuildAgent(crate::agent::MayAgentError::GrokAuth(
+                crate::grok::GrokAuthError::Http(error),
+            )) if error.is_timeout() => Some(Failure::transient()),
+            Self::BuildAgent(crate::agent::MayAgentError::GrokAuth(
+                crate::grok::GrokAuthError::Http(error),
+            )) if error.is_connect() => Some(Failure::network()),
+            _ => None,
+        }
+    }
 }
 
 /// Puts the session gate's questions to the user through the session's
