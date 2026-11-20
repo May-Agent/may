@@ -183,6 +183,64 @@ async fn a_prompt_a_run_blocks_on_announces_its_question() {
     waiting.abort();
 }
 
+/// The asking run that goes away before an answer arrives leaves no
+/// blocking prompt behind: its persisted request is cleared and the
+/// session returns to idle instead of pinning itself to
+/// `waiting_ask_user` forever.
+#[tokio::test]
+async fn a_blocking_prompt_is_cleared_when_the_asking_run_is_gone() {
+    let mut fixture = Fixture::new().await;
+    let approver = AskUserApprover::new().with_runtime_service(fixture.runtime.clone());
+    let (broker, queue) = crate::harness::ask_user::channel();
+    tokio::spawn(async move {
+        while let Some(request) = queue.next().await {
+            approver.enqueue(request, None).await;
+        }
+    });
+    let asking = tokio::spawn(async move {
+        broker
+            .request(AskUserRequestPayload {
+                session_id: "session".to_owned(),
+                request: AskUserArgs {
+                    question: Some("Proceed?".to_owned()),
+                    option: vec!["yes".to_owned()],
+                    multi_select: false,
+                    questions: Vec::new(),
+                },
+            })
+            .await
+    });
+
+    assert!(matches!(
+        fixture.announced().await.ask,
+        UserAsk::Question { .. }
+    ));
+    assert!(
+        fixture
+            .runtime
+            .get("session")
+            .await
+            .expect("runtime")
+            .waiting_ask_user
+            .is_some(),
+        "the prompt blocks the session while the asker waits"
+    );
+
+    asking.abort();
+    let summary = tokio::time::timeout(WAIT_BOUND, async {
+        loop {
+            let summary = fixture.runtime.get("session").await.expect("runtime");
+            if summary.waiting_ask_user.is_none() {
+                break summary;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the prompt is cleared once the asker is gone");
+    assert_eq!(summary.state, crate::session::SessionRuntimeState::Idle);
+}
+
 #[tokio::test]
 async fn an_open_question_announces_itself() {
     let mut fixture = Fixture::new().await;

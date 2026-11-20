@@ -40,6 +40,18 @@ impl<Args, Response> ToolRequest<Args, Response> {
     }
 }
 
+impl<Args: Sync, Response: Send> ToolRequest<Args, Response> {
+    /// Resolves once the requester has dropped its response receiver.
+    ///
+    /// The bounds keep the returned future `Send`: `&self` crosses the
+    /// call, so `ToolRequest` must be `Sync`, and the wait borrows the
+    /// response channel's sender, which is `Send` only when `Response`
+    /// is.
+    pub async fn closed(&self) {
+        self.response_tx.clone().closed().await;
+    }
+}
+
 /// Request broker for UI-mediated tools.
 #[derive(Debug, Clone)]
 pub struct ToolRequestBroker<Args, Response> {
