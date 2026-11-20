@@ -14,6 +14,7 @@ pub enum SlashCommand {
     Archive,
     New,
     Chat,
+    Gui,
     Profile,
     Model,
     Effort,
@@ -62,12 +63,13 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::Help,
         Self::Session,
         Self::Archive,
         Self::New,
         Self::Chat,
+        Self::Gui,
         Self::Profile,
         Self::Model,
         Self::Effort,
@@ -116,6 +118,7 @@ impl SlashCommand {
                 "Start a new session, optionally on a repository",
             ),
             Self::Chat => ("/chat", "", "Start a new repo-less chat"),
+            Self::Gui => ("/gui", "", "Open this session in the web UI"),
             Self::Profile => ("/profile", "", "Switch profile (Ctrl+P)"),
             Self::Model => ("/model", "[query]", "Switch model for this session"),
             Self::Effort => ("/effort", "", "Adjust reasoning effort for this session"),

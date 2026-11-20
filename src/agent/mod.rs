@@ -64,6 +64,7 @@ pub mod runner;
 mod runtime_context;
 #[cfg(test)]
 mod secret_redaction_tests;
+pub(crate) mod serve_tool;
 mod session_find;
 mod session_model;
 /// Session tool registration for the agent.

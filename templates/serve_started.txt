@@ -1,0 +1,11 @@
+The service is running as background task `{{ task_id }}`. It has no timeout and lives until it exits, `terminal_kill` stops it or the session ends. `terminal_read` reads its output.
+{% if let Some(tunnel) = tunnel %}
+The user can open it at {{ tunnel.local_url }}; emit the link as `<tunnel id="{{ tunnel.id }}" />`.
+{% endif %}
+{% if let Some(ready) = ready %}
+{%- if ready -%}
+Its output matched --ready-regex; the service reports ready.
+{%- else -%}
+No --ready-regex match within the wait; check `terminal_read` for its startup output before reporting it up.
+{%- endif -%}
+{% endif %}
