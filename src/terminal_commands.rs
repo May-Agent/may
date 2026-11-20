@@ -148,6 +148,13 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened: it alone gets `global-rules`.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// Builds a model for an explicit `provider::model` selector, serving
+    /// `subagent --model` and `model = "..."` definitions; `None` refuses
+    /// both.
+    pub subagent_models: Option<crate::subagent::SubagentModelResolver<LLM>>,
+    /// What the `models` command lists; `None` leaves `models`
+    /// unregistered.
+    pub model_listing: Option<crate::agent::models_tool::ModelListing>,
     /// Handles every session of the host shares.
     pub services: SharedServices,
 }
@@ -599,6 +606,7 @@ where
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
         tiers,
+        models: config.subagent_models.clone(),
         definitions: crate::bundle::Bundle::subagent_definitions()
             .into_iter()
             .map(|definition| (definition.name.clone(), definition))
@@ -652,6 +660,13 @@ where
             ))
         });
     });
+
+    if let Some(listing) = config.model_listing {
+        // `subagent --model` is the main agent's choice; its catalog is too.
+        let models = crate::agent::models_tool::ModelsTool::new(listing);
+        describe_tool(&mut descriptions, &models);
+        builder.main_only(|reserved| reserved.configure_tool(models));
+    }
 
     // An MCP server's tools are a command set: the registry reads its tool
     // list at every lookup, so a tool the server adds mid-session runs at
@@ -862,6 +877,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -959,6 +976,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1029,6 +1048,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1093,6 +1114,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1152,6 +1175,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1324,6 +1349,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1454,6 +1481,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1515,6 +1544,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1580,6 +1611,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

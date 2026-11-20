@@ -190,6 +190,9 @@ pub struct App {
     pub model_select_list: Vec<String>,
     /// Search query in the model select popup
     pub model_select_query: String,
+    /// Whether the model select popup also lists models a newer generation
+    /// of their line replaced; `!` toggles it.
+    pub model_select_show_outdated: bool,
     /// Last fetched provider catalog; seeds the next `/model` open so the
     /// picker does not paint the configured-only list while a fetch lands
     pub model_catalog: Vec<FetchedModel>,
@@ -234,6 +237,9 @@ pub struct App {
     pub tier_picker_models: Vec<FetchedModel>,
     /// Filtered models based on search query
     pub tier_picker_filtered: Vec<usize>,
+    /// Whether the picker also lists models a newer generation of their
+    /// line replaced; `!` toggles it.
+    pub tier_picker_show_outdated: bool,
     /// Selected index in filtered list
     pub tier_picker_selected: usize,
     /// Search query in tier picker
@@ -687,6 +693,7 @@ impl App {
             model_select_index: 0,
             model_select_list: Vec::new(),
             model_select_query: String::new(),
+            model_select_show_outdated: false,
             model_catalog: Vec::new(),
             effort_ladder: Vec::new(),
             family_effort_rungs: std::collections::HashMap::new(),
@@ -707,6 +714,7 @@ impl App {
             tier_picker_tier: None,
             tier_picker_models: Vec::new(),
             tier_picker_filtered: Vec::new(),
+            tier_picker_show_outdated: false,
             tier_picker_selected: 0,
             tier_picker_query: String::new(),
             tier_picker_loading: false,

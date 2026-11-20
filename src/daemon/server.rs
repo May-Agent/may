@@ -858,6 +858,8 @@ fn build_models_response(
     let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
     let mut family_rungs = crate::models::FamilyEffortRungs::new();
     crate::models::record_family_effort_rungs(&mut family_rungs, &fetched);
+    let registry = aither_models::ModelRegistry::bundled();
+    let outdated_index = crate::models::OutdatedIndex::of(registry);
 
     for item in fetched {
         let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
@@ -875,6 +877,7 @@ fn build_models_response(
                 &item.abilities,
             ),
             abilities: item.abilities,
+            outdated: item.outdated,
         };
         model_map
             .entry(selector)
@@ -923,6 +926,7 @@ fn build_models_response(
                         &abilities,
                     ),
                     abilities,
+                    outdated: outdated_index.is_outdated_id(registry, selector.model_id()),
                 }
             });
         }
@@ -1000,6 +1004,7 @@ fn build_provider_models_response(
                 context_window: item.context_window,
                 effort_ladder,
                 abilities: item.abilities,
+                outdated: item.outdated,
             });
     }
 
@@ -1059,6 +1064,7 @@ mod tests {
             context_window: None,
             abilities: abilities.iter().map(ToString::to_string).collect(),
             provider_id: "relay".to_string(),
+            outdated: false,
         }
     }
 

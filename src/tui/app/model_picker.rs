@@ -42,6 +42,12 @@ impl App {
                         (self.tier_picker_selected + 1).min(self.tier_picker_filtered.len() - 1);
                 }
             }
+            KeyCode::Char('!') => {
+                // A model retired or superseded by a newer generation of its
+                // line stays pickable — the picker only hides it by default.
+                self.tier_picker_show_outdated = !self.tier_picker_show_outdated;
+                self.update_tier_picker_filter();
+            }
             KeyCode::Backspace => {
                 self.tier_picker_query.pop();
                 self.update_tier_picker_filter();
@@ -58,12 +64,14 @@ impl App {
     /// Update tier picker filtered list based on query.
     pub(super) fn update_tier_picker_filter(&mut self) {
         let query_lower = self.tier_picker_query.to_lowercase();
+        let show_outdated = self.tier_picker_show_outdated;
         self.tier_picker_filtered = self
             .tier_picker_models
             .iter()
             .enumerate()
             .filter(|(_, model)| {
-                query_lower.is_empty() || model.id.to_lowercase().contains(&query_lower)
+                (show_outdated || !model.outdated)
+                    && (query_lower.is_empty() || model.id.to_lowercase().contains(&query_lower))
             })
             .map(|(i, _)| i)
             .collect();
@@ -152,6 +160,9 @@ impl App {
         self.model_select_list
             .retain(|entry| seen.insert(entry.clone()));
         for model in &models {
+            if model.outdated && !self.model_select_show_outdated {
+                continue;
+            }
             let id =
                 family_base_of(&model.provider_id, &model.id).unwrap_or_else(|| model.id.clone());
             let selector = crate::ModelSelector::new(&model.provider_id, &id).to_string();
@@ -306,6 +317,14 @@ impl App {
                             if self.model_select_index + 1 < filtered_len {
                                 self.model_select_index += 1;
                             }
+                            return None;
+                        }
+                        '!' => {
+                            // Retired or superseded models stay selectable —
+                            // the picker only hides them by default.
+                            self.model_select_show_outdated = !self.model_select_show_outdated;
+                            let catalog = self.model_catalog.clone();
+                            self.merge_model_select_models(catalog);
                             return None;
                         }
                         _ => {}

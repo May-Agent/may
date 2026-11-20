@@ -883,8 +883,20 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
             })
             .collect();
 
+        let hidden = if app.tier_picker_show_outdated {
+            0
+        } else {
+            app.tier_picker_models
+                .iter()
+                .filter(|model| model.outdated)
+                .count()
+        };
         let title = if total > 0 {
-            format!(" {tier_name} ({total}) ")
+            if hidden > 0 {
+                format!(" {tier_name} ({total}, {hidden} outdated hidden, ! shows all) ")
+            } else {
+                format!(" {tier_name} ({total}) ")
+            }
         } else {
             format!(" {tier_name} (no models) ")
         };

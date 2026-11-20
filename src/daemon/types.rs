@@ -1317,6 +1317,9 @@ pub struct ModelInfoItem {
     /// The reasoning-effort levels the model accepts, lowest first; empty
     /// when the model has no effort control.
     pub(crate) effort_ladder: Vec<String>,
+    /// Retired by its provider or superseded by a newer generation of its
+    /// line; pickers hide it by default.
+    pub(crate) outdated: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
