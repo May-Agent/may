@@ -230,7 +230,7 @@ impl<M> RedactedModel<M> {
 }
 
 /// Fails `fut` with `on_timeout` when it has not finished within `timeout`.
-pub(crate) async fn bounded<T, E>(
+pub async fn bounded<T, E>(
     timeout: std::time::Duration,
     fut: impl Future<Output = Result<T, E>>,
     on_timeout: impl FnOnce(std::time::Duration) -> E,
@@ -313,7 +313,7 @@ where
     async fn profile(&self) -> Result<ModelProfile, Self::Error> {
         let mut profile = bounded(
             PROVIDER_SETUP_TIMEOUT,
-            async { self.inner.profile().await.map_err(RedactedError::Model) },
+            Box::pin(async { self.inner.profile().await.map_err(RedactedError::Model) }),
             RedactedError::StreamTimeout,
         )
         .await?;
@@ -343,12 +343,12 @@ where
             redactions.redact_request(&mut request);
             bounded(
                 PROVIDER_SETUP_TIMEOUT,
-                async {
+                Box::pin(async {
                     self.inner
                         .count_tokens(&request)
                         .await
                         .map_err(RedactedError::of_count)
-                },
+                }),
                 |timeout| GenerateError::Provider(RedactedError::StreamTimeout(timeout)),
             )
             .await
@@ -831,7 +831,9 @@ pub(super) async fn build_cloud_provider_from_instance(
 ) -> Result<ProviderLlm, MayAgentError> {
     bounded(
         PROVIDER_SETUP_TIMEOUT,
-        build_cloud_provider_from_instance_inner(id, provider, model, redactor),
+        Box::pin(build_cloud_provider_from_instance_inner(
+            id, provider, model, redactor,
+        )),
         |timeout| MayAgentError::ProviderTimeout {
             provider_id: id.to_string(),
             timeout,
