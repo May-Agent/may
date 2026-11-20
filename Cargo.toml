@@ -345,6 +345,13 @@ opt-level = 3
 [profile.dev.package.lzma-rust2]
 opt-level = 3
 
+# The check jobs compile nothing for debugging: clippy skips debuginfo and
+# incremental state entirely, which halves what each check run carries.
+[profile.ci-check]
+inherits = "dev"
+debug = false
+incremental = false
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

@@ -26,10 +26,25 @@ runs:
           echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
           exit 1
         fi
+    # mv returns at once and the delete runs in the background while the
+    # toolchain installs; rm -rf used to block checkout for up to two minutes.
     - name: Free runner disk
       if: runner.os == 'Linux'
       shell: bash
-      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      run: |
+        sudo bash -c 'for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+          mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
+        done
+        rm -rf /tmp/gc-* &'
+    # The default linker spends minutes on the multi-GB test binaries; mold
+    # is preinstalled on the hosted runners and links them in seconds.
+    - name: Link test binaries with mold
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      shell: bash
+      run: |
+        if command -v mold > /dev/null; then
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "${GITHUB_ENV}"
+        fi
     - uses: dtolnay/rust-toolchain@stable
     # Only main saves; a PR or merge-group cache lives in a scope nothing else
     # restores, and its size evicts main's under the cache limit. Keyed by the
@@ -112,3 +127,17 @@ runs:
       with:
         path: ${{ steps.downloads.outputs.tools-path }}
         key: ${{ steps.downloads.outputs.tools-key }}
+    # The Rust cache this job saves is written after the run, so every
+    # earlier generation under the job's prefix can go now; without this the
+    # generations accumulate past the repository's cache quota and evict the
+    # hot one.
+    - name: Retire superseded Rust caches
+      if: github.ref == 'refs/heads/main'
+      shell: bash
+      run: |
+        prefix="v0-rust-${{ github.job }}-"
+        gh api --paginate "repos/${{ github.repository }}/actions/caches?key=${prefix}" \
+          -q ".actions_caches[] | select(.key | startswith(\"${prefix}\")) | .id" \
+          | while read -r id; do
+              gh api -X DELETE "repos/${{ github.repository }}/actions/caches/${id}" || true
+            done
