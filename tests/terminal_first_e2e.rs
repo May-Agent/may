@@ -4024,7 +4024,9 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         &client,
         &server,
         &session_id,
-        Duration::from_secs(10) + environment.first_turn_allowance(),
+        // The first terminal dispatch competes with the rest of the parallel
+        // pool for the runner's CPU, and 10s was observed to be too tight.
+        Duration::from_secs(30) + environment.first_turn_allowance(),
         "terminal runtime to expose taskId and outputFile",
         |runtime| {
             let terminal = runtime
