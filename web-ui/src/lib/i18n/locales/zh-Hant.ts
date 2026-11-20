@@ -46,13 +46,14 @@ export const zhHant: Messages = {
   sidebar: {
     newChat: '新對話',
     newChatRepo: {
-      title: '在 GitHub repo 開始新對話',
+      title: '在 repo 開始新對話',
       description: '建立綁定 repo 的 session — 不需要本地 checkout。',
       search: '搜尋 repo…',
       empty: '沒有符合的 repo',
       recent: '最近使用',
       all: '你的 repo',
-      unauthenticated: '此機器尚未登入 GitHub。請執行 `gh auth login` 後重新開啟此清單。',
+      unauthenticated:
+        '此機器尚未登入任何 forge 主機。請在「設定 → Forge」或 `/login` 設定 GitHub / GitLab 存取後重新開啟此清單。',
     },
     newChatInRepo: '在 {repo} 開始新對話',
     orphanedPrs: '孤立的 PR',

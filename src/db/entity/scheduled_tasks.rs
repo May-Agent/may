@@ -94,6 +94,7 @@ impl Model {
             (Some(secret), Some(header)) => Some(crate::task_trigger::WebhookSignature {
                 secret: secret.clone(),
                 header: header.clone(),
+                scheme: None,
             }),
             _ => None,
         };

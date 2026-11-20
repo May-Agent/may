@@ -44,13 +44,14 @@ export const enUS = {
   sidebar: {
     newChat: 'New chat',
     newChatRepo: {
-      title: 'New chat in a GitHub repo',
+      title: 'New chat in a repository',
       description: 'Start a session bound to a repository — no local checkout needed.',
       search: 'Search repositories…',
       empty: 'No matching repositories',
       recent: 'Recently used',
       all: 'Your repositories',
-      unauthenticated: 'GitHub is not signed in on this machine. Run `gh auth login` and reopen this list.',
+      unauthenticated:
+        'No forge host is signed in on this machine. Configure GitHub or GitLab access under Settings → Forge or `/login`, then reopen this list.',
     },
     newChatInRepo: 'New chat in {repo}',
     orphanedPrs: 'Orphaned PRs',

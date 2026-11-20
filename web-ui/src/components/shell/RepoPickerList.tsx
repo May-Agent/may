@@ -1,7 +1,7 @@
-import { Github, Loader2 } from 'lucide-react';
+import { Github, Gitlab, Loader2 } from 'lucide-react';
 import { Command } from 'cmdk';
 import type { GithubRepo } from '@/lib/api/githubRepos';
-import { filterRepos } from '@/lib/repo';
+import { filterRepos, repoBinding, repoForge } from '@/lib/repo';
 
 export type RepoListState =
   | { status: 'loading' }
@@ -22,8 +22,8 @@ interface RepoPickerListProps {
   state: RepoListState;
   query: string;
   onQueryChange: (query: string) => void;
-  /** Called with `owner/repo` of the picked entry. */
-  onPick: (fullName: string) => void;
+  /** Called with the canonical binding of the picked entry. */
+  onPick: (binding: string) => void;
   busy?: boolean;
   labels: RepoPickerLabels;
 }
@@ -56,10 +56,14 @@ export function RepoPickerList({
             key={repo.fullName}
             value={repo.fullName}
             disabled={busy}
-            onSelect={() => onPick(repo.fullName)}
+            onSelect={() => onPick(repoBinding(repo))}
             className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[13px] normal-case tracking-normal text-foreground aria-selected:bg-accent data-[disabled=true]:opacity-50"
           >
-            <Github className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            {repoForge(repo) === 'gitlab' ? (
+              <Gitlab className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            ) : (
+              <Github className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            )}
             <span className="truncate">{repo.fullName}</span>
           </Command.Item>
         ))}

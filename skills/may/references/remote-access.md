@@ -18,7 +18,7 @@ Remote access refuses to start while any local-environment profile exists, and t
 
 ## Funnel (public webhooks)
 
-`[remote_access] funnel = true` runs `tailscale funnel` for `/api/tasks/webhook` only, on `funnel_port` (443, 8443 or 10000; default 443), through a separate loopback listener whose router holds the webhook routes and nothing else. It must differ from `https_port` while remote access is enabled (Funnel exposes its whole port), and it is blocked by local profiles in the same way. Deliveries authenticate by token and signature; bodies larger than `webhook_max_body_bytes` (default 25 MiB) are refused with 413.
+`[remote_access] funnel = true` runs `tailscale funnel` for `/api/tasks/webhook` only, on `funnel_port` (443, 8443 or 10000; default 443), through a separate loopback listener whose router holds the webhook routes and nothing else. It must differ from `https_port` while remote access is enabled (Funnel exposes its whole port), and it is blocked by local profiles in the same way. Deliveries authenticate by token and signature; bodies larger than `webhook_max_body_bytes` (default 25 MiB) are refused with 413. A task's webhook signature names a header: `X-Hub-Signature-256` (or any other) verifies an HMAC-SHA256 of the body, with an optional `sha256=` prefix, while `X-Gitlab-Token` verifies GitLab's static secret token; either comparison is constant-time.
 
 ## Settings
 

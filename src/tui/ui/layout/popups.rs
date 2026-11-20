@@ -442,7 +442,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     let title = match app.skill_add_mode {
         SkillAddMode::None => " Skills ",
-        SkillAddMode::GitHubRepo => " Install Skill from GitHub ",
+        SkillAddMode::ForgeRepo => " Install Skill from a Repository ",
     };
 
     // Render the border block
@@ -479,7 +479,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                     )));
                     skill_lines.push(Line::from(""));
                     skill_lines.push(Line::from(Span::styled(
-                        "Press 'a' to install from GitHub.",
+                        "Press 'a' to install from a repository.",
                         Style::default().fg(Color::Yellow),
                     )));
                 } else {
@@ -520,12 +520,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
 
                     let source_str = match &skill.source {
                         crate::skill::SkillSource::Bundled => String::new(),
-                        crate::skill::SkillSource::GitHub { owner, repo } => {
-                            format!(" ({owner}/{repo})")
-                        }
-                        crate::skill::SkillSource::LocalPath { path } => {
-                            format!(" (local:{path})")
-                        }
+                        source => format!(" ({source})"),
                     };
 
                     let line = Line::from(vec![
@@ -599,21 +594,21 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
             };
             frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
         }
-        SkillAddMode::GitHubRepo => {
+        SkillAddMode::ForgeRepo => {
             let content = vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter repository (owner/repo):",
+                    "Enter repository (owner/repo or github:/gitlab: binding):",
                     Style::default().fg(Color::White),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("> {}", app.skill_github_input),
+                    format!("> {}", app.skill_repo_input),
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Example: anthropics/skills",
+                    "Example: anthropics/skills or gitlab:group/skills",
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),
@@ -625,7 +620,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
             frame.render_widget(Paragraph::new(content), inner_area);
             let caret_x = inner_area.x
                 + 2
-                + u16::try_from(UnicodeWidthStr::width(app.skill_github_input.as_str()))
+                + u16::try_from(UnicodeWidthStr::width(app.skill_repo_input.as_str()))
                     .unwrap_or(u16::MAX);
             frame.set_cursor_position((
                 caret_x.min(inner_area.right().saturating_sub(1)),

@@ -319,10 +319,10 @@ pub struct App {
     pub skill_selected: usize,
     /// Skill scroll offset for long lists
     pub skill_scroll: usize,
-    /// Skill add mode (entering GitHub repo or searching)
+    /// Skill add mode (entering a forge repository spec or searching)
     pub skill_add_mode: SkillAddMode,
-    /// GitHub repo input for skill installation
-    pub skill_github_input: String,
+    /// Forge repository spec input for skill installation
+    pub skill_repo_input: String,
     /// Skill search query
     pub skill_search: String,
 
@@ -765,7 +765,7 @@ impl App {
             skill_selected: 0,
             skill_scroll: 0,
             skill_add_mode: SkillAddMode::None,
-            skill_github_input: String::new(),
+            skill_repo_input: String::new(),
             skill_search: String::new(),
 
             profiles,
@@ -2617,10 +2617,10 @@ impl App {
             }
             AppMode::SkillManage => {
                 match self.skill_add_mode {
-                    SkillAddMode::GitHubRepo => {
+                    SkillAddMode::ForgeRepo => {
                         return Some(ActiveTextInput::Simple {
-                            input: &mut self.skill_github_input,
-                            filter: PasteFilter::GitHubRepo,
+                            input: &mut self.skill_repo_input,
+                            filter: PasteFilter::ForgeRepo,
                         });
                     }
                     SkillAddMode::None => {

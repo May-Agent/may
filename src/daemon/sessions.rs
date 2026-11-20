@@ -673,8 +673,8 @@ pub(super) async fn cloud_catalog(
 }
 
 /// Normalize a repo spec into a stored binding: `owner/repo` or a
-/// `github:owner/repo` spec binds the GitHub repository itself; an
-/// existing path binds that repository's local identity; anything else
+/// `github:`/`gitlab:` canonical binding binds the forge repository itself;
+/// an existing path binds that repository's local identity; anything else
 /// fails.
 pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -687,9 +687,16 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
             .map(|binding| Some(binding.to_stored()))
             .map_err(|error| error.to_string());
     }
-    let github = spec.strip_prefix("github:").unwrap_or(spec);
+    // A `github:`/`gitlab:` spec is a canonical forge binding:
+    // `github:owner/repo`, `github:<host>/owner/repo`,
+    // `gitlab:<group/.../repo>` or `gitlab:<host>/<group/.../repo>`.
+    if spec.starts_with("github:") || spec.starts_with("gitlab:") {
+        return crate::session::RepoBinding::parse(spec)
+            .map(|binding| Some(binding.to_stored()))
+            .map_err(|error| error.to_string());
+    }
     let looks_like_github = {
-        let mut parts = github.split('/');
+        let mut parts = spec.split('/');
         matches!(
             (parts.next(), parts.next(), parts.next()),
             (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() && !o.contains(' ') && !r.contains(' ')
@@ -697,15 +704,13 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
     };
     // An existing filesystem path binds the local repository identity.
     let path = std::path::Path::new(spec);
-    if let Some(worktree) = crate::repo_search::worktree_root(path)
-        && !spec.starts_with("github:")
-    {
+    if let Some(worktree) = crate::repo_search::worktree_root(path) {
         let key = crate::issue::repository_identity(&worktree)
             .map_err(|e| format!("repository identity: {e}"))?;
         return Ok(Some(format!("local:{}", key.display())));
     }
     if looks_like_github {
-        return Ok(Some(format!("github:{github}")));
+        return Ok(Some(format!("github:{spec}")));
     }
     Err(format!("invalid repo spec '{spec}'"))
 }

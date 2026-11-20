@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Github } from 'lucide-react';
+import { GitBranch } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -15,16 +15,16 @@ import { RepoPickerList, type RepoListState } from './RepoPickerList';
 interface NewChatRepoDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Called with the picked `owner/repo`; the caller starts the session. */
+  /** Called with the picked repository's canonical binding; the caller starts the session. */
   onPick: (repo: string) => void;
   busy?: boolean;
 }
 
 /**
- * Start a chat bound to a GitHub repository that needs no local checkout —
- * the session binds to `github:owner/repo` and the cloud remote is the
- * source of truth. The repository is picked from the daemon's list of what
- * the host's GitHub account can reach.
+ * Start a chat bound to a forge repository that needs no local checkout —
+ * the session binds to `github:owner/repo` or `gitlab:<host>/<path>` and the
+ * remote is the source of truth. The repository is picked from the daemon's
+ * list of what the host's forge accounts can reach.
  */
 export function NewChatRepoDialog({
   open,
@@ -38,7 +38,7 @@ export function NewChatRepoDialog({
       <DialogContent className="gap-3 sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <Github className="size-4" aria-hidden />
+            <GitBranch className="size-4" aria-hidden />
             {t('sidebar.newChatRepo.title')}
           </DialogTitle>
           <DialogDescription>{t('sidebar.newChatRepo.description')}</DialogDescription>
