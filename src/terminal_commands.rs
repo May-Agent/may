@@ -430,6 +430,7 @@ where
         review: Some(publish_review),
         signing,
         github_api: crate::pr::PrContext::default_github_api(config.services.forge_auth.clone()),
+        gitlab_api: None,
         forge_auth: config.services.forge_auth.clone(),
         land_locks: config.services.land_locks.clone(),
         checkouts: Some(config.services.checkouts.clone()),
@@ -445,6 +446,7 @@ where
         config.db.clone(),
         config.session_id.clone(),
         config.may_dir.clone(),
+        config.services.forge_auth.clone(),
     );
     describe_tool(&mut descriptions, &ci_tool);
     builder.configure_tool(ci_tool);

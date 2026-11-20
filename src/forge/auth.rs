@@ -826,7 +826,8 @@ impl ForgeAuth {
     }
 
     /// The kind `host` forges: its entry's `kind`, or the kind its name implies.
-    fn kind_of(&self, host: &str) -> Option<ForgeKind> {
+    #[must_use]
+    pub fn kind_of(&self, host: &str) -> Option<ForgeKind> {
         self.hosts
             .get(host)
             .and_then(|entry| entry.kind)

@@ -17,7 +17,7 @@ Name the one step or test that holds most of the time before changing anything.
 
 ## 2. Find the cause
 
-Read the log of that step (`gh run view --job <id> --log`) and match it to the usual causes in `references/causes.md`: cold or missing caches, work repeated across jobs, serial work that can run in parallel, a build that compiles more than the job needs, one test dominating the run, waits and timeouts. For the test runner in use, `references/cargo.md` covers cargo test and nextest and `references/bun.md` covers bun test.
+Read the log of that step (`ci log <job_id>`, where `<job_id>` is the id in the failed check's URL — `…/actions/runs/<run>/job/<id>` on GitHub, `…/-/jobs/<id>` on GitLab) and match it to the usual causes in `references/causes.md`: cold or missing caches, work repeated across jobs, serial work that can run in parallel, a build that compiles more than the job needs, one test dominating the run, waits and timeouts. For the test runner in use, `references/cargo.md` covers cargo test and nextest and `references/bun.md` covers bun test.
 
 State the cause as a measurement ("the cache restore missed and `cargo build` took 11m of 14m"), not a guess.
 

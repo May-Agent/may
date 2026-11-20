@@ -350,6 +350,19 @@ impl ForgeRepo {
         remote: &str,
         config: &crate::config::MayConfig,
     ) -> Result<Self, ForgeRepoError> {
+        Self::from_remote_url_with(remote, |host| config.forge_kind(host))
+    }
+
+    /// [`Self::from_remote_url`] with the host's kind resolved by `kind`
+    /// instead of a `MayConfig` — the live forge authenticator answers it
+    /// for the same `[forge]` map.
+    ///
+    /// # Errors
+    /// As [`Self::from_remote_url`].
+    pub fn from_remote_url_with(
+        remote: &str,
+        kind: impl Fn(&str) -> Option<ForgeKind>,
+    ) -> Result<Self, ForgeRepoError> {
         let invalid = || ForgeRepoError::RemoteUrl(remote.to_string());
         let remote = remote.trim();
         let (authority, path) = match remote.split_once("://") {
@@ -379,8 +392,7 @@ impl ForgeRepo {
         }
         let host = ForgeHost::new(&authority)
             .map_err(|source| ForgeRepoError::Host(authority.clone(), source))?;
-        let kind = config
-            .forge_kind(host.as_str())
+        let kind = kind(host.as_str())
             .ok_or_else(|| ForgeRepoError::UnknownKind(host.as_str().to_string()))?;
         let path = path.trim_end_matches('/');
         let path = path.strip_suffix(".git").unwrap_or(path);
@@ -512,6 +524,27 @@ impl ForgeRepo {
         }
     }
 
+    /// The repository a [`Self::cache_key`] names: `owner/repo` on
+    /// `github.com`, `<host>/<namespace>/<repo>` everywhere else.
+    ///
+    /// # Errors
+    /// Returns [`ForgeRepoError::Binding`] when `key` is not a cache key of
+    /// `kind`, and [`ForgeRepoError::Host`] for a bad host part.
+    pub fn from_cache_key(kind: ForgeKind, key: &str) -> Result<Self, ForgeRepoError> {
+        let segments: Vec<&str> = key.split('/').collect();
+        let (host, path) = match kind {
+            ForgeKind::GitHub if segments.len() == 2 => (GITHUB_HOST.to_string(), key.to_string()),
+            _ if segments.len() >= 3 => (segments[0].to_string(), segments[1..].join("/")),
+            _ => return Err(ForgeRepoError::Binding(key.to_string())),
+        };
+        let host =
+            ForgeHost::new(&host).map_err(|source| ForgeRepoError::Host(host.clone(), source))?;
+        let (namespace, name) = path
+            .rsplit_once('/')
+            .ok_or_else(|| ForgeRepoError::Binding(key.to_string()))?;
+        Self::new(kind, host, namespace, name)
+    }
+
     /// The binding `parse_binding` accepts, plus the bare `owner/repo`
     /// `workspace.toml` and session rows wrote before the canonical form:
     /// it means `github:owner/repo`. A bare `host/ns/repo` names the GitLab
@@ -562,6 +595,14 @@ const GITLAB_PATH_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_A
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+
+/// `value` percent-encoded as one GitLab API path segment — the set
+/// [`ForgeRepo::gitlab_encoded_path`] uses, for path pieces such as a
+/// branch name that may carry `/`.
+#[must_use]
+pub fn url_path_encode(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, GITLAB_PATH_ENCODE).to_string()
+}
 
 #[cfg(test)]
 mod tests {

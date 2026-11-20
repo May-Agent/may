@@ -70,11 +70,21 @@ impl CheckView {
         }
     }
 
-    /// The Actions job id a `…/actions/runs/<run>/job/<job>` link names.
+    /// The CI job id a job link names: `…/actions/runs/<run>/job/<job>` on
+    /// GitHub, `…/-/jobs/<job>` on GitLab.
     #[must_use]
     pub fn job_id(&self) -> Option<u64> {
-        let (_, job) = self.url.as_deref()?.split_once("/actions/runs/")?;
-        job.split_once("/job/")?
+        let url = self.url.as_deref()?;
+        if let Some((_, run)) = url.split_once("/actions/runs/") {
+            return run
+                .split_once("/job/")?
+                .1
+                .split(['/', '?', '#'])
+                .next()?
+                .parse()
+                .ok();
+        }
+        url.split_once("/-/jobs/")?
             .1
             .split(['/', '?', '#'])
             .next()?
@@ -220,7 +230,7 @@ pub enum LogExcerpt {
     NoErrorLines,
     /// The log could not be read, for this reason.
     Unavailable(String),
-    /// The check is not an Actions job, so it has no log to read.
+    /// The check is not a CI job, so it has no log to read.
     NoLog,
 }
 
@@ -238,15 +248,8 @@ const LOG_LINES: usize = 12;
 /// Failed checks whose logs are fetched at once.
 const LOG_FETCH_CONCURRENCY: usize = 4;
 
-/// Each failed check of `report` with the key lines of its Actions log.
-pub async fn failure_details(
-    api: &crate::issue::github::GitHubRest<super::PrTokenSource>,
-    owner_repo: &str,
-    pr_number: i64,
-    report: &ChecksReport,
-) -> Vec<FailureDetail> {
-    let actions = crate::ci::github::GhActions::new(api.clone(), owner_repo, pr_number);
-    let actions = &actions;
+/// Each failed check of `report` with the key lines of its CI log.
+pub async fn failure_details(actions: &impl Actions, report: &ChecksReport) -> Vec<FailureDetail> {
     let failed: Vec<(String, Option<String>, Option<u64>)> = report
         .failed()
         .map(|check| (check.name.clone(), check.url.clone(), check.job_id()))
@@ -264,10 +267,7 @@ pub async fn failure_details(
         .await
 }
 
-async fn excerpt(
-    actions: &crate::ci::github::GhActions<super::PrTokenSource>,
-    job: u64,
-) -> LogExcerpt {
+async fn excerpt(actions: &impl Actions, job: u64) -> LogExcerpt {
     match actions.log(job).await {
         Err(error) => LogExcerpt::Unavailable(error.to_string()),
         Ok(log) => match crate::ci::logs::error_lines(&log, LOG_LINES) {
@@ -307,10 +307,15 @@ impl ReadChecks {
 #[derive(Debug, Clone, PartialEq, Eq, Template)]
 #[template(path = "pr_checks.txt", escape = "none")]
 pub enum ChecksSection {
-    /// GitHub answered.
+    /// The forge answered.
     Read(ReadChecks),
-    /// The GitHub query failed.
-    Unreadable(String),
+    /// The forge's query failed.
+    Unreadable {
+        /// The forge the query ran against (`GitHub` or `GitLab`).
+        forge: &'static str,
+        /// Why it failed.
+        error: String,
+    },
 }
 
 /// A change in a PR's checks the agent is told about.
@@ -318,25 +323,50 @@ pub enum ChecksSection {
 #[template(path = "pr_checks_alert.txt", escape = "none")]
 pub enum ChecksEvent {
     /// A check failed.
-    Failed { pr_number: i64, names: Vec<String> },
+    Failed {
+        /// The PR's sigil (`#` or `!`).
+        sigil: char,
+        /// The PR number.
+        pr_number: i64,
+        /// The failed checks.
+        names: Vec<String>,
+    },
     /// Every check passed.
-    Passed { pr_number: i64, total: u32 },
-    /// The checks could not be read from GitHub.
-    Unreadable { pr_number: i64, error: String },
+    Passed {
+        /// The PR's sigil.
+        sigil: char,
+        /// The PR number.
+        pr_number: i64,
+        /// How many checks ran.
+        total: u32,
+    },
+    /// The checks could not be read from the forge.
+    Unreadable {
+        /// The PR's sigil.
+        sigil: char,
+        /// The PR number.
+        pr_number: i64,
+        /// The forge the query ran against (`GitHub` or `GitLab`).
+        forge: &'static str,
+        /// Why it failed.
+        error: String,
+    },
 }
 
 impl ChecksEvent {
     /// The alert for a rollup the agent hears of: a failure, or every check
     /// passed.
     #[must_use]
-    pub fn for_rollup(pr_number: i64, report: &ChecksReport) -> Option<Self> {
+    pub fn for_rollup(sigil: char, pr_number: i64, report: &ChecksReport) -> Option<Self> {
         match report.rollup() {
             Rollup::Pending => None,
             Rollup::Failed => Some(Self::Failed {
+                sigil,
                 pr_number,
                 names: report.failed().map(|check| check.name.clone()).collect(),
             }),
             Rollup::Passed => Some(Self::Passed {
+                sigil,
                 pr_number,
                 total: u32::try_from(report.checks.len()).expect("fewer than 2^32 checks"),
             }),
@@ -452,7 +482,7 @@ mod tests {
             true,
             None,
         )]));
-        assert_eq!(ChecksEvent::for_rollup(3, &pending), None);
+        assert_eq!(ChecksEvent::for_rollup('#', 3, &pending), None);
         let passed = ChecksReport::of(&snapshot(vec![
             run(
                 "a",
@@ -470,8 +500,9 @@ mod tests {
             ),
         ]));
         assert_eq!(
-            ChecksEvent::for_rollup(3, &passed),
+            ChecksEvent::for_rollup('#', 3, &passed),
             Some(ChecksEvent::Passed {
+                sigil: '#',
                 pr_number: 3,
                 total: 1
             })
@@ -481,6 +512,7 @@ mod tests {
     #[test]
     fn the_alert_names_the_failed_checks_and_points_to_pr_show() {
         let text = ChecksEvent::Failed {
+            sigil: '#',
             pr_number: 12,
             names: vec![
                 "test (ubuntu)".to_string(),
@@ -494,6 +526,7 @@ mod tests {
             "PR #12's checks failed: test (ubuntu), 测试 テスト 테스트. `pr show 12` lists the error lines of their logs."
         );
         let text = ChecksEvent::Passed {
+            sigil: '#',
             pr_number: 12,
             total: 5,
         }
@@ -505,7 +538,9 @@ mod tests {
     #[test]
     fn a_failed_query_is_stated() {
         let text = ChecksEvent::Unreadable {
+            sigil: '#',
             pr_number: 12,
+            forge: "GitHub",
             error: "GitHub 502".to_string(),
         }
         .render()
@@ -514,10 +549,25 @@ mod tests {
             text,
             "PR #12's checks could not be read from GitHub (GitHub 502); `pr show 12` retries the query."
         );
-        let text = ChecksSection::Unreadable("GitHub 502".to_string())
-            .render()
-            .unwrap();
+        let text = ChecksSection::Unreadable {
+            forge: "GitHub",
+            error: "GitHub 502".to_string(),
+        }
+        .render()
+        .unwrap();
         assert_eq!(text, "checks: could not be read from GitHub (GitHub 502)");
+        let text = ChecksEvent::Unreadable {
+            sigil: '!',
+            pr_number: 12,
+            forge: "GitLab",
+            error: "GitLab 502".to_string(),
+        }
+        .render()
+        .unwrap();
+        assert_eq!(
+            text,
+            "PR !12's checks could not be read from GitLab (GitLab 502); `pr show 12` retries the query."
+        );
     }
 
     #[test]
@@ -550,7 +600,7 @@ mod tests {
              failed 测试 (https://github.com/o/r/actions/runs/9/job/8):\n\
              > error[E0308]: 类型不匹配\n\
              > テスト failed: 테스트\n\
-             failed ci/legacy: it is not an Actions job, so it has no log"
+             failed ci/legacy: it is not a CI job, so it has no log"
         );
     }
 }

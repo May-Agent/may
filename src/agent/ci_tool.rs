@@ -28,6 +28,8 @@ const SLOW_TESTS: usize = 10;
 /// - `ci slow <pr>` — a PR's checks by job, step and test against the job
 ///   baselines; `ci slow <run> --run` names a GitHub workflow run instead
 /// - `ci queue` — merge-queue wait against run time for the session's PRs
+/// - `ci log <job>` — the log of a recorded CI job, from GitHub Actions or
+///   GitLab CI over the forge's HTTP API
 ///
 /// A job is abnormally long past the `[ci]` limit or past a multiple of its
 /// baseline, the median of its last successful base-branch runs.
@@ -47,6 +49,13 @@ pub enum CiArgs {
     },
     /// Merge-queue wait against run time.
     Queue {},
+    /// The log of a recorded CI job, by its forge job id (the id a check's
+    /// `…/job/<id>` or `…/-/jobs/<id>` link names).
+    Log {
+        /// The forge job id.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
+        job_id: i64,
+    },
 }
 
 /// The `ci` command of one session.
@@ -54,6 +63,9 @@ pub struct CiTool {
     db: ChatDb,
     session_id: String,
     may_dir: PathBuf,
+    github_api: crate::issue::github::GitHubRest<crate::pr::PrTokenSource>,
+    gitlab_api: Option<crate::issue::gitlab::GitLabRest<crate::pr::PrGitLabToken>>,
+    forge_auth: crate::forge::LiveForgeAuth,
 }
 
 impl std::fmt::Debug for CiTool {
@@ -64,14 +76,40 @@ impl std::fmt::Debug for CiTool {
 
 impl CiTool {
     /// The command for `session_id`, reading `[ci]` from `may_dir`'s config
-    /// each time it judges a job.
+    /// each time it judges a job. `forge_auth` resolves the credentials a
+    /// `ci log` read of either forge carries.
     #[must_use]
-    pub fn new(db: ChatDb, session_id: impl Into<String>, may_dir: PathBuf) -> Self {
+    pub fn new(
+        db: ChatDb,
+        session_id: impl Into<String>,
+        may_dir: PathBuf,
+        forge_auth: crate::forge::LiveForgeAuth,
+    ) -> Self {
         Self {
             db,
             session_id: session_id.into(),
             may_dir,
+            github_api: crate::pr::PrContext::default_github_api(forge_auth.clone()),
+            gitlab_api: None,
+            forge_auth,
         }
+    }
+
+    /// The REST client of GitLab `host`: `gitlab_api` for tests, else the
+    /// host's `api/v4` endpoint with its `[forge]` credential.
+    fn gitlab_rest(
+        &self,
+        host: &str,
+    ) -> crate::issue::gitlab::GitLabRest<crate::pr::PrGitLabToken> {
+        self.gitlab_api.clone().unwrap_or_else(|| {
+            crate::issue::gitlab::GitLabRest::new(
+                crate::pr::PrGitLabToken::Forge(crate::issue::gitlab::ForgeGitLabAuth::new(
+                    self.forge_auth.clone(),
+                    host.to_string(),
+                )),
+                host,
+            )
+        })
     }
 
     async fn limits(&self) -> Result<Limits, CiError> {
@@ -172,7 +210,13 @@ impl CiTool {
                 Some(pr) => self.db.ci_jobs_for_pr(pr.id).await?,
                 None => Vec::new(),
             };
-            (format!("PR #{number}"), jobs)
+            (
+                format!(
+                    "PR {}{number}",
+                    pr.as_ref().map_or('#', crate::db::PrRow::sigil)
+                ),
+                jobs,
+            )
         };
         let limits = self.limits().await?;
         let mut views = Vec::with_capacity(jobs.len());
@@ -183,12 +227,12 @@ impl CiTool {
     }
 
     async fn queue(&self) -> Result<String, CiError> {
-        let numbers: std::collections::HashMap<i64, i64> = self
+        let numbers: std::collections::HashMap<i64, (i64, char)> = self
             .db
             .list_session_prs(&self.session_id)
             .await?
             .into_iter()
-            .map(|pr| (pr.id, pr.number))
+            .map(|pr| (pr.id, (pr.number, pr.sigil())))
             .collect();
         let rows = self
             .db
@@ -196,8 +240,10 @@ impl CiTool {
             .await?
             .into_iter()
             .filter_map(|row| {
+                let (number, sigil) = numbers.get(&row.pr_id)?;
                 Some(QueueRow {
-                    pr_number: *numbers.get(&row.pr_id)?,
+                    sigil: *sigil,
+                    pr_number: *number,
                     wait: Span(Duration::from_secs(row.queue_wait_secs.unsigned_abs())),
                     run: Span(Duration::from_secs(row.run_secs.unsigned_abs())),
                 })
@@ -205,6 +251,92 @@ impl CiTool {
             .collect();
         Ok(CiQueue { rows }.render()?)
     }
+
+    /// `ci log <job_id>` — the forge job id a check's URL names, resolved to
+    /// the recorded job of a repository this session works on, then read
+    /// over the forge's HTTP API. Read-only: no subprocess runs.
+    async fn log(&self, job_id: i64) -> Result<String, CiError> {
+        let jobs = self.db.ci_jobs_for_session_repos(&self.session_id).await?;
+        let matches: Vec<&CiJobRow> = jobs
+            .iter()
+            .filter(|job| job.external_id == job_id)
+            .collect();
+        let job = match matches.as_slice() {
+            [job] => *job,
+            [] => {
+                return Err(CiError::Resolve(format!(
+                    "no recorded CI job {job_id} in this session"
+                )));
+            }
+            _ => {
+                return Err(CiError::Resolve(format!(
+                    "several recorded jobs have id {job_id}"
+                )));
+            }
+        };
+        let repo_key = self
+            .db
+            .repo_key_of_project(job.project_id)
+            .await?
+            .ok_or_else(|| CiError::Resolve("the job's repository is missing".to_string()))?;
+        let kind = match job.source.as_str() {
+            "gitlab" => crate::forge::ForgeKind::GitLab,
+            "github" => crate::forge::ForgeKind::GitHub,
+            other => {
+                return Err(CiError::Resolve(format!(
+                    "job {job_id} was recorded from {other}, which has no remote log"
+                )));
+            }
+        };
+        let repo = crate::forge::ForgeRepo::from_cache_key(kind, &repo_key)
+            .map_err(|error| CiError::Resolve(error.to_string()))?;
+        let external_id = u64::try_from(job.external_id)
+            .map_err(|_| CiError::Resolve(format!("job {job_id} is not a forge job id")))?;
+        let pr_number = self
+            .db
+            .get_pr_by_id(job.pr_id)
+            .await?
+            .map_or(0, |pr| pr.number);
+        let text = match kind {
+            crate::forge::ForgeKind::GitHub => {
+                crate::ci::github::Actions::log(
+                    &crate::ci::github::GhActions::new(
+                        self.github_api.clone(),
+                        repo.full_path(),
+                        pr_number,
+                    ),
+                    external_id,
+                )
+                .await?
+            }
+            crate::forge::ForgeKind::GitLab => {
+                crate::ci::github::Actions::log(
+                    &crate::ci::gitlab::GitLabCi::new(
+                        self.gitlab_rest(repo.host().as_str()),
+                        repo,
+                        pr_number,
+                    ),
+                    external_id,
+                )
+                .await?
+            }
+        };
+        Ok(CiLog {
+            workflow: &job.workflow,
+            name: &job.name,
+            log: &text,
+        }
+        .render()?)
+    }
+}
+
+/// What `ci log` prints: which job, then its log.
+#[derive(Template)]
+#[template(path = "ci_log.txt", escape = "none")]
+struct CiLog<'a> {
+    workflow: &'a str,
+    name: &'a str,
+    log: &'a str,
 }
 
 impl Tool for CiTool {
@@ -224,6 +356,7 @@ impl Tool for CiTool {
             CiArgs::Stats {} => self.stats().await,
             CiArgs::Slow { number, run } => self.slow(number, run).await,
             CiArgs::Queue {} => self.queue().await,
+            CiArgs::Log { job_id } => self.log(job_id).await,
         };
         Ok(ToolResult::text(text.unwrap_or_else(|e| e.to_string())))
     }
@@ -252,7 +385,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let tool = CiTool::new(db.clone(), "s", dir.path().to_path_buf());
+        let tool = CiTool::new(
+            db.clone(),
+            "s",
+            dir.path().to_path_buf(),
+            crate::forge::LiveForgeAuth::default(),
+        );
         (dir, db, tool, pr)
     }
 

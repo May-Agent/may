@@ -75,8 +75,10 @@ impl Step {
     }
 }
 
-/// What the recorder reads from GitHub.
+/// What the recorder reads from a forge's CI: GitHub Actions or GitLab CI.
 pub trait Actions: Sync {
+    /// The `ci_jobs.source` rows of this backend record under.
+    const SOURCE: &'static str;
     /// The base branch of the PR.
     fn base_branch(&self) -> impl Future<Output = Result<String, CiError>> + Send;
     /// Every workflow run on `sha`.
@@ -202,6 +204,8 @@ struct Base {
 }
 
 impl<T: GitHubTokenSource + Sync> Actions for GhActions<T> {
+    const SOURCE: &'static str = "github";
+
     async fn base_branch(&self) -> Result<String, CiError> {
         let pr: PullRequest = self
             .get_json(format!(
@@ -275,5 +279,46 @@ impl<T: GitHubTokenSource + Sync> Actions for GhActions<T> {
             self.owner_repo
         ))
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::issue::IssueError;
+    use crate::test_support::{ApiReply, serve_api};
+
+    #[derive(Debug)]
+    struct StaticToken;
+
+    impl GitHubTokenSource for StaticToken {
+        fn token(&self) -> impl Future<Output = Result<String, IssueError>> + Send {
+            std::future::ready(Ok("tok".to_string()))
+        }
+    }
+
+    /// A 302 to a signed third-party URL is followed without the token: the
+    /// second request carries no `Authorization` header at all.
+    #[tokio::test]
+    async fn a_log_redirect_forwards_no_authorization() {
+        let second = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = second.clone();
+        let (redirect_base, _) = serve_api(move |request, _| {
+            *seen.lock().unwrap() = request.authorization.clone();
+            ApiReply::json(200, "the log")
+        })
+        .await;
+        let (api_base, requests) = serve_api(move |request, _| {
+            if request.path.ends_with("/actions/jobs/5/logs") {
+                ApiReply::json(302, "").header("location", redirect_base.as_str())
+            } else {
+                ApiReply::json(404, "{}")
+            }
+        })
+        .await;
+        let actions = GhActions::new(GitHubRest::with_api_base(StaticToken, &api_base), "o/r", 1);
+        assert_eq!(actions.log(5).await.unwrap(), "the log");
+        assert_eq!(requests.lock().unwrap()[0].authorization, "Bearer tok");
+        assert_eq!(*second.lock().unwrap(), "");
     }
 }

@@ -105,6 +105,8 @@ pub struct JobView {
 #[derive(Debug, Template)]
 #[template(path = "ci_alert.txt", escape = "none")]
 pub struct CiAlert<'a> {
+    /// The PR's sigil (`#` or `!`).
+    pub sigil: char,
     /// The PR.
     pub pr_number: i64,
     /// The abnormal jobs.
@@ -115,6 +117,8 @@ pub struct CiAlert<'a> {
 #[derive(Debug, Template)]
 #[template(path = "ci_warning.txt", escape = "none")]
 pub struct CiWarning<'a> {
+    /// The PR's sigil (`#` or `!`).
+    pub sigil: char,
     /// The PR.
     pub pr_number: i64,
     /// The abnormal jobs.
@@ -176,6 +180,8 @@ pub struct CiSlow {
 /// One line of `ci queue`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueRow {
+    /// The PR's sigil (`#` or `!`).
+    pub sigil: char,
     /// The PR.
     pub pr_number: i64,
     /// Time in the merge queue.
@@ -233,6 +239,7 @@ mod tests {
     fn the_alert_states_the_finding_the_harm_and_the_skill() {
         let jobs = [abnormal()];
         let text = CiAlert {
+            sigil: '#',
             pr_number: 12,
             jobs: &jobs,
         }
@@ -268,6 +275,7 @@ mod tests {
     fn the_warning_states_the_same_finding() {
         let jobs = [abnormal()];
         let text = CiWarning {
+            sigil: '#',
             pr_number: 12,
             jobs: &jobs,
         }
@@ -306,6 +314,7 @@ mod tests {
         );
         let queue = CiQueue {
             rows: vec![QueueRow {
+                sigil: '#',
                 pr_number: 3,
                 wait: Span(Duration::from_mins(15)),
                 run: Span(Duration::from_mins(5)),
