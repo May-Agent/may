@@ -1200,6 +1200,11 @@ impl MayAgent {
                 shared_terminal_commands.fork_launcher.clone(),
                 toolkit.clone(),
                 config.languages,
+                permissions.for_read_only_subagent(),
+                crate::secrets::SecretRedactor::for_session(
+                    &config.may_dir,
+                    config.session_id.as_str(),
+                ),
             )
         });
 

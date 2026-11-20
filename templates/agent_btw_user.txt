@@ -1,0 +1,6 @@
+<system-reminder>
+The user asks you a side question with /btw. You answer it as a read-only fork of yourself: the main agent is not interrupted and keeps working, and nothing here reaches your own conversation. Run only quick, read-only commands to gather what the answer needs; never start long-running work. Answer as directly as you can: your reply is what the user sees.
+</system-reminder>
+<agent-btw from="the user">
+{{ question }}
+</agent-btw>
