@@ -248,7 +248,7 @@ mod tests {
         assert!(text.contains(
             "[4] role: user\nattachments:\n  - file:///Users/lexoliu/Coding/demo/backtrace.log\n附件里是出错时的堆栈"
         ));
-        assert!(text.contains("[6] role: user\n<tasks>"));
+        assert!(text.contains("[6] role: system\n<tasks>"));
         assert_eq!(dump.messages.len(), 7);
     }
 }
