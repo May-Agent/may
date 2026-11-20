@@ -271,7 +271,10 @@ async fn resolve_repo_filter(
         .list_prs_with_repo(None, None, PrFilter::All, false)
         .await?;
     if let Some(matched) = rows.into_iter().find(|row| {
-        row.repo_key == raw || crate::pr::github_owner_repo(&row.repo_key).as_deref() == Some(raw)
+        row.repo_key == raw
+            || crate::pr::github_owner_repo(&row.repo_key).as_deref() == Some(raw)
+            || crate::forge::ForgeRepo::parse_stored(raw)
+                .is_ok_and(|repo| repo.cache_key() == row.repo_key)
     }) {
         return Ok(Some(matched.repo_key));
     }
@@ -316,6 +319,7 @@ fn host_pr_context(state: &DaemonState) -> crate::pr::PrContext {
         review: None,
         signing: crate::commit_signing::CommitSigning::new(host_git, &state.may_dir, "user"),
         github_api: state.github_api.clone(),
+        gitlab_api: None,
         forge_auth: state.forge_auth.clone(),
         land_locks: state.services.land_locks.clone(),
         checkouts: Some(state.services.checkouts.clone()),
@@ -341,7 +345,7 @@ fn map_pr_error(error: &PrError) -> SkyError {
         | PrError::DirtyClone(_)
         | PrError::Screened(_)
         | PrError::MainAgentOnly(_) => StatusCode::CONFLICT,
-        PrError::Gh(_) | PrError::Signing(_) => StatusCode::BAD_GATEWAY,
+        PrError::Gh(_) | PrError::Gl(_) | PrError::Signing(_) => StatusCode::BAD_GATEWAY,
         PrError::Db(_) | PrError::RepoClone(_) | PrError::Publish(_) | PrError::Io(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
