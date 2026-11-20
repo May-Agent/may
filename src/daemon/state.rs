@@ -462,6 +462,9 @@ pub struct DaemonState {
     pub(crate) title_generation_queue: TitleGenerationQueue,
     pub(crate) location_provider: crate::location::LocationProvider,
     pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
+    /// Hidden-context prompts delivered to a session's queue and woken with:
+    /// subagent approval requests and parked-run results reach parents here.
+    pub(crate) session_prompts: crate::task_wake::SessionPrompts,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     /// Embedded baseline tool distribution shared by agents, tasks and containers.
     pub(crate) tool_distribution: Arc<crate::tools::ToolDistribution>,
@@ -1540,6 +1543,10 @@ impl DaemonState {
             ),
             title_generation_queue,
             location_provider: crate::location::LocationProvider::new(),
+            session_prompts: crate::task_wake::SessionPrompts::new(
+                runtime_service.clone(),
+                async_channel::unbounded().0,
+            ),
             runtime_service,
             task_runtime,
             tool_distribution,

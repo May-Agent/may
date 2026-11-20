@@ -102,6 +102,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub workspace_request_broker: Option<WorkspaceRequestBroker>,
     /// What the `subagent` command builds its agents from.
     pub subagents: SubagentAssembly,
+    /// The requests subagents put to the agent that launched them: the
+    /// session's permission handler parks them here and the `subagent`
+    /// command watches and answers them.
+    pub child_approvals: crate::subagent::ChildApprovals,
     /// Request parameters the agent will run with. Provider-hosted URL fetch
     /// (`Parameters::hosted_web_fetch`) suppresses the redundant `webfetch`
     /// command. Search is always provider-hosted; there is no `websearch`
@@ -682,6 +686,7 @@ where
     } = config.subagents;
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
+        approvals: config.child_approvals.clone(),
         tiers,
         models: config.subagent_models.clone(),
         definitions: crate::bundle::Bundle::subagent_definitions()
@@ -977,6 +982,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1076,6 +1082,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1148,6 +1155,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1214,6 +1222,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1275,6 +1284,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1449,6 +1459,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1581,6 +1592,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1644,6 +1656,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1711,6 +1724,7 @@ mod tests {
                 rules_import: None,
                 subagent_models: None,
                 model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

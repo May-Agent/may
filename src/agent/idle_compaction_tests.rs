@@ -320,6 +320,7 @@ impl SessionParts {
         MayAgentSessionInput {
             #[cfg(target_os = "macos")]
             computer: None,
+            session_prompts: None,
             sandbox_dir: self.dir.join("sandbox"),
             may_dir: self.dir.join(".may"),
             cwd,

@@ -21,9 +21,10 @@ use aither_agent::{
 use aither_core::LanguageModel;
 use aither_core::llm::model::ClaudePromptCacheTtl;
 use aither_core::llm::tool::{CancelSignal, ToolContext};
-use aither_core::llm::{AgentIdentity, Tool, ToolResult};
+use aither_core::llm::{AgentIdentity, Approval, CallIdentity, Tool, ToolResult};
 use aither_sandbox::{CommitLedger, CommitMark, SubagentGrant};
 
+use super::approvals::ChildApproval;
 use super::args::{Call, Requested, SubagentArgs};
 use super::child::{ChildHooks, ChildParts, ChildSession, KeepAlive};
 use super::external::{ExternalAgents, ExternalStart};
@@ -105,6 +106,9 @@ pub struct SubagentSettings<LLM> {
     /// Usage of the runs in flight, and the cards they report; its runs are
     /// the main agent's [`SubagentRuns`].
     pub tracker: SubagentTracker,
+    /// The requests runs put to the agent that launched them: a call watches
+    /// its children's and `subagent approve`/`deny` answers them.
+    pub approvals: super::ChildApprovals,
     /// The model of each tier.
     pub tiers: TierModels<LLM>,
     /// Builds a model for an explicit `provider::model`; `None` refuses
@@ -260,6 +264,16 @@ enum Ready<LLM: LanguageModel + 'static> {
     External(Box<Held<LLM>>),
 }
 
+/// What the wait on a spawned run resolves to.
+enum Awaited<LLM: LanguageModel + 'static> {
+    /// The run ended.
+    Done(RunOutcome, Held<LLM>),
+    /// One of its children put a request to this call's agent.
+    Approval(ChildApproval),
+    /// The run task died without reporting.
+    Lost,
+}
+
 /// Releases the id a continuation checked out when the call is dropped
 /// before it stored the subagent back.
 struct Checkout<'a, LLM: LanguageModel + 'static> {
@@ -355,6 +369,30 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
 
     fn refuse_fork(refusal: &ForkRefusal) -> anyhow::Error {
         anyhow::anyhow!(render(&ForkRefused { reason: refusal }))
+    }
+
+    /// Answers a request a subagent parked for `decided_by` — the agent its
+    /// launching call names, never another.
+    fn answer(
+        &self,
+        decided_by: &CallIdentity,
+        id: &str,
+        approval: Approval,
+    ) -> aither_core::Result<ToolResult> {
+        let approved = approval.is_approved();
+        let undecided = self
+            .service
+            .settings
+            .approvals
+            .decide(id, decided_by.agent(), approval);
+        anyhow::ensure!(
+            undecided.is_none(),
+            "no request `{id}` of a subagent you launched awaits your decision"
+        );
+        Ok(ToolResult::text(render(&super::report::ApprovalAnswered {
+            id,
+            approved,
+        })))
     }
 
     /// The main agent's request a fork starts from.
@@ -507,6 +545,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             }
             Call::External { .. } | Call::Resume { .. } => {
                 unreachable!("external and resumed calls do not prepare an agent")
+            }
+            Call::Approve { .. } | Call::Deny { .. } => {
+                unreachable!("approve and deny calls are answered, never prepared")
             }
         };
         let tiers = &self.settings().tiers;
@@ -665,6 +706,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                 let pending = self.prepare(call, prompt, caller).await?;
                 Ok((Ready::Fresh(Box::new(pending)), id))
             }
+            Call::Approve { .. } | Call::Deny { .. } => {
+                unreachable!("approve and deny calls are answered, never run")
+            }
         }
     }
 
@@ -703,6 +747,22 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
             anyhow::bail!("the subagent command is called from an agent's tool call");
         };
         let call = args.call()?;
+        match call {
+            Call::Approve { id } => {
+                return self.answer(started_by, id, Approval::Approved);
+            }
+            Call::Deny { id, reason } => {
+                return self.answer(
+                    started_by,
+                    id,
+                    Approval::Denied {
+                        reason: reason
+                            .map_or_else(|| "denied by its parent".to_string(), str::to_string),
+                    },
+                );
+            }
+            _ => {}
+        }
         let caller = cx.working_dir().map(Path::new);
         let prompt = self.read_prompt(&args.prompt_file, caller).await?;
         let service = &self.service;
@@ -742,7 +802,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
             Ready::Fresh(pending) => pending.name.clone(),
         };
         let run = service.runs().start(started_by, &name, &prompt);
-        let (usage, _tracked) = service.settings.tracker.track(run.id());
+        let (usage, tracked) = service.settings.tracker.track(run.id());
         let mut held = match ready {
             Ready::Continue(mut held) => {
                 if let Body::Agent(session) = &mut held.body {
@@ -765,37 +825,125 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
                 prompt.clone(),
             )
         });
+        let card_seed = self.cards.then(|| CardSeed {
+            call_id: started_by.call().to_string(),
+            prompt: prompt.clone(),
+        });
 
-        let outcome = run
-            .run(
-                &mut held.body,
-                &run_prompt(&prompt, resumed, &held.working_copies),
-            )
-            .await;
+        let prompt_text = run_prompt(&prompt, resumed, &held.working_copies).into_owned();
+        let (done_tx, done_rx) = async_channel::bounded::<(RunOutcome, Held<LLM>)>(1);
+        executor_core::Executor::spawn(&executor_core::DefaultExecutor, async move {
+            let outcome = run.run(&mut held.body, &prompt_text).await;
+            let _ = done_tx.try_send((outcome, held));
+            drop(tracked);
+        })
+        .detach();
+
+        // The turn stays free while a child waits on a decision: the request
+        // reaches the caller as this call's result, and the run reports back
+        // on the session when it ends.
+        let awaited = futures_lite::future::or(
+            async {
+                match done_rx.recv().await {
+                    Ok((outcome, held)) => Awaited::Done(outcome, held),
+                    Err(_) => Awaited::Lost,
+                }
+            },
+            async { Awaited::Approval(service.settings.approvals.wait_for(started_by).await) },
+        )
+        .await;
+
+        let finish = Finish {
+            service: service.clone(),
+            name: name.clone(),
+            lease: lease.clone(),
+            ledger,
+            mark,
+            card_seed,
+        };
+        match awaited {
+            Awaited::Done(outcome, held) => finish.report(held, outcome, card).await,
+            Awaited::Approval(approval) => {
+                // The call returns to answer: its card ends here while the
+                // run's report back recreates one when it ends.
+                if let Some(card) = card {
+                    card.withdraw();
+                }
+                executor_core::Executor::spawn(&executor_core::DefaultExecutor, async move {
+                    let Ok((outcome, held)) = done_rx.recv().await else {
+                        return;
+                    };
+                    finish.deliver(held, outcome).await;
+                })
+                .detach();
+                Ok(ToolResult::text(render(&super::report::ApprovalNeeded {
+                    subagent: approval.child_name(),
+                    id: approval.id(),
+                    subject: approval.request().subject(),
+                    reason: approval.request().reason(),
+                })))
+            }
+            Awaited::Lost => {
+                if let Some(card) = card {
+                    card.withdraw();
+                }
+                anyhow::bail!("the subagent's run ended without a result")
+            }
+        }
+    }
+}
+
+/// What a parked run's card is rebuilt from when its report lands.
+struct CardSeed {
+    call_id: String,
+    prompt: String,
+}
+
+/// What a run's report shares between the path that waits on it and the one
+/// delivering a parked run's result to its session.
+struct Finish<LLM: LanguageModel + 'static> {
+    service: Arc<SubagentService<LLM>>,
+    name: String,
+    lease: aither_core::IdLease,
+    ledger: Option<CommitLedger>,
+    mark: Option<CommitMark>,
+    card_seed: Option<CardSeed>,
+}
+
+impl<LLM: LanguageModel + 'static> Finish<LLM> {
+    /// Renders `outcome` into the call's result: jobs the run left are
+    /// stopped, its commits are listed, a completed run's subagent is kept
+    /// for continuation and its answer is redacted.
+    async fn report(
+        &self,
+        held: Held<LLM>,
+        outcome: RunOutcome,
+        card: Option<RunCard<'_>>,
+    ) -> anyhow::Result<ToolResult> {
+        let settings = &self.service.settings;
         settings
             .work
-            .record(WorkEvent::SubagentFinished(name.clone()));
+            .record(WorkEvent::SubagentFinished(self.name.clone()));
         if let Body::Agent(session) = &held.body {
             let stopped = session.stop_jobs().await;
             if stopped > 0 {
-                tracing::info!(subagent = %name, stopped, "Stopped background jobs left by a subagent");
+                tracing::info!(subagent = %self.name, stopped, "Stopped background jobs left by a subagent");
             }
         }
         // Whatever way the run ended, the commits it made are reported.
-        let commits = CommitListing::of(ledger.as_ref(), mark.as_ref()).await;
+        let commits = CommitListing::of(self.ledger.as_ref(), self.mark.as_ref()).await;
         let working_copies = held.working_copies.clone();
 
         let failure = match outcome {
             RunOutcome::Completed { final_text } => {
-                tracing::info!(subagent = %name, "Subagent completed");
+                tracing::info!(subagent = %self.name, "Subagent completed");
                 let alert = match &held.body {
                     Body::Agent(session) => session.idle_alert(),
                     Body::External { .. } => None,
                 };
                 let cache_bound = matches!(held.body, Body::Agent(_));
                 let (tier, model) = (held.tier, held.model.clone());
-                checkout.id = None;
-                service.finished.store(lease.clone(), held);
+                self.service.finished.store(self.lease.clone(), held);
                 // What the run returns is output of its commands too: the
                 // session's secrets are redacted from it, fail closed.
                 let redactions = settings.redactor.current().await.map_err(|error| {
@@ -803,12 +951,12 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
                 })?;
                 let final_text = redactions.redact(&final_text);
                 let text = render(&SubagentResult {
-                    subagent: &name,
+                    subagent: &self.name,
                     outcome: SubagentReport::Completed {
                         tier: tier.map(Tier::label),
                         model: model.as_deref(),
                         result: &final_text,
-                        id: &lease,
+                        id: &self.lease,
                         cache_bound,
                         alert: alert.as_deref(),
                     },
@@ -826,9 +974,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
                 if let Some(card) = card {
                     card.withdraw();
                 }
-                tracing::info!(subagent = %name, "Subagent cancelled");
+                tracing::info!(subagent = %self.name, "Subagent cancelled");
                 return Ok(ToolResult::text(render(&SubagentResult {
-                    subagent: &name,
+                    subagent: &self.name,
                     outcome: SubagentReport::Cancelled,
                     commits: commits.as_ref(),
                     working_copies: &working_copies,
@@ -849,12 +997,46 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
             Body::External { .. } => Vec::new(),
         };
         Err(anyhow::anyhow!(render(&SubagentError {
-            subagent: &name,
+            subagent: &self.name,
             error: &failure,
             commits: commits.as_ref(),
             working_copies: &working_copies,
             history: &history,
         })))
+    }
+
+    /// Delivers a parked run's report to the session that launched it — the
+    /// call already returned when its subagent asked for a decision, so the
+    /// result arrives as hidden context that wakes the session.
+    async fn deliver(self, held: Held<LLM>, outcome: RunOutcome) {
+        let card = self.card_seed.as_ref().map(|seed| {
+            RunCard::start(
+                &self.service.settings.tracker,
+                seed.call_id.clone(),
+                self.name.clone(),
+                seed.prompt.clone(),
+            )
+        });
+        let result = self.report(held, outcome, card).await;
+        let Some((prompts, session_id)) = self.service.settings.approvals.session() else {
+            return;
+        };
+        let text = match &result {
+            Ok(result) => result.as_text().unwrap_or_default().to_string(),
+            Err(error) => format!("{error:#}"),
+        };
+        if let Err(error) = prompts
+            .deliver_hidden(
+                &session_id,
+                render(&super::report::RunFinished {
+                    subagent: &self.name,
+                    report: &text,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, subagent = %self.name, "failed to deliver a parked run's result");
+        }
     }
 }
 

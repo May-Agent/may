@@ -150,6 +150,35 @@ impl SessionPrompts {
         let _ = self.wake.try_send(session_id.to_string());
         Ok(())
     }
+
+    /// Queues `text` for `session_id` as hidden context — a reminder the
+    /// session's agent reads as a system message, not a user message — and
+    /// wakes the session: an idle one starts a turn with it, a busy one gets
+    /// it after its turn.
+    ///
+    /// # Errors
+    /// [`TaskWakeError`] on storage failure or unusable text.
+    pub async fn deliver_hidden(
+        &self,
+        session_id: &str,
+        text: String,
+    ) -> Result<(), TaskWakeError> {
+        let message = PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: Some(XmlBlock::parse(text)?),
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: PendingUserMessageMode::Queue,
+        };
+        self.runtime_service
+            .enqueue(session_id, message, PendingUserMessageMode::Queue)
+            .await?;
+        let _ = self.wake.try_send(session_id.to_string());
+        Ok(())
+    }
 }
 
 /// Prompt the session that created this task with the text of a file.
