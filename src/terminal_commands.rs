@@ -420,6 +420,7 @@ where
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         host: config.git.clone(),
         checkouts: Some(config.services.checkouts.clone()),
+        github: crate::pr::PrContext::default_github_api(),
         host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());

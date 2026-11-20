@@ -860,9 +860,9 @@ impl MayAgent {
                 let cfg = workspace.config.clone();
                 let key = owner_repo.clone();
                 let publishes =
-                    blocking::unblock(move || crate::trust::trust_for_github(&cfg, &key))
+                    blocking::unblock(move || crate::trust::effective_for_github(&cfg, &key))
                         .await
-                        .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                        .publishes_to_github();
                 publishes.then(|| {
                     (
                         owner_repo.clone(),
@@ -897,11 +897,15 @@ impl MayAgent {
                     .map(Path::to_path_buf);
                 checkout
                     .map_or_else(
-                        || blocking::unblock(|| None),
-                        |c| blocking::unblock(move || crate::trust::trust_for(&cfg, &id, &c)),
+                        || blocking::unblock(|| crate::trust::TrustLevel::LocalBranch),
+                        |_| {
+                            let cfg = cfg.clone();
+                            let id = id.clone();
+                            blocking::unblock(move || crate::trust::effective_for(&cfg, &id))
+                        },
                     )
                     .await
-                    .is_some_and(crate::trust::TrustLevel::clones_work)
+                    .clones_work()
             }
             (Some(crate::session::RepoBinding::Github(_)), _) => github_target.is_some(),
             (None, Some(worktree)) => matches!(

@@ -3629,10 +3629,12 @@ async fn gate_session_repo(
         session_id: session_id.as_str().to_string(),
     };
     let host = crate::host_git::HostGit::inherit();
+    let github = crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource);
     let verdict = crate::repo_gate::RepoGate {
         db: &db,
         host: &host,
         asker: &asker,
+        github: &github,
         config_path: &config_path,
         session_root: &sandbox,
         staging: &staging,
@@ -7652,12 +7654,42 @@ mod tests {
     async fn stopping_a_run_blocked_in_repo_gate_ask_user_settles_and_withdraws() {
         let provider = stub_provider(vec![sse_text("ok")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
         let state = failover_state(may_dir.path(), &provider, &provider).await;
+        // A GitHub-bound session launched in a GitHub checkout whose remote
+        // cannot be reached: the gate's checkout preflight asks the user.
+        // `origin` names github.com so the checkout counts as GitHub, and a
+        // dead loopback proxy fails `ls-remote` at once, without the network.
+        let checkout_dir = cwd.path().join("checkout");
+        let repo = git2::Repository::init(&checkout_dir).expect("git init");
+        repo.remote("origin", "https://github.com/acme/app.git")
+            .expect("origin");
+        repo.config()
+            .expect("git config")
+            .set_str("http.proxy", "http://127.0.0.1:9")
+            .expect("dead proxy");
+        let checkout = checkout_dir.canonicalize().expect("canonical checkout");
+        let config_path =
+            crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
+        crate::trust::persist(
+            &config_path,
+            &checkout,
+            Some(&crate::trust::RepoKind::Github {
+                owner_repo: "acme/app".to_string(),
+            }),
+            crate::trust::TrustLevel::Full,
+        )
+        .expect("persist trust");
         state
             .db()
             .set_session_repo("session", Some("github:acme/app"))
             .await
             .expect("bind repo");
+        state
+            .db()
+            .set_session_cwd("session", &checkout.to_string_lossy())
+            .await
+            .expect("session cwd");
 
         let mut sink = TestSink::default();
         let req = ChatRequest {

@@ -1108,12 +1108,15 @@ impl App {
         let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
         let config =
             crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()).ok();
-        let trust = config.as_ref().and_then(|config| {
-            let worktree = crate::repo_search::worktree_root(&self.cwd)?;
-            let key = crate::issue::repository_identity(&worktree).ok()?;
-            crate::trust::trust_for(config, &key, &worktree)
-        });
-        let clones_work = trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        // Inside a worktree the effective trust decides: only an explicit
+        // `local` decision writes the checkout directly.
+        let clones_work = crate::repo_search::worktree_root(&self.cwd)
+            .and_then(|worktree| crate::issue::repository_identity(&worktree).ok())
+            .is_some_and(|key| {
+                config
+                    .as_ref()
+                    .is_none_or(|config| crate::trust::effective_for(config, &key).clones_work())
+            });
         self.sidebar_file_changes = !clones_work;
         // With clones, the daemon's registry names the roots; they join
         // tracking when its answer arrives.
@@ -2343,9 +2346,8 @@ impl App {
                 }
             };
             let kind = crate::trust::repo_kind(&worktree);
-            let mut ask = AskUserState::for_open_question(crate::trust::question_for(
-                &kind, &worktree, false,
-            ));
+            let mut ask =
+                AskUserState::for_open_question(crate::trust::question_for(&kind, &worktree));
             if let Some(cursor) = current.and_then(|level| {
                 ask.questions[0]
                     .option
@@ -2359,14 +2361,24 @@ impl App {
                 worktree,
                 kind,
                 config_path,
-                redecide: true,
             });
         } else {
+            let config = match crate::workspace::WorkspaceConfig::load(&config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    self.chat.push_error(&format!(
+                        "Cannot read workspace config from {}: {error}",
+                        config_path.display()
+                    ));
+                    return;
+                }
+            };
+            // Writable directories open on the grant option, read-only ones
+            // on "keep it read-only".
             self.mode = AppMode::LaunchGrant(crate::tui::state::LaunchGrantState {
                 path: self.cwd.clone(),
                 config_path,
-                redecide: true,
-                selected: 0,
+                selected: usize::from(!config.has_write_access(&self.cwd)),
             });
         }
     }
