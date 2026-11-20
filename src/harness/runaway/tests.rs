@@ -710,6 +710,30 @@ fn the_alerts_read_as_plain_text() {
         pid: 1,
         footprint_bytes: gib * GIB,
     };
+    let yellow_idle = HostLoadEvent::MemoryYellow {
+        domain: MemoryDomain::Machine,
+        jobs: Vec::new(),
+    };
+    assert_eq!(
+        yellow_idle.alert_text(),
+        "The machine's memory is getting tight (pressure: warning). Hold back memory-hungry work. You have no running jobs."
+    );
+    let yellow_busy = HostLoadEvent::MemoryYellow {
+        domain: MemoryDomain::Machine,
+        jobs: vec![job("small", 1)],
+    };
+    assert_eq!(
+        yellow_busy.alert_text(),
+        "The machine's memory is getting tight (pressure: warning). Hold back memory-hungry work and stop jobs you no longer need. Your running jobs by memory, largest first:\n- 'small' (`run small`): 1.0 GiB"
+    );
+    let red_idle = HostLoadEvent::MemoryRed {
+        domain: MemoryDomain::Machine,
+        jobs: Vec::new(),
+    };
+    assert_eq!(
+        red_idle.alert_text(),
+        "The machine's memory is critically tight (pressure: critical). Hold back memory-hungry work; a job that grows too large may be killed. You have no running jobs."
+    );
     let red = HostLoadEvent::MemoryRed {
         domain: MemoryDomain::Machine,
         jobs: vec![job("big", 36), job("small", 1)],

@@ -82,7 +82,6 @@ pub(super) async fn build_api_prs(
             title: row.title,
             state: row.state,
             backend: row.backend,
-            external_number: row.external_number,
             issue_number: row.issue_number,
             auto_merge: row.auto_merge,
             base_sha: row.base_sha,

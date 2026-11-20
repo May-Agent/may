@@ -55,6 +55,7 @@ pub enum PrArgs {
     /// Re-pin own PR `n` to the clone's current HEAD.
     Update {
         /// PR number.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
         number: i64,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
@@ -63,6 +64,7 @@ pub enum PrArgs {
     /// Merge PR `n` (checks → serialized land → cleanup); also retries.
     Merge {
         /// PR number.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
         number: i64,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
@@ -81,6 +83,7 @@ pub enum PrArgs {
     /// Show one PR with its event trail.
     Show {
         /// PR number.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
         number: i64,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
@@ -89,6 +92,7 @@ pub enum PrArgs {
     /// Take over a PR owned by a deleted (or other) session.
     Adopt {
         /// PR number.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
         number: i64,
         /// `local:<path>` or `github:owner/repo`.
         repo: Option<String>,
@@ -96,6 +100,7 @@ pub enum PrArgs {
     /// Close an own, unmerged PR.
     Close {
         /// PR number.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
         number: i64,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
@@ -461,5 +466,28 @@ mod tests {
             }
         }
         assert!(db.list_repo_clones("s1").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn cli_number_accepts_plain_digits_and_hash_or_bang_sigils() {
+        let schema = serde_json::to_value(schemars::schema_for!(PrArgs)).unwrap();
+        for token in ["42", "#42", "!42"] {
+            let json =
+                crate::ipc::cli_to_json(&schema, &["show".to_string(), token.to_string()]).unwrap();
+            let parsed: PrArgs = serde_json::from_value(json).unwrap();
+            assert!(
+                matches!(
+                    parsed,
+                    PrArgs::Show {
+                        number: 42,
+                        repo: None
+                    }
+                ),
+                "{token}"
+            );
+        }
+        let bad =
+            crate::ipc::cli_to_json(&schema, &["show".to_string(), "#0".to_string()]).unwrap();
+        assert!(serde_json::from_value::<PrArgs>(bad).is_err());
     }
 }

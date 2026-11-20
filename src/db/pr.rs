@@ -148,10 +148,8 @@ pub struct PrRow {
     pub base_sha: String,
     /// The commit the PR owns: pinned when opened, moved only by `pr update`.
     pub head_sha: Option<String>,
-    /// `may` or `github`.
+    /// `may`, `github` or `gitlab`.
     pub backend: String,
-    /// External PR number (GitHub), when the backend created one.
-    pub external_number: Option<i64>,
     /// Merge as soon as checks pass (default) vs. hold for `pr merge`.
     pub auto_merge: bool,
     /// Associated issue number, when the PR was opened with `--issue`.
@@ -166,6 +164,20 @@ pub struct PrRow {
     pub merged_at: Option<String>,
 }
 
+/// Reference sigil for a PR/MR backend (`!` for GitLab merge requests, `#` otherwise).
+#[must_use]
+pub fn pr_sigil(backend: &str) -> char {
+    if backend == "gitlab" { '!' } else { '#' }
+}
+
+impl PrRow {
+    /// Reference sigil (`#` or `!`) for this PR's backend.
+    #[must_use]
+    pub fn sigil(&self) -> char {
+        pr_sigil(&self.backend)
+    }
+}
+
 /// A `prs` row joined with its repository key and whether its owning session
 /// has been deleted.
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
@@ -178,7 +190,7 @@ pub struct PrSummaryRow {
     pub repo_key: String,
     /// Whether the owning session row no longer exists.
     pub orphaned: bool,
-    /// Per-project number, like an issue number.
+    /// Upstream PR/MR number (or per-project sequential number on the local `may` backend).
     pub number: i64,
     /// Session that opened (or last adopted) the PR.
     pub session_id: String,
@@ -188,16 +200,14 @@ pub struct PrSummaryRow {
     pub body: String,
     /// Where the PR stands.
     pub state: PrState,
-    /// Local durable ref or GitHub remote branch.
+    /// Local durable ref or remote branch.
     pub branch: String,
     /// Base commit the PR was opened against.
     pub base_sha: String,
     /// Pinned head commit.
     pub head_sha: Option<String>,
-    /// `may` or `github`.
+    /// `may`, `github` or `gitlab`.
     pub backend: String,
-    /// External PR number (GitHub), when the backend created one.
-    pub external_number: Option<i64>,
     /// Merge as soon as checks pass vs. hold for explicit merge.
     pub auto_merge: bool,
     /// Associated issue number, when linked.
@@ -228,7 +238,6 @@ impl PrSummaryRow {
             base_sha: self.base_sha,
             head_sha: self.head_sha,
             backend: self.backend,
-            external_number: self.external_number,
             auto_merge: self.auto_merge,
             issue_number: self.issue_number,
             merge_commit_sha: self.merge_commit_sha,
@@ -264,6 +273,53 @@ pub struct PrEventRow {
 }
 
 impl ChatDb {
+    /// Backfills legacy `prs.external_number` values into `prs.number` so
+    /// remote PRs carry their upstream number directly.
+    pub(super) async fn migrate_pr_external_numbers(
+        db: &skyzen_services::Db,
+    ) -> Result<(), ChatDbError> {
+        let has_external = query!(
+            db,
+            "SELECT 1 AS value FROM pragma_table_info('prs') WHERE name = 'external_number'"
+        )
+        .fetch_optional::<I64ValueRow>()
+        .await?
+        .is_some();
+        if !has_external {
+            return Ok(());
+        }
+        let pending = query!(
+            db,
+            "SELECT 1 AS value FROM prs WHERE external_number IS NOT NULL LIMIT 1"
+        )
+        .fetch_optional::<I64ValueRow>()
+        .await?
+        .is_some();
+        let mut tx = db.begin().await?;
+        query!(tx, "DROP INDEX IF EXISTS idx_prs_backend_external")
+            .execute()
+            .await?;
+        if pending {
+            // Park migrating rows at negative surrogate ids first so swapping
+            // local sequential numbers for upstream numbers cannot hit a
+            // transient UNIQUE (project_id, number) collision mid-statement.
+            query!(
+                tx,
+                "UPDATE prs SET number = -id WHERE external_number IS NOT NULL"
+            )
+            .execute()
+            .await?;
+            query!(
+                tx,
+                "UPDATE prs SET number = external_number, external_number = NULL WHERE external_number IS NOT NULL"
+            )
+            .execute()
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn find_project(&self, repo_key: &str) -> Result<Option<i64>, ChatDbError> {
         Ok(query!(
             self.db,
@@ -275,7 +331,9 @@ impl ChatDb {
         .map(|row| row.value))
     }
 
-    /// Create a PR for `repo_key`, numbered next within the project.
+    /// Create a PR for `repo_key`: `explicit_number` for remote backends
+    /// (`Some(upstream_number)`), or numbered next within the project (`None`)
+    /// for the local `may` backend.
     ///
     /// # Errors
     /// Fails on database errors.
@@ -291,31 +349,52 @@ impl ChatDb {
         backend: &str,
         auto_merge: bool,
         issue_number: Option<i64>,
-        external_number: Option<i64>,
+        explicit_number: Option<i64>,
     ) -> Result<PrRow, ChatDbError> {
         let project_id = self.ensure_issue_project(repo_key).await?;
         let now = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
-        query!(
-            tx,
-            "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, external_number, auto_merge, issue_number, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM prs WHERE project_id = ?",
-            project_id,
-            session_id,
-            title,
-            body,
-            PrState::Open.as_str(),
-            branch,
-            base_sha,
-            backend,
-            external_number,
-            auto_merge,
-            issue_number,
-            now.clone(),
-            now,
-            project_id
-        )
-        .execute()
-        .await?;
+        if let Some(number) = explicit_number {
+            query!(
+                tx,
+                "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, auto_merge, issue_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                project_id,
+                number,
+                session_id,
+                title,
+                body,
+                PrState::Open.as_str(),
+                branch,
+                base_sha,
+                backend,
+                auto_merge,
+                issue_number,
+                now.clone(),
+                now
+            )
+            .execute()
+            .await?;
+        } else {
+            query!(
+                tx,
+                "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, auto_merge, issue_number, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM prs WHERE project_id = ?",
+                project_id,
+                session_id,
+                title,
+                body,
+                PrState::Open.as_str(),
+                branch,
+                base_sha,
+                backend,
+                auto_merge,
+                issue_number,
+                now.clone(),
+                now,
+                project_id
+            )
+            .execute()
+            .await?;
+        }
         let id = query!(tx, "SELECT last_insert_rowid() AS value")
             .fetch_one::<I64ValueRow>()
             .await?
@@ -714,10 +793,11 @@ mod tests {
                 "github",
                 true,
                 None,
-                None,
+                Some(42),
             )
             .await
             .unwrap();
+        assert_eq!(pr.number, 42);
         for (name, state) in STORED {
             query!(db.db, "UPDATE prs SET state = ? WHERE id = ?", name, pr.id)
                 .execute()
@@ -763,5 +843,68 @@ mod tests {
         assert!(
             PrFilter::Merged.selects(PrState::Merged) && !PrFilter::Merged.selects(PrState::Closed)
         );
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_external_numbers_without_unique_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let raw = ChatDb::connect(&path).await.unwrap();
+        query!(
+            raw,
+            "CREATE TABLE issue_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, repo_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)"
+        )
+        .execute()
+        .await
+        .unwrap();
+        query!(
+            raw,
+            "INSERT INTO issue_projects (id, repo_key, created_at) VALUES (1, 'github:o/r', '2026-01-01T00:00:00Z'), (2, '/tmp/local/.git', '2026-01-01T00:00:00Z')"
+        )
+        .execute()
+        .await
+        .unwrap();
+        query!(
+            raw,
+            "CREATE TABLE prs (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, number INTEGER NOT NULL, session_id TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, branch TEXT NOT NULL, base_sha TEXT NOT NULL, head_sha TEXT, backend TEXT NOT NULL, external_number INTEGER, auto_merge BOOLEAN NOT NULL DEFAULT 1, issue_number INTEGER, merge_commit_sha TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, merged_at TEXT, UNIQUE (project_id, number))"
+        )
+        .execute()
+        .await
+        .unwrap();
+        query!(
+            raw,
+            "CREATE INDEX idx_prs_backend_external ON prs(backend, external_number) WHERE external_number IS NOT NULL"
+        )
+        .execute()
+        .await
+        .unwrap();
+        // Row 1 had local number 1 and upstream #2, while row 2 already held local number 2 and upstream #765.
+        query!(
+            raw,
+            "INSERT INTO prs (id, project_id, number, session_id, title, body, state, branch, base_sha, backend, external_number, auto_merge, created_at, updated_at) VALUES \
+             (1, 1, 1, 's1', 'First', '', 'open', 'may/s1', 'a', 'github', 2, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), \
+             (2, 1, 2, 's2', 'Second', '', 'merged', 'may/s2', 'b', 'github', 765, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), \
+             (3, 2, 1, 's3', 'Local', '', 'open', 'refs/may/pr/1', 'c', 'may', NULL, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        .execute()
+        .await
+        .unwrap();
+        drop(raw);
+
+        let db = ChatDb::open(&path).await.unwrap();
+        let first = db.get_pr("github:o/r", 2).await.unwrap().unwrap();
+        assert_eq!(first.id, 1);
+        assert_eq!(first.title, "First");
+        let second = db.get_pr("github:o/r", 765).await.unwrap().unwrap();
+        assert_eq!(second.id, 2);
+        assert_eq!(second.title, "Second");
+        assert!(db.get_pr("github:o/r", 1).await.unwrap().is_none());
+        let local = db.get_pr("/tmp/local/.git", 1).await.unwrap().unwrap();
+        assert_eq!(local.id, 3);
+
+        // Reopening is idempotent.
+        drop(db);
+        let db2 = ChatDb::open(&path).await.unwrap();
+        assert_eq!(db2.get_pr("github:o/r", 765).await.unwrap().unwrap().id, 2);
     }
 }

@@ -742,11 +742,8 @@ pub struct WirePr {
     pub title: String,
     /// Lifecycle state.
     pub state: crate::db::PrState,
-    /// `may` or `github`.
+    /// `may`, `github` or `gitlab`.
     pub backend: String,
-    /// External PR number, when the backend created one.
-    #[serde(default)]
-    pub external_number: Option<i64>,
     /// Associated issue number, when linked.
     #[serde(default)]
     pub issue_number: Option<i64>,

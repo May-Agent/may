@@ -168,10 +168,17 @@ impl GitHub {
     }
 
     /// The release's archive, checked against the checksum the release
-    /// publishes beside it.
-    pub(super) async fn download_release(&self, latest: &Latest) -> Result<Vec<u8>, UpdateError> {
-        let checksum = self.get_public(&latest.checksum_url).await?;
-        let archive = self.get_public(&latest.archive_url).await?;
+    /// publishes beside it. `progress` reports each chunk's running
+    /// `downloaded`/`total` bytes.
+    pub(super) async fn download_release(
+        &self,
+        latest: &Latest,
+        progress: &mut impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, UpdateError> {
+        let checksum = self.get_public(&latest.checksum_url).await?.bytes().await?;
+        let archive =
+            super::github::body_bytes(self.get_public(&latest.archive_url).await?, None, progress)
+                .await?;
         let checksum = String::from_utf8_lossy(&checksum);
         verify_sha256(&archive, parse_checksum(&checksum)?)?;
         Ok(archive.into())
@@ -292,13 +299,13 @@ mod tests {
 
         assert_eq!(
             github
-                .download_release(&latest("may"))
+                .download_release(&latest("may"), &mut |_, _| {})
                 .await
                 .expect("the archive matches its checksum"),
             archive.as_bytes()
         );
         let error = github
-            .download_release(&latest("bad"))
+            .download_release(&latest("bad"), &mut |_, _| {})
             .await
             .expect_err("the checksum differs");
         assert!(

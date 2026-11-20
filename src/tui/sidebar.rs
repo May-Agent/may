@@ -454,7 +454,6 @@ mod tests {
             title: "t".to_string(),
             state: crate::db::PrState::Open,
             backend: "may".to_string(),
-            external_number: None,
             issue_number: None,
             auto_merge: false,
             base_sha: String::new(),

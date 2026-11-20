@@ -329,7 +329,8 @@ fn pr_rows(
         (true, true) => "▾ ",
         (true, false) => "▸ ",
     };
-    let number = format!("#{} ", pr.number);
+    let sigil = crate::db::pr_sigil(&pr.backend);
+    let number = format!("{sigil}{} ", pr.number);
     let badge = if pr.orphaned {
         "[orphaned] ".to_string()
     } else if pr.require_review && !pr.state.is_terminal() {
@@ -866,7 +867,6 @@ mod tests {
             title: "title".to_string(),
             state,
             backend: "github".to_string(),
-            external_number: Some(1),
             issue_number: None,
             auto_merge: false,
             base_sha: String::new(),
