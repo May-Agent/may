@@ -69,6 +69,26 @@ impl ChatDb {
         timestamp: Option<&str>,
         meta: MessageMeta<'_>,
     ) -> Result<messages::Model, ChatDbError> {
+        let mut tx = match fence {
+            Some(fence) => self.begin_fenced(fence).await?,
+            None => self.db.begin().await?,
+        };
+        let model = self
+            .append_message_in_tx(&mut tx, session_id, role, content, timestamp, meta)
+            .await?;
+        tx.commit().await?;
+        Ok(model)
+    }
+
+    pub(super) async fn append_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        timestamp: Option<&str>,
+        meta: MessageMeta<'_>,
+    ) -> Result<messages::Model, ChatDbError> {
         let MessageMeta {
             tool_call_id,
             stats,
@@ -111,10 +131,6 @@ impl ChatDb {
         let provider_id = stats.and_then(|s| s.provider_id.clone());
         let session_update = role.session_summary_update();
         let role_str = role.as_str();
-        let mut tx = match fence {
-            Some(fence) => self.begin_fenced(fence).await?,
-            None => self.db.begin().await?,
-        };
         let model = query!(
             tx,
             "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation, thinking) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
@@ -145,7 +161,7 @@ impl ChatDb {
                 .update_preview
                 .then(|| truncate_preview(content));
             Self::update_session_stats_in(
-                &mut tx,
+                tx,
                 session_id,
                 &now,
                 preview.as_deref(),
@@ -154,9 +170,8 @@ impl ChatDb {
             .await?;
         }
         if let Some(entry_id) = commit_pending_entry {
-            Self::commit_pending_entry_in(&mut tx, entry_id).await?;
+            Self::commit_pending_entry_in(tx, entry_id).await?;
         }
-        tx.commit().await?;
 
         Ok(model)
     }
@@ -684,9 +699,83 @@ impl ChatDb {
             .await
     }
 
+    /// Append a batch of chat history messages atomically in a single
+    /// transaction: either every message lands or none do.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn append_chat_messages(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<Option<i64>, ChatDbError> {
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        self.check_write_fault()?;
+        let mut tx = self.db.begin().await?;
+        let mut last_id = None;
+        for message in messages {
+            let row = self
+                .append_chat_message_in_tx(&mut tx, session_id, message, None)
+                .await?;
+            last_id = Some(i64::from(row.id));
+        }
+        tx.commit().await?;
+        Ok(last_id)
+    }
+
+    /// Append a batch of chat history messages atomically in a single fenced
+    /// transaction: committed only while `fence` still holds, and rolled back
+    /// whole on any failure.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RunLost`] when the lease was taken over or
+    /// released, or [`ChatDbError`] on storage failure.
+    pub async fn append_chat_messages_as_run(
+        &self,
+        fence: &RunFence,
+        messages: &[ChatMessage],
+    ) -> Result<Option<i64>, ChatDbError> {
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        let mut tx = self.begin_fenced(fence).await?;
+        let mut last_id = None;
+        for message in messages {
+            let row = self
+                .append_chat_message_in_tx(&mut tx, &fence.session_id, message, None)
+                .await?;
+            last_id = Some(i64::from(row.id));
+        }
+        tx.commit().await?;
+        Ok(last_id)
+    }
+
     async fn append_chat_message_fenced(
         &self,
         fence: Option<&RunFence>,
+        session_id: &str,
+        message: &ChatMessage,
+        commit_pending_entry: Option<i64>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let mut tx = match fence {
+            Some(fence) => self.begin_fenced(fence).await?,
+            None => {
+                self.check_write_fault()?;
+                self.db.begin().await?
+            }
+        };
+        let model = self
+            .append_chat_message_in_tx(&mut tx, session_id, message, commit_pending_entry)
+            .await?;
+        tx.commit().await?;
+        Ok(model)
+    }
+
+    async fn append_chat_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
         session_id: &str,
         message: &ChatMessage,
         commit_pending_entry: Option<i64>,
@@ -727,8 +816,8 @@ impl ChatDb {
             .map_err(|error| {
                 storage_error(format!("failed to serialize message translation: {error}"))
             })?;
-        self.append_message_fenced(
-            fence,
+        self.append_message_in_tx(
+            tx,
             session_id,
             message.role.clone(),
             &message.content,
@@ -756,6 +845,7 @@ impl ChatDb {
         session_id: &str,
         stats: &MessageStatsParams,
     ) -> Result<(), ChatDbError> {
+        self.check_write_fault()?;
         let row = query!(
             self.db,
             "SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY id DESC LIMIT 1",

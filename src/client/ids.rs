@@ -184,8 +184,10 @@ impl IdAllocator for SessionPool {
         if self.0.kept().remove(word) {
             return;
         }
-        let mut tail = String::from("/ids/");
-        tail.push_str(word);
+        let encoded = super::encode_path_segment(word);
+        let mut tail = String::with_capacity(5 + encoded.len());
+        tail.push_str("/ids/");
+        tail.push_str(&encoded);
         // No answer is awaited: a closed connection already released it.
         let sent = self.0.daemon.exchanges.try_send(Exchange {
             method: Method::DELETE,
@@ -206,16 +208,20 @@ impl StoredIds for SessionPool {
     fn keep(&self, lease: IdLease) {
         let word = lease.to_string();
         self.0.kept().insert(word.clone());
-        let mut tail = String::from("/ids/");
-        tail.push_str(&word);
+        let encoded = super::encode_path_segment(&word);
+        let mut tail = String::with_capacity(10 + encoded.len());
+        tail.push_str("/ids/");
+        tail.push_str(&encoded);
         tail.push_str("/keep");
         self.0.expect_success(Method::POST, &tail);
         drop(lease);
     }
 
     fn release(&self, word: &str) {
-        let mut tail = String::from("/stored-ids/");
-        tail.push_str(word);
+        let encoded = super::encode_path_segment(word);
+        let mut tail = String::with_capacity(12 + encoded.len());
+        tail.push_str("/stored-ids/");
+        tail.push_str(&encoded);
         self.0.expect_success(Method::DELETE, &tail);
     }
 }

@@ -15,7 +15,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::agent_link::{AgentLinkError, AttributeText, UntrustedText, resolve_prompt_path};
+use crate::agent_link::{AgentLinkError, AttributeText, UntrustedText, resolve_prompt_path_async};
 use crate::db::ChatDbError;
 use crate::session::{
     PendingMessageState, PendingUserMessage, PendingUserMessageMode, SessionRuntimeService,
@@ -207,7 +207,9 @@ impl WakeTool {
             .as_deref()
             .ok_or_else(|| TaskWakeError::NoSession(self.task_name.clone()))?;
         let prompts = self.prompts.as_ref().ok_or(TaskWakeError::Unavailable)?;
-        let path = resolve_prompt_path(&self.work_dir, self.workspace_mount.as_ref(), prompt_file)?;
+        let path =
+            resolve_prompt_path_async(&self.work_dir, self.workspace_mount.as_ref(), prompt_file)
+                .await?;
         let body = async_fs::read_to_string(&path)
             .await
             .map_err(|source| TaskWakeError::Read {
@@ -244,5 +246,60 @@ impl Tool for WakeTool {
             .render()
             .expect("task wake sent template must render"),
         ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{SessionPrompts, TaskWakeError, WakeTool};
+    use crate::agent_link::AgentLinkError;
+    use crate::db::ChatDb;
+    use crate::session::{MayHomePaths, SessionRuntimeService};
+    use crate::ui_event_bus::UiEventBus;
+    use aither_sandbox::{ContainerPath, MountRoot};
+    use std::os::unix::fs::symlink;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn container_wake_refuses_symlink_escaping_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work_dir = temp.path().join("task-work");
+        std::fs::create_dir_all(&work_dir).expect("work_dir");
+        let host_secret = temp.path().join("host-secret.txt");
+        std::fs::write(&host_secret, "top secret").expect("secret");
+        symlink(&host_secret, work_dir.join("prompt.md")).expect("symlink");
+
+        let db = ChatDb::open(&temp.path().join("history.db"))
+            .await
+            .expect("db");
+        db.create_session("s1", Some("Main"), None)
+            .await
+            .expect("session");
+        let runtime = Arc::new(SessionRuntimeService::new(
+            db,
+            UiEventBus::new(),
+            MayHomePaths::new(temp.path().join(".may")),
+        ));
+        let (wake_tx, _wake_rx) = async_channel::unbounded();
+        let tool = WakeTool::new(
+            Some(SessionPrompts::new(runtime, wake_tx)),
+            "t1".to_string(),
+            "Check".to_string(),
+            Some("s1".to_string()),
+            work_dir.clone(),
+            Some(MountRoot {
+                host_root: work_dir,
+                container_root: ContainerPath::new("/workspace").expect("path"),
+            }),
+        );
+
+        let err = tool
+            .wake("/workspace/prompt.md")
+            .await
+            .expect_err("container symlink to host file must be refused");
+        assert!(matches!(
+            err,
+            TaskWakeError::PromptPath(AgentLinkError::OutsideSandbox(_))
+        ));
     }
 }

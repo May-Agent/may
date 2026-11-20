@@ -1896,17 +1896,19 @@ pub(super) async fn run_bash(
         .map_err(internal_error)?
         .ok_or_else(|| super::error::bad_request_error("session not found"))?;
     let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
-    let secrets = crate::secrets::Secrets::load(
-        &crate::secrets::SecretStore::new(&state.may_dir),
-        state.config.load().as_ref(),
-    )
-    .map_err(internal_error)?;
-    let run_secrets = secrets.clone();
+    let may_dir = state.may_dir.clone();
+    let config_snapshot = state.config.load_full();
     let patterns = state.secret_patterns.clone();
-    let outcome = blocking::unblock(move || {
-        crate::bash::run_bash_command(&command, &cwd, &run_secrets, &patterns)
+    let (secrets, outcome) = blocking::unblock(move || -> Result<_, crate::secrets::SecretError> {
+        let secrets = crate::secrets::Secrets::load(
+            &crate::secrets::SecretStore::new(&may_dir),
+            config_snapshot.as_ref(),
+        )?;
+        let outcome = crate::bash::run_bash_command(&command, &cwd, &secrets, &patterns);
+        Ok((secrets, outcome))
     })
-    .await;
+    .await
+    .map_err(internal_error)?;
     // The transcript returned to the client never carries the raw secret.
     let (masked_command, _) = secrets.mask(&state.secret_patterns, &outcome.command);
     Ok(Json(crate::daemon::types::BashResponse {
@@ -2054,6 +2056,42 @@ struct TurnStep<'a, 't, 's, S> {
     checkpoints: aither_agent::Checkpoints,
 }
 
+async fn flush_turn_persister_resilient(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    turn_persister: &mut turn_persister::TurnPersister,
+    agent: Option<&mut MayAgent>,
+) -> Result<bool, crate::db::ChatDbError> {
+    let db = state.db();
+    let _ = state.pending_transcripts.flush_session(&db, session_id).await;
+    match turn_persister.flush(&db).await {
+        Ok(_) => Ok(false),
+        Err(error) => {
+            if let Some(cause) = error.disk_exhaustion_cause() {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "deferring turn transcript writes until home environment disk space returns"
+                );
+                let deferred = turn_persister.take_pending_chat_messages();
+                state
+                    .pending_transcripts
+                    .defer_messages(session_id, deferred, cause);
+                if let Some(agent) = agent
+                    && let Ok(checkpoint) = agent.export_checkpoint().await
+                {
+                    state
+                        .pending_transcripts
+                        .defer_checkpoint(session_id, checkpoint, cause);
+                }
+                Ok(true)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 /// The handler [`aither_agent::Run::drive`] calls with each event of a
 /// turn's run: the job facts the agent read before it are shown first, and a
 /// checkpoint is persisted before its event is handled, so a crash mid-run
@@ -2075,7 +2113,27 @@ async fn step_turn<'a, 't, 's, S: ChatSink>(
         )
         .await
     {
-        return ControlFlow::Break(turn_events::TurnStop::Persist(error));
+        if let Some(cause) = error.disk_exhaustion_cause() {
+            tracing::warn!(
+                session_id = %step.turn.session_id,
+                %error,
+                "deferring run checkpoint until home environment disk space returns"
+            );
+            if let Some(checkpoint) = step.checkpoints.latest() {
+                step.turn.state.pending_transcripts.defer_checkpoint(
+                    step.turn.session_id.as_str(),
+                    checkpoint,
+                    cause,
+                );
+            } else {
+                step.turn
+                    .state
+                    .pending_transcripts
+                    .arm_alert(step.turn.session_id.as_str(), cause);
+            }
+        } else {
+            return ControlFlow::Break(turn_events::TurnStop::Persist(error));
+        }
     }
     match step.turn.handle(timed).await {
         ControlFlow::Continue(()) => ControlFlow::Continue(step),
@@ -2644,10 +2702,18 @@ fn run_agent_loop_attempts<'a>(
                 }
 
                 // Flush the entire turn atomically
-                turn_persister.flush(&state.db()).await?;
+                let _ = flush_turn_persister_resilient(
+                    state,
+                    session_id.as_str(),
+                    &mut turn_persister,
+                    Some(&mut agent),
+                )
+                .await?;
                 let assistant_message_ids =
-                    stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
-                clear_terminal_runtime_state(state, session_id.as_str()).await?;
+                    stored_assistant_message_ids(state, session_id.as_str(), turn_boundary)
+                        .await
+                        .unwrap_or_default();
+                let _ = clear_terminal_runtime_state(state, session_id.as_str()).await;
 
                 record_request_log(
                     state,
@@ -2767,7 +2833,13 @@ fn run_agent_loop_attempts<'a>(
                                     segment_emitted_at(segment_at),
                                 );
                             }
-                            turn_persister.flush(&state.db()).await?;
+                            let _ = flush_turn_persister_resilient(
+                                state,
+                                session_id.as_str(),
+                                &mut turn_persister,
+                                Some(&mut agent),
+                            )
+                            .await?;
                             continue_from_transcript = true;
                         }
                         if turn_is_resume {
@@ -2847,7 +2919,13 @@ fn run_agent_loop_attempts<'a>(
                         .push_assistant(segment_text.clone(), segment_emitted_at(segment_at));
                 }
                 // Flush the entire turn atomically before returning
-                turn_persister.flush(&state.db()).await?;
+                let _ = flush_turn_persister_resilient(
+                    state,
+                    session_id.as_str(),
+                    &mut turn_persister,
+                    Some(&mut agent),
+                )
+                .await?;
                 record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
                 return Err(AgentLoopError::Cancelled(reason));
             }
@@ -2874,10 +2952,23 @@ fn run_agent_loop_attempts<'a>(
             }
 
             // Flush the entire turn atomically
-            turn_persister.flush(&state.db()).await?;
-            let assistant_message_ids =
+            let deferred_turn = flush_turn_persister_resilient(
+                state,
+                session_id.as_str(),
+                &mut turn_persister,
+                Some(&mut agent),
+            )
+            .await?;
+            let mut assistant_message_ids =
                 stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
-            clear_terminal_runtime_state(state, session_id.as_str()).await?;
+            if deferred_turn && assistant_message_ids.is_empty() {
+                assistant_message_ids.push(turn_boundary.saturating_add(1));
+            }
+            if let Err(error) = clear_terminal_runtime_state(state, session_id.as_str()).await
+                && !error.is_disk_exhausted()
+            {
+                return Err(error.into());
+            }
 
             // Final sample carries the exact rate now that Usage has arrived.
             if let Some(rate) = decode_meter.rate() {
@@ -2885,7 +2976,7 @@ fn run_agent_loop_attempts<'a>(
             }
 
             let elapsed_ms = elapsed_ms_saturating(&started_at);
-            persist_latest_assistant_stats(
+            if let Err(error) = persist_latest_assistant_stats(
                 state,
                 &session_id,
                 &provider_id,
@@ -2893,7 +2984,27 @@ fn run_agent_loop_attempts<'a>(
                 model_context_window,
                 elapsed_ms,
             )
-            .await?;
+            .await
+            {
+                if let Some(cause) = error.disk_exhaustion_cause() {
+                    state.pending_transcripts.defer_stats(
+                        session_id.as_str(),
+                        crate::db::MessageStatsParams {
+                            provider_id: Some(provider_id.clone()),
+                            prompt_tokens: usage.prompt_tokens,
+                            completion_tokens: usage.completion_tokens,
+                            total_tokens: usage.total_tokens,
+                            cache_read_tokens: usage.cache_read_tokens,
+                            cache_write_tokens: usage.cache_write_tokens,
+                            context_window: model_context_window,
+                            elapsed_ms: Some(elapsed_ms),
+                        },
+                        cause,
+                    );
+                } else if !deferred_turn {
+                    return Err(error.into());
+                }
+            }
             if let Some(entry) = ledger.finished(Instant::now()) {
                 record_request_log(state, entry).await;
             }
@@ -3778,6 +3889,10 @@ pub(super) async fn resolve_session_context(
     }
 
     let db = state.db();
+    let _ = state
+        .pending_transcripts
+        .flush_session(&db, session_id.as_str())
+        .await;
     let session = db
         .get_session(session_id.as_str())
         .await
@@ -3871,7 +3986,8 @@ pub(super) async fn resolve_session_context(
     // checkpoint, so every transcript seq is one aither assigned.
     let seed_messages = if transcript.is_empty() {
         history
-            .to_aither_messages()
+            .to_aither_messages_async()
+            .await
             .map_err(UiChatPreparationError::HistoryReplay)?
     } else {
         Vec::new()
@@ -3897,7 +4013,8 @@ pub(super) async fn resolve_session_context(
                     ))
                 })?;
             history
-                .input_messages_after(written)
+                .input_messages_after_async(written)
+                .await
                 .map_err(UiChatPreparationError::HistoryReplay)?
         }
         None => Vec::new(),
@@ -3910,6 +4027,32 @@ pub(super) async fn resolve_session_context(
     let mut hidden_commit_entry = req
         .pending_entry_id
         .filter(|_| persist_user_message && !request_has_visible_user_input(req));
+    if let Some(disk_alert) = state.pending_transcripts.take_alert(session_id.as_str()) {
+        if let Err(error) = push_hidden_context_part(
+            &db,
+            fence,
+            &history,
+            &mut hidden_context_parts,
+            disk_alert.clone(),
+            persist_user_message,
+            &mut hidden_commit_entry,
+        )
+        .await
+        {
+            if let Some(cause) = error.disk_exhaustion_cause() {
+                state.pending_transcripts.defer_messages(
+                    session_id.as_str(),
+                    vec![ChatMessage::hidden_context(disk_alert.clone())],
+                    cause,
+                );
+                if !hidden_context_parts.iter().any(|part| part == &disk_alert) {
+                    hidden_context_parts.push(disk_alert);
+                }
+            } else {
+                return Err(UiChatPreparationError::PersistHiddenContext(error));
+            }
+        }
+    }
     let takeover_alert_consumed =
         persist_user_message && take_over_alert_pending(state, &session_id).await;
     if takeover_alert_consumed {
@@ -4023,23 +4166,55 @@ pub(super) async fn resolve_session_context(
         );
         // A claimed queue entry commits in the same fenced transaction as
         // its user message: either both land or neither does.
-        let row = if let Some(entry_id) = req.pending_entry_id {
+        let append_res = if let Some(entry_id) = req.pending_entry_id {
             db.append_chat_message_as_run_and_commit_pending(fence, entry_id, &user_message)
                 .await
         } else {
             db.append_chat_message_as_run(fence, &user_message).await
+        };
+        match append_res {
+            Ok(row) => {
+                if session.title.is_none() {
+                    // The prompt row lands first: a client reloading history on the
+                    // title's `updated_at` drift already sees the message.
+                    let title = truncate_preview(&req.content);
+                    if let Err(error) = db
+                        .update_session(session_id.as_str(), Some(title.as_str()), None, None)
+                        .await
+                        && !error.is_disk_exhausted()
+                    {
+                        return Err(UiChatPreparationError::UpdateSessionTitle(error));
+                    }
+                    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+                }
+                Some(row.id)
+            }
+            Err(error) => {
+                if let Some(cause) = error.disk_exhaustion_cause() {
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "deferring user message persistence until home environment disk space returns"
+                    );
+                    let alert = crate::daemon::disk_exhaustion::format_disk_exhausted_alert(cause);
+                    state.pending_transcripts.defer_messages(
+                        session_id.as_str(),
+                        vec![
+                            ChatMessage::hidden_context(alert.clone()),
+                            user_message,
+                        ],
+                        cause,
+                    );
+                    let _ = state.pending_transcripts.take_alert(session_id.as_str());
+                    if !hidden_context_parts.iter().any(|part| part == &alert) {
+                        hidden_context_parts.push(alert);
+                    }
+                    None
+                } else {
+                    return Err(UiChatPreparationError::AppendUserMessage(error));
+                }
+            }
         }
-        .map_err(UiChatPreparationError::AppendUserMessage)?;
-        if session.title.is_none() {
-            // The prompt row lands first: a client reloading history on the
-            // title's `updated_at` drift already sees the message.
-            let title = truncate_preview(&req.content);
-            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
-                .await
-                .map_err(UiChatPreparationError::UpdateSessionTitle)?;
-            state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-        }
-        Some(row.id)
     } else {
         None
     };
@@ -4262,10 +4437,19 @@ async fn setup_agent_environment(
                 .ipc_route(&container_id)
                 .await
                 .map_err(UiChatPreparationError::ResolveContainerIpcRoute)?;
-            let container_exec =
-                AnyContainerExec::new(std::sync::Arc::new(BollardContainerExec::new(
-                    std::sync::Arc::new(container_manager.runtime().client.clone()),
-                )));
+            let raw_exec = AnyContainerExec::new(std::sync::Arc::new(BollardContainerExec::new(
+                std::sync::Arc::new(container_manager.runtime().client.clone()),
+            )));
+            let container_exec = AnyContainerExec::new(std::sync::Arc::new(
+                crate::daemon::disk_exhaustion::ResilientContainerExec::new(
+                    raw_exec,
+                    container_id.clone(),
+                    crate::daemon::disk_exhaustion::DaemonContainerReconnect::new(
+                        Arc::downgrade(state),
+                        launch_spec,
+                    ),
+                ),
+            ));
 
             crate::agent::AgentEnvironment::Container {
                 container_id,
@@ -4518,7 +4702,7 @@ fn prepare_agent_for_request<'a>(
                 )
                 .await
                 .map_err(UiChatPreparationError::PreviewRequest)?;
-            persist_context_debug_snapshot(
+            if let Err(error) = persist_context_debug_snapshot(
                 state,
                 &ctx.session_id,
                 &ctx.current_model,
@@ -4528,7 +4712,10 @@ fn prepare_agent_for_request<'a>(
                 &preview_messages,
             )
             .await
-            .map_err(UiChatPreparationError::PersistContextDebugSnapshot)?;
+                && !error.is_disk_exhausted()
+            {
+                return Err(UiChatPreparationError::PersistContextDebugSnapshot(error));
+            }
             (prompt, attachments)
         };
 

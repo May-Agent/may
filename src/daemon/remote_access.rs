@@ -20,7 +20,7 @@ use crate::config::RemoteAccessConfig;
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
 
-use super::auth::{NodeNames, NodeNamesSource, TailnetLogin};
+use super::auth::{NodeNames, NodeNamesSource, TailnetLogin, WhoisSource};
 use super::error::{bad_request_error, internal_error};
 use super::state::DaemonState;
 use super::types::{
@@ -784,6 +784,16 @@ impl NodeNamesSource for TailscaleNodeNames {
         let binary = tailscale_binary(&self.0.config_snapshot().remote_access);
         let output = tailscale(&binary, vec!["status".into(), "--json".into()]).await?;
         parse_node_names(&output)
+    }
+}
+
+/// Resolves direct-listener peer addresses through the configured `tailscale`
+/// binary once `DirectListener` has validated the request's `Host`.
+pub(super) struct TailscalePeerWhois(pub(super) Arc<DaemonState>);
+
+impl WhoisSource for TailscalePeerWhois {
+    async fn resolve(&self, peer: IpAddr) -> Option<TailnetLogin> {
+        resolve_tailnet_login(&self.0, peer).await
     }
 }
 

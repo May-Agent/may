@@ -550,33 +550,219 @@ pub struct AgentTool {
     languages: Option<crate::harness::language::LanguageGuard>,
 }
 
-/// The host file behind a path as the session's terminal spells it. In a
-/// container session the sandbox is mounted at the container root, so an
-/// absolute path must lie beneath it and nothing may climb out of it.
+fn normalize_relative_segments(
+    relative: &Path,
+    prompt_file: &str,
+) -> Result<PathBuf, AgentLinkError> {
+    let outside = || AgentLinkError::OutsideSandbox(prompt_file.to_string());
+    let mut cleaned = PathBuf::new();
+    for part in relative.components() {
+        match part {
+            std::path::Component::Normal(segment) => cleaned.push(segment),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return Err(outside()),
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        return Err(outside());
+    }
+    Ok(cleaned)
+}
+
+fn symlink_target_escapes_lexically(target: &Path) -> bool {
+    target.is_absolute()
+        || target.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+/// The host file behind a path as the session's terminal spells it. Both local
+/// and container roots are canonicalized on the host and every path component
+/// is checked so symlinks inside the workspace cannot escape to host files.
 pub(crate) fn resolve_prompt_path(
     sandbox_dir: &Path,
     mount: Option<&aither_sandbox::MountRoot>,
     prompt_file: &str,
 ) -> Result<PathBuf, AgentLinkError> {
-    let Some(mount) = mount else {
-        return Ok(sandbox_dir.join(prompt_file));
-    };
     let outside = || AgentLinkError::OutsideSandbox(prompt_file.to_string());
+    let root_dir = mount.map_or(sandbox_dir, |m| m.host_root.as_path());
     let requested = Path::new(prompt_file);
-    let relative = if requested.is_absolute() {
-        requested
-            .strip_prefix(mount.container_root.as_str())
-            .map_err(|_| outside())?
+    let canonical_root = std::fs::canonicalize(root_dir).map_err(|source| {
+        if mount.is_some()
+            || requested.is_absolute()
+            || requested
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            outside()
+        } else {
+            AgentLinkError::PromptFile {
+                path: root_dir.join(requested),
+                source,
+            }
+        }
+    })?;
+
+    let raw_relative = if let Some(mount) = mount {
+        if requested.is_absolute() {
+            requested
+                .strip_prefix(mount.container_root.as_str())
+                .map_err(|_| outside())?
+                .to_path_buf()
+        } else {
+            requested.to_path_buf()
+        }
+    } else if requested.is_absolute() {
+        if let Ok(rel) = requested.strip_prefix(sandbox_dir) {
+            rel.to_path_buf()
+        } else if let Ok(rel) = requested.strip_prefix(&canonical_root) {
+            rel.to_path_buf()
+        } else if let (Some(parent), Some(file_name)) = (requested.parent(), requested.file_name())
+            && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+            && let Ok(parent_rel) = canonical_parent.strip_prefix(&canonical_root)
+        {
+            parent_rel.join(file_name)
+        } else {
+            return Err(outside());
+        }
     } else {
-        requested
+        requested.to_path_buf()
     };
-    if relative
-        .components()
-        .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
+
+    let relative = normalize_relative_segments(&raw_relative, prompt_file)?;
+    let mut current = canonical_root.clone();
+    for part in relative.components() {
+        let std::path::Component::Normal(segment) = part else {
+            return Err(outside());
+        };
+        current.push(segment);
+        if let Ok(meta) = std::fs::symlink_metadata(&current)
+            && meta.file_type().is_symlink()
+        {
+            match std::fs::canonicalize(&current) {
+                Ok(resolved) => {
+                    if !resolved.starts_with(&canonical_root) {
+                        return Err(outside());
+                    }
+                    current = resolved;
+                }
+                Err(_) => {
+                    let link_target = std::fs::read_link(&current).map_err(|_| outside())?;
+                    if symlink_target_escapes_lexically(&link_target) {
+                        return Err(outside());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(resolved) = std::fs::canonicalize(&current) {
+        if !resolved.starts_with(&canonical_root) {
+            return Err(outside());
+        }
+        return Ok(resolved);
+    }
+    if !current.starts_with(&canonical_root) {
         return Err(outside());
     }
-    Ok(mount.host_root.join(relative))
+    Ok(current)
+}
+
+/// Async counterpart of [`resolve_prompt_path`] using non-blocking filesystem metadata.
+pub(crate) async fn resolve_prompt_path_async(
+    sandbox_dir: &Path,
+    mount: Option<&aither_sandbox::MountRoot>,
+    prompt_file: &str,
+) -> Result<PathBuf, AgentLinkError> {
+    let outside = || AgentLinkError::OutsideSandbox(prompt_file.to_string());
+    let root_dir = mount.map_or(sandbox_dir, |m| m.host_root.as_path());
+    let requested = Path::new(prompt_file);
+    let canonical_root = async_fs::canonicalize(root_dir).await.map_err(|source| {
+        if mount.is_some()
+            || requested.is_absolute()
+            || requested
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            outside()
+        } else {
+            AgentLinkError::PromptFile {
+                path: root_dir.join(requested),
+                source,
+            }
+        }
+    })?;
+
+    let raw_relative = if let Some(mount) = mount {
+        if requested.is_absolute() {
+            requested
+                .strip_prefix(mount.container_root.as_str())
+                .map_err(|_| outside())?
+                .to_path_buf()
+        } else {
+            requested.to_path_buf()
+        }
+    } else if requested.is_absolute() {
+        if let Ok(rel) = requested.strip_prefix(sandbox_dir) {
+            rel.to_path_buf()
+        } else if let Ok(rel) = requested.strip_prefix(&canonical_root) {
+            rel.to_path_buf()
+        } else if let (Some(parent), Some(file_name)) = (requested.parent(), requested.file_name())
+            && let Ok(canonical_parent) = async_fs::canonicalize(parent).await
+            && let Ok(parent_rel) = canonical_parent.strip_prefix(&canonical_root)
+        {
+            parent_rel.join(file_name)
+        } else {
+            return Err(outside());
+        }
+    } else {
+        requested.to_path_buf()
+    };
+
+    let relative = normalize_relative_segments(&raw_relative, prompt_file)?;
+    let mut current = canonical_root.clone();
+    for part in relative.components() {
+        let std::path::Component::Normal(segment) = part else {
+            return Err(outside());
+        };
+        current.push(segment);
+        if let Ok(meta) = async_fs::symlink_metadata(&current).await
+            && meta.file_type().is_symlink()
+        {
+            match async_fs::canonicalize(&current).await {
+                Ok(resolved) => {
+                    if !resolved.starts_with(&canonical_root) {
+                        return Err(outside());
+                    }
+                    current = resolved;
+                }
+                Err(_) => {
+                    let link_target = async_fs::read_link(&current).await.map_err(|_| outside())?;
+                    if symlink_target_escapes_lexically(&link_target) {
+                        return Err(outside());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(resolved) = async_fs::canonicalize(&current).await {
+        if !resolved.starts_with(&canonical_root) {
+            return Err(outside());
+        }
+        return Ok(resolved);
+    }
+    if !current.starts_with(&canonical_root) {
+        return Err(outside());
+    }
+    Ok(current)
 }
 
 impl AgentTool {
@@ -637,11 +823,12 @@ impl Tool for AgentTool {
                     .expect("agent list template must render")
             }
             AgentArgs::Send { name, prompt_file } => {
-                let path = resolve_prompt_path(
+                let path = resolve_prompt_path_async(
                     &self.sandbox_dir,
                     self.workspace_mount.as_ref(),
                     &prompt_file,
-                )?;
+                )
+                .await?;
                 let body = async_fs::read_to_string(&path).await.map_err(|source| {
                     AgentLinkError::PromptFile {
                         path: path.clone(),

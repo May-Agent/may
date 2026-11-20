@@ -535,6 +535,28 @@ impl ChatHistory {
             .collect()
     }
 
+    /// Async counterpart of [`Self::input_messages_after`] using non-blocking
+    /// file reads when a pasted-text attachment lacks inline `text_content`.
+    pub async fn input_messages_after_async(
+        &self,
+        since: Timestamp,
+    ) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
+        let mut out = Vec::new();
+        for message in &self.messages {
+            if !message.timestamp.is_some_and(|stored| stored > since) {
+                continue;
+            }
+            match message.role {
+                MessageRole::User => out.push(replay_user_message_async(message).await?),
+                MessageRole::HiddenContext => {
+                    out.push(aither_core::llm::Message::system(&message.content));
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
     /// Convert to aither messages.
     ///
     /// Rebuild durable LLM history from persisted chat messages.
@@ -634,6 +656,95 @@ impl ChatHistory {
             })
             .collect()
     }
+
+    /// Async counterpart of [`Self::to_aither_messages`] using non-blocking
+    /// attachment reads so turn preparation never blocks an executor thread.
+    pub async fn to_aither_messages_async(
+        &self,
+    ) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
+        use aither_core::llm::Message;
+        let mut out = Vec::with_capacity(self.messages.len());
+        for m in &self.messages {
+            match m.role {
+                MessageRole::User => out.push(replay_user_message_async(m).await?),
+                MessageRole::Assistant => out.push(Message::assistant_with_reasoning(
+                    m.content.clone(),
+                    m.tool_calls.clone(),
+                    m.reasoning.clone(),
+                )),
+                MessageRole::System | MessageRole::HiddenContext => {
+                    out.push(Message::system(&m.content));
+                }
+                MessageRole::Tool => {
+                    let Some(tool_call_id) = m.tool_call_id.as_deref() else {
+                        let boundary = m.content.floor_char_boundary(100);
+                        let preview = m
+                            .content
+                            .get(..boundary)
+                            .unwrap_or(m.content.as_str())
+                            .to_string();
+                        return Err(HistoryReplayError::MissingToolCallId { preview });
+                    };
+                    let event = serde_json::from_str::<ToolEventRecord>(&m.content)
+                        .map_err(HistoryReplayError::InvalidToolEvent)?;
+                    match event {
+                        ToolEventRecord::Start {
+                            id,
+                            name,
+                            arguments,
+                            ..
+                        } => {
+                            if id != tool_call_id {
+                                return Err(HistoryReplayError::ToolEventIdMismatch {
+                                    event_id: id,
+                                    message_id: tool_call_id.to_string(),
+                                });
+                            }
+                            let arguments = serde_json::from_str(&arguments).map_err(|source| {
+                                HistoryReplayError::InvalidToolArguments {
+                                    tool_call_id: id.clone(),
+                                    source,
+                                }
+                            })?;
+                            out.push(Message::assistant_with_tool_calls(
+                                "",
+                                vec![aither_core::llm::ToolCall::new(id, name, arguments)],
+                            ));
+                        }
+                        ToolEventRecord::End { id, result, .. } => {
+                            if id != tool_call_id {
+                                return Err(HistoryReplayError::ToolEventIdMismatch {
+                                    event_id: id,
+                                    message_id: tool_call_id.to_string(),
+                                });
+                            }
+                            out.push(Message::tool(id, result.render_for_model()));
+                        }
+                        ToolEventRecord::Stopped { id, .. } => {
+                            if id != tool_call_id {
+                                return Err(HistoryReplayError::ToolEventIdMismatch {
+                                    event_id: id,
+                                    message_id: tool_call_id.to_string(),
+                                });
+                            }
+                            out.push(Message::tool(
+                                id,
+                                ToolEventRecord::stopped_result().render_for_model(),
+                            ));
+                        }
+                    }
+                }
+                MessageRole::PermissionRequest
+                | MessageRole::PermissionResponse
+                | MessageRole::WorkspaceRequest
+                | MessageRole::WorkspaceResponse
+                | MessageRole::AskUserRequest
+                | MessageRole::AskUserResponse
+                | MessageRole::Recap => {}
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn invalid_attachment(
@@ -678,6 +789,50 @@ fn replay_user_message(
                             invalid_attachment(attachment, format!("read pasted text: {error}"))
                         },
                     )?,
+                };
+                let saved_path = attachment_local_path(attachment).ok();
+                let block = crate::pasted_text::pasted_text_block(&text, saved_path.as_deref());
+                let _ = write!(content, "\n{block}");
+            }
+            AttachmentKind::File => {
+                let label = attachment_local_path(attachment).map_or_else(
+                    |_| attachment.url.clone(),
+                    |path| crate::fs_utils::display_path(&path),
+                );
+                let _ = write!(content, "\n[File reference: {label}]");
+            }
+            AttachmentKind::Image
+            | AttachmentKind::Document
+            | AttachmentKind::Pdf
+            | AttachmentKind::Audio
+            | AttachmentKind::Video => {
+                let url = attachment_url(attachment)?;
+                let mime = attachment_media_type(attachment, &url)?;
+                attachments.push(aither_core::llm::Attachment::new(url, mime));
+            }
+        }
+    }
+    Ok(aither_core::llm::Message::user(&content).with_attachments(attachments))
+}
+
+async fn replay_user_message_async(
+    message: &ChatMessage,
+) -> Result<aither_core::llm::Message, HistoryReplayError> {
+    use super::runtime::AttachmentKind;
+    use std::fmt::Write as _;
+
+    let mut content = message.content.clone();
+    let mut attachments: Vec<aither_core::llm::Attachment> = Vec::new();
+    for attachment in &message.attachments {
+        match attachment.attachment_type {
+            AttachmentKind::Text => {
+                let text = match attachment.text_content.as_deref() {
+                    Some(text) => text.to_string(),
+                    None => async_fs::read_to_string(attachment_local_path(attachment)?)
+                        .await
+                        .map_err(|error| {
+                            invalid_attachment(attachment, format!("read pasted text: {error}"))
+                        })?,
                 };
                 let saved_path = attachment_local_path(attachment).ok();
                 let block = crate::pasted_text::pasted_text_block(&text, saved_path.as_deref());

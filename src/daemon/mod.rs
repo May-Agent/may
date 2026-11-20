@@ -27,6 +27,7 @@ mod cloud_home;
 mod cloud_sessions;
 mod computer;
 mod config;
+pub(crate) mod disk_exhaustion;
 mod error;
 mod error_chain;
 mod events;
@@ -293,7 +294,8 @@ struct SingleInstance {
 fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance> {
     use std::io::Write as _;
 
-    std::fs::create_dir_all(paths.root())?;
+    crate::session::ensure_private_dir_sync(paths.root())
+        .with_context(|| format!("failed to secure {}", paths.root().display()))?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -320,6 +322,12 @@ fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance
 fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        crate::session::ensure_private_dir_sync(parent)
+            .with_context(|| format!("failed to secure {}", parent.display()))?;
+    }
     // The single-instance lock is held, so any socket file left behind
     // belongs to a daemon that is gone.
     match std::fs::remove_file(path) {
@@ -663,6 +671,9 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
                         config_state
                             .live_limits
                             .apply(&config_state.config_snapshot());
+                        extra
+                            .reconcile(&config_state.config_snapshot().daemon.listen)
+                            .await;
                     })
                     .await;
                 }
@@ -745,4 +756,47 @@ pub fn indexer_status_snapshot(
     status: &IndexerStatus,
 ) -> crate::repo_search::indexer::IndexerSnapshot {
     status.snapshot()
+}
+
+#[cfg(all(test, unix))]
+mod fs_permissions_tests {
+    use super::{DaemonPaths, acquire_single_instance, bind_unix};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[tokio::test]
+    async fn daemon_secures_may_dir_0700_and_socket_0600_before_exposing_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let may_dir = temp.path().join(".may");
+        std::fs::create_dir_all(&may_dir).expect("create may_dir");
+        std::fs::set_permissions(&may_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("initial world-rx mode");
+
+        let paths = DaemonPaths::new(may_dir.clone());
+        let _single = acquire_single_instance(&paths).expect("single instance lock");
+        let dir_mode = std::fs::metadata(&may_dir)
+            .expect("may_dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "~/.may must be tightened to 0700");
+
+        let _listener = bind_unix(&paths.socket()).expect("bind unix socket");
+        let sock_mode = std::fs::metadata(paths.socket())
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sock_mode, 0o600, "daemon.sock must be 0600");
+
+        let fresh_may = temp.path().join("fresh-may");
+        crate::session::initialize_session_persistence(&fresh_may)
+            .await
+            .expect("persistence init");
+        let fresh_mode = std::fs::metadata(&fresh_may)
+            .expect("fresh_may metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(fresh_mode, 0o700, "persistence init must enforce 0700");
+    }
 }

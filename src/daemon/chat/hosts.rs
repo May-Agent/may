@@ -211,23 +211,36 @@ pub(super) async fn idle_agent(
     )
     .await
     .map_err(internal_error);
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Err(release_error) = guard
+                .finish_idle(crate::session::RunOutcome::Failed)
+                .await
+            {
+                tracing::warn!(
+                    %session_id,
+                    error = %release_error,
+                    "failed to release the session after a failed agent build"
+                );
+            }
+            return Err(error);
+        }
+    };
+    // Park the built agent while the run guard still holds the session, passing
+    // `guard.released()` so no concurrent caller can observe the session idle
+    // before `parked_agents` holds its worker.
+    state
+        .parked_agents
+        .park(state, session_id, prepared.agent, guard.released());
+    let worker = state.parked_agents.get(session_id);
     if let Err(error) = guard
         .finish_idle(crate::session::RunOutcome::Completed)
         .await
     {
         tracing::warn!(%session_id, %error, "failed to release the session after building its agent");
     }
-    let prepared = prepared?;
-    state.parked_agents.park(
-        state,
-        session_id,
-        prepared.agent,
-        crate::session::RunReleased::already_released(),
-    );
-    state
-        .parked_agents
-        .get(session_id)
-        .ok_or_else(|| internal_error_message("the idle agent stopped at once"))
+    worker.ok_or_else(|| internal_error_message("the idle agent stopped at once"))
 }
 
 /// Waits for the worker's answer to one command.

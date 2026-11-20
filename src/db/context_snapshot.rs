@@ -285,7 +285,10 @@ impl ChatDb {
             .map_err(|error| storage_error(format!("failed to encode checkpoint blob: {error}")))?;
         let mut tx = match fence {
             Some(fence) => self.begin_fenced(fence).await?,
-            None => self.db.begin().await?,
+            None => {
+                self.check_write_fault()?;
+                self.db.begin().await?
+            }
         };
         for entry in &snapshot.transcript_entries {
             query!(

@@ -1325,3 +1325,92 @@ async fn foreign_hosts_do_not_make_the_listener_read_the_status_without_bound() 
         "requests within the refresh interval share one read"
     );
 }
+
+#[derive(Clone)]
+struct CountingWhois {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    delay: std::time::Duration,
+}
+
+impl super::auth::WhoisSource for CountingWhois {
+    async fn resolve(&self, _peer: std::net::IpAddr) -> Option<TailnetLogin> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = self
+            .inflight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.peak
+            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Some(TailnetLogin("owner@example.com".into()))
+    }
+}
+
+#[tokio::test]
+async fn direct_listener_skips_whois_on_foreign_host_and_bounds_concurrent_lookups() {
+    let state = state().await;
+    let source = tailscale_source(&["owner@example.com"]);
+    let whois = CountingWhois {
+        calls: Arc::default(),
+        inflight: Arc::default(),
+        peak: Arc::default(),
+        delay: std::time::Duration::from_millis(40),
+    };
+    let router = Arc::new(build_router(
+        state.clone(),
+        DaemonMode::Rest,
+        DirectListener::with_whois(
+            NodeNamesCache::with_names(StubNodeNames::new(Ok(node_names())), node_names()),
+            super::auth::WhoisCache::with_limits(
+                whois.clone(),
+                2,
+                std::time::Duration::from_secs(30),
+            ),
+            RequireIdentity::new(vec![Box::new(source.whois_source())]),
+        ),
+    ));
+
+    let mut bad = browser_request("GET", "/api/health", "rebind.evil.example:8787", None);
+    bad.extensions_mut()
+        .insert(PeerAddr("100.64.0.25:50000".parse().expect("peer")));
+    assert_eq!(status(&router, bad).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        whois.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "foreign Host must be rejected before running tailscale whois"
+    );
+
+    let make_good = |ip: &str| {
+        let mut req = browser_request("GET", "/api/health", DIRECT_HOST, None);
+        req.extensions_mut()
+            .insert(PeerAddr(format!("{ip}:50000").parse().expect("peer")));
+        req
+    };
+    assert_eq!(status(&router, make_good("100.64.0.25")).await, StatusCode::OK);
+    assert_eq!(status(&router, make_good("100.64.0.25")).await, StatusCode::OK);
+    assert_eq!(
+        whois.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "second request from the same peer IP must hit the short TTL cache"
+    );
+
+    let mut tasks = Vec::new();
+    for octet in 30..36 {
+        let router = router.clone();
+        let req = make_good(&format!("100.64.0.{octet}"));
+        tasks.push(tokio::spawn(async move { status(&router, req).await }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.expect("task"), StatusCode::OK);
+    }
+    assert!(
+        whois.peak.load(std::sync::atomic::Ordering::SeqCst) <= 2,
+        "concurrent whois subprocesses must stay within the semaphore limit"
+    );
+}
