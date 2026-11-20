@@ -62,11 +62,12 @@ pub mod runner;
 mod runtime_context;
 #[cfg(test)]
 mod secret_redaction_tests;
+/// Authorization for the SSH servers `terminal` commands name.
+pub(crate) mod serve_tool;
 mod session_find;
 mod session_model;
 /// Session tool registration for the agent.
 pub mod session_tool;
-/// Authorization for the SSH servers `terminal` commands name.
 pub mod ssh_authorizer;
 /// Live tracking of `subagent` command invocations.
 pub mod subagent_spaces;
