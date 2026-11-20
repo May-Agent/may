@@ -147,6 +147,16 @@ pub fn is_api_key(input: &str) -> bool {
     input.trim().starts_with(API_KEY_PREFIX)
 }
 
+/// Longest one `OpenRouter` auth call may take; nothing downstream bounds it.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("the HTTP client builds with its default configuration")
+}
+
 /// Validate an `sk-or-` API key against the introspection endpoint.
 ///
 /// # Errors
@@ -154,7 +164,7 @@ pub fn is_api_key(input: &str) -> bool {
 /// Returns [`OpenrouterAuthError`] when the request fails or the key is
 /// rejected.
 pub async fn validate_api_key(api_key: &str) -> Result<(), OpenrouterAuthError> {
-    let response = reqwest::Client::new()
+    let response = http()
         .get(KEY_CHECK_URL)
         .bearer_auth(api_key)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -178,7 +188,7 @@ pub async fn validate_api_key(api_key: &str) -> Result<(), OpenrouterAuthError> 
 /// Returns [`OpenrouterAuthError`] on transport errors, rejection by the keys
 /// endpoint, or a response missing the `key` field.
 pub async fn exchange_code(code: &str, verifier: &str) -> Result<String, OpenrouterAuthError> {
-    let response = reqwest::Client::new()
+    let response = http()
         .post(KEYS_URL)
         .header(reqwest::header::ACCEPT, "application/json")
         .json(&serde_json::json!({

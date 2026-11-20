@@ -107,6 +107,15 @@ pub enum MayAgentError {
     /// Missing API key.
     #[error("Missing API key: {0}")]
     MissingApiKey(String),
+    /// A provider's setup — auth refresh, discovery — produced nothing
+    /// within the bound; the same failure a request would have met.
+    #[error("provider '{provider_id}' did not respond within {}s during setup", timeout.as_secs())]
+    ProviderTimeout {
+        /// The provider being built.
+        provider_id: String,
+        /// The bound that elapsed.
+        timeout: std::time::Duration,
+    },
     /// Copilot token error.
     #[error("Copilot token error: {0}")]
     CopilotToken(#[from] crate::copilot::CopilotTokenError),

@@ -65,6 +65,14 @@ pub struct ProviderModelFetchResult {
     pub error: Option<String>,
 }
 
+/// Longest one provider's model list may take before it counts as failed:
+/// the fetch is best-effort enrichment, so a hung endpoint cannot stall a
+/// turn that asked for the context window.
+const PROVIDER_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One provider HTTP call may take at most this long.
+const FETCH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Fetch models from all configured providers with per-provider status.
 ///
 /// Providers are queried concurrently for maximum throughput.
@@ -86,7 +94,18 @@ pub async fn fetch_models_by_provider(config: &MayConfig) -> Vec<ProviderModelFe
                     };
                 }
 
-                match fetch_models_for_provider(&id, &instance).await {
+                match crate::agent::bounded(
+                    PROVIDER_MODELS_TIMEOUT,
+                    fetch_models_for_provider(&id, &instance),
+                    |timeout| {
+                        ModelFetchError::Provider(format!(
+                            "model list timed out after {}s",
+                            timeout.as_secs()
+                        ))
+                    },
+                )
+                .await
+                {
                     Ok(mut provider_models) => {
                         provider_models.sort_by(|a, b| a.id.cmp(&b.id));
                         provider_models.dedup_by(|a, b| a.id == b.id);
@@ -277,7 +296,10 @@ async fn fetch_openai_compatible_models(
         headers.insert(AUTHORIZATION, value);
     }
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(FETCH_REQUEST_TIMEOUT)
+        .build()
+        .expect("the HTTP client builds with its default configuration")
         .get(endpoint)
         .headers(headers)
         .send()
