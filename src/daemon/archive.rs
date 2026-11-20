@@ -195,6 +195,7 @@ mod tests {
                     session_id: Some("permission".into()),
                     agent_id: None,
                     reading: None,
+                    interpreter: None,
                 },
             }),
         )

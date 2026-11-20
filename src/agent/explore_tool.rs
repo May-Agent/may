@@ -60,6 +60,8 @@ where
             prompt_file: args.prompt_file,
             id: None,
             agent: None,
+            model: None,
+            tier: None,
             worktrees: Vec::new(),
             commit_worktrees: Vec::new(),
         };

@@ -4,7 +4,7 @@ use aither_cloud::{
     ClaudeProvider, CloudModelProvider, CodexProvider, CopilotProvider, GeminiProvider,
 };
 use aither_core::llm::LanguageModelProvider;
-use aither_models::lookup as lookup_model_info;
+use aither_models::{ModelMode, ModelRegistry, Provider, lookup as lookup_model_info};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
 
@@ -52,6 +52,9 @@ pub struct FetchedModel {
     pub abilities: Vec<String>,
     /// Provider ID that can serve this model.
     pub provider_id: String,
+    /// Retired by its provider or superseded by a newer generation of its
+    /// line; listings hide it by default.
+    pub outdated: bool,
 }
 
 /// Fetch result for one provider.
@@ -241,6 +244,8 @@ async fn fetch_models_for_provider(
         .list_models()
         .await
         .map_err(|error| ModelFetchError::Provider(error.to_string()))?;
+    let registry = ModelRegistry::bundled();
+    let outdated_index = OutdatedIndex::of(registry);
     Ok(profiles
         .into_iter()
         .map(|p| {
@@ -270,12 +275,14 @@ async fn fetch_models_for_provider(
                     .collect();
             }
 
+            let outdated = outdated_index.is_outdated_id(registry, &model_id);
             FetchedModel {
                 id: model_id,
                 nickname,
                 context_window: Some(p.context_length),
                 abilities,
                 provider_id: id.to_string(),
+                outdated,
             }
         })
         .collect())
@@ -308,6 +315,8 @@ async fn fetch_openai_compatible_models(
         .json::<OpenAiModelListResponse>()
         .await?;
 
+    let registry = ModelRegistry::bundled();
+    let outdated_index = OutdatedIndex::of(registry);
     Ok(response
         .data
         .into_iter()
@@ -333,12 +342,14 @@ async fn fetch_openai_compatible_models(
                     .collect()
             });
 
+            let outdated = outdated_index.is_outdated_id(registry, &model_id);
             FetchedModel {
                 id: model_id,
                 nickname,
                 context_window,
                 abilities,
                 provider_id: id.to_string(),
+                outdated,
             }
         })
         .collect())
@@ -494,6 +505,110 @@ pub fn record_family_effort_rungs(rungs: &mut FamilyEffortRungs, models: &[Fetch
     }
 }
 
+/// Grouping key and version of a model id within its product line.
+///
+/// The key is the alpha tokens up to the first token carrying a digit
+/// (`claude-sonnet-5-5` → `claude-sonnet`); the version is that token's
+/// leading digits plus every following pure-digit token of at most two
+/// digits (`5-5` → `[5, 5]`). Everything after the version run is a variant
+/// tag, not part of the key (`gpt-4o-mini` shares `gpt-4o`'s `gpt`; `o4-mini`
+/// and `o5` share `o`). Dated or numeric run-ons end the run
+/// (`gpt-4o-2024-08-06` still parses as `gpt` `[4]`), and ids with no
+/// version or no key — `whisper`, `codex-mini-latest` — return `None`:
+/// without a version there is nothing to compare.
+fn line_version(id: &str) -> Option<(String, Vec<u32>)> {
+    let mut key = String::new();
+    let mut version: Vec<u32> = Vec::new();
+    for token in id.split(['-', '.']) {
+        match token.bytes().position(|byte| byte.is_ascii_digit()) {
+            _ if !version.is_empty() => {
+                if token.bytes().all(|byte| byte.is_ascii_digit()) && token.len() <= 2 {
+                    version.push(token.parse().ok()?);
+                } else {
+                    break;
+                }
+            }
+            None => {
+                if !key.is_empty() {
+                    key.push('-');
+                }
+                key.push_str(token);
+            }
+            Some(at) => {
+                if at > 0 {
+                    if !key.is_empty() {
+                        key.push('-');
+                    }
+                    key.push_str(&token[..at]);
+                }
+                let digits: String = token[at..]
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .map(char::from)
+                    .collect();
+                version.push(digits.parse().ok()?);
+            }
+        }
+    }
+    (!key.is_empty() && !version.is_empty()).then_some((key, version))
+}
+
+/// Latest generation per `(provider, mode, line)` of a model registry, for
+/// telling apart a model that is retired or superseded from one that is
+/// merely not the latest a vendor offers.
+///
+/// `effort_family_base` folds effort rungs into their family first, so
+/// `o4-mini-high` and `o4-mini` are one entry, never each other's newer
+/// generation.
+#[derive(Debug)]
+pub struct OutdatedIndex {
+    latest: std::collections::HashMap<(Provider, ModelMode, String), Vec<u32>>,
+}
+
+impl OutdatedIndex {
+    /// Indexes `registry`'s entries by product line.
+    #[must_use]
+    pub fn of(registry: &ModelRegistry) -> Self {
+        let mut latest: std::collections::HashMap<_, Vec<u32>> = std::collections::HashMap::new();
+        for entry in registry.all() {
+            let Some((line, version)) = line_version(&effort_family_base(entry.id())) else {
+                continue;
+            };
+            let key = (entry.provider().clone(), entry.mode(), line);
+            if latest.get(&key).is_none_or(|max| version > *max) {
+                latest.insert(key, version);
+            }
+        }
+        Self { latest }
+    }
+
+    /// Whether `entry` is retired by its provider or superseded by a newer
+    /// generation of its own line. Entries carrying no version are never
+    /// superseded — there is no newer one to name.
+    #[must_use]
+    pub fn is_outdated(&self, entry: &aither_models::ModelEntry) -> bool {
+        if entry.is_deprecated() {
+            return true;
+        }
+        let Some((line, version)) = line_version(&effort_family_base(entry.id())) else {
+            return false;
+        };
+        self.latest
+            .get(&(entry.provider().clone(), entry.mode(), line))
+            .is_some_and(|max| version < *max)
+    }
+
+    /// Whether `model_id` is outdated in `registry`: the entry its id
+    /// normalizes to is retired or superseded. Unknown ids are never
+    /// outdated — there is no evidence either way.
+    #[must_use]
+    pub fn is_outdated_id(&self, registry: &ModelRegistry, model_id: &str) -> bool {
+        registry
+            .lookup(model_id)
+            .is_some_and(|entry| self.is_outdated(entry))
+    }
+}
+
 /// The level a session uses before any selection.
 pub const DEFAULT_EFFORT: &str = "medium";
 
@@ -542,6 +657,7 @@ mod tests {
 
     fn fetched(provider_id: &str, id: &str) -> FetchedModel {
         FetchedModel {
+            outdated: false,
             id: id.to_string(),
             nickname: id.to_string(),
             context_window: None,
@@ -577,9 +693,53 @@ mod tests {
 
     fn with_window(provider_id: &str, id: &str, window: u32) -> FetchedModel {
         FetchedModel {
+            outdated: false,
             context_window: Some(window),
             ..fetched(provider_id, id)
         }
+    }
+
+    fn registry() -> aither_models::ModelRegistry {
+        aither_models::ModelRegistry::from_litellm_json(
+            br#"{
+                "gpt-4o": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "gpt-4o-mini": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "gpt-6.2": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "o4-mini": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "o4-mini-high": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "claude-sonnet-4": {"litellm_provider": "anthropic", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "claude-sonnet-5-5": {"litellm_provider": "anthropic", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "claude-opus-4-5": {"litellm_provider": "anthropic", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6},
+                "retired-model": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6, "deprecation_date": "2020-01-01"},
+                "unversioned": {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}
+            }"#,
+        )
+    }
+
+    #[test]
+    fn a_model_is_outdated_when_its_line_has_a_newer_generation() {
+        let registry = registry();
+        let index = super::OutdatedIndex::of(&registry);
+        let outdated = |id: &str| index.is_outdated_id(&registry, id);
+        assert!(outdated("gpt-4o"), "gpt-4o < gpt-6.2");
+        assert!(outdated("gpt-4o-mini"), "same line, same old generation");
+        assert!(!outdated("gpt-6.2"), "the line's latest is never outdated");
+        assert!(
+            !outdated("o4-mini"),
+            "a different line is untouched by gpt-6.2"
+        );
+        assert!(
+            !outdated("o4-mini-high"),
+            "an effort rung is not its family's newer generation"
+        );
+        assert!(outdated("claude-sonnet-4"), "sonnet 4 < sonnet 5.5");
+        assert!(!outdated("claude-opus-4-5"), "opus is its own line");
+        assert!(outdated("retired-model"), "deprecated is outdated");
+        assert!(!outdated("unversioned"), "unversioned is never outdated");
+        assert!(
+            !outdated("totally-unknown"),
+            "unknown ids are never outdated"
+        );
     }
 
     #[test]

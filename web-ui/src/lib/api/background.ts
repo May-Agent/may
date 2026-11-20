@@ -13,6 +13,8 @@ export interface BackgroundJob {
   taskId: string;
   executionKey?: string;
   script: string;
+  /** The interpreter the script runs under (`"shell"` or `"python"`). */
+  interpreter: string;
   mode: string;
   elapsedMs: number;
   status: BackgroundJobStatus;

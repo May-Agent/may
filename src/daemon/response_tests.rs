@@ -134,7 +134,7 @@ impl Prompt for Permission {
         let runtime = runtime.clone();
         tokio::spawn(async move {
             let accepted = approver
-                .request_and_wait(SandboxMode::Unsandboxed, "make install".to_string())
+                .request_and_wait(SandboxMode::Unsandboxed, "make install".to_string(), None)
                 .await
                 .expect("the waiter is woken with a decision");
             observe(&runtime, Self::RESPONSE_ROLE, accepted).await

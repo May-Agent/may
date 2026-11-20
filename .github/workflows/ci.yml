@@ -59,7 +59,18 @@ jobs:
           if [ "${EVENT}" = push ] && [ "${PUSH_BEFORE}" = 0000000000000000000000000000000000000000 ]; then
             printf 'fmt=true\nclippy=true\ntest=true\nweb_ui=true\nacceptance=true\n' | tee -a "${GITHUB_OUTPUT}"
           else
-            git diff --name-only "${range}" | tee /dev/stderr | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
+            files="$(git diff --name-only "${range}")"
+            printf '%s\n' "${files}" | tee /dev/stderr
+            if [ -n "${files}" ] \
+              && ! printf '%s\n' "${files}" | grep -qv -e 'CHANGELOG\.md$' -e '^Cargo\.toml$' -e '^Cargo\.lock$' \
+              && ! git diff -U0 "${range}" -- Cargo.toml Cargo.lock \
+                   | grep '^[+-]' | grep -v '^[+-]\{3\}' | grep -vq 'version *='; then
+              # Version and changelog edits change no compiled code: the
+              # release-plz bump they carry was already green on main.
+              printf 'fmt=false\nclippy=false\ntest=false\nweb_ui=false\nacceptance=false\n' | tee -a "${GITHUB_OUTPUT}"
+            else
+              printf '%s\n' "${files}" | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
+            fi
           fi
 
   # The container tests in container-acceptance pull the workspace image, whose
@@ -154,8 +165,13 @@ jobs:
           verify-baseline-tools: 'true'
           upload-e2e-bin: 'true'
 
+  # One macOS job covers the whole suite: a second macOS runner used to take
+  # the integration tests, but the compile it paid twice costs more than the
+  # parallelism it bought, and the two runners queued for the same scarce
+  # macOS capacity. Baseline-tool verification rides this job on macOS the
+  # way it does on Ubuntu.
   test-macos:
-    name: test (macos-latest, unit)
+    name: test (macos-latest)
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: macos-latest
@@ -168,25 +184,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/test
         with:
-          cargo-flags: '--workspace --lib'
-          upload-may: 'false'
-
-  test-macos-integration:
-    name: test (macos-latest, integration)
-    needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
-    runs-on: macos-latest
-    timeout-minutes: 40
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # See test-ubuntu.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/test
-        with:
-          cargo-flags: '--bins --test crash_signal --test startup_config --test terminal_first_e2e'
-          upload-may: 'true'
           verify-baseline-tools: 'true'
 
 
@@ -283,7 +280,6 @@ jobs:
       - clippy
       - test-ubuntu
       - test-macos
-      - test-macos-integration
       - container-image
       - container-acceptance
       - web-ui

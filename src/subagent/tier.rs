@@ -31,6 +31,16 @@ impl Tier {
             Self::Fast => "fast",
         }
     }
+
+    /// The configured model tier this one draws its model from.
+    #[must_use]
+    pub const fn as_model_tier(self) -> ModelTier {
+        match self {
+            Self::Advanced => ModelTier::Advanced,
+            Self::Balanced => ModelTier::Balanced,
+            Self::Fast => ModelTier::Fast,
+        }
+    }
 }
 
 impl TryFrom<ModelTier> for Tier {

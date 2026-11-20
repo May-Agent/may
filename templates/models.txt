@@ -1,0 +1,11 @@
+Model tiers:
+{% for tier in tiers %}
+  {{ tier.label }} → {{ tier.resolved }}{% if tier.session %} (the session model){% endif %}{% if tier.outdated %} (outdated){% endif %}
+{% endfor %}
+The models in play, named as `provider::model` for `subagent --model`:
+{% for line in lines %}
+  {{ line.selector }}{% if !line.note.is_empty() %} — {{ line.note }}{% endif %}{% if line.outdated %} (outdated){% endif %}
+{% endfor %}
+{% if hidden > 0 %}
+{{ hidden }} outdated model{% if hidden > 1 %}s{% endif %} hidden — `models --full` lists {% if hidden > 1 %}them{% else %}it{% endif %}.
+{% endif %}

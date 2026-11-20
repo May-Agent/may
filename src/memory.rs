@@ -406,7 +406,16 @@ impl ProfileMemories {
 
 #[cfg(test)]
 mod context_tests {
-    use super::ProfileMemories;
+    use super::{ProfileMemories, RECENCY_PROMPT};
+
+    #[test]
+    fn recency_prompt_excludes_transient_harness_and_runtime_state() {
+        assert!(
+            RECENCY_PROMPT.contains("Ignore and drop transient runtime or harness state")
+                && RECENCY_PROMPT.contains("memory or disk pressure alerts"),
+            "{RECENCY_PROMPT}"
+        );
+    }
 
     #[test]
     fn context_lists_the_memories_that_exist() {

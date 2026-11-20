@@ -6,6 +6,7 @@
 //! name = "explore"
 //! description = "Investigates a codebase and returns its conclusion."
 //! tier = "fast"            # advanced, balanced or fast; absent: the fast model routes the brief
+//! model = "openai::gpt-5"  # or pin a concrete `provider::model`; `tier` and `model` are mutually exclusive
 //! access = "read_only"     # or "worktrees": writes the worktrees its caller grants
 //! prompt = '''
 //! You investigate the workspace for the task in the brief.
@@ -52,8 +53,11 @@ pub struct SubagentDefinition {
     /// Its role prompt; the caller's brief is its first message.
     pub prompt: String,
     /// The model tier it runs on; `None` lets the fast model route each
-    /// brief to a tier.
+    /// brief to a tier. Mutually exclusive with [`model`](Self::model).
     pub tier: Option<ModelTier>,
+    /// The concrete `provider::model` it runs on, pinned past any tier and
+    /// past what a call may choose; `None` leaves the choice to `tier`.
+    pub model: Option<crate::ModelSelector>,
     /// What it may write besides its own working directory.
     pub access: SubagentAccess,
 }
@@ -67,6 +71,8 @@ struct DefinitionFile {
     prompt: String,
     #[serde(default)]
     tier: Option<ModelTier>,
+    #[serde(default)]
+    model: Option<String>,
     access: SubagentAccess,
 }
 
@@ -85,6 +91,12 @@ pub enum DefinitionError {
     /// The name cannot be a file name.
     #[error("the name '{0}' may hold only ASCII letters, digits, `-` and `_`")]
     InvalidName(String),
+    /// The model selector is invalid.
+    #[error(transparent)]
+    Model(#[from] crate::model_selector::ModelSelectorParseError),
+    /// `tier` and `model` were both declared.
+    #[error("a definition takes `tier` or `model`, not both")]
+    TierAndModel,
 }
 
 /// Checks that `name` can name a subagent: a file name of ASCII letters,
@@ -122,11 +134,22 @@ impl SubagentDefinition {
                 return Err(DefinitionError::Empty(field));
             }
         }
+        // A bad selector reports itself before the `tier`/`model` overlap
+        // does — the name is the more specific diagnosis.
+        let model = file
+            .model
+            .map(|model| model.parse())
+            .transpose()
+            .map_err(DefinitionError::Model)?;
+        if file.tier.is_some() && model.is_some() {
+            return Err(DefinitionError::TierAndModel);
+        }
         Ok(Self {
             name: file.name,
             description: file.description.trim().to_string(),
             prompt: file.prompt.trim().to_string(),
             tier: file.tier,
+            model,
             access: file.access,
         })
     }
@@ -319,12 +342,14 @@ You review.
                 description: "Reviews a change.".to_string(),
                 prompt: "You review.".to_string(),
                 tier: Some(ModelTier::Balanced),
+                model: None,
                 access: SubagentAccess::Worktrees,
             }
         );
         let routed =
             SubagentDefinition::parse(&DEFINITION.replace("tier = \"balanced\"\n", "")).unwrap();
         assert_eq!(routed.tier, None);
+        assert_eq!(routed.model, None);
     }
 
     #[test]
@@ -335,7 +360,17 @@ You review.
                 DEFINITION.replace("tier = \"balanced\"", "tier = \"huge\""),
                 "huge",
             ),
-            (format!("{DEFINITION}model = \"fast\"\n"), "model"),
+            (
+                format!("{DEFINITION}model = \"fast\"\n"),
+                "invalid model selector 'fast'",
+            ),
+            (
+                DEFINITION.replace(
+                    "tier = \"balanced\"",
+                    "tier = \"balanced\"\nmodel = \"openai::gpt-5\"",
+                ),
+                "takes `tier` or `model`, not both",
+            ),
             (
                 DEFINITION.replace("Reviews a change.", "  "),
                 "`description` must not be empty",

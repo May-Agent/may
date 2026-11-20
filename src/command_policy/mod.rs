@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use aither_core::llm::tool::CallIdentity;
+use aither_core::llm::tool::{CallIdentity, ToolCallId};
 use aither_sandbox::{
     ScriptCheck, ScriptDecision, ScriptEnd, ScriptOrigin, ScriptOutcome, ScriptPolicy,
     ScriptRefusal, ShellBuilder, ShellCommand, ShellScript,
@@ -38,14 +38,14 @@ pub const fn runs_managed_bash(in_container: bool) -> bool {
 /// boundary to tell a turn made only of repeated reads from one that
 /// learned something. Every clone shares the record.
 #[derive(Debug, Clone, Default)]
-pub struct RefusedReads(Arc<Mutex<HashSet<CallIdentity>>>);
+pub struct RefusedReads(Arc<Mutex<HashSet<ToolCallId>>>);
 
 impl RefusedReads {
-    fn record(&self, call: CallIdentity) {
+    fn record(&self, call: &CallIdentity) {
         self.0
             .lock()
             .expect("the refused read record is never held across a panic")
-            .insert(call);
+            .insert(call.call().clone());
     }
 
     /// Whether `call` was refused as an unchanged re-read; each call is
@@ -54,11 +54,24 @@ impl RefusedReads {
     /// # Panics
     /// Panics when the record's lock is poisoned.
     #[must_use]
-    pub fn take(&self, call: &CallIdentity) -> bool {
+    pub fn take(&self, call: &ToolCallId) -> bool {
         self.0
             .lock()
             .expect("the refused read record is never held across a panic")
             .remove(call)
+    }
+
+    /// Whether `call` was refused as an unchanged re-read, without consuming
+    /// the answer the turn boundary still needs.
+    ///
+    /// # Panics
+    /// Panics when the record's lock is poisoned.
+    #[must_use]
+    pub fn peek(&self, call: &ToolCallId) -> bool {
+        self.0
+            .lock()
+            .expect("the refused read record is never held across a panic")
+            .contains(call)
     }
 }
 
@@ -383,7 +396,7 @@ impl ScriptPolicy for UnchangedFileReads {
         if unchanged {
             let paths: Vec<&Path> = stamps.iter().map(|(path, _)| path.as_path()).collect();
             if let Some(call) = script.call {
-                self.refused.record(call.clone());
+                self.refused.record(call);
             }
             return refuse(&UnchangedFileReadRefused { paths: &paths });
         }

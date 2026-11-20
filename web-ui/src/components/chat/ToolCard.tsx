@@ -11,11 +11,13 @@ import {
   Play,
   Search,
   Sparkles,
+  TriangleAlert,
   Wrench,
   X,
 } from 'lucide-react';
 import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
 import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash';
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python';
 import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import { cn } from '@/lib/utils';
 import type { TurnToolState } from '@/lib/stream/reducer';
@@ -33,6 +35,7 @@ import { searchFetchLabel } from '@/lib/hostedLabel';
 import { SearchRow } from './SearchRow';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
+SyntaxHighlighter.registerLanguage('python', python);
 
 interface ToolCardProps {
   tool: TurnToolState;
@@ -133,9 +136,14 @@ function hasError(result: unknown): boolean {
   return terminal !== null && terminal.exitCode !== null && terminal.exitCode !== 0;
 }
 
-function statusIcon(status: TurnToolState['status'], result: unknown) {
+function statusIcon(status: TurnToolState['status'], result: unknown, refused?: boolean) {
   if (status === 'streaming') {
     return <Loader2 className="size-3.5 animate-spin text-muted-foreground" />;
+  }
+  // A refused call is a notice, not a failure — the task it read stays
+  // running.
+  if (refused) {
+    return <TriangleAlert className="size-3.5 text-amber-500" />;
   }
   if (hasError(result)) {
     return <X className="size-3.5 text-destructive" />;
@@ -153,13 +161,18 @@ const shellHighlighterStyle: React.CSSProperties = {
   minWidth: 0,
 };
 
-function ShellBlock({ script }: { script: string }) {
+/** The prism language a terminal script highlights with. */
+export function scriptLanguage(interpreter: string | null | undefined): string {
+  return interpreter === 'python' ? 'python' : 'bash';
+}
+
+function ShellBlock({ script, interpreter }: { script: string; interpreter?: string | null }) {
   return (
     <div className="flex gap-2 text-xs font-mono leading-relaxed">
       <span className="shrink-0 text-muted-foreground select-none">$</span>
       <div className="flex-1 min-w-0 max-h-64 overflow-auto scrollbar-thin">
         <SyntaxHighlighter
-          language="bash"
+          language={scriptLanguage(interpreter)}
           style={oneLight}
           customStyle={shellHighlighterStyle}
           codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
@@ -250,7 +263,12 @@ function TerminalDetails({
   return (
     <div className="space-y-2">
       {readingShown && <CommandReadingView reading={reading} />}
-      {showScript && <ShellBlock script={script} />}
+      {showScript && (
+        <ShellBlock
+          script={script}
+          interpreter={tool.summary?.interpreter ?? projectField(tool.argumentsRaw, 'interpreter')}
+        />
+      )}
       {location !== null && (
         <div className="text-[11px] text-muted-foreground">
           [{t('tools.sshLocation')} {location}]
@@ -404,7 +422,7 @@ function ExpandableToolCard({ tool }: ToolCardProps) {
           {primary}
         </span>
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
-          {statusIcon(tool.status, tool.result)}
+          {statusIcon(tool.status, tool.result, tool.refused)}
           <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
         </span>
       </summary>
