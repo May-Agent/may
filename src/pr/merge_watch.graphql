@@ -8,7 +8,29 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
         totalCount
         nodes {
           __typename
-          ... on RemovedFromMergeQueueEvent { reason }
+          ... on RemovedFromMergeQueueEvent {
+            reason
+            beforeCommit {
+              statusCheckRollup {
+                contexts(first: 100) {
+                  nodes {
+                    __typename
+                    ... on CheckRun {
+                      name
+                      detailsUrl
+                      status
+                      conclusion
+                    }
+                    ... on StatusContext {
+                      context
+                      targetUrl
+                      state
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
       commits(last: 1) {

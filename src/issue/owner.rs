@@ -374,7 +374,24 @@ fn references(tasks: &str) -> Vec<Reference> {
     }
     let mut excluded = excluded.into_iter().peekable();
     let mut found = Vec::new();
+    // A fenced code block keeps its `- #N` lines from claiming, wherever
+    // it sits — the list items inside are literals, not task rows.
+    let mut fence: Option<&str> = None;
     for (number, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let marker = trimmed
+            .strip_prefix("```")
+            .map(|_| "```")
+            .or_else(|| trimmed.strip_prefix("~~~").map(|_| "~~~"));
+        match (fence, marker) {
+            (Some(mark), Some(m)) if m == mark => fence = None,
+            (Some(_), _) => continue,
+            (None, Some(m)) => {
+                fence = Some(m);
+                continue;
+            }
+            (None, None) => {}
+        }
         let at = number + 1;
         while excluded.peek().is_some_and(|next| *next < at) {
             excluded.next();

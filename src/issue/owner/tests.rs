@@ -287,6 +287,20 @@ fn star_items_claim_and_notes_and_code_do_not() {
     assert_eq!(found, [(None, 7), (None, 9), (Some("acme/app"), 17)]);
 }
 
+/// List-like lines inside a fenced code block claim nothing, in any
+/// section — the fence makes them literals, not task rows.
+#[test]
+fn a_fenced_block_in_a_claim_section_claims_nothing() {
+    let found = references(
+        "## Doing\n- #7\n```\n- #13 in code\n```\n- #19\n~~~\n* #23 also code\n~~~\n- #29\n",
+    );
+    let found = found
+        .iter()
+        .map(|reference| reference.number)
+        .collect::<Vec<_>>();
+    assert_eq!(found, [7, 19, 29]);
+}
+
 /// A repository key matches a claim's coordinate without regard to ASCII case.
 #[test]
 fn repository_keys_match_case_insensitively() {
