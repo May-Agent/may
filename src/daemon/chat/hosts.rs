@@ -424,7 +424,18 @@ pub async fn btw_inner(
     use aither_core::llm::Message;
     use futures_lite::StreamExt as _;
 
-    let mut messages = req
+    // A live agent answers through a read-only fork of itself: it may run
+    // commands in its own sandboxed space to gather what the answer needs.
+    let question = req.messages.last().map(|message| message.content.clone());
+    if let Some(question) = question
+        && let Some(answer) = super::agent_messaging(state)
+            .side_answer(session_id, &question)
+            .await
+            .map_err(internal_error)?
+    {
+        return Ok(Json(BtwResponse { answer }));
+    }
+    let messages = req
         .messages
         .into_iter()
         .map(|message| match message.role.as_str() {
@@ -433,26 +444,8 @@ pub async fn btw_inner(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let side = super::sidecar::side_context(state, session_id)
-        .await
-        .map_err(internal_error)?;
-    let llm = if let Some(side) = side {
-        // The agent's own context replaces the client's rendering of the
-        // chat: only the contract (first, when it is a system message) and
-        // the question (last) are kept.
-        let question = messages.pop();
-        let contract = messages
-            .into_iter()
-            .next()
-            .filter(|message| message.role() == aither_core::llm::Role::System);
-        messages = side.messages;
-        messages.extend(contract);
-        messages.extend(question);
-        side.model
-    } else {
-        let worker = idle_agent(state, session_id).await?;
-        worker.side_model().await.map_err(internal_error_message)?
-    };
+    let worker = idle_agent(state, session_id).await?;
+    let llm = worker.side_model().await.map_err(internal_error_message)?;
     let mut answer = String::new();
     let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(event) = stream.next().await {
