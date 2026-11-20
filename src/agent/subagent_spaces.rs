@@ -51,6 +51,10 @@ pub enum SubagentSpaceError {
 pub struct SessionSubagentSpaces {
     /// The session's clones; none for a shell that has none to clone from.
     repos: Option<SessionRepos>,
+    /// Whether the session's commands run inside a container: then a caller
+    /// working directory is a container path, resolved through the workspace
+    /// mount rather than on the host.
+    container: bool,
 }
 
 impl SessionSubagentSpaces {
@@ -58,24 +62,64 @@ impl SessionSubagentSpaces {
     /// are made by `repos`' git.
     #[must_use]
     pub const fn new(repos: SessionRepos) -> Self {
-        Self { repos: Some(repos) }
+        Self {
+            repos: Some(repos),
+            container: false,
+        }
     }
 
     /// Spaces for a shell with no session clones: each holds the writable
     /// directories alone.
     #[must_use]
     pub const fn without_clones() -> Self {
-        Self { repos: None }
+        Self {
+            repos: None,
+            container: false,
+        }
+    }
+
+    /// Resolves caller working directories as container paths: the session
+    /// directory is mounted at the container workspace, and a caller outside
+    /// it maps to nothing.
+    #[must_use]
+    pub const fn for_container(mut self) -> Self {
+        self.container = true;
+        self
+    }
+
+    /// The host path `run.caller` names, when it maps to one. A container
+    /// caller below the workspace mount maps onto the session root; a
+    /// container caller outside it maps to nothing, so the run gets an
+    /// empty space rather than an `ENOENT`. A missing directory is `None`
+    /// for a container caller and an error for a host one.
+    async fn host_caller(
+        &self,
+        repos: &SessionRepos,
+        caller: &Path,
+    ) -> Result<Option<PathBuf>, SubagentSpaceError> {
+        match resolve(caller).await {
+            Ok(path) => return Ok(Some(path)),
+            Err(error) if !self.container => return Err(error),
+            Err(_) => {}
+        }
+        let Ok(relative) = caller.strip_prefix(crate::container::lifecycle::CONTAINER_WORKSPACE)
+        else {
+            return Ok(None);
+        };
+        Ok(resolve(&repos.session_root().join(relative)).await.ok())
     }
 
     /// The clone `run` was launched from inside, by its canonical path: a
     /// clone `repos` registered, or the working copy of the launcher's own
     /// space when the launcher is a subagent.
     async fn launched_from(
+        &self,
         repos: &SessionRepos,
         run: &RunSpace<'_>,
     ) -> Result<Option<PathBuf>, SubagentSpaceError> {
-        let caller = resolve(run.caller).await?;
+        let Some(caller) = self.host_caller(repos, run.caller).await? else {
+            return Ok(None);
+        };
         let mut sources = Vec::new();
         for record in repos.clones().await? {
             match async_fs::canonicalize(repos.path(&record.dir)).await {
@@ -114,10 +158,35 @@ impl SubagentSpaces for SessionSubagentSpaces {
             .fold(PreparedSpace::new(), |prepared, (name, directory)| {
                 prepared.with_env_dir(name, directory)
             });
+        // Each subagent keeps its own `tasks.md` in its space rather than
+        // inheriting the main session's through `MAY_TASKS`; the file is
+        // created so tools resolving the env path find it there.
+        let tasks_md = run.space.join(crate::tasks_md::FILE);
+        if !crate::harness::fs_util::path_exists(&tasks_md)
+            .await
+            .unwrap_or(false)
+        {
+            async_fs::write(&tasks_md, "")
+                .await
+                .map_err(SubagentSpaceError::Directories)?;
+        }
+        let prepared = prepared.with_env_dir(crate::tasks_md::ENV, tasks_md);
+        // A subagent's `HOME` is its space: the sandbox `.gitconfig` the
+        // launcher's space carries (signing program, identity) is copied so
+        // the run's commits look like the session's own.
+        let launcher_gitconfig = run.launcher.join(".gitconfig");
+        if crate::harness::fs_util::path_exists(&launcher_gitconfig)
+            .await
+            .unwrap_or(false)
+        {
+            async_fs::copy(&launcher_gitconfig, run.space.join(".gitconfig"))
+                .await
+                .map_err(SubagentSpaceError::Directories)?;
+        }
         let Some(repos) = &self.repos else {
             return Ok(prepared);
         };
-        let Some(source) = Self::launched_from(repos, &run).await? else {
+        let Some(source) = self.launched_from(repos, &run).await? else {
             return Ok(prepared);
         };
         let copy = run.space.join(WORKING_COPY);
@@ -285,7 +354,7 @@ mod tests {
     }
 
     /// What every prepared space records: the layout of [`WritableDirs`],
-    /// spelled out.
+    /// spelled out, plus the run's own `tasks.md` named by `MAY_TASKS`.
     fn expected_env(space: &Path) -> PreparedSpace {
         let tmp = space.join("tmp");
         let cache = space.join(".cache");
@@ -297,6 +366,7 @@ mod tests {
             .with_env_dir("XDG_CACHE_HOME", &cache)
             .with_env_dir("XDG_CONFIG_HOME", space.join(".config"))
             .with_env_dir("BUN_INSTALL_CACHE_DIR", cache.join("bun"))
+            .with_env_dir(crate::tasks_md::ENV, space.join(crate::tasks_md::FILE))
     }
 
     fn assert_env_dirs_exist(space: &Path) {

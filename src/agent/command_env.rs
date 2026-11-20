@@ -3,6 +3,7 @@
 
 use aither_sandbox::{EnvSource, LaunchInfo};
 
+use crate::ipc::Role;
 use crate::secrets::SessionEnv;
 
 /// What a spawned command's environment holds beyond the sandbox's own.
@@ -28,7 +29,7 @@ impl CommandEnv {
 }
 
 impl EnvSource for CommandEnv {
-    fn env(&self, _launch: &LaunchInfo) -> Vec<(String, String)> {
+    fn env(&self, launch: &LaunchInfo) -> Vec<(String, String)> {
         // `EnvSource` cannot fail a launch. A command that starts without its
         // secrets sends nothing unredacted anywhere; its result then fails the
         // redaction hook, which ends the run with the same error.
@@ -37,7 +38,11 @@ impl EnvSource for CommandEnv {
             Vec::new()
         });
         env.retain(|(name, _)| name != crate::tasks_md::ENV);
-        env.push((crate::tasks_md::ENV.to_string(), self.tasks_md.clone()));
+        // Subagents get their own `MAY_TASKS` inside their prepared subagent
+        // space rather than the main session's `tasks.md`.
+        if Role::of(launch) == Role::Main {
+            env.push((crate::tasks_md::ENV.to_string(), self.tasks_md.clone()));
+        }
         env
     }
 }
@@ -66,6 +71,23 @@ mod tests {
                 crate::tasks_md::ENV.to_string(),
                 "/workspace/tasks.md".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn subagent_launch_does_not_receive_main_tasks_path() {
+        use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolCallId};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut launch = LaunchInfo::default();
+        launch.call = Some(CallIdentity::new(
+            ToolCallId::new("call-1"),
+            AgentIdentity::Subagent(SubagentIdentity::new("worker", None)),
+        ));
+        let env = env_of(dir.path(), "/workspace/tasks.md").env(&launch);
+        assert!(
+            env.iter().all(|(name, _)| name != crate::tasks_md::ENV),
+            "subagent should not inherit main MAY_TASKS: {env:?}"
         );
     }
 

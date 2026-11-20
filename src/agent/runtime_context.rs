@@ -1210,10 +1210,13 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
 /// The approved workspace directories as an external block; `None` while
 /// none is approved.
 pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<ExternalContent> {
+    // Only writable approvals belong in context: a read-only grant is no
+    // approved write root, and saying it were one invites writes it rejects.
     let workdirs: Vec<WorkspaceDirEntry> = workspace
         .config
         .workdirs
         .iter()
+        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
         .map(WorkspaceDirEntry::from)
         .collect();
     if workdirs.is_empty() {
