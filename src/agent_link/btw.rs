@@ -99,6 +99,7 @@ impl ForkHost {
         let builder = aither_agent::AgentBuilder::new(self.model.llm.clone())
             .hooks(ChildHooks::denying(refusal))
             .forked_from(snapshot)
+            .read_only_cache()
             .identity(AgentIdentity::Subagent(SubagentIdentity::new(
                 BTW_FORK, None,
             )));
