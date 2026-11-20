@@ -296,7 +296,8 @@ mod tests {
     #[test]
     fn a_session_whose_prefix_never_changes_records_no_miss() {
         let tools = [tool("terminal")];
-        let mut previous = observation(0, 0, 4_000, PrefixChain::of(&tools, &conversation(1), true));
+        let mut previous =
+            observation(0, 0, 4_000, PrefixChain::of(&tools, &conversation(1), true));
         for turn in 2..8_u32 {
             let current = observation(
                 i64::from(turn) * 60_000,
@@ -322,7 +323,12 @@ mod tests {
     #[test]
     fn a_gap_past_the_cache_lifetime_is_an_expiry() {
         let tools = [tool("terminal")];
-        let previous = observation(0, 8_000, 500, PrefixChain::of(&tools, &conversation(2), true));
+        let previous = observation(
+            0,
+            8_000,
+            500,
+            PrefixChain::of(&tools, &conversation(2), true),
+        );
         let current = observation(
             HOUR_MS + 1,
             0,
@@ -367,13 +373,23 @@ mod tests {
     #[test]
     fn a_compaction_names_the_compaction() {
         let tools = [tool("terminal")];
-        let previous = observation(0, 90_000, 2_000, PrefixChain::of(&tools, &conversation(30), true));
+        let previous = observation(
+            0,
+            90_000,
+            2_000,
+            PrefixChain::of(&tools, &conversation(30), true),
+        );
         let compacted = vec![
             Message::system("you are may"),
             Message::user("handoff"),
             Message::system("live tail"),
         ];
-        let current = observation(60_000, 1_000, 3_000, PrefixChain::of(&tools, &compacted, true));
+        let current = observation(
+            60_000,
+            1_000,
+            3_000,
+            PrefixChain::of(&tools, &compacted, true),
+        );
         let since = SincePrevious {
             rewrites: PrefixRewrites {
                 compacted: true,
@@ -422,7 +438,12 @@ mod tests {
     #[test]
     fn a_rebuilt_agent_with_a_new_system_prompt_names_the_rebuild() {
         let tools = [tool("terminal")];
-        let previous = observation(0, 20_000, 500, PrefixChain::of(&tools, &conversation(4), true));
+        let previous = observation(
+            0,
+            20_000,
+            500,
+            PrefixChain::of(&tools, &conversation(4), true),
+        );
         let mut rebuilt = conversation(5);
         rebuilt[0] = Message::system("you are may, rebuilt");
         let current = observation(30_000, 0, 21_000, PrefixChain::of(&tools, &rebuilt, true));
