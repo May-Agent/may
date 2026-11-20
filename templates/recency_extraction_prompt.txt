@@ -20,9 +20,10 @@ Conversation to analyze:
 Instructions:
 1. Read the conversation and identify recent context about the user.
 2. Merge new context with existing memory, prioritizing recent information.
-3. Remove outdated entries that are clearly superseded.
-4. Output the updated recency memory as a concise markdown list.
-5. If no relevant context is found, return the current memory unchanged.
-6. Keep the total output under 2000 characters.
+3. Ignore and drop transient runtime or harness state — host load, memory or disk pressure alerts, running or exited background job PIDs, tool refusals, sandbox errors, and bare greetings with no user topic.
+4. Remove outdated entries that are clearly superseded.
+5. Output the updated recency memory as a concise markdown list.
+6. If no relevant context is found and nothing in current memory needs dropping, return the current memory unchanged.
+7. Keep the total output under 2000 characters.
 
 Output ONLY the updated recency memory content, no explanation.

@@ -170,6 +170,17 @@ async fn a_fresh_session_prompt_has_one_section_per_concern_and_external_content
     // The catalog entry of `computer`-like descriptions is a whole sentence,
     // and `ask_user` is listed.
     assert!(prefix.contains("\n- ask_user: "), "{prefix}");
+    assert!(
+        prefix.contains("not part of the conversation with the user")
+            && prefix.contains("neither acknowledge it nor act on it unprompted"),
+        "system alerts are framed as silent harness notes:\n{prefix}"
+    );
+    assert!(
+        prefix.contains(
+            "background reference for when relevant, not open tasks or state of this session"
+        ),
+        "past-session memories are framed as background reference:\n{prefix}"
+    );
 }
 
 /// The global `~/.may/AGENTS.md` reaches a fresh session's prompt, after
