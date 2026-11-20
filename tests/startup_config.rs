@@ -80,7 +80,7 @@ const FILES: [ConfigFile; 4] = [
 enum EntryPoint {
     Tui,
     Rest,
-    Ui,
+    Gui,
     Exec,
     OneShot,
 }
@@ -88,7 +88,7 @@ enum EntryPoint {
 const ENTRY_POINTS: [EntryPoint; 5] = [
     EntryPoint::Tui,
     EntryPoint::Rest,
-    EntryPoint::Ui,
+    EntryPoint::Gui,
     EntryPoint::Exec,
     EntryPoint::OneShot,
 ];
@@ -99,7 +99,7 @@ impl EntryPoint {
         match self {
             Self::Tui => Vec::new(),
             Self::Rest => strings(&["rest", "--host", "127.0.0.1", "--port", &free_port()]),
-            Self::Ui => strings(&["ui", "--host", "127.0.0.1", "--port", &free_port()]),
+            Self::Gui => strings(&["gui", "--port", &free_port()]),
             Self::Exec => strings(&["exec", "--session", "no-such-session", "--", "true"]),
             Self::OneShot => strings(&["say hello"]),
         }
@@ -208,8 +208,8 @@ async fn assert_starts_without_file(entry: EntryPoint, file: ConfigFile) {
     assert!(!absent.exists(), "{} must be absent", absent.display());
     let context = format!("{entry:?} without {}", file.name);
     match entry {
-        EntryPoint::Rest | EntryPoint::Ui => {
-            // `ui` needs the `ui` cargo feature, so it ends with its own
+        EntryPoint::Rest | EntryPoint::Gui => {
+            // `gui` needs the `ui` cargo feature, so it ends with its own
             // error; either way the startup step must not refuse.
             if matches!(entry, EntryPoint::Rest) {
                 assert_rest_answers(home.path(), &context).await;
