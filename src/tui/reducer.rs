@@ -34,9 +34,15 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.compaction.clear_expired(std::time::Instant::now());
             app.history.poll_load();
             app.completion.refresh_file_matches();
-            // Image keys come from the last frame's layout; scanning here
-            // on the tick cadence keeps the work off the draw path.
-            app.scan_and_fetch_images();
+            // Image keys come from the last frame's layout; scanning runs
+            // only when that layout's entries changed — new messages,
+            // attachments, refolds, width or session changes — not on
+            // every idle tick.
+            let scan_version = app.chat_layout.scan_version();
+            if app.last_image_scan_version != scan_version {
+                app.last_image_scan_version = scan_version;
+                app.scan_and_fetch_images();
+            }
             app.sync_profile_follow();
             if app.new_year.check_due(std::time::Instant::now()) {
                 let zone = crate::tui::new_year::user_zone(&app.config.time);
@@ -283,6 +289,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         }
         AppEvent::ImageDecoded { key, state } => {
             app.handle_image_decoded(key, state);
+            Ok(None)
+        }
+        AppEvent::ImageEncoded { key, proto } => {
+            app.handle_image_encoded(key, proto);
             Ok(None)
         }
 

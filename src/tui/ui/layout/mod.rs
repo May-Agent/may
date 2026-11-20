@@ -274,6 +274,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             &mut app.image_regions,
             &image_positions,
             &occluders,
+            &app.event_tx,
         );
     }
 
@@ -646,6 +647,7 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
         .split(inner);
 
     let image_area = rows[0];
+    let event_tx = app.event_tx.clone();
     let state = app.image_cache.get_mut(&key).expect("checked above");
     let fitted = state.fitted(image_area);
     let draw_area = Rect::new(
@@ -655,7 +657,7 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
         fitted.height.min(image_area.height),
     );
     app.image_view_area = Some(draw_area);
-    super::image::render_image(frame, draw_area, state);
+    super::image::render_image(frame, draw_area, state, &key, &event_tx);
 
     let caption = Paragraph::new(caption)
         .style(Style::default().fg(Color::DarkGray))
@@ -2922,6 +2924,7 @@ fn render_inline_images(
     image_regions: &mut Vec<ImageRegion>,
     placements: &[chat::ImagePlacement],
     occluders: &[Rect],
+    events_tx: &crate::tui::event::EventSender,
 ) {
     use super::streaming_markdown::IMAGE_HEIGHT;
 
@@ -2985,7 +2988,7 @@ fn render_inline_images(
             fitted.height.min(image_area.height),
         );
 
-        super::image::render_image(frame, image_area, state);
+        super::image::render_image(frame, image_area, state, &placement.key, events_tx);
         image_regions.push(ImageRegion {
             rect: draw_area,
             key: placement.key.clone(),
@@ -3124,26 +3127,49 @@ mod tests {
             ProtocolType::Iterm2,
         ] {
             let mut state = image_state(protocol);
+            let (tx, rx) = async_channel::unbounded();
             let mut terminal = Terminal::new(ScreenBackend::new(40, 16)).unwrap();
             let image_area = Rect::new(2, 2, 20, 6);
             for fill in ['a', 'b', 'c'] {
                 let mut truth = Buffer::empty(Rect::new(0, 0, 40, 16));
-                terminal
-                    .draw(|frame| {
-                        let area = frame.area();
-                        let row: String = std::iter::repeat_n(fill, 40).collect();
-                        for y in 0..area.height {
-                            frame.buffer_mut().set_string(
-                                0,
-                                y,
-                                &row,
-                                ratatui::style::Style::default(),
-                            );
+                // Off-draw encodes return through the event channel; the app
+                // loop draws again once they land, so draw until none are
+                // left encoding.
+                for _ in 0..3 {
+                    terminal
+                        .draw(|frame| {
+                            let area = frame.area();
+                            let row: String = std::iter::repeat_n(fill, 40).collect();
+                            for y in 0..area.height {
+                                frame.buffer_mut().set_string(
+                                    0,
+                                    y,
+                                    &row,
+                                    ratatui::style::Style::default(),
+                                );
+                            }
+                            render_image(frame, image_area, &mut state, "test-image", &tx);
+                            truth.clone_from(frame.buffer_mut());
+                        })
+                        .unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let mut applied = false;
+                    while matches!(state.proto, crate::tui::ui::image::ImageProtocol::Encoding) {
+                        match rx.try_recv() {
+                            Ok(crate::tui::event::AppEvent::ImageEncoded { proto, .. }) => {
+                                state.proto = crate::tui::ui::image::ImageProtocol::Other(proto.0);
+                                applied = true;
+                            }
+                            Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Ok(_) | Err(_) => break,
                         }
-                        render_image(frame, image_area, &mut state);
-                        truth.clone_from(frame.buffer_mut());
-                    })
-                    .unwrap();
+                    }
+                    if !applied {
+                        break;
+                    }
+                }
                 let shown = terminal.backend().screen();
                 let expected = buffer_screen(&truth);
                 for y in 0..16u16 {
@@ -3204,35 +3230,66 @@ mod tests {
     ) -> (Vec<String>, Vec<ImageRegion>) {
         let mut regions = Vec::new();
         let mut truth = None;
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                let mut placements: Vec<ImagePlacement> = Vec::new();
-                render_unified(
-                    frame,
-                    area,
-                    chat,
-                    layout,
-                    scroll,
-                    UnifiedRenderContext {
-                        selected_tool: None,
-                        content_height_out: None,
-                        view_height_out: None,
-                        input_ctx: None,
-                        input_caret_active: false,
-                        queue_ctx: None,
-                        status_ctx: None,
-                        images_supported: true,
-                        hide_todos: false,
-                        image_positions_out: Some(&mut placements),
-                        spinner_frame: 0,
-                        band_bg: None,
-                    },
-                );
-                render_inline_images(frame, area, cache, &mut regions, &placements, &[]);
-                truth = Some(frame.buffer_mut().clone());
-            })
-            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        // The app's event loop draws again after an off-draw encode lands;
+        // repeat until no protocol is left encoding.
+        for _ in 0..4 {
+            regions.clear();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let mut placements: Vec<ImagePlacement> = Vec::new();
+                    render_unified(
+                        frame,
+                        area,
+                        chat,
+                        layout,
+                        scroll,
+                        UnifiedRenderContext {
+                            selected_tool: None,
+                            content_height_out: None,
+                            view_height_out: None,
+                            input_ctx: None,
+                            input_caret_active: false,
+                            queue_ctx: None,
+                            status_ctx: None,
+                            images_supported: true,
+                            hide_todos: false,
+                            image_positions_out: Some(&mut placements),
+                            spinner_frame: 0,
+                            band_bg: None,
+                        },
+                    );
+                    render_inline_images(frame, area, cache, &mut regions, &placements, &[], &tx);
+                    truth = Some(frame.buffer_mut().clone());
+                })
+                .unwrap();
+            // Apply off-draw encodes the way the app loop does, waiting for
+            // any encode still in flight before deciding whether to redraw.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut applied = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(crate::tui::event::AppEvent::ImageEncoded { key, proto }) => {
+                        if let Some(state) = cache.get_mut(&key) {
+                            state.proto = crate::tui::ui::image::ImageProtocol::Other(proto.0);
+                        }
+                        applied = true;
+                    }
+                    Ok(_) | Err(_)
+                        if cache.values().any(|state| {
+                            matches!(state.proto, crate::tui::ui::image::ImageProtocol::Encoding)
+                        }) && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(_) | Err(_) => break,
+                }
+            }
+            if !applied {
+                break;
+            }
+        }
         let shown = terminal.backend().screen();
         let truth = buffer_screen(&truth.expect("drawn"));
         // Skip cells inside an image are painted by the terminal itself.
@@ -3375,6 +3432,7 @@ mod tests {
         let mut layout = ChatLayout::default();
         let mut terminal = Terminal::new(ScreenBackend::new(50, 20)).unwrap();
         let mut regions = Vec::new();
+        let (tx, _rx) = async_channel::unbounded();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -3408,6 +3466,7 @@ mod tests {
                     &mut regions,
                     &placements,
                     &[occluder],
+                    &tx,
                 );
             })
             .unwrap();

@@ -3,8 +3,8 @@ import { ArrowUp, Paperclip, Square, X, Zap, ListOrdered } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/lib/i18n';
-import type { ApiAttachment, AttachmentKind } from '@/lib/types';
-import { uploadAttachment } from '@/lib/api/artifacts';
+import type { ApiAttachment } from '@/lib/types';
+import { fileToAttachment } from './composerAttachments';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { MachinePicker } from './MachinePicker';
 import { ModelPicker } from './ModelPicker';
@@ -21,25 +21,6 @@ interface ComposerProps {
   /** A message the daemon withdrew; its text and attachments return to the input. */
   restored?: { content: string; attachments: ApiAttachment[] } | null;
   onRestored?: () => void;
-}
-
-function detectKind(mime: string): AttachmentKind {
-  if (mime.startsWith('image/')) return 'image';
-  if (mime.startsWith('audio/')) return 'audio';
-  if (mime.startsWith('video/')) return 'video';
-  if (mime.startsWith('text/') || mime === 'application/json') return 'text';
-  if (mime === 'application/pdf') return 'pdf';
-  if (mime.startsWith('application/')) return 'document';
-  return 'file';
-}
-
-async function fileToAttachment(sessionId: string, file: File): Promise<ApiAttachment> {
-  const record = await uploadAttachment(sessionId, file);
-  const kind = detectKind(file.type || '');
-  if (kind === 'text' && file.size < 256 * 1024) {
-    record.textContent = await file.text();
-  }
-  return record;
 }
 
 export function Composer({
@@ -96,12 +77,17 @@ export function Composer({
     setUploadError(null);
   }, [value, attachments, deliveryMode, disabled, uploading, onSend]);
 
+  /** The one materialization in flight — every concurrent upload shares it. */
+  const materializing = useRef<{ id: string; session: Promise<string> } | null>(null);
+
   const addFiles = async (files: FileList | File[]) => {
     const list = Array.from(files);
     setUploading((count) => count + 1);
     setUploadError(null);
     try {
-      const mapped = await Promise.all(list.map((file) => fileToAttachment(sessionId, file)));
+      const mapped = await Promise.all(
+        list.map((file) => fileToAttachment(sessionId, file, materializing)),
+      );
       setAttachments((prev) => [...prev, ...mapped]);
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : String(error));

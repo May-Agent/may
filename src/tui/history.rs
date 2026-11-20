@@ -114,7 +114,7 @@ impl InputHistory {
     /// An empty history that writes nothing — for tests and the CLI paths
     /// with no `~/.may`.
     #[cfg(test)]
-    fn empty_for_test() -> Self {
+    const fn empty_for_test() -> Self {
         Self {
             entries: Vec::new(),
             nav_index: None,

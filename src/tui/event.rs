@@ -122,6 +122,14 @@ pub enum AppEvent {
         /// Ready-to-render protocol state; `None` when fetch/decode failed.
         state: Option<super::ui::image::ImageState>,
     },
+    /// An iTerm2/Sixel/halfblocks protocol finished its resize+encode on a
+    /// worker thread; the cached bytes now match the draw area it asked for.
+    ImageEncoded {
+        /// Cache key the encoded protocol belongs to.
+        key: String,
+        /// The protocol holding the freshly encoded bytes.
+        proto: super::ui::image::EncodedProtocol,
+    },
 
     // ─── Sidebar ─────────────────────────────────────────────────────
     /// The session's `tasks.md`, as the daemon served it (`None`: no file).
@@ -321,6 +329,7 @@ impl AppEvent {
             Self::EffortLoaded(_) => "effort_loaded",
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",
+            Self::ImageEncoded { .. } => "image_encoded",
             Self::SidebarTasks { .. } => "sidebar_tasks",
             Self::SidebarPrs { .. } => "sidebar_prs",
             Self::PrsInvalidated => "prs_invalidated",

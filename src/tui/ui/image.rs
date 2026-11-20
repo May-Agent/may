@@ -17,7 +17,9 @@ use base64::Engine as _;
 use ratatui_image::picker::cap_parser::Parser;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::{Resize, ResizeEncodeRender, StatefulImage};
+
+use crate::tui::event::{AppEvent, EventSender};
 
 use super::kitty_diacritics::diacritic;
 
@@ -153,11 +155,27 @@ pub enum ImageProtocol {
     Kitty(KittyImage),
     /// iTerm2/Sixel/halfblocks: ratatui-image resizes+encodes per area.
     Other(StatefulProtocol),
+    /// The protocol was moved to a worker thread for `resize_encode` and
+    /// arrives back through [`crate::tui::event::AppEvent::ImageEncoded`].
+    /// Draw paints the placeholder until then — the encode never happens
+    /// inside `terminal.draw`.
+    Encoding,
 }
 
 impl std::fmt::Debug for ImageProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageProtocol").finish_non_exhaustive()
+    }
+}
+
+/// A [`StatefulProtocol`] in flight from an off-draw `resize_encode` back
+/// to the cache — [`StatefulProtocol`] has no `Debug`, which
+/// [`crate::tui::event::AppEvent`] derives.
+pub struct EncodedProtocol(pub StatefulProtocol);
+
+impl std::fmt::Debug for EncodedProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedProtocol").finish_non_exhaustive()
     }
 }
 
@@ -341,13 +359,47 @@ fn kitty_image_state(picker: &Picker, data: &[u8]) -> Option<KittyImage> {
 /// leftover gray blocks) and kitty rows lost their placeholders. Pinning
 /// those cells to a width of one keeps the diff exact; the rest of the
 /// image area is already marked skip by the protocol.
-pub fn render_image(frame: &mut Frame, area: Rect, state: &mut ImageState) {
+pub fn render_image(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut ImageState,
+    key: &str,
+    events_tx: &EventSender,
+) {
     match &mut state.proto {
         ImageProtocol::Kitty(kitty) => render_kitty(frame.buffer_mut(), area, kitty),
         ImageProtocol::Other(protocol) => {
-            let image_widget = StatefulImage::default();
-            frame.render_stateful_widget(image_widget, area, protocol);
+            match protocol.needs_resize(&Resize::Fit(None), area) {
+                // The stored encoding already covers this area: the widget
+                // paints cells only — no resize, no encode.
+                None => {
+                    let image_widget = StatefulImage::default();
+                    frame.render_stateful_widget(image_widget, area, protocol);
+                }
+                // A new area needs fresh bytes: the protocol moves to a
+                // worker thread for `resize_encode` and returns through
+                // `AppEvent::ImageEncoded`; draw paints the placeholder
+                // meanwhile.
+                Some(size) => {
+                    let ImageProtocol::Other(mut proto) =
+                        std::mem::replace(&mut state.proto, ImageProtocol::Encoding)
+                    else {
+                        unreachable!("matched above")
+                    };
+                    let key = key.to_owned();
+                    let tx = events_tx.clone();
+                    std::thread::spawn(move || {
+                        proto.resize_encode(&Resize::Fit(None), size);
+                        let _ = tx.try_send(AppEvent::ImageEncoded {
+                            key,
+                            proto: EncodedProtocol(proto),
+                        });
+                    });
+                }
+            }
         }
+        // Bytes are being encoded on a worker thread.
+        ImageProtocol::Encoding => {}
     }
     pin_escape_cells(frame.buffer_mut(), area);
 }
@@ -360,6 +412,8 @@ impl ImageState {
         match &self.proto {
             ImageProtocol::Kitty(kitty) => kitty.fit_rect(area),
             ImageProtocol::Other(protocol) => protocol.size_for(Resize::Fit(None), area),
+            // While the protocol encodes off-draw the slot keeps its area.
+            ImageProtocol::Encoding => area,
         }
     }
 }

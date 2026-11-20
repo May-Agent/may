@@ -358,6 +358,10 @@ pub struct App {
     pub image_regions: Vec<ImageRegion>,
     /// Image rect inside the zoom overlay — a click outside it closes the view
     pub image_view_area: Option<ratatui::layout::Rect>,
+    /// `ChatLayout::scan_version` the last image-key scan ran on; `u64::MAX`
+    /// forces the first scan. Markdown anchors are rescanned only when the
+    /// laid-out set changed — on updates, never on an idle tick.
+    pub last_image_scan_version: u64,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
     /// Where the pointer last was inside the chat column (screen cell);
@@ -782,6 +786,7 @@ impl App {
             image_failed: ahash::AHashSet::new(),
             image_regions: Vec::new(),
             image_view_area: None,
+            last_image_scan_version: u64::MAX,
             selection: None,
             hover: None,
             link_opener: std::sync::Arc::new(super::ui::links::SystemOpener),
@@ -1890,6 +1895,29 @@ impl App {
         } else {
             tracing::debug!("Image fetch/decode failed for {}", key);
             self.image_failed.insert(key);
+        }
+    }
+
+    /// Restore an iTerm2/Sixel/halfblocks protocol that finished its
+    /// `resize_encode` off the draw path. A stale encode — the entry was
+    /// re-fetched or the session changed meanwhile — is dropped.
+    pub(super) fn handle_image_encoded(
+        &mut self,
+        key: String,
+        proto: super::ui::image::EncodedProtocol,
+    ) {
+        let proto = proto.0;
+        match self.image_cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if matches!(entry.get().proto, super::ui::image::ImageProtocol::Encoding) {
+                    entry.get_mut().proto = super::ui::image::ImageProtocol::Other(proto);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(super::ui::image::ImageState {
+                    proto: super::ui::image::ImageProtocol::Other(proto),
+                });
+            }
         }
     }
 
@@ -5590,10 +5618,13 @@ mod tests {
                 ..crate::config::ProviderInstance::default()
             },
         );
-        config.models.advanced.push(crate::model_selector::ModelSelector::new(
-            "anthropic",
-            "claude-test",
-        ));
+        config
+            .models
+            .advanced
+            .push(crate::model_selector::ModelSelector::new(
+                "anthropic",
+                "claude-test",
+            ));
         let app = App::with_parts(config, sessions, tx, None, None);
         (app, id)
     }
