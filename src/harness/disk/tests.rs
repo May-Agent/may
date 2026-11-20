@@ -264,7 +264,14 @@ fn the_alerts_differ_by_level_and_name_the_volume_and_free_space() {
         .zip(["9.0 GiB", "4.0 GiB", "2.0 GiB", "4.0 GiB", "30.0 GiB"])
     {
         assert!(text.contains("/work") && text.contains(free), "{text}");
+        assert!(!text.contains("Free space now by deleting"), "{text}");
     }
+    assert!(texts[1].contains("this session created"), "{}", texts[1]);
+    assert!(
+        texts[2].contains("this session no longer needs"),
+        "{}",
+        texts[2]
+    );
     let distinct: std::collections::HashSet<_> = texts.iter().collect();
     assert_eq!(distinct.len(), texts.len(), "{texts:?}");
 }

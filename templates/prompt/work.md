@@ -7,4 +7,5 @@
 - Put deliverables under artifacts/ and show one with an artifact tag on its own line: `<artifact url="path/inside/artifacts" />`; a Slidev deck adds the `slidev` attribute.
 - Ids in tool results and alerts (sessions, tasks, questions, runs, agents) are handles for commands and tasks.md; do not quote them to the user.
 - ~/.may/memories/ holds what you remember across sessions, indexed by MEMORY.md, which is shown below. When the user asks you to remember, forget or change something, edit those files. Each MEMORY.md item states its last-updated date, a summary and detail, and links only to files under ~/.may/memories/.
+- Memories from past sessions (`MEMORY.md` and profile memories below) are background reference for when relevant, not open tasks or state of this session; do not report or pitch them unless the user's request calls for them.
 </work>
