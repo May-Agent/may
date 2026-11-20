@@ -226,6 +226,8 @@ pub struct App {
     pub openrouter_auth_status: Option<OpenrouterAuthStatus>,
     /// Selected row in the `/login` provider picker
     pub login_selected: usize,
+    /// A forge login's current step, while `AppMode::ForgeAuth` runs.
+    pub forge_auth: Option<crate::tui::state::ForgeAuthStep>,
     /// Screen an OAuth flow returns to when it closes
     pub auth_return: AuthReturn,
     /// Tier being edited in `TierModelPicker` mode
@@ -715,6 +717,7 @@ impl App {
             grok_auth_status: None,
             openrouter_auth_status: None,
             login_selected: 0,
+            forge_auth: None,
             auth_return: AuthReturn::Config,
             tier_picker_tier: None,
             tier_picker_models: Vec::new(),
@@ -2870,6 +2873,7 @@ impl App {
             AppMode::CopilotAuth => Ok(super::reducer::manage::handle_copilot_auth_key(self, code)),
             AppMode::ChatgptAuth => Ok(super::reducer::manage::handle_chatgpt_auth_key(self, code)),
             AppMode::Login => Ok(super::reducer::manage::handle_login_key(self, code)),
+            AppMode::ForgeAuth => Ok(super::reducer::manage::handle_forge_auth_key(self, code)),
             AppMode::Connect(_) => {
                 super::connect::handle_connect_key(self, code);
                 Ok(None)
@@ -5205,6 +5209,30 @@ pub enum SendAction {
     SubmitOpenrouterCode {
         /// The pasted text to resolve.
         input: String,
+    },
+    /// Configure `host` for a personal access token login.
+    ForgeToken {
+        /// The forge host.
+        host: String,
+        /// The token to store.
+        token: String,
+    },
+    /// Configure `host` for its CLI login (`gh`/`glab`).
+    ForgeCli {
+        /// The forge host.
+        host: String,
+    },
+    /// Start `host`'s OAuth device flow with `client_id`.
+    ForgeOauth {
+        /// The forge host.
+        host: String,
+        /// The OAuth application's `client_id`.
+        client_id: String,
+    },
+    /// Disconnect `host`: drop its credentials and `[forge]` entry.
+    ForgeLogout {
+        /// The forge host.
+        host: String,
     },
     /// Switch to a different model for this session.
     SwitchModel(String),

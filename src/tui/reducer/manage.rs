@@ -90,8 +90,166 @@ pub fn handle_login_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                 Some("chatgpt") => Some(SendAction::StartChatgptAuth),
                 Some("grok") => Some(SendAction::StartGrokAuth),
                 Some("openrouter") => Some(SendAction::StartOpenrouterAuth),
+                Some("github") => {
+                    app.mode = AppMode::ForgeAuth;
+                    app.forge_auth = Some(crate::tui::state::ForgeAuthStep::PickMode {
+                        host: "github.com".to_string(),
+                        selected: 0,
+                        configured: false,
+                    });
+                    None
+                }
+                Some("gitlab") => {
+                    app.mode = AppMode::ForgeAuth;
+                    app.forge_auth = Some(crate::tui::state::ForgeAuthStep::Host {
+                        input: "gitlab.com".to_string(),
+                    });
+                    None
+                }
                 _ => None,
             };
+        }
+        _ => {}
+    }
+    None
+}
+
+/// The forge login modes `PickMode` offers, in display order.
+const FORGE_MODES: &[(&str, &str)] = &[
+    ("token", "Personal access token"),
+    ("oauth", "OAuth device flow"),
+    ("cli", "The host's own CLI login"),
+];
+
+/// Key handling for a forge host's login (`AppMode::ForgeAuth`).
+pub fn handle_forge_auth_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    use crate::tui::state::ForgeAuthStep as Step;
+    match (code, app.forge_auth.clone()) {
+        (KeyCode::Esc, _) => {
+            app.forge_auth = None;
+            app.mode = AppMode::Login;
+        }
+        (
+            KeyCode::Up | KeyCode::Char('k'),
+            Some(Step::PickMode {
+                host,
+                selected,
+                configured,
+            }),
+        ) => {
+            app.forge_auth = Some(Step::PickMode {
+                host,
+                selected: selected.saturating_sub(1),
+                configured,
+            });
+        }
+        (
+            KeyCode::Down | KeyCode::Char('j'),
+            Some(Step::PickMode {
+                host,
+                selected,
+                configured,
+            }),
+        ) => {
+            let rows = FORGE_MODES.len() + usize::from(configured);
+            app.forge_auth = Some(Step::PickMode {
+                host,
+                selected: (selected + 1).min(rows.saturating_sub(1)),
+                configured,
+            });
+        }
+        (
+            KeyCode::Enter,
+            Some(Step::PickMode {
+                host,
+                selected,
+                configured,
+            }),
+        ) => match FORGE_MODES.get(selected) {
+            Some(("token", _)) => {
+                app.forge_auth = Some(Step::Token {
+                    host,
+                    input: String::new(),
+                });
+            }
+            Some(("oauth", _)) => {
+                app.forge_auth = Some(Step::ClientId {
+                    host,
+                    input: String::new(),
+                });
+            }
+            Some(("cli", _)) => {
+                app.forge_auth = None;
+                app.mode = AppMode::Login;
+                return Some(SendAction::ForgeCli { host });
+            }
+            _ => {
+                if configured {
+                    app.forge_auth = None;
+                    app.mode = AppMode::Login;
+                    return Some(SendAction::ForgeLogout { host });
+                }
+            }
+        },
+        (KeyCode::Enter, Some(Step::Host { input })) => {
+            let host = input.trim().to_string();
+            if !host.is_empty() {
+                app.forge_auth = Some(Step::PickMode {
+                    host,
+                    selected: 0,
+                    configured: false,
+                });
+            }
+        }
+        (KeyCode::Enter, Some(Step::Token { host, input })) => {
+            let token = input.trim().to_string();
+            if !token.is_empty() {
+                app.forge_auth = None;
+                app.mode = AppMode::Login;
+                return Some(SendAction::ForgeToken { host, token });
+            }
+        }
+        (KeyCode::Enter, Some(Step::ClientId { host, input })) => {
+            app.forge_auth = None;
+            app.mode = AppMode::Login;
+            return Some(SendAction::ForgeOauth {
+                host,
+                client_id: input.trim().to_string(),
+            });
+        }
+        (KeyCode::Backspace, Some(step)) => {
+            app.forge_auth = Some(match step {
+                Step::Host { mut input } => {
+                    input.pop();
+                    Step::Host { input }
+                }
+                Step::Token { host, mut input } => {
+                    input.pop();
+                    Step::Token { host, input }
+                }
+                Step::ClientId { host, mut input } => {
+                    input.pop();
+                    Step::ClientId { host, input }
+                }
+                step => step,
+            });
+        }
+        (KeyCode::Char(c), Some(step)) => {
+            app.forge_auth = Some(match step {
+                Step::Host { mut input } => {
+                    input.push(c);
+                    Step::Host { input }
+                }
+                Step::Token { host, mut input } => {
+                    input.push(c);
+                    Step::Token { host, input }
+                }
+                Step::ClientId { host, mut input } => {
+                    input.push(c);
+                    Step::ClientId { host, input }
+                }
+                step => step,
+            });
         }
         _ => {}
     }

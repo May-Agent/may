@@ -30,6 +30,13 @@ mod config;
 mod error;
 mod error_chain;
 mod events;
+/// Forge-authentication routes and their wire types.
+///
+/// Exposed publicly so the CLI and TUI share the daemon's request and
+/// response shapes.
+pub mod forge_auth;
+#[cfg(test)]
+mod forge_auth_tests;
 mod github_repos;
 #[cfg(test)]
 mod github_repos_tests;

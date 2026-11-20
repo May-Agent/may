@@ -78,6 +78,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_login_screen(frame, area, app);
             return;
         }
+        AppMode::ForgeAuth => {
+            render_forge_auth_screen(frame, area, app);
+            return;
+        }
         AppMode::GrokAuth => {
             render_grok_auth_screen(frame, area, app);
             return;
@@ -408,6 +412,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         | AppMode::CopilotAuth
         | AppMode::ChatgptAuth
         | AppMode::Login
+        | AppMode::ForgeAuth
         | AppMode::GrokAuth
         | AppMode::OpenrouterAuth => return None,
     };
@@ -1758,6 +1763,77 @@ fn render_chatgpt_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the `/login` provider picker.
+fn render_forge_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::tui::state::ForgeAuthStep as Step;
+
+    let mut content = vec![Line::from("")];
+    match app.forge_auth.as_ref() {
+        Some(Step::PickMode {
+            host,
+            selected,
+            configured,
+        }) => {
+            content.push(Line::from(format!(" Sign in to {host}")));
+            content.push(Line::from(""));
+            let mut entries = vec![
+                "Personal access token",
+                "OAuth device flow",
+                "The host's own CLI login",
+            ];
+            if *configured {
+                entries.push("Disconnect");
+            }
+            for (index, name) in entries.iter().enumerate() {
+                let on = index == *selected;
+                content.push(Line::from(vec![
+                    Span::styled(
+                        if on { " › " } else { "   " },
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        *name,
+                        Style::default().fg(if on { Color::Cyan } else { Color::White }),
+                    ),
+                ]));
+            }
+        }
+        Some(Step::Host { input }) => {
+            content.push(Line::from(" Forge host (host[:port]):"));
+            content.push(Line::from(format!("  {input}")));
+        }
+        Some(Step::Token { host, input }) => {
+            content.push(Line::from(format!(" Personal access token for {host}:")));
+            content.push(Line::from(format!("  {}", "*".repeat(input.len()))));
+        }
+        Some(Step::ClientId { host, input }) => {
+            content.push(Line::from(format!(" OAuth client_id for {host}:")));
+            content.push(Line::from(format!("  {input}")));
+        }
+        Some(Step::Device {
+            host,
+            user_code,
+            verification_uri,
+            status,
+            ..
+        }) => {
+            content.push(Line::from(format!(" Approve {host} at:")));
+            content.push(Line::from(format!("  {verification_uri}")));
+            content.push(Line::from(""));
+            content.push(Line::from(format!("  Code: {user_code}")));
+            content.push(Line::from(format!("  {status}")));
+        }
+        None => content.push(Line::from(" Forge login")),
+    }
+    let sheet = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(" Forge login ")
+                .borders(ratatui::widgets::Borders::ALL),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(sheet, area);
+}
+
 fn render_login_screen(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)

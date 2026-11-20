@@ -44,6 +44,8 @@ pub enum AppMode {
     ChatgptAuth,
     /// `/login` provider picker
     Login,
+    /// A forge host's login, from `/login`.
+    ForgeAuth,
     /// `/connect` picker for ACP agents
     Connect(super::connect::ConnectState),
     /// xAI Grok OAuth authentication
@@ -115,6 +117,7 @@ impl AppMode {
             Self::CopilotAuth => "copilot-auth",
             Self::ChatgptAuth => "chatgpt-auth",
             Self::Login => "login",
+            Self::ForgeAuth => "forge_auth",
             Self::Connect(_) => "connect",
             Self::GrokAuth => "grok-auth",
             Self::OpenrouterAuth => "openrouter-auth",
@@ -657,7 +660,65 @@ pub const LOGIN_PROVIDERS: &[LoginProvider] = &[
         name: "OpenRouter",
         detail: "one key for every model",
     },
+    LoginProvider {
+        id: "github",
+        name: "GitHub",
+        detail: "github.com forge host (issues, PRs, CI)",
+    },
+    LoginProvider {
+        id: "gitlab",
+        name: "GitLab",
+        detail: "gitlab.com or a self-hosted forge host",
+    },
 ];
+
+/// One step of a forge host's login, owned by `AppMode::ForgeAuth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgeAuthStep {
+    /// Pick the login mode: PAT, OAuth device flow, the host's CLI, or
+    /// disconnect. `entries` is the offered modes, `selected` the row.
+    PickMode {
+        /// The host being configured.
+        host: String,
+        /// The selected mode row.
+        selected: usize,
+        /// Whether the host is currently configured (offers disconnect).
+        configured: bool,
+    },
+    /// The host name, for a self-hosted forge.
+    Host {
+        /// The collected input.
+        input: String,
+    },
+    /// The personal access token.
+    Token {
+        /// The host being configured.
+        host: String,
+        /// The collected input.
+        input: String,
+    },
+    /// The OAuth application's `client_id`.
+    ClientId {
+        /// The host being configured.
+        host: String,
+        /// The collected input.
+        input: String,
+    },
+    /// The device flow runs: the code the user types, the page it goes at,
+    /// and what the last poll learned.
+    Device {
+        /// The host being configured.
+        host: String,
+        /// The `device_code` being polled.
+        device_code: String,
+        /// The code the user types.
+        user_code: String,
+        /// The page it goes at.
+        verification_uri: String,
+        /// `pending`, `slow_down`, `authorized`, or an error message.
+        status: String,
+    },
+}
 
 /// Character filter for paste validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

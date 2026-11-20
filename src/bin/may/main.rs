@@ -1795,6 +1795,38 @@ where
                     Some(SendAction::StartOpenrouterAuth) => {
                         run_openrouter_auth(app, events, terminal).await?;
                     }
+                    Some(SendAction::ForgeToken { host, token }) => {
+                        run_forge_configure(
+                            app,
+                            may_agent::daemon::forge_auth::ConfigureForgeAuthRequest {
+                                host,
+                                kind: None,
+                                mode: may_agent::forge::ForgeAuthMode::Token,
+                                client_id: None,
+                                token: Some(token),
+                            },
+                        )
+                        .await?;
+                    }
+                    Some(SendAction::ForgeCli { host }) => {
+                        run_forge_configure(
+                            app,
+                            may_agent::daemon::forge_auth::ConfigureForgeAuthRequest {
+                                host,
+                                kind: None,
+                                mode: may_agent::forge::ForgeAuthMode::Cli,
+                                client_id: None,
+                                token: None,
+                            },
+                        )
+                        .await?;
+                    }
+                    Some(SendAction::ForgeOauth { host, client_id }) => {
+                        run_forge_oauth(app, events, terminal, host, client_id).await?;
+                    }
+                    Some(SendAction::ForgeLogout { host }) => {
+                        run_forge_logout(app, host).await?;
+                    }
                     Some(SendAction::SwitchModel(model)) => {
                         let persisted = app
                             .session_manager
@@ -2614,6 +2646,163 @@ where
                 return Ok(());
             }
         }
+    }
+}
+
+/// Configure a forge host's login and wait for the result to be dismissed.
+async fn run_forge_configure(
+    app: &mut App,
+    request: may_agent::daemon::forge_auth::ConfigureForgeAuthRequest,
+) -> anyhow::Result<()> {
+    let host = request.host.clone();
+    app.set_persistent_status(format!("Signing in to {host}…"));
+    let result = match app.session_manager.daemon_handle() {
+        Ok(client) => client
+            .forge_auth_configure(&request)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(error) => Err(format!("the daemon is not reachable: {error}")),
+    };
+    app.clear_persistent_status();
+    match result {
+        Ok(status) => app.set_status(format!(
+            "{host} signed in{}",
+            if status.authenticated {
+                ""
+            } else {
+                " (unverified)"
+            }
+        )),
+        Err(error) => app
+            .chat
+            .push_error(&format!("{host} login failed: {error}")),
+    }
+    Ok(())
+}
+
+/// Disconnect a forge host and wait for the result to be dismissed.
+async fn run_forge_logout(app: &mut App, host: String) -> anyhow::Result<()> {
+    app.set_persistent_status(format!("Signing out of {host}…"));
+    let result = match app.session_manager.daemon_handle() {
+        Ok(client) => client
+            .forge_auth_logout(&host)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(error) => Err(format!("the daemon is not reachable: {error}")),
+    };
+    app.clear_persistent_status();
+    match result {
+        Ok(()) => app.set_status(format!("{host} signed out")),
+        Err(error) => app
+            .chat
+            .push_error(&format!("{host} sign-out failed: {error}")),
+    }
+    Ok(())
+}
+
+/// Run a forge host's OAuth device flow: start it, show the device code in
+/// the forge screen, and poll until the user authorizes or closes it.
+async fn run_forge_oauth<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+    host: String,
+    client_id: String,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    use may_agent::daemon::forge_auth as api;
+
+    let client = match app.session_manager.daemon_handle() {
+        Ok(client) => client,
+        Err(error) => {
+            app.chat
+                .push_error(&format!("the daemon is not reachable: {error}"));
+            return Ok(());
+        }
+    };
+    app.set_persistent_status(format!("Starting the {host} device flow…"));
+    let device = client
+        .forge_auth_oauth_start(&api::ForgeOauthStartRequest {
+            host: host.clone(),
+            kind: None,
+            client_id: Some(client_id),
+        })
+        .await;
+    app.clear_persistent_status();
+    let device = match device {
+        Ok(device) => device,
+        Err(error) => {
+            app.chat
+                .push_error(&format!("{host} device flow did not start: {error}"));
+            return Ok(());
+        }
+    };
+    app.mode = may_agent::tui::AppMode::ForgeAuth;
+    app.forge_auth = Some(may_agent::tui::state::ForgeAuthStep::Device {
+        host: host.clone(),
+        device_code: device.device_code.clone(),
+        user_code: device.user_code.clone(),
+        verification_uri: device
+            .verification_uri_complete
+            .clone()
+            .unwrap_or_else(|| device.verification_uri.clone()),
+        status: "pending".to_string(),
+    });
+    terminal.draw(|frame| ui::render(frame, app))?;
+    let mut interval = std::time::Duration::from_secs(device.interval_secs.max(1));
+    loop {
+        let event = tokio::select! {
+            () = tokio::time::sleep(interval) => None,
+            event = events.next() => event,
+        };
+        if let Some(event) = event {
+            if matches!(app.handle_event(event)?, Some(SendAction::Quit)) {
+                return Ok(());
+            }
+            if !matches!(app.mode, may_agent::tui::AppMode::ForgeAuth) {
+                return Ok(());
+            }
+            terminal.draw(|frame| ui::render(frame, app))?;
+            continue;
+        }
+        match client
+            .forge_auth_oauth_poll(&host, &device.device_code)
+            .await
+        {
+            Ok(poll) => {
+                use may_agent::daemon::forge_auth::ForgeOauthPollStatus as Status;
+                match poll.status {
+                    Status::Authorized => {
+                        app.forge_auth = None;
+                        app.mode = may_agent::tui::AppMode::Login;
+                        app.set_status(format!("{host} signed in"));
+                        return Ok(());
+                    }
+                    Status::Pending | Status::SlowDown => {
+                        interval = std::time::Duration::from_secs(poll.retry_after_secs.max(1));
+                        if let Some(may_agent::tui::state::ForgeAuthStep::Device {
+                            status, ..
+                        }) = app.forge_auth.as_mut()
+                        {
+                            *status = match poll.status {
+                                Status::SlowDown => "slowing down".to_string(),
+                                _ => "pending".to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                app.forge_auth = None;
+                app.mode = may_agent::tui::AppMode::Login;
+                app.chat
+                    .push_error(&format!("{host} device flow failed: {error}"));
+                return Ok(());
+            }
+        }
+        terminal.draw(|frame| ui::render(frame, app))?;
     }
 }
 

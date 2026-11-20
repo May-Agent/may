@@ -312,6 +312,7 @@ fn host_pr_context(state: &DaemonState) -> crate::pr::PrContext {
         review: None,
         signing: crate::commit_signing::CommitSigning::new(host_git, &state.may_dir, "user"),
         github_api: state.github_api.clone(),
+        forge_auth: state.forge_auth.clone(),
         land_locks: state.services.land_locks.clone(),
         checkouts: Some(state.services.checkouts.clone()),
         task_events: None,

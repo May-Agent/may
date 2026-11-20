@@ -307,6 +307,78 @@ impl DaemonClient {
         self.get("/api/health").await
     }
 
+    /// `GET /api/forge-auth`: every forge host's configuration and whether a
+    /// credential currently resolves for it.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn forge_auth_status(
+        &self,
+    ) -> Result<crate::daemon::forge_auth::ForgeAuthStatusResponse, DaemonClientError> {
+        self.get("/api/forge-auth").await
+    }
+
+    /// `POST /api/forge-auth/configure`: write `[forge."<host>"]` and store
+    /// the request's token in the keychain.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable, the request is invalid or the
+    /// write fails.
+    pub async fn forge_auth_configure(
+        &self,
+        request: &crate::daemon::forge_auth::ConfigureForgeAuthRequest,
+    ) -> Result<crate::daemon::forge_auth::ForgeHostStatus, DaemonClientError> {
+        self.post("/api/forge-auth/configure", request).await
+    }
+
+    /// `POST /api/forge-auth/logout`: drop `host`'s credentials and entry.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn forge_auth_logout(&self, host: &str) -> Result<(), DaemonClientError> {
+        let _: serde_json::Value = self
+            .post(
+                "/api/forge-auth/logout",
+                &crate::daemon::forge_auth::ForgeLogoutRequest {
+                    host: host.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `POST /api/forge-auth/oauth/start`: begin `host`'s device flow.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable, the request is invalid or the
+    /// forge's device endpoint refuses.
+    pub async fn forge_auth_oauth_start(
+        &self,
+        request: &crate::daemon::forge_auth::ForgeOauthStartRequest,
+    ) -> Result<crate::daemon::forge_auth::ForgeDeviceAuthorization, DaemonClientError> {
+        self.post("/api/forge-auth/oauth/start", request).await
+    }
+
+    /// `POST /api/forge-auth/oauth/poll`: one poll of the device flow
+    /// `device_code` runs on `host`.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn forge_auth_oauth_poll(
+        &self,
+        host: &str,
+        device_code: &str,
+    ) -> Result<crate::daemon::forge_auth::ForgeOauthPollResponse, DaemonClientError> {
+        self.post(
+            "/api/forge-auth/oauth/poll",
+            &crate::daemon::forge_auth::ForgeOauthPollRequest {
+                host: host.to_string(),
+                device_code: device_code.to_string(),
+            },
+        )
+        .await
+    }
+
     /// Asks the daemon to stop after its running turns.
     ///
     /// # Errors

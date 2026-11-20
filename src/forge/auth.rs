@@ -50,7 +50,7 @@ fn builtin_client_id(kind: ForgeKind, host: &str) -> Option<&'static str> {
 }
 
 /// Where the token for a forge host comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ForgeAuthMode {
     /// May's own OAuth login: device flow or PKCE, stored in the OS
@@ -708,16 +708,23 @@ impl ForgeKeychain {
     }
 }
 
-/// `(program, args)` the `cli` mode runs for `host`.
-fn cli_command(kind: ForgeKind, host: &str) -> (&'static str, Vec<String>) {
+/// `(program, args)` the `cli` mode runs for `host`. `account` is the
+/// `gh` login's `--user`; GitLab's CLI has no equivalent and ignores it.
+fn cli_command(kind: ForgeKind, host: &str, account: Option<&str>) -> (&'static str, Vec<String>) {
     match kind {
-        ForgeKind::GitHub => (
-            "gh",
-            ["auth", "token", "--hostname", host]
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-        ),
+        ForgeKind::GitHub => {
+            let mut args = vec![
+                "auth".to_string(),
+                "token".to_string(),
+                "--hostname".to_string(),
+                host.to_string(),
+            ];
+            if let Some(account) = account {
+                args.push("--user".to_string());
+                args.push(account.to_string());
+            }
+            ("gh", args)
+        }
         ForgeKind::GitLab => (
             "glab",
             ["config", "get", "token", "--host", host]
@@ -729,8 +736,12 @@ fn cli_command(kind: ForgeKind, host: &str) -> (&'static str, Vec<String>) {
 }
 
 /// Run the host CLI for `token` output, off the async executor.
-async fn cli_token(kind: ForgeKind, host: &str) -> Result<String, ForgeAuthError> {
-    let (program, args) = cli_command(kind, host);
+async fn cli_token(
+    kind: ForgeKind,
+    host: &str,
+    account: Option<&str>,
+) -> Result<String, ForgeAuthError> {
+    let (program, args) = cli_command(kind, host, account);
     let failed = |message: String| ForgeAuthError::Cli {
         host: host.to_string(),
         program,
@@ -774,8 +785,13 @@ impl ForgeAuth {
     /// The authenticator `config`'s `[forge]` map describes.
     #[must_use]
     pub fn new(config: &crate::config::MayConfig) -> Self {
-        let hosts = config
-            .forge
+        Self::from_config(&config.forge)
+    }
+
+    /// The authenticator the `[forge]` map itself describes.
+    #[must_use]
+    pub fn from_config(forge: &BTreeMap<String, ForgeHostConfig>) -> Self {
+        let hosts = forge
             .iter()
             .map(|(host, entry)| {
                 let canonical = ForgeHost::new(host)
@@ -850,7 +866,7 @@ impl ForgeAuth {
                 host: host.to_string(),
             })?;
         match entry.mode {
-            ForgeAuthMode::Cli => cli_token(kind, host).await,
+            ForgeAuthMode::Cli => cli_token(kind, host, None).await,
             ForgeAuthMode::Token => self
                 .keychain
                 .read(&pat_account(kind, host))?
@@ -860,6 +876,39 @@ impl ForgeAuth {
                 }),
             ForgeAuthMode::Oauth => self.oauth_token(kind, &parsed_host).await,
         }
+    }
+
+    /// The bearer token of one named account on `host`.
+    ///
+    /// `account` only means something under `mode = "cli"`: it is handed to
+    /// `gh auth token --user <account>` on GitHub. Every other mode resolves
+    /// the host's own credential and `account` is ignored, so a profile's
+    /// recorded `gh` login never changes an `oauth` or `token` login.
+    ///
+    /// # Errors
+    /// As [`Self::token_for`].
+    pub async fn token_for_account(
+        &self,
+        host: &str,
+        account: &str,
+    ) -> Result<String, ForgeAuthError> {
+        let parsed_host = ForgeHost::new(host)?;
+        let host = parsed_host.as_str();
+        let entry = self
+            .hosts
+            .get(host)
+            .ok_or_else(|| ForgeAuthError::Unauthenticated {
+                host: host.to_string(),
+            })?;
+        if entry.mode == ForgeAuthMode::Cli {
+            let kind = entry
+                .kind_for(host)
+                .ok_or_else(|| ForgeAuthError::KindNotConfigured {
+                    host: host.to_string(),
+                })?;
+            return cli_token(kind, host, Some(account)).await;
+        }
+        self.token_for(host).await
     }
 
     /// The OAuth path of [`Self::token_for`]: serve the stored access
@@ -1032,6 +1081,114 @@ impl ForgeAuth {
     }
 }
 
+/// A [`ForgeAuth`] that follows the live `MayConfig`: every clone shares
+/// one swap cell, so rebuilding it on a config change reaches every holder
+/// — token sources, cloud providers and the OAuth endpoints alike.
+#[derive(Debug, Clone)]
+pub struct LiveForgeAuth(Arc<arc_swap::ArcSwap<ForgeAuth>>);
+
+impl Default for LiveForgeAuth {
+    fn default() -> Self {
+        Self::from_config(&BTreeMap::new())
+    }
+}
+
+impl LiveForgeAuth {
+    /// An authenticator reading `config`'s `[forge]` map.
+    #[must_use]
+    pub fn new(config: &crate::config::MayConfig) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(ForgeAuth::new(
+            config,
+        ))))
+    }
+
+    /// An authenticator reading the `[forge]` map itself.
+    #[must_use]
+    pub fn from_config(forge: &BTreeMap<String, ForgeHostConfig>) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(
+            ForgeAuth::from_config(forge),
+        )))
+    }
+
+    /// Rebuild the shared authenticator after `config` changed.
+    pub fn update(&self, config: &crate::config::MayConfig) {
+        self.0.store(Arc::new(ForgeAuth::new(config)));
+    }
+
+    /// The authenticator as it is right now.
+    #[must_use]
+    pub fn get(&self) -> Arc<ForgeAuth> {
+        self.0.load_full()
+    }
+
+    /// [`ForgeAuth::token_for`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::token_for`].
+    pub async fn token_for(&self, host: &str) -> Result<String, ForgeAuthError> {
+        self.get().token_for(host).await
+    }
+
+    /// [`ForgeAuth::token_for_account`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::token_for_account`].
+    pub async fn token_for_account(
+        &self,
+        host: &str,
+        account: &str,
+    ) -> Result<String, ForgeAuthError> {
+        self.get().token_for_account(host, account).await
+    }
+
+    /// [`ForgeAuth::oauth_client`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::oauth_client`].
+    pub fn oauth_client(&self, host: &str) -> Result<ForgeOAuth, ForgeAuthError> {
+        self.get().oauth_client(host)
+    }
+
+    /// [`ForgeAuth::store_pat`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::store_pat`].
+    pub fn store_pat(&self, host: &str, token: &str) -> Result<(), ForgeAuthError> {
+        self.get().store_pat(host, token)
+    }
+
+    /// [`ForgeAuth::store_oauth`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::store_oauth`].
+    pub async fn store_oauth(
+        &self,
+        host: &str,
+        credentials: &OAuthCredentials,
+    ) -> Result<(), ForgeAuthError> {
+        self.get().store_oauth(host, credentials).await
+    }
+
+    /// [`ForgeAuth::delete_credentials`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::delete_credentials`].
+    pub async fn delete_credentials(&self, host: &str) -> Result<bool, ForgeAuthError> {
+        self.get().delete_credentials(host).await
+    }
+
+    /// [`ForgeAuth::git_https_auth`] on the live authenticator.
+    ///
+    /// # Errors
+    /// As [`ForgeAuth::git_https_auth`].
+    pub async fn git_https_auth(
+        &self,
+        host: &str,
+    ) -> Result<crate::host_git::HttpsAuth, ForgeAuthError> {
+        self.get().git_https_auth(host).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,10 +1260,10 @@ mod tests {
 
     #[test]
     fn cli_mode_targets_the_right_host_cli() {
-        let (program, args) = cli_command(ForgeKind::GitHub, "ghe.corp.com");
+        let (program, args) = cli_command(ForgeKind::GitHub, "ghe.corp.com", None);
         assert_eq!(program, "gh");
         assert_eq!(args, ["auth", "token", "--hostname", "ghe.corp.com"]);
-        let (program, args) = cli_command(ForgeKind::GitLab, "gitlab.corp.com");
+        let (program, args) = cli_command(ForgeKind::GitLab, "gitlab.corp.com", None);
         assert_eq!(program, "glab");
         assert_eq!(
             args,

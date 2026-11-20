@@ -415,6 +415,14 @@ pub struct DaemonState {
     pub(crate) db: crate::db::ChatDb,
     /// The host's GitHub REST client, for the repository picker.
     pub(crate) github_api: crate::issue::github::GitHubRest<crate::pr::PrTokenSource>,
+    /// The daemon's forge authenticator, swapped in step with `config` so an
+    /// OAuth refresh or a `[forge]` edit applies everywhere at once.
+    pub(crate) forge_auth: crate::forge::LiveForgeAuth,
+    /// Device authorizations `oauth/start` opened, keyed by
+    /// `(host, device_code)`, so `oauth/poll` knows each flow's interval.
+    pub(crate) forge_device_flows: std::sync::Mutex<
+        std::collections::HashMap<(String, String), crate::forge::DeviceAuthorization>,
+    >,
     pub(crate) default_profile_id: String,
     pub(crate) mcp_service: McpService,
     pub(crate) permission_approver: PermissionApprover,
@@ -574,6 +582,7 @@ impl DaemonState {
         let mut config = (*self.config.load_full()).clone();
         let _ = update(&mut config);
         self.config.store(Arc::new(config.clone()));
+        self.forge_auth.update(&config);
         config
     }
 
@@ -1455,6 +1464,7 @@ impl DaemonState {
             .with_secret_store(SecretStore::in_memory(may_dir)),
         );
         let live_limits = crate::agent::LiveLimits::of(&config);
+        let forge_auth = crate::forge::LiveForgeAuth::new(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
             tcp_listeners: super::TcpListeners::new(),
@@ -1470,7 +1480,9 @@ impl DaemonState {
                 db.clone(),
             )),
             db: db.clone(),
-            github_api: crate::pr::PrContext::default_github_api(),
+            github_api: crate::pr::PrContext::default_github_api(forge_auth.clone()),
+            forge_auth: forge_auth.clone(),
+            forge_device_flows: std::sync::Mutex::default(),
             default_profile_id: "test".to_string(),
             mcp_service: McpService::spawn(crate::mcp::McpManager::new(
                 crate::mcp::McpConfig::default(),
@@ -1498,7 +1510,7 @@ impl DaemonState {
             cloud_sessions: std::sync::Arc::new(
                 super::cloud_sessions::CloudSessions::load(
                     db.clone(),
-                    super::cloud_sessions::GitHubCloud,
+                    super::cloud_sessions::GitHubCloud::new(forge_auth.clone()),
                     config.clone(),
                     ui_event_bus.clone(),
                 )
@@ -1523,7 +1535,8 @@ impl DaemonState {
             .await
             .expect("test jobserver starts"),
             may_dir: may_dir.to_path_buf(),
-            services: crate::terminal_commands::SharedServices::new(may_dir),
+            services: crate::terminal_commands::SharedServices::new(may_dir)
+                .with_forge_auth(forge_auth.clone()),
             quota_patterns: crate::quota::QuotaPatterns::default(),
             vision_ocr: crate::vision_ocr::VisionOcr::new(),
             secret_patterns: crate::secrets::SecretPatterns::default(),

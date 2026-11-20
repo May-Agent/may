@@ -472,7 +472,7 @@ pub(super) async fn set_profile_codespaces(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     use crate::cloud::Codespaces;
-    use crate::issue::github::{GhAccountTokenSource, GhCliTokenSource, GitHubRest};
+    use crate::issue::github::{ForgeTokenSource, GitHubRest};
 
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
@@ -483,8 +483,19 @@ pub(super) async fn set_profile_codespaces(
         .ok_or_else(|| bad_request_error("Profile not found"))?;
 
     let verified = match req.login {
-        Some(login) => Codespaces::verify(&GitHubRest::new(GhAccountTokenSource::new(login))).await,
-        None => Codespaces::verify(&GitHubRest::new(GhCliTokenSource)).await,
+        Some(login) => {
+            Codespaces::verify(&GitHubRest::new(ForgeTokenSource::for_account(
+                state.forge_auth.clone(),
+                login,
+            )))
+            .await
+        }
+        None => {
+            Codespaces::verify(&GitHubRest::new(ForgeTokenSource::new(
+                state.forge_auth.clone(),
+            )))
+            .await
+        }
     };
     let account = match verified {
         Ok(account) => account,

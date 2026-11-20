@@ -13,7 +13,7 @@ mod coord;
 
 pub use auth::{
     DeviceAuthorization, DevicePoll, ForgeAuth, ForgeAuthError, ForgeAuthMode, ForgeHostConfig,
-    ForgeOAuth, OAuthCredentials, Pkce,
+    ForgeOAuth, LiveForgeAuth, OAuthCredentials, Pkce,
 };
 pub use coord::{
     ForgeHost, ForgeHostError, ForgeKind, ForgeRepo, ForgeRepoError, GITHUB_HOST, GITLAB_HOST,
