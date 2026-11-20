@@ -2091,7 +2091,17 @@ impl MayAgent {
         };
         let cold_in = self.inner.cache_warmth().cold_in()?;
         let jobs = self.shell.jobs().list().await;
-        super::keep_warm::refresh_in(Some(cold_in), lifetime, &jobs)
+        let due = super::keep_warm::refresh_in(Some(cold_in), lifetime, &jobs)?;
+        // A running job that outlives the entry is a near-certain
+        // continuation; refresh only when it still pays for itself.
+        if self
+            .inner
+            .keep_warm_economics(1.0)
+            .is_some_and(|economics| !economics.warm)
+        {
+            return None;
+        }
+        Some(due)
     }
 
     /// Refreshes the idle agent's cache entry with a one-token request whose

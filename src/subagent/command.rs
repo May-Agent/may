@@ -19,7 +19,6 @@ use aither_agent::{
     SubagentRuns,
 };
 use aither_core::LanguageModel;
-use aither_core::llm::model::ClaudePromptCacheTtl;
 use aither_core::llm::tool::{CancelSignal, ToolContext};
 use aither_core::llm::{AgentIdentity, Tool, ToolResult};
 use aither_sandbox::{CommitLedger, CommitMark, SubagentGrant};
@@ -593,9 +592,6 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             Source::Fork(snapshot) => {
                 builder = builder.forked_from(snapshot);
             }
-        }
-        if settings.keep_alive.is_some() {
-            builder = builder.claude_cache_ttl(ClaudePromptCacheTtl::FiveMinutes);
         }
         builder = settings
             .toolkit
