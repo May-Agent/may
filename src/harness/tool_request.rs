@@ -38,12 +38,15 @@ impl<Args, Response> ToolRequest<Args, Response> {
     pub fn is_closed(&self) -> bool {
         self.response_tx.is_closed()
     }
+}
 
+impl<Args: Sync, Response: Send> ToolRequest<Args, Response> {
     /// Resolves once the requester has dropped its response receiver.
     ///
-    /// The sender is cloned before the wait so `&self` is not held across
-    /// the `.await` — the returned future stays `Send` even when `Args`
-    /// is not `Sync`.
+    /// The bounds keep the returned future `Send`: `&self` crosses the
+    /// call, so `ToolRequest` must be `Sync`, and the wait borrows the
+    /// response channel's sender, which is `Send` only when `Response`
+    /// is.
     pub async fn closed(&self) {
         self.response_tx.clone().closed().await;
     }
