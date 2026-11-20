@@ -429,8 +429,12 @@ async fn resolve_prompt_path_blocks_container_and_local_symlink_escapes() {
         );
     }
 
-    let ok_container = super::resolve_prompt_path_async(&sandbox, Some(&mount), "/workspace/inside_link.md")
-        .await
-        .expect("intra-sandbox symlink is permitted");
-    assert_eq!(ok_container, std::fs::canonicalize(sandbox.join("real.md")).expect("canonical"));
+    let ok_container =
+        super::resolve_prompt_path_async(&sandbox, Some(&mount), "/workspace/inside_link.md")
+            .await
+            .expect("intra-sandbox symlink is permitted");
+    assert_eq!(
+        ok_container,
+        std::fs::canonicalize(sandbox.join("real.md")).expect("canonical")
+    );
 }

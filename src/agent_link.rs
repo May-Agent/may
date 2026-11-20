@@ -646,18 +646,15 @@ pub(crate) fn resolve_prompt_path(
         if let Ok(meta) = std::fs::symlink_metadata(&current)
             && meta.file_type().is_symlink()
         {
-            match std::fs::canonicalize(&current) {
-                Ok(resolved) => {
-                    if !resolved.starts_with(&canonical_root) {
-                        return Err(outside());
-                    }
-                    current = resolved;
+            if let Ok(resolved) = std::fs::canonicalize(&current) {
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(outside());
                 }
-                Err(_) => {
-                    let link_target = std::fs::read_link(&current).map_err(|_| outside())?;
-                    if symlink_target_escapes_lexically(&link_target) {
-                        return Err(outside());
-                    }
+                current = resolved;
+            } else {
+                let link_target = std::fs::read_link(&current).map_err(|_| outside())?;
+                if symlink_target_escapes_lexically(&link_target) {
+                    return Err(outside());
                 }
             }
         }
@@ -736,18 +733,15 @@ pub(crate) async fn resolve_prompt_path_async(
         if let Ok(meta) = async_fs::symlink_metadata(&current).await
             && meta.file_type().is_symlink()
         {
-            match async_fs::canonicalize(&current).await {
-                Ok(resolved) => {
-                    if !resolved.starts_with(&canonical_root) {
-                        return Err(outside());
-                    }
-                    current = resolved;
+            if let Ok(resolved) = async_fs::canonicalize(&current).await {
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(outside());
                 }
-                Err(_) => {
-                    let link_target = async_fs::read_link(&current).await.map_err(|_| outside())?;
-                    if symlink_target_escapes_lexically(&link_target) {
-                        return Err(outside());
-                    }
+                current = resolved;
+            } else {
+                let link_target = async_fs::read_link(&current).await.map_err(|_| outside())?;
+                if symlink_target_escapes_lexically(&link_target) {
+                    return Err(outside());
                 }
             }
         }

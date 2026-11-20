@@ -1392,8 +1392,14 @@ async fn direct_listener_skips_whois_on_foreign_host_and_bounds_concurrent_looku
             .insert(PeerAddr(format!("{ip}:50000").parse().expect("peer")));
         req
     };
-    assert_eq!(status(&router, make_good("100.64.0.25")).await, StatusCode::OK);
-    assert_eq!(status(&router, make_good("100.64.0.25")).await, StatusCode::OK);
+    assert_eq!(
+        status(&router, make_good("100.64.0.25")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&router, make_good("100.64.0.25")).await,
+        StatusCode::OK
+    );
     assert_eq!(
         whois.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,

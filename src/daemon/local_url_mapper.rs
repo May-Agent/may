@@ -233,11 +233,9 @@ impl LocalUrlPortMapper {
 
     /// Shuts down and forgets every mapped port belonging to `session_id`.
     pub fn remove_session(&self, session_id: &str) {
-        let _ = self
-            .command_tx
-            .send(LocalUrlProxyCommand::RemoveSession {
-                session_id: session_id.to_string(),
-            });
+        let _ = self.command_tx.send(LocalUrlProxyCommand::RemoveSession {
+            session_id: session_id.to_string(),
+        });
     }
 
     /// Shuts down and forgets every mapped port across all sessions.

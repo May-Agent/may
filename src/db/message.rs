@@ -759,12 +759,11 @@ impl ChatDb {
         message: &ChatMessage,
         commit_pending_entry: Option<i64>,
     ) -> Result<messages::Model, ChatDbError> {
-        let mut tx = match fence {
-            Some(fence) => self.begin_fenced(fence).await?,
-            None => {
-                self.check_write_fault()?;
-                self.db.begin().await?
-            }
+        let mut tx = if let Some(fence) = fence {
+            self.begin_fenced(fence).await?
+        } else {
+            self.check_write_fault()?;
+            self.db.begin().await?
         };
         let model = self
             .append_chat_message_in_tx(&mut tx, session_id, message, commit_pending_entry)

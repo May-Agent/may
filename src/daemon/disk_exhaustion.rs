@@ -54,6 +54,7 @@ impl DiskExhaustionCause {
 }
 
 /// Classifies an [`std::io::Error`] caused by home-environment disk exhaustion.
+#[cfg(test)]
 #[must_use]
 pub fn classify_io_error(error: &std::io::Error) -> Option<DiskExhaustionCause> {
     if error.kind() == std::io::ErrorKind::StorageFull {
@@ -182,7 +183,7 @@ struct SessionTranscriptBacklog {
 }
 
 impl SessionTranscriptBacklog {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.snapshot.is_none() && self.stats.is_none()
     }
 }
@@ -220,6 +221,7 @@ impl PendingTranscriptStore {
         if entry.pending_alert.is_none() {
             entry.pending_alert = Some(cause);
         }
+        drop(sessions);
     }
 
     /// Takes the queued one-shot `<system-reminder>` alert for `session_id`, if any.
@@ -257,6 +259,7 @@ impl PendingTranscriptStore {
             if entry.pending_alert.is_none() {
                 entry.pending_alert = Some(cause);
             }
+            drop(sessions);
         }
         self.nudge();
     }
@@ -278,6 +281,7 @@ impl PendingTranscriptStore {
             if entry.pending_alert.is_none() {
                 entry.pending_alert = Some(cause);
             }
+            drop(sessions);
         }
         self.nudge();
     }
@@ -296,11 +300,13 @@ impl PendingTranscriptStore {
             if entry.pending_alert.is_none() {
                 entry.pending_alert = Some(cause);
             }
+            drop(sessions);
         }
         self.nudge();
     }
 
     /// Whether `session_id` has deferred transcript writes waiting for space.
+    #[cfg(test)]
     #[must_use]
     pub fn has_pending(&self, session_id: &str) -> bool {
         self.sessions
@@ -324,11 +330,7 @@ impl PendingTranscriptStore {
     /// Attempts to flush deferred writes for `session_id` to `db`.
     ///
     /// Any write that still fails stays buffered in order for the next retry.
-    pub async fn flush_session(
-        &self,
-        db: &ChatDb,
-        session_id: &str,
-    ) -> Result<bool, ChatDbError> {
+    pub async fn flush_session(&self, db: &ChatDb, session_id: &str) -> Result<bool, ChatDbError> {
         let (messages, snapshot, stats) = {
             let mut sessions = self.sessions.lock().expect("pending transcript lock");
             let Some(entry) = sessions.get_mut(session_id) else {
@@ -337,11 +339,13 @@ impl PendingTranscriptStore {
             if entry.is_empty() {
                 return Ok(false);
             }
-            (
+            let taken = (
                 std::mem::take(&mut entry.messages),
                 entry.snapshot.take(),
                 entry.stats.take(),
-            )
+            );
+            drop(sessions);
+            taken
         };
 
         if !messages.is_empty()
@@ -358,6 +362,7 @@ impl PendingTranscriptStore {
             if entry.stats.is_none() {
                 entry.stats = stats;
             }
+            drop(sessions);
             return Err(error);
         }
 
@@ -365,7 +370,10 @@ impl PendingTranscriptStore {
             let backup_checkpoint = snapshot.checkpoint.clone();
             let backup_seq = snapshot.applied_seq;
             let backup_entries = snapshot.transcript_entries.clone();
-            if let Err(error) = db.upsert_session_context_snapshot(session_id, snapshot).await {
+            if let Err(error) = db
+                .upsert_session_context_snapshot(session_id, snapshot)
+                .await
+            {
                 let mut sessions = self.sessions.lock().expect("pending transcript lock");
                 let entry = sessions.entry(session_id.to_string()).or_default();
                 if entry.snapshot.is_none() {
@@ -378,6 +386,7 @@ impl PendingTranscriptStore {
                 if entry.stats.is_none() {
                     entry.stats = stats;
                 }
+                drop(sessions);
                 return Err(error);
             }
         }
@@ -390,18 +399,16 @@ impl PendingTranscriptStore {
             if entry.stats.is_none() {
                 entry.stats = Some(stats);
             }
+            drop(sessions);
             return Err(error);
         }
 
-        {
-            let mut sessions = self.sessions.lock().expect("pending transcript lock");
-            if sessions
-                .get(session_id)
-                .is_some_and(|entry| entry.is_empty() && entry.pending_alert.is_none())
-            {
-                sessions.remove(session_id);
-            }
-        }
+        self.sessions
+            .lock()
+            .expect("pending transcript lock")
+            .retain(|id, entry| {
+                !(id == session_id && entry.is_empty() && entry.pending_alert.is_none())
+            });
         Ok(true)
     }
 
@@ -516,7 +523,11 @@ pub struct ResilientContainerExec<R> {
 
 impl<R: ContainerReconnect> ResilientContainerExec<R> {
     #[must_use]
-    pub fn new(initial_exec: AnyContainerExec, initial_container_id: String, reconnect: R) -> Self {
+    pub const fn new(
+        initial_exec: AnyContainerExec,
+        initial_container_id: String,
+        reconnect: R,
+    ) -> Self {
         Self {
             active: async_lock::Mutex::new((initial_exec, initial_container_id)),
             reconnect,
@@ -527,9 +538,14 @@ impl<R: ContainerReconnect> ResilientContainerExec<R> {
         self.active.lock().await.clone()
     }
 
-    async fn try_reconnect(&self, failed_container_id: &str) -> Result<(AnyContainerExec, String), String> {
-        let mut guard = self.active.lock().await;
-        // Another concurrent command may have already reconnected to a fresh container.
+    async fn try_reconnect(
+        &self,
+        failed_container_id: &str,
+    ) -> Result<(AnyContainerExec, String), String> {
+        // The guard stays held across `reconnect` so concurrent commands
+        // serialize: a second caller waits for the fresh container instead of
+        // racing a recreate of its own.
+        let guard = &mut *self.active.lock().await;
         if guard.1 != failed_container_id {
             return Ok(guard.clone());
         }
@@ -738,9 +754,7 @@ mod tests {
         AgentCheckpoint, Context, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot,
     };
     use aither_core::llm::{Message as LlmMessage, ToolResult};
-    use aither_sandbox::{
-        AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime,
-    };
+    use aither_sandbox::{AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime};
 
     use super::{
         ContainerReconnect, DiskExhaustionCause, ResilientContainerExec, classify_error_text,
@@ -794,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_survives_exhausted_transcript_and_output_writes_and_recovers_when_space_returns()
-    {
+     {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = MayConfig::default();
         config.upsert_provider(
@@ -825,7 +839,8 @@ mod tests {
         assert!(db.claim_session_run(&fence).await.expect("claim"));
 
         // Simulate OutputStore failing on ENOSPC during a tool call.
-        let tool_err = ToolResult::error("execution failed: I/O error: No space left on device (os error 28)");
+        let tool_err =
+            ToolResult::error("execution failed: I/O error: No space left on device (os error 28)");
         let rendered = tool_err.render_for_model();
         let cause = classify_error_text(&rendered).expect("ENOSPC classified");
         state.pending_transcripts.arm_alert("s-disk", cause);
@@ -836,7 +851,12 @@ mod tests {
             .store(true, Ordering::SeqCst);
 
         // Daemon reads & health remain responsive while disk is full.
-        assert!(db.get_session("s-disk").await.expect("session read").is_some());
+        assert!(
+            db.get_session("s-disk")
+                .await
+                .expect("session read")
+                .is_some()
+        );
 
         // Resolving the next turn's context while disk is STILL full must NOT fail:
         // it injects the home-disk-exhausted <system-reminder> to the agent and defers
@@ -849,11 +869,10 @@ mod tests {
             delivery_mode: PendingUserMessageMode::Steer,
             pending_entry_id: None,
         };
-        let ctx = crate::daemon::chat::resolve_session_context(
-            &state, &req, &fence, true, true, None,
-        )
-        .await
-        .expect("turn preparation must survive SQLITE_FULL / ENOSPC");
+        let ctx =
+            crate::daemon::chat::resolve_session_context(&state, &req, &fence, true, true, None)
+                .await
+                .expect("turn preparation must survive SQLITE_FULL / ENOSPC");
         let hidden = ctx
             .hidden_context_xml
             .expect("agent must be told the home environment is out of disk space");
@@ -865,7 +884,10 @@ mod tests {
         // Defer assistant reply, checkpoint, and stats while disk remains full.
         state.pending_transcripts.defer_messages(
             "s-disk",
-            vec![ChatMessage::assistant("Cleaned workspace scratch files.")],
+            vec![ChatMessage::assistant(
+                "Cleaned workspace scratch files.",
+                jiff::Timestamp::now(),
+            )],
             DiskExhaustionCause::NoSpaceLeft,
         );
         let mut agent_ctx = Context::new();
@@ -967,7 +989,7 @@ mod tests {
     }
 
     impl ContainerExec for MockExec {
-        async fn exec(
+        fn exec(
             &self,
             container_id: &str,
             _script: &str,
@@ -975,12 +997,13 @@ mod tests {
             _kill_rx: async_channel::Receiver<()>,
             _stdin_rx: async_channel::Receiver<Vec<u8>>,
             _lifetime: ExecLifetime,
-        ) -> Result<ContainerExecOutcome, String> {
+        ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             self.seen_containers
                 .lock()
                 .expect("lock")
                 .push(container_id.to_string());
-            match self.mode.lock().expect("lock").clone() {
+            let mode = self.mode.lock().expect("lock").clone();
+            std::future::ready(match mode {
                 Ok(stdout) => Ok(ContainerExecOutcome::Completed {
                     #[cfg(unix)]
                     output: Output {
@@ -993,7 +1016,7 @@ mod tests {
                     killed: Vec::new(),
                 }),
                 Err(err) => Err(err),
-            }
+            })
         }
 
         async fn exec_streamed(
@@ -1006,8 +1029,15 @@ mod tests {
             _stdout: async_channel::Sender<Vec<u8>>,
             lifetime: ExecLifetime,
         ) -> Result<ContainerExecOutcome, String> {
-            self.exec(container_id, script, working_dir, kill_rx, stdin_rx, lifetime)
-                .await
+            self.exec(
+                container_id,
+                script,
+                working_dir,
+                kill_rx,
+                stdin_rx,
+                lifetime,
+            )
+            .await
         }
     }
 
@@ -1018,12 +1048,19 @@ mod tests {
     }
 
     impl ContainerReconnect for MockReconnect {
-        async fn reconnect(&self) -> Result<(AnyContainerExec, String), String> {
+        fn reconnect(
+            &self,
+        ) -> impl Future<Output = Result<(AnyContainerExec, String), String>> + Send {
             self.reconnect_calls.fetch_add(1, Ordering::SeqCst);
             if !self.available.load(Ordering::SeqCst) {
-                return Err("connection refused (docker.sock missing)".to_string());
+                return std::future::ready(Err(
+                    "connection refused (docker.sock missing)".to_string()
+                ));
             }
-            Ok((self.reconnected_exec.clone(), "container-recreated-v2".to_string()))
+            std::future::ready(Ok((
+                self.reconnected_exec.clone(),
+                "container-recreated-v2".to_string(),
+            )))
         }
     }
 
@@ -1031,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn container_session_reports_eio_and_reconnects_when_disappeared_runtime_returns() {
         let initial_mode = Arc::new(Mutex::new(Err(
-            "Input/output error (os error 5)".to_string(),
+            "Input/output error (os error 5)".to_string()
         )));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let initial_exec = AnyContainerExec::new(Arc::new(MockExec {

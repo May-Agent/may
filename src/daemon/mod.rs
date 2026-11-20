@@ -557,7 +557,11 @@ impl TcpListeners {
             e.insert(self.routers().spawn(listener, addr, state));
         }
         inner.local = Some(addr);
-        state.update_config(|config| config.daemon.port = Some(addr.port()));
+        // The pin is in-memory: the caller persists it once it knows the
+        // address is served.
+        let mut config = (*state.config_snapshot()).clone();
+        config.daemon.port = Some(addr.port());
+        state.replace_config(config);
         Self::report_local_addr(&inner, state);
         drop(inner);
         Ok(addr)
@@ -671,8 +675,9 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
                         config_state
                             .live_limits
                             .apply(&config_state.config_snapshot());
-                        extra
-                            .reconcile(&config_state.config_snapshot().daemon.listen)
+                        config_state
+                            .tcp_listeners
+                            .reconcile_config(&config_state.config_snapshot().daemon, &config_state)
                             .await;
                     })
                     .await;

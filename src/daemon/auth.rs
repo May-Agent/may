@@ -465,6 +465,13 @@ const WHOIS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Upper bound on cached peer entries so arbitrary peers cannot grow memory without bound.
 const WHOIS_MAX_ENTRIES: usize = 1024;
 
+/// A [`WhoisCache`] lookup: `Hit` is a remembered resolution (including a
+/// remembered "no login"); `Miss` asks the caller to resolve.
+enum WhoisLookup {
+    Hit(Option<TailnetLogin>),
+    Miss,
+}
+
 /// Bounded, short-lived cache around [`WhoisSource`] so `WhoIs` runs lazily
 /// after `Host` validation, coalesces concurrent lookups per IP, and caps
 /// subprocess concurrency.
@@ -491,14 +498,16 @@ impl<W: WhoisSource> WhoisCache<W> {
         })
     }
 
-    fn cached(&self, peer: IpAddr) -> Option<Option<TailnetLogin>> {
+    fn cached(&self, peer: IpAddr) -> WhoisLookup {
         let mut entries = self.entries.lock().expect("whois cache mutex poisoned");
-        let (stored_at, ref login) = *entries.get(&peer)?;
+        let Some((stored_at, login)) = entries.get(&peer) else {
+            return WhoisLookup::Miss;
+        };
         if stored_at.elapsed() < self.ttl {
-            return Some(login.clone());
+            return WhoisLookup::Hit(login.clone());
         }
         entries.remove(&peer);
-        None
+        WhoisLookup::Miss
     }
 
     fn store(&self, peer: IpAddr, login: Option<TailnetLogin>) {
@@ -521,7 +530,7 @@ impl<W: WhoisSource> WhoisCache<W> {
 
     pub async fn resolve(&self, peer: IpAddr) -> Option<TailnetLogin> {
         let peer = peer.to_canonical();
-        if let Some(hit) = self.cached(peer) {
+        if let WhoisLookup::Hit(hit) = self.cached(peer) {
             return hit;
         }
         let ip_lock = {
@@ -532,7 +541,7 @@ impl<W: WhoisSource> WhoisCache<W> {
                 .clone()
         };
         let _ip_guard = ip_lock.lock().await;
-        let resolved = if let Some(hit) = self.cached(peer) {
+        let resolved = if let WhoisLookup::Hit(hit) = self.cached(peer) {
             hit
         } else {
             let _permit = self.semaphore.acquire().await;
@@ -562,6 +571,7 @@ pub struct DirectListener<S, W = NoWhoisSource> {
 }
 
 impl<S: NodeNamesSource> DirectListener<S, NoWhoisSource> {
+    #[cfg(test)]
     pub const fn new(names: Arc<NodeNamesCache<S>>, identity: RequireIdentity) -> Self {
         Self {
             names,

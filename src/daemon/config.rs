@@ -876,9 +876,7 @@ pub(super) async fn reload_config_from_disk(state: &Arc<DaemonState>) {
     let next_browser_manager = if loaded.browser.enabled {
         match &previous_browser_manager {
             Some(manager) if loaded.browser == previous_config.browser => {
-                if codec_changed
-                    && let Err(error) = manager.set_codec(codec).await
-                {
+                if codec_changed && let Err(error) = manager.set_codec(codec).await {
                     tracing::warn!(%error, "failed to update browser stream codec after config.toml reload");
                 }
                 Some(manager.clone())
@@ -944,6 +942,13 @@ pub(super) async fn reload_config_from_disk(state: &Arc<DaemonState>) {
     state.notify_ui_events(topics);
 }
 
+/// One turn of the config-file watch loop.
+enum WatchStep {
+    Shutdown,
+    Event(Option<notify::Result<NotifyEvent>>),
+    QuietElapsed,
+}
+
 /// Watches `<may_dir>/config.toml` for external edits (including atomic editor
 /// renames and file creation/removal) and reloads configuration live without
 /// restarting the daemon.
@@ -983,11 +988,6 @@ pub(super) fn spawn_config_file_watcher(state: &Arc<DaemonState>) {
     state.tokio_handle.spawn(async move {
         let _watcher = watcher;
         let mut dirty = false;
-        enum WatchStep {
-            Shutdown,
-            Event(Option<notify::Result<NotifyEvent>>),
-            QuietElapsed,
-        }
         loop {
             let step = if dirty {
                 futures_lite::future::or(
@@ -1018,9 +1018,10 @@ pub(super) fn spawn_config_file_watcher(state: &Arc<DaemonState>) {
             match step {
                 WatchStep::Shutdown | WatchStep::Event(None) => break,
                 WatchStep::Event(Some(Ok(event))) => {
-                    let touches_config = event.paths.iter().any(|path| {
-                        path.file_name().is_some_and(|name| name == "config.toml")
-                    });
+                    let touches_config = event
+                        .paths
+                        .iter()
+                        .any(|path| path.file_name().is_some_and(|name| name == "config.toml"));
                     if touches_config {
                         dirty = true;
                     }
@@ -1289,10 +1290,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_full_config_returns_400_without_mutating_live_state() {
-        use skyzen::HttpError as _;
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut initial = MayConfig::default();
-        initial.max_iterations = 42;
+        let initial = MayConfig {
+            max_iterations: 42,
+            ..MayConfig::default()
+        };
         initial
             .save_to(&dir.path().join("config.toml"))
             .await
@@ -1330,8 +1332,10 @@ mod tests {
     async fn external_config_toml_edits_reload_live_and_emit_config_event() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
-        let mut initial = MayConfig::default();
-        initial.max_iterations = 15;
+        let initial = MayConfig {
+            max_iterations: 15,
+            ..MayConfig::default()
+        };
         initial
             .save_to(&config_path)
             .await
@@ -1346,8 +1350,10 @@ mod tests {
         super::spawn_config_file_watcher(&state);
 
         // External atomic editor save (write temp file + rename over config.toml).
-        let mut edited = MayConfig::default();
-        edited.max_iterations = 88;
+        let mut edited = MayConfig {
+            max_iterations: 88,
+            ..MayConfig::default()
+        };
         edited.preferences.show_decode_speed = true;
         let tmp_path = dir.path().join(".config.toml.swp");
         async_fs::write(&tmp_path, toml::to_string_pretty(&edited).expect("toml"))

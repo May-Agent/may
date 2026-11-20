@@ -1834,8 +1834,8 @@ mod tests {
             );
         }
 
-        let policy = crate::config::NetworkPolicyConfig {
-            mode: crate::config::NetworkPolicyMode::AllowList,
+        let policy = crate::network_policy::NetworkPolicyConfig {
+            mode: crate::network_policy::NetworkPolicyMode::AllowList,
             hosts: vec!["allowed.example.com".to_string()],
         }
         .compile()
@@ -1846,7 +1846,7 @@ mod tests {
             profile_id: "profile".to_string(),
             source: NetworkAccessSource::TaskContainer,
             allow_network: true,
-            network_policy: Some(policy),
+            network_policy: policy,
         };
         assert!(
             aither_sandbox::DomainApprover::approve(

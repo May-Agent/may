@@ -77,7 +77,7 @@ pub fn checkpoint_watermark(context: &aither_agent::ContextCheckpoint) -> i64 {
     i64::try_from(covered).expect("checkpoint seq fits in i64") - 1
 }
 
-pub(crate) fn snapshot_upsert(
+pub fn snapshot_upsert(
     checkpoint: AgentCheckpoint,
 ) -> Result<crate::db::SessionContextSnapshotUpsert, crate::db::ChatDbError> {
     // The transcript records exactly what the agent committed: every

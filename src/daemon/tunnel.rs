@@ -227,10 +227,7 @@ fn normalize_target(raw: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
-fn allows_tunnel_target_host(
-    environment: crate::db::ProfileEnvironmentKind,
-    host: &str,
-) -> bool {
+fn allows_tunnel_target_host(environment: crate::db::ProfileEnvironmentKind, host: &str) -> bool {
     match environment {
         crate::db::ProfileEnvironmentKind::Local => super::auth::is_loopback_name(host),
         crate::db::ProfileEnvironmentKind::Container => is_container_local_proxy_host(host),
@@ -767,7 +764,7 @@ mod tests {
         );
         state
             .remote_access_manager
-            .set_local_listener_addr("127.0.0.1:8787".parse().expect("addr"));
+            .set_local_listener_addr(Some("127.0.0.1:8787".parse().expect("addr")));
         let local_profile = state
             .db()
             .ensure_default_profiles()
@@ -801,7 +798,12 @@ mod tests {
             );
         }
 
-        for allowed in ["localhost:3000", "127.0.0.1:3000", "[::1]:3000", "0.0.0.0:3000"] {
+        for allowed in [
+            "localhost:3000",
+            "127.0.0.1:3000",
+            "[::1]:3000",
+            "0.0.0.0:3000",
+        ] {
             handle_tunnel_request(
                 &state,
                 TunnelRequest {
@@ -855,7 +857,7 @@ mod tests {
         );
         state
             .remote_access_manager
-            .set_local_listener_addr("127.0.0.1:8787".parse().expect("addr"));
+            .set_local_listener_addr(Some("127.0.0.1:8787".parse().expect("addr")));
         let local_profile = state
             .db()
             .ensure_default_profiles()

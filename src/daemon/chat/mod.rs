@@ -1899,16 +1899,17 @@ pub(super) async fn run_bash(
     let may_dir = state.may_dir.clone();
     let config_snapshot = state.config.load_full();
     let patterns = state.secret_patterns.clone();
-    let (secrets, outcome) = blocking::unblock(move || -> Result<_, crate::secrets::SecretError> {
-        let secrets = crate::secrets::Secrets::load(
-            &crate::secrets::SecretStore::new(&may_dir),
-            config_snapshot.as_ref(),
-        )?;
-        let outcome = crate::bash::run_bash_command(&command, &cwd, &secrets, &patterns);
-        Ok((secrets, outcome))
-    })
-    .await
-    .map_err(internal_error)?;
+    let (secrets, outcome) =
+        blocking::unblock(move || -> Result<_, crate::secrets::SecretError> {
+            let secrets = crate::secrets::Secrets::load(
+                &crate::secrets::SecretStore::new(&may_dir),
+                config_snapshot.as_ref(),
+            )?;
+            let outcome = crate::bash::run_bash_command(&command, &cwd, &secrets, &patterns);
+            Ok((secrets, outcome))
+        })
+        .await
+        .map_err(internal_error)?;
     // The transcript returned to the client never carries the raw secret.
     let (masked_command, _) = secrets.mask(&state.secret_patterns, &outcome.command);
     Ok(Json(crate::daemon::types::BashResponse {
@@ -2063,7 +2064,10 @@ async fn flush_turn_persister_resilient(
     agent: Option<&mut MayAgent>,
 ) -> Result<bool, crate::db::ChatDbError> {
     let db = state.db();
-    let _ = state.pending_transcripts.flush_session(&db, session_id).await;
+    let _ = state
+        .pending_transcripts
+        .flush_session(&db, session_id)
+        .await;
     match turn_persister.flush(&db).await {
         Ok(_) => Ok(false),
         Err(error) => {
@@ -3560,7 +3564,7 @@ pub(super) struct SessionContext {
     /// written: the input of a turn whose run ended before its first
     /// checkpoint, which a restored agent has not seen.
     uncheckpointed_input: Vec<LlmMessage>,
-    hidden_context_xml: Option<String>,
+    pub(super) hidden_context_xml: Option<String>,
     profile_persona: Option<String>,
     pub(super) profile_memories: Option<crate::memory::ProfileMemories>,
     pub(super) memory_off: bool,
@@ -4027,8 +4031,8 @@ pub(super) async fn resolve_session_context(
     let mut hidden_commit_entry = req
         .pending_entry_id
         .filter(|_| persist_user_message && !request_has_visible_user_input(req));
-    if let Some(disk_alert) = state.pending_transcripts.take_alert(session_id.as_str()) {
-        if let Err(error) = push_hidden_context_part(
+    if let Some(disk_alert) = state.pending_transcripts.take_alert(session_id.as_str())
+        && let Err(error) = push_hidden_context_part(
             &db,
             fence,
             &history,
@@ -4038,19 +4042,18 @@ pub(super) async fn resolve_session_context(
             &mut hidden_commit_entry,
         )
         .await
-        {
-            if let Some(cause) = error.disk_exhaustion_cause() {
-                state.pending_transcripts.defer_messages(
-                    session_id.as_str(),
-                    vec![ChatMessage::hidden_context(disk_alert.clone())],
-                    cause,
-                );
-                if !hidden_context_parts.iter().any(|part| part == &disk_alert) {
-                    hidden_context_parts.push(disk_alert);
-                }
-            } else {
-                return Err(UiChatPreparationError::PersistHiddenContext(error));
+    {
+        if let Some(cause) = error.disk_exhaustion_cause() {
+            state.pending_transcripts.defer_messages(
+                session_id.as_str(),
+                vec![ChatMessage::hidden_context(disk_alert.clone())],
+                cause,
+            );
+            if !hidden_context_parts.iter().any(|part| part == &disk_alert) {
+                hidden_context_parts.push(disk_alert);
             }
+        } else {
+            return Err(UiChatPreparationError::PersistHiddenContext(error));
         }
     }
     let takeover_alert_consumed =
@@ -4199,10 +4202,7 @@ pub(super) async fn resolve_session_context(
                     let alert = crate::daemon::disk_exhaustion::format_disk_exhausted_alert(cause);
                     state.pending_transcripts.defer_messages(
                         session_id.as_str(),
-                        vec![
-                            ChatMessage::hidden_context(alert.clone()),
-                            user_message,
-                        ],
+                        vec![ChatMessage::hidden_context(alert.clone()), user_message],
                         cause,
                     );
                     let _ = state.pending_transcripts.take_alert(session_id.as_str());

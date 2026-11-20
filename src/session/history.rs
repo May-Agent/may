@@ -537,13 +537,16 @@ impl ChatHistory {
 
     /// Async counterpart of [`Self::input_messages_after`] using non-blocking
     /// file reads when a pasted-text attachment lacks inline `text_content`.
+    ///
+    /// # Errors
+    /// Returns [`HistoryReplayError`] when an attachment's file cannot be read.
     pub async fn input_messages_after_async(
         &self,
         since: Timestamp,
     ) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
         let mut out = Vec::new();
         for message in &self.messages {
-            if !message.timestamp.is_some_and(|stored| stored > since) {
+            if message.timestamp.is_none_or(|stored| stored <= since) {
                 continue;
             }
             match message.role {
@@ -659,6 +662,9 @@ impl ChatHistory {
 
     /// Async counterpart of [`Self::to_aither_messages`] using non-blocking
     /// attachment reads so turn preparation never blocks an executor thread.
+    ///
+    /// # Errors
+    /// Returns [`HistoryReplayError`] when an attachment's file cannot be read.
     pub async fn to_aither_messages_async(
         &self,
     ) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {

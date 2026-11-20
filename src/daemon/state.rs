@@ -1450,6 +1450,15 @@ impl DaemonState {
         .await
     }
 
+    /// Mutates the live config in memory only; tests that need the edit on
+    /// disk use [`Self::save_and_update_config`].
+    pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
+        let mut config = (*self.config.load_full()).clone();
+        let _ = update(&mut config);
+        self.config.store(Arc::new(config.clone()));
+        config
+    }
+
     /// [`Self::for_test`] on a given connectivity source.
     pub(crate) async fn for_test_with_connectivity(
         may_dir: &std::path::Path,

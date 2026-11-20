@@ -135,17 +135,19 @@ pub(super) async fn configure_forge_auth(
         ));
     }
     let client_id = req.client_id.filter(|id| !id.trim().is_empty());
-    let updated = state.update_config(|config| {
-        config.forge.insert(
-            host.clone(),
-            crate::forge::ForgeHostConfig {
-                kind,
-                mode: req.mode,
-                client_id: client_id.clone(),
-            },
-        );
-    });
-    state.save_config(&updated).await.map_err(internal_error)?;
+    let updated = state
+        .save_and_update_config(|config| {
+            config.forge.insert(
+                host.clone(),
+                crate::forge::ForgeHostConfig {
+                    kind,
+                    mode: req.mode,
+                    client_id: client_id.clone(),
+                },
+            );
+        })
+        .await
+        .map_err(internal_error)?;
     if let Some(token) = &req.token {
         state
             .forge_auth
@@ -181,10 +183,12 @@ pub(super) async fn forge_logout(
         .lock()
         .expect("device flows")
         .retain(|(flow_host, _), _| flow_host != &host);
-    let updated = state.update_config(|config| {
-        config.forge.remove(&host);
-    });
-    state.save_config(&updated).await.map_err(internal_error)?;
+    state
+        .save_and_update_config(|config| {
+            config.forge.remove(&host);
+        })
+        .await
+        .map_err(internal_error)?;
     json_ok_response(&super::types::API_OK)
 }
 
@@ -239,23 +243,25 @@ pub(super) async fn forge_oauth_start(
         )
     })?;
     let client_id = req.client_id.filter(|id| !id.trim().is_empty());
-    let updated = state.update_config(|config| {
-        let entry =
-            config
-                .forge
-                .entry(host.clone())
-                .or_insert_with(|| crate::forge::ForgeHostConfig {
-                    kind: Some(kind),
-                    mode: ForgeAuthMode::Oauth,
-                    client_id: None,
-                });
-        entry.kind = Some(kind);
-        entry.mode = ForgeAuthMode::Oauth;
-        if let Some(id) = &client_id {
-            entry.client_id = Some(id.clone());
-        }
-    });
-    state.save_config(&updated).await.map_err(internal_error)?;
+    state
+        .save_and_update_config(|config| {
+            let entry =
+                config
+                    .forge
+                    .entry(host.clone())
+                    .or_insert_with(|| crate::forge::ForgeHostConfig {
+                        kind: Some(kind),
+                        mode: ForgeAuthMode::Oauth,
+                        client_id: None,
+                    });
+            entry.kind = Some(kind);
+            entry.mode = ForgeAuthMode::Oauth;
+            if let Some(id) = &client_id {
+                entry.client_id = Some(id.clone());
+            }
+        })
+        .await
+        .map_err(internal_error)?;
     let authorization = state
         .forge_auth
         .oauth_client(&host)

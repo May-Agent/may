@@ -851,24 +851,24 @@ impl ChatDb {
                 continue;
             }
             let blocking_request_id = blocking_ask_by_session.remove(session_id);
-            let (ask_row, ask_questions, ask_options) = match blocking_request_id {
-                Some(request_id) => {
-                    let questions = questions_by_request
-                        .remove(&request_id)
-                        .unwrap_or_default();
+            let (ask_row, ask_questions, ask_options) = blocking_request_id.map_or_else(
+                || (None, Vec::new(), Vec::new()),
+                |request_id| {
+                    let questions = questions_by_request.remove(&request_id).unwrap_or_default();
                     let options = options_by_request.remove(&request_id).unwrap_or_default();
-                    (Some(PendingAskUserRequestRow { request_id }), questions, options)
-                }
-                None => (None, Vec::new(), Vec::new()),
-            };
+                    (
+                        Some(PendingAskUserRequestRow { request_id }),
+                        questions,
+                        options,
+                    )
+                },
+            );
             let open_questions = open_asks_by_session
                 .remove(session_id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|request_id| {
-                    let questions = questions_by_request
-                        .remove(&request_id)
-                        .unwrap_or_default();
+                    let questions = questions_by_request.remove(&request_id).unwrap_or_default();
                     let options = options_by_request.remove(&request_id).unwrap_or_default();
                     Self::persisted_ask_user_request_from_parts(
                         PendingAskUserRequestRow { request_id },
@@ -880,7 +880,9 @@ impl ChatDb {
             let summary = Self::build_session_runtime_summary(
                 runtime_by_session.remove(session_id),
                 messages_by_session.remove(session_id).unwrap_or_default(),
-                attachments_by_session.remove(session_id).unwrap_or_default(),
+                attachments_by_session
+                    .remove(session_id)
+                    .unwrap_or_default(),
                 permission_by_session.remove(session_id),
                 workspace_by_session.remove(session_id),
                 PendingAskUserParts {
@@ -1919,7 +1921,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::{ChatDb, query};
-    use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+    use crate::session::{
+        AttachmentKind, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
+        PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment, SessionPlanState,
+        SessionRuntimeState,
+    };
 
     fn ask_user_request(id: &str) -> PersistedAskUserRequest {
         PersistedAskUserRequest {
@@ -2193,7 +2199,7 @@ mod tests {
         db.set_session_runtime_state("s-rich", SessionRuntimeState::Running)
             .await
             .expect("state");
-        db.set_session_plan_state("s-rich", SessionPlanState::Planning)
+        db.set_session_plan_state("s-rich", SessionPlanState::Draft)
             .await
             .expect("plan");
         db.set_session_yolo("s-rich", true).await.expect("yolo");

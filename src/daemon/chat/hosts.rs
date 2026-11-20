@@ -214,9 +214,7 @@ pub(super) async fn idle_agent(
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            if let Err(release_error) = guard
-                .finish_idle(crate::session::RunOutcome::Failed)
-                .await
+            if let Err(release_error) = guard.finish_idle(crate::session::RunOutcome::Failed).await
             {
                 tracing::warn!(
                     %session_id,

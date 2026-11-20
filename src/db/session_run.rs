@@ -67,7 +67,11 @@ pub struct RunGates {
 }
 
 impl ChatDb {
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        clippy::missing_const_for_fn
+    )]
     pub(super) fn check_write_fault(&self) -> Result<(), ChatDbError> {
         #[cfg(test)]
         if self

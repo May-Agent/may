@@ -820,8 +820,10 @@ async fn ensure_local_listener(
         .ensure_local(req.port, &state)
         .await
         .map_err(|error| super::error::bad_request_error(error.to_string()))?;
-    let updated = state.update_config(|config| config.daemon.port = Some(addr.port()));
-    state.save_config(&updated).await.map_err(internal_error)?;
+    state
+        .save_and_update_config(|config| config.daemon.port = Some(addr.port()))
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(crate::ui_event_bus::UiEventTopics::CONFIG);
     Ok(Json(super::types::LocalListenerResponse {
         port: addr.port(),
