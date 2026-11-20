@@ -1529,23 +1529,21 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
 }
 
 pub(super) fn is_container_local_proxy_host(host: &str) -> bool {
-    let normalized = host
-        .trim()
+    let trimmed = host.trim();
+    if super::auth::is_loopback_name(trimmed) {
+        return true;
+    }
+    let normalized = trimmed
         .trim_matches('[')
         .trim_matches(']')
-        .to_lowercase();
-    if normalized == "localhost"
-        || normalized == "0.0.0.0"
+        .to_ascii_lowercase();
+    normalized == "0.0.0.0"
         || normalized == "::1"
         || normalized == "host.docker.internal"
         || normalized == "host.containers.internal"
-    {
-        return true;
-    }
-    if normalized.starts_with("127.") {
-        return true;
-    }
-    false
+        || normalized
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[derive(Debug)]
@@ -1558,14 +1556,10 @@ pub(super) async fn resolve_container_proxy_target(
     state: &DaemonState,
     session_id: &str,
 ) -> Result<ResolvedContainerProxyTarget, skyzen::Error> {
-    let container_manager = state
-        .container_manager
-        .as_ref()
-        .ok_or_else(|| {
-            skyzen::Error::msg("container runtime unavailable")
-                .set_status(StatusCode::SERVICE_UNAVAILABLE)
-        })?
-        .clone();
+    let container_manager = state.resolve_container_manager(false).await.map_err(|_| {
+        skyzen::Error::msg("container runtime unavailable")
+            .set_status(StatusCode::SERVICE_UNAVAILABLE)
+    })?;
 
     let db = state.db();
 
@@ -1675,7 +1669,7 @@ pub(super) async fn map_container_local_url(
         .ensure_port(key, upstream)
         .await
         .map_err(internal_error)?;
-    if let Some(container_manager) = state.container_manager.as_ref() {
+    if let Some(container_manager) = state.container_manager.load_full() {
         container_manager.touch_activity(&resolved.container_id);
     }
     Ok(Json(LocalUrlMapResponse {

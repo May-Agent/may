@@ -50,20 +50,41 @@ impl RunGate {
     }
 }
 
-/// Gates on the two awaits a dropped handler can interrupt.
-#[cfg(test)]
+/// Gates on the two awaits a dropped handler can interrupt, plus the injected
+/// write faults disk-exhaustion tests arm. The suspend gates are test-only;
+/// the fault flags exist in every build so `check_write_fault` reads them
+/// unconditionally.
 #[derive(Debug, Clone, Default)]
 pub struct RunGates {
     /// Passed after the claim is written, before its result is returned.
+    #[cfg(test)]
     pub claim: RunGate,
     /// Passed before the finish transaction starts.
+    #[cfg(test)]
     pub finish: RunGate,
     /// While set, the next finish fails with a storage error, as a full
     /// disk would make it.
     pub fail_next_finish: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// While set, transcript/checkpoint/stats writes fail with `SQLITE_FULL`
+    /// so tests can exercise disk-exhaustion survival and deferred flushing.
+    pub fail_transcript_disk_full: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ChatDb {
+    /// Returns the injected transcript fault when tests have armed
+    /// [`RunGates::fail_transcript_disk_full`].
+    pub(super) fn check_write_fault(&self) -> Result<(), ChatDbError> {
+        if self
+            .run_gates
+            .fail_transcript_disk_full
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ChatDbError::Storage(
+                "database or disk is full (SQLITE_FULL)".to_string(),
+            ));
+        }
+        Ok(())
+    }
     /// Stamp `fence`'s run id on the session's runtime row and mark it
     /// `Running`, creating the row when missing. The stamp is conditional
     /// on no run id being recorded, so it backs the process registry's
@@ -99,6 +120,7 @@ impl ChatDb {
         &self,
         fence: &RunFence,
     ) -> Result<DbTransaction, ChatDbError> {
+        self.check_write_fault()?;
         let mut tx = self.db.begin().await?;
         let held = query!(
             tx,
@@ -128,20 +150,39 @@ impl ChatDb {
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn finish_session_run(&self, fence: &RunFence) -> Result<bool, ChatDbError> {
         #[cfg(test)]
+        self.run_gates.finish.hit().await;
+        if self
+            .run_gates
+            .fail_next_finish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            self.run_gates.finish.hit().await;
-            if self
-                .run_gates
-                .fail_next_finish
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(ChatDbError::Storage("injected finish failure".to_string()));
-            }
+            return Err(ChatDbError::Storage("injected finish failure".to_string()));
         }
-        let mut tx = match self.begin_fenced(fence).await {
-            Ok(tx) => tx,
-            Err(ChatDbError::RunLost { .. }) => return Ok(false),
-            Err(error) => return Err(error),
+        let mut tx = {
+            let tx_res: Result<DbTransaction, ChatDbError> = async {
+                let mut tx = self.db.begin().await?;
+                let held = query!(
+                    tx,
+                    "UPDATE session_runtimes SET run_id = run_id WHERE session_id = ? AND run_id = ?",
+                    fence.session_id.as_str(),
+                    fence.run_id.as_str()
+                )
+                .execute()
+                .await?;
+                if held.rows_written == 0 {
+                    tx.rollback().await?;
+                    return Err(ChatDbError::RunLost {
+                        session_id: fence.session_id.clone(),
+                    });
+                }
+                Ok(tx)
+            }
+            .await;
+            match tx_res {
+                Ok(tx) => tx,
+                Err(ChatDbError::RunLost { .. }) => return Ok(false),
+                Err(error) => return Err(error),
+            }
         };
         let session_id = fence.session_id.as_str();
         for sql in [

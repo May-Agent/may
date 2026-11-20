@@ -24,6 +24,7 @@ pub(crate) mod tool_result_wire;
 mod user_wait;
 
 pub use binding::{BindingError, RepoBinding, group_sessions, project_label};
+pub(crate) use context_snapshot::snapshot_upsert;
 pub use context_snapshot::{
     PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_watermark,
     load_persisted_context_snapshot, parse_persisted_context_snapshot,
@@ -58,3 +59,33 @@ pub use runtime::{
 pub use runtime_service::{AnswerError, AskUserAnswer, ResolvedRequest, SessionRuntimeService};
 pub use store::{SandboxResourceLayout, SessionStore, StoreError};
 pub use user_wait::{UserAsk, UserWait};
+
+/// Creates `path` (and missing parents) and restricts `path` itself to mode
+/// `0700` on Unix so other local users cannot traverse `~/.may`.
+///
+/// # Errors
+/// Returns an I/O error when directory creation or permission tightening fails.
+pub fn ensure_private_dir_sync(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
+/// Async counterpart of [`ensure_private_dir_sync`].
+///
+/// # Errors
+/// Returns an I/O error when directory creation or permission tightening fails.
+pub async fn ensure_private_dir_async(path: &std::path::Path) -> std::io::Result<()> {
+    let owned = path.to_path_buf();
+    blocking::unblock(move || ensure_private_dir_sync(&owned)).await
+}

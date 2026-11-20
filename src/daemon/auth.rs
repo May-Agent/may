@@ -17,12 +17,13 @@
 //!   only when its `Host` names the node itself ([`NodeNames`]) — a
 //!   DNS-rebinding page's name never does.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hyper::http::uri::Authority;
+use skyzen::extract::PeerAddr;
 use skyzen::header::{HOST, ORIGIN};
 use skyzen::middleware::{Middleware, Next};
 use skyzen::{Error, Request, Response, StatusCode};
@@ -70,11 +71,17 @@ impl Middleware for LoopbackOnly {
 /// The authority the request was addressed to: the URI's (HTTP/2's
 /// `:authority`, or an absolute-form target), else `Host`.
 fn request_authority(request: &Request) -> Option<Authority> {
-    if let Some(authority) = request.uri().authority() {
+    authority_from_parts(request.uri(), request.headers())
+}
+
+pub(super) fn authority_from_parts(
+    uri: &hyper::Uri,
+    headers: &skyzen::header::HeaderMap,
+) -> Option<Authority> {
+    if let Some(authority) = uri.authority() {
         return Some(authority.clone());
     }
-    request
-        .headers()
+    headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<Authority>().ok())
@@ -83,12 +90,23 @@ fn request_authority(request: &Request) -> Option<Authority> {
 /// The request's authority names a loopback host. A request naming no
 /// authority is refused.
 fn has_loopback_host(request: &Request) -> bool {
-    request_authority(request).is_some_and(|authority| is_loopback_name(authority.host()))
+    has_loopback_host_parts(request.uri(), request.headers())
+}
+
+pub(super) fn has_loopback_host_parts(
+    uri: &hyper::Uri,
+    headers: &skyzen::header::HeaderMap,
+) -> bool {
+    authority_from_parts(uri, headers).is_some_and(|authority| is_loopback_name(authority.host()))
 }
 
 /// No `Origin`, or an http(s) origin whose host is a loopback name.
 fn has_loopback_origin_or_none(request: &Request) -> bool {
-    let Some(origin) = request.headers().get(ORIGIN) else {
+    has_loopback_origin_or_none_headers(request.headers())
+}
+
+pub(super) fn has_loopback_origin_or_none_headers(headers: &skyzen::header::HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
         return true;
     };
     origin
@@ -102,7 +120,7 @@ fn has_loopback_origin_or_none(request: &Request) -> bool {
 /// `localhost` or a `.localhost` name (RFC 6761), a 127/8 address, or `[::1]`
 /// — names no DNS answer can point elsewhere. IPv6 comes bracketed, as in a
 /// URL authority.
-fn is_loopback_name(host: &str) -> bool {
+pub(super) fn is_loopback_name(host: &str) -> bool {
     if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         return v6.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
     }
@@ -424,22 +442,160 @@ fn foreign_host() -> Error {
         .set_status(StatusCode::FORBIDDEN)
 }
 
-/// A direct tailnet bind's policy: the request's `Host` must name the node
-/// itself — one of its tailnet addresses, its `MagicDNS` name, or the address
-/// the connection arrived on ([`LocalAddr`]) — before any identity is
-/// resolved; then [`RequireIdentity`] decides.
-pub struct DirectListener<S> {
-    names: Arc<NodeNamesCache<S>>,
-    identity: RequireIdentity,
+/// Where a direct listener resolves a peer address to its user login.
+pub trait WhoisSource: Send + Sync + 'static {
+    /// Resolves `peer` to a user login, or `None` when unattributed.
+    fn resolve(&self, peer: IpAddr) -> impl Future<Output = Option<TailnetLogin>> + Send;
 }
 
-impl<S: NodeNamesSource> DirectListener<S> {
-    pub const fn new(names: Arc<NodeNamesCache<S>>, identity: RequireIdentity) -> Self {
-        Self { names, identity }
+/// Placeholder [`WhoisSource`] for direct listeners whose tests attach
+/// [`TailnetLogin`] directly to request extensions.
+pub struct NoWhoisSource;
+
+impl WhoisSource for NoWhoisSource {
+    fn resolve(&self, _peer: IpAddr) -> impl Future<Output = Option<TailnetLogin>> + Send {
+        std::future::ready(None)
     }
 }
 
-impl<S: NodeNamesSource> Middleware for DirectListener<S> {
+/// Maximum concurrent `tailscale whois` subprocesses across direct connections.
+const WHOIS_MAX_CONCURRENT: usize = 4;
+/// How long a resolved `WhoIs` result (including `None`) is reused per peer IP.
+const WHOIS_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Upper bound on cached peer entries so arbitrary peers cannot grow memory without bound.
+const WHOIS_MAX_ENTRIES: usize = 1024;
+
+/// A [`WhoisCache`] lookup: `Hit` is a remembered resolution (including a
+/// remembered "no login"); `Miss` asks the caller to resolve.
+enum WhoisLookup {
+    Hit(Option<TailnetLogin>),
+    Miss,
+}
+
+/// Bounded, short-lived cache around [`WhoisSource`] so `WhoIs` runs lazily
+/// after `Host` validation, coalesces concurrent lookups per IP, and caps
+/// subprocess concurrency.
+pub struct WhoisCache<W> {
+    source: W,
+    semaphore: async_lock::Semaphore,
+    ttl: Duration,
+    entries: std::sync::Mutex<HashMap<IpAddr, (Instant, Option<TailnetLogin>)>>,
+    inflight: async_lock::Mutex<HashMap<IpAddr, Arc<async_lock::Mutex<()>>>>,
+}
+
+impl<W: WhoisSource> WhoisCache<W> {
+    pub fn new(source: W) -> Arc<Self> {
+        Self::with_limits(source, WHOIS_MAX_CONCURRENT, WHOIS_CACHE_TTL)
+    }
+
+    pub fn with_limits(source: W, max_concurrent: usize, ttl: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            source,
+            semaphore: async_lock::Semaphore::new(max_concurrent.max(1)),
+            ttl,
+            entries: std::sync::Mutex::new(HashMap::new()),
+            inflight: async_lock::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn cached(&self, peer: IpAddr) -> WhoisLookup {
+        let mut entries = self.entries.lock().expect("whois cache mutex poisoned");
+        let Some((stored_at, login)) = entries.get(&peer) else {
+            return WhoisLookup::Miss;
+        };
+        if stored_at.elapsed() < self.ttl {
+            return WhoisLookup::Hit(login.clone());
+        }
+        entries.remove(&peer);
+        WhoisLookup::Miss
+    }
+
+    fn store(&self, peer: IpAddr, login: Option<TailnetLogin>) {
+        let now = Instant::now();
+        let ttl = self.ttl;
+        let mut entries = self.entries.lock().expect("whois cache mutex poisoned");
+        if entries.len() >= WHOIS_MAX_ENTRIES && !entries.contains_key(&peer) {
+            entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
+            if entries.len() >= WHOIS_MAX_ENTRIES
+                && let Some(oldest_ip) = entries
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(ip, _)| *ip)
+            {
+                entries.remove(&oldest_ip);
+            }
+        }
+        entries.insert(peer, (now, login));
+    }
+
+    pub async fn resolve(&self, peer: IpAddr) -> Option<TailnetLogin> {
+        let peer = peer.to_canonical();
+        if let WhoisLookup::Hit(hit) = self.cached(peer) {
+            return hit;
+        }
+        let ip_lock = {
+            let mut inflight = self.inflight.lock().await;
+            inflight
+                .entry(peer)
+                .or_insert_with(|| Arc::new(async_lock::Mutex::new(())))
+                .clone()
+        };
+        let _ip_guard = ip_lock.lock().await;
+        let resolved = if let WhoisLookup::Hit(hit) = self.cached(peer) {
+            hit
+        } else {
+            let _permit = self.semaphore.acquire().await;
+            let login = self.source.resolve(peer).await;
+            self.store(peer, login.clone());
+            login
+        };
+        {
+            let mut inflight = self.inflight.lock().await;
+            if Arc::strong_count(&ip_lock) <= 2 {
+                inflight.remove(&peer);
+            }
+        }
+        resolved
+    }
+}
+
+/// A direct tailnet bind's policy: the request's `Host` must name the node
+/// itself — one of its tailnet addresses, its `MagicDNS` name, or the address
+/// the connection arrived on ([`LocalAddr`]) — before any identity is
+/// resolved; then `WhoIs` resolves lazily for admitted hosts and
+/// [`RequireIdentity`] decides.
+pub struct DirectListener<S, W = NoWhoisSource> {
+    names: Arc<NodeNamesCache<S>>,
+    whois: Option<Arc<WhoisCache<W>>>,
+    identity: RequireIdentity,
+}
+
+impl<S: NodeNamesSource> DirectListener<S, NoWhoisSource> {
+    #[cfg(test)]
+    pub const fn new(names: Arc<NodeNamesCache<S>>, identity: RequireIdentity) -> Self {
+        Self {
+            names,
+            whois: None,
+            identity,
+        }
+    }
+}
+
+impl<S: NodeNamesSource, W: WhoisSource> DirectListener<S, W> {
+    pub const fn with_whois(
+        names: Arc<NodeNamesCache<S>>,
+        whois: Arc<WhoisCache<W>>,
+        identity: RequireIdentity,
+    ) -> Self {
+        Self {
+            names,
+            whois: Some(whois),
+            identity,
+        }
+    }
+}
+
+impl<S: NodeNamesSource, W: WhoisSource> Middleware for DirectListener<S, W> {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
         let host = request_authority(request).map(|authority| authority.host().to_owned());
         let local = request
@@ -458,6 +614,13 @@ impl<S: NodeNamesSource> Middleware for DirectListener<S> {
         if !addressed {
             tracing::warn!(host = ?host, "direct request addressed to another host refused");
             return Err(foreign_host());
+        }
+        if request.extensions().get::<TailnetLogin>().is_none()
+            && let Some(whois) = &self.whois
+            && let Some(PeerAddr(peer)) = request.extensions().get::<PeerAddr>().copied()
+            && let Some(login) = whois.resolve(peer.ip()).await
+        {
+            request.extensions_mut().insert(login);
         }
         self.identity.handle(request, next).await
     }

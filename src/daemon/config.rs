@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use notify::{
+    Config as NotifyConfig, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::responder::Sse;
@@ -49,14 +52,10 @@ fn scoped_skill_manager(state: &DaemonState, profile_id: &str) -> SkillManager {
     SkillManager::from_profile_home(&home_paths.profile_home(profile_id))
 }
 
-fn parse_selector_list(values: &[String]) -> Vec<ModelSelector> {
+fn parse_selector_list(values: &[String]) -> SkyResult<Vec<ModelSelector>> {
     values
         .iter()
-        .map(|value| {
-            value
-                .parse::<ModelSelector>()
-                .expect("ui config save must receive valid model selectors")
-        })
+        .map(|value| value.parse::<ModelSelector>().map_err(bad_request_error))
         .collect()
 }
 
@@ -254,33 +253,108 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
     let previous_browser_manager = state.browser_manager();
     let previous_config = state.config_snapshot();
     let codec = req.stream.codec;
+    let job_pool_size = parse_job_pool_size(req.sandbox.job_pool_size)?;
+    let advanced = parse_selector_list(&req.models.advanced)?;
+    let balanced = parse_selector_list(&req.models.balanced)?;
+    let fast = parse_selector_list(&req.models.fast)?;
+    let image_generation = parse_selector_list(&req.models.image_generation)?;
+    let compaction_model = req
+        .models
+        .compaction_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<ModelSelector>().map_err(bad_request_error))
+        .transpose()?;
+    let last_model = req
+        .last_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<ModelSelector>().map_err(bad_request_error))
+        .transpose()?;
+
+    let mut updated = (*previous_config).clone();
+    updated.provider = provider_map_from_ui(&updated.provider, &req.providers);
+    updated.models.advanced = advanced;
+    updated.models.balanced = balanced;
+    updated.models.fast = fast;
+    updated.models.image_generation = image_generation;
+    updated.models.compaction_model = compaction_model;
+    updated.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
+    updated.preferences.show_token_usage = req.preferences.show_token_usage;
+    updated.preferences.show_decode_speed = req.preferences.show_decode_speed;
+    updated.preferences.network_policy.mode = req.preferences.network_policy_mode;
+    updated.preferences.network_policy.hosts = req
+        .preferences
+        .network_policy_hosts
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    updated.appearance.font.clone_from(&req.appearance.font);
+    updated.appearance.theme = req.appearance.theme;
+    updated.last_model = last_model;
+    updated.max_iterations = req.max_iterations;
+    updated.sandbox.command_priority = req.sandbox.command_priority;
+    updated.sandbox.job_pool_size = job_pool_size;
+    updated.stream.codec = codec;
+    updated.browser.enabled = req.browser.enabled;
+    updated.browser.backend = req.browser.backend;
+    updated.browser.port = req.browser.port;
+    updated.browser.remote_cdp_endpoint = req
+        .browser
+        .remote_cdp_endpoint
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    updated.browser.screencast_jpeg_quality = req.browser.screencast_jpeg_quality;
+    updated.browser.encoder_initial_bitrate_kbps = req.browser.encoder_initial_bitrate_kbps;
+    updated.browser.screencast_max_width = req.browser.screencast_max_width;
+    updated.browser.screencast_max_height = req.browser.screencast_max_height;
+    updated.browser.every_nth_frame = req.browser.every_nth_frame;
+    updated.browser.stealth_enabled = req.browser.stealth_enabled;
+    updated.browser.system_profile =
+        req.browser
+            .system_profile
+            .as_ref()
+            .map(|sp| crate::config::SystemProfileConfig {
+                path: std::path::PathBuf::from(&sp.path),
+                copy_on_first_use: sp.copy_on_first_use,
+            });
+    updated.remote_access.enabled = req.remote_access.enabled;
+    updated
+        .remote_access
+        .tailscale_binary
+        .clone_from(&req.remote_access.tailscale_binary);
+    updated.remote_access.https_port = req.remote_access.https_port;
+    updated.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
+    updated.remote_access.allowed_logins = normalize_logins(&req.remote_access.allowed_logins);
+    updated.remote_access.funnel = req.remote_access.funnel;
+    updated.remote_access.funnel_port = req.remote_access.funnel_port;
+    updated.remote_access.webhook_max_body_bytes = req.remote_access.webhook_max_body_bytes;
+    if let Some(suggestions) = &req.suggestions {
+        updated.suggestions.enabled = suggestions.enabled;
+    }
+    if let Some(recap) = &req.recap {
+        updated.recap.auto = recap.auto;
+        updated.recap.idle_minutes = recap.idle_minutes;
+    }
+    if let Some(sessions) = &req.sessions {
+        updated.sessions.recent_hours = sessions.recent_hours;
+    }
+
+    updated.validate().map_err(bad_request_error)?;
+    updated
+        .preferences
+        .network_policy
+        .compile()
+        .map_err(bad_request_error)?;
+
     // Each stream selects the codec for its own format before it changes
     // anything, so a codec this host cannot serve leaves both as they were.
     let codec_changed = codec != previous_config.stream.codec;
-    let next_browser_manager = if req.browser.enabled {
-        let next_browser_config = crate::config::BrowserConfig {
-            enabled: req.browser.enabled,
-            backend: req.browser.backend,
-            port: req.browser.port,
-            remote_cdp_endpoint: req
-                .browser
-                .remote_cdp_endpoint
-                .clone()
-                .filter(|value| !value.trim().is_empty()),
-            screencast_jpeg_quality: req.browser.screencast_jpeg_quality,
-            encoder_initial_bitrate_kbps: req.browser.encoder_initial_bitrate_kbps,
-            screencast_max_width: req.browser.screencast_max_width,
-            screencast_max_height: req.browser.screencast_max_height,
-            every_nth_frame: req.browser.every_nth_frame,
-            stealth_enabled: req.browser.stealth_enabled,
-            system_profile: req.browser.system_profile.as_ref().map(|sp| {
-                crate::config::SystemProfileConfig {
-                    path: std::path::PathBuf::from(&sp.path),
-                    copy_on_first_use: sp.copy_on_first_use,
-                }
-            }),
-        };
-        next_browser_config.validate().map_err(bad_request_error)?;
+    let next_browser_manager = if updated.browser.enabled {
+        let next_browser_config = updated.browser.clone();
         match &previous_browser_manager {
             // Nothing but possibly the codec changed: the running browser
             // keeps its pages and only its stream moves to the new codec.
@@ -326,97 +400,9 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         }
     }
 
-    let job_pool_size = parse_job_pool_size(req.sandbox.job_pool_size)?;
-    let updated = state.update_config(|config| {
-        config.provider = provider_map_from_ui(&config.provider, &req.providers);
-        config.models.advanced = parse_selector_list(&req.models.advanced);
-        config.models.balanced = parse_selector_list(&req.models.balanced);
-        config.models.fast = parse_selector_list(&req.models.fast);
-        config.models.image_generation = parse_selector_list(&req.models.image_generation);
-        config.models.compaction_model = req
-            .models
-            .compaction_model
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                value
-                    .parse::<ModelSelector>()
-                    .expect("ui config save must receive valid model selectors")
-            });
-        config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
-        config.preferences.show_token_usage = req.preferences.show_token_usage;
-        config.preferences.show_decode_speed = req.preferences.show_decode_speed;
-        config.preferences.network_policy.mode = req.preferences.network_policy_mode;
-        config.preferences.network_policy.hosts = req
-            .preferences
-            .network_policy_hosts
-            .iter()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect();
-        config.appearance.font.clone_from(&req.appearance.font);
-        config.appearance.theme = req.appearance.theme;
-        config.last_model = req.last_model.clone().map(|value| {
-            value
-                .parse::<ModelSelector>()
-                .expect("ui config save must receive valid model selectors")
-        });
-        config.max_iterations = req.max_iterations;
-        config.sandbox.command_priority = req.sandbox.command_priority;
-        config.sandbox.job_pool_size = job_pool_size;
-        config.stream.codec = codec;
-        config.browser.enabled = req.browser.enabled;
-        config.browser.backend = req.browser.backend;
-        config.browser.port = req.browser.port;
-        config.browser.remote_cdp_endpoint = req
-            .browser
-            .remote_cdp_endpoint
-            .clone()
-            .filter(|value| !value.trim().is_empty());
-        config.browser.screencast_jpeg_quality = req.browser.screencast_jpeg_quality;
-        config.browser.encoder_initial_bitrate_kbps = req.browser.encoder_initial_bitrate_kbps;
-        config.browser.screencast_max_width = req.browser.screencast_max_width;
-        config.browser.screencast_max_height = req.browser.screencast_max_height;
-        config.browser.every_nth_frame = req.browser.every_nth_frame;
-        config.browser.stealth_enabled = req.browser.stealth_enabled;
-        config.browser.system_profile =
-            req.browser
-                .system_profile
-                .as_ref()
-                .map(|sp| crate::config::SystemProfileConfig {
-                    path: std::path::PathBuf::from(&sp.path),
-                    copy_on_first_use: sp.copy_on_first_use,
-                });
-        config.remote_access.enabled = req.remote_access.enabled;
-        config
-            .remote_access
-            .tailscale_binary
-            .clone_from(&req.remote_access.tailscale_binary);
-        config.remote_access.https_port = req.remote_access.https_port;
-        config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
-        config.remote_access.allowed_logins = normalize_logins(&req.remote_access.allowed_logins);
-        config.remote_access.funnel = req.remote_access.funnel;
-        config.remote_access.funnel_port = req.remote_access.funnel_port;
-        config.remote_access.webhook_max_body_bytes = req.remote_access.webhook_max_body_bytes;
-        if let Some(suggestions) = &req.suggestions {
-            config.suggestions.enabled = suggestions.enabled;
-        }
-        if let Some(recap) = &req.recap {
-            config.recap.auto = recap.auto;
-            config.recap.idle_minutes = recap.idle_minutes;
-        }
-        if let Some(sessions) = &req.sessions {
-            config.sessions.recent_hours = sessions.recent_hours;
-        }
-    });
-
-    updated
-        .preferences
-        .network_policy
-        .compile()
-        .map_err(bad_request_error)?;
-
     state.save_config(&updated).await.map_err(internal_error)?;
+    state.replace_config(updated.clone());
+    state.live_limits.apply(&updated);
     state.job_server.resize(updated.sandbox.job_pool_size());
     if let Some(previous_browser_manager) = previous_browser_manager
         && !next_browser_manager
@@ -431,7 +417,7 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
     state.set_browser_manager(next_browser_manager);
     state
         .task_runtime
-        .set_network_policy(&state.config_snapshot().preferences.network_policy)
+        .set_network_policy(&updated.preferences.network_policy)
         .map_err(internal_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await
@@ -454,8 +440,10 @@ pub(super) async fn set_job_pool(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let size = parse_job_pool_size(req.size)?;
-    let updated = state.update_config(|config| config.sandbox.job_pool_size = size);
-    state.save_config(&updated).await.map_err(internal_error)?;
+    let updated = state
+        .save_and_update_config(|config| config.sandbox.job_pool_size = size)
+        .await
+        .map_err(internal_error)?;
     state.job_server.resize(updated.sandbox.job_pool_size());
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
@@ -465,8 +453,10 @@ pub(super) async fn set_update_channel(
     Json(req): Json<UpdateChannelRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let updated = state.update_config(|config| config.update.channel = Some(req.channel));
-    state.save_config(&updated).await.map_err(internal_error)?;
+    let _ = state
+        .save_and_update_config(|config| config.update.channel = Some(req.channel))
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }
@@ -493,7 +483,12 @@ pub(super) async fn set_last_model(
 
     persist_last_model(&state, model)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| match error {
+            super::model_resolution::PersistLastModelError::InvalidSelector(err) => {
+                bad_request_error(err)
+            }
+            super::model_resolution::PersistLastModelError::Save(err) => internal_error(err),
+        })?;
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -532,8 +527,10 @@ pub(super) async fn add_ssh_server(
     let server = SshServerConfig::probe(req.name, req.target)
         .await
         .map_err(bad_request_error)?;
-    let updated = state.update_config(|config| config.upsert_ssh_server(server));
-    state.save_config(&updated).await.map_err(internal_error)?;
+    let _ = state
+        .save_and_update_config(|config| config.upsert_ssh_server(server))
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }
@@ -543,10 +540,12 @@ pub(super) async fn remove_ssh_server(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let updated = state.update_config(|config| {
-        let _ = config.remove_ssh_server(name);
-    });
-    state.save_config(&updated).await.map_err(internal_error)?;
+    let _ = state
+        .save_and_update_config(|config| {
+            let _ = config.remove_ssh_server(name);
+        })
+        .await
+        .map_err(internal_error)?;
     state
         .db()
         .remove_profile_attachments_for_server(name)
@@ -831,6 +830,220 @@ pub(super) async fn copilot_logout() -> SkyResult<Json<ApiHealth>> {
     Ok(Json(ApiHealth { ok: true }))
 }
 
+const CONFIG_WATCH_DEBOUNCE: Duration = Duration::from_millis(60);
+
+fn configs_equal(left: &MayConfig, right: &MayConfig) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Reloads `<may_dir>/config.toml` from disk into `state` when valid and
+/// different from the active snapshot, broadcasting `UiEventTopics::CONFIG`.
+/// Invalid edits are logged and ignored so the daemon keeps serving.
+pub(super) async fn reload_config_from_disk(state: &Arc<DaemonState>) {
+    let config_path = state.may_dir.join("config.toml");
+    let loaded = match MayConfig::load_from(&config_path).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::warn!(
+                path = %config_path.display(),
+                %error,
+                "ignoring invalid config.toml edit; keeping previous configuration"
+            );
+            return;
+        }
+    };
+    if let Err(error) = loaded.preferences.network_policy.compile() {
+        tracing::warn!(
+            path = %config_path.display(),
+            %error,
+            "ignoring config.toml edit with invalid network policy; keeping previous configuration"
+        );
+        return;
+    }
+
+    let previous_config = state.config_snapshot();
+    if configs_equal(&previous_config, &loaded) {
+        return;
+    }
+
+    let previous_browser_manager = state.browser_manager();
+    let codec = loaded.stream.codec;
+    let codec_changed = codec != previous_config.stream.codec;
+    let mut browser_updated = false;
+    let next_browser_manager = if loaded.browser.enabled {
+        match &previous_browser_manager {
+            Some(manager) if loaded.browser == previous_config.browser => {
+                if codec_changed && let Err(error) = manager.set_codec(codec).await {
+                    tracing::warn!(%error, "failed to update browser stream codec after config.toml reload");
+                }
+                Some(manager.clone())
+            }
+            _ => match crate::container::browser::BrowserManager::new(
+                loaded.browser.clone(),
+                state.may_dir.clone(),
+                crate::container::browser::BrowserLifecyclePublisher::new(
+                    state.browser_lifecycle_tx.clone(),
+                ),
+                codec,
+            ) {
+                Ok(manager) => {
+                    browser_updated = true;
+                    Some(Arc::new(manager))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to initialize browser manager after config.toml reload");
+                    previous_browser_manager.clone()
+                }
+            },
+        }
+    } else {
+        browser_updated = previous_browser_manager.is_some();
+        None
+    };
+
+    if codec_changed
+        && state.computer.is_running()
+        && let Err(error) = state
+            .computer
+            .request(AgentRequest::SetStreamCodec { codec })
+            .await
+    {
+        tracing::warn!(%error, "failed to update computer stream codec after config.toml reload");
+    }
+
+    state.replace_config(loaded.clone());
+    state.live_limits.apply(&loaded);
+    state.job_server.resize(loaded.sandbox.job_pool_size());
+    if let Some(previous_browser_manager) = previous_browser_manager
+        && !next_browser_manager
+            .as_ref()
+            .is_some_and(|next| Arc::ptr_eq(next, &previous_browser_manager))
+        && let Err(error) = previous_browser_manager.stop().await
+    {
+        tracing::warn!(%error, "failed to stop previous browser manager after config.toml reload");
+    }
+    state.set_browser_manager(next_browser_manager);
+    if let Err(error) = state
+        .task_runtime
+        .set_network_policy(&loaded.preferences.network_policy)
+    {
+        tracing::warn!(%error, "failed to apply reloaded network policy");
+    }
+    if let Err(error) = super::remote_access::sync_remote_access_from_state(state).await {
+        tracing::warn!(%error, "failed to sync remote access after config.toml reload");
+    }
+    let mut topics = UiEventTopics::CONFIG;
+    if browser_updated {
+        topics |= UiEventTopics::BROWSER_STATUS;
+    }
+    state.notify_ui_events(topics);
+}
+
+/// One turn of the config-file watch loop.
+enum WatchStep {
+    Shutdown,
+    Event(Option<notify::Result<NotifyEvent>>),
+    QuietElapsed,
+}
+
+/// Watches `<may_dir>/config.toml` for external edits (including atomic editor
+/// renames and file creation/removal) and reloads configuration live without
+/// restarting the daemon.
+pub(super) fn spawn_config_file_watcher(state: &Arc<DaemonState>) {
+    if let Err(error) = crate::session::ensure_private_dir_sync(&state.may_dir) {
+        tracing::warn!(
+            path = %state.may_dir.display(),
+            %error,
+            "config watcher could not ensure may_dir"
+        );
+        return;
+    }
+    let (watch_tx, watch_rx) = async_channel::unbounded::<notify::Result<NotifyEvent>>();
+    let mut watcher = match RecommendedWatcher::new(
+        move |event| {
+            let _ = watch_tx.send_blocking(event);
+        },
+        NotifyConfig::default().with_poll_interval(Duration::from_millis(200)),
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::warn!(%error, "config.toml watcher unavailable");
+            return;
+        }
+    };
+    if let Err(error) = watcher.watch(&state.may_dir, RecursiveMode::NonRecursive) {
+        tracing::warn!(
+            path = %state.may_dir.display(),
+            %error,
+            "config.toml watcher failed to watch may_dir"
+        );
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    let shutdown = state.daemon_shutdown.clone();
+    state.tokio_handle.spawn(async move {
+        let _watcher = watcher;
+        let mut dirty = false;
+        loop {
+            let step = if dirty {
+                futures_lite::future::or(
+                    async {
+                        shutdown.notified().await;
+                        WatchStep::Shutdown
+                    },
+                    futures_lite::future::or(
+                        async { WatchStep::Event(watch_rx.recv().await.ok()) },
+                        async {
+                            async_io::Timer::after(CONFIG_WATCH_DEBOUNCE).await;
+                            WatchStep::QuietElapsed
+                        },
+                    ),
+                )
+                .await
+            } else {
+                futures_lite::future::or(
+                    async {
+                        shutdown.notified().await;
+                        WatchStep::Shutdown
+                    },
+                    async { WatchStep::Event(watch_rx.recv().await.ok()) },
+                )
+                .await
+            };
+
+            match step {
+                WatchStep::Shutdown | WatchStep::Event(None) => break,
+                WatchStep::Event(Some(Ok(event))) => {
+                    let touches_config = event
+                        .paths
+                        .iter()
+                        .any(|path| path.file_name().is_some_and(|name| name == "config.toml"));
+                    if touches_config {
+                        dirty = true;
+                    }
+                }
+                WatchStep::Event(Some(Err(error))) => {
+                    tracing::warn!(%error, "config.toml watcher error");
+                }
+                WatchStep::QuietElapsed => {
+                    dirty = false;
+                    let Some(state) = weak_state.upgrade() else {
+                        break;
+                    };
+                    crate::panic_boundary::round("config.toml watcher", async {
+                        reload_config_from_disk(&state).await;
+                    })
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_ui_full_config, provider_map_from_ui};
@@ -1072,6 +1285,107 @@ mod tests {
         assert!(
             serde_json::from_value::<super::UiFullConfig>(ui).is_err(),
             "an unknown priority must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_full_config_returns_400_without_mutating_live_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let initial = MayConfig {
+            max_iterations: 42,
+            ..MayConfig::default()
+        };
+        initial
+            .save_to(&dir.path().join("config.toml"))
+            .await
+            .expect("save initial");
+        let state = std::sync::Arc::new(
+            super::DaemonState::for_test(dir.path(), initial.clone())
+                .await
+                .expect("daemon state"),
+        );
+
+        let mut bad_selector = build_ui_full_config(&initial);
+        bad_selector.models.advanced = vec!["invalid-without-separator".to_string()];
+        bad_selector.max_iterations = 999;
+        let err = super::run_save_full_config(state.clone(), bad_selector)
+            .await
+            .expect_err("invalid model selector must return 400");
+        assert_eq!(err.status(), skyzen::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state.config_snapshot().max_iterations,
+            42,
+            "failed save must not mutate live DaemonState::config"
+        );
+
+        let mut bad_compaction = build_ui_full_config(&initial);
+        bad_compaction.models.compaction_model = Some("bad_selector".to_string());
+        bad_compaction.max_iterations = 777;
+        let err = super::run_save_full_config(state.clone(), bad_compaction)
+            .await
+            .expect_err("invalid compaction selector must return 400");
+        assert_eq!(err.status(), skyzen::StatusCode::BAD_REQUEST);
+        assert_eq!(state.config_snapshot().max_iterations, 42);
+    }
+
+    #[tokio::test]
+    async fn external_config_toml_edits_reload_live_and_emit_config_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let initial = MayConfig {
+            max_iterations: 15,
+            ..MayConfig::default()
+        };
+        initial
+            .save_to(&config_path)
+            .await
+            .expect("initial config.toml");
+
+        let state = std::sync::Arc::new(
+            super::DaemonState::for_test(dir.path(), initial)
+                .await
+                .expect("daemon state"),
+        );
+        let mut rx = state.ui_event_bus.subscribe();
+        super::spawn_config_file_watcher(&state);
+
+        // External atomic editor save (write temp file + rename over config.toml).
+        let mut edited = MayConfig {
+            max_iterations: 88,
+            ..MayConfig::default()
+        };
+        edited.preferences.show_decode_speed = true;
+        let tmp_path = dir.path().join(".config.toml.swp");
+        async_fs::write(&tmp_path, toml::to_string_pretty(&edited).expect("toml"))
+            .await
+            .expect("write temp");
+        async_fs::rename(&tmp_path, &config_path)
+            .await
+            .expect("atomic rename");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(topics) = rx.recv().await
+                    && topics.contains(crate::ui_event_bus::UiEventTopics::CONFIG)
+                    && state.config_snapshot().max_iterations == 88
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("watcher should reload config.toml and emit CONFIG without restart");
+        assert!(state.config_snapshot().preferences.show_decode_speed);
+
+        // Malformed TOML must not crash the daemon or clobber the valid config.
+        async_fs::write(&config_path, "max_iterations = [unterminated")
+            .await
+            .expect("write broken toml");
+        super::reload_config_from_disk(&state).await;
+        assert_eq!(
+            state.config_snapshot().max_iterations,
+            88,
+            "invalid external config.toml edit must keep the previous valid snapshot"
         );
     }
 }

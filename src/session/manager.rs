@@ -468,6 +468,7 @@ pub async fn summarize_db_sessions(
 /// # Errors
 /// Returns [`SessionError`] when the directories or bundle cannot be set up.
 pub async fn initialize_session_dirs(may_dir: &Path) -> Result<SessionStore, SessionError> {
+    super::ensure_private_dir_async(may_dir).await?;
     let home_paths = MayHomePaths::new(may_dir.to_path_buf());
     async_fs::create_dir_all(home_paths.sessions_dir()).await?;
 
@@ -849,7 +850,7 @@ impl SessionManager {
     pub async fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
         let daemon = self.daemon()?;
         let api = match daemon
-            .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
+            .get::<crate::client::WireSession>(&crate::client::session_path(id.as_str(), ""))
             .await
         {
             Ok(api) => api,
@@ -926,7 +927,7 @@ impl SessionManager {
     pub async fn session_profile(&self, id: &SessionId) -> Result<Option<String>, SessionError> {
         let api = self
             .daemon()?
-            .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
+            .get::<crate::client::WireSession>(&crate::client::session_path(id.as_str(), ""))
             .await?;
         Ok(api.profile_id)
     }

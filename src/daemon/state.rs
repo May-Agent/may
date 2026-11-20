@@ -435,7 +435,8 @@ pub struct DaemonState {
     pub(crate) live_limits: crate::agent::LiveLimits,
     pub(crate) ui_event_bus: UiEventBus,
     pub(crate) container_prepare: ContainerPrepareTracker,
-    pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
+    pub(crate) container_manager: ArcSwapOption<crate::container::lifecycle::ContainerManager>,
+    pub(crate) pending_transcripts: super::disk_exhaustion::PendingTranscriptStore,
     pub(crate) browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
     pub(crate) browser_owner_session_id: ArcSwapOption<String>,
     /// Sequential lifecycle facts emitted by the browser actor, fanned out
@@ -578,12 +579,20 @@ impl DaemonState {
         .await
     }
 
-    pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
+    pub(crate) fn replace_config(&self, config: MayConfig) {
+        self.config.store(Arc::new(config));
+    }
+
+    pub(crate) async fn save_and_update_config(
+        &self,
+        update: impl FnOnce(&mut MayConfig),
+    ) -> Result<MayConfig, crate::config::ConfigError> {
         let mut config = (*self.config.load_full()).clone();
-        let _ = update(&mut config);
+        update(&mut config);
+        self.save_config(&config).await?;
         self.config.store(Arc::new(config.clone()));
         self.forge_auth.update(&config);
-        config
+        Ok(config)
     }
 
     /// Writes `config` to this daemon's `config.toml`, in its own May
@@ -1366,8 +1375,20 @@ impl DaemonState {
         allow_managed_podman_download: bool,
     ) -> Result<Arc<crate::container::lifecycle::ContainerManager>, crate::container::ContainerError>
     {
-        if let Some(manager) = self.container_manager.as_ref() {
-            return Ok(manager.clone());
+        if let Some(manager) = self.container_manager.load_full() {
+            let healthy = futures_lite::future::or(
+                async { manager.runtime().client.ping().await.is_ok() },
+                async {
+                    async_io::Timer::after(Duration::from_secs(2)).await;
+                    false
+                },
+            )
+            .await;
+            if healthy {
+                return Ok(manager);
+            }
+            tracing::warn!("cached container runtime no longer responds; re-detecting runtime");
+            self.container_manager.store(None);
         }
 
         let runtime = crate::container::ContainerRuntime::detect_with_preference_and_options(
@@ -1377,12 +1398,12 @@ impl DaemonState {
             },
         )
         .await?;
-        Ok(Arc::new(
-            crate::container::lifecycle::ContainerManager::new(
-                Arc::new(runtime),
-                self.may_dir.clone(),
-            ),
-        ))
+        let manager = Arc::new(crate::container::lifecycle::ContainerManager::new(
+            Arc::new(runtime),
+            self.may_dir.clone(),
+        ));
+        self.container_manager.store(Some(manager.clone()));
+        Ok(manager)
     }
 
     pub(crate) async fn try_begin_container_prepare(&self, profile_id: &str) -> bool {
@@ -1427,6 +1448,15 @@ impl DaemonState {
             aither_connectivity::Connectivity::manual(true).0,
         )
         .await
+    }
+
+    /// Mutates the live config in memory only; tests that need the edit on
+    /// disk use [`Self::save_and_update_config`].
+    pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
+        let mut config = (*self.config.load_full()).clone();
+        let _ = update(&mut config);
+        self.config.store(Arc::new(config.clone()));
+        config
     }
 
     /// [`Self::for_test`] on a given connectivity source.
@@ -1515,7 +1545,8 @@ impl DaemonState {
             live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
-            container_manager: None,
+            container_manager: arc_swap::ArcSwapOption::empty(),
+            pending_transcripts: super::disk_exhaustion::PendingTranscriptStore::default(),
             browser_manager: arc_swap::ArcSwapOption::empty(),
             browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
             browser_lifecycle_tx,

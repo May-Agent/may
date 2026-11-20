@@ -219,7 +219,7 @@ fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String
 
 /// Creates the directory a local task runs in; an existing one is kept.
 async fn prepare_working_dir(dir: &Path) -> Result<(), String> {
-    tokio::fs::create_dir_all(dir)
+    async_fs::create_dir_all(dir)
         .await
         .map_err(|error| workspace_prepare_error(dir, &error))
 }
@@ -327,7 +327,7 @@ impl TaskFilePlacement {
 
     async fn write(&self, file_name: String, contents: &[u8]) -> Result<PlacedTaskFile, String> {
         let host_path = self.host_dir.join(&file_name);
-        tokio::fs::write(&host_path, contents)
+        async_fs::write(&host_path, contents)
             .await
             .map_err(|error| {
                 format!("failed to write task file {}: {error}", host_path.display())
@@ -391,7 +391,7 @@ impl TaskExecutionEnvelope {
         let trigger = task
             .persisted_trigger()
             .map_err(|error| prefixed_error("invalid persisted task trigger: ", &error))?
-            .response(task.run_at.clone(), task.cron_expression.clone());
+            .redacted_response(task.run_at.clone(), task.cron_expression.clone());
         Ok(Self {
             task: TaskExecutionTask {
                 id: task.id.clone(),
@@ -400,7 +400,7 @@ impl TaskExecutionEnvelope {
                 session_id: task.session_id.clone(),
                 trigger,
             },
-            invocation,
+            invocation: invocation.redacted_for_script(),
         })
     }
 }
@@ -427,6 +427,11 @@ impl Approver for SchedulerPermissionHandler {
 impl DomainApprover for SchedulerPermissionHandler {
     async fn approve(&self, request: &DomainRequest) -> bool {
         let (domain, port) = (request.host.as_str(), request.port);
+        let allowed = self.allow_network
+            && self
+                .network_policy
+                .as_ref()
+                .is_none_or(|policy| policy.allows_domain(domain));
         let reason = if self.allow_network {
             self.network_policy
                 .as_ref()
@@ -443,7 +448,7 @@ impl DomainApprover for SchedulerPermissionHandler {
                 mode: NetworkAccessMode::Network,
                 domain,
                 port,
-                allowed: self.allow_network,
+                allowed,
                 reason,
             })
             .await;
@@ -451,8 +456,9 @@ impl DomainApprover for SchedulerPermissionHandler {
             ui_event_bus.publish(UiEventTopics::NETWORK_ACCESS_LOGS);
         }
         // A task that does not need the network runs in the sandbox with
-        // every connection refused.
-        self.allow_network
+        // every connection refused; otherwise the configured network policy
+        // filters which domains it may reach.
+        allowed
     }
 }
 
@@ -587,7 +593,7 @@ impl TaskRuntime {
             .await
             .map_err(|error| prefixed_error("failed to delete task: ", &error))?;
         let dir = crate::session::MayHomePaths::new(self.may_dir.clone()).inline_task_dir(id);
-        match tokio::fs::remove_dir_all(&dir).await {
+        match async_fs::remove_dir_all(&dir).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -1180,7 +1186,7 @@ impl TaskRuntime {
             .may_dir
             .join("task-workspaces")
             .join(profile_workspace_key(profile));
-        tokio::fs::create_dir_all(&workspace_dir)
+        async_fs::create_dir_all(&workspace_dir)
             .await
             .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
         Ok(workspace_dir)
@@ -1230,7 +1236,7 @@ impl TaskRuntime {
 
     async fn cleanup_materialized_execution(&self, cleanup_paths: Vec<PathBuf>) {
         for path in cleanup_paths {
-            if let Err(error) = tokio::fs::remove_file(&path).await
+            if let Err(error) = async_fs::remove_file(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
                 tracing::warn!(path = %path.display(), error = %error, "failed to remove materialized task file");
@@ -1253,10 +1259,10 @@ impl TaskRuntime {
                 host_working_dir: inline_dir,
             }),
             (None, Some(path)) => {
-                let canonical = tokio::fs::canonicalize(path)
+                let canonical = async_fs::canonicalize(path)
                     .await
                     .map_err(|error| prefixed_error("failed to resolve script_path: ", &error))?;
-                let content = tokio::fs::read_to_string(&canonical)
+                let content = async_fs::read_to_string(&canonical)
                     .await
                     .map_err(|error| {
                         format!(
@@ -1540,9 +1546,20 @@ impl TaskRuntime {
             .ipc_route(&container_id)
             .await
             .map_err(|error| prefixed_error("failed to resolve container IPC route: ", &error))?;
-        let exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
+        let raw_exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
             container_manager.runtime().client.clone(),
         ))));
+        let exec = AnyContainerExec::new(Arc::new(
+            crate::daemon::disk_exhaustion::ResilientContainerExec::new(
+                raw_exec,
+                container_id.clone(),
+                crate::daemon::disk_exhaustion::TaskContainerReconnect::new(
+                    self.may_dir.clone(),
+                    container_manager.clone(),
+                    launch_spec,
+                ),
+            ),
+        ));
         let runtime =
             ContainerShellRuntime::new(container_id.clone(), container_ipc_route, exec.clone())
                 .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
@@ -1554,7 +1571,7 @@ impl TaskRuntime {
                     ui_event_bus: self.ui_event_bus.clone(),
                     profile_id: profile.id.clone(),
                     source,
-                    allow_network: true,
+                    allow_network: task.is_some_and(|t| t.needs_network),
                     network_policy: self.network_policy.load().as_ref().clone(),
                 },
                 &workspace_dir,
@@ -1816,6 +1833,128 @@ mod tests {
                 allow_network
             );
         }
+
+        let policy = crate::network_policy::NetworkPolicyConfig {
+            mode: crate::network_policy::NetworkPolicyMode::AllowList,
+            hosts: vec!["allowed.example.com".to_string()],
+        }
+        .compile()
+        .expect("policy compiles");
+        let filtered = SchedulerPermissionHandler {
+            db: db.clone(),
+            ui_event_bus: None,
+            profile_id: "profile".to_string(),
+            source: NetworkAccessSource::TaskContainer,
+            allow_network: true,
+            network_policy: policy,
+        };
+        assert!(
+            aither_sandbox::DomainApprover::approve(
+                &filtered,
+                &aither_sandbox::DomainRequest {
+                    host: "allowed.example.com".to_string(),
+                    port: 443,
+                    agent: None,
+                }
+            )
+            .await
+        );
+        assert!(
+            !aither_sandbox::DomainApprover::approve(
+                &filtered,
+                &aither_sandbox::DomainRequest {
+                    host: "blocked.example.com".to_string(),
+                    port: 443,
+                    agent: None,
+                }
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_execution_envelope_redacts_token_path_and_authorization_headers() {
+        let dir = tempdir().expect("tempdir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let profile_id = db.ensure_default_profiles().await.expect("profiles");
+        let secret_token = "whsec_live_token_abc123";
+        let trigger = PersistedTaskTrigger::Webhook {
+            token: secret_token.to_string(),
+            signature: None,
+        };
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "wh-redact",
+            profile_id: &profile_id,
+            session_id: None,
+            name: "Webhook redact",
+            trigger: &trigger,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo ok"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task created");
+        let task = db
+            .get_scheduled_task("wh-redact")
+            .await
+            .expect("query")
+            .expect("task");
+
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            vec!["Bearer super-secret-bearer".to_string()],
+        );
+        headers.insert("x-github-event".to_string(), vec!["push".to_string()]);
+        let envelope = super::TaskExecutionEnvelope::new(
+            &task,
+            crate::task_trigger::TaskInvocation::Webhook {
+                request: crate::task_trigger::TaskWebhookRequest {
+                    method: "POST".to_string(),
+                    path: format!("/api/tasks/webhook/{secret_token}"),
+                    query: None,
+                    headers,
+                    body_base64: String::new(),
+                    body_text: Some("payload".to_string()),
+                    body_json: None,
+                    remote_addr: None,
+                    body_size_bytes: 7,
+                },
+            },
+        )
+        .expect("envelope builds");
+        let serialized = serde_json::to_string(&envelope).expect("serializes");
+        assert!(
+            !serialized.contains(secret_token),
+            "webhook token must not leak into $MAY_TASK_TRIGGER_FILE: {serialized}"
+        );
+        assert!(
+            !serialized.contains("super-secret-bearer"),
+            "authorization header must be redacted: {serialized}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&serialized).expect("valid json");
+        assert_eq!(json["task"]["trigger"]["token"], "{token}");
+        assert_eq!(
+            json["task"]["trigger"]["webhookPath"],
+            "/api/tasks/webhook/{token}"
+        );
+        assert_eq!(
+            json["invocation"]["request"]["path"],
+            "/api/tasks/webhook/{token}"
+        );
+        assert_eq!(
+            json["invocation"]["request"]["headers"]["authorization"],
+            serde_json::json!(["[REDACTED]"])
+        );
+        assert_eq!(
+            json["invocation"]["request"]["headers"]["x-github-event"],
+            serde_json::json!(["push"])
+        );
     }
 
     #[tokio::test]
