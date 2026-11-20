@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_agent::ContextWindowPhase;
-use aither_sandbox::SandboxMode;
+use aither_sandbox::{Interpreter, SandboxMode};
 use askama::Template as _;
 
 use crate::agent::cache_miss::CacheMissCause;
@@ -158,6 +158,8 @@ pub enum ToolDisplay {
         /// Name of the SSH server the command runs on; `None` for the home
         /// environment.
         location: Option<String>,
+        /// Interpreter the script runs under; decides its highlighting.
+        interpreter: Interpreter,
         /// How May reads the script; `None` while the script streams in
         /// and for `!` bash calls.
         reading: Option<CommandReading>,
@@ -3999,6 +4001,14 @@ fn format_status_usage(
 /// Marker prefix shown before a terminal command for its execution
 /// backend. A host-run (`unsafe`) command is marked by the red status
 /// icon instead — see [`status_icon`].
+/// The syntect syntax token a script of `interpreter` highlights with.
+pub(crate) const fn interpreter_syntax(interpreter: Interpreter) -> &'static str {
+    match interpreter {
+        Interpreter::Shell => "bash",
+        Interpreter::Python => "python",
+    }
+}
+
 const fn terminal_mode_marker(mode: SandboxMode) -> &'static str {
     match mode {
         SandboxMode::Sandboxed | SandboxMode::Unsandboxed => "",
@@ -4068,6 +4078,7 @@ fn tool_header_line<'a>(
             command,
             mode,
             location,
+            interpreter,
             diffs,
             ..
         } => {
@@ -4092,7 +4103,10 @@ fn tool_header_line<'a>(
                 spans.push(Span::styled("$ ", dim.patch(selection_style)));
                 spans.extend(
                     highlighting
-                        .shell_spans(command.lines().next().unwrap_or_default())
+                        .spans(
+                            interpreter_syntax(*interpreter),
+                            command.lines().next().unwrap_or_default(),
+                        )
                         .into_iter()
                         .flatten()
                         .map(|span| Span::styled(span.content, span.style.patch(selection_style))),
@@ -4283,6 +4297,7 @@ fn render_tool_inline_at<'a>(
             command,
             mode,
             location,
+            interpreter,
             status,
             output,
             reading,
@@ -4299,7 +4314,7 @@ fn render_tool_inline_at<'a>(
             let mut command_rows = if recognised.is_some() {
                 Vec::new()
             } else {
-                highlighting.shell_spans(command)
+                highlighting.spans(interpreter_syntax(*interpreter), command)
             }
             .into_iter();
             if let Some(reading) = recognised {
@@ -5030,7 +5045,7 @@ mod tests {
         assert_eq!(format_cost_usd(0.000_004_2), "$0.0000042");
     }
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
-    use aither_sandbox::SandboxMode;
+    use aither_sandbox::{Interpreter, SandboxMode};
     use ratatui::style::Color;
     use ratatui::text::Line;
     use std::path::PathBuf;
@@ -5188,6 +5203,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5237,6 +5253,7 @@ mod tests {
                 command: command.to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5286,6 +5303,7 @@ mod tests {
                 command: command.to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5340,6 +5358,7 @@ mod tests {
                 command: "ech".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5371,6 +5390,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5418,6 +5438,7 @@ mod tests {
                 command: "uname".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: location.map(str::to_string),
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -5449,6 +5470,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -5476,6 +5498,7 @@ mod tests {
             command: command.to_string(),
             mode: SandboxMode::Sandboxed,
             location: None,
+            interpreter: Interpreter::Shell,
             reading: None,
             card: None,
             status: ToolStatus::Done,
@@ -5504,6 +5527,7 @@ mod tests {
                 command: "terminal {…}".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -6045,6 +6069,7 @@ mod tests {
             command: script.to_string(),
             mode: SandboxMode::Sandboxed,
             location: None,
+            interpreter: Interpreter::Shell,
             reading: Some(crate::command_reading::CommandReading::of(script)),
             card: None,
             status: ToolStatus::Running,
@@ -7158,6 +7183,7 @@ mod tests {
                 command: format!("echo {label}"),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -7265,6 +7291,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -7313,6 +7340,7 @@ mod tests {
                 command: "echo inner".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,

@@ -4185,6 +4185,7 @@ impl App {
                 command: format!("! {masked}"),
                 mode: aither_sandbox::SandboxMode::Unsandboxed,
                 location: None,
+                interpreter: aither_sandbox::Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: super::ui::chat::ToolStatus::Running,
@@ -4681,11 +4682,13 @@ impl App {
                 script,
                 mode,
                 location,
+                interpreter,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
                 location,
+                interpreter,
                 // The daemon's reading arrives right after the start.
                 reading: None,
                 card: None,

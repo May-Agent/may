@@ -668,6 +668,11 @@ pub struct PersistedPermissionRequestPayload {
     /// request that covers no script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reading: Option<crate::command_reading::CommandReading>,
+    /// The interpreter the script runs under, so the prompt highlights it in
+    /// its language; absent for a request that covers no script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub interpreter: Option<aither_sandbox::Interpreter>,
 }
 
 impl PersistedPermissionRequestPayload {
@@ -687,6 +692,7 @@ impl PersistedPermissionRequestPayload {
             session_id,
             agent_id,
             reading,
+            interpreter: None,
         }
     }
 }

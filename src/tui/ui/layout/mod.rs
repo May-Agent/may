@@ -462,11 +462,25 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
             render_connect_picker(frame, sheet, state, app.spinner_frame, app.band_bg);
         }
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
-        AppMode::JobDetail(state) => render_job_detail(frame, sheet, state, app.band_bg),
+        AppMode::JobDetail(state) => {
+            render_job_detail(
+                frame,
+                sheet,
+                state,
+                &app.chat.assets().highlighting,
+                app.band_bg,
+            );
+        }
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state, app.band_bg),
         AppMode::Progress(state) => render_progress_popup(frame, sheet, state, app.band_bg),
         AppMode::PermissionConfirm(state) => {
-            render_permission_confirm(frame, sheet, state, app.band_bg);
+            render_permission_confirm(
+                frame,
+                sheet,
+                state,
+                &app.chat.assets().highlighting,
+                app.band_bg,
+            );
         }
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason, app.band_bg);
@@ -1143,7 +1157,10 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                         .take(48)
                         .collect();
                     (
-                        format!("{prefix}◉ subagent {}", run.agent),
+                        vec![Span::styled(
+                            format!("{prefix}◉ subagent {}", run.agent),
+                            title_style,
+                        )],
                         format!(
                             "    {} · {} tok (in {}, out {}) · {}",
                             chat::format_elapsed(run.elapsed_secs()),
@@ -1173,14 +1190,24 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                     };
                     let first_line = job.script.lines().next().unwrap_or("");
                     let cmd: String = first_line.chars().take(60).collect();
-                    (
-                        format!("{prefix}{icon} pid {} · {cmd}", job.pid),
-                        job_row_detail(job, &status),
-                    )
+                    let mut title = vec![Span::styled(
+                        format!("{prefix}{icon} pid {} · ", job.pid),
+                        title_style,
+                    )];
+                    title.extend(
+                        app.chat
+                            .assets()
+                            .highlighting
+                            .spans(chat::interpreter_syntax(job.interpreter), &cmd)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default(),
+                    );
+                    (title, job_row_detail(job, &status))
                 }
             };
             ListItem::new(vec![
-                Line::from(Span::styled(title, title_style)),
+                Line::from(title),
                 Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
             ])
         })
@@ -1196,11 +1223,17 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Job/subagent detail: bottom drawer with live stats or buffered output.
-fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: Option<Color>) {
-    let (title, body): (String, Vec<Line<'_>>) = match state.target {
+fn render_job_detail(
+    frame: &mut Frame,
+    area: Rect,
+    state: &JobDetailState,
+    highlighting: &super::highlight::Highlighting,
+    bg: Option<Color>,
+) {
+    let (title, body): (Vec<Span<'_>>, Vec<Line<'_>>) = match state.target {
         JobDetailTarget::Job(pid) => {
             let title = state.job.as_ref().map_or_else(
-                || format!("job {pid} — gone"),
+                || vec![Span::raw(format!("job {pid} — gone"))],
                 |job| {
                     let status = match &job.status {
                         aither_sandbox::JobStatus::Running => format!(
@@ -1215,17 +1248,24 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
                         }
                         aither_sandbox::JobStatus::Killed { .. } => "killed".to_string(),
                     };
-                    format!(
-                        "job {} · {} — {status}",
-                        job.pid,
-                        job.script
-                            .lines()
+                    let cmd: String = job
+                        .script
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect();
+                    let mut spans = vec![Span::raw(format!("job {} · ", job.pid))];
+                    spans.extend(
+                        highlighting
+                            .spans(chat::interpreter_syntax(job.interpreter), &cmd)
+                            .into_iter()
                             .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(48)
-                            .collect::<String>(),
-                    )
+                            .unwrap_or_default(),
+                    );
+                    spans.push(Span::raw(format!(" — {status}")));
+                    spans
                 },
             );
             let mut lines: Vec<Line<'_>> = Vec::new();
@@ -1247,7 +1287,7 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
         JobDetailTarget::Subagent(_) => state.subagent.as_ref().map_or_else(
             || {
                 (
-                    "subagent — gone".to_string(),
+                    vec![Span::raw("subagent — gone")],
                     vec![Line::from(Span::styled(
                         "(finished)",
                         Style::default().fg(Color::DarkGray),
@@ -1276,7 +1316,7 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
                     Style::default().fg(Color::DarkGray),
                 ))];
                 lines.extend(run.prompt.lines().map(|line| Line::from(line.to_string())));
-                (title, lines)
+                (vec![Span::raw(title)], lines)
             },
         ),
     };
@@ -1286,13 +1326,9 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
     let scroll = state.scroll.min(body.len().saturating_sub(inner_height));
     let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
 
-    let block = panel(
-        Some(Span::raw(format!(
-            "{title} (Esc back · ↑↓ scroll · x stop · r refresh)"
-        ))),
-        Color::Cyan,
-        bg,
-    );
+    let mut title_spans = title;
+    title_spans.push(Span::raw(" (Esc back · ↑↓ scroll · x stop · r refresh)"));
+    let block = panel(Some(Line::from(title_spans)), Color::Cyan, bg);
     frame.render_widget(
         Paragraph::new(body).block(block).scroll((scroll, 0)),
         panel_area,
@@ -2309,6 +2345,7 @@ fn render_permission_confirm(
     frame: &mut Frame,
     area: Rect,
     state: &crate::tui::state::PermissionConfirmState,
+    highlighting: &super::highlight::Highlighting,
     bg: Option<Color>,
 ) {
     let mut content = vec![
@@ -2335,10 +2372,17 @@ fn render_permission_confirm(
             "Script:",
             Style::default().fg(Color::White),
         )));
-        content.push(Line::from(Span::styled(
-            format!("  {}", state.request.script.as_str()),
-            Style::default().fg(Color::Yellow),
-        )));
+        let language = chat::interpreter_syntax(
+            state
+                .request
+                .interpreter
+                .unwrap_or(aither_sandbox::Interpreter::Shell),
+        );
+        for spans in highlighting.spans(language, state.request.script.as_str()) {
+            let mut line_spans = vec![Span::raw("  ")];
+            line_spans.extend(spans);
+            content.push(Line::from(line_spans));
+        }
     }
     content.push(Line::from(""));
     let mut keys = vec![
@@ -3624,7 +3668,15 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
         terminal
-            .draw(|frame| super::render_permission_confirm(frame, frame.area(), state, None))
+            .draw(|frame| {
+                super::render_permission_confirm(
+                    frame,
+                    frame.area(),
+                    state,
+                    &super::super::highlight::Highlighting::default(),
+                    None,
+                );
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -3677,6 +3729,7 @@ mod tests {
             command: "cargo test --workspace".to_string(),
             mode: aither_sandbox::SandboxMode::Sandboxed,
             location: None,
+            interpreter: aither_sandbox::Interpreter::Shell,
             reading: None,
             card: None,
             status: ToolStatus::Done,

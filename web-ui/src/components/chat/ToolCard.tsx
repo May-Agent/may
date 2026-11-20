@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
 import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash';
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python';
 import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import { cn } from '@/lib/utils';
 import type { TurnToolState } from '@/lib/stream/reducer';
@@ -33,6 +34,7 @@ import { searchFetchLabel } from '@/lib/hostedLabel';
 import { SearchRow } from './SearchRow';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
+SyntaxHighlighter.registerLanguage('python', python);
 
 interface ToolCardProps {
   tool: TurnToolState;
@@ -153,13 +155,18 @@ const shellHighlighterStyle: React.CSSProperties = {
   minWidth: 0,
 };
 
-function ShellBlock({ script }: { script: string }) {
+/** The prism language a terminal script highlights with. */
+export function scriptLanguage(interpreter: string | null | undefined): string {
+  return interpreter === 'python' ? 'python' : 'bash';
+}
+
+function ShellBlock({ script, interpreter }: { script: string; interpreter?: string | null }) {
   return (
     <div className="flex gap-2 text-xs font-mono leading-relaxed">
       <span className="shrink-0 text-muted-foreground select-none">$</span>
       <div className="flex-1 min-w-0 max-h-64 overflow-auto scrollbar-thin">
         <SyntaxHighlighter
-          language="bash"
+          language={scriptLanguage(interpreter)}
           style={oneLight}
           customStyle={shellHighlighterStyle}
           codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
@@ -250,7 +257,12 @@ function TerminalDetails({
   return (
     <div className="space-y-2">
       {readingShown && <CommandReadingView reading={reading} />}
-      {showScript && <ShellBlock script={script} />}
+      {showScript && (
+        <ShellBlock
+          script={script}
+          interpreter={tool.summary?.interpreter ?? projectField(tool.argumentsRaw, 'interpreter')}
+        />
+      )}
       {location !== null && (
         <div className="text-[11px] text-muted-foreground">
           [{t('tools.sshLocation')} {location}]

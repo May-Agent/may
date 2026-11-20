@@ -1433,6 +1433,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                         session_id: request.request.session_id,
                         agent_id: request.request.agent_id,
                         reading: request.request.reading,
+                        interpreter: request.request.interpreter,
                     },
                 }),
             waiting_workspace: summary.waiting_workspace.map(|request| WorkspacePollItem {

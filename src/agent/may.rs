@@ -641,8 +641,14 @@ impl MayAgent {
         .await?;
         let catalog = tools.catalog().clone();
 
+        let call_interpreters = super::hooks::CallInterpreters::default();
+        // Every derived approver clone shares the call→interpreter record.
+        let permission_approver = config
+            .permission_approver
+            .clone()
+            .map(|approver| approver.with_interpreters(call_interpreters.clone()));
         let permissions = TerminalPermissionHandler::for_agent(
-            config.permission_approver.clone(),
+            permission_approver.clone(),
             config.network_policy.clone(),
             config.profile_id.clone(),
         )
@@ -748,7 +754,7 @@ impl MayAgent {
                 hosts.agents(
                     config.session_id.as_str(),
                     super::acp_sandbox::SessionServices::new(
-                        config.permission_approver.clone(),
+                        permission_approver.clone(),
                         config
                             .job_server
                             .broker()
@@ -1002,15 +1008,14 @@ impl MayAgent {
         let publish_gate = config
             .live_config
             .clone()
-            .zip(config.permission_approver.clone())
+            .zip(permission_approver.clone())
             .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator.clone(),
             artifacts_dir: session_paths.artifacts_dir(),
         };
         let agent_messaging = config.agent_messaging.clone();
-        let hook_runtime = config
-            .permission_approver
+        let hook_runtime = permission_approver
             .as_ref()
             .and_then(|approver| approver.runtime_service.clone());
 
@@ -1153,6 +1158,7 @@ impl MayAgent {
             session_id: config.session_id.clone(),
             redactor: SecretRedactor::for_session(&config.may_dir, config.session_id.as_str()),
             refused: refused_reads,
+            interpreters: call_interpreters,
             jobs: shell.jobs(),
             valve: valve.clone(),
             compaction: compaction_requested.clone(),
