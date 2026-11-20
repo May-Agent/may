@@ -33,7 +33,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 - `/questions` opens the questions the agent left open (`ask_user`); repeated use cycles through them. Ctrl+Left does the same. An unanswered question is never treated as permission.
 - `/yolo` toggles, for this session only, granting every approval request without asking; it applies from the next request, and grants are recorded in the history like user approvals. Say it again to turn it off. The web UI has the same switch on the session page.
 - `/memory off` turns memory off for the rest of this session: the session neither reads (`<memory>`, `<profile_memories>`) nor contributes memories (`MemoryProcessor` skips it). Once off it stays off for the session; while the provider cache is warm the system prompt only drops the memory blocks on the next reassembly. The web UI has the same switch on the session page, and `may "<prompt>"` one-shot runs always run with memory off.
-- `/permission` re-asks the launch directory's access decision: the repository trust question inside a git worktree (opened on the level in force), the write-grant question outside one.
+- `/permission` opens the launch directory's access decision as a bottom sheet: the repository trust options inside a git worktree (opened on the level in force — persisted, else the derived default), the write-grant question outside one (opened on the decision in force). Esc cancels; the level chosen is persisted to `workspace.toml`.
 - `/sleep` and `/sleep off`: see `sleep.md`.
 
 ## Connections and secrets

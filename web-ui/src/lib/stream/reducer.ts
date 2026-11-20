@@ -23,6 +23,8 @@ export interface TurnToolState {
   status: 'streaming' | 'done';
   /** Parsed result once tool_end arrives. */
   result?: unknown;
+  /** The call ended in a policy refusal, not a failure. */
+  refused?: boolean;
   /** Last observed seq — used for ordering. */
   seq: number;
 }
@@ -277,6 +279,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           summary: mergeSummary(existing.summary, event.summary),
           status: 'done',
           result: event.result,
+          refused: event.refused,
           seq: event.seq,
         }),
         () => ({
@@ -287,6 +290,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           summary: event.summary ?? {},
           status: 'done',
           result: event.result,
+          refused: event.refused,
           seq: event.seq,
         }),
       );

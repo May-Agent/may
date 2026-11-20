@@ -1,6 +1,14 @@
+import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
+import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash';
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python';
+import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import type { PersistedPermissionRequest } from '../../lib/types';
 import { recognisesAny } from '../../lib/commandReading';
 import { CommandReadingView } from '../chat/CommandReadingView';
+import { scriptLanguage } from '../chat/ToolCard';
+
+SyntaxHighlighter.registerLanguage('bash', bash);
+SyntaxHighlighter.registerLanguage('python', python);
 
 interface PermissionBodyProps {
   request: PersistedPermissionRequest;
@@ -23,8 +31,16 @@ export function PermissionBody({ request, showScript }: PermissionBodyProps) {
     );
   }
   return (
-    <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono whitespace-pre-wrap break-all">
-      {request.script}
-    </pre>
+    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono max-h-64 overflow-auto scrollbar-thin">
+      <SyntaxHighlighter
+        language={scriptLanguage(request.interpreter)}
+        style={oneLight}
+        customStyle={{ background: 'transparent', padding: 0, margin: 0 }}
+        codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
+        PreTag="div"
+      >
+        {request.script}
+      </SyntaxHighlighter>
+    </div>
   );
 }

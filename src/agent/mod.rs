@@ -41,6 +41,8 @@ mod live_limits;
 mod live_settings;
 mod loop_watch;
 mod may;
+/// The `models` command and the listing it reads.
+pub mod models_tool;
 /// The text May's agents read for aither's alerts, notices and refusals.
 pub mod notices;
 #[cfg(test)]

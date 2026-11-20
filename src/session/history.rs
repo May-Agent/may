@@ -72,6 +72,11 @@ pub enum ToolEventRecord {
         /// Tool result, stored in its wire form.
         #[serde(with = "super::tool_result_wire")]
         result: aither_core::llm::ToolResult,
+        /// The call ended in a refusal, not a failure — an unchanged
+        /// re-read the policy rejected; the task it read stays running.
+        /// Absent on rows stored before refusals were marked.
+        #[serde(default)]
+        refused: bool,
     },
     /// Tool call the user stopped before it produced a result.
     #[serde(rename = "stopped")]
@@ -806,6 +811,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "lookup".to_string(),
             result: ToolResult::text("done"),
+            refused: false,
         })
         .expect("serialize tool end");
         history
@@ -843,6 +849,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "terminal".to_string(),
             result: result.clone(),
+            refused: false,
         })
         .expect("serialize command tool end");
         let ToolEventRecord::End { result: loaded, .. } =
@@ -1016,6 +1023,7 @@ pub fn chat_messages_from_transcript(
                         id: call_id.clone(),
                         name: name.clone(),
                         result: result.clone(),
+                        refused: false,
                     }),
                     ("stopped", _) => Some(ToolEventRecord::Stopped {
                         id: call_id.clone(),

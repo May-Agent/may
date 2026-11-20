@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_agent::ContextWindowPhase;
-use aither_sandbox::SandboxMode;
+use aither_sandbox::{Interpreter, SandboxMode};
 use askama::Template as _;
 
 use crate::agent::cache_miss::CacheMissCause;
@@ -42,6 +42,9 @@ pub enum ToolStatus {
     Done,
     /// Tool call failed with an error message.
     Failed(String),
+    /// The call's result is a policy refusal, not a failure — an unchanged
+    /// re-read the sandbox rejected; the task it read stays running.
+    Refused(String),
 }
 
 /// An image produced by a tool call, rendered as an overlay when the
@@ -158,6 +161,8 @@ pub enum ToolDisplay {
         /// Name of the SSH server the command runs on; `None` for the home
         /// environment.
         location: Option<String>,
+        /// Interpreter the script runs under; decides its highlighting.
+        interpreter: Interpreter,
         /// How May reads the script; `None` while the script streams in
         /// and for `!` bash calls.
         reading: Option<CommandReading>,
@@ -1295,6 +1300,33 @@ impl ChatStream {
         }
     }
 
+    /// Mark the call `id` as refused — its result is a policy refusal, not
+    /// a failure, so it shows as a notice. The refusal rides the end event
+    /// of a live call and the persisted record of a replayed one.
+    pub fn set_tool_refused(&mut self, id: &str) {
+        let Some(index) = self.tool_index(id) else {
+            return;
+        };
+        let touched = if let ChatElement::ToolCall { display, .. } = &mut self.elements[index] {
+            let status = match display {
+                ToolDisplay::Terminal { status, .. }
+                | ToolDisplay::Action { status, .. }
+                | ToolDisplay::Builtin { status, .. } => status,
+            };
+            if let ToolStatus::Failed(message) = status {
+                *status = ToolStatus::Refused(std::mem::take(message));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if touched {
+            self.touch(index);
+        }
+    }
+
     /// Attach the card of a terminal call that ran one of May's commands, or
     /// take it away so the call shows as the ordinary command row.
     pub fn set_tool_card(&mut self, id: &str, card: Option<Card>) {
@@ -2374,6 +2406,7 @@ fn body_status_text(status: &ToolStatus) -> Option<String> {
         ToolStatus::Running => Some("running".to_string()),
         ToolStatus::Done => None,
         ToolStatus::Failed(e) => Some(format!("failed: {e}")),
+        ToolStatus::Refused(e) => Some(format!("refused: {e}")),
     }
 }
 
@@ -2387,6 +2420,7 @@ fn collapsed_status_suffix(display: &ToolDisplay, open: bool) -> String {
         ToolStatus::Running => " — running".to_string(),
         ToolStatus::Done => String::new(),
         ToolStatus::Failed(e) => format!(" — failed: {e}"),
+        ToolStatus::Refused(e) => format!(" — refused: {e}"),
     }
 }
 
@@ -3999,6 +4033,14 @@ fn format_status_usage(
 /// Marker prefix shown before a terminal command for its execution
 /// backend. A host-run (`unsafe`) command is marked by the red status
 /// icon instead — see [`status_icon`].
+/// The syntect syntax token a script of `interpreter` highlights with.
+pub(crate) const fn interpreter_syntax(interpreter: Interpreter) -> &'static str {
+    match interpreter {
+        Interpreter::Shell => "bash",
+        Interpreter::Python => "python",
+    }
+}
+
 const fn terminal_mode_marker(mode: SandboxMode) -> &'static str {
     match mode {
         SandboxMode::Sandboxed | SandboxMode::Unsandboxed => "",
@@ -4023,12 +4065,14 @@ fn status_icon(status: &ToolStatus, spinner_frame: usize, unsafe_exec: bool) -> 
             ToolStatus::Running => Color::DarkGray,
             ToolStatus::Done => Color::Green,
             ToolStatus::Failed(_) => Color::Red,
+            ToolStatus::Refused(_) => Color::Yellow,
         }
     };
     let icon = match status {
         ToolStatus::Running => SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()],
         ToolStatus::Done => '✓',
         ToolStatus::Failed(_) => '✗',
+        ToolStatus::Refused(_) => '!',
     };
     (icon, Style::default().fg(state_color))
 }
@@ -4068,6 +4112,7 @@ fn tool_header_line<'a>(
             command,
             mode,
             location,
+            interpreter,
             diffs,
             ..
         } => {
@@ -4092,7 +4137,10 @@ fn tool_header_line<'a>(
                 spans.push(Span::styled("$ ", dim.patch(selection_style)));
                 spans.extend(
                     highlighting
-                        .shell_spans(command.lines().next().unwrap_or_default())
+                        .spans(
+                            interpreter_syntax(*interpreter),
+                            command.lines().next().unwrap_or_default(),
+                        )
                         .into_iter()
                         .flatten()
                         .map(|span| Span::styled(span.content, span.style.patch(selection_style))),
@@ -4149,10 +4197,10 @@ fn tool_header_line<'a>(
     }
     let suffix = collapsed_status_suffix(display, open);
     if !suffix.is_empty() {
-        let style = if matches!(display.status(), ToolStatus::Failed(_)) {
-            Style::default().fg(Color::Red)
-        } else {
-            dim
+        let style = match display.status() {
+            ToolStatus::Failed(_) => Style::default().fg(Color::Red),
+            ToolStatus::Refused(_) => Style::default().fg(Color::Yellow),
+            _ => dim,
         };
         spans.push(Span::styled(suffix, style));
     }
@@ -4283,6 +4331,7 @@ fn render_tool_inline_at<'a>(
             command,
             mode,
             location,
+            interpreter,
             status,
             output,
             reading,
@@ -4299,7 +4348,7 @@ fn render_tool_inline_at<'a>(
             let mut command_rows = if recognised.is_some() {
                 Vec::new()
             } else {
-                highlighting.shell_spans(command)
+                highlighting.spans(interpreter_syntax(*interpreter), command)
             }
             .into_iter();
             if let Some(reading) = recognised {
@@ -4779,6 +4828,10 @@ pub fn render_tool_fullscreen(
             format!("Status: Failed - {e}"),
             Style::default().fg(Color::Red),
         ),
+        ToolStatus::Refused(e) => Span::styled(
+            format!("Status: Refused - {e}"),
+            Style::default().fg(Color::Yellow),
+        ),
     };
     lines.push(Line::from(status_line));
     lines.push(Line::from(""));
@@ -5030,7 +5083,7 @@ mod tests {
         assert_eq!(format_cost_usd(0.000_004_2), "$0.0000042");
     }
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
-    use aither_sandbox::SandboxMode;
+    use aither_sandbox::{Interpreter, SandboxMode};
     use ratatui::style::Color;
     use ratatui::text::Line;
     use std::path::PathBuf;
@@ -5188,6 +5241,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5237,6 +5291,7 @@ mod tests {
                 command: command.to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5286,6 +5341,7 @@ mod tests {
                 command: command.to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5340,6 +5396,7 @@ mod tests {
                 command: "ech".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5371,6 +5428,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Running,
@@ -5418,6 +5476,7 @@ mod tests {
                 command: "uname".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: location.map(str::to_string),
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -5449,6 +5508,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -5476,6 +5536,7 @@ mod tests {
             command: command.to_string(),
             mode: SandboxMode::Sandboxed,
             location: None,
+            interpreter: Interpreter::Shell,
             reading: None,
             card: None,
             status: ToolStatus::Done,
@@ -5504,6 +5565,7 @@ mod tests {
                 command: "terminal {…}".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -6045,6 +6107,7 @@ mod tests {
             command: script.to_string(),
             mode: SandboxMode::Sandboxed,
             location: None,
+            interpreter: Interpreter::Shell,
             reading: Some(crate::command_reading::CommandReading::of(script)),
             card: None,
             status: ToolStatus::Running,
@@ -6267,6 +6330,25 @@ mod tests {
     fn a_finished_read_folds_to_its_headline() {
         let rows = call_rows(&finished(read_call("cat src/lib.rs")));
         assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[test]
+    fn a_refused_call_flips_from_failed_to_a_refused_notice() {
+        let mut stream = ChatStream::new();
+        let mut display = read_call("cat a.rs");
+        if let ToolDisplay::Terminal { status, .. } = &mut display {
+            *status = ToolStatus::Failed("re-read refused".to_string());
+        }
+        stream.push_tool("c1".to_string(), display);
+        stream.set_tool_refused("c1");
+        let Some(ChatElement::ToolCall { display, .. }) = stream.elements.first() else {
+            panic!("terminal call expected");
+        };
+        assert!(matches!(display.status(), ToolStatus::Refused(_)));
+        // A refused call keeps its message but leaves the failure icon.
+        let (icon, style) = super::status_icon(display.status(), 0, false);
+        assert_eq!(icon, '!');
+        assert_eq!(style.fg, Some(Color::Yellow));
     }
 
     #[test]
@@ -7158,6 +7240,7 @@ mod tests {
                 command: format!("echo {label}"),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -7265,6 +7348,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,
@@ -7313,6 +7397,7 @@ mod tests {
                 command: "echo inner".to_string(),
                 mode: SandboxMode::Sandboxed,
                 location: None,
+                interpreter: Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: ToolStatus::Done,

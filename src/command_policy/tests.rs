@@ -182,10 +182,10 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
         panic!("the unchanged re-read is refused");
     };
     assert!(
-        policy.refused.take(&call),
+        policy.refused.take(call.call()),
         "the refused call is recorded for the turn boundary"
     );
-    assert!(!policy.refused.take(&call), "and answered once");
+    assert!(!policy.refused.take(call.call()), "and answered once");
     assert!(
         refused.text().contains(&format!(
             "repeats your last read of `{}`, unchanged since",

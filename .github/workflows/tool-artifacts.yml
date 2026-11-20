@@ -47,22 +47,28 @@ permissions:
   contents: read
 
 jobs:
-  # Whether the bash job's inputs changed. A release (tags to attach) and a
-  # manual run always build it; a pull request measures from the merge base
-  # with its base branch, a push from the commit main pointed at before, and a
-  # push with no previous commit selects it. Should this job fail, bash builds,
-  # so a broken scope never skips it.
+  # Whether the bash and tool matrices' inputs changed. A release (tags to
+  # attach), a manual run and a workflow_call always build; a pull request
+  # measures from the merge base with its base branch, a push from the commit
+  # main pointed at before, and a push with no previous commit builds. The
+  # five-platform tool matrix also needs more than a touched path when only
+  # Cargo.toml/Cargo.lock changed: the tools rebuild only when the dependency
+  # closure cargo tree reports for may-patch and may-sed changed, so a
+  # version bump or an unrelated dependency edit builds nothing. Should this
+  # job fail, both matrices build, so a broken scope never skips them.
   scope:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       bash: ${{ steps.scope.outputs.bash }}
+      tools: ${{ steps.scope.outputs.tools }}
     steps:
       # The diff needs the base commit, which a shallow clone lacks.
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
       - id: scope
         env:
           EVENT: ${{ github.event_name }}
@@ -74,23 +80,54 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${TAGS}" ] && [ "${TAGS}" != '[]' ]; then
-            echo bash=true | tee -a "${GITHUB_OUTPUT}"
+            printf 'bash=true\ntools=true\n' | tee -a "${GITHUB_OUTPUT}"
             exit 0
           fi
           case "${EVENT}" in
             pull_request) range="${PR_BASE}...${PR_HEAD}" ;;
             push) range="${PUSH_BEFORE}..${PUSH_AFTER}" ;;
-            workflow_dispatch) echo bash=true | tee -a "${GITHUB_OUTPUT}"; exit 0 ;;
-            *) echo "::error::unexpected event ${EVENT}"; exit 1 ;;
+            *) printf 'bash=true\ntools=true\n' | tee -a "${GITHUB_OUTPUT}"; exit 0 ;;
           esac
           if [ "${EVENT}" = push ] && [ "${PUSH_BEFORE}" = 0000000000000000000000000000000000000000 ]; then
-            echo bash=true | tee -a "${GITHUB_OUTPUT}"
-          elif git diff --name-only "${range}" | tee /dev/stderr \
-              | grep -q -e '^patch/bash/' -e '^\.github/workflows/tool-artifacts\.yml$'; then
-            echo bash=true | tee -a "${GITHUB_OUTPUT}"
-          else
-            echo bash=false | tee -a "${GITHUB_OUTPUT}"
+            printf 'bash=true\ntools=true\n' | tee -a "${GITHUB_OUTPUT}"
+            exit 0
           fi
+          files="$(git diff --name-only "${range}")"
+          printf '%s\n' "${files}" | tee /dev/stderr
+          if printf '%s\n' "${files}" | grep -q -e '^patch/bash/' -e '^\.github/workflows/tool-artifacts\.yml$'; then
+            bash=true
+          else
+            bash=false
+          fi
+          if printf '%s\n' "${files}" | grep -q -e '^patch/' -e '^sed/' \
+            -e '^\.github/scripts/build-artifact\.sh$' \
+            -e '^\.github/scripts/built-tools\.json$' \
+            -e '^\.github/scripts/verify-sandbox\.sh$' \
+            -e '^\.github/workflows/tool-artifacts\.yml$'; then
+            tools=true
+          elif printf '%s\n' "${files}" | grep -q -e '^Cargo\.toml$' -e '^Cargo\.lock$'; then
+            # The tools' own version lines go away so a release-plz bump of
+            # may-patch/may-sed still counts: the comparison is the closure
+            # of dependencies each tool compiles, not its own version.
+            base_sha="${range%%...*}"
+            base_sha="${base_sha%%..*}"
+            git worktree add --detach "${RUNNER_TEMP}/base" "${base_sha}" > /dev/null
+            (cd "${RUNNER_TEMP}/base" && cargo tree --locked --prefix none --edges normal,build \
+              -p may-patch -p may-sed | grep -v -e '^may-patch ' -e '^may-sed ' | sort -u) \
+              > "${RUNNER_TEMP}/base.tree"
+            cargo tree --locked --prefix none --edges normal,build \
+              -p may-patch -p may-sed | grep -v -e '^may-patch ' -e '^may-sed ' | sort -u \
+              > "${RUNNER_TEMP}/head.tree"
+            if cmp -s "${RUNNER_TEMP}/base.tree" "${RUNNER_TEMP}/head.tree"; then
+              tools=false
+            else
+              tools=true
+              diff "${RUNNER_TEMP}/base.tree" "${RUNNER_TEMP}/head.tree" || true
+            fi
+          else
+            tools=false
+          fi
+          printf 'bash=%s\ntools=%s\n' "${bash}" "${tools}" | tee -a "${GITHUB_OUTPUT}"
 
   # GNU bash for the platforms that run terminal scripts through it; Windows
   # has none. Each target builds on a runner of its own architecture.
@@ -146,6 +183,8 @@ jobs:
 
   artifact:
     name: ${{ matrix.target }}
+    needs: scope
+    if: always() && !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.tools == 'true')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     defaults:

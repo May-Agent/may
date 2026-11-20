@@ -34,6 +34,16 @@ pub struct SubagentArgs {
     /// `external` only: the connected agent to run.
     #[serde(default)]
     pub agent: Option<String>,
+    /// The `provider::model` to run this call on (`models` lists the models
+    /// in play). Mutually exclusive with `tier`; refused when the definition
+    /// pins `model`, and for `fork`, `resume` and `external`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The tier to run this call on. Mutually exclusive with `model`;
+    /// refused when the definition pins `tier` or `model`, and for `fork`,
+    /// `resume` and `external`.
+    #[serde(default)]
+    pub tier: Option<super::tier::Tier>,
     /// Directories, usually linked git worktrees you created, the subagent
     /// may write besides its own space, when its definition lets it write
     /// worktrees. Each must be inside what you can write. It cannot commit
@@ -57,6 +67,10 @@ pub enum Call<'a> {
         name: &'a str,
         /// The directories it is granted.
         grant: Requested<'a>,
+        /// The concrete model the call asks for.
+        model: Option<crate::ModelSelector>,
+        /// The tier the call asks for.
+        tier: Option<super::tier::Tier>,
     },
     /// Continues the calling agent's context.
     Fork {
@@ -146,6 +160,18 @@ impl SubagentArgs {
         if name != "external" && self.agent.is_some() {
             anyhow::bail!("`--agent` names a connected agent: use it with `subagent external`");
         }
+        if self.model.is_some() && self.tier.is_some() {
+            anyhow::bail!("a `subagent` call takes `--model` or `--tier`, not both");
+        }
+        let model = self
+            .model
+            .as_deref()
+            .map(str::parse::<crate::ModelSelector>)
+            .transpose()
+            .map_err(|error| {
+                anyhow::anyhow!("{error}; run `models` to see the models a call may run on")
+            })?;
+        let choosing = model.is_some() || self.tier.is_some();
         Ok(match name {
             "resume" => {
                 let Some(id) = self.id.as_deref() else {
@@ -158,16 +184,38 @@ impl SubagentArgs {
                         "a continued subagent keeps what it was granted: `subagent resume` takes no `--worktrees` or `--commit-worktrees`"
                     );
                 }
+                if choosing {
+                    anyhow::bail!(
+                        "a continued subagent keeps the model it ran on: `subagent resume` takes no `--model` or `--tier`"
+                    );
+                }
                 Call::Resume { id }
             }
-            "fork" => Call::Fork { grant },
+            "fork" => {
+                if choosing {
+                    anyhow::bail!(
+                        "a fork continues your context on your model: `subagent fork` takes no `--model` or `--tier`"
+                    );
+                }
+                Call::Fork { grant }
+            }
             "external" => {
                 let Some(agent) = self.agent.as_deref() else {
                     anyhow::bail!("`subagent external` takes the `--agent` to run");
                 };
+                if choosing {
+                    anyhow::bail!(
+                        "a connected agent runs on its own model: `subagent external` takes no `--model` or `--tier`"
+                    );
+                }
                 Call::External { agent, grant }
             }
-            name => Call::Named { name, grant },
+            name => Call::Named {
+                name,
+                grant,
+                model,
+                tier: self.tier,
+            },
         })
     }
 }
@@ -201,5 +249,41 @@ mod tests {
         assert!(matches!(resume.call(), Ok(Call::Resume { id: "amber" })));
         resume.worktrees.push("w".into());
         assert!(resume.call().is_err());
+    }
+
+    #[test]
+    fn model_and_tier_are_mutually_exclusive_and_named_only() {
+        let mut named = args("general");
+        named.model = Some("openai::gpt-5".into());
+        assert!(matches!(
+            named.call(),
+            Ok(Call::Named { model: Some(_), .. })
+        ));
+        named.tier = Some(crate::subagent::Tier::Fast);
+        assert!(named.call().is_err(), "--model and --tier exclude");
+        named.model = None;
+        assert!(matches!(
+            named.call(),
+            Ok(Call::Named {
+                tier: Some(crate::subagent::Tier::Fast),
+                ..
+            })
+        ));
+
+        for reserved in ["fork", "external", "resume"] {
+            let mut call = args(reserved);
+            call.agent = (reserved == "external").then(|| "devin".to_string());
+            call.id = (reserved == "resume").then(|| "amber".to_string());
+            call.model = Some("openai::gpt-5".into());
+            assert!(call.call().is_err(), "{reserved} refuses --model");
+            call.model = None;
+            call.tier = Some(crate::subagent::Tier::Fast);
+            assert!(call.call().is_err(), "{reserved} refuses --tier");
+        }
+
+        let mut bad = args("general");
+        bad.model = Some("gpt-5".into());
+        let error = bad.call().unwrap_err().to_string();
+        assert!(error.contains("`models`"), "{error}");
     }
 }

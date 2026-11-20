@@ -1,15 +1,16 @@
 //! What happens to a session's repository binding before its first turn.
 //!
-//! - A GitHub-bound session needs no checkout, so the trust decision for the
-//!   repository is asked here when it is still open.
-//! - A session that starts in a checkout of a GitHub repository whose trust is
-//!   decided gets the checkout-state preflight ([`crate::repo_preflight`]):
-//!   clean and current proceeds silently, anything else asks.
+//! - A GitHub-bound session needs no checkout, so its trust is resolved
+//!   here ([`crate::trust::resolve_github_remote`]).
+//! - A session that starts in a checkout has its trust resolved
+//!   ([`crate::trust::resolve_checkout`]): a level that publishes to GitHub
+//!   gets the checkout-state preflight ([`crate::repo_preflight`]) — clean
+//!   and current proceeds silently, anything else asks unless the session
+//!   is non-interactive.
 //! - Then the session is bound: trust, or the preflight's choice, sets the
 //!   binding that groups the session and names its clone.
 //!
-//! A repo-less session, or one in a repository with no decision yet, is left
-//! alone: those are decided by their own flows.
+//! A repo-less session is left alone.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,8 @@ use crate::host_git::HostGit;
 use crate::repo_clone::{RepoCloneError, SessionRepos};
 use crate::repo_preflight::{Choice, PreflightError};
 use crate::session::{BindingError, RepoBinding};
-use crate::trust::RepoKind;
-use crate::workspace::{WorkspaceConfig, WorkspaceConfigError};
+use crate::trust::{GitHubProbe, RepoKind};
+use crate::workspace::WorkspaceConfigError;
 
 /// Puts a question to the user and waits for the answers.
 pub trait Asker {
@@ -71,13 +72,15 @@ pub enum Verdict {
 }
 
 /// The gate for one session.
-pub struct RepoGate<'a, A> {
+pub struct RepoGate<'a, A, P> {
     /// The session database.
     pub db: &'a ChatDb,
     /// Git on the host.
     pub host: &'a HostGit,
     /// Who the questions go to.
     pub asker: &'a A,
+    /// Reads GitHub repository access while default trust is derived.
+    pub github: &'a P,
     /// The `workspace.toml` that holds the trust decisions.
     pub config_path: &'a Path,
     /// The session's sandbox root, where its clones live.
@@ -88,13 +91,13 @@ pub struct RepoGate<'a, A> {
     pub remote: &'a str,
 }
 
-impl<A> std::fmt::Debug for RepoGate<'_, A> {
+impl<A, P> std::fmt::Debug for RepoGate<'_, A, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RepoGate").finish_non_exhaustive()
     }
 }
 
-impl<A: Asker + Sync> RepoGate<'_, A> {
+impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
     /// Run the gate for `session_id`.
     ///
     /// # Errors
@@ -104,14 +107,15 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         let Some(row) = self.db.get_session(session_id).await? else {
             return Ok(Verdict::Proceed);
         };
-        let path = self.config_path.to_path_buf();
-        let config = blocking::unblock(move || WorkspaceConfig::load(&path)).await?;
         let non_interactive = row.non_interactive;
         match row.repo.as_deref().map(RepoBinding::parse).transpose()? {
-            Some(RepoBinding::Github(repository)) => {
-                self.decide_remote_trust(&config, &repository.to_string(), non_interactive)
-                    .await
-            }
+            Some(RepoBinding::Github(repository)) => match row.cwd {
+                Some(cwd) => {
+                    self.gate_bound_checkout(session_id, cwd, &repository, non_interactive)
+                        .await
+                }
+                None => self.decide_remote_trust(&repository.to_string()).await,
+            },
             Some(RepoBinding::Local(identity)) => match row.cwd {
                 Some(cwd) => {
                     let repos = SessionRepos::new(self.session_root, session_id, self.db.clone())
@@ -120,7 +124,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
                     if repos.clone_for(&key).await?.is_some() {
                         Ok(Verdict::Proceed)
                     } else {
-                        self.bind_checkout(session_id, &config, PathBuf::from(cwd), non_interactive)
+                        self.bind_checkout(session_id, PathBuf::from(cwd), non_interactive)
                             .await
                     }
                 }
@@ -128,7 +132,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             },
             None => match row.cwd {
                 Some(cwd) => {
-                    self.bind_checkout(session_id, &config, PathBuf::from(cwd), non_interactive)
+                    self.bind_checkout(session_id, PathBuf::from(cwd), non_interactive)
                         .await
                 }
                 None => Ok(Verdict::Proceed),
@@ -136,84 +140,70 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         }
     }
 
-    /// First contact with a GitHub repository that has no checkout: ask for
-    /// the trust level once.
-    async fn decide_remote_trust(
-        &self,
-        config: &WorkspaceConfig,
-        owner_repo: &str,
-        non_interactive: bool,
-    ) -> Result<Verdict, GateError> {
-        // Matching a project reads its checkout's remote: off the executor.
-        let decided = {
-            let (config, owner_repo) = (config.clone(), owner_repo.to_string());
-            blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo)).await
-        };
-        if decided.is_some() || non_interactive {
-            return Ok(Verdict::Proceed);
-        }
-        let answers = self
-            .asker
-            .ask(crate::trust::remote_question(owner_repo))
-            .await?;
-        let Some(level) = answers.first().and_then(crate::trust::level_for_answer) else {
-            return Ok(Verdict::Exit);
-        };
-        let (path, owner_repo) = (self.config_path.to_path_buf(), owner_repo.to_string());
-        blocking::unblock(move || crate::trust::persist_github(&path, &owner_repo, level)).await?;
+    /// A GitHub repository bound with no checkout: resolve its trust —
+    /// persisted, or derived from the viewer's access — and proceed.
+    async fn decide_remote_trust(&self, owner_repo: &str) -> Result<Verdict, GateError> {
+        crate::trust::resolve_github_remote(self.config_path, owner_repo, self.github).await?;
         Ok(Verdict::Proceed)
     }
 
-    /// A session that starts in `cwd`: preflight a GitHub checkout, then bind
-    /// the session to its repository.
+    /// A GitHub-bound session that keeps its launch checkout: rebind
+    /// through the checkout when the remote clone the binding names was
+    /// never made, or when the checkout's persisted trust no longer
+    /// publishes to GitHub — `/permission` switching to `local-branch` or
+    /// `local` moves the session to `local:<identity>`. A session whose
+    /// remote clone exists under a still-publishing trust proceeds
+    /// untouched.
+    async fn gate_bound_checkout(
+        &self,
+        session_id: &str,
+        cwd: String,
+        repository: &crate::workspace::GitHubRepository,
+        non_interactive: bool,
+    ) -> Result<Verdict, GateError> {
+        let demoted = {
+            let (dir, config_path) = (cwd.clone(), self.config_path.to_path_buf());
+            blocking::unblock(move || crate::trust::persisted_level(Path::new(&dir), &config_path))
+                .await?
+        }
+        .is_some_and(|level| !level.publishes_to_github());
+        if !demoted {
+            let repos = SessionRepos::new(self.session_root, session_id, self.db.clone())
+                .with_host(self.host.clone());
+            if repos.clone_for(&repository.to_string()).await?.is_some() {
+                return Ok(Verdict::Proceed);
+            }
+        }
+        self.bind_checkout(session_id, PathBuf::from(cwd), non_interactive)
+            .await
+    }
+
+    /// A session that starts in `cwd`: resolve its trust, preflight a
+    /// GitHub-publishing checkout, then bind the session to its repository.
     async fn bind_checkout(
         &self,
         session_id: &str,
-        config: &WorkspaceConfig,
         cwd: PathBuf,
         non_interactive: bool,
     ) -> Result<Verdict, GateError> {
-        let config = config.clone();
-        let found = blocking::unblock(move || {
-            let worktree = crate::repo_search::worktree_root(&cwd)?;
-            let identity = crate::issue::repository_identity(&worktree).ok()?;
-            let level = crate::trust::trust_for(&config, &identity, &worktree);
-            Some((worktree, identity, level))
-        })
-        .await;
-        let Some((worktree, identity, maybe_level)) = found else {
+        let found = {
+            let cwd = cwd.clone();
+            blocking::unblock(move || {
+                let worktree = crate::repo_search::worktree_root(&cwd)?;
+                let identity = crate::issue::repository_identity(&worktree).ok()?;
+                Some((worktree, identity))
+            })
+            .await
+        };
+        let Some((worktree, identity)) = found else {
             return Ok(Verdict::Proceed);
         };
-        let level = if let Some(level) = maybe_level {
-            level
-        } else if non_interactive {
-            return Ok(Verdict::Proceed);
-        } else {
-            let kind = {
-                let worktree = worktree.clone();
-                blocking::unblock(move || crate::trust::repo_kind(&worktree)).await
-            };
-            let request = crate::trust::question_for(&kind, &worktree, true);
-            let Some(q) = request.questions.into_iter().next() else {
-                return Ok(Verdict::Exit);
-            };
-            let question = crate::ask_user::Question {
-                section: q.section,
-                question: q.question,
-                option: q.option,
-                multi_select: q.multi_select,
-            };
-            let answers = self.asker.ask(question).await?;
-            let Some(level) = answers.first().and_then(crate::trust::level_for_answer) else {
-                return Ok(Verdict::Exit);
-            };
-            let (path, worktree) = (self.config_path.to_path_buf(), worktree.clone());
-            blocking::unblock(move || crate::trust::persist(&path, &worktree, Some(&kind), level))
-                .await?;
-            level
-        };
+        let level =
+            crate::trust::resolve_checkout(self.config_path, &worktree, self.github).await?;
         if level.publishes_to_github()
-            && let Some(verdict) = self.preflight(session_id, &worktree, &identity).await?
+            && let Some(verdict) = self
+                .preflight(session_id, &worktree, &identity, non_interactive)
+                .await?
         {
             return Ok(verdict);
         }
@@ -229,12 +219,14 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
 
     /// The checkout-state preflight. `None` when the checkout needs no
     /// choice (or the session already holds its clone), so the trust level
-    /// binds the session; `Some` when a choice settled the binding.
+    /// binds the session; `Some` when a choice settled the binding. A
+    /// non-interactive session never asks: it proceeds on the trust level.
     async fn preflight(
         &self,
         session_id: &str,
         worktree: &Path,
         identity: &Path,
+        non_interactive: bool,
     ) -> Result<Option<Verdict>, GateError> {
         let RepoKind::Github { owner_repo } = ({
             let worktree = worktree.to_path_buf();
@@ -264,6 +256,9 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         let state = match inspected {
             Ok(state) => state,
             Err(PreflightError::RemoteUnreachable(_)) => {
+                if non_interactive {
+                    return Ok(None);
+                }
                 return self
                     .offline(session_id, &repos, worktree, identity, &owner_repo)
                     .await
@@ -271,7 +266,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             }
             Err(error) => return Err(error.into()),
         };
-        if !state.needs_choice() {
+        if !state.needs_choice() || non_interactive {
             return Ok(None);
         }
         let answers = self
@@ -380,7 +375,40 @@ mod tests {
     use super::*;
     use crate::ask_user::AnswerValue;
     use crate::trust::TrustLevel;
+    use crate::workspace::WorkspaceConfig;
     use std::sync::Mutex;
+
+    /// A [`crate::trust::GitHubProbe`] reporting `access`, or offline when
+    /// `None`.
+    struct Probe(Option<crate::issue::github::RepositoryAccess>);
+
+    impl Probe {
+        fn owned() -> Self {
+            Self(Some(crate::issue::github::RepositoryAccess {
+                owned: true,
+                can_push: true,
+                has_issues: true,
+            }))
+        }
+
+        const fn offline() -> Self {
+            Self(None)
+        }
+    }
+
+    impl crate::trust::GitHubProbe for Probe {
+        fn repository_access(
+            &self,
+            _repository: &crate::workspace::GitHubRepository,
+        ) -> impl Future<
+            Output = Result<crate::issue::github::RepositoryAccess, crate::issue::IssueError>,
+        > + Send {
+            std::future::ready(
+                self.0
+                    .ok_or_else(|| crate::issue::IssueError::GitHubAuth("offline".to_string())),
+            )
+        }
+    }
 
     /// Answers every question with a fixed option and records the questions.
     struct Scripted {
@@ -409,17 +437,21 @@ mod tests {
     }
 
     impl Asker for Scripted {
-        #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
-        async fn ask(&self, question: Question) -> Result<Vec<QuestionAnswer>, GateError> {
+        fn ask(
+            &self,
+            question: Question,
+        ) -> impl Future<Output = Result<Vec<QuestionAnswer>, GateError>> + Send {
             let section = question.section.clone();
             self.asked.lock().unwrap().push(question);
-            let answer = self
-                .answer
-                .ok_or_else(|| GateError::Ask("no one was meant to be asked".to_string()))?;
-            Ok(vec![QuestionAnswer {
-                section,
-                answer: AnswerValue::Selected(vec![answer.to_string()]),
-            }])
+            let answers = self.answer.map(|answer| {
+                vec![QuestionAnswer {
+                    section,
+                    answer: AnswerValue::Selected(vec![answer.to_string()]),
+                }]
+            });
+            std::future::ready(
+                answers.ok_or_else(|| GateError::Ask("no one was meant to be asked".to_string())),
+            )
         }
     }
 
@@ -449,6 +481,7 @@ mod tests {
         checkout: PathBuf,
         db: ChatDb,
         config_path: PathBuf,
+        probe: Probe,
     }
 
     impl Fixture {
@@ -502,6 +535,7 @@ mod tests {
                 checkout,
                 db,
                 config_path,
+                probe: Probe::owned(),
             }
         }
 
@@ -540,6 +574,7 @@ mod tests {
                 db: &self.db,
                 host: &host,
                 asker,
+                github: &self.probe,
                 config_path: &self.config_path,
                 session_root: &self.root().join("session"),
                 staging: &staging,
@@ -695,37 +730,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_undecided_checkout_asks_trust_once_persists_and_binds() {
+    async fn an_undecided_checkout_resolves_trust_and_binds() {
         let fx = Fixture::new().await;
         fx.start_in_checkout().await;
-        let asker = Scripted::answering("local-branch — Isolated clone and local PRs");
+        let asker = Scripted::silent();
         assert_eq!(fx.run(&asker).await, Verdict::Proceed);
-        assert_eq!(asker.asked(), 1);
-        assert!(fx.binding().await.unwrap().starts_with("local:"));
+        assert_eq!(asker.asked(), 0);
+        assert_eq!(fx.binding().await.as_deref(), Some("github:acme/app"));
         let config = WorkspaceConfig::load(&fx.config_path).unwrap();
         let identity = crate::issue::repository_identity(&fx.checkout).unwrap();
         assert_eq!(
-            crate::trust::trust_for(&config, &identity, &fx.checkout),
-            Some(TrustLevel::LocalBranch)
+            crate::trust::persisted_for(&config, &identity),
+            Some(TrustLevel::Full)
         );
-        // Decided now: the next run asks nothing.
+        // Decided now: the next run resolves from the persisted entry.
         assert_eq!(fx.run(&asker).await, Verdict::Proceed);
-        assert_eq!(asker.asked(), 1);
+        assert_eq!(asker.asked(), 0);
     }
 
+    /// A failed access lookup falls back to `local-branch`, persists
+    /// nothing and binds the session to the checkout.
     #[tokio::test]
-    async fn declining_checkout_trust_exits_without_persisting() {
+    async fn an_offline_lookup_falls_back_to_local_branch_unpersisted() {
+        let mut fx = Fixture::new().await;
+        fx.start_in_checkout().await;
+        fx.probe = Probe::offline();
+        let asker = Scripted::silent();
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(asker.asked(), 0);
+        assert!(fx.binding().await.unwrap().starts_with("local:"));
+        assert!(!fx.config_path.exists());
+    }
+
+    /// A non-interactive session resolves the same way and never asks, even
+    /// when the remote cannot be reached.
+    #[tokio::test]
+    async fn a_non_interactive_session_never_asks() {
         let fx = Fixture::new().await;
         fx.start_in_checkout().await;
-        let asker = Scripted::answering("exit — Do not bind this repository");
-        assert_eq!(fx.run(&asker).await, Verdict::Exit);
-        assert_eq!(fx.binding().await, None);
-        let config = WorkspaceConfig::load(&fx.config_path).unwrap();
-        let identity = crate::issue::repository_identity(&fx.checkout).unwrap();
-        assert_eq!(
-            crate::trust::trust_for(&config, &identity, &fx.checkout),
-            None
-        );
+        fx.db.set_session_non_interactive("s").await.unwrap();
+        let asker = Scripted::silent();
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(asker.asked(), 0);
+        assert_eq!(fx.binding().await.as_deref(), Some("github:acme/app"));
+    }
+
+    /// An explicit decision wins over the access lookup: the probe is not
+    /// consulted and the level stays.
+    #[tokio::test]
+    async fn a_persisted_decision_is_never_overwritten() {
+        let fx = Fixture::new().await;
+        fx.start_in_checkout().await;
+        fx.trust(TrustLevel::Local);
+        let asker = Scripted::silent();
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(asker.asked(), 0);
+        assert!(fx.binding().await.unwrap().starts_with("local:"));
     }
 
     #[tokio::test]
@@ -746,6 +806,34 @@ mod tests {
         assert_eq!(fx.binding().await.as_deref(), Some("github:acme/app"));
     }
 
+    /// A `/permission` switch away from a publishing level rebinds a
+    /// GitHub-bound checkout session to `local:<identity>` on the next
+    /// run, without asking anything.
+    #[tokio::test]
+    async fn a_demoted_trust_rebinds_a_github_bound_checkout_session_locally() {
+        let fx = Fixture::new().await;
+        fx.start_in_checkout().await;
+        fx.trust(TrustLevel::Full);
+        let asker = Scripted::silent();
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(fx.binding().await.as_deref(), Some("github:acme/app"));
+        fx.trust(TrustLevel::LocalBranch);
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(asker.asked(), 0);
+        let identity = crate::issue::repository_identity(&fx.checkout).unwrap();
+        assert_eq!(
+            fx.binding().await,
+            Some(format!("local:{}", identity.display()))
+        );
+        // The local binding holds: the next run does not flip back.
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(
+            fx.binding().await,
+            Some(format!("local:{}", identity.display()))
+        );
+        assert_eq!(asker.asked(), 0);
+    }
+
     #[tokio::test]
     async fn a_repo_less_session_stays_unbound() {
         let fx = Fixture::new().await;
@@ -755,36 +843,42 @@ mod tests {
         assert_eq!(fx.binding().await, None);
     }
 
+    /// A session launched on a GitHub repository with no checkout resolves
+    /// its trust from access and persists it — no question is asked.
     #[tokio::test]
-    async fn a_github_bound_session_with_no_checkout_asks_trust_once() {
-        let fx = Fixture::new().await;
+    async fn a_github_bound_session_with_no_checkout_resolves_trust() {
+        let mut fx = Fixture::new().await;
         fx.db
             .set_session_repo("s", Some("github:acme/app"))
             .await
             .unwrap();
-        let asker = Scripted::answering("prs-only — GitHub PRs only");
+        let asker = Scripted::silent();
         assert_eq!(fx.run(&asker).await, Verdict::Proceed);
-        assert_eq!(asker.asked(), 1);
+        assert_eq!(asker.asked(), 0);
         let config = WorkspaceConfig::load(&fx.config_path).unwrap();
         assert_eq!(
             crate::trust::trust_for_github(&config, "acme/app"),
-            Some(TrustLevel::PrsOnly)
+            Some(TrustLevel::Full)
         );
-        // Decided now: the next turn asks nothing.
+        // Decided now: the next turn resolves from the persisted entry.
+        fx.probe = Probe::offline();
         assert_eq!(fx.run(&asker).await, Verdict::Proceed);
-        assert_eq!(asker.asked(), 1);
+        assert_eq!(asker.asked(), 0);
     }
 
+    /// An offline access lookup on a remote binding falls back to
+    /// `prs-only` and persists nothing.
     #[tokio::test]
-    async fn declining_the_remote_trust_question_exits() {
-        let fx = Fixture::new().await;
+    async fn an_offline_remote_binding_proceeds_unpersisted() {
+        let mut fx = Fixture::new().await;
         fx.db
             .set_session_repo("s", Some("github:acme/app"))
             .await
             .unwrap();
-        let asker = Scripted::answering("exit — Do not bind this repository");
-        assert_eq!(fx.run(&asker).await, Verdict::Exit);
-        let config = WorkspaceConfig::load(&fx.config_path).unwrap();
-        assert_eq!(crate::trust::trust_for_github(&config, "acme/app"), None);
+        fx.probe = Probe::offline();
+        let asker = Scripted::silent();
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(asker.asked(), 0);
+        assert!(!fx.config_path.exists());
     }
 }

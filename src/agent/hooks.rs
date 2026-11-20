@@ -21,8 +21,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aither_agent::{AfterTool, Hooks, ToolOutcome, TurnBoundaryAction, TurnBoundaryContext};
-use aither_sandbox::{JobStatus, Jobs, Refused, UnchangedRead};
+use aither_agent::{
+    AfterTool, Hooks, ToolDecision, ToolInvocation, ToolOutcome, TurnBoundaryAction,
+    TurnBoundaryContext,
+};
+use aither_sandbox::{Interpreter, JobStatus, Jobs, Refused, UnchangedRead};
 
 use super::loop_watch::LoopWatch;
 use crate::command_policy::RefusedReads;
@@ -32,6 +35,41 @@ use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionRuntimeService};
 use crate::vision_ocr::VisionOcr;
 
+/// The interpreter each `terminal` call's script runs under, keyed by call
+/// so an approval request for the same call renders the script in its
+/// language. Every clone shares the record.
+#[derive(Debug, Clone, Default)]
+pub struct CallInterpreters(
+    std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<aither_core::llm::tool::CallIdentity, Interpreter>,
+        >,
+    >,
+);
+
+impl CallInterpreters {
+    /// Record the interpreter a `terminal` call's script runs under.
+    fn record(&self, call: aither_core::llm::tool::CallIdentity, interpreter: Interpreter) {
+        self.0
+            .lock()
+            .expect("the interpreter record is never held across a panic")
+            .insert(call, interpreter);
+    }
+
+    /// The interpreter recorded for `call`, when any.
+    ///
+    /// # Panics
+    /// Panics when the record's lock is poisoned.
+    #[must_use]
+    pub fn get(&self, call: &aither_core::llm::tool::CallIdentity) -> Option<Interpreter> {
+        self.0
+            .lock()
+            .expect("the interpreter record is never held across a panic")
+            .get(call)
+            .copied()
+    }
+}
+
 /// What a May agent decides at the loop's control points.
 #[derive(Debug, Clone)]
 pub(super) struct MayHooks {
@@ -40,6 +78,9 @@ pub(super) struct MayHooks {
     pub(super) session_id: SessionId,
     pub(super) redactor: SecretRedactor,
     pub(super) refused: RefusedReads,
+    /// The interpreter each `terminal` call runs under, for the approver's
+    /// prompt to highlight its script.
+    pub(super) interpreters: CallInterpreters,
     pub(super) jobs: Jobs,
     /// The `compact` tool's valve: a request it holds ends the turn.
     pub(super) valve: Arc<CompactSignal>,
@@ -83,7 +124,7 @@ impl MayHooks {
         outcomes
             .iter()
             .map(|outcome| {
-                let refused = self.refused.take(&outcome.call);
+                let refused = self.refused.take(outcome.call.call());
                 let polled =
                     outcome.result.as_ref().err().is_some_and(|error| {
                         error.downcast_ref::<Refused<UnchangedRead>>().is_some()
@@ -95,6 +136,21 @@ impl MayHooks {
 }
 
 impl Hooks for MayHooks {
+    fn before_tool(
+        &self,
+        call: &ToolInvocation<'_>,
+    ) -> impl std::future::Future<Output = ToolDecision> + Send {
+        if call.name == "terminal"
+            && let Some(interpreter) = call
+                .arguments
+                .get("interpreter")
+                .and_then(|value| serde_json::from_value::<Interpreter>(value.clone()).ok())
+        {
+            self.interpreters.record(call.call.clone(), interpreter);
+        }
+        std::future::ready(ToolDecision::Allow)
+    }
+
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
         if outcome.name != COMPACT_TOOL_NAME {
             self.valve.acted();
@@ -298,6 +354,7 @@ mod tests {
             session_id: SessionId::from_string("ocr-session"),
             redactor: SecretRedactor::fixed(&[("DEPLOY_TOKEN", "hunter2-secret-value")]),
             refused: RefusedReads::default(),
+            interpreters: CallInterpreters::default(),
             jobs: terminal.shell().jobs(),
             valve: Arc::new(CompactSignal::default()),
             compaction: Arc::new(AtomicBool::new(false)),

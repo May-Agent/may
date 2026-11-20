@@ -108,12 +108,13 @@ impl Highlighting {
         .collect()
     }
 
-    /// Highlight `script` as bash, returning one span vector per source line.
-    /// The script is highlighted as a unit so state (quotes, heredocs) carries
-    /// across lines. An empty script yields no lines.
-    pub(super) fn shell_spans(&self, script: &str) -> Vec<Vec<Span<'static>>> {
+    /// Highlight `script` as `language`, a syntect token like `bash` or
+    /// `python`; unknown languages fall back to bash so the script still
+    /// reads as a command.
+    pub(super) fn spans(&self, language: &str, script: &str) -> Vec<Vec<Span<'static>>> {
         let mut highlighter = self
-            .highlighter("bash")
+            .highlighter(language)
+            .or_else(|| self.highlighter("bash"))
             .expect("syntect's default syntaxes include bash");
         script
             .lines()
@@ -127,7 +128,7 @@ mod tests {
     use super::Highlighting;
 
     fn shell_spans(script: &str) -> Vec<Vec<ratatui::text::Span<'static>>> {
-        Highlighting::default().shell_spans(script)
+        Highlighting::default().spans("bash", script)
     }
 
     #[test]
