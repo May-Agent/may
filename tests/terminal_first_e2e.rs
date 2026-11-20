@@ -2349,13 +2349,14 @@ async fn create_session_via_api(
 /// returns its id. The id stays short on purpose: it becomes part of the
 /// session container's name, which Linux caps as a hostname at 63 bytes.
 async fn create_container_profile(harness: &TestHarness) -> String {
-    let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
-        .await
-        .expect("session persistence should initialize");
     // The profile's id and name feed the session and task container names,
     // and every test in this pool shares the host's one Docker daemon, so
     // each harness names its own or their containers would collide.
     static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
+        .await
+        .expect("session persistence should initialize");
     let key = format!(
         "e2e-{}-{}",
         std::process::id(),
