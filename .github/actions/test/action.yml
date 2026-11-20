@@ -13,6 +13,10 @@ inputs:
     description: Whether to run the ignored baseline tools acceptance test after nextest.
     required: false
     default: 'false'
+  upload-e2e-bin:
+    description: Whether to pack and upload the terminal_first_e2e test binary for the container-acceptance job to run without compiling.
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -33,9 +37,8 @@ runs:
     - uses: dtolnay/rust-toolchain@stable
     # Only main saves; a PR or merge-group cache lives in a scope nothing else
     # restores, and its size evicts main's under the cache limit. Keyed by the
-    # job id (`test-ubuntu`, `test-macos`), it is the one Rust cache per OS that
-    # `verify-tools` and `container-acceptance` restore too, so main's caches
-    # fit under the limit together.
+    # job id (`test-ubuntu`, `test-macos`), it is the one Rust cache per OS,
+    # so main's caches fit under the limit together.
     - uses: Swatinem/rust-cache@v2
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -76,6 +79,19 @@ runs:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
         path: may-debug.tar.gz
         retention-days: 90
+    - name: Pack the e2e test binary
+      if: inputs.upload-e2e-bin == 'true'
+      shell: bash
+      run: |
+        path="$(find target/debug -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
+        tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
+    - name: Upload the e2e test binary
+      if: inputs.upload-e2e-bin == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-test-bin-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        path: e2e-test-bin.tar.gz
+        retention-days: 30
     # The merge queue already tested the tree a push to main lands, so that
     # push only builds, to seed main's caches; it still tests when the test
     # downloads missed, since the tests are what fetch them.

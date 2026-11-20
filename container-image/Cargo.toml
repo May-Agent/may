@@ -1,0 +1,15 @@
+[package]
+name = "may-container-image"
+version = "0.1.0"
+edition = "2024"
+description = "Content-addressed GHCR references for May's container images"
+license = "MIT"
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
+toml = "1"
