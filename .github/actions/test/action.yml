@@ -50,13 +50,15 @@ runs:
           echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "${GITHUB_ENV}"
         fi
     - uses: dtolnay/rust-toolchain@stable
-    # Only main saves; a PR or merge-group cache lives in a scope nothing else
-    # restores, and its size evicts main's under the cache limit. Keyed by the
+    # Main and pull requests save; a merge-group cache lives in a deleted
+    # branch's scope nothing restores. A PR's cache is scoped to its own ref,
+    # so only later pushes of the same PR restore it — chiefly the dependency
+    # rebuild a lockfile change would otherwise pay every push. Keyed by the
     # job id (`test-ubuntu`, `test-macos`), it is the one Rust cache per OS,
     # so main's caches fit under the limit together.
     - uses: Swatinem/rust-cache@v2
       with:
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
     # rust-cache prunes the files under target/tmp but keeps its directories,
     # so a restored cache holds an empty skeleton of the tests' shared tool
     # cache that the tests would take for a prepared one.
@@ -146,14 +148,15 @@ runs:
     # The Rust cache this job saves is written after the run, so every
     # earlier generation under the job's prefix can go now; without this the
     # generations accumulate past the repository's cache quota and evict the
-    # hot one.
+    # hot one. Only main's own generations retire: pull-request caches share
+    # the prefix and a later push of their PR still restores them.
     - name: Retire superseded Rust caches
       if: github.ref == 'refs/heads/main'
       shell: bash
       run: |
         prefix="v0-rust-${{ github.job }}-"
         gh api --paginate "repos/${{ github.repository }}/actions/caches?key=${prefix}" \
-          -q ".actions_caches[] | select(.key | startswith(\"${prefix}\")) | .id" \
+          -q ".actions_caches[] | select(.key | startswith(\"${prefix}\")) | select(.ref == \"refs/heads/main\") | .id" \
           | while read -r id; do
               gh api -X DELETE "repos/${{ github.repository }}/actions/caches/${id}" || true
             done
