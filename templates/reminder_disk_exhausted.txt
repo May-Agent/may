@@ -1,0 +1,3 @@
+<system-reminder>
+The home environment is out of disk space ({{ cause }}). Pending transcript or output writes are held in memory until disk space returns; free space in the session workspace before writing more data.
+</system-reminder>

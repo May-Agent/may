@@ -90,8 +90,8 @@ pub struct ChatDb {
     pub(super) db: SkyDb,
     /// Each session's pool of model-facing ids.
     session_pools: session_ids::SessionPools,
-    /// Test seam: suspends a run claim or finish at its await.
-    #[cfg(test)]
+    /// Test seam: suspends a run claim or finish at its await and injects the
+    /// storage faults disk-exhaustion coverage relies on.
     pub(crate) run_gates: session_run::RunGates,
 }
 
@@ -126,7 +126,6 @@ impl ChatDb {
         Ok(Self {
             db,
             session_pools: session_ids::SessionPools::default(),
-            #[cfg(test)]
             run_gates: session_run::RunGates::default(),
         })
     }

@@ -50,13 +50,17 @@ impl RunGate {
     }
 }
 
-/// Gates on the two awaits a dropped handler can interrupt.
-#[cfg(test)]
+/// Gates on the two awaits a dropped handler can interrupt, plus the injected
+/// write faults disk-exhaustion tests arm. The suspend gates are test-only;
+/// the fault flags exist in every build so `check_write_fault` reads them
+/// unconditionally.
 #[derive(Debug, Clone, Default)]
 pub struct RunGates {
     /// Passed after the claim is written, before its result is returned.
+    #[cfg(test)]
     pub claim: RunGate,
     /// Passed before the finish transaction starts.
+    #[cfg(test)]
     pub finish: RunGate,
     /// While set, the next finish fails with a storage error, as a full
     /// disk would make it.
@@ -67,13 +71,9 @@ pub struct RunGates {
 }
 
 impl ChatDb {
-    #[allow(
-        clippy::unnecessary_wraps,
-        clippy::unused_self,
-        clippy::missing_const_for_fn
-    )]
+    /// Returns the injected transcript fault when tests have armed
+    /// [`RunGates::fail_transcript_disk_full`].
     pub(super) fn check_write_fault(&self) -> Result<(), ChatDbError> {
-        #[cfg(test)]
         if self
             .run_gates
             .fail_transcript_disk_full
@@ -150,15 +150,13 @@ impl ChatDb {
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn finish_session_run(&self, fence: &RunFence) -> Result<bool, ChatDbError> {
         #[cfg(test)]
+        self.run_gates.finish.hit().await;
+        if self
+            .run_gates
+            .fail_next_finish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            self.run_gates.finish.hit().await;
-            if self
-                .run_gates
-                .fail_next_finish
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(ChatDbError::Storage("injected finish failure".to_string()));
-            }
+            return Err(ChatDbError::Storage("injected finish failure".to_string()));
         }
         let mut tx = {
             let tx_res: Result<DbTransaction, ChatDbError> = async {

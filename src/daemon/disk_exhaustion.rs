@@ -107,32 +107,20 @@ pub fn classify_error_text(text: &str) -> Option<DiskExhaustionCause> {
 }
 
 #[derive(Template)]
-#[template(
-    source = "The home environment is out of disk space ({{ cause }}): {{ detail }}\nFree space in the session workspace before writing more output.",
-    ext = "txt",
-    escape = "none"
-)]
+#[template(path = "disk_exhausted_tool_notice.txt", escape = "none")]
 struct HomeDiskExhaustedToolNotice<'a> {
     cause: &'a str,
     detail: &'a str,
 }
 
 #[derive(Template)]
-#[template(
-    source = "<system-reminder>\nThe home environment is out of disk space ({{ cause }}). Pending transcript or output writes are held in memory until disk space returns; free space in the session workspace before writing more data.\n</system-reminder>",
-    ext = "txt",
-    escape = "none"
-)]
+#[template(path = "reminder_disk_exhausted.txt", escape = "none")]
 struct HomeDiskExhaustedAlert<'a> {
     cause: &'a str,
 }
 
 #[derive(Template)]
-#[template(
-    source = "The container runtime for this session is currently unavailable ({{ detail }}). Once the container runtime is running again, the session will reconnect and restore its container automatically.",
-    ext = "txt",
-    escape = "none"
-)]
+#[template(path = "container_runtime_unavailable.txt", escape = "none")]
 struct ContainerRuntimeUnavailableNotice<'a> {
     detail: &'a str,
 }
