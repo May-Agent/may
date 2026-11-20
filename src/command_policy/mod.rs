@@ -107,7 +107,7 @@ impl PolicySet {
         builder: ShellBuilder<I, L, O, W, T>,
     ) -> ShellBuilder<I, L, O, W, T> {
         let builder = builder
-            .policy(KillByName)
+            .policy(KillByName::new())
             .policy(ForegroundSleep)
             .policy(UnchangedFileReads {
                 refused: self.refused,
@@ -159,8 +159,34 @@ struct UnparsableRefused<'a> {
 /// Refuses a script that signals processes selected by name or pattern,
 /// which may hit processes the session did not start, and a shell script
 /// that does not parse, which cannot be checked for that.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct KillByName;
+#[derive(Debug, Clone)]
+pub struct KillByName {
+    /// `subprocess`/`os.system` calls whose arguments name a kill command.
+    python_kill_run: regex::Regex,
+}
+
+impl KillByName {
+    /// The policy with its Python patterns compiled.
+    ///
+    /// # Panics
+    /// Panics if the fixed kill-command pattern fails to compile, which it
+    /// cannot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            python_kill_run: regex::Regex::new(
+                r"(?:os\.system|subprocess\.\w+)\s*\([^)]*\b(?:pkill|killall|kill)\b",
+            )
+            .expect("python kill pattern compiles"),
+        }
+    }
+}
+
+impl Default for KillByName {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Programs that signal processes selected by name, user or other pattern.
 const KILLERS: &[&str] = &["pkill", "killall", "killall5", "skill"];
@@ -214,23 +240,17 @@ fn kill_by_name(script: &ShellScript) -> Option<String> {
     None
 }
 
-/// `subprocess`/`os.system` calls whose arguments name a kill command.
-static PYTHON_KILL_RUN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?:os\.system|subprocess\.\w+)\s*\([^)]*\b(?:pkill|killall|kill)\b")
-        .expect("python kill pattern compiles")
-});
-
 /// The process-kill a Python script reaches for, when it does: `os.kill`
 /// and `os.killpg` name no pid the script can justify from its own tree,
 /// and a `kill`/`pkill`/`killall` run through `os.system` or `subprocess`
 /// is the shell builtin the script was refused.
-fn python_kill_by_name(source: &str) -> Option<String> {
+fn python_kill_by_name(source: &str, run: &regex::Regex) -> Option<String> {
     for call in ["os.killpg(", "os.kill(", "os.abort("] {
         if source.contains(call) {
             return Some(call.trim_end_matches('(').to_string());
         }
     }
-    let found = PYTHON_KILL_RUN.find(source)?;
+    let found = run.find(source)?;
     Some(
         ["pkill", "killall", "kill"]
             .iter()
@@ -257,9 +277,10 @@ impl ScriptPolicy for KillByName {
         let decision = match script.shell {
             None => {
                 if script.interpreter == aither_sandbox::Interpreter::Python {
-                    python_kill_by_name(script.script).map_or(ScriptDecision::Pass, |program| {
-                        refuse(&KillByNameRefused { program: &program })
-                    })
+                    python_kill_by_name(script.script, &self.python_kill_run)
+                        .map_or(ScriptDecision::Pass, |program| {
+                            refuse(&KillByNameRefused { program: &program })
+                        })
                 } else {
                     ScriptDecision::Pass
                 }
