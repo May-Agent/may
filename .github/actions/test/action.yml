@@ -129,17 +129,18 @@ runs:
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
       run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
-    # Runs the binary the build step already produced: a second cargo
-    # invocation resolves a narrower target set than `--all-targets` and
+    # The same `--all-targets` resolution the build and nextest steps used:
+    # `--test` selects a narrower target set, which re-resolves features and
     # recompiles may-agent (five minutes on macOS) to run a fifteen-second
-    # test.
+    # test. Running the binary directly would skip the cargo environment the
+    # tests read (`CARGO_BIN_EXE_may`).
     - name: Verify baseline tools
       if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
       shell: bash
-      run: |
-        bin="$(find target/debug -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
-        "$bin" --ignored --exact --nocapture \
-          the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
+      run: >
+        cargo nextest run --locked --all-targets --run-ignored only
+        -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
+        --no-capture
     - name: Upload cargo timings
       if: always()
       uses: actions/upload-artifact@v4
