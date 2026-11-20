@@ -3872,6 +3872,50 @@ impl App {
                     .set_launch(crate::session::SessionLaunch::RepoLess);
                 Some(SendAction::NewSession)
             }
+            SlashCommand::Gui => {
+                if let Some(client) = self.btw_daemon.clone() {
+                    let tx = self.event_tx.clone();
+                    let link_opener = self.link_opener.clone();
+                    // `null` keeps the pinned `[daemon] port`; the daemon
+                    // picks and pins a free one when none is pinned yet.
+                    let path = match (
+                        self.session_manager.current_profile_id(),
+                        self.session_manager.current(),
+                    ) {
+                        (Some(profile), Some(session)) => {
+                            format!("/p/{profile}/s/{}", session.id)
+                        }
+                        (Some(profile), None) => format!("/p/{profile}"),
+                        (None, _) => String::new(),
+                    };
+                    spawn(async move {
+                        let result = async {
+                            let bound: crate::daemon::LocalListenerResponse = client
+                                .put(
+                                    "/api/daemon/local-listener",
+                                    &serde_json::json!({ "port": null }),
+                                )
+                                .await
+                                .map_err(|error| error.reason())?;
+                            let url = format!("http://127.0.0.1:{}{path}", bound.port);
+                            link_opener.open(&url);
+                            Ok::<_, String>(format!("Web UI: {url}"))
+                        }
+                        .await;
+                        let _ = tx
+                            .send(AppEvent::Status(match result {
+                                Ok(message) => message,
+                                Err(error) => error,
+                            }))
+                            .await;
+                    })
+                    .detach();
+                    self.set_status("Opening the web UI…");
+                } else {
+                    self.set_status("The daemon is not attached");
+                }
+                None
+            }
             SlashCommand::Profile => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
