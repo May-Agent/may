@@ -10,6 +10,7 @@
 //! and returns it as a [`ResolvedIssueStore`].
 
 pub mod github;
+pub mod gitlab;
 pub mod may;
 pub mod owner;
 pub mod provenance;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub use github::{GhCliTokenSource, GitHubIssueStore, GitHubTokenSource};
+pub use gitlab::{ForgeGitLabAuth, GitLabIssueStore, GitLabRest, GitLabTokenSource};
 pub use may::MayIssueStore;
 
 use crate::db::ChatDb;
@@ -212,6 +214,12 @@ pub enum IssueError {
     /// The `gh` CLI could not provide a token.
     #[error("gh authentication failed: {0}")]
     GitHubAuth(String),
+    /// HTTP transport or API error in the GitLab backend.
+    #[error("GitLab API error: {0}")]
+    GitLab(String),
+    /// The `[forge]` credential could not provide a GitLab token.
+    #[error("GitLab authentication failed: {0}")]
+    GitLabAuth(String),
     /// The referenced issue does not exist.
     #[error("issue #{0} not found")]
     NotFound(i64),
@@ -277,10 +285,24 @@ impl IssueKind {
 /// Backend identity surfaced to the base system prompt.
 #[derive(Debug, Clone)]
 pub struct IssueBackendInfo {
-    /// Short backend name (`may` or `github`).
+    /// Short backend name (`may`, `github` or `gitlab`).
     pub name: &'static str,
-    /// `owner/repo` when the backend is GitHub.
+    /// The repository the issues live on (`owner/repo` on the default host,
+    /// `<host>/<namespace>/<repo>` elsewhere) when the backend is remote.
     pub repository: Option<String>,
+}
+
+/// Whether `written` names the repository `ours`: case-insensitive equality,
+/// or either a host-qualified prefix of the other (`group/sub/repo` matches
+/// `gitlab.com/group/sub/repo` and the reverse).
+#[must_use]
+pub fn repository_matches(written: &str, ours: &str) -> bool {
+    let suffix_match = |long: &str, short: &str| {
+        long.len() > short.len()
+            && long.as_bytes()[long.len() - short.len() - 1] == b'/'
+            && long[long.len() - short.len()..].eq_ignore_ascii_case(short)
+    };
+    ours.eq_ignore_ascii_case(written) || suffix_match(ours, written) || suffix_match(written, ours)
 }
 
 /// An issue store: the backend a session reads and writes issues through.
@@ -381,7 +403,9 @@ pub enum ResolvedIssueStore {
     /// Issues in the session's history database.
     May(MayIssueStore),
     /// Issues of the configured GitHub repository.
-    GitHub(GitHubIssueStore<GhCliTokenSource>),
+    GitHub(GitHubIssueStore<github::ForgeTokenSource>),
+    /// Issues of the configured GitLab project.
+    GitLab(GitLabIssueStore<ForgeGitLabAuth>),
 }
 
 impl IssueStore for ResolvedIssueStore {
@@ -389,6 +413,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.info(),
             Self::GitHub(store) => store.info(),
+            Self::GitLab(store) => store.info(),
         }
     }
 
@@ -396,6 +421,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.search_key(),
             Self::GitHub(store) => store.search_key(),
+            Self::GitLab(store) => store.search_key(),
         }
     }
 
@@ -403,6 +429,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.owned_by_user().await,
             Self::GitHub(store) => store.owned_by_user().await,
+            Self::GitLab(store) => store.owned_by_user().await,
         }
     }
 
@@ -410,6 +437,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.opened_by_user(number).await,
             Self::GitHub(store) => store.opened_by_user(number).await,
+            Self::GitLab(store) => store.opened_by_user(number).await,
         }
     }
 
@@ -421,6 +449,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.updated_since(since, limit).await,
             Self::GitHub(store) => store.updated_since(since, limit).await,
+            Self::GitLab(store) => store.updated_since(since, limit).await,
         }
     }
 
@@ -433,6 +462,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.create(title, body, labels).await,
             Self::GitHub(store) => store.create(title, body, labels).await,
+            Self::GitLab(store) => store.create(title, body, labels).await,
         }
     }
 
@@ -440,6 +470,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.get(number).await,
             Self::GitHub(store) => store.get(number).await,
+            Self::GitLab(store) => store.get(number).await,
         }
     }
 
@@ -447,6 +478,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.status(number).await,
             Self::GitHub(store) => store.status(number).await,
+            Self::GitLab(store) => store.status(number).await,
         }
     }
 
@@ -459,6 +491,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.list(state, labels, limit).await,
             Self::GitHub(store) => store.list(state, labels, limit).await,
+            Self::GitLab(store) => store.list(state, labels, limit).await,
         }
     }
 
@@ -472,6 +505,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.edit(number, title, body, state).await,
             Self::GitHub(store) => store.edit(number, title, body, state).await,
+            Self::GitLab(store) => store.edit(number, title, body, state).await,
         }
     }
 
@@ -479,6 +513,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.comment(number, body).await,
             Self::GitHub(store) => store.comment(number, body).await,
+            Self::GitLab(store) => store.comment(number, body).await,
         }
     }
 
@@ -491,6 +526,7 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.edit_labels(number, add, remove).await,
             Self::GitHub(store) => store.edit_labels(number, add, remove).await,
+            Self::GitLab(store) => store.edit_labels(number, add, remove).await,
         }
     }
 
@@ -504,17 +540,43 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.edit_relation(number, kind, target_number, add).await,
             Self::GitHub(store) => store.edit_relation(number, kind, target_number, add).await,
+            Self::GitLab(store) => store.edit_relation(number, kind, target_number, add).await,
         }
+    }
+}
+
+/// The issue store a remote [`crate::workspace::ProjectIssues`] backend
+/// names, when it is a remote backend; `forge_auth` supplies the `[forge]`
+/// credentials the GitLab store needs.
+fn remote_issue_store(
+    issues: &crate::workspace::ProjectIssues,
+    forge_auth: &crate::forge::LiveForgeAuth,
+) -> Option<ResolvedIssueStore> {
+    match issues {
+        crate::workspace::ProjectIssues::Github { repository } => {
+            Some(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+                repository.clone(),
+                crate::issue::github::ForgeTokenSource::new(forge_auth.clone()),
+            )))
+        }
+        crate::workspace::ProjectIssues::Gitlab { repository } => {
+            Some(ResolvedIssueStore::GitLab(GitLabIssueStore::new(
+                repository.clone(),
+                ForgeGitLabAuth::new(forge_auth.clone(), repository.host().as_str().to_string()),
+            )))
+        }
+        crate::workspace::ProjectIssues::May => None,
     }
 }
 
 /// Resolve the issue store for a workspace.
 ///
 /// `cwd` is the session's working directory, `workspace_config_path` the
-/// workspace.toml holding per-project entries, and `db` the session's
+/// workspace.toml holding per-project entries, `forge_auth` the live
+/// authenticator supplying `[forge]` credentials, and `db` the session's
 /// already-open chat database the may store writes through. A `[[projects]]`
-/// entry whose path resolves to the same repository identity selects the
-/// GitHub store; everything else falls back to the local store.
+/// entry whose path resolves to the same repository identity selects its
+/// configured forge store; everything else falls back to the local store.
 ///
 /// # Errors
 /// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
@@ -523,14 +585,12 @@ impl IssueStore for ResolvedIssueStore {
 pub fn resolve_issue_store(
     cwd: &Path,
     workspace_config_path: &Path,
+    forge_auth: &crate::forge::LiveForgeAuth,
     db: ChatDb,
 ) -> Result<ResolvedIssueStore, IssueError> {
     let identity = repository_identity(cwd)?;
-    if let Some(repository) = project_github_repository(&identity, workspace_config_path)? {
-        return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
-            repository,
-            GhCliTokenSource,
-        )));
+    if let Some(store) = project_issue_store(&identity, workspace_config_path, forge_auth)? {
+        return Ok(store);
     }
     Ok(ResolvedIssueStore::May(MayIssueStore::new(
         db,
@@ -540,9 +600,9 @@ pub fn resolve_issue_store(
 
 /// Resolve the issue store of a session bound to `binding`.
 ///
-/// A GitHub binding uses the GitHub store when its project keeps issues on
-/// GitHub and the local store otherwise; a local binding always uses the
-/// local store, keyed by its repository identity. Without a binding the
+/// A forge binding uses the remote store when its project keeps issues on
+/// that forge and the local store otherwise; a local binding always uses
+/// the local store, keyed by its repository identity. Without a binding the
 /// working directory decides ([`resolve_issue_store`]).
 ///
 /// # Errors
@@ -553,64 +613,53 @@ pub fn resolve_bound_issue_store(
     binding: Option<&crate::session::RepoBinding>,
     cwd: &Path,
     workspace_config_path: &Path,
+    may_config: &crate::config::MayConfig,
+    forge_auth: &crate::forge::LiveForgeAuth,
     db: ChatDb,
 ) -> Result<ResolvedIssueStore, IssueError> {
     use crate::session::RepoBinding;
     match binding {
-        None => resolve_issue_store(cwd, workspace_config_path, db),
+        None => resolve_issue_store(cwd, workspace_config_path, forge_auth, db),
         Some(RepoBinding::Local(identity)) => Ok(ResolvedIssueStore::May(MayIssueStore::new(
             db,
             identity.display().to_string(),
         ))),
-        Some(RepoBinding::Github(repository)) => {
+        Some(RepoBinding::Forge(repository)) => {
             let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
-            if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
-                .project_for_github(repository)
-                .map(|project| &project.issues)
+            let project = config.project_for_forge(repository, may_config);
+            if let Some(store) =
+                project.and_then(|project| remote_issue_store(&project.issues, forge_auth))
             {
-                return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
-                    repository.clone(),
-                    GhCliTokenSource,
-                )));
+                return Ok(store);
             }
             // Issues kept internal have one key per repository, whatever
             // directory the session runs in: the identity of the project's
             // checkout when the workspace names one, else the repository.
-            let key = match config
-                .project_for_github(repository)
-                .and_then(|project| project.path.as_deref())
-            {
+            let key = match project.and_then(|project| project.path.as_deref()) {
                 Some(path) => repository_identity(path)?.display().to_string(),
-                None => format!("github:{repository}"),
+                None => repository.canonical_binding(),
             };
             Ok(ResolvedIssueStore::May(MayIssueStore::new(db, key)))
         }
     }
 }
 
-/// The GitHub repository the workspace config assigns the project with
+/// The issue store the workspace config assigns the project with
 /// `identity`, or `None` when the project has no entry or keeps its issues
 /// locally.
 ///
 /// # Errors
 /// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
 /// be loaded.
-pub(crate) fn project_github_repository(
+pub(crate) fn project_issue_store(
     identity: &Path,
     workspace_config_path: &Path,
-) -> Result<Option<crate::workspace::GitHubRepository>, IssueError> {
+    forge_auth: &crate::forge::LiveForgeAuth,
+) -> Result<Option<ResolvedIssueStore>, IssueError> {
     let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
-    Ok(
-        match config
-            .project_for_identity(identity)
-            .map(|project| &project.issues)
-        {
-            Some(crate::workspace::ProjectIssues::Github { repository }) => {
-                Some(repository.clone())
-            }
-            _ => None,
-        },
-    )
+    Ok(config
+        .project_for_identity(identity)
+        .and_then(|project| remote_issue_store(&project.issues, forge_auth)))
 }
 
 /// The repository identity an issue namespace is keyed by.
@@ -676,8 +725,15 @@ mod tests {
         let config_path = dir.path().join("workspace.toml");
         let key = |cwd: &std::path::Path| {
             super::IssueStore::search_key(
-                &super::resolve_bound_issue_store(Some(&binding), cwd, &config_path, db.clone())
-                    .expect("store"),
+                &super::resolve_bound_issue_store(
+                    Some(&binding),
+                    cwd,
+                    &config_path,
+                    &crate::config::MayConfig::default(),
+                    &crate::forge::LiveForgeAuth::default(),
+                    db.clone(),
+                )
+                .expect("store"),
             )
         };
 
@@ -723,15 +779,25 @@ mod tests {
             .await
             .expect("db");
 
-        let resolved =
-            resolve_issue_store(&repo, &config_path, db.clone()).expect("existing project");
+        let resolved = resolve_issue_store(
+            &repo,
+            &config_path,
+            &crate::forge::LiveForgeAuth::default(),
+            db.clone(),
+        )
+        .expect("existing project");
         let ResolvedIssueStore::GitHub(store) = resolved else {
             panic!("the existing project resolves to its GitHub store");
         };
         assert_eq!(store.repository().to_string(), "owner/repo");
 
-        let resolved =
-            resolve_issue_store(&elsewhere, &config_path, db).expect("unconfigured directory");
+        let resolved = resolve_issue_store(
+            &elsewhere,
+            &config_path,
+            &crate::forge::LiveForgeAuth::default(),
+            db,
+        )
+        .expect("unconfigured directory");
         assert!(matches!(resolved, ResolvedIssueStore::May(_)));
     }
 }

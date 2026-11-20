@@ -28,7 +28,6 @@ use may_agent::session::{
 use may_agent::tools::{HostProgram, ToolTarget};
 use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
-use serial_test::file_serial;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
@@ -1380,9 +1379,6 @@ impl TestHarness {
         tier_models: Option<&str>,
         context: ContextConfig,
     ) -> Self {
-        // A killed earlier run left agents of homes that no longer exist.
-        may_agent::repo_search::sweep_stale_relocated_agents()
-            .expect("sweeping stale relocated-home agents should succeed");
         let home = tempfile::tempdir().expect("test home tempdir should be created");
         let home_path = dunce::canonicalize(home.path()).expect("test home should resolve");
         let may_dir = home_path.join(".may");
@@ -1437,14 +1433,16 @@ impl TestHarness {
         )
         .expect("host gitconfig should be written");
 
+        let home_paths = MayHomePaths::new(may_dir.clone());
         futures_lite::future::zip(
             futures_lite::future::zip(
-                share_and_warm_tool_cache(&may_dir),
-                share_and_warm_host_programs(&may_dir),
+                share_tool_cache(&home_paths),
+                share_host_program_cache(&home_paths),
             ),
             warm_may_binary(&home_path),
         )
         .await;
+        ensure_shared_tools_prepared(&home_paths).await;
 
         Self {
             _home: home,
@@ -1709,17 +1707,34 @@ fn shared_download_root() -> PathBuf {
         .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
 }
 
-/// Points the test home's tool cache at one cache shared by every test run
-/// and prepares the host's baseline tools and `heel` in it through the
-/// embedded distribution, so the first hash-verified download happens here
-/// instead of inside a server's readiness deadline. Later runs reuse the
-/// cached artifacts.
-async fn share_and_warm_tool_cache(may_dir: &Path) {
+/// The marker a prepared shared tool cache carries, named for the same pin
+/// files the Actions cache key hashes, so a cache restored from another pin
+/// set prepares again instead of serving stale tools.
+fn shared_cache_ready_marker(shared: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for name in [
+        "third-party-tools.json",
+        "tool-artifacts.json",
+        "host-programs.json",
+    ] {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/tools")
+                .join(name),
+        )
+        .expect("tool pin file should read")
+        .hash(&mut hasher);
+    }
+    shared.join(format!(".ready-{:016x}", hasher.finish()))
+}
+
+/// Points the test home's tool cache at the one every test run shares.
+async fn share_tool_cache(home_paths: &MayHomePaths) {
     let shared = shared_download_root().join("may-tools");
     tokio::fs::create_dir_all(&shared)
         .await
         .expect("shared tool cache dir should be created");
-    let home_paths = MayHomePaths::new(may_dir.to_path_buf());
     #[cfg(unix)]
     tokio::fs::symlink(&shared, home_paths.tools_dir())
         .await
@@ -1728,37 +1743,17 @@ async fn share_and_warm_tool_cache(may_dir: &Path) {
     tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
         .await
         .expect("test home tool cache should link to the shared cache");
-    let distribution =
-        may_agent::tools::embedded_distribution().expect("embedded distribution should validate");
-    let tools_dir = home_paths.tools_dir();
-    let (bundle, heel) = futures_lite::future::zip(
-        distribution.load(
-            &ToolTarget::native().expect("test host should have a tool target"),
-            &home_paths.tool_artifacts_dir(),
-        ),
-        may_agent::tools::prepare_heel(&distribution, &tools_dir),
-    )
-    .await;
-    heel.expect("the distribution's heel should download and verify");
-    let bundle = bundle.expect("baseline tool artifacts should download and verify");
-    bundle
-        .prepare_local(&home_paths.tool_runtimes_dir())
-        .await
-        .expect("baseline tools should prepare");
 }
 
-/// Points the test home's host-program cache at one cache shared by every
-/// test run and prepares the pinned repo-search binary in it, so a daemon's
-/// first search request reuses a hash-verified executable instead of
-/// downloading it again for every home.
-async fn share_and_warm_host_programs(may_dir: &Path) {
+/// Points the test home's host-program cache at the shared repo-search binary.
+async fn share_host_program_cache(home_paths: &MayHomePaths) {
     let shared = shared_download_root()
         .join("may-tools")
         .join("host-programs");
     tokio::fs::create_dir_all(&shared)
         .await
         .expect("shared host-program cache dir should be created");
-    let cache = MayHomePaths::new(may_dir.to_path_buf()).host_programs_dir();
+    let cache = home_paths.host_programs_dir();
     tokio::fs::create_dir_all(cache.parent().expect("host-program cache has a parent"))
         .await
         .expect("test home cache dir should be created");
@@ -1770,15 +1765,53 @@ async fn share_and_warm_host_programs(may_dir: &Path) {
     tokio::fs::symlink_dir(&shared, &cache)
         .await
         .expect("test home host-program cache should link to the shared cache");
-    may_agent::tools::embedded_distribution()
-        .expect("embedded distribution should validate")
+}
+
+/// Prepares the shared cache exactly once per run, behind a lock file in it:
+/// the first test through the lock verifies and extracts the pinned
+/// distribution and host programs and sweeps the agents a killed earlier run
+/// left loaded; the rest see the ready marker and only pay their own links.
+/// `home_paths` is the caller that lost the race — its tools and
+/// host-program dirs link into the shared cache the work lands in.
+async fn ensure_shared_tools_prepared(home_paths: &MayHomePaths) {
+    let shared = shared_download_root().join("may-tools");
+    let ready = shared_cache_ready_marker(&shared);
+    if ready.exists() {
+        return;
+    }
+    let lock =
+        std::fs::File::create(shared.join(".prepare.lock")).expect("shared cache lock should open");
+    lock.lock().expect("shared cache lock should be held");
+    if ready.exists() {
+        return;
+    }
+    may_agent::repo_search::sweep_stale_relocated_agents()
+        .expect("sweeping stale relocated-home agents should succeed");
+    let distribution =
+        may_agent::tools::embedded_distribution().expect("embedded distribution should validate");
+    let (bundle, heel) = futures_lite::future::zip(
+        distribution.load(
+            &ToolTarget::native().expect("test host should have a tool target"),
+            &home_paths.tool_artifacts_dir(),
+        ),
+        may_agent::tools::prepare_heel(&distribution, &home_paths.tools_dir()),
+    )
+    .await;
+    heel.expect("the distribution's heel should download and verify");
+    let bundle = bundle.expect("baseline tool artifacts should download and verify");
+    bundle
+        .prepare_local(&home_paths.tool_runtimes_dir())
+        .await
+        .expect("baseline tools should prepare");
+    distribution
         .prepare_host_program(
             HostProgram::RepoSearch,
             &ToolTarget::native().expect("test host should have a tool target"),
-            &cache,
+            &home_paths.host_programs_dir(),
         )
         .await
         .expect("the repo-search host program should download and verify");
+    std::fs::write(&ready, []).expect("ready marker should be written");
 }
 
 /// The daemon's shutdown drains runs for up to 30 s and settles cancelled
@@ -2316,19 +2349,29 @@ async fn create_session_via_api(
 /// returns its id. The id stays short on purpose: it becomes part of the
 /// session container's name, which Linux caps as a hostname at 63 bytes.
 async fn create_container_profile(harness: &TestHarness) -> String {
+    // The profile's id and name feed the session and task container names,
+    // and every test in this pool shares the host's one Docker daemon, so
+    // each harness names its own or their containers would collide.
+    static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
         .await
         .expect("session persistence should initialize");
+    let key = format!(
+        "e2e-{}-{}",
+        std::process::id(),
+        NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     if let Some(existing) = db
-        .get_profile("e2e-container")
+        .get_profile(&key)
         .await
         .expect("profile lookup should succeed")
     {
         return existing.id;
     }
     db.create_profile(CreateProfileParams {
-        id: "e2e-container",
-        name: "e2e-container",
+        id: &key,
+        name: &key,
         environment: ProfileEnvironmentKind::Container,
         slug: None,
         icon: None,
@@ -2406,7 +2449,6 @@ fn extract_stored_output_path(text: &str) -> Option<PathBuf> {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn the_harness_config_never_lets_a_daemon_update_itself() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -2421,7 +2463,6 @@ async fn the_harness_config_never_lets_a_daemon_update_itself() {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -2508,7 +2549,6 @@ async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn a_user_who_does_not_sign_commits_unsigned_as_themselves_in_the_sandbox() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -2532,7 +2572,6 @@ async fn a_user_who_does_not_sign_commits_unsigned_as_themselves_in_the_sandbox(
 }
 
 #[tokio::test]
-#[file_serial]
 async fn a_user_who_signs_has_sandbox_commits_signed_through_the_harness() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -2567,7 +2606,6 @@ async fn a_user_who_signs_has_sandbox_commits_signed_through_the_harness() {
 /// heel's strict filesystem grants.
 #[cfg(unix)]
 #[tokio::test]
-#[file_serial]
 async fn a_terminal_command_runs_and_writes_in_the_session_directory_when_home_is_a_symlink() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::RunsScript(
         "cd \"$(pwd)\" && printf written > symlink-home-probe && cat symlink-home-probe",
@@ -2640,7 +2678,6 @@ fn command_table_alerts(request: &Value) -> Vec<String> {
 /// once, and the model hears of it once, as a diff, while the cached prefix
 /// stays as it was sent.
 #[tokio::test]
-#[file_serial]
 async fn a_tool_an_mcp_server_adds_mid_session_runs_and_is_announced_once() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::AddsMcpTool).await;
     let harness = TestHarness::new(&mock.base_url()).await;
@@ -2769,7 +2806,6 @@ async fn exec_script(
 }
 
 #[tokio::test]
-#[file_serial]
 async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_sandbox() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -2900,7 +2936,6 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
 }
 
 #[tokio::test]
-#[file_serial]
 async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -2951,7 +2986,6 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn ui_session_crud_round_trip_matches_api_contract() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
@@ -3060,7 +3094,6 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
 /// while `PUT /tasks` lands on disk where the next model request's tasks
 /// injection reads it.
 #[tokio::test]
-#[file_serial]
 async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     const MODEL_WRITTEN: &str = "## Notes\nreport shipped\n";
     const REWRITTEN: &str = "## Doing\n- rewritten plan\n";
@@ -3402,7 +3435,6 @@ fn near_compaction_user_turn() -> String {
 const FORK_FILLER_REPEATS: usize = 32_500;
 
 #[tokio::test]
-#[file_serial]
 async fn a_fork_continues_the_main_agents_context() {
     let probe = run_probe_turn(MockChatScenario::ForkProbe, "Run the fork probe.").await;
     assert_fork_continues(probe).await;
@@ -3411,7 +3443,6 @@ async fn a_fork_continues_the_main_agents_context() {
 /// The session runs on the balanced tier's model, which is not the configured
 /// advanced model.
 #[tokio::test]
-#[file_serial]
 async fn a_fork_on_a_non_advanced_session_model_succeeds() {
     let probe = run_probe_turn_on(
         MockChatScenario::ForkProbe,
@@ -3424,7 +3455,6 @@ async fn a_fork_on_a_non_advanced_session_model_succeeds() {
 
 /// The session's model belongs to none of the configured tiers.
 #[tokio::test]
-#[file_serial]
 async fn a_fork_on_a_model_in_no_tier_succeeds() {
     let probe = run_probe_turn_on(
         MockChatScenario::ForkProbe,
@@ -3477,7 +3507,6 @@ async fn assert_fork_continues((files, mock): (ProbeFiles, MockOpenAiServer)) {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn a_fork_near_the_compaction_point_returns_the_compact_first_error() {
     let (files, mock) =
         run_probe_turn(MockChatScenario::ForkProbe, &near_compaction_user_turn()).await;
@@ -3508,7 +3537,6 @@ const WORKTREE_FINAL: &str = "git -C repo rev-parse subagent/s1/work > tip.after
 const CHILD_COMMIT: &str = "cd ../../wt && echo x > f.txt && echo WROTE_FILE && git add f.txt && git -c user.name=c -c user.email=c@e commit -q -m 'child commit'; echo CHILD_RC=$?";
 
 #[tokio::test]
-#[file_serial]
 async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
     // The fixture is well-formed free text under `## Notes`: the run loop
     // holds the turn open while tasks.md breaks its format or has open rows.
@@ -3539,7 +3567,6 @@ async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
@@ -3576,7 +3603,6 @@ async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
 /// 512 KiB stack on macOS without a configured worker stack. The result
 /// reports the tier and model the routing picked.
 #[tokio::test]
-#[file_serial]
 async fn general_is_routed_by_the_fast_model_and_reports_the_pick() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: ":",
@@ -3639,7 +3665,6 @@ const SUBAGENT_NAMES: [&str; 7] = [
 
 /// `subagent` alone runs nothing and fails with the list of subcommands.
 #[tokio::test]
-#[file_serial]
 async fn subagent_without_a_subcommand_fails_with_the_list() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: ":",
@@ -3672,7 +3697,6 @@ async fn subagent_without_a_subcommand_fails_with_the_list() {
 /// Every subcommand runs on its tier's model; only `general`, given a
 /// worktree, writes outside its scratch directory, and only there.
 #[tokio::test]
-#[file_serial]
 async fn each_subcommand_runs_on_its_model_and_only_general_writes_the_workspace() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
@@ -3742,7 +3766,6 @@ async fn each_subcommand_runs_on_its_model_and_only_general_writes_the_workspace
 }
 
 #[tokio::test]
-#[file_serial]
 async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listing() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
@@ -3786,7 +3809,6 @@ async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listin
 /// cause survives: the failing request must be logged at error level with the
 /// underlying error.
 #[tokio::test]
-#[file_serial]
 async fn daemon_error_logs_its_cause() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
@@ -3843,13 +3865,11 @@ async fn daemon_error_logs_its_cause() {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
     stream_stop_mid_response_persists_partial_assistant_text(ChatEnvironment::Local).await;
 }
 
 #[tokio::test]
-#[file_serial]
 #[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn ui_stream_stop_mid_response_persists_partial_assistant_text_in_container() {
     stream_stop_mid_response_persists_partial_assistant_text(ChatEnvironment::Container).await;
@@ -3957,7 +3977,6 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
 }
 
 #[tokio::test]
-#[file_serial]
 async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
     terminal_and_terminal_input_round_trip(ChatEnvironment::Local).await;
 }
@@ -3967,7 +3986,6 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
 /// container's bridge route — and the model sees the container environment
 /// context.
 #[tokio::test]
-#[file_serial]
 #[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn ui_chat_executes_terminal_and_terminal_input_round_trip_in_container() {
     terminal_and_terminal_input_round_trip(ChatEnvironment::Container).await;
@@ -4006,7 +4024,9 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         &client,
         &server,
         &session_id,
-        Duration::from_secs(10) + environment.first_turn_allowance(),
+        // The first terminal dispatch competes with the rest of the parallel
+        // pool for the runner's CPU, and 10s was observed to be too tight.
+        Duration::from_secs(30) + environment.first_turn_allowance(),
         "terminal runtime to expose taskId and outputFile",
         |runtime| {
             let terminal = runtime
@@ -4120,7 +4140,6 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
 /// what the previous turn cached is recorded as one expired-cache miss, and
 /// `/usage` reports it; the warm turns before it record none.
 #[tokio::test]
-#[file_serial]
 async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
     const LIFETIME: Duration = Duration::from_secs(2);
     let mock = MockOpenAiServer::spawn(MockChatScenario::CachedTextEveryTurn {
@@ -4210,13 +4229,11 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn ui_chat_turns_on_one_session_prepare_tools_once() {
     chat_turns_on_one_session_prepare_tools_once(ChatEnvironment::Local).await;
 }
 
 #[tokio::test]
-#[file_serial]
 #[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn ui_chat_turns_on_one_session_prepare_tools_once_in_container() {
     chat_turns_on_one_session_prepare_tools_once(ChatEnvironment::Container).await;
@@ -4303,7 +4320,6 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
 /// the same provider: it completes without an error after one announced wait,
 /// and the failed attempt never reaches history.
 #[tokio::test]
-#[file_serial]
 async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
     // The aither OpenAI client retries a retryable failure three times
     // before it surfaces to the turn.
@@ -4374,7 +4390,6 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[file_serial]
 async fn ui_linux_runtime_has_heel_env_for_sandbox_stdin_detection() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TerminalRoundTrip).await;
     let harness = TestHarness::new(&mock.base_url()).await;
@@ -4465,7 +4480,6 @@ const IO_BACKGROUND: i32 = 3 << 13; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)
 /// CPU nice level and I/O policy, and the probe's own child must inherit both.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
-#[file_serial]
 async fn exec_applies_local_command_priority() {
     let probe = priority_probe_command().await;
 
@@ -4597,7 +4611,6 @@ fn pinned_version(entries: &str, tool: Option<&str>) -> String {
 /// from a cache keyed on the pins.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
-#[file_serial]
 #[ignore = "downloads the pinned tools; run by the verify-tools CI job"]
 async fn the_baseline_tools_pass_their_acceptance_script_in_the_sandbox() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
@@ -4651,7 +4664,6 @@ async fn the_baseline_tools_pass_their_acceptance_script_in_the_sandbox() {
 /// job have.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[file_serial]
 #[ignore = "needs Docker; run by the container-acceptance CI job"]
 async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("unused".to_string())).await;
@@ -4729,7 +4741,6 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
 /// A chat turn against a provider nobody listens on must end with the
 /// provider's error on the stream, and the server must survive it.
 #[tokio::test]
-#[file_serial]
 async fn ui_chat_reports_unreachable_provider_error() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let mut server = RunningDaemon::spawn(harness.home_path(), &[]).await;
@@ -4917,14 +4928,12 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
 }
 
 #[tokio::test]
-#[file_serial]
 #[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn container_profile_inline_script_task_reads_its_trigger_file() {
     container_task_reads_its_trigger_file(TaskScriptSource::Inline).await;
 }
 
 #[tokio::test]
-#[file_serial]
 #[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn container_profile_script_file_task_reads_its_trigger_file() {
     container_task_reads_its_trigger_file(TaskScriptSource::File).await;
@@ -4970,7 +4979,6 @@ fn only_open_question_id(runtime: &Value) -> String {
 /// question stays open in the runtime summary, and an answer after the run is
 /// committed and then starts a follow-up run that sees its text.
 #[tokio::test]
-#[file_serial]
 async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::AsksUser).await;
     let harness = TestHarness::new(&mock.base_url()).await;
@@ -5060,7 +5068,6 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
 /// first and reaches the model in that run's next request, not the one
 /// already sent.
 #[tokio::test]
-#[file_serial]
 async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
     // Agent request 0 asks; request 1 follows the command result and is held.
     let gate = RequestGate::holding(1);
@@ -5185,7 +5192,6 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
 /// A one-shot run whose turn ends on a detached command stays attached,
 /// streams the turn that command's result starts, and exits only after it.
 #[tokio::test]
-#[file_serial]
 async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
@@ -5248,7 +5254,6 @@ async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
 }
 
 #[tokio::test]
-#[file_serial]
 async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     // The reply pauses longer than a model's typical think after its first
     // text; the run still ends only when the turn does.
@@ -5305,7 +5310,6 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
 /// ends right after them, reaches a one-shot run whole: the run prints every
 /// delta through the turn's end however far its event stream falls behind.
 #[tokio::test]
-#[file_serial]
 async fn oneshot_run_prints_a_burst_turn_through_its_end() {
     const DELTAS: usize = 6_000;
     let chunks = (0..DELTAS)
@@ -5385,7 +5389,6 @@ fn launchd_job_loaded(label: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-#[file_serial]
 async fn temp_home_daemon_leaves_no_repo_search_job_after_it_stops() {
     use repo_search_client::launcher::launchd::labels_for;
 
@@ -5462,7 +5465,6 @@ async fn install_repo_search_agents(
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-#[file_serial]
 async fn a_killed_temp_home_daemons_agents_are_swept_by_the_next_daemon_start() {
     use repo_search_client::launcher::launchd::{LABEL, SERVER_LABEL, labels_for};
 
@@ -5542,7 +5544,6 @@ fn background_job<'a>(background: &'a Value, script: &str) -> Option<&'a Value> 
 }
 
 #[tokio::test]
-#[file_serial]
 async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
@@ -5660,7 +5661,6 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
 /// own, in which the model sees the job's output; meanwhile the session is
 /// idle, so the user is free to send messages.
 #[tokio::test]
-#[file_serial]
 async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
@@ -5789,7 +5789,6 @@ fn frame_index(event: &TestSseEvent) -> u64 {
 /// only the frames after it; one that missed frames of a turn that already
 /// ended is told to reload the session.
 #[tokio::test]
-#[file_serial]
 async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: (0..12).map(|index| format!("chunk-{index} ")).collect(),
@@ -5893,7 +5892,6 @@ fn compaction_probe_user_turn() -> String {
 /// is persisted with the context snapshot, and is what a restarted daemon
 /// resumes from.
 #[tokio::test]
-#[file_serial]
 async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(CompactionProbe::Lands)).await;
@@ -5985,7 +5983,6 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
 /// A compaction that fails at the pause point is cleaned up and rerun, and
 /// the run shows both in its agent frames.
 #[tokio::test]
-#[file_serial]
 async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(
         CompactionProbe::FailsThenLands,
@@ -6062,7 +6059,6 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
 /// An explicit compaction on an idle session reaches every client of the
 /// session as a `session_compaction` start and an applied finish.
 #[tokio::test]
-#[file_serial]
 async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(
         CompactionProbe::LandsAtOnce,
@@ -6132,7 +6128,6 @@ async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events(
 /// A command run through `may exec` draws its jobs from the daemon's
 /// machine-wide pool: it can take every token of the pool, and no more.
 #[tokio::test]
-#[file_serial]
 async fn exec_commands_draw_from_the_daemons_job_pool() {
     const POOL: i64 = 3;
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
@@ -6164,7 +6159,6 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
 /// local ones: while a container command holds every token, a local command
 /// gets none.
 #[tokio::test]
-#[file_serial]
 #[ignore = "pulls the workspace image; run by the container-acceptance CI job"]
 async fn container_and_local_commands_share_the_daemons_job_pool() {
     const POOL: i64 = 3;
@@ -6360,7 +6354,6 @@ fn killed_job_word(output: &std::process::Output) -> String {
 /// the daemon holds is never handed to exec, and a word exec holds is never
 /// handed out by the daemon.
 #[tokio::test]
-#[file_serial]
 async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec!["unused".to_string()],
@@ -6453,7 +6446,6 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
 /// its result; the subagent's writes to the workspace, `tasks.md` and issues
 /// are refused.
 #[tokio::test]
-#[file_serial]
 async fn explore_runs_read_only_on_the_fast_model() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: "printf -- '## Notes\\noriginal\\n' > tasks.md",
@@ -6569,7 +6561,6 @@ async fn start_background_job(
 /// the next daemon start ends the command, and since the session's prompt
 /// cache is warm its agent starts again at once with the alert.
 #[tokio::test]
-#[file_serial]
 async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_session() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
@@ -6615,7 +6606,6 @@ async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_sessio
 /// has since gone cold: nothing runs at the next start, and the user's next
 /// message carries the alert.
 #[tokio::test]
-#[file_serial]
 async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
     // Agent request 1, the second turn's, is held so the daemon dies in it.
     let gate = RequestGate::holding(1);
@@ -6731,7 +6721,6 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
 /// interrupted before it serves anyone, so the follow-up message is admitted
 /// only when nothing restarted, and it carries no alert.
 #[tokio::test]
-#[file_serial]
 async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
@@ -6806,7 +6795,6 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
 /// A daemon stopped through its shutdown path owes no session the alert:
 /// nothing starts at the next start, and the next message carries none.
 #[tokio::test]
-#[file_serial]
 async fn a_graceful_stop_does_not_alert() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;

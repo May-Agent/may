@@ -21,7 +21,7 @@ use crate::host_git::HostGit;
 use crate::repo_clone::{RepoCloneError, SessionRepos};
 use crate::repo_preflight::{Choice, PreflightError};
 use crate::session::{BindingError, RepoBinding};
-use crate::trust::{GitHubProbe, RepoKind};
+use crate::trust::{ForgeProbe, RepoKind};
 use crate::workspace::WorkspaceConfigError;
 
 /// Puts a question to the user and waits for the answers.
@@ -79,10 +79,15 @@ pub struct RepoGate<'a, A, P> {
     pub host: &'a HostGit,
     /// Who the questions go to.
     pub asker: &'a A,
-    /// Reads GitHub repository access while default trust is derived.
-    pub github: &'a P,
+    /// Reads forge repository access while default trust is derived.
+    pub probe: &'a P,
+    /// The live forge authenticator clones authenticate with.
+    pub forge_auth: &'a crate::forge::LiveForgeAuth,
     /// The `workspace.toml` that holds the trust decisions.
     pub config_path: &'a Path,
+    /// The daemon configuration: its `[forge]` map resolves a self-hosted
+    /// remote's kind.
+    pub may_config: &'a crate::config::MayConfig,
     /// The session's sandbox root, where its clones live.
     pub session_root: &'a Path,
     /// Host scratch space new clones are made in.
@@ -97,24 +102,45 @@ impl<A, P> std::fmt::Debug for RepoGate<'_, A, P> {
     }
 }
 
-impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
+impl<A: Asker + Sync, P: ForgeProbe + Sync> RepoGate<'_, A, P> {
     /// Run the gate for `session_id`.
     ///
     /// # Errors
     /// Fails when the session, its configuration or its checkout cannot be
     /// read, a clone cannot be made, or the user cannot be asked.
     pub async fn run(&self, session_id: &str) -> Result<Verdict, GateError> {
+        let started = std::time::Instant::now();
+        tracing::debug!(session_id, "repo gate: start");
+        let verdict = self.gate(session_id).await;
+        match &verdict {
+            Ok(verdict) => tracing::info!(
+                session_id,
+                ?verdict,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "repo gate: done"
+            ),
+            Err(error) => tracing::info!(
+                session_id,
+                %error,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "repo gate: failed"
+            ),
+        }
+        verdict
+    }
+
+    async fn gate(&self, session_id: &str) -> Result<Verdict, GateError> {
         let Some(row) = self.db.get_session(session_id).await? else {
             return Ok(Verdict::Proceed);
         };
         let non_interactive = row.non_interactive;
         match row.repo.as_deref().map(RepoBinding::parse).transpose()? {
-            Some(RepoBinding::Github(repository)) => match row.cwd {
+            Some(RepoBinding::Forge(repository)) => match row.cwd {
                 Some(cwd) => {
                     self.gate_bound_checkout(session_id, cwd, &repository, non_interactive)
                         .await
                 }
-                None => self.decide_remote_trust(&repository.to_string()).await,
+                None => self.decide_remote_trust(&repository).await,
             },
             Some(RepoBinding::Local(identity)) => match row.cwd {
                 Some(cwd) => {
@@ -140,25 +166,34 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
         }
     }
 
-    /// A GitHub repository bound with no checkout: resolve its trust —
+    /// A forge repository bound with no checkout: resolve its trust —
     /// persisted, or derived from the viewer's access — and proceed.
-    async fn decide_remote_trust(&self, owner_repo: &str) -> Result<Verdict, GateError> {
-        crate::trust::resolve_github_remote(self.config_path, owner_repo, self.github).await?;
+    async fn decide_remote_trust(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> Result<Verdict, GateError> {
+        crate::trust::resolve_forge_remote(
+            self.config_path,
+            repository,
+            self.may_config,
+            self.probe,
+        )
+        .await?;
         Ok(Verdict::Proceed)
     }
 
-    /// A GitHub-bound session that keeps its launch checkout: rebind
+    /// A forge-bound session that keeps its launch checkout: rebind
     /// through the checkout when the remote clone the binding names was
     /// never made, or when the checkout's persisted trust no longer
-    /// publishes to GitHub — `/permission` switching to `local-branch` or
-    /// `local` moves the session to `local:<identity>`. A session whose
+    /// publishes to the forge — `/permission` switching to `local-branch`
+    /// or `local` moves the session to `local:<identity>`. A session whose
     /// remote clone exists under a still-publishing trust proceeds
     /// untouched.
     async fn gate_bound_checkout(
         &self,
         session_id: &str,
         cwd: String,
-        repository: &crate::workspace::GitHubRepository,
+        repository: &crate::forge::ForgeRepo,
         non_interactive: bool,
     ) -> Result<Verdict, GateError> {
         let demoted = {
@@ -166,11 +201,11 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
             blocking::unblock(move || crate::trust::persisted_level(Path::new(&dir), &config_path))
                 .await?
         }
-        .is_some_and(|level| !level.publishes_to_github());
+        .is_some_and(|level| !level.publishes_to_forge());
         if !demoted {
             let repos = SessionRepos::new(self.session_root, session_id, self.db.clone())
                 .with_host(self.host.clone());
-            if repos.clone_for(&repository.to_string()).await?.is_some() {
+            if repos.clone_for(&repository.cache_key()).await?.is_some() {
                 return Ok(Verdict::Proceed);
             }
         }
@@ -198,9 +233,8 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
         let Some((worktree, identity)) = found else {
             return Ok(Verdict::Proceed);
         };
-        let level =
-            crate::trust::resolve_checkout(self.config_path, &worktree, self.github).await?;
-        if level.publishes_to_github()
+        let level = crate::trust::resolve_checkout(self.config_path, &worktree, self.probe).await?;
+        if level.publishes_to_forge()
             && let Some(verdict) = self
                 .preflight(session_id, &worktree, &identity, non_interactive)
                 .await?
@@ -208,10 +242,12 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
             return Ok(verdict);
         }
         let binding = {
-            let worktree = worktree.clone();
-            blocking::unblock(move || RepoBinding::for_trust(&worktree, level))
-                .await
-                .map_err(|error| GateError::Identity(error.to_string()))?
+            let (worktree, may_config) = (worktree.clone(), self.may_config.clone());
+            blocking::unblock(move || {
+                RepoBinding::for_trust_with_config(&worktree, level, &may_config)
+            })
+            .await
+            .map_err(|error| GateError::Identity(error.to_string()))?
         };
         self.bind(session_id, &binding).await?;
         Ok(Verdict::Proceed)
@@ -228,16 +264,20 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
         identity: &Path,
         non_interactive: bool,
     ) -> Result<Option<Verdict>, GateError> {
-        let RepoKind::Github { owner_repo } = ({
-            let worktree = worktree.to_path_buf();
-            blocking::unblock(move || crate::trust::repo_kind(&worktree)).await
+        let RepoKind::Forge { repo } = ({
+            let (worktree, may_config) = (worktree.to_path_buf(), self.may_config.clone());
+            blocking::unblock(move || crate::trust::repo_kind_with_config(&worktree, &may_config))
+                .await
         }) else {
             return Ok(None);
         };
+        let owner_repo = repo.host_and_path();
         let repos = SessionRepos::new(self.session_root, session_id, self.db.clone())
-            .with_host(self.host.clone());
+            .with_host(self.host.clone())
+            .with_may_config(self.may_config.clone())
+            .with_forge_auth(self.forge_auth.clone());
         let identity_key = identity.to_string_lossy();
-        if repos.clone_for(&owner_repo).await?.is_some()
+        if repos.clone_for(&repo.cache_key()).await?.is_some()
             || repos.clone_for(&identity_key).await?.is_some()
         {
             return Ok(None);
@@ -248,10 +288,17 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
                 worktree.to_path_buf(),
                 self.remote.to_string(),
             );
-            blocking::unblock(move || {
+            let started = std::time::Instant::now();
+            let inspected = blocking::unblock(move || {
                 crate::repo_preflight::inspect_against(&host, &worktree, &remote)
             })
-            .await
+            .await;
+            tracing::debug!(
+                session_id,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "repo gate: checkout state inspected"
+            );
+            inspected
         };
         let state = match inspected {
             Ok(state) => state,
@@ -269,6 +316,12 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
         if !state.needs_choice() || non_interactive {
             return Ok(None);
         }
+        tracing::info!(
+            session_id,
+            worktree = %worktree.display(),
+            ?state,
+            "repo gate: checkout state needs a choice; asking"
+        );
         let answers = self
             .asker
             .ask(crate::repo_preflight::question(
@@ -279,12 +332,7 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
             .await?;
         match answers.first().and_then(Choice::of_answer) {
             Some(Choice::Remote) => {
-                let repository = owner_repo.parse().map_err(
-                    |error: crate::workspace::GitHubRepositoryError| {
-                        GateError::Identity(error.to_string())
-                    },
-                )?;
-                self.bind(session_id, &RepoBinding::Github(repository))
+                self.bind(session_id, &RepoBinding::Forge(repo.clone()))
                     .await?;
                 Ok(Some(Verdict::Proceed))
             }
@@ -313,14 +361,9 @@ impl<A: Asker + Sync, P: GitHubProbe + Sync> RepoGate<'_, A, P> {
                     .map_err(|error| GateError::Identity(error.to_string()))?
                 };
                 repos
-                    .ensure_remote_wip_clone(url.trim(), &owner_repo, self.staging, worktree)
+                    .ensure_remote_wip_clone(url.trim(), &repo.cache_key(), self.staging, worktree)
                     .await?;
-                let repository = owner_repo.parse().map_err(
-                    |error: crate::workspace::GitHubRepositoryError| {
-                        GateError::Identity(error.to_string())
-                    },
-                )?;
-                self.bind(session_id, &RepoBinding::Github(repository))
+                self.bind(session_id, &RepoBinding::Forge(repo.clone()))
                     .await?;
                 Ok(Some(Verdict::Proceed))
             }
@@ -396,10 +439,10 @@ mod tests {
         }
     }
 
-    impl crate::trust::GitHubProbe for Probe {
+    impl crate::trust::ForgeProbe for Probe {
         fn repository_access(
             &self,
-            _repository: &crate::workspace::GitHubRepository,
+            _repository: &crate::forge::ForgeRepo,
         ) -> impl Future<
             Output = Result<crate::issue::github::RepositoryAccess, crate::issue::IssueError>,
         > + Send {
@@ -554,8 +597,8 @@ mod tests {
             crate::trust::persist(
                 &self.config_path,
                 &self.checkout,
-                Some(&RepoKind::Github {
-                    owner_repo: "acme/app".to_string(),
+                Some(&RepoKind::Forge {
+                    repo: crate::forge::ForgeRepo::parse_binding("github:acme/app").unwrap(),
                 }),
                 level,
             )
@@ -570,12 +613,16 @@ mod tests {
             let host = HostGit::from_file(config);
             let staging = self.root().join("staging");
             let remote = self.origin.to_str().unwrap().to_string();
+            let may_config = crate::config::MayConfig::default();
+            let forge_auth = crate::forge::LiveForgeAuth::default();
             RepoGate {
                 db: &self.db,
                 host: &host,
                 asker,
-                github: &self.probe,
+                probe: &self.probe,
+                forge_auth: &forge_auth,
                 config_path: &self.config_path,
+                may_config: &may_config,
                 session_root: &self.root().join("session"),
                 staging: &staging,
                 remote: &remote,

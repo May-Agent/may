@@ -191,8 +191,17 @@ async fn issue_briefs(
         .map(crate::session::RepoBinding::parse)
         .transpose()
         .map_err(internal_error)?;
+    let may_config = state.config_snapshot();
+    let forge_auth = state.forge_auth.clone();
     let issue_store = blocking::unblock(move || {
-        crate::issue::resolve_bound_issue_store(binding.as_ref(), &cwd, &workspace_config, db)
+        crate::issue::resolve_bound_issue_store(
+            binding.as_ref(),
+            &cwd,
+            &workspace_config,
+            &may_config,
+            &forge_auth,
+            db,
+        )
     })
     .await
     .map_err(internal_error)?;

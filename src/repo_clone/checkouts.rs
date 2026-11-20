@@ -163,6 +163,8 @@ impl Drop for GenerationLease {
 pub struct DaemonCheckouts {
     root: PathBuf,
     host: HostGit,
+    /// The `[forge]` credentials HTTPS clones and fetches authenticate with.
+    forge: Option<crate::forge::LiveForgeAuth>,
     entries: Arc<DashMap<String, Arc<RepoEntry>>>,
 }
 
@@ -173,6 +175,7 @@ impl DaemonCheckouts {
         Self {
             root: root.into(),
             host: HostGit::inherit(),
+            forge: None,
             entries: Arc::new(DashMap::new()),
         }
     }
@@ -182,6 +185,28 @@ impl DaemonCheckouts {
     pub fn with_host(mut self, host: HostGit) -> Self {
         self.host = host;
         self
+    }
+
+    /// Authenticate HTTPS clones and fetches with the `[forge]` credentials
+    /// `forge` holds.
+    #[must_use]
+    pub fn with_forge_auth(mut self, forge: crate::forge::LiveForgeAuth) -> Self {
+        self.forge = Some(forge);
+        self
+    }
+
+    /// The git `remote_url` is cloned or fetched with: the host git
+    /// carrying the URL host's `[forge]` credential when there is one, the
+    /// plain host otherwise so public repositories still work.
+    async fn host_for_remote(&self, remote_url: &str) -> Result<HostGit, RepoCloneError> {
+        let (Some(forge), Some(host)) = (&self.forge, super::https_url_host(remote_url)) else {
+            return Ok(self.host.clone());
+        };
+        match forge.git_https_auth(host).await {
+            Ok(auth) => Ok(self.host.clone().with_https_auth(auth)),
+            Err(crate::forge::ForgeAuthError::Unauthenticated { .. }) => Ok(self.host.clone()),
+            Err(error) => Err(RepoCloneError::ForgeAuth(error)),
+        }
     }
 
     /// Base directory under which all repository checkouts live.
@@ -228,7 +253,7 @@ impl DaemonCheckouts {
         let entry = self.entry_for(repo_key);
         let _guard = entry.lock.lock().await;
         let repo_dir = self.repo_dir(repo_key);
-        let host = self.host.clone();
+        let host = self.host_for_remote(remote_url).await?;
         let repo_key_owned = repo_key.to_string();
         let remote_url_owned = remote_url.to_string();
 
@@ -256,7 +281,7 @@ impl DaemonCheckouts {
         let entry = self.entry_for(repo_key);
         let _guard = entry.lock.lock().await;
         let repo_dir = self.repo_dir(repo_key);
-        let host = self.host.clone();
+        let host = self.host_for_remote(remote_url).await?;
         let repo_key_owned = repo_key.to_string();
         let remote_url_owned = remote_url.to_string();
         let entry_ref = Arc::clone(&entry);

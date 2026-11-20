@@ -50,13 +50,15 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// A directory inside the project (typically the main checkout root).
-    /// Absent for a GitHub repository trusted without any local checkout
+    /// Absent for a forge repository trusted without any local checkout
     /// ([`Self::repository`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// The GitHub repository of an entry that has no checkout.
+    /// The forge repository of an entry that has no checkout: its canonical
+    /// binding (`gitlab:<host>/<ns>/<repo>`); a bare `owner/repo` still
+    /// loads as `github:owner/repo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository: Option<GitHubRepository>,
+    pub repository: Option<crate::forge::ForgeRepo>,
     /// Issue backend for this project; absent means local may issues.
     #[serde(default)]
     pub issues: ProjectIssues,
@@ -78,39 +80,55 @@ impl ProjectConfig {
         })
     }
 
-    /// Whether this entry covers the GitHub repository `owner_repo`, through
-    /// its own `repository` or its checkout's `origin`.
+    /// Whether this entry covers the forge repository `repo`, through its
+    /// own `repository` or its checkout's `origin`.
     #[must_use]
-    pub fn covers_github(&self, owner_repo: &GitHubRepository) -> bool {
-        self.github_repository().as_ref() == Some(owner_repo)
+    pub fn covers_forge(
+        &self,
+        repo: &crate::forge::ForgeRepo,
+        config: &crate::config::MayConfig,
+    ) -> bool {
+        self.forge_repository(config).as_ref() == Some(repo)
     }
 
-    /// The GitHub repository this project publishes to, independent of its
-    /// issue backend: the GitHub `origin` of its path, else the repository a
-    /// GitHub issue backend names (a project whose origin is not GitHub).
+    /// The forge repository this project publishes to, independent of its
+    /// issue backend: the forge `origin` of its path, else the repository a
+    /// forge issue backend names (a project whose origin is no forge).
     #[must_use]
-    pub fn github_repository(&self) -> Option<GitHubRepository> {
+    pub fn forge_repository(
+        &self,
+        config: &crate::config::MayConfig,
+    ) -> Option<crate::forge::ForgeRepo> {
         if let Some(repository) = &self.repository {
             return Some(repository.clone());
         }
         if let Some(path) = &self.path
-            && let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(path)
-            && let Ok(repository) = owner_repo.parse()
+            && let crate::trust::RepoKind::Forge { repo } =
+                crate::trust::repo_kind_with_config(path, config)
         {
-            return Some(repository);
+            return Some(repo);
         }
-        match &self.issues {
-            ProjectIssues::Github { repository } => Some(repository.clone()),
-            ProjectIssues::May => None,
-        }
+        self.issues.repository()
+    }
+
+    /// The `github.com` `owner/repo` this project publishes to, when its
+    /// forge is GitHub's default host: the form `pr` records repository keys
+    /// under and GitHub-only paths consume.
+    #[must_use]
+    pub fn github_repository(&self) -> Option<GitHubRepository> {
+        let repo = self.forge_repository(&crate::config::MayConfig::default())?;
+        (repo.kind() == crate::forge::ForgeKind::GitHub
+            && repo.host().as_str() == crate::forge::GITHUB_HOST)
+            .then(|| repo.full_path().parse())
+            .and_then(Result::ok)
     }
 }
 
 /// `pr` settings for a project.
 ///
-/// `backend` overrides detection (`"may"` or `"github"`); `screen` runs
-/// every published text through the outbound screen before it reaches
-/// GitHub — the "PRs only" trust mode's guard.
+/// `backend` overrides detection (`"may"`, `"github"` or `"gitlab"`);
+/// `screen` runs every published text through the outbound screen before it
+/// reaches the forge — the "PRs only" trust mode's guard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectPr {
     /// `"may"` or `"github"`; absent detects GitHub remotes automatically.
@@ -142,7 +160,8 @@ impl ProjectPr {
 /// Issue backend selected for a project.
 ///
 /// Serialized as an internally tagged table, e.g.:
-/// `issues = { backend = "github", repository = "owner/repo" }`.
+/// `issues = { backend = "github", repository = "owner/repo" }` or
+/// `issues = { backend = "gitlab", repository = "gitlab:host/ns/repo" }`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum ProjectIssues {
@@ -154,6 +173,24 @@ pub enum ProjectIssues {
         /// `owner/repo` of the GitHub repository.
         repository: GitHubRepository,
     },
+    /// GitLab issues on the named repository.
+    Gitlab {
+        /// The repository's canonical binding (`gitlab:<host>/<ns>/<repo>`).
+        repository: crate::forge::ForgeRepo,
+    },
+}
+
+impl ProjectIssues {
+    /// The forge repository the backend's issues live on, when it is a
+    /// remote backend.
+    #[must_use]
+    pub fn repository(&self) -> Option<crate::forge::ForgeRepo> {
+        match self {
+            Self::May => None,
+            Self::Github { repository } => Some(repository.forge_repo()),
+            Self::Gitlab { repository } => Some(repository.clone()),
+        }
+    }
 }
 
 /// A GitHub repository in `owner/repo` form.
@@ -174,6 +211,22 @@ impl GitHubRepository {
     #[must_use]
     pub fn repo(&self) -> &str {
         &self.repo
+    }
+
+    /// This `owner/repo` on `github.com` as a [`crate::forge::ForgeRepo`].
+    ///
+    /// # Panics
+    /// Never: `owner/repo` passed the `GitHubRepository` shape checks.
+    #[must_use]
+    pub fn forge_repo(&self) -> crate::forge::ForgeRepo {
+        crate::forge::ForgeRepo::new(
+            crate::forge::ForgeKind::GitHub,
+            crate::forge::ForgeHost::new(crate::forge::GITHUB_HOST)
+                .expect("github.com is a valid host"),
+            &self.owner,
+            &self.repo,
+        )
+        .expect("an owner/repo pair builds a GitHub ForgeRepo")
     }
 }
 
@@ -272,11 +325,15 @@ impl WorkspaceConfig {
         self.projects.iter().find(|p| p.has_identity(identity))
     }
 
-    /// The `[[projects]]` entry for a GitHub repository, whether it holds a
+    /// The `[[projects]]` entry for a forge repository, whether it holds a
     /// checkout or only the repository.
     #[must_use]
-    pub fn project_for_github(&self, owner_repo: &GitHubRepository) -> Option<&ProjectConfig> {
-        self.projects.iter().find(|p| p.covers_github(owner_repo))
+    pub fn project_for_forge(
+        &self,
+        repo: &crate::forge::ForgeRepo,
+        config: &crate::config::MayConfig,
+    ) -> Option<&ProjectConfig> {
+        self.projects.iter().find(|p| p.covers_forge(repo, config))
     }
 
     fn check_projects_unique(&self) -> Result<(), WorkspaceConfigError> {

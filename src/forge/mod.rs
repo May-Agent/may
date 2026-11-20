@@ -13,8 +13,10 @@ mod coord;
 
 pub use auth::{
     DeviceAuthorization, DevicePoll, ForgeAuth, ForgeAuthError, ForgeAuthMode, ForgeHostConfig,
-    ForgeOAuth, OAuthCredentials, Pkce,
+    ForgeOAuth, LiveForgeAuth, OAuthCredentials, Pkce,
 };
+pub(crate) use coord::looks_like_host;
+
 pub use coord::{
     ForgeHost, ForgeHostError, ForgeKind, ForgeRepo, ForgeRepoError, GITHUB_HOST, GITLAB_HOST,
 };
