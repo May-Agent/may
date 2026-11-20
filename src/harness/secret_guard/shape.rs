@@ -82,6 +82,14 @@ const PROVIDER_KEY: &str = concat!(
     r"|npm_[A-Za-z0-9]{36}",
     r"|hf_[A-Za-z0-9]{34,}",
 );
+/// GitLab's documented token prefixes besides `glpat-` (OAuth application
+/// secrets `gloas-`, runner tokens `glrt-`/`glrtr-`, deploy tokens `gldt-`,
+/// pipeline trigger tokens `glptt-`, CI job tokens `glcbt-`, feed tokens
+/// `glft-`, incoming-mail tokens `glimt-`, agent-for-Kubernetes tokens
+/// `glagent-`, SCIM tokens `glsoat-`, feature-flag client tokens `glffct-`).
+/// `gloas-` secrets are hexadecimal, so the gate is alphanumeric, not the
+/// mixed-case random one.
+const GITLAB_TOKEN: &str = r"gl(?:oas|rtr?|dt|ptt|cbt|ft|imt|agent|soat|ffct)-[A-Za-z0-9_-]{20,}";
 const AWS_ACCESS_KEY_ID: &str = r"(?:AKIA|ASIA)[A-Z0-9]{16}";
 const JWT: &str = r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}";
 /// A block without its end marker, as truncated output leaves it, runs to
@@ -126,6 +134,11 @@ impl SecretShapes {
             rules: vec![
                 rule(SecretShape::PrivateKey, PRIVATE_KEY, Gate::None),
                 rule(SecretShape::ProviderKey, PROVIDER_KEY, Gate::RandomToken),
+                rule(
+                    SecretShape::ProviderKey,
+                    GITLAB_TOKEN,
+                    Gate::AlphanumericToken,
+                ),
                 rule(
                     SecretShape::AwsAccessKeyId,
                     AWS_ACCESS_KEY_ID,
