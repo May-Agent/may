@@ -162,6 +162,10 @@ pub struct SseToolEndEvent<'a> {
     #[schema(value_type = serde_json::Value)]
     #[serde(serialize_with = "crate::session::tool_result_wire::serialize")]
     pub(crate) result: &'a ToolResult,
+    /// True when the call ended in a refusal — an unchanged re-read the
+    /// policy rejected — not a failure; the task it read stays running.
+    #[serde(default)]
+    pub(crate) refused: bool,
     #[serde(skip_serializing_if = "crate::daemon::tool_summary::ToolSummary::is_empty")]
     pub(crate) summary: crate::daemon::tool_summary::ToolSummary,
 }

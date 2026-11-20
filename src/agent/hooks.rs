@@ -83,7 +83,7 @@ impl MayHooks {
         outcomes
             .iter()
             .map(|outcome| {
-                let refused = self.refused.take(&outcome.call);
+                let refused = self.refused.take(outcome.call.call());
                 let polled =
                     outcome.result.as_ref().err().is_some_and(|error| {
                         error.downcast_ref::<Refused<UnchangedRead>>().is_some()

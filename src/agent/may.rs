@@ -40,7 +40,7 @@ use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
-use crate::command_policy::{PolicySet, RefusedReads};
+use crate::command_policy::PolicySet;
 use crate::config::MayConfig;
 use crate::db::{ChatDb, RunFence};
 use crate::harness::compact_tool::CompactSignal;
@@ -660,7 +660,14 @@ impl MayAgent {
                 target: s.target.clone(),
             })
             .collect();
-        let refused_reads = RefusedReads::default();
+        // The session's runtime service owns one refused-read record so the
+        // UI can tell a refused read from a failed call.
+        let refused_reads = config
+            .permission_approver
+            .as_ref()
+            .and_then(|approver| approver.runtime_service.clone())
+            .map(|runtime| runtime.refused_reads())
+            .unwrap_or_default();
         let budgets = config.limits.shell();
         let assembly = ShellAssembly {
             tools: tools.clone(),

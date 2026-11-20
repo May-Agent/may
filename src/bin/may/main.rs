@@ -1300,6 +1300,11 @@ where
                     TuiEvent::ToolCard { call_id, card } => {
                         app.chat.set_tool_card(&call_id, card);
                     }
+                    TuiEvent::ToolEnd { call_id, refused } => {
+                        if refused {
+                            app.chat.set_tool_refused(&call_id);
+                        }
+                    }
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {
                             let at = until

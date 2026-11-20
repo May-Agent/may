@@ -436,6 +436,8 @@ export interface SseToolEnd {
   variant: ToolVariant;
   arguments?: string;
   result: unknown;
+  /** The call ended in a policy refusal, not a failure. */
+  refused?: boolean;
   summary?: ToolSummary;
 }
 

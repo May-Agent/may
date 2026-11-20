@@ -11,6 +11,7 @@ import {
   Play,
   Search,
   Sparkles,
+  TriangleAlert,
   Wrench,
   X,
 } from 'lucide-react';
@@ -133,9 +134,14 @@ function hasError(result: unknown): boolean {
   return terminal !== null && terminal.exitCode !== null && terminal.exitCode !== 0;
 }
 
-function statusIcon(status: TurnToolState['status'], result: unknown) {
+function statusIcon(status: TurnToolState['status'], result: unknown, refused?: boolean) {
   if (status === 'streaming') {
     return <Loader2 className="size-3.5 animate-spin text-muted-foreground" />;
+  }
+  // A refused call is a notice, not a failure — the task it read stays
+  // running.
+  if (refused) {
+    return <TriangleAlert className="size-3.5 text-amber-500" />;
   }
   if (hasError(result)) {
     return <X className="size-3.5 text-destructive" />;
@@ -404,7 +410,7 @@ function ExpandableToolCard({ tool }: ToolCardProps) {
           {primary}
         </span>
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
-          {statusIcon(tool.status, tool.result)}
+          {statusIcon(tool.status, tool.result, tool.refused)}
           <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
         </span>
       </summary>

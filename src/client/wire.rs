@@ -214,6 +214,16 @@ pub enum SessionAgentBody {
         #[serde(default)]
         card: Option<crate::command_reading::Card>,
     },
+    /// The call `call_id` ended in a refusal, not a failure — an unchanged
+    /// re-read the policy rejected, so the task it read stays running. Sent
+    /// right after the call's `ToolCallEnded`; a client renders the call as
+    /// a notice instead of a failed tool call.
+    ToolEnd {
+        /// The call the refusal belongs to.
+        call_id: String,
+        /// Whether the call's result is a policy refusal.
+        refused: bool,
+    },
     /// The run is parked.
     Hold {
         /// What the run waits for.

@@ -82,7 +82,9 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
                 },
             );
         }
-        ToolEventRecord::End { id, name, result } => {
+        ToolEventRecord::End {
+            id, name, result, ..
+        } => {
             if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
                 return;
             }

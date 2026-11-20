@@ -522,6 +522,8 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 // A one-shot run prints no tool cards.
                 | TuiEvent::ToolReading { .. }
                 | TuiEvent::ToolCard { .. }
+                // A refused call's own result already carries the refusal.
+                | TuiEvent::ToolEnd { .. }
                 // It prints the reply as it streamed, not its translation.
                 | TuiEvent::ReplyTranslated { .. },
             ) => {}
