@@ -16,7 +16,7 @@ use aither_core::LanguageModel;
 use std::pin::Pin;
 
 use aither_core::llm::{
-    Classify, Event as LlmEvent, Failure, GenerateError, LLMRequest, TokenCounting,
+    Classify, Event as LlmEvent, Failure, GenerateError, LLMRequest, RetryPolicy, TokenCounting,
     model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use futures_lite::{Stream, StreamExt as _};
@@ -182,8 +182,8 @@ impl<E: Classify> Classify for RedactedError<E> {
 }
 
 impl<E> RedactedError<E> {
-    /// Wraps the inner failure of a token count.
-    fn of_count(error: GenerateError<E>) -> GenerateError<Self> {
+    /// Wraps the inner failure of a structured generation or token count.
+    fn of_generate(error: GenerateError<E>) -> GenerateError<Self> {
         match error {
             GenerateError::Provider(error) => GenerateError::Provider(Self::Model(error)),
             GenerateError::Parse { source, response } => GenerateError::Parse { source, response },
@@ -198,10 +198,10 @@ impl<E> RedactedError<E> {
 /// with [`RedactedError::Secrets`] instead.
 ///
 /// The secrets are read when each request is sent, so one added mid-session
-/// applies from its next request. `respond` and the endpoint token count
-/// redact the request they send; every other entry point of the trait
-/// (tool-carrying and structured requests) is defined in terms of `respond`,
-/// so no request can bypass the redaction.
+/// applies from its next request. `respond`, `generate`, and the endpoint
+/// token count all redact the request before forwarding to the inner model so
+/// provider-specific structured-output overrides keep working without
+/// bypassing redaction.
 #[derive(Debug, Clone)]
 pub struct RedactedModel<M> {
     inner: M,
@@ -310,6 +310,32 @@ where
         )
     }
 
+    #[allow(
+        clippy::manual_async_fn,
+        reason = "boxing the future keeps callers below clippy::large_futures"
+    )]
+    fn generate<T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static>(
+        &self,
+        mut request: LLMRequest,
+    ) -> impl Future<Output = Result<T, GenerateError<Self::Error>>> + Send {
+        Box::pin(async move {
+            let redactions = self
+                .redactor
+                .current()
+                .await
+                .map_err(|error| GenerateError::Provider(RedactedError::Secrets(error)))?;
+            redactions.redact_request(&mut request);
+            self.inner
+                .generate(request)
+                .await
+                .map_err(RedactedError::of_generate)
+        })
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.inner.retry_policy()
+    }
+
     async fn profile(&self) -> Result<ModelProfile, Self::Error> {
         let mut profile = bounded(
             PROVIDER_SETUP_TIMEOUT,
@@ -347,7 +373,7 @@ where
                     self.inner
                         .count_tokens(&request)
                         .await
-                        .map_err(RedactedError::of_count)
+                        .map_err(RedactedError::of_generate)
                 }),
                 |timeout| GenerateError::Provider(RedactedError::StreamTimeout(timeout)),
             )
@@ -1251,5 +1277,74 @@ mod tests {
             timed.next().await.is_none(),
             "stream must terminate after timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn redacted_model_forwards_generate_and_retry_policy_with_redaction() {
+        use std::sync::{Arc, Mutex};
+        use aither_core::llm::{Message, RetryPolicy};
+        use schemars::JsonSchema;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        struct Echo {
+            seen: String,
+        }
+
+        #[derive(Clone)]
+        struct CapturingModel {
+            seen: Arc<Mutex<Vec<String>>>,
+            policy: RetryPolicy,
+        }
+
+        impl LanguageModel for CapturingModel {
+            type Error = std::convert::Infallible;
+
+            fn respond(
+                &self,
+                _request: LLMRequest,
+            ) -> impl Stream<Item = Result<LlmEvent, Self::Error>> + Send {
+                futures_lite::stream::empty()
+            }
+
+            async fn generate<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
+                &self,
+                request: LLMRequest,
+            ) -> Result<T, GenerateError<Self::Error>> {
+                let text = format!("{request:?}");
+                self.seen.lock().expect("lock").push(text.clone());
+                let json = serde_json::json!({ "seen": text });
+                Ok(serde_json::from_value(json).expect("deserialize echo"))
+            }
+
+            fn retry_policy(&self) -> RetryPolicy {
+                self.policy.clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::secrets::SecretStore::new(dir.path());
+        store
+            .set_global("API_TOKEN", "super-secret-value-12345")
+            .expect("store secret");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let policy = RetryPolicy::default();
+        let inner = CapturingModel {
+            seen: seen.clone(),
+            policy: policy.clone(),
+        };
+        let redacted = RedactedModel::new(inner, SecretRedactor::new(dir.path()));
+        assert_eq!(redacted.retry_policy(), policy);
+
+        let echo: Echo = redacted
+            .generate(LLMRequest::new(vec![Message::user(
+                "send super-secret-value-12345 please",
+            )]))
+            .await
+            .expect("generate succeeds");
+        assert!(!echo.seen.contains("super-secret-value-12345"), "{}", echo.seen);
+        assert!(echo.seen.contains("API_TOKEN"), "{}", echo.seen);
+        assert_eq!(seen.lock().expect("lock").len(), 1);
     }
 }

@@ -24,8 +24,8 @@ use super::cli::{
 };
 use super::command_set::{AnyCommandSet, CommandSet};
 use super::payload::{
-    CallImageStore, CommandEnvelope, ReservedForMain, ToolUsageError, UnknownCommand,
-    answer_recording_images, tool_usage_error,
+    CallImageStore, CommandEnvelope, HandlerOutput, RecordedCallImage, ReservedForMain,
+    ToolUsageError, UnknownCommand, answer_recording_images, tool_usage_error,
 };
 
 /// Which side of the authority boundary a launch is on: the main agent's, or
@@ -94,10 +94,17 @@ impl Caller {
     }
 }
 
-type HandlerFuture = Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>;
+type HandlerFuture = Pin<Box<dyn Future<Output = Result<HandlerOutput, String>> + Send>>;
 type Handler = Arc<dyn Fn(Caller, Vec<String>) -> HandlerFuture + Send + Sync>;
 type Factory = Arc<dyn Fn(&Binding<'_>) -> Handler + Send + Sync>;
 type UsageFn<T> = fn(Arc<T>) -> Pin<Box<dyn Future<Output = String> + Send>>;
+
+/// A [`Tool`] whose structured result carries image artifacts for the IPC
+/// registry to attach directly without scraping prose output.
+pub trait IpcImageTool: Tool {
+    /// Structured image metadata emitted by `result`.
+    fn images(result: &Self::Res) -> &[RecordedCallImage];
+}
 
 /// A terminal command whose valid arguments depend on what exists when it is
 /// called, such as the names a lookup can resolve.
@@ -278,11 +285,27 @@ where
     T: Tool + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
+    tool_handler_with_images(tool, schema, usage, |_| Vec::new())
+}
+
+fn tool_handler_with_images<T, F>(
+    tool: Arc<T>,
+    schema: Value,
+    usage: Option<UsageFn<T>>,
+    extract_images: F,
+) -> Handler
+where
+    T: Tool + Send + Sync + 'static,
+    T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    F: Fn(&T::Res) -> Vec<RecordedCallImage> + Send + Sync + 'static,
+{
     let name = tool.name().to_string();
+    let extract_images = Arc::new(extract_images);
     Arc::new(move |caller: Caller, args: Vec<String>| {
         let tool = tool.clone();
         let schema = schema.clone();
         let name = name.clone();
+        let extract_images = extract_images.clone();
         Box::pin(async move {
             tracing::debug!(tool = %name, ?args, "command: raw CLI args");
             let json_args = match cli_to_json(&schema, &args) {
@@ -315,9 +338,11 @@ where
                 .call(parsed, caller.into_context())
                 .await
                 .map_err(|error| error.to_string())?;
-            output
+            let images = extract_images(&output);
+            let result = output
                 .into_tool_result()
-                .map_err(|error| format!("failed to convert tool result: {error}"))
+                .map_err(|error| format!("failed to convert tool result: {error}"))?;
+            Ok(HandlerOutput { result, images })
         }) as HandlerFuture
     })
 }
@@ -332,6 +357,32 @@ where
     let help = schema_to_help(&schema);
     let stdin_arg = detect_stdin_arg(&schema);
     let handler = tool_handler(Arc::new(tool), schema.clone(), None);
+    (
+        name,
+        Entry {
+            help,
+            schema: Some(schema),
+            stdin_arg,
+            main: Arc::new(move |_| handler.clone()),
+            subagent: SubagentSide::Same,
+            modes: Modes::Every,
+        },
+    )
+}
+
+fn image_tool_entry<T>(tool: T) -> (String, Entry)
+where
+    T: IpcImageTool + Send + Sync + 'static,
+    T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+{
+    let schema = live_tool_schema(&tool);
+    let name = tool.name().to_string();
+    let help = schema_to_help(&schema);
+    let stdin_arg = detect_stdin_arg(&schema);
+    let handler =
+        tool_handler_with_images(Arc::new(tool), schema.clone(), None, |res| {
+            T::images(res).to_vec()
+        });
     (
         name,
         Entry {
@@ -423,6 +474,21 @@ impl CommandRegistryBuilder {
         self.entries.insert(name, entry);
     }
 
+    /// Registers a tool that returns structured image metadata alongside its
+    /// tool result.
+    ///
+    /// # Panics
+    /// Panics if the tool's argument schema cannot be serialized or lays out
+    /// its positional fields invalidly.
+    pub fn configure_image_tool<T>(&mut self, tool: T)
+    where
+        T: IpcImageTool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        let (name, entry) = image_tool_entry(tool);
+        self.entries.insert(name, entry);
+    }
+
     /// Registers one command with a handler per role.
     ///
     /// # Panics
@@ -510,9 +576,19 @@ impl CommandRegistryBuilder {
         help: impl Into<String>,
         handler: F,
     ) where
-        F: Fn(Option<CallIdentity>, Vec<String>) -> HandlerFuture + Send + Sync + 'static,
+        F: Fn(
+                Option<CallIdentity>,
+                Vec<String>,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        let handler: Handler = Arc::new(move |caller, args| handler(caller.call, args));
+        let handler = Arc::new(handler);
+        let handler: Handler = Arc::new(move |caller, args| {
+            let handler = handler.clone();
+            Box::pin(async move { handler(caller.call, args).await.map(HandlerOutput::from) })
+        });
         self.entries.insert(
             name.into(),
             Entry {
@@ -529,7 +605,13 @@ impl CommandRegistryBuilder {
     /// Registers a command whose arguments are the schema of `definition`.
     pub fn configure_definition_handler<F>(&mut self, definition: &ToolDefinition, handler: F)
     where
-        F: Fn(Option<CallIdentity>, Value) -> HandlerFuture + Send + Sync + 'static,
+        F: Fn(
+                Option<CallIdentity>,
+                Value,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         let schema = checked_schema(definition.arguments_openai_schema());
         let name = definition.name().to_string();
@@ -540,7 +622,7 @@ impl CommandRegistryBuilder {
             let handler = handler.clone();
             Box::pin(async move {
                 match cli_to_json(&schema, &args) {
-                    Ok(value) => handler(caller.call, value).await,
+                    Ok(value) => handler(caller.call, value).await.map(HandlerOutput::from),
                     Err(error) => Err(tool_usage_error(&error.to_string(), &name)),
                 }
             })
@@ -680,7 +762,11 @@ impl CommandRegistry {
             let handler = Arc::new(move |call, arguments| {
                 let set = set.clone();
                 let command = command.clone();
-                Box::pin(async move { set.call(&command, call, arguments).await }) as HandlerFuture
+                Box::pin(async move {
+                    set.call(&command, call, arguments)
+                        .await
+                        .map(HandlerOutput::from)
+                }) as HandlerFuture
             });
             let schema = checked_schema(definition.arguments_openai_schema());
             let tool = name.to_string();
