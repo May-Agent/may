@@ -17,10 +17,29 @@ interface ModelPickerProps {
 export function ModelPicker({ sessionId, currentModel, disabled }: ModelPickerProps) {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
+  const [showOutdated, setShowOutdated] = useState(false);
   const setModel = useSessionsStore((s) => s.setModel);
   const groups = useModelsStore((s) => s.groups);
   const refresh = useModelsStore((s) => s.refresh);
   const { t } = useTranslation();
+
+  const visibleGroups = useMemo(() => {
+    if (!groups) return groups;
+    return groups
+      .map((group) => ({
+        ...group,
+        details: group.details.filter((d) => showOutdated || !d.outdated),
+      }))
+      .filter((group) => group.details.length > 0);
+  }, [groups, showOutdated]);
+
+  const hiddenOutdated = useMemo(() => {
+    if (!groups || showOutdated) return 0;
+    return groups.reduce(
+      (count, group) => count + group.details.filter((d) => d.outdated).length,
+      0,
+    );
+  }, [groups, showOutdated]);
 
   useEffect(() => {
     if (open) void refresh();
@@ -83,7 +102,7 @@ export function ModelPicker({ sessionId, currentModel, disabled }: ModelPickerPr
             <Command.Empty className="px-3 py-6 text-center text-xs text-muted-foreground">
               {t('composer.modelPicker.empty')}
             </Command.Empty>
-            {groups?.map((group) => (
+            {visibleGroups?.map((group) => (
               <Command.Group
                 key={group.providerId}
                 heading={group.providerId}
@@ -115,6 +134,19 @@ export function ModelPicker({ sessionId, currentModel, disabled }: ModelPickerPr
               </Command.Group>
             ))}
           </Command.List>
+          {(hiddenOutdated > 0 || showOutdated) && (
+            <div className="border-t border-border px-2 py-1">
+              <button
+                type="button"
+                onClick={() => setShowOutdated((v) => !v)}
+                className="w-full rounded-md px-1 py-1 text-left text-[11px] text-muted-foreground hover:bg-accent"
+              >
+                {showOutdated
+                  ? t('composer.modelPicker.hideOutdated')
+                  : t('composer.modelPicker.showOutdated', { count: hiddenOutdated })}
+              </button>
+            </div>
+          )}
         </Command>
       </PopoverContent>
     </Popover>

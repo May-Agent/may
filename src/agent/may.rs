@@ -315,6 +315,11 @@ pub struct MayAgentConfig {
     pub rules_import: Option<crate::rules_import::RulesImport>,
     /// The daemon's live limits, shared by every agent it builds.
     pub limits: super::LiveLimits,
+    /// Builds a model for an explicit `provider::model` selector, serving
+    /// `subagent --model` and `model = "..."` definitions.
+    pub subagent_models: Option<crate::subagent::SubagentModelResolver<ProviderLlm>>,
+    /// What the `models` command lists.
+    pub model_listing: crate::agent::models_tool::ModelListing,
     /// The repo-search handle and PR land locks the daemon shares.
     pub services: crate::terminal_commands::SharedServices,
     /// Daemon-wide sleep state observed by the session's sleep context source.
@@ -1095,6 +1100,8 @@ impl MayAgent {
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
+                subagent_models: config.subagent_models.clone(),
+                model_listing: Some(config.model_listing.clone()),
                 services: config.services.clone(),
             },
         ))
@@ -1480,9 +1487,72 @@ impl MayAgent {
             may_config,
             session_id.as_str(),
         )?;
+        let subagent_models = {
+            let may_config = Arc::new(may_config.clone());
+            let pushed_providers = pushed_providers.clone();
+            let redactor = redactor.clone();
+            let resolve = crate::subagent::SubagentModelResolver::new(
+                move |selector: &crate::ModelSelector| {
+                    let may_config = may_config.clone();
+                    let pushed_providers = pushed_providers.clone();
+                    let redactor = redactor.clone();
+                    let selector = selector.clone();
+                    Box::pin(async move {
+                        let providers = super::Providers::new(&may_config, &pushed_providers);
+                        let provider_id = selector.provider_id().to_string();
+                        let provider = providers.get(&provider_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "provider '{provider_id}' is not configured; run `models` to see the models a call may run on"
+                            )
+                        })?;
+                        let llm = super::provider::build_cloud_provider_from_instance(
+                            &provider_id,
+                            &provider,
+                            selector.model_id(),
+                            &redactor,
+                        )
+                        .await
+                        .map_err(|error| anyhow::anyhow!("failed to build '{selector}': {error}"))?
+                        .with_context_window(
+                            crate::models::resolve_context_window(
+                                &[],
+                                &provider_id,
+                                selector.model_id(),
+                            ),
+                        );
+                        Ok(crate::agent::ModelSlot::new(
+                            llm,
+                            super::provider::request_parameters_for(
+                                &provider_id,
+                                Some(&provider.instance),
+                                selector.model_id(),
+                                None,
+                            ),
+                        ))
+                    })
+                },
+            );
+            Some(resolve)
+        };
+        let model_listing = crate::agent::models_tool::ModelListing {
+            session: crate::ModelSelector::new(
+                provider_id.clone(),
+                selector.model_id().to_string(),
+            ),
+            tiers: [
+                crate::subagent::Tier::Advanced,
+                crate::subagent::Tier::Balanced,
+                crate::subagent::Tier::Fast,
+            ]
+            .into_iter()
+            .map(|tier| (tier, providers.tier(tier.as_model_tier())))
+            .collect(),
+        };
         Ok(MayAgentConfig {
             subagent_tracker,
             connectivity,
+            subagent_models,
+            model_listing,
             tool_distribution,
             tool_environments,
             job_server,
