@@ -217,9 +217,10 @@ impl RemoteAccessManager {
         self.remote_listener_addr.send_replace(Some(addr));
     }
 
-    /// Records the address the local listener is actually bound to.
-    pub(crate) fn set_local_listener_addr(&self, addr: SocketAddr) {
-        self.local_listener_addr.send_replace(Some(addr));
+    /// Records the address the local listener is actually bound to, or that
+    /// no local listener serves.
+    pub(crate) fn set_local_listener_addr(&self, addr: Option<SocketAddr>) {
+        self.local_listener_addr.send_replace(addr);
     }
 
     /// The local listener's bound address, once it listens.

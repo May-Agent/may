@@ -183,7 +183,7 @@ async fn async_main() -> anyhow::Result<()> {
     // diagnostics go there too.
     let is_server_mode = matches!(
         cli_mode,
-        CliMode::Ui
+        CliMode::Gui { .. }
             | CliMode::Rest(_)
             | CliMode::Daemon(cli::DaemonCommand::Run)
             | CliMode::ComputerAgent { .. }
@@ -262,14 +262,8 @@ async fn async_main() -> anyhow::Result<()> {
     };
     match cli_mode {
         CliMode::Completion(_) => unreachable!("handled before the configuration check"),
-        CliMode::Ui => return open_web_ui().await,
-        CliMode::Rest(address) => {
-            return may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
-                mode: may_agent::daemon::DaemonMode::Rest,
-                tcp: Some(address),
-            })
-            .await;
-        }
+        CliMode::Gui { port } => return open_gui(port).await,
+        CliMode::Rest(args) => return run_rest(args).await,
         CliMode::Daemon(command) => return run_daemon_command(command).await,
         CliMode::Update { channel } => return run_update(channel).await,
         CliMode::ComputerAgent { may_dir, .. } => {
@@ -481,6 +475,9 @@ where
             app.set_status("Loading profiles…");
             terminal.draw(|frame| ui::render(frame, &mut app))?;
             app.btw_daemon = Some(client.clone());
+            if let Ok(health) = client.health().await {
+                app.daemon_addr = health.local_listener;
+            }
             may_agent::tui::remote::spawn_build_watch(
                 client.clone(),
                 build.clone(),
@@ -3176,21 +3173,88 @@ where
     Ok(())
 }
 
-/// `may ui`: make sure the daemon runs, then open its web UI.
-async fn open_web_ui() -> anyhow::Result<()> {
+/// The `[daemon] port` a `rest`/`gui` run serves on: the pinned one, or a
+/// free port picked now and pinned into the configuration.
+async fn pinned_port() -> anyhow::Result<u16> {
+    use anyhow::Context as _;
+    let mut config = may_agent::config::MayConfig::load().await?;
+    if let Some(port) = config.daemon.port {
+        return Ok(port);
+    }
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("no TCP port is free for the May listener")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    config.daemon.port = Some(port);
+    config.save().await?;
+    Ok(port)
+}
+
+/// Whether `error`'s cause chain holds an address-in-use bind failure.
+fn addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// `may rest`: the daemon in the foreground, serving the API on its TCP
+/// listener — the pinned `[daemon] port`, pinned on the first run.
+async fn run_rest(args: cli::RestArgs) -> anyhow::Result<()> {
+    let (addr, pinned) = match args.port {
+        Some(port) => (std::net::SocketAddr::new(args.host, port), false),
+        None => (
+            std::net::SocketAddr::new(args.host, pinned_port().await?),
+            true,
+        ),
+    };
+    may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
+        mode: may_agent::daemon::DaemonMode::Rest,
+        tcp: Some(addr),
+    })
+    .await
+    .map_err(|error| {
+        if pinned && addr_in_use(&error) {
+            anyhow::anyhow!(
+                "{addr} is already in use — change [daemon] port in {} or free the port",
+                may_agent::config::MayConfig::config_path().map_or_else(
+                    |_| "~/.may/config.toml".to_string(),
+                    |path| path.display().to_string()
+                ),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// `may gui`: make sure the daemon runs with its web UI listener, then
+/// open it. The pinned `[daemon] port` applies, else the daemon picks a
+/// free port and pins it.
+async fn open_gui(port: Option<u16>) -> anyhow::Result<()> {
     if !cfg!(feature = "ui") {
         anyhow::bail!(
-            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+            "`may gui` requires the `ui` cargo feature; use `may rest` for the REST API server"
         );
     }
     let paths = may_agent::daemon::DaemonPaths::user()?;
-    may_agent::daemon::lifecycle::ensure_running(&paths, |line| eprintln!("{line}")).await?;
-    let config = may_agent::config::MayConfig::load().await?;
-    let port = config
-        .daemon
-        .port
-        .unwrap_or(may_agent::daemon::DEFAULT_PORT);
-    let url = format!("http://127.0.0.1:{port}");
+    let client =
+        may_agent::daemon::lifecycle::ensure_running(&paths, |line| eprintln!("{line}")).await?;
+    // An explicit `--port` pins it; without one the pinned `[daemon] port`
+    // applies (`null` lets the daemon pick and pin a free port).
+    let port = match port {
+        Some(port) => Some(port),
+        None => may_agent::config::MayConfig::load().await?.daemon.port,
+    };
+    let bound: may_agent::daemon::LocalListenerResponse = client
+        .put(
+            "/api/daemon/local-listener",
+            &serde_json::json!({ "port": port }),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+    let url = format!("http://127.0.0.1:{}", bound.port);
     eprintln!("May web UI: {url}");
     if let Err(error) = open::that(&url) {
         eprintln!("Open {url} in a browser ({error}).");
@@ -3309,6 +3373,9 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
                             .last_error
                             .map_or_default(|error| format!("; last error: {error}"))
                     );
+                    if let Some(addr) = health.local_listener {
+                        println!("TCP listener: http://{addr}");
+                    }
                 }
                 Err(_) => println!("May daemon not running."),
             }

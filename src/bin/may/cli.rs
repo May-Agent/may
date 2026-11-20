@@ -3,7 +3,7 @@
 //! `may` alone is the TUI; a trailing positional is a one-shot prompt; every
 //! other first word is a subcommand. clap refuses anything else.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use aither_core::llm::model::ReasoningEffort;
@@ -20,9 +20,13 @@ use may_agent::update::Channel;
 pub enum CliMode {
     Tui(TuiArgs),
     Resume(ResumeArgs),
-    Ui,
-    /// The API-only daemon, on this address.
-    Rest(SocketAddr),
+    /// `may gui`: the web UI on its pinned port; `Some` re-pins.
+    Gui {
+        /// Port to serve on and pin; the pinned `[daemon] port` when omitted.
+        port: Option<u16>,
+    },
+    /// The API-only daemon, in the foreground.
+    Rest(RestArgs),
     Daemon(DaemonCommand),
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
@@ -62,6 +66,16 @@ pub struct OneShotArgs {
     pub prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Parsed `may rest` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestArgs {
+    /// Address to bind.
+    pub host: IpAddr,
+    /// Port to bind; `None` uses the pinned `[daemon] port`, pinning a free
+    /// pick on the first run.
+    pub port: Option<u16>,
 }
 
 /// Parsed `may daemon` invocation.
@@ -161,8 +175,13 @@ enum Command {
         /// Session id; the most recently active session when omitted.
         session: Option<String>,
     },
-    /// Start the daemon if needed and open its web UI in the browser.
-    Ui(ListenArgs),
+    /// Start the daemon if needed, serve its web UI on the pinned port and
+    /// open it in the browser.
+    Gui {
+        /// Port to serve on and pin; the pinned `[daemon] port` when omitted.
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Run the daemon in the foreground, API only, without the embedded web UI.
     Rest(ListenArgs),
     /// Run the daemon in the foreground, or manage it.
@@ -209,9 +228,10 @@ struct ListenArgs {
     /// Address to bind.
     #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
-    /// Port to bind.
-    #[arg(long, default_value_t = may_agent::daemon::DEFAULT_PORT)]
-    port: u16,
+    /// Port to bind; without it the `[daemon] port` applies (a free port
+    /// pinned on the first run).
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -444,10 +464,11 @@ impl Cli {
                 launch: SessionLaunch::RepoLess,
             }),
             Some(Command::Resume { session }) => CliMode::Resume(ResumeArgs { session }),
-            // `may ui` always opens the configured port; the pair is accepted
-            // for compatibility and not used.
-            Some(Command::Ui(_)) => CliMode::Ui,
-            Some(Command::Rest(listen)) => CliMode::Rest(SocketAddr::new(listen.host, listen.port)),
+            Some(Command::Gui { port }) => CliMode::Gui { port },
+            Some(Command::Rest(listen)) => CliMode::Rest(RestArgs {
+                host: listen.host,
+                port: listen.port,
+            }),
             Some(Command::Daemon { action }) => CliMode::Daemon(action.into()),
             Some(Command::Exec(exec)) => {
                 let script = joined(&exec.command);
@@ -564,24 +585,36 @@ mod tests {
     }
 
     #[test]
-    fn ui_accepts_the_listen_pair() {
-        assert_eq!(parse(&["may", "ui"]), CliMode::Ui);
-        assert_eq!(parse(&["may", "ui", "--host", "127.0.0.1"]), CliMode::Ui);
+    fn gui_takes_an_optional_port() {
+        assert_eq!(parse(&["may", "gui"]), CliMode::Gui { port: None });
+        assert_eq!(
+            parse(&["may", "gui", "--port", "9000"]),
+            CliMode::Gui { port: Some(9000) }
+        );
     }
 
     #[test]
     fn rest_resolves_its_address() {
         assert_eq!(
             parse(&["may", "rest", "--port", "9000"]),
-            CliMode::Rest("127.0.0.1:9000".parse().unwrap())
+            CliMode::Rest(RestArgs {
+                host: "127.0.0.1".parse().unwrap(),
+                port: Some(9000),
+            })
         );
         assert_eq!(
             parse(&["may", "rest", "--host=0.0.0.0", "--port=1"]),
-            CliMode::Rest("0.0.0.0:1".parse().unwrap())
+            CliMode::Rest(RestArgs {
+                host: "0.0.0.0".parse().unwrap(),
+                port: Some(1),
+            })
         );
         assert_eq!(
             parse(&["may", "rest"]),
-            CliMode::Rest("127.0.0.1:8787".parse().unwrap())
+            CliMode::Rest(RestArgs {
+                host: "127.0.0.1".parse().unwrap(),
+                port: None,
+            })
         );
     }
 

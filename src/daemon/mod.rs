@@ -2,9 +2,11 @@
 //!
 //! The daemon owns the sessions' agents, the task scheduler and the search
 //! indexes. It serves the REST API and the `/api/events` stream on a unix
-//! socket (`~/.may/daemon.sock`, the TUI's transport) and on TCP (the web
-//! UI's, plus any `[daemon] listen` addresses such as a tailnet address).
-//! Every UI is a client, so any number of them can attach to one session.
+//! socket (`~/.may/daemon.sock`, the TUI's transport); TCP arrives only when
+//! asked — the `[daemon] port` local listener a `gui`/`rest` run pins, the
+//! `[daemon] listen` addresses such as a tailnet address, and the explicit
+//! address of a foreground `may rest`. Every UI is a client, so any number
+//! of them can attach to one session.
 
 pub mod lifecycle;
 pub mod serve;
@@ -96,7 +98,7 @@ pub use chat::{
 };
 pub use server::{DEFAULT_PORT, DaemonMode};
 pub(crate) use server::{start, sync_remote_access};
-pub use types::DaemonHealth;
+pub use types::{DaemonHealth, LocalListenerResponse};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -249,7 +251,9 @@ pub fn current_build_id() -> std::io::Result<String> {
 pub struct DaemonOptions {
     /// Whether the embedded web UI is served next to the API.
     pub mode: DaemonMode,
-    /// TCP address replacing `127.0.0.1:<[daemon] port>`.
+    /// TCP address this run must serve (`may rest`); a failed bind is
+    /// fatal. The configured `[daemon] port` and `listen` binds happen
+    /// regardless, best-effort.
     pub tcp: Option<SocketAddr>,
 }
 
@@ -329,7 +333,6 @@ fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
 /// — the Tailscale header is only valid through tailscale serve's own proxy
 /// on the remote listener.
 struct TcpRouters {
-    state: Arc<state::DaemonState>,
     loopback: Arc<Router>,
     direct: Arc<Router>,
 }
@@ -349,49 +352,200 @@ impl TcpRouters {
         &self,
         listener: tokio::net::TcpListener,
         addr: SocketAddr,
+        state: &Arc<state::DaemonState>,
     ) -> tokio::task::JoinHandle<()> {
         let router = self.router_for(addr).clone();
         if addr.ip().is_loopback() {
             tokio::spawn(serve::serve_tcp(listener, router))
         } else {
-            tokio::spawn(serve::serve_tcp_tailnet(
-                listener,
-                router,
-                self.state.clone(),
-            ))
+            tokio::spawn(serve::serve_tcp_tailnet(listener, router, state.clone()))
         }
     }
 }
 
-/// The extra `[daemon] listen` listeners, rebound whenever the config changes.
-struct ExtraListeners {
-    routers: TcpRouters,
-    running: HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
+/// The daemon's TCP listeners. The unix socket is the always-on transport
+/// for the TUI and one-shot runs; TCP is optional and arrives by three
+/// routes — the `[daemon] port` local listener a `gui` or `rest` run pins
+/// and serves, the `[daemon] listen` addresses, and the explicit address a
+/// foreground `may rest` asks for.
+pub(crate) struct TcpListeners {
+    /// The routers serving every bind, wired once the daemon's routers exist.
+    routers: std::sync::OnceLock<TcpRouters>,
+    inner: tokio::sync::Mutex<TcpListenersInner>,
 }
 
-impl ExtraListeners {
-    async fn reconcile(&mut self, wanted: &[SocketAddr]) {
-        self.running.retain(|addr, task| {
-            let keep = wanted.contains(addr);
+#[derive(Default)]
+struct TcpListenersInner {
+    /// Bound address → its accept task, for every managed bind.
+    running: HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
+    /// The bound address `[daemon] port` names — the loopback listener the
+    /// web UI and its clients use. `None` until such a bind serves.
+    local: Option<SocketAddr>,
+    /// The explicit `may rest` bind; reconciles keep it however configured.
+    explicit: Option<SocketAddr>,
+}
+
+impl TcpListenersInner {
+    /// The address tunnels and links for this machine name: the local
+    /// listener's when one serves, else the explicit bind's.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.local.or(self.explicit)
+    }
+}
+
+impl TcpListeners {
+    /// An empty registry; the routers are wired by [`Self::set_routers`]
+    /// before the daemon serves.
+    pub(crate) fn new() -> Self {
+        Self {
+            routers: std::sync::OnceLock::new(),
+            inner: tokio::sync::Mutex::new(TcpListenersInner {
+                running: HashMap::new(),
+                local: None,
+                explicit: None,
+            }),
+        }
+    }
+
+    /// Wires the routers every bind is served with; called once, before
+    /// the first listener accepts.
+    fn set_routers(&self, routers: TcpRouters) {
+        self.routers
+            .set(routers)
+            .ok()
+            .expect("the TCP routers are set once");
+    }
+
+    fn routers(&self) -> &TcpRouters {
+        self.routers
+            .get()
+            .expect("the TCP routers are set before the daemon serves")
+    }
+
+    /// The addresses currently bound, for the startup report.
+    async fn bound_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self.inner.lock().await.running.keys().copied().collect();
+        addrs.sort_unstable();
+        addrs
+    }
+
+    /// Publishes the address links for this machine resolve to.
+    fn report_local_addr(inner: &TcpListenersInner, state: &state::DaemonState) {
+        state
+            .remote_access_manager
+            .set_local_listener_addr(inner.local_addr());
+    }
+
+    /// Serves `addr` as this run's required bind (`may rest`): a failure
+    /// propagates so the run exits.
+    ///
+    /// # Errors
+    /// Fails when the address cannot be bound.
+    async fn bind_explicit(
+        &self,
+        addr: SocketAddr,
+        state: &Arc<state::DaemonState>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = inner.running.entry(addr) {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to listen on {addr}"))?;
+            tracing::info!(%addr, "listening");
+            e.insert(self.routers().spawn(listener, addr, state));
+        }
+        inner.explicit = Some(addr);
+        Self::report_local_addr(&inner, state);
+        drop(inner);
+        Ok(())
+    }
+
+    /// Reconciles the managed binds with `daemon`: the `[daemon] port`
+    /// local listener and every `[daemon] listen` address, bound
+    /// best-effort — a taken port warns, it never kills the daemon whose
+    /// unix socket still serves.
+    async fn reconcile_config(
+        &self,
+        daemon: &crate::config::DaemonConfig,
+        state: &Arc<state::DaemonState>,
+    ) {
+        let local = daemon
+            .port
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let mut inner = self.inner.lock().await;
+        let explicit = inner.explicit;
+        inner.running.retain(|addr, task| {
+            let keep =
+                Some(*addr) == explicit || Some(*addr) == local || daemon.listen.contains(addr);
             if !keep {
                 task.abort();
                 tracing::info!(%addr, "stopped listening");
             }
             keep
         });
-        for addr in wanted {
-            if self.running.contains_key(addr) {
+        for addr in daemon.listen.iter().copied().chain(local) {
+            if inner.running.contains_key(&addr) {
                 continue;
             }
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     tracing::info!(%addr, remote = !addr.ip().is_loopback(), "listening");
-                    let task = self.routers.spawn(listener, *addr);
-                    self.running.insert(*addr, task);
+                    inner
+                        .running
+                        .insert(addr, self.routers().spawn(listener, addr, state));
                 }
                 Err(error) => tracing::warn!(%addr, %error, "failed to listen"),
             }
         }
+        inner.local = local.filter(|addr| inner.running.contains_key(addr));
+        Self::report_local_addr(&inner, state);
+        drop(inner);
+    }
+
+    /// The local loopback listener `gui` and `rest` clients ask for: bound
+    /// at `port`, else at the configured `[daemon] port`, else at a free
+    /// port the daemon picks. Whichever binds, it is pinned into the
+    /// configuration (the caller persists it) so every later run reuses it.
+    ///
+    /// # Errors
+    /// Fails when the resolved port cannot be bound.
+    pub(crate) async fn ensure_local(
+        &self,
+        port: Option<u16>,
+        state: &Arc<state::DaemonState>,
+    ) -> anyhow::Result<SocketAddr> {
+        let mut inner = self.inner.lock().await;
+        let addr = match port.or(state.config_snapshot().daemon.port) {
+            Some(port) => SocketAddr::from(([127, 0, 0, 1], port)),
+            None => {
+                if let Some(addr) = inner.local {
+                    addr
+                } else {
+                    let listener =
+                        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                            .await
+                            .context("no TCP port is free for the May listener")?;
+                    listener
+                        .local_addr()
+                        .context("the May listener has no address")?
+                }
+            }
+        };
+        if let std::collections::hash_map::Entry::Vacant(e) = inner.running.entry(addr) {
+            let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+                format!(
+                    "{addr} is already in use — change [daemon] port in {} or free the port",
+                    state.may_dir.join("config.toml").display()
+                )
+            })?;
+            tracing::info!(%addr, "listening");
+            e.insert(self.routers().spawn(listener, addr, state));
+        }
+        inner.local = Some(addr);
+        state.update_config(|config| config.daemon.port = Some(addr.port()));
+        Self::report_local_addr(&inner, state);
+        drop(inner);
+        Ok(addr)
     }
 }
 
@@ -431,22 +585,20 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let state = started.state;
     let socket_router = Arc::new(started.socket_router);
     let remote_router = Arc::new(started.remote_router);
-    let tcp_routers = TcpRouters {
-        state: state.clone(),
+    state.tcp_listeners.set_routers(TcpRouters {
         loopback: Arc::new(started.loopback_router),
         direct: Arc::new(started.direct_router),
-    };
+    });
     state
         .remote_access_manager
         .set_webhook_router(Arc::new(started.webhook_router));
 
-    let config = state.config_snapshot();
-    let tcp = options.tcp.unwrap_or_else(|| {
-        SocketAddr::from(([127, 0, 0, 1], config.daemon.port.unwrap_or(DEFAULT_PORT)))
-    });
-    let tcp_listener = tokio::net::TcpListener::bind(tcp)
-        .await
-        .with_context(|| format!("failed to listen on {tcp}"))?;
+    // A `rest` run's address must bind: a failure exits the run. `--host`
+    // may name a non-loopback address, which gets the identity policy like
+    // any other non-loopback bind.
+    if let Some(tcp) = options.tcp {
+        state.tcp_listeners.bind_explicit(tcp, &state).await?;
+    }
     // Remote access needs identity: it forwards the tailnet to the remote
     // listener, bound on loopback because only the tunnel process connects.
     // A cloud home binds the port its fronting daemon forwards to.
@@ -459,33 +611,26 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
             .await
             .context("failed to bind the remote listener")?;
     let unix_listener = bind_unix(&paths.socket())?;
-    state.remote_access_manager.set_local_listener_addr(
-        tcp_listener
-            .local_addr()
-            .context("the daemon's local listener has no address")?,
-    );
     state.remote_access_manager.set_remote_listener_addr(
         remote_listener
             .local_addr()
             .context("the daemon's remote listener has no address")?,
     );
+    let config = state.config_snapshot();
+    state
+        .tcp_listeners
+        .reconcile_config(&config.daemon, &state)
+        .await;
     crate::daemon::sync_remote_access(&state).await?;
-    // `--host` may name a non-loopback address: it gets the identity policy
-    // like any other non-loopback bind.
-    tcp_routers.spawn(tcp_listener, tcp);
     tokio::spawn(serve::serve_unix(unix_listener, socket_router));
     tokio::spawn(serve::serve_tcp(remote_listener, remote_router));
-    tracing::info!(%tcp, socket = %paths.socket().display(), "May daemon listening");
-    eprintln!(
-        "May daemon listening on http://{tcp} and {}",
-        paths.socket().display()
-    );
+    let bound = state.tcp_listeners.bound_addrs().await;
+    tracing::info!(?bound, socket = %paths.socket().display(), "May daemon listening");
+    eprintln!("May daemon listening on {}", paths.socket().display());
+    for addr in bound {
+        eprintln!("May daemon listening on http://{addr}");
+    }
 
-    let mut extra = ExtraListeners {
-        routers: tcp_routers,
-        running: HashMap::new(),
-    };
-    extra.reconcile(&config.daemon.listen).await;
     chat::watch_aux_settings(&state);
     sleep::spawn_reminders(&state);
     let config_state = state.clone();
@@ -498,8 +643,9 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
                         config_state
                             .live_limits
                             .apply(&config_state.config_snapshot());
-                        extra
-                            .reconcile(&config_state.config_snapshot().daemon.listen)
+                        config_state
+                            .tcp_listeners
+                            .reconcile_config(&config_state.config_snapshot().daemon, &config_state)
                             .await;
                     })
                     .await;

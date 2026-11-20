@@ -370,6 +370,9 @@ pub struct App {
     pub background: Option<crate::client::background::RemoteBackground>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
+    /// The daemon's loopback TCP listener (`host:port`) as its health
+    /// reports, when one serves — `<tunnel>` links resolve against it.
+    pub daemon_addr: Option<String>,
     /// Right sidebar: task tree, linked issues (background lists come
     /// from `jobs` / `subagents`).
     pub sidebar: super::sidebar::SidebarState,
@@ -497,11 +500,19 @@ const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Base URL `<tunnel id>` tags of `session` resolve against in the TUI: the
 /// session's tunnels on the daemon's loopback listener. A tunnel is named by
 /// a word of its session's ids, so the session is part of its address.
-fn tunnel_base(config: &MayConfig, session: Option<&SessionId>) -> String {
-    let port = config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT);
+fn tunnel_base(config: &MayConfig, listener: Option<&str>, session: Option<&SessionId>) -> String {
+    let host = listener.map_or_else(
+        || {
+            format!(
+                "localhost:{}",
+                config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT)
+            )
+        },
+        ToString::to_string,
+    );
     session.map_or_else(
-        || format!("http://localhost:{port}/tunnel"),
-        |session| format!("http://localhost:{port}/tunnel/{session}"),
+        || format!("http://{host}/tunnel"),
+        |session| format!("http://{host}/tunnel/{session}"),
     )
 }
 
@@ -622,6 +633,7 @@ impl App {
         let needs_setup = !config.is_configured();
         let tunnel_base = tunnel_base(
             &config,
+            None,
             session_manager.current().map(|session| &session.id),
         );
         // Always start in Chat mode - show inline message if not configured
@@ -767,6 +779,7 @@ impl App {
             last_click: None,
             background: None,
             btw_daemon: None,
+            daemon_addr: None,
             sidebar: super::sidebar::SidebarState::default(),
             chat_area: ratatui::layout::Rect::default(),
             band_bg: None,
@@ -2040,6 +2053,7 @@ impl App {
     async fn render_history(&mut self, messages: &[ChatMessage]) {
         self.chat = ChatStream::successor_of(&self.chat).with_tunnel_base(tunnel_base(
             &self.config,
+            self.daemon_addr.as_deref(),
             self.session_manager.current().map(|session| &session.id),
         ));
         self.chat.push_welcome(self.cwd_label());

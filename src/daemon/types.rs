@@ -608,6 +608,28 @@ pub struct DaemonHealth {
     pub build: String,
     /// Search indexer state.
     pub search_index: crate::repo_search::indexer::IndexerSnapshot,
+    /// The loopback TCP listener the web UI and API are bound to, when one
+    /// serves (`rest`/`gui`), as `host:port`.
+    #[serde(default)]
+    pub local_listener: Option<String>,
+}
+
+/// `PUT /api/daemon/local-listener` body: the loopback port the web
+/// UI/API listener is ensured on; `null` uses `[daemon] port` or a fresh
+/// pick the daemon pins.
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalListenerRequest {
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
+}
+
+/// Its answer: the port the local listener serves.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalListenerResponse {
+    /// The port the local listener serves.
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, skyzen::ToSchema)]

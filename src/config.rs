@@ -2050,7 +2050,9 @@ mod duration_text {
 /// Where the May daemon listens besides its unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DaemonConfig {
-    /// TCP port on `127.0.0.1` for the web UI and API; `None` uses 8787.
+    /// TCP port on `127.0.0.1` for the web UI and API — the local listener
+    /// `may gui`/`may rest` serve; `None` binds no loopback TCP. The first
+    /// `gui`/`rest` run picks a free port and pins it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// Further TCP addresses to serve on, such as a tailnet address
