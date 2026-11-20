@@ -66,8 +66,13 @@ async fn recent_repositories(mut usage: Vec<crate::db::RepoUsage>) -> Vec<String
             .iter()
             .filter(|path| path.is_dir())
             .filter_map(|path| match crate::trust::repo_kind(path) {
-                crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
-                crate::trust::RepoKind::Git => None,
+                crate::trust::RepoKind::Forge { repo }
+                    if repo.kind() == crate::forge::ForgeKind::GitHub
+                        && repo.host().as_str() == crate::forge::GITHUB_HOST =>
+                {
+                    Some(repo.full_path())
+                }
+                _ => None,
             })
             .collect()
     })

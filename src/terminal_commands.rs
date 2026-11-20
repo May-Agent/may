@@ -188,10 +188,15 @@ impl SharedServices {
         }
     }
 
-    /// The services with `forge_auth` — the daemon's live authenticator.
+    /// The services with `forge_auth` — the daemon's live authenticator,
+    /// which also authenticates the checkouts' HTTPS clones and fetches.
     #[must_use]
     pub fn with_forge_auth(self, forge_auth: crate::forge::LiveForgeAuth) -> Self {
-        Self { forge_auth, ..self }
+        Self {
+            checkouts: self.checkouts.with_forge_auth(forge_auth.clone()),
+            forge_auth,
+            ..self
+        }
     }
 }
 
@@ -278,6 +283,10 @@ where
         .map(|cfg| cfg.load().remote_access.tailscale_binary.clone());
     let local_env =
         crate::harness::publish_review::LocalEnvironment::detect(tailscale_bin.as_deref()).await;
+    let may_config = config.live_config.as_ref().map_or_else(
+        || Arc::new(crate::config::MayConfig::default()),
+        |live| live.load_full(),
+    );
     let publish_review = crate::harness::publish_review::PublishReview::new(
         fast.clone(),
         config.may_dir.clone(),
@@ -315,6 +324,8 @@ where
                     config.session_id.clone(),
                     config.db.clone(),
                 )
+                .with_may_config(may_config.clone())
+                .with_forge_auth(config.services.forge_auth.clone())
                 .with_checkouts(config.services.checkouts.clone()),
             ),
             config.workspace_config.clone(),
@@ -333,7 +344,11 @@ where
             config.db.clone(),
             config.cwd.clone(),
             crate::session::SessionPaths::new(config.sandbox_dir.clone()).workspace_config(),
-            crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource),
+            may_config.clone(),
+            crate::issue::github::GitHubRest::new(crate::issue::github::ForgeTokenSource::new(
+                config.services.forge_auth.clone(),
+            )),
+            config.services.forge_auth.clone(),
         )
     };
     let mut issue_tool = issue_tool
@@ -354,7 +369,9 @@ where
         .with_search(issue_search)
         .with_targets(issue_targets());
     if let Some(messaging) = &config.agent_messaging {
-        let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone());
+        let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone())
+            .with_may_config(may_config.clone())
+            .with_forge_auth(config.services.forge_auth.clone());
         issue_tool = issue_tool.with_owners(owners.clone());
         subagent_issue_tool = subagent_issue_tool.with_owners(owners);
     }
@@ -370,6 +387,17 @@ where
             |_call, _args| {
                 Box::pin(async {
                     Err(GhRefused.render().expect("the gh refusal template renders"))
+                })
+            },
+        );
+        sandboxed.configure_raw_handler(
+            "glab",
+            "Refused in the sandbox; use `issue` or `pr`",
+            |_call, _args| {
+                Box::pin(async {
+                    Err(GlabRefused
+                        .render()
+                        .expect("the glab refusal template renders"))
                 })
             },
         );
@@ -437,8 +465,12 @@ where
         session_id: config.session_id.clone(),
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         host: config.git.clone(),
+        may_config: may_config.clone(),
         checkouts: Some(config.services.checkouts.clone()),
-        github: crate::pr::PrContext::default_github_api(config.services.forge_auth),
+        probe: crate::trust::ForgeProbes::new(
+            crate::pr::PrContext::default_github_api(config.services.forge_auth.clone()),
+            config.services.forge_auth.clone(),
+        ),
         host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());
@@ -715,6 +747,11 @@ fn arguments_usage<A: schemars::JsonSchema>() -> String {
 #[derive(askama::Template)]
 #[template(path = "gh_refused.txt", escape = "none")]
 struct GhRefused;
+
+/// What the sandboxed `glab` command answers with.
+#[derive(askama::Template)]
+#[template(path = "glab_refused.txt", escape = "none")]
+struct GlabRefused;
 
 fn register_tool_with_description<T>(
     builder: &mut CommandRegistryBuilder,
@@ -1780,5 +1817,13 @@ mod tests {
             short_description("Runs on aither 0.16.0 builds"),
             "Runs on aither 0.16.0 builds"
         );
+    }
+
+    #[test]
+    fn the_glab_refusal_renders() {
+        use askama::Template;
+        let text = GlabRefused.render().expect("the glab refusal renders");
+        assert!(text.contains("`glab`"), "{text}");
+        assert!(text.contains("`issue`"), "{text}");
     }
 }

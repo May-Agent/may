@@ -143,6 +143,12 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
         &self.api_base
     }
 
+    /// The token source this client reads credentials from.
+    #[must_use]
+    pub const fn token_source(&self) -> &T {
+        &self.token_source
+    }
+
     /// Sends an authenticated request; a 404 is [`IssueError::NotFound`]
     /// with the placeholder number `-1` for the caller to replace, any
     /// other non-success status is [`IssueError::GitHub`].
@@ -1106,7 +1112,9 @@ mod tests {
             db.clone(),
             dir.path().to_path_buf(),
             dir.path().join("workspace.toml"),
+            std::sync::Arc::new(crate::config::MayConfig::default()),
             GitHubRest::with_api_base(StaticToken, &api_base),
+            crate::forge::LiveForgeAuth::default(),
         );
         let tool = IssueTool::new(
             session_store,

@@ -244,7 +244,11 @@ async fn session_repo_key(
             crate::session::MayHomePaths::new(state.may_dir.clone()).workspace_config();
         let workspace_config =
             crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default();
-        if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(checkout, &workspace_config) {
+        if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
+            checkout,
+            &workspace_config,
+            &crate::config::MayConfig::default(),
+        ) {
             return Ok(Some(source.key()));
         }
     }

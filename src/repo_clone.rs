@@ -75,6 +75,17 @@ pub enum RepoCloneError {
         /// How it ended, as the terminal reports a command.
         reason: String,
     },
+    /// The `[forge]` credential a remote needs could not be produced.
+    #[error("forge authentication failed: {0}")]
+    ForgeAuth(#[from] crate::forge::ForgeAuthError),
+}
+
+/// The authority of an `https://` remote URL, or `None` for any other form.
+pub(crate) fn https_url_host(url: &str) -> Option<&str> {
+    url.strip_prefix("https://")?
+        .split('/')
+        .next()
+        .filter(|authority| !authority.is_empty())
 }
 
 /// The session's terminal sandbox, where everything inside an
@@ -165,13 +176,14 @@ impl CloneSandbox {
 /// is held under. The one place that decision is made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloneSource {
-    /// A checkout with a GitHub `origin`: cloned from the remote and keyed
-    /// by `owner/repo`.
+    /// A checkout with a forge `origin`: cloned from the remote and keyed by
+    /// the repository's cache key (`owner/repo` on `github.com`,
+    /// `<host>/<path>` elsewhere).
     Remote {
         /// The `origin` URL.
         url: String,
-        /// `owner/repo` of the GitHub remote.
-        owner_repo: String,
+        /// The forge repository the remote names.
+        repo: crate::forge::ForgeRepo,
     },
     /// Any other checkout: cloned locally and keyed by the canonical git
     /// common dir.
@@ -185,18 +197,20 @@ impl CloneSource {
     /// The source `checkout`'s clone is made from, as its repository's
     /// effective trust in `config` decides.
     ///
-    /// `full` and `prs-only` clone a GitHub `origin` from the remote,
+    /// `full` and `prs-only` clone a forge `origin` from the remote,
     /// `local-branch` clones the checkout locally, and `local` binds no
     /// clone. An unpersisted checkout resolves to `local-branch`, the same
     /// fallback [`crate::trust::resolve_checkout`] gives an undecided
-    /// repository — a non-GitHub one, or a GitHub one whose access lookup
-    /// failed — so it clones locally too.
+    /// repository — a non-forge one, or one whose access lookup failed —
+    /// so it clones locally too. `may_config` resolves a self-hosted
+    /// remote's kind.
     ///
     /// # Errors
     /// Fails when the checkout's identity cannot be read.
     pub fn of(
         checkout: &Path,
         config: &crate::workspace::WorkspaceConfig,
+        may_config: &crate::config::MayConfig,
     ) -> Result<Option<Self>, RepoCloneError> {
         let identity = crate::issue::repository_identity(checkout)
             .map_err(|error| RepoCloneError::Io(std::io::Error::other(error)))?;
@@ -204,11 +218,12 @@ impl CloneSource {
         if !trust.clones_work() {
             return Ok(None);
         }
-        if trust.publishes_to_github()
-            && let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(checkout)
+        if trust.publishes_to_forge()
+            && let crate::trust::RepoKind::Forge { repo } =
+                crate::trust::repo_kind_with_config(checkout, may_config)
             && let Some(url) = crate::trust::remote_url(checkout)
         {
-            return Ok(Some(Self::Remote { url, owner_repo }));
+            return Ok(Some(Self::Remote { url, repo }));
         }
         Ok(Some(Self::Local { identity }))
     }
@@ -217,7 +232,7 @@ impl CloneSource {
     #[must_use]
     pub fn key(&self) -> String {
         match self {
-            Self::Remote { owner_repo, .. } => owner_repo.clone(),
+            Self::Remote { repo, .. } => repo.cache_key(),
             Self::Local { identity } => identity.to_string_lossy().into_owned(),
         }
     }
@@ -337,7 +352,12 @@ pub struct SessionRepos {
     db: ChatDb,
     /// The git that makes clones.
     host: HostGit,
-    /// Daemon-held default-branch checkouts used to derive GitHub workspaces
+    /// The daemon configuration: the `[forge]` map, which resolves a
+    /// self-hosted remote's kind.
+    may_config: std::sync::Arc<crate::config::MayConfig>,
+    /// The `[forge]` credentials HTTPS clones and fetches authenticate with.
+    forge: Option<crate::forge::LiveForgeAuth>,
+    /// Daemon-held default-branch checkouts used to derive workspaces
     /// copy-on-write without re-cloning over the network.
     checkouts: Option<DaemonCheckouts>,
 }
@@ -352,6 +372,8 @@ impl SessionRepos {
             session_id: session_id.into(),
             db,
             host: HostGit::inherit(),
+            may_config: std::sync::Arc::new(crate::config::MayConfig::default()),
+            forge: None,
             checkouts: None,
         }
     }
@@ -363,7 +385,40 @@ impl SessionRepos {
         self
     }
 
-    /// Derive GitHub workspaces copy-on-write from `checkouts`.
+    /// Read the `[forge]` map of `config`, so a self-hosted remote's kind is
+    /// recognized.
+    #[must_use]
+    pub fn with_may_config(
+        mut self,
+        config: impl Into<std::sync::Arc<crate::config::MayConfig>>,
+    ) -> Self {
+        self.may_config = config.into();
+        self
+    }
+
+    /// Authenticate HTTPS clones and fetches with the `[forge]` credentials
+    /// `forge` holds.
+    #[must_use]
+    pub fn with_forge_auth(mut self, forge: crate::forge::LiveForgeAuth) -> Self {
+        self.forge = Some(forge);
+        self
+    }
+
+    /// The git a remote `url` is cloned or fetched with: the host git
+    /// carrying the URL host's `[forge]` credential when there is one, the
+    /// plain host otherwise so public repositories still work.
+    async fn host_for_remote(&self, url: &str) -> Result<HostGit, RepoCloneError> {
+        let (Some(forge), Some(host)) = (&self.forge, https_url_host(url)) else {
+            return Ok(self.host.clone());
+        };
+        match forge.git_https_auth(host).await {
+            Ok(auth) => Ok(self.host.clone().with_https_auth(auth)),
+            Err(crate::forge::ForgeAuthError::Unauthenticated { .. }) => Ok(self.host.clone()),
+            Err(error) => Err(RepoCloneError::ForgeAuth(error)),
+        }
+    }
+
+    /// Derive workspaces copy-on-write from `checkouts`.
     #[must_use]
     pub fn with_checkouts(mut self, checkouts: DaemonCheckouts) -> Self {
         self.checkouts = Some(checkouts);
@@ -473,15 +528,15 @@ impl SessionRepos {
         staging: &Path,
         create_new: bool,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        let Some(source) = CloneSource::of(checkout, config)? else {
+        let Some(source) = CloneSource::of(checkout, config, self.may_config.as_ref())? else {
             return Ok(None);
         };
         if !create_new && let Some(reusable) = self.reusable_untouched_clone(&source).await? {
             return Ok(Some(reusable));
         }
         Ok(Some(match source {
-            CloneSource::Remote { url, owner_repo } => {
-                self.create_remote_clone(&url, &owner_repo, staging, None)
+            CloneSource::Remote { url, repo } => {
+                self.create_remote_clone(&url, &repo.cache_key(), staging, None)
                     .await?
             }
             CloneSource::Local { identity } => {
@@ -503,23 +558,23 @@ impl SessionRepos {
         create_new: bool,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
         match binding {
-            crate::session::RepoBinding::Github(repository) => {
-                let owner_repo = repository.to_string();
+            crate::session::RepoBinding::Forge(repository) => {
                 let publishes = {
-                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    let (config, repository, may_config) =
+                        (config.clone(), repository.clone(), self.may_config.clone());
                     blocking::unblock(move || {
-                        crate::trust::effective_for_github(&config, &owner_repo)
+                        crate::trust::effective_for_forge(&config, &repository, may_config.as_ref())
                     })
                     .await
                 }
-                .publishes_to_github();
+                .publishes_to_forge();
                 if !publishes {
                     return Ok(None);
                 }
-                let url = format!("https://github.com/{owner_repo}.git");
+                let url = repository.https_clone_url();
                 let source = CloneSource::Remote {
                     url: url.clone(),
-                    owner_repo: owner_repo.clone(),
+                    repo: repository.clone(),
                 };
                 if !create_new
                     && let Some(reusable) = self.reusable_untouched_clone(&source).await?
@@ -527,7 +582,7 @@ impl SessionRepos {
                     return Ok(Some(reusable));
                 }
                 Ok(Some(
-                    self.create_remote_clone(&url, &owner_repo, staging, None)
+                    self.create_remote_clone(&url, &repository.cache_key(), staging, None)
                         .await?,
                 ))
             }
@@ -569,9 +624,13 @@ impl SessionRepos {
         // checkout first and only reuse an untouched workspace if it already
         // matches the remote HEAD.
         let expected_head = match (source, &self.checkouts) {
-            (CloneSource::Remote { url, owner_repo }, Some(checkouts)) => {
-                Some(checkouts.refresh(owner_repo, url).await?.snapshot.head_sha)
-            }
+            (CloneSource::Remote { url, repo }, Some(checkouts)) => Some(
+                checkouts
+                    .refresh(&repo.cache_key(), url)
+                    .await?
+                    .snapshot
+                    .head_sha,
+            ),
             _ => None,
         };
         let host = self.host.clone();
@@ -634,7 +693,7 @@ impl SessionRepos {
         checkout: &Path,
         config: &crate::workspace::WorkspaceConfig,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        match CloneSource::of(checkout, config)? {
+        match CloneSource::of(checkout, config, self.may_config.as_ref())? {
             Some(source) => self.clone_for(&source.key()).await,
             None => Ok(None),
         }
@@ -655,16 +714,19 @@ impl SessionRepos {
         config: &crate::workspace::WorkspaceConfig,
         staging: &Path,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        Ok(Some(match CloneSource::of(checkout, config)? {
-            None => return Ok(None),
-            Some(CloneSource::Remote { url, owner_repo }) => {
-                self.ensure_remote_clone(&url, &owner_repo, staging).await?
-            }
-            Some(CloneSource::Local { identity }) => {
-                self.ensure_local_clone(checkout, &identity, staging)
-                    .await?
-            }
-        }))
+        Ok(Some(
+            match CloneSource::of(checkout, config, self.may_config.as_ref())? {
+                None => return Ok(None),
+                Some(CloneSource::Remote { url, repo }) => {
+                    self.ensure_remote_clone(&url, &repo.cache_key(), staging)
+                        .await?
+                }
+                Some(CloneSource::Local { identity }) => {
+                    self.ensure_local_clone(checkout, &identity, staging)
+                        .await?
+                }
+            },
+        ))
     }
 
     /// Ensure the session's clone of the repository `binding` names exists
@@ -683,24 +745,25 @@ impl SessionRepos {
         staging: &Path,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
         match binding {
-            crate::session::RepoBinding::Github(repository) => {
-                let owner_repo = repository.to_string();
+            crate::session::RepoBinding::Forge(repository) => {
                 // Matching a project reads its checkout's remote: off the
                 // executor.
                 let publishes = {
-                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    let (config, repository, may_config) =
+                        (config.clone(), repository.clone(), self.may_config.clone());
                     blocking::unblock(move || {
-                        crate::trust::effective_for_github(&config, &owner_repo)
+                        crate::trust::effective_for_forge(&config, &repository, may_config.as_ref())
                     })
                     .await
                 }
-                .publishes_to_github();
+                .publishes_to_forge();
                 if !publishes {
                     return Ok(None);
                 }
-                let url = format!("https://github.com/{owner_repo}.git");
+                let url = repository.https_clone_url();
                 Ok(Some(
-                    self.ensure_remote_clone(&url, &owner_repo, staging).await?,
+                    self.ensure_remote_clone(&url, &repository.cache_key(), staging)
+                        .await?,
                 ))
             }
             // A local binding is the checkout's own repository: its clone is
@@ -730,7 +793,8 @@ impl SessionRepos {
     /// Run `git clone <args> <staged>` in a fresh directory under `staging`,
     /// then move the finished clone to `repos/<dir>`. The clone is never
     /// agent-writable while host git works on it, so nothing the agent writes
-    /// into it runs on the host.
+    /// into it runs on the host. `host` carries any credentials the source
+    /// needs.
     ///
     /// With `wip_of`, the checkout's uncommitted and untracked files become
     /// one commit on top of the clone's HEAD, whose id is returned.
@@ -740,12 +804,12 @@ impl SessionRepos {
         staging: &Path,
         dir: &CloneDir,
         wip_of: Option<&Path>,
+        host: HostGit,
     ) -> Result<Option<String>, RepoCloneError> {
         let wip_of = wip_of.map(Path::to_path_buf);
         let staging = staging.to_path_buf();
         let session_root = self.session_root.clone();
         let dir = dir.clone();
-        let host = self.host.clone();
         blocking::unblock(move || {
             std::fs::create_dir_all(&staging)?;
             let scratch = tempfile::Builder::new()
@@ -850,6 +914,7 @@ impl SessionRepos {
                 staging,
                 &clone_dir,
                 with_wip.then_some(checkout),
+                self.host.clone(),
             )
             .await?;
         self.register(
@@ -901,6 +966,7 @@ impl SessionRepos {
                 staging,
                 &clone_dir,
                 with_wip.then_some(checkout),
+                self.host.clone(),
             )
             .await?;
         self.register(
@@ -1006,6 +1072,7 @@ impl SessionRepos {
             })
             .await;
         }
+        let host = self.host_for_remote(url).await?;
         self.clone_staged(
             vec![
                 "--origin".to_string(),
@@ -1015,6 +1082,7 @@ impl SessionRepos {
             staging,
             clone_dir,
             wip_of,
+            host,
         )
         .await
     }
@@ -1611,10 +1679,10 @@ mod tests {
 
         let config = crate::trust::config_at(tmp.path(), &checkout, TrustLevel::Full);
         assert_eq!(
-            CloneSource::of(&checkout, &config).unwrap(),
+            CloneSource::of(&checkout, &config, &crate::config::MayConfig::default()).unwrap(),
             Some(CloneSource::Remote {
                 url: "https://github.com/o/r.git".to_string(),
-                owner_repo: "o/r".to_string(),
+                repo: crate::forge::ForgeRepo::parse_binding("github:o/r").unwrap(),
             })
         );
         // The session binding and `pr` both go through `ensure_clone_of`.
@@ -1648,7 +1716,7 @@ mod tests {
         .unwrap();
         let remote = Some(CloneSource::Remote {
             url: "https://github.com/o/r.git".to_string(),
-            owner_repo: "o/r".to_string(),
+            repo: crate::forge::ForgeRepo::parse_binding("github:o/r").unwrap(),
         });
         let local = Some(CloneSource::Local {
             identity: repo_key(&checkout),
@@ -1661,7 +1729,7 @@ mod tests {
         ] {
             let config = crate::trust::config_at(tmp.path(), &checkout, level);
             assert_eq!(
-                CloneSource::of(&checkout, &config).unwrap(),
+                CloneSource::of(&checkout, &config, &crate::config::MayConfig::default()).unwrap(),
                 expected,
                 "{level:?}"
             );
@@ -1669,7 +1737,12 @@ mod tests {
         // An unpersisted GitHub checkout — an offline access lookup falls
         // back to `local-branch` without persisting — clones locally.
         assert_eq!(
-            CloneSource::of(&checkout, &crate::workspace::WorkspaceConfig::default()).unwrap(),
+            CloneSource::of(
+                &checkout,
+                &crate::workspace::WorkspaceConfig::default(),
+                &crate::config::MayConfig::default()
+            )
+            .unwrap(),
             local
         );
     }

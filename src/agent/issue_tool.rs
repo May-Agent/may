@@ -681,6 +681,9 @@ async fn execute_in_target<S: IssueStore, T: GitHubTokenSource + Clone>(
         TargetStore::GitHub(store) => {
             execute(&store, provenance, origin, search, owners, None, args).await
         }
+        TargetStore::GitLab(store) => {
+            execute(&store, provenance, origin, search, owners, None, args).await
+        }
     }
 }
 

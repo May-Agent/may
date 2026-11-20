@@ -236,7 +236,8 @@ impl PrStore {
         let repos = context.db.clone().map(|db| {
             let mut repos =
                 SessionRepos::new(&context.session_root, context.session_id.clone(), db)
-                    .with_host(context.signing.host().clone());
+                    .with_host(context.signing.host().clone())
+                    .with_forge_auth(context.forge_auth.clone());
             if let Some(checkouts) = context.checkouts.clone() {
                 repos = repos.with_checkouts(checkouts);
             }
@@ -290,9 +291,13 @@ impl PrStore {
         // The repository the cwd sits in, when it has one unambiguous workspace.
         let cwd_key = crate::repo_search::worktree_root(&self.context.cwd)
             .and_then(|worktree| {
-                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
-                    .ok()
-                    .flatten()
+                crate::repo_clone::CloneSource::of(
+                    &worktree,
+                    &self.context.workspace_config,
+                    &crate::config::MayConfig::default(),
+                )
+                .ok()
+                .flatten()
             })
             .map(|source| source.key());
         if let Some(key) = cwd_key.as_deref() {
@@ -364,10 +369,13 @@ impl PrStore {
             .ok_or_else(|| PrError::Resolve("not inside a repository".to_string()))?;
         let config_path =
             crate::session::SessionPaths::new(self.context.session_root.clone()).workspace_config();
-        let level =
-            crate::trust::resolve_checkout(&config_path, &worktree, &self.context.github_api)
-                .await
-                .map_err(|e| PrError::Resolve(format!("repository trust: {e}")))?;
+        let probe = crate::trust::ForgeProbes::new(
+            self.context.github_api.clone(),
+            self.context.forge_auth.clone(),
+        );
+        let level = crate::trust::resolve_checkout(&config_path, &worktree, &probe)
+            .await
+            .map_err(|e| PrError::Resolve(format!("repository trust: {e}")))?;
         if !level.clones_work() {
             return Err(PrError::Resolve(
                 "local trust writes the checkout; `pr` is for full, prs-only and local-branch"
@@ -418,9 +426,13 @@ impl PrStore {
             Some(name.to_string())
         } else if let Some(key) = crate::repo_search::worktree_root(&self.context.cwd)
             .and_then(|w| {
-                crate::repo_clone::CloneSource::of(&w, &self.context.workspace_config)
-                    .ok()
-                    .flatten()
+                crate::repo_clone::CloneSource::of(
+                    &w,
+                    &self.context.workspace_config,
+                    &crate::config::MayConfig::default(),
+                )
+                .ok()
+                .flatten()
             })
             .map(|s| s.key())
         {
@@ -487,9 +499,11 @@ impl PrStore {
                     return Ok(identity.display().to_string());
                 }
             }
-            if let Ok(Some(source)) =
-                crate::repo_clone::CloneSource::of(Path::new(name), &self.context.workspace_config)
-            {
+            if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
+                Path::new(name),
+                &self.context.workspace_config,
+                &crate::config::MayConfig::default(),
+            ) {
                 return Ok(source.key());
             }
             if let Ok(resolved) = self.resolve(Some(name)).await {
@@ -508,8 +522,11 @@ impl PrStore {
             return Err(PrError::Resolve(format!("no session clone named {name}")));
         }
         if let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd)
-            && let Ok(Some(source)) =
-                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
+            && let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
+                &worktree,
+                &self.context.workspace_config,
+                &crate::config::MayConfig::default(),
+            )
         {
             return Ok(source.key());
         }
@@ -976,8 +993,11 @@ impl PrStore {
         let key = if let Some(name) = repo {
             Some(self.resolve_repo_key(Some(name)).await?)
         } else if let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd)
-            && let Ok(Some(source)) =
-                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
+            && let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
+                &worktree,
+                &self.context.workspace_config,
+                &crate::config::MayConfig::default(),
+            )
         {
             Some(source.key())
         } else if let Some(binding) = self.session_binding().await? {

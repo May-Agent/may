@@ -50,7 +50,7 @@ impl ChatDb {
         let owner_repo = {
             let worktree = worktree.to_path_buf();
             blocking::unblock(move || match crate::trust::repo_kind(&worktree) {
-                crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+                crate::trust::RepoKind::Forge { repo } => Some(repo.cache_key()),
                 crate::trust::RepoKind::Git => None,
             })
             .await
