@@ -8,8 +8,13 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { RenameDialog } from '@/components/ui/rename-dialog';
 import { ComputerPanel } from '../computer/ComputerPanel';
 import { BrowserPanel } from '@/components/browser/BrowserPanel';
+import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
+import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash';
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python';
+import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import { useTranslation } from '@/lib/i18n';
 import { EMPTY_INSPECTOR_ENTRY, useInspectorStore } from '@/lib/stores/inspector';
+import { scriptLanguage } from '../chat/ToolCard';
 import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
 import { useTurnStore } from '@/lib/stores/turn';
 import { useUiStore } from '@/lib/stores/ui';
@@ -31,6 +36,9 @@ import { ReferenceLabel, TaskRowsView } from './TaskRowsView';
 import { PullRequestsView } from './PullRequestsView';
 import { PlanEditorSheet } from './PlanEditorSheet';
 import { LibraryPanel } from './LibraryPanel';
+
+SyntaxHighlighter.registerLanguage('bash', bash);
+SyntaxHighlighter.registerLanguage('python', python);
 
 type PendingStop =
   | { kind: 'job'; job: BackgroundJob }
@@ -167,7 +175,17 @@ function DetailsPanel({ session }: { session: ApiSession }) {
     return (
       <ListRow
         key={job.pid}
-        title={<span className="font-mono text-xs">{headline}</span>}
+        title={
+          <SyntaxHighlighter
+            language={scriptLanguage(job.interpreter)}
+            style={oneLight}
+            customStyle={{ display: 'inline', background: 'transparent', padding: 0, margin: 0 }}
+            codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
+            PreTag="span"
+          >
+            {headline}
+          </SyntaxHighlighter>
+        }
         titleText={job.script}
         meta={<JobMeta job={job} stopping={stopping} />}
         action={

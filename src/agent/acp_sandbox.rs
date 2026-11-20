@@ -572,7 +572,7 @@ impl PermissionHandler for ApprovalPermissions {
                 match approver
                     .clone()
                     .for_subagent()
-                    .request_and_wait(SandboxMode::Sandboxed, script)
+                    .request_and_wait(SandboxMode::Sandboxed, script, None)
                     .await
                 {
                     Ok(answer) => answer,

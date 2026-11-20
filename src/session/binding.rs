@@ -130,7 +130,7 @@ impl RepoBinding {
         level: TrustLevel,
         may_config: &crate::config::MayConfig,
     ) -> Result<Self, std::io::Error> {
-        if level.publishes_to_github()
+        if level.publishes_to_forge()
             && let RepoKind::Forge { repo } =
                 crate::trust::repo_kind_with_config(worktree, may_config)
         {

@@ -60,6 +60,7 @@ impl Host {
             may_dir.path().join("workspace.toml"),
             std::sync::Arc::new(crate::config::MayConfig::default()),
             GitHubRest::new(GhCliTokenSource),
+            crate::forge::LiveForgeAuth::default(),
         );
         let tool = IssueTool::new(store, IssueProvenance::new(db.clone(), "a1".to_string()))
             .with_owners(IssueOwners::new(directory.clone()))

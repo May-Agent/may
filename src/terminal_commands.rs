@@ -148,6 +148,13 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened: it alone gets `global-rules`.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// Builds a model for an explicit `provider::model` selector, serving
+    /// `subagent --model` and `model = "..."` definitions; `None` refuses
+    /// both.
+    pub subagent_models: Option<crate::subagent::SubagentModelResolver<LLM>>,
+    /// What the `models` command lists; `None` leaves `models`
+    /// unregistered.
+    pub model_listing: Option<crate::agent::models_tool::ModelListing>,
     /// Handles every session of the host shares.
     pub services: SharedServices,
 }
@@ -162,6 +169,9 @@ pub struct SharedServices {
     pub land_locks: crate::pr::LandLocks,
     /// Daemon-held per-repo default-branch checkouts.
     pub checkouts: crate::repo_clone::DaemonCheckouts,
+    /// The forge authenticator `pr` pushes and GitHub calls read; the daemon
+    /// keeps it in step with its live config.
+    pub forge_auth: crate::forge::LiveForgeAuth,
 }
 
 impl SharedServices {
@@ -174,17 +184,17 @@ impl SharedServices {
             checkouts: crate::repo_clone::DaemonCheckouts::new(
                 crate::session::MayHomePaths::new(may_dir.to_path_buf()).checkouts_dir(),
             ),
+            forge_auth: crate::forge::LiveForgeAuth::default(),
         }
     }
 
-    /// Authenticate the checkouts' HTTPS clones and fetches with the
-    /// `[forge]` credentials `config` holds.
+    /// The services with `forge_auth` — the daemon's live authenticator,
+    /// which also authenticates the checkouts' HTTPS clones and fetches.
     #[must_use]
-    pub fn with_forge_auth(self, config: &crate::config::MayConfig) -> Self {
+    pub fn with_forge_auth(self, forge_auth: crate::forge::LiveForgeAuth) -> Self {
         Self {
-            checkouts: self
-                .checkouts
-                .with_forge_auth(crate::forge::ForgeAuth::new(config)),
+            checkouts: self.checkouts.with_forge_auth(forge_auth.clone()),
+            forge_auth,
             ..self
         }
     }
@@ -315,7 +325,7 @@ where
                     config.db.clone(),
                 )
                 .with_may_config(may_config.clone())
-                .with_forge_auth(crate::forge::ForgeAuth::new(may_config.as_ref()))
+                .with_forge_auth(config.services.forge_auth.clone())
                 .with_checkouts(config.services.checkouts.clone()),
             ),
             config.workspace_config.clone(),
@@ -335,7 +345,10 @@ where
             config.cwd.clone(),
             crate::session::SessionPaths::new(config.sandbox_dir.clone()).workspace_config(),
             may_config.clone(),
-            crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource),
+            crate::issue::github::GitHubRest::new(crate::issue::github::ForgeTokenSource::new(
+                config.services.forge_auth.clone(),
+            )),
+            config.services.forge_auth.clone(),
         )
     };
     let mut issue_tool = issue_tool
@@ -357,7 +370,8 @@ where
         .with_targets(issue_targets());
     if let Some(messaging) = &config.agent_messaging {
         let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone())
-            .with_may_config(may_config.clone());
+            .with_may_config(may_config.clone())
+            .with_forge_auth(config.services.forge_auth.clone());
         issue_tool = issue_tool.with_owners(owners.clone());
         subagent_issue_tool = subagent_issue_tool.with_owners(owners);
     }
@@ -415,7 +429,8 @@ where
         workspace_config: config.workspace_config.clone(),
         review: Some(publish_review),
         signing,
-        github_api: crate::pr::PrContext::default_github_api(),
+        github_api: crate::pr::PrContext::default_github_api(config.services.forge_auth.clone()),
+        forge_auth: config.services.forge_auth.clone(),
         land_locks: config.services.land_locks.clone(),
         checkouts: Some(config.services.checkouts.clone()),
         task_events: Some(config.task_events.clone()),
@@ -452,6 +467,10 @@ where
         host: config.git.clone(),
         may_config: may_config.clone(),
         checkouts: Some(config.services.checkouts.clone()),
+        probe: crate::trust::ForgeProbes::new(
+            crate::pr::PrContext::default_github_api(config.services.forge_auth.clone()),
+            config.services.forge_auth.clone(),
+        ),
         host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());
@@ -631,6 +650,7 @@ where
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
         tiers,
+        models: config.subagent_models.clone(),
         definitions: crate::bundle::Bundle::subagent_definitions()
             .into_iter()
             .map(|definition| (definition.name.clone(), definition))
@@ -684,6 +704,13 @@ where
             ))
         });
     });
+
+    if let Some(listing) = config.model_listing {
+        // `subagent --model` is the main agent's choice; its catalog is too.
+        let models = crate::agent::models_tool::ModelsTool::new(listing);
+        describe_tool(&mut descriptions, &models);
+        builder.main_only(|reserved| reserved.configure_tool(models));
+    }
 
     // An MCP server's tools are a command set: the registry reads its tool
     // list at every lookup, so a tool the server adds mid-session runs at
@@ -899,6 +926,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -996,6 +1025,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1066,6 +1097,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1130,6 +1163,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1189,6 +1224,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1361,6 +1398,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1491,6 +1530,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1552,6 +1593,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1617,6 +1660,8 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 computer: None,
                 rules_import: None,
+                subagent_models: None,
+                model_listing: None,
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

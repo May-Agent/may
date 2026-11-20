@@ -271,6 +271,7 @@ pub async fn start(
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
     let live_limits = crate::agent::LiveLimits::of(&config);
+    let forge_auth = crate::forge::LiveForgeAuth::new(&config);
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
     // Each extraction resolves its models when it runs, so a model
     // configured or pushed later is used.
@@ -285,7 +286,7 @@ pub async fn start(
     let cloud_sessions = Arc::new(
         super::cloud_sessions::CloudSessions::load(
             db_for_archive.clone(),
-            super::cloud_sessions::GitHubCloud,
+            super::cloud_sessions::GitHubCloud::new(forge_auth.clone()),
             config.clone(),
             ui_event_bus.clone(),
         )
@@ -298,12 +299,13 @@ pub async fn start(
         tokio::runtime::Handle::current(),
     ));
 
-    let forge_config = config.load_full();
     let state = Arc::new(DaemonState {
         acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
         db: db_for_archive.clone(),
-        github_api: crate::pr::PrContext::default_github_api(),
+        github_api: crate::pr::PrContext::default_github_api(forge_auth.clone()),
+        forge_auth: forge_auth.clone(),
+        forge_device_flows: std::sync::Mutex::default(),
         default_profile_id,
         mcp_service: super::state::McpService::spawn(mcp_manager),
         permission_approver,
@@ -340,7 +342,7 @@ pub async fn start(
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         job_server,
         services: crate::terminal_commands::SharedServices::new(&may_dir)
-            .with_forge_auth(&forge_config),
+            .with_forge_auth(forge_auth.clone()),
         quota_patterns: crate::quota::QuotaPatterns::default(),
         vision_ocr: crate::vision_ocr::VisionOcr::new(),
         secret_patterns: crate::secrets::SecretPatterns::default(),
@@ -461,6 +463,9 @@ fn api_routes() -> Route {
         save_memory, set_job_pool, set_last_model, set_update_channel,
     };
     use super::events::stream_events;
+    use super::forge_auth::{
+        configure_forge_auth, forge_logout, forge_oauth_poll, forge_oauth_start, list_forge_auth,
+    };
     use super::notifications::{
         get_vapid_key, list_network_access_logs, list_notification_mailbox, subscribe,
         test_notification, unsubscribe,
@@ -497,6 +502,13 @@ fn api_routes() -> Route {
                 "/by-provider".at(models_by_provider),
             ))),
             "/github/repos".at(super::github_repos::list_github_repos),
+            "/forge-auth".route(Route::new((
+                "".at(list_forge_auth),
+                "/configure".post(configure_forge_auth),
+                "/logout".post(forge_logout),
+                "/oauth/start".post(forge_oauth_start),
+                "/oauth/poll".post(forge_oauth_poll),
+            ))),
             "/events".at(stream_events),
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
             "/prs".route(Route::new((
@@ -887,6 +899,8 @@ fn build_models_response(
     let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
     let mut family_rungs = crate::models::FamilyEffortRungs::new();
     crate::models::record_family_effort_rungs(&mut family_rungs, &fetched);
+    let registry = aither_models::ModelRegistry::bundled();
+    let outdated_index = crate::models::OutdatedIndex::of(registry);
 
     for item in fetched {
         let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
@@ -904,6 +918,7 @@ fn build_models_response(
                 &item.abilities,
             ),
             abilities: item.abilities,
+            outdated: item.outdated,
         };
         model_map
             .entry(selector)
@@ -952,6 +967,7 @@ fn build_models_response(
                         &abilities,
                     ),
                     abilities,
+                    outdated: outdated_index.is_outdated_id(registry, selector.model_id()),
                 }
             });
         }
@@ -1029,6 +1045,7 @@ fn build_provider_models_response(
                 context_window: item.context_window,
                 effort_ladder,
                 abilities: item.abilities,
+                outdated: item.outdated,
             });
     }
 
@@ -1088,6 +1105,7 @@ mod tests {
             context_window: None,
             abilities: abilities.iter().map(ToString::to_string).collect(),
             provider_id: "relay".to_string(),
+            outdated: false,
         }
     }
 

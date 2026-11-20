@@ -240,11 +240,12 @@ const LOG_FETCH_CONCURRENCY: usize = 4;
 
 /// Each failed check of `report` with the key lines of its Actions log.
 pub async fn failure_details(
+    api: &crate::issue::github::GitHubRest<super::PrTokenSource>,
     owner_repo: &str,
     pr_number: i64,
     report: &ChecksReport,
 ) -> Vec<FailureDetail> {
-    let actions = crate::ci::github::GhActions::new(owner_repo, pr_number);
+    let actions = crate::ci::github::GhActions::new(api.clone(), owner_repo, pr_number);
     let actions = &actions;
     let failed: Vec<(String, Option<String>, Option<u64>)> = report
         .failed()
@@ -263,7 +264,10 @@ pub async fn failure_details(
         .await
 }
 
-async fn excerpt(actions: &crate::ci::github::GhActions, job: u64) -> LogExcerpt {
+async fn excerpt(
+    actions: &crate::ci::github::GhActions<super::PrTokenSource>,
+    job: u64,
+) -> LogExcerpt {
     match actions.log(job).await {
         Err(error) => LogExcerpt::Unavailable(error.to_string()),
         Ok(log) => match crate::ci::logs::error_lines(&log, LOG_LINES) {

@@ -30,18 +30,19 @@ pub trait GitLabTokenSource: Send + Sync + std::fmt::Debug {
     fn token(&self) -> impl Future<Output = Result<String, IssueError>> + Send;
 }
 
-/// Token source reading the `[forge]` credential of `host` through
-/// [`crate::forge::ForgeAuth`].
+/// Token source reading the `[forge]` credential of `host` through a live
+/// [`crate::forge::LiveForgeAuth`], so a `/login` or a Web Settings change
+/// applies to a store built before it.
 #[derive(Debug, Clone)]
 pub struct ForgeGitLabAuth {
-    forge: crate::forge::ForgeAuth,
+    forge: crate::forge::LiveForgeAuth,
     host: String,
 }
 
 impl ForgeGitLabAuth {
     /// The credential `forge` resolves for `host`.
     #[must_use]
-    pub const fn new(forge: crate::forge::ForgeAuth, host: String) -> Self {
+    pub const fn new(forge: crate::forge::LiveForgeAuth, host: String) -> Self {
         Self { forge, host }
     }
 }
@@ -208,6 +209,24 @@ impl<T: GitLabTokenSource> GitLabRest<T> {
     /// Fails on token, transport or status errors, a missing repository
     /// included: a failed lookup never counts as owned.
     pub async fn repository_owned(&self, repository: &ForgeRepo) -> Result<bool, IssueError> {
+        self.repository_access(repository)
+            .await
+            .map(|access| access.owned)
+    }
+
+    /// The authenticated user's access to `repository`, in the shape
+    /// [`crate::issue::github::RepositoryAccess`] gives GitHub's:
+    /// ownership or membership with at least Developer access (`>= 30`),
+    /// which is also GitLab's push threshold, and whether Issues are
+    /// enabled on the project.
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors, a missing repository
+    /// included.
+    pub async fn repository_access(
+        &self,
+        repository: &ForgeRepo,
+    ) -> Result<crate::issue::github::RepositoryAccess, IssueError> {
         let url = format!(
             "{}/projects/{}",
             self.api_base,
@@ -221,11 +240,9 @@ impl<T: GitLabTokenSource> GitLabRest<T> {
                 .map_err(|error| IssueError::GitLab(error.to_string()))
         })
         .await?;
-        if project.namespace.kind == "user" && project.namespace.path.eq_ignore_ascii_case(&viewer)
-        {
-            return Ok(true);
-        }
-        Ok(project.permissions.is_some_and(|permissions| {
+        let personal = project.namespace.kind == "user"
+            && project.namespace.path.eq_ignore_ascii_case(&viewer);
+        let member = project.permissions.is_some_and(|permissions| {
             permissions
                 .project_access
                 .iter()
@@ -233,7 +250,14 @@ impl<T: GitLabTokenSource> GitLabRest<T> {
                 .filter_map(|access| access.access_level)
                 .max()
                 .is_some_and(|level| level >= 30)
-        }))
+        });
+        let owned = personal || member;
+        Ok(crate::issue::github::RepositoryAccess {
+            owned,
+            can_push: owned,
+            has_issues: project.issues_access_level.as_deref() != Some("disabled")
+                && project.issues_enabled != Some(false),
+        })
     }
 
     /// Whether the authenticated user's account opened issue `number` of
@@ -279,6 +303,10 @@ struct GlUser {
 struct GlProject {
     namespace: GlNamespace,
     permissions: Option<GlPermissions>,
+    /// `enabled`, `private` or `disabled`; Issues exist unless disabled.
+    issues_access_level: Option<String>,
+    /// The pre-`issues_access_level` flag some GitLab versions still send.
+    issues_enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -483,10 +483,11 @@ where
     // Issues belong to the project `may exec` runs in, as for the TUI and
     // UI server, never to the session sandbox.
     let cwd = std::env::current_dir().map_err(ExecError::CurrentDir)?;
+    let forge_auth = may_agent::forge::LiveForgeAuth::new(may_config);
     let issue_store = may_agent::issue::resolve_issue_store(
         &cwd,
         &session_paths.workspace_config(),
-        may_config,
+        &forge_auth,
         context.db.clone(),
     )
     .map_err(ExecError::ResolveIssueBackend)?;
@@ -496,7 +497,10 @@ where
             #[cfg(target_os = "macos")]
             computer: None,
             rules_import: None,
-            services: may_agent::SharedServices::new(&context.may_dir).with_forge_auth(may_config),
+            subagent_models: None,
+            model_listing: None,
+            services: may_agent::SharedServices::new(&context.may_dir)
+                .with_forge_auth(forge_auth.clone()),
             llm,
             ask_flagship: None,
             ask_balanced: None,

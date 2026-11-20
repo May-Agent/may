@@ -403,7 +403,7 @@ pub enum ResolvedIssueStore {
     /// Issues in the session's history database.
     May(MayIssueStore),
     /// Issues of the configured GitHub repository.
-    GitHub(GitHubIssueStore<GhCliTokenSource>),
+    GitHub(GitHubIssueStore<github::ForgeTokenSource>),
     /// Issues of the configured GitLab project.
     GitLab(GitLabIssueStore<ForgeGitLabAuth>),
 }
@@ -546,23 +546,23 @@ impl IssueStore for ResolvedIssueStore {
 }
 
 /// The issue store a remote [`crate::workspace::ProjectIssues`] backend
-/// names, when it is a remote backend; `may_config` supplies the `[forge]`
+/// names, when it is a remote backend; `forge_auth` supplies the `[forge]`
 /// credentials the GitLab store needs.
 fn remote_issue_store(
     issues: &crate::workspace::ProjectIssues,
-    may_config: &crate::config::MayConfig,
+    forge_auth: &crate::forge::LiveForgeAuth,
 ) -> Option<ResolvedIssueStore> {
     match issues {
-        crate::workspace::ProjectIssues::Github { repository } => Some(ResolvedIssueStore::GitHub(
-            GitHubIssueStore::new(repository.clone(), GhCliTokenSource),
-        )),
+        crate::workspace::ProjectIssues::Github { repository } => {
+            Some(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+                repository.clone(),
+                crate::issue::github::ForgeTokenSource::new(forge_auth.clone()),
+            )))
+        }
         crate::workspace::ProjectIssues::Gitlab { repository } => {
             Some(ResolvedIssueStore::GitLab(GitLabIssueStore::new(
                 repository.clone(),
-                ForgeGitLabAuth::new(
-                    crate::forge::ForgeAuth::new(may_config),
-                    repository.host().as_str().to_string(),
-                ),
+                ForgeGitLabAuth::new(forge_auth.clone(), repository.host().as_str().to_string()),
             )))
         }
         crate::workspace::ProjectIssues::May => None,
@@ -572,8 +572,8 @@ fn remote_issue_store(
 /// Resolve the issue store for a workspace.
 ///
 /// `cwd` is the session's working directory, `workspace_config_path` the
-/// workspace.toml holding per-project entries, `may_config` the daemon
-/// configuration supplying `[forge]` credentials, and `db` the session's
+/// workspace.toml holding per-project entries, `forge_auth` the live
+/// authenticator supplying `[forge]` credentials, and `db` the session's
 /// already-open chat database the may store writes through. A `[[projects]]`
 /// entry whose path resolves to the same repository identity selects its
 /// configured forge store; everything else falls back to the local store.
@@ -585,11 +585,11 @@ fn remote_issue_store(
 pub fn resolve_issue_store(
     cwd: &Path,
     workspace_config_path: &Path,
-    may_config: &crate::config::MayConfig,
+    forge_auth: &crate::forge::LiveForgeAuth,
     db: ChatDb,
 ) -> Result<ResolvedIssueStore, IssueError> {
     let identity = repository_identity(cwd)?;
-    if let Some(store) = project_issue_store(&identity, workspace_config_path, may_config)? {
+    if let Some(store) = project_issue_store(&identity, workspace_config_path, forge_auth)? {
         return Ok(store);
     }
     Ok(ResolvedIssueStore::May(MayIssueStore::new(
@@ -614,11 +614,12 @@ pub fn resolve_bound_issue_store(
     cwd: &Path,
     workspace_config_path: &Path,
     may_config: &crate::config::MayConfig,
+    forge_auth: &crate::forge::LiveForgeAuth,
     db: ChatDb,
 ) -> Result<ResolvedIssueStore, IssueError> {
     use crate::session::RepoBinding;
     match binding {
-        None => resolve_issue_store(cwd, workspace_config_path, may_config, db),
+        None => resolve_issue_store(cwd, workspace_config_path, forge_auth, db),
         Some(RepoBinding::Local(identity)) => Ok(ResolvedIssueStore::May(MayIssueStore::new(
             db,
             identity.display().to_string(),
@@ -627,7 +628,7 @@ pub fn resolve_bound_issue_store(
             let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
             let project = config.project_for_forge(repository, may_config);
             if let Some(store) =
-                project.and_then(|project| remote_issue_store(&project.issues, may_config))
+                project.and_then(|project| remote_issue_store(&project.issues, forge_auth))
             {
                 return Ok(store);
             }
@@ -653,12 +654,12 @@ pub fn resolve_bound_issue_store(
 pub(crate) fn project_issue_store(
     identity: &Path,
     workspace_config_path: &Path,
-    may_config: &crate::config::MayConfig,
+    forge_auth: &crate::forge::LiveForgeAuth,
 ) -> Result<Option<ResolvedIssueStore>, IssueError> {
     let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
     Ok(config
         .project_for_identity(identity)
-        .and_then(|project| remote_issue_store(&project.issues, may_config)))
+        .and_then(|project| remote_issue_store(&project.issues, forge_auth)))
 }
 
 /// The repository identity an issue namespace is keyed by.
@@ -729,6 +730,7 @@ mod tests {
                     cwd,
                     &config_path,
                     &crate::config::MayConfig::default(),
+                    &crate::forge::LiveForgeAuth::default(),
                     db.clone(),
                 )
                 .expect("store"),
@@ -780,7 +782,7 @@ mod tests {
         let resolved = resolve_issue_store(
             &repo,
             &config_path,
-            &crate::config::MayConfig::default(),
+            &crate::forge::LiveForgeAuth::default(),
             db.clone(),
         )
         .expect("existing project");
@@ -792,7 +794,7 @@ mod tests {
         let resolved = resolve_issue_store(
             &elsewhere,
             &config_path,
-            &crate::config::MayConfig::default(),
+            &crate::forge::LiveForgeAuth::default(),
             db,
         )
         .expect("unconfigured directory");

@@ -162,6 +162,10 @@ pub struct SseToolEndEvent<'a> {
     #[schema(value_type = serde_json::Value)]
     #[serde(serialize_with = "crate::session::tool_result_wire::serialize")]
     pub(crate) result: &'a ToolResult,
+    /// True when the call ended in a refusal — an unchanged re-read the
+    /// policy rejected — not a failure; the task it read stays running.
+    #[serde(default)]
+    pub(crate) refused: bool,
     #[serde(skip_serializing_if = "crate::daemon::tool_summary::ToolSummary::is_empty")]
     pub(crate) summary: crate::daemon::tool_summary::ToolSummary,
 }
@@ -1337,6 +1341,9 @@ pub struct ModelInfoItem {
     /// The reasoning-effort levels the model accepts, lowest first; empty
     /// when the model has no effort control.
     pub(crate) effort_ladder: Vec<String>,
+    /// Retired by its provider or superseded by a newer generation of its
+    /// line; pickers hide it by default.
+    pub(crate) outdated: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -1433,6 +1440,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                         session_id: request.request.session_id,
                         agent_id: request.request.agent_id,
                         reading: request.request.reading,
+                        interpreter: request.request.interpreter,
                     },
                 }),
             waiting_workspace: summary.waiting_workspace.map(|request| WorkspacePollItem {

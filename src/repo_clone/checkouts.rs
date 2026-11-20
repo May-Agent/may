@@ -164,7 +164,7 @@ pub struct DaemonCheckouts {
     root: PathBuf,
     host: HostGit,
     /// The `[forge]` credentials HTTPS clones and fetches authenticate with.
-    forge: Option<crate::forge::ForgeAuth>,
+    forge: Option<crate::forge::LiveForgeAuth>,
     entries: Arc<DashMap<String, Arc<RepoEntry>>>,
 }
 
@@ -190,7 +190,7 @@ impl DaemonCheckouts {
     /// Authenticate HTTPS clones and fetches with the `[forge]` credentials
     /// `forge` holds.
     #[must_use]
-    pub fn with_forge_auth(mut self, forge: crate::forge::ForgeAuth) -> Self {
+    pub fn with_forge_auth(mut self, forge: crate::forge::LiveForgeAuth) -> Self {
         self.forge = Some(forge);
         self
     }

@@ -13,7 +13,7 @@ mod coord;
 
 pub use auth::{
     DeviceAuthorization, DevicePoll, ForgeAuth, ForgeAuthError, ForgeAuthMode, ForgeHostConfig,
-    ForgeOAuth, OAuthCredentials, Pkce,
+    ForgeOAuth, LiveForgeAuth, OAuthCredentials, Pkce,
 };
 pub(crate) use coord::looks_like_host;
 

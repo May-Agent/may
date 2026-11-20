@@ -1,17 +1,26 @@
-//! Repository trust: the first-contact decision, resolved per repo.
+//! Repository trust: the level a session works under, resolved per repo.
 //!
-//! A session must not bind a repository it does not know — the first
-//! meeting asks the user once, the answer persists to `[[projects]]` in
-//! `workspace.toml`, and every later session reuses it. Levels:
+//! A persisted `[[projects]]` entry in `workspace.toml` wins. Without one
+//! the default is derived: a non-forge repository works at `local-branch`;
+//! a forge repository's level comes from the authenticated user's access
+//! to it — owned with Issues enabled is `full`, push access or ownership
+//! without Issues is `prs-only`, anything else is `local-branch` on a
+//! checkout and `prs-only` on a remote-only binding. A successful lookup
+//! persists the derived level; a failed one (offline, unauthenticated)
+//! falls back without writing, so a transient failure never locks a
+//! degraded level in. `/permission` and `repo trust set` override either
+//! way. Levels:
 //!
-//! - `full` — GitHub PRs and GitHub issues; work in a session clone
-//! - `prs_only` — GitHub PRs, may issues; every published text is screened
+//! - `full` — forge PRs and forge issues; work in a session clone
+//! - `prs_only` — forge PRs, may issues; every published text is screened
 //! - `local_branch` — may PR + may issue on a session clone
 //! - `local` — write the launch checkout directly (not recommended)
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use crate::ask_user::{AnswerValue, QuestionAnswer};
+use crate::issue::github::RepositoryAccess;
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::workspace::{
     GitHubRepository, ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig,
@@ -21,9 +30,9 @@ use crate::workspace::{
 /// The persisted trust level for one repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustLevel {
-    /// GitHub PRs and issues.
+    /// Forge PRs and issues.
     Full,
-    /// GitHub PRs, internal may issues, outbound screen on published text.
+    /// Forge PRs, internal may issues, outbound screen on published text.
     PrsOnly,
     /// May PR + may issue on a session clone; the checkout stays read-only.
     LocalBranch,
@@ -58,7 +67,7 @@ impl TrustLevel {
     /// The session clone is made from the forge remote and its PRs open on
     /// it; every other level keeps its clone local.
     #[must_use]
-    pub const fn publishes_to_github(self) -> bool {
+    pub const fn publishes_to_forge(self) -> bool {
         matches!(self, Self::Full | Self::PrsOnly)
     }
 
@@ -114,60 +123,8 @@ pub fn remote_url(worktree: &Path) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// A launch repository with no persisted trust decision: the worktree and
-/// its detected kind, which pick the gate's option set.
-#[derive(Debug, Clone)]
-pub struct PendingTrust {
-    /// The launch repository's worktree root.
-    pub worktree: PathBuf,
-    /// Whether the remote is GitHub-backed.
-    pub kind: RepoKind,
-}
-
-/// The trust decision `cwd`'s repository still waits for, detecting the
-/// remote's forge kind through `may_config`'s `[forge]` map.
-///
-/// `Some` when `cwd` is inside a worktree whose repository has no
-/// `[[projects]]` entry. Outside a repository there is no repo gate —
-/// the write-grant applies.
-///
-/// # Errors
-/// Fails when `config_path` exists but cannot be read or parsed.
-pub fn pending_decision(
-    cwd: &Path,
-    config_path: &Path,
-) -> Result<Option<PendingTrust>, WorkspaceConfigError> {
-    pending_decision_with_config(cwd, config_path, &crate::config::MayConfig::default())
-}
-
-/// [`pending_decision`] with the `[forge]` map `may_config` carries, so a
-/// self-hosted forge remote gets the full option set.
-///
-/// # Errors
-/// Fails when `config_path` exists but cannot be read or parsed.
-pub fn pending_decision_with_config(
-    cwd: &Path,
-    config_path: &Path,
-    may_config: &crate::config::MayConfig,
-) -> Result<Option<PendingTrust>, WorkspaceConfigError> {
-    let Some(worktree) = crate::repo_search::worktree_root(cwd) else {
-        return Ok(None);
-    };
-    let Ok(repo_key) = crate::issue::repository_identity(&worktree) else {
-        return Ok(None);
-    };
-    let config = WorkspaceConfig::load(config_path)?;
-    if trust_for(&config, &repo_key, &worktree).is_some() {
-        return Ok(None);
-    }
-    Ok(Some(PendingTrust {
-        kind: repo_kind_with_config(&worktree, may_config),
-        worktree,
-    }))
-}
-
-/// The trust level a gate answer selects. `exit`, dismissal and custom text
-/// that is not a level name decide nothing — the repository stays as it was.
+/// The trust level a `/permission` answer selects. Custom text that is not
+/// a level name decides nothing — the repository stays as it was.
 #[must_use]
 pub fn level_for_answer(answer: &QuestionAnswer) -> Option<TrustLevel> {
     let text = match &answer.answer {
@@ -178,16 +135,16 @@ pub fn level_for_answer(answer: &QuestionAnswer) -> Option<TrustLevel> {
     option_level(text)
 }
 
-/// The level a gate option names. Options read `level — description`;
+/// The level a question option names. Options read `level — description`;
 /// custom text is a bare level name.
 #[must_use]
 pub fn option_level(option: &str) -> Option<TrustLevel> {
     TrustLevel::parse(option.split(" —").next().unwrap_or(option).trim())
 }
 
-/// The trust level persisted in `config_path` for `worktree`'s repository;
-/// `None` when it is undecided or the repository identity cannot be
-/// resolved.
+/// The persisted trust level in `config_path` for `worktree`'s repository;
+/// `None` when no `[[projects]]` entry covers it or the repository
+/// identity cannot be resolved.
 ///
 /// # Errors
 /// Fails when `config_path` exists but cannot be read or parsed.
@@ -199,17 +156,13 @@ pub fn persisted_level(
         return Ok(None);
     };
     let config = WorkspaceConfig::load(config_path)?;
-    Ok(trust_for(&config, &repo_key, worktree))
+    Ok(persisted_for(&config, &repo_key))
 }
 
 /// The persisted trust for a repository identity, when a `[[projects]]`
 /// entry exists for it.
 #[must_use]
-pub fn trust_for(
-    config: &WorkspaceConfig,
-    repo_key: &Path,
-    _worktree: &Path,
-) -> Option<TrustLevel> {
+pub fn persisted_for(config: &WorkspaceConfig, repo_key: &Path) -> Option<TrustLevel> {
     config.project_for_identity(repo_key).map(level_of)
 }
 
@@ -237,6 +190,32 @@ pub fn trust_for_forge(
     config.project_for_forge(repo, may_config).map(level_of)
 }
 
+/// The effective trust for a local checkout: the persisted level, else the
+/// `local-branch` an undecided checkout resolves to.
+#[must_use]
+pub fn effective_for(config: &WorkspaceConfig, repo_key: &Path) -> TrustLevel {
+    persisted_for(config, repo_key).unwrap_or(TrustLevel::LocalBranch)
+}
+
+/// The effective trust for a GitHub-bound session: the persisted level,
+/// else the `prs-only` an undecided remote binding resolves to.
+#[must_use]
+pub fn effective_for_github(config: &WorkspaceConfig, owner_repo: &str) -> TrustLevel {
+    trust_for_github(config, owner_repo).unwrap_or(TrustLevel::PrsOnly)
+}
+
+/// The effective trust for a forge-bound session: the persisted level,
+/// else the `prs-only` an undecided remote binding resolves to.
+/// `may_config` resolves a self-hosted checkout's remote.
+#[must_use]
+pub fn effective_for_forge(
+    config: &WorkspaceConfig,
+    repo: &crate::forge::ForgeRepo,
+    may_config: &crate::config::MayConfig,
+) -> TrustLevel {
+    trust_for_forge(config, repo, may_config).unwrap_or(TrustLevel::PrsOnly)
+}
+
 fn level_of(project: &ProjectConfig) -> TrustLevel {
     match (project.pr.backend.as_deref(), &project.issues) {
         (Some("checkout"), _) => TrustLevel::Local,
@@ -247,6 +226,279 @@ fn level_of(project: &ProjectConfig) -> TrustLevel {
         (Some("github" | "gitlab"), ProjectIssues::May) => TrustLevel::PrsOnly,
         _ => TrustLevel::LocalBranch,
     }
+}
+
+/// The authenticated user's access to a forge repository, asked while
+/// resolving the repository's default trust.
+pub trait ForgeProbe {
+    /// The viewer's access to `repository`.
+    ///
+    /// # Errors
+    /// Fails when the lookup cannot be made — offline or unauthenticated.
+    fn repository_access(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> impl Future<Output = Result<RepositoryAccess, crate::issue::IssueError>> + Send;
+}
+
+impl<T: crate::issue::github::GitHubTokenSource> ForgeProbe
+    for crate::issue::github::GitHubRest<T>
+{
+    async fn repository_access(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> Result<RepositoryAccess, crate::issue::IssueError> {
+        if repository.kind() != crate::forge::ForgeKind::GitHub {
+            return Err(crate::issue::IssueError::Invalid(format!(
+                "{} is not a GitHub repository",
+                repository.host_and_path()
+            )));
+        }
+        let github = repository.full_path().parse().map_err(
+            |error: crate::workspace::GitHubRepositoryError| {
+                crate::issue::IssueError::Invalid(error.to_string())
+            },
+        )?;
+        Self::repository_access(self, &github).await
+    }
+}
+
+impl<T: crate::issue::gitlab::GitLabTokenSource> ForgeProbe
+    for crate::issue::gitlab::GitLabRest<T>
+{
+    async fn repository_access(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> Result<RepositoryAccess, crate::issue::IssueError> {
+        if repository.kind() != crate::forge::ForgeKind::GitLab {
+            return Err(crate::issue::IssueError::Invalid(format!(
+                "{} is not a GitLab project",
+                repository.host_and_path()
+            )));
+        }
+        Self::repository_access(self, repository).await
+    }
+}
+
+/// A [`ForgeProbe`] over the daemon's live credentials.
+///
+/// A GitHub repository is asked through `github` (a GitHub Enterprise host
+/// through a client built for its `/api/v3`), a GitLab project through a
+/// [`crate::issue::gitlab::GitLabRest`] built for its host on `auth`, so a
+/// `/login` or a Web Settings change applies to a probe built before it.
+#[derive(Debug, Clone)]
+pub struct ForgeProbes<T> {
+    /// The `api.github.com` REST client.
+    github: crate::issue::github::GitHubRest<T>,
+    /// The live authenticator GitLab clients are built per host from.
+    auth: crate::forge::LiveForgeAuth,
+}
+
+impl<T> ForgeProbes<T> {
+    /// Probes reading `github` for GitHub and `auth` for GitLab.
+    #[must_use]
+    pub const fn new(
+        github: crate::issue::github::GitHubRest<T>,
+        auth: crate::forge::LiveForgeAuth,
+    ) -> Self {
+        Self { github, auth }
+    }
+}
+
+impl<T: crate::issue::github::GitHubTokenSource + Clone + Sync> ForgeProbe for ForgeProbes<T> {
+    async fn repository_access(
+        &self,
+        repository: &crate::forge::ForgeRepo,
+    ) -> Result<RepositoryAccess, crate::issue::IssueError> {
+        match repository.kind() {
+            crate::forge::ForgeKind::GitHub => {
+                let host = repository.host().as_str();
+                let rest = if host == crate::forge::GITHUB_HOST {
+                    self.github.clone()
+                } else {
+                    crate::issue::github::GitHubRest::with_api_base(
+                        self.github.token_source().clone(),
+                        &format!("https://{host}/api/v3"),
+                    )
+                };
+                ForgeProbe::repository_access(&rest, repository).await
+            }
+            crate::forge::ForgeKind::GitLab => {
+                crate::issue::gitlab::GitLabRest::new(
+                    crate::issue::gitlab::ForgeGitLabAuth::new(
+                        self.auth.clone(),
+                        repository.host().as_str().to_string(),
+                    ),
+                    repository.host().as_str(),
+                )
+                .repository_access(repository)
+                .await
+            }
+        }
+    }
+}
+
+/// The default trust a forge access lookup gives a local checkout.
+///
+/// Owned with Issues is `full`, push access `prs-only`, anything else —
+/// lookup failure included — `local-branch`.
+#[must_use]
+pub const fn default_for_checkout(access: Option<RepositoryAccess>) -> TrustLevel {
+    match access {
+        Some(access) if access.owned && access.has_issues => TrustLevel::Full,
+        Some(access) if access.owned || access.can_push => TrustLevel::PrsOnly,
+        Some(_) | None => TrustLevel::LocalBranch,
+    }
+}
+
+/// The default trust a forge access lookup gives a remote-only binding.
+///
+/// Owned with Issues is `full`, anything else — lookup failure included —
+/// `prs-only`, so remote cloning still works and issues stay internal.
+#[must_use]
+pub const fn default_for_remote(access: Option<RepositoryAccess>) -> TrustLevel {
+    match access {
+        Some(access) if access.owned && access.has_issues => TrustLevel::Full,
+        Some(_) | None => TrustLevel::PrsOnly,
+    }
+}
+
+/// The trust of the repository `worktree` belongs to.
+///
+/// The persisted level when `workspace.toml` holds one, else the derived
+/// default — persisted when the forge access lookup succeeded, so a
+/// concurrent `/permission` or `repo trust set` decision is never
+/// clobbered.
+///
+/// # Errors
+/// Fails when the config cannot be read or written, or the repository
+/// identity cannot be resolved.
+pub async fn resolve_checkout<P: ForgeProbe + Sync>(
+    config_path: &Path,
+    worktree: &Path,
+    probe: &P,
+) -> Result<TrustLevel, WorkspaceConfigError> {
+    let (config, identity, kind) = {
+        let (config_path, worktree) = (config_path.to_path_buf(), worktree.to_path_buf());
+        // Loading matches a project by its checkout's remote, and reading
+        // the kind and the identity runs git: off the executor.
+        blocking::unblock(move || {
+            let config = WorkspaceConfig::load(&config_path)?;
+            let identity = crate::issue::repository_identity(&worktree)
+                .map_err(|e| invalid_input(format!("repository identity: {e}")))?;
+            let kind = repo_kind(&worktree);
+            Ok::<_, WorkspaceConfigError>((config, identity, kind))
+        })
+        .await?
+    };
+    if let Some(level) = persisted_for(&config, &identity) {
+        return Ok(level);
+    }
+    let RepoKind::Forge { repo } = &kind else {
+        // A non-forge repository defaults to local-branch without
+        // persisting: a forge `origin` added later is picked up.
+        return Ok(TrustLevel::LocalBranch);
+    };
+    let repository = repo.clone();
+    let access = match probe.repository_access(&repository).await {
+        Ok(access) => access,
+        Err(error) => {
+            // Offline or unauthenticated: fall back without persisting so
+            // a transient failure never locks in a degraded level.
+            tracing::debug!(%error, repo = %repository.host_and_path(), "forge access lookup failed; defaulting trust");
+            return Ok(TrustLevel::LocalBranch);
+        }
+    };
+    let level = default_for_checkout(Some(access));
+    let (config_path, worktree) = (config_path.to_path_buf(), worktree.to_path_buf());
+    blocking::unblock(move || persist_checkout_decision(&config_path, &worktree, &kind, level))
+        .await
+}
+
+/// The trust of a forge repository bound with no checkout.
+///
+/// The persisted level when one exists, else the derived default —
+/// persisted when the access lookup succeeded; `may_config` matches a
+/// self-hosted checkout's project entry.
+///
+/// # Errors
+/// Fails when the config cannot be read or written.
+pub async fn resolve_forge_remote<P: ForgeProbe + Sync>(
+    config_path: &Path,
+    repository: &crate::forge::ForgeRepo,
+    may_config: &crate::config::MayConfig,
+    probe: &P,
+) -> Result<TrustLevel, WorkspaceConfigError> {
+    let config = {
+        let config_path = config_path.to_path_buf();
+        blocking::unblock(move || WorkspaceConfig::load(&config_path)).await?
+    };
+    if let Some(level) = trust_for_forge(&config, repository, may_config) {
+        return Ok(level);
+    }
+    let access = match probe.repository_access(repository).await {
+        Ok(access) => access,
+        Err(error) => {
+            tracing::debug!(%error, repo = %repository.host_and_path(), "forge access lookup failed; defaulting trust");
+            return Ok(TrustLevel::PrsOnly);
+        }
+    };
+    let level = default_for_remote(Some(access));
+    let (config_path, repository, may_config) = (
+        config_path.to_path_buf(),
+        repository.clone(),
+        may_config.clone(),
+    );
+    blocking::unblock(move || {
+        persist_remote_decision(&config_path, &repository, &may_config, level)
+    })
+    .await
+}
+
+/// Write `level` for `worktree`'s repository unless a decision landed
+/// meanwhile; the level actually in force is returned.
+fn persist_checkout_decision(
+    config_path: &Path,
+    worktree: &Path,
+    kind: &RepoKind,
+    level: TrustLevel,
+) -> Result<TrustLevel, WorkspaceConfigError> {
+    let mut config = WorkspaceConfig::load(config_path)?;
+    let identity = crate::issue::repository_identity(worktree)
+        .map_err(|e| invalid_input(format!("repository identity: {e}")))?;
+    if let Some(existing) = persisted_for(&config, &identity) {
+        return Ok(existing);
+    }
+    apply(&mut config, worktree, Some(kind), level)?;
+    config.save(config_path)?;
+    Ok(level)
+}
+
+/// Write `level` for `repository` unless a decision landed meanwhile; the
+/// level actually in force is returned.
+fn persist_remote_decision(
+    config_path: &Path,
+    repository: &crate::forge::ForgeRepo,
+    may_config: &crate::config::MayConfig,
+    level: TrustLevel,
+) -> Result<TrustLevel, WorkspaceConfigError> {
+    let mut config = WorkspaceConfig::load(config_path)?;
+    if let Some(existing) = trust_for_forge(&config, repository, may_config) {
+        return Ok(existing);
+    }
+    Decision {
+        issues: issues_of(repository, level),
+        backend: Some(repository.kind().binding_prefix().to_string()),
+        screen: (level == TrustLevel::PrsOnly).then_some(true),
+    }
+    .store(
+        &mut config,
+        |p| p.covers_forge(repository, may_config),
+        None,
+        Some(repository.clone()),
+    );
+    config.save(config_path)?;
+    Ok(level)
 }
 
 /// Persist a trust decision for a GitHub repository with no local checkout.
@@ -279,7 +531,7 @@ pub fn persist_forge(
     repo: &crate::forge::ForgeRepo,
     level: TrustLevel,
 ) -> Result<(), WorkspaceConfigError> {
-    if !level.publishes_to_github() {
+    if !level.publishes_to_forge() {
         return Err(invalid_input(format!(
             "{} needs a local checkout; {} has none",
             level.as_str(),
@@ -365,23 +617,15 @@ impl Decision {
     }
 }
 
-/// Persist a trust decision to `workspace.toml`.
-///
-/// The file is read afresh and the entry for the worktree's repository
-/// identity is updated in place: only the fields trust owns (issue backend,
-/// `pr.backend`, `pr.screen`) change; `checks` and the rest of the entry
-/// stay. A repository without an entry gets one at `worktree`.
-///
-/// # Errors
-/// Fails when the config cannot be read, parsed or written, or the
-/// repository identity cannot be resolved.
-pub fn persist(
-    config_path: &Path,
+/// Apply a trust decision to `config`: only the fields trust owns (issue
+/// backend, `pr.backend`, `pr.screen`) change; `checks` and the rest of
+/// the entry stay. A repository without an entry gets one at `worktree`.
+fn apply(
+    config: &mut WorkspaceConfig,
     worktree: &Path,
     kind: Option<&RepoKind>,
     level: TrustLevel,
 ) -> Result<(), WorkspaceConfigError> {
-    let mut config = WorkspaceConfig::load(config_path)?;
     let identity = crate::issue::repository_identity(worktree)
         .map_err(|e| invalid_input(format!("repository identity: {e}")))?;
     let repo = match kind {
@@ -419,7 +663,7 @@ pub fn persist(
         screen,
     }
     .store(
-        &mut config,
+        config,
         |p| p.has_identity(&identity),
         Some(worktree.to_path_buf()),
         None,
@@ -429,6 +673,27 @@ pub fn persist(
     } else {
         config.remove_workdir(worktree);
     }
+    Ok(())
+}
+
+/// Persist a trust decision to `workspace.toml`.
+///
+/// The file is read afresh and the entry for the worktree's repository
+/// identity is updated in place: only the fields trust owns (issue backend,
+/// `pr.backend`, `pr.screen`) change; `checks` and the rest of the entry
+/// stay. A repository without an entry gets one at `worktree`.
+///
+/// # Errors
+/// Fails when the config cannot be read, parsed or written, or the
+/// repository identity cannot be resolved.
+pub fn persist(
+    config_path: &Path,
+    worktree: &Path,
+    kind: Option<&RepoKind>,
+    level: TrustLevel,
+) -> Result<(), WorkspaceConfigError> {
+    let mut config = WorkspaceConfig::load(config_path)?;
+    apply(&mut config, worktree, kind, level)?;
     config.save(config_path)
 }
 
@@ -441,48 +706,10 @@ pub(crate) fn config_at(dir: &Path, worktree: &Path, level: TrustLevel) -> Works
     WorkspaceConfig::load(&path).expect("load trust")
 }
 
-#[derive(askama::Template)]
-#[template(path = "repo_trust_remote_question.txt", escape = "none")]
-struct RemoteQuestionText<'a> {
-    owner_repo: &'a str,
-}
-
-/// The first-contact question for a GitHub repository with no local
-/// checkout: only the levels that publish to GitHub apply, and the answer
-/// is read with [`level_for_answer`].
-///
-/// # Panics
-/// Never: the template renders for every input.
+/// The `/permission` `ask_user` request for one repository.
 #[must_use]
-pub fn remote_question(owner_repo: &str) -> crate::ask_user::Question {
-    use askama::Template as _;
-    crate::ask_user::Question {
-        section: "repo-trust".to_string(),
-        question: RemoteQuestionText { owner_repo }
-            .render()
-            .expect("the remote trust question renders")
-            .trim()
-            .to_string(),
-        option: vec![
-            "full — Allow GitHub PRs and issues".to_string(),
-            "prs-only — GitHub PRs only; issues stay internal, published text is screened"
-                .to_string(),
-            "exit — Do not bind this repository".to_string(),
-        ],
-        multi_select: false,
-    }
-}
-
-/// The first-contact `ask_user` request for one repository.
-/// `include_exit` appends the quit option — the launch gate offers it,
-/// `/permission`'s re-ask does not.
-#[must_use]
-pub fn question_for(
-    kind: &RepoKind,
-    worktree: &Path,
-    include_exit: bool,
-) -> PersistedAskUserRequest {
-    let mut options = match kind {
+pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest {
+    let options = match kind {
         RepoKind::Forge { repo } => {
             let forge = match repo.kind() {
                 crate::forge::ForgeKind::GitHub => "GitHub",
@@ -503,9 +730,6 @@ pub fn question_for(
             "local — Write the checkout directly (not recommended)".to_string(),
         ],
     };
-    if include_exit {
-        options.push("exit — Do not bind this repository".to_string());
-    }
     let question = match kind {
         RepoKind::Forge { repo } => {
             format!(
@@ -531,6 +755,7 @@ pub fn question_for(
 mod tests {
     use super::*;
     use crate::ask_user::{AnswerValue, QuestionAnswer};
+    use crate::issue::IssueError;
     use std::process::Command;
 
     fn git_repo() -> tempfile::TempDir {
@@ -544,8 +769,44 @@ mod tests {
         dir
     }
 
+    /// `dir` is `dir` inside a git worktree whose `origin` names
+    /// `https://github.com/acme/app.git`.
+    fn github_checkout() -> tempfile::TempDir {
+        let dir = git_repo();
+        let status = Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/acme/app.git"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git remote");
+        assert!(status.success());
+        dir
+    }
+
     fn identity(path: &Path) -> std::path::PathBuf {
         crate::issue::repository_identity(path).expect("identity")
+    }
+
+    /// A [`ForgeProbe`] answering with `access`, or offline when `None`.
+    struct Stub(Option<RepositoryAccess>);
+
+    impl ForgeProbe for Stub {
+        fn repository_access(
+            &self,
+            _repository: &crate::forge::ForgeRepo,
+        ) -> impl Future<Output = Result<RepositoryAccess, IssueError>> + Send {
+            std::future::ready(
+                self.0
+                    .ok_or_else(|| IssueError::GitHubAuth("offline".to_string())),
+            )
+        }
+    }
+
+    const fn access(owned: bool, can_push: bool, has_issues: bool) -> RepositoryAccess {
+        RepositoryAccess {
+            owned,
+            can_push,
+            has_issues,
+        }
     }
 
     #[test]
@@ -557,20 +818,17 @@ mod tests {
         persist(&config_path, worktree, Some(&kind), TrustLevel::Full).expect("full");
         let loaded = WorkspaceConfig::load(&config_path).expect("load");
         let key = identity(worktree);
-        assert_eq!(trust_for(&loaded, &key, worktree), Some(TrustLevel::Full));
+        assert_eq!(persisted_for(&loaded, &key), Some(TrustLevel::Full));
 
         persist(&config_path, worktree, Some(&kind), TrustLevel::LocalBranch)
             .expect("local-branch");
         let loaded = WorkspaceConfig::load(&config_path).expect("load");
-        assert_eq!(
-            trust_for(&loaded, &key, worktree),
-            Some(TrustLevel::LocalBranch)
-        );
+        assert_eq!(persisted_for(&loaded, &key), Some(TrustLevel::LocalBranch));
         assert!(!loaded.has_write_access(worktree));
 
         persist(&config_path, worktree, Some(&kind), TrustLevel::Local).expect("local");
         let loaded = WorkspaceConfig::load(&config_path).expect("load");
-        assert_eq!(trust_for(&loaded, &key, worktree), Some(TrustLevel::Local));
+        assert_eq!(persisted_for(&loaded, &key), Some(TrustLevel::Local));
         assert!(loaded.has_write_access(worktree));
         assert_eq!(loaded.projects[0].pr.backend.as_deref(), Some("checkout"));
     }
@@ -616,10 +874,7 @@ mod tests {
             assert_eq!(project.checks.as_deref(), Some("cargo test"));
             assert_eq!(project.pr.auto_merge, Some(false));
             assert_eq!(project.pr.require_review, Some(true));
-            assert_eq!(
-                trust_for(&loaded, &identity(repo.path()), repo.path()),
-                Some(level)
-            );
+            assert_eq!(persisted_for(&loaded, &identity(repo.path())), Some(level));
         }
     }
 
@@ -654,7 +909,7 @@ mod tests {
         assert_eq!(loaded.projects[0].checks.as_deref(), Some("cargo test"));
         for dir in [repo.path(), linked.as_path()] {
             assert_eq!(
-                trust_for(&loaded, &identity(dir), dir),
+                persisted_for(&loaded, &identity(dir)),
                 Some(TrustLevel::LocalBranch)
             );
         }
@@ -721,10 +976,7 @@ mod tests {
             },
         });
         let key = identity(repo.path());
-        assert_eq!(
-            trust_for(&config, &key, repo.path()),
-            Some(TrustLevel::LocalBranch)
-        );
+        assert_eq!(persisted_for(&config, &key), Some(TrustLevel::LocalBranch));
     }
 
     #[test]
@@ -778,5 +1030,218 @@ mod tests {
         }
         let custom = answer(AnswerValue::Custom("prs-only".to_string()));
         assert_eq!(level_for_answer(&custom), Some(TrustLevel::PrsOnly));
+    }
+
+    /// The default each GitHub access result gives, on a checkout and on a
+    /// remote-only binding.
+    #[test]
+    fn github_access_maps_to_default_levels() {
+        let owned = Some(access(true, true, true));
+        let owned_fork = Some(access(true, true, false));
+        let collaborator = Some(access(false, true, true));
+        let read_only = Some(access(false, false, true));
+        for (probe_result, checkout, remote) in [
+            (owned, TrustLevel::Full, TrustLevel::Full),
+            (owned_fork, TrustLevel::PrsOnly, TrustLevel::PrsOnly),
+            (collaborator, TrustLevel::PrsOnly, TrustLevel::PrsOnly),
+            (read_only, TrustLevel::LocalBranch, TrustLevel::PrsOnly),
+            (None, TrustLevel::LocalBranch, TrustLevel::PrsOnly),
+        ] {
+            assert_eq!(
+                default_for_checkout(probe_result),
+                checkout,
+                "{probe_result:?}"
+            );
+            assert_eq!(default_for_remote(probe_result), remote, "{probe_result:?}");
+        }
+    }
+
+    fn config_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("workspace.toml")
+    }
+
+    fn level_on_disk(config_path: &Path, worktree: &Path) -> Option<TrustLevel> {
+        let config = WorkspaceConfig::load(config_path).expect("load");
+        persisted_for(&config, &identity(worktree))
+    }
+
+    /// An owned GitHub checkout resolves to `full` and persists it.
+    #[tokio::test]
+    async fn an_owned_github_checkout_resolves_full_and_persists() {
+        let repo = github_checkout();
+        let config_path = config_path(&repo);
+        let probe = Stub(Some(access(true, true, true)));
+        let level = resolve_checkout(&config_path, repo.path(), &probe)
+            .await
+            .expect("resolve");
+        assert_eq!(level, TrustLevel::Full);
+        assert_eq!(
+            level_on_disk(&config_path, repo.path()),
+            Some(TrustLevel::Full)
+        );
+    }
+
+    /// An owned fork with Issues off, a collaborator and a read-only
+    /// checkout resolve to `prs-only`, `prs-only` and `local-branch`.
+    #[tokio::test]
+    async fn github_access_decides_the_checkout_default() {
+        for (probe_result, expected) in [
+            (Some(access(true, true, false)), TrustLevel::PrsOnly),
+            (Some(access(false, true, true)), TrustLevel::PrsOnly),
+            (Some(access(false, false, true)), TrustLevel::LocalBranch),
+        ] {
+            let repo = github_checkout();
+            let config_path = config_path(&repo);
+            let probe = Stub(probe_result);
+            let level = resolve_checkout(&config_path, repo.path(), &probe)
+                .await
+                .expect("resolve");
+            assert_eq!(level, expected, "{probe_result:?}");
+            assert_eq!(
+                level_on_disk(&config_path, repo.path()),
+                Some(expected),
+                "{probe_result:?} persists"
+            );
+        }
+    }
+
+    /// An offline lookup falls back to `local-branch` without persisting,
+    /// and a later online run resolves and persists `full`.
+    #[tokio::test]
+    async fn an_offline_lookup_falls_back_without_persisting() {
+        let repo = github_checkout();
+        let config_path = config_path(&repo);
+        let offline = Stub(None);
+        let level = resolve_checkout(&config_path, repo.path(), &offline)
+            .await
+            .expect("resolve");
+        assert_eq!(level, TrustLevel::LocalBranch);
+        assert_eq!(level_on_disk(&config_path, repo.path()), None);
+
+        let online = Stub(Some(access(true, true, true)));
+        let level = resolve_checkout(&config_path, repo.path(), &online)
+            .await
+            .expect("resolve");
+        assert_eq!(level, TrustLevel::Full);
+        assert_eq!(
+            level_on_disk(&config_path, repo.path()),
+            Some(TrustLevel::Full)
+        );
+    }
+
+    /// A non-GitHub repository resolves to `local-branch` without
+    /// persisting, so a GitHub `origin` added later upgrades it.
+    #[tokio::test]
+    async fn a_plain_git_checkout_resolves_local_branch_unpersisted() {
+        let repo = git_repo();
+        let config_path = config_path(&repo);
+        let probe = Stub(Some(access(true, true, true)));
+        let level = resolve_checkout(&config_path, repo.path(), &probe)
+            .await
+            .expect("resolve");
+        assert_eq!(level, TrustLevel::LocalBranch);
+        assert_eq!(level_on_disk(&config_path, repo.path()), None);
+
+        // An `origin` added later is picked up and resolves by access.
+        let status = Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/acme/app.git"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git remote");
+        assert!(status.success());
+        let level = resolve_checkout(&config_path, repo.path(), &probe)
+            .await
+            .expect("resolve");
+        assert_eq!(level, TrustLevel::Full);
+        assert_eq!(
+            level_on_disk(&config_path, repo.path()),
+            Some(TrustLevel::Full)
+        );
+    }
+
+    /// An explicit decision is never overwritten by auto-detection.
+    #[tokio::test]
+    async fn a_persisted_decision_is_never_overwritten() {
+        for level in [
+            TrustLevel::Local,
+            TrustLevel::LocalBranch,
+            TrustLevel::PrsOnly,
+            TrustLevel::Full,
+        ] {
+            let repo = github_checkout();
+            let config_path = config_path(&repo);
+            persist(&config_path, repo.path(), Some(&github()), level).expect("persist");
+            // The probe reports different access than the decision needs.
+            let probe = Stub(Some(access(false, false, false)));
+            let resolved = resolve_checkout(&config_path, repo.path(), &probe)
+                .await
+                .expect("resolve");
+            assert_eq!(resolved, level, "{level:?} survives the probe");
+            assert_eq!(level_on_disk(&config_path, repo.path()), Some(level));
+        }
+    }
+
+    /// A remote-only `github:owner/repo` binding resolves by access: owned
+    /// with Issues persists `full`, read-only access `prs-only`, and an
+    /// offline lookup falls back to `prs-only` unpersisted.
+    #[tokio::test]
+    async fn a_remote_binding_resolves_by_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = config_path(&dir);
+        for (probe_result, expected) in [
+            (Some(access(true, true, true)), TrustLevel::Full),
+            (Some(access(true, true, false)), TrustLevel::PrsOnly),
+            (Some(access(false, true, true)), TrustLevel::PrsOnly),
+            (Some(access(false, false, true)), TrustLevel::PrsOnly),
+        ] {
+            let probe = Stub(probe_result);
+            let level = resolve_forge_remote(
+                &config_path,
+                &forge_repo("github:acme/app"),
+                &crate::config::MayConfig::default(),
+                &probe,
+            )
+            .await
+            .expect("resolve");
+            assert_eq!(level, expected, "{probe_result:?}");
+            let config = WorkspaceConfig::load(&config_path).expect("load");
+            assert_eq!(
+                trust_for_github(&config, "acme/app"),
+                Some(expected),
+                "{probe_result:?} persists"
+            );
+            std::fs::remove_file(&config_path).expect("clean");
+        }
+        let offline = Stub(None);
+        let level = resolve_forge_remote(
+            &config_path,
+            &forge_repo("github:acme/app"),
+            &crate::config::MayConfig::default(),
+            &offline,
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(level, TrustLevel::PrsOnly);
+        let config = WorkspaceConfig::load(&config_path).expect("load");
+        assert_eq!(trust_for_github(&config, "acme/app"), None);
+    }
+
+    /// A decision recorded for the remote between the lookup and the write
+    /// wins over the derived default.
+    #[tokio::test]
+    async fn a_concurrent_remote_decision_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = config_path(&dir);
+        persist_github(&config_path, "acme/app", TrustLevel::PrsOnly).expect("persist");
+        let probe = Stub(Some(access(true, true, true)));
+        let level = resolve_forge_remote(
+            &config_path,
+            &forge_repo("github:acme/app"),
+            &crate::config::MayConfig::default(),
+            &probe,
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(level, TrustLevel::PrsOnly);
     }
 }

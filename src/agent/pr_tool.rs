@@ -295,7 +295,10 @@ mod tests {
                         tmp.path(),
                         "s1",
                     ),
-                    github_api: PrContext::default_github_api(),
+                    github_api: PrContext::default_github_api(
+                        crate::forge::LiveForgeAuth::default(),
+                    ),
+                    forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
                     task_events: None,
@@ -405,7 +408,10 @@ mod tests {
                     workspace_config: crate::workspace::WorkspaceConfig::default(),
                     review: None,
                     signing: user.signing(&tmp.join("may-home"), "s1"),
-                    github_api: PrContext::default_github_api(),
+                    github_api: PrContext::default_github_api(
+                        crate::forge::LiveForgeAuth::default(),
+                    ),
+                    forge_auth: crate::forge::LiveForgeAuth::default(),
                     land_locks: LandLocks::default(),
                     checkouts: None,
                     task_events: None,

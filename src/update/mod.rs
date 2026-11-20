@@ -33,8 +33,6 @@ pub use release::ReleasePlatform;
 
 use std::path::{Path, PathBuf};
 
-use crate::issue::{GhCliTokenSource, GitHubTokenSource as _};
-
 use github::GitHub;
 
 /// The commit this binary was built from; empty when git was unavailable.
@@ -355,10 +353,16 @@ pub async fn check(
     channel: Channel,
     progress: &mut impl FnMut(Progress),
 ) -> Result<Option<Available>, UpdateError> {
-    let token = GhCliTokenSource
-        .token()
-        .await
-        .map_err(|error| error.to_string());
+    // `github.com`'s configured credential: required on `dev`, where the CI
+    // artifacts are private; a bonus on `stable`, where it only raises the
+    // public release API's rate limit.
+    let token = match crate::config::MayConfig::load().await {
+        Ok(config) => crate::forge::ForgeAuth::new(&config)
+            .token_for(crate::forge::GITHUB_HOST)
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
     check_at(GITHUB_API, channel, &Build::this(), token, progress).await
 }
 

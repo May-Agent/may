@@ -118,6 +118,7 @@ struct Claims {
 pub struct IssueOwners {
     directory: AgentDirectory,
     may_config: std::sync::Arc<crate::config::MayConfig>,
+    forge_auth: crate::forge::LiveForgeAuth,
 }
 
 impl IssueOwners {
@@ -127,6 +128,7 @@ impl IssueOwners {
         Self {
             directory,
             may_config: std::sync::Arc::new(crate::config::MayConfig::default()),
+            forge_auth: crate::forge::LiveForgeAuth::default(),
         }
     }
 
@@ -138,6 +140,14 @@ impl IssueOwners {
         may_config: impl Into<std::sync::Arc<crate::config::MayConfig>>,
     ) -> Self {
         self.may_config = may_config.into();
+        self
+    }
+
+    /// Resolve agents' GitLab stores with the live authenticator
+    /// `forge_auth`.
+    #[must_use]
+    pub fn with_forge_auth(mut self, forge_auth: crate::forge::LiveForgeAuth) -> Self {
+        self.forge_auth = forge_auth;
         self
     }
 
@@ -255,12 +265,14 @@ impl IssueOwners {
         let binding = agent.binding.clone();
         let db = self.directory.db();
         let may_config = self.may_config.clone();
+        let forge_auth = self.forge_auth.clone();
         blocking::unblock(move || {
             resolve_bound_issue_store(
                 binding.as_ref(),
                 &cwd,
                 &workspace_config,
                 may_config.as_ref(),
+                &forge_auth,
                 db,
             )
         })

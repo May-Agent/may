@@ -40,14 +40,16 @@ pub struct IssueTargets<T> {
     workspace_config: PathBuf,
     may_config: std::sync::Arc<crate::config::MayConfig>,
     rest: GitHubRest<T>,
+    forge_auth: crate::forge::LiveForgeAuth,
 }
 
 impl<T: GitHubTokenSource + Clone> IssueTargets<T> {
     /// Targets whose local repositories read through `db`, whose GitHub
     /// repositories read through `rest`, and whose GitLab repositories read
-    /// through the `[forge]` credentials of `may_config`; relative paths
-    /// resolve against `cwd`, and the project at a path is looked up in the
-    /// workspace config at `workspace_config`.
+    /// through `forge_auth` so a credential set later still applies;
+    /// `may_config` resolves a self-hosted target's forge kind. Relative
+    /// paths resolve against `cwd`, and the project at a path is looked up
+    /// in the workspace config at `workspace_config`.
     #[must_use]
     pub const fn new(
         db: ChatDb,
@@ -55,6 +57,7 @@ impl<T: GitHubTokenSource + Clone> IssueTargets<T> {
         workspace_config: PathBuf,
         may_config: std::sync::Arc<crate::config::MayConfig>,
         rest: GitHubRest<T>,
+        forge_auth: crate::forge::LiveForgeAuth,
     ) -> Self {
         Self {
             db,
@@ -62,12 +65,13 @@ impl<T: GitHubTokenSource + Clone> IssueTargets<T> {
             workspace_config,
             may_config,
             rest,
+            forge_auth,
         }
     }
 
     fn gitlab_store(&self, repository: ForgeRepo) -> GitLabIssueStore<ForgeGitLabAuth> {
         let auth = ForgeGitLabAuth::new(
-            crate::forge::ForgeAuth::new(self.may_config.as_ref()),
+            self.forge_auth.clone(),
             repository.host().as_str().to_string(),
         );
         GitLabIssueStore::new(repository, auth)
@@ -222,6 +226,7 @@ mod tests {
             config_path,
             std::sync::Arc::new(crate::config::MayConfig::default()),
             GitHubRest::new(GhCliTokenSource),
+            crate::forge::LiveForgeAuth::default(),
         );
 
         let resolved = targets
@@ -263,6 +268,7 @@ mod tests {
             dir.path().join("workspace.toml"),
             std::sync::Arc::new(may_config),
             GitHubRest::new(GhCliTokenSource),
+            crate::forge::LiveForgeAuth::default(),
         );
 
         let resolved = targets.resolve("owner/repo").await.expect("github");

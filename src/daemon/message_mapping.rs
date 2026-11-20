@@ -192,7 +192,9 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
                 "summary": summary,
             })
         }
-        ToolEventRecord::End { id, name, result } => json!({
+        ToolEventRecord::End {
+            id, name, result, ..
+        } => json!({
             "stage": "end",
             "id": id,
             "name": name,

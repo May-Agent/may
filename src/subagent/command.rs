@@ -34,6 +34,7 @@ use super::report::{
     SubagentResult, SubagentUsage, render,
 };
 use super::tier::{Tier, TierModels};
+use crate::agent::ModelSlot;
 use crate::agent::acp_subagent::AcpSession;
 use crate::agent::subagent_tracker::{RunCard, RunUsage, SubagentTracker};
 use crate::harness::compact_tool::CompactSignal;
@@ -49,6 +50,56 @@ pub const FORK_DESCRIPTION: &str = "Continues your own context on your model; us
 /// The name a fork's run is reported under.
 const FORK: &str = "fork";
 
+/// The builder a [`SubagentModelResolver`] wraps.
+type ResolveModel<LLM> = dyn Fn(
+        &crate::ModelSelector,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<crate::agent::ModelSlot<LLM>>>
+    + Send
+    + Sync;
+
+/// Resolves a `provider::model` selector into a model slot, for a call's
+/// `--model` or a definition's `model` pin.
+#[derive(Clone)]
+pub struct SubagentModelResolver<LLM> {
+    /// The builder.
+    build: std::sync::Arc<ResolveModel<LLM>>,
+}
+
+impl<LLM> std::fmt::Debug for SubagentModelResolver<LLM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubagentModelResolver")
+    }
+}
+
+impl<LLM> SubagentModelResolver<LLM> {
+    /// Wraps `build`.
+    pub fn new<F>(build: F) -> Self
+    where
+        F: Fn(
+                &crate::ModelSelector,
+            )
+                -> futures::future::BoxFuture<'static, anyhow::Result<crate::agent::ModelSlot<LLM>>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            build: std::sync::Arc::new(build),
+        }
+    }
+
+    /// The slot `selector` builds on.
+    ///
+    /// # Errors
+    /// Returns what `build` rejected.
+    pub async fn resolve(
+        &self,
+        selector: &crate::ModelSelector,
+    ) -> anyhow::Result<crate::agent::ModelSlot<LLM>> {
+        (self.build)(selector).await
+    }
+}
+
 /// What every `subagent` call of a session shares.
 pub struct SubagentSettings<LLM> {
     /// Usage of the runs in flight, and the cards they report; its runs are
@@ -56,6 +107,9 @@ pub struct SubagentSettings<LLM> {
     pub tracker: SubagentTracker,
     /// The model of each tier.
     pub tiers: TierModels<LLM>,
+    /// Builds a model for an explicit `provider::model`; `None` refuses
+    /// `--model` calls and `model = "..."` definitions.
+    pub models: Option<SubagentModelResolver<LLM>>,
     /// The definitions May supplies, by name.
     pub definitions: BTreeMap<String, SubagentDefinition>,
     /// Where a prompt file resolves.
@@ -179,9 +233,13 @@ impl<LLM: LanguageModel + 'static> Expires for Held<LLM> {
 }
 
 /// What a fresh agent is built from, once its run is registered.
-struct Pending {
+struct Pending<LLM: LanguageModel + 'static> {
     name: String,
-    tier: Tier,
+    /// The tier the run reports; `None` for an explicitly chosen model.
+    tier: Option<Tier>,
+    /// The model the agent is built on.
+    slot: ModelSlot<LLM>,
+    /// The model name the run reports.
     model: String,
     shell: SessionShell,
     source: Source,
@@ -195,7 +253,7 @@ enum Source {
 /// What a call runs.
 enum Ready<LLM: LanguageModel + 'static> {
     Continue(Box<Held<LLM>>),
-    Fresh(Box<Pending>),
+    Fresh(Box<Pending<LLM>>),
     External(Box<Held<LLM>>),
 }
 
@@ -371,6 +429,26 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         })
     }
 
+    /// The slot an explicit `provider::model` builds on, and the name the
+    /// run reports.
+    async fn explicit_slot(
+        &self,
+        selector: &crate::ModelSelector,
+    ) -> anyhow::Result<(ModelSlot<LLM>, String)> {
+        let Some(resolve) = &self.settings().models else {
+            anyhow::bail!(
+                "this session builds no explicit models; run `models` to see the models a call may run on"
+            );
+        };
+        let slot = resolve.resolve(selector).await?;
+        let model = slot
+            .llm
+            .profile()
+            .await
+            .map_or_else(|_| selector.to_string(), |profile| profile.name);
+        Ok((slot, model))
+    }
+
     /// Resolves everything a fresh in-process subagent needs that can fail,
     /// so its run is registered only once nothing can.
     async fn prepare(
@@ -378,17 +456,42 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         call: Call<'_>,
         prompt: &str,
         caller: Option<&Path>,
-    ) -> anyhow::Result<Pending> {
-        let (source, grant, name, declared) = match call {
+    ) -> anyhow::Result<Pending<LLM>> {
+        let (source, grant, name, request) = match call {
             Call::Fork { grant } => {
                 let snapshot = self.fork_snapshot()?;
                 (Source::Fork(snapshot), grant, FORK.to_string(), None)
             }
-            Call::Named { name, grant } => {
+            Call::Named {
+                name,
+                grant,
+                model,
+                tier,
+            } => {
                 let definition = self.lookup(caller).resolve(name).await?;
                 if definition.access == SubagentAccess::ReadOnly && !grant.is_empty() {
                     anyhow::bail!(
                         "subagent '{name}' is read-only: it writes only its own working directory and takes no `--worktrees` or `--commit-worktrees`"
+                    );
+                }
+                // A `model` pin is absolute: an agent defined as an opus 5.5
+                // agent is that agent only on that model. A `tier` pin fixes
+                // the class, not the concrete model — it exists to abstract
+                // the choice, and a call naming a concrete model brings
+                // information the class cannot hold, so `--model` still wins.
+                if let Some(pinned) = &definition.model
+                    && (model.is_some() || tier.is_some())
+                {
+                    anyhow::bail!(
+                        "subagent '{name}' pins its model to '{pinned}': a call chooses no model"
+                    );
+                }
+                if let Some(pinned) = definition.tier
+                    && tier.is_some()
+                {
+                    anyhow::bail!(
+                        "subagent '{name}' pins the {} tier; a call chooses a concrete model with `--model`",
+                        pinned.short_name()
                     );
                 }
                 let declared = definition.tier.map(Tier::try_from).transpose()?;
@@ -396,7 +499,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                     Source::Definition(Box::new(definition.clone())),
                     grant,
                     definition.name,
-                    declared,
+                    Some((declared, model, tier)),
                 )
             }
             Call::External { .. } | Call::Resume { .. } => {
@@ -404,8 +507,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             }
         };
         let tiers = &self.settings().tiers;
-        // A fork runs on the main agent's model.
-        let (tier, model) = match &source {
+        let (tier, slot, model) = match &source {
+            // A fork runs on the main agent's model.
             Source::Fork(snapshot) => {
                 let (tier, model) = tiers.select(prompt, Some(Tier::Advanced)).await?;
                 if model != snapshot.model() {
@@ -414,9 +517,19 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                         fork: model,
                     }));
                 }
-                (tier, model)
+                (Some(tier), tiers.slot(tier).clone(), model)
             }
-            Source::Definition(_) => tiers.select(prompt, declared).await?,
+            Source::Definition(definition) => {
+                let (declared, call_model, call_tier) =
+                    request.expect("a named call carries its choice");
+                if let Some(selector) = definition.model.as_ref().or(call_model.as_ref()) {
+                    let (slot, model) = self.explicit_slot(selector).await?;
+                    (None, slot, model)
+                } else {
+                    let (tier, model) = tiers.select(prompt, call_tier.or(declared)).await?;
+                    (Some(tier), tiers.slot(tier).clone(), model)
+                }
+            }
         };
         let shell = self
             .launch(grant.grant(Some(self.caller_dir(caller))), caller, &name)
@@ -424,6 +537,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         Ok(Pending {
             name,
             tier,
+            slot,
             model,
             shell,
             source,
@@ -432,16 +546,16 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
 
     /// Builds the agent of `pending` under the identity its run was
     /// registered with.
-    fn build(&self, pending: Pending, identity: AgentIdentity, usage: RunUsage) -> Held<LLM> {
+    fn build(&self, pending: Pending<LLM>, identity: AgentIdentity, usage: RunUsage) -> Held<LLM> {
         let settings = self.settings();
         let Pending {
             name,
             tier,
+            slot,
             model,
             shell,
             source,
         } = pending;
-        let slot = settings.tiers.slot(tier);
         let valve = Arc::new(CompactSignal::default());
         let requested = Arc::new(AtomicBool::new(false));
         let child_hooks = ChildHooks::compacting(Some(valve.clone()), requested.clone());
@@ -459,7 +573,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let floor = match &source {
             Source::Definition(definition) => {
                 builder = builder
-                    .request_parameters(slot.parameters.clone())
+                    .request_parameters(slot.parameters)
                     .cache_lifetime(settings.cache_lifetime)
                     .instruction(definition.prompt.clone());
                 for block in &settings.instructions {
@@ -508,7 +622,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         );
         Held {
             name,
-            tier: Some(tier),
+            tier,
             model: Some(model),
             ledger,
             working_copies,
