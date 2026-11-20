@@ -196,7 +196,7 @@ async fn a_compaction_request_carries_structured_outputs() {
     assert_eq!(compactions.len(), 1);
     assert_eq!(turns.len(), 1);
     assert_eq!(
-        compactions[0]["response_format"]["type"], "json_object",
+        compactions[0]["response_format"]["type"], "json_schema",
         "the compaction asks for structured output: {}",
         compactions[0]
     );

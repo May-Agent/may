@@ -222,7 +222,7 @@ impl TestCloud {
 fn signed_in(access: &str) -> CodexCredentials {
     CodexCredentials {
         access_token: access.into(),
-        refresh_token: REFRESH_TOKEN.into(),
+        refresh_token: Some(REFRESH_TOKEN.into()),
         id_token: None,
         account_id: Some("account-日本語-한국어-中文".into()),
         residency: None,

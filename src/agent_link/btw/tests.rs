@@ -230,7 +230,7 @@ async fn a_cold_recipient_is_refused_without_a_model_call() {
             at: jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2),
             usage: &usage,
             prefix: aither_agent::context::PromptPrefix {
-                chain: aither_agent::context::PrefixChain::of(&[], &[]),
+                chain: aither_agent::context::PrefixChain::of(&[], &[], false),
                 rewrites: aither_agent::context::PrefixRewrites::default(),
                 first_request: true,
             },
