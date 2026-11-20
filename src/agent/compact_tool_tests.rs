@@ -140,11 +140,19 @@ fn plan(traffic: &mut Traffic, script: fn(usize) -> Step, text: &str) -> (Durati
             let handoff = json!({
                 "current_task": HANDOFF_TASK,
                 "key_decisions": [],
-                "context_files": [],
+                "context_files": if text.contains("RESTORE-SPEC-REQUEST") {
+                    json!([{"path": "spec.md", "why": "active specification"}])
+                } else {
+                    json!([])
+                },
                 "errors_fixes": [],
                 "pending_work": [],
                 "recovery_hints": [],
-                "skills": [],
+                "skills": if text.contains("RESTORE-SPEC-REQUEST") {
+                    json!(["may"])
+                } else {
+                    json!([])
+                },
             });
             (
                 Duration::ZERO,
@@ -415,5 +423,102 @@ async fn a_session_with_ssh_servers_runs_local_commands_in_the_job_pool() {
     assert!(
         followup.contains("--jobserver-auth=fifo:"),
         "the local command ran without the pool: {followup}"
+    );
+}
+
+fn read_compact_then_recall(index: usize) -> Step {
+    match index {
+        // Run 1 (below start_point): read `note.txt` before compaction forks,
+        // recording its stamp in UnchangedFileReads.
+        // Run 2: Turn 2 runs while async WindowFilling compaction is in flight
+        // -> folded into <handoff>; Turn 3 runs after compaction applies ->
+        // re-reads `note.txt` without UnchangedFileReads refusal.
+        0 | 3 => terminal("cat note.txt"),
+        1 => Step::Text("warmed"),
+        2 => terminal("echo IN-FLIGHT-POST-FORK-STEP"),
+        _ => Step::Text("done"),
+    }
+}
+
+/// Automatic `WindowFilling` compaction folds in-flight post-fork tool calls
+/// into `<handoff>`, inlines `context_files` and `skills` into
+/// `<restored_context>`, and resets `UnchangedFileReads` so post-compaction
+/// file recall succeeds.
+#[tokio::test]
+async fn async_compaction_restores_context_folds_post_fork_and_allows_file_recall() {
+    let model = ScriptedModel::spawn(read_compact_then_recall).await;
+    let context = ContextConfig {
+        handoff_reserve: 2_000,
+        compact_ceiling: 50_000,
+        start_distance: 25_000,
+        warn_distance: 30_000,
+        ..ContextConfig::default()
+    };
+    let config = config_for(&model, context);
+    let mut session = Box::pin(Session::start(&config)).await;
+    let may_dir = session
+        .agent
+        .sandbox_dir()
+        .parent()
+        .expect("test root")
+        .join(".may");
+    crate::bundle::Bundle::ensure_extracted(&may_dir)
+        .await
+        .expect("extract bundled skills");
+    session.rebuild(&config).await;
+    let sandbox_dir = session.agent.sandbox_dir();
+    async_fs::write(sandbox_dir.join("note.txt"), "NOTE-RECALL-PAYLOAD-99\n")
+        .await
+        .expect("write note.txt");
+    async_fs::write(sandbox_dir.join("spec.md"), "RESTORED-SPEC-BODY-77\n")
+        .await
+        .expect("write spec.md");
+
+    // First run (no filler): read `note.txt` cleanly before any compaction forks.
+    run(&mut session, 0, "Inspect note.txt first.").await;
+
+    // Second run: seed enough tokens to trigger background `WindowFilling`
+    // compaction without crossing the pause point.
+    run(
+        &mut session,
+        4 * 26_000,
+        "RESTORE-SPEC-REQUEST: keep working and recall note.txt once compacted.",
+    )
+    .await;
+
+    let (compactions, requests) = {
+        let traffic = model.traffic.lock().await;
+        (traffic.compactions, traffic.requests.clone())
+    };
+    assert!(compactions >= 1, "async WindowFilling compaction ran");
+
+    let post_compact_req = requests
+        .iter()
+        .find(|req| !req.contains(COMPACTION_MARKER) && req.contains(HANDOFF_TASK))
+        .expect("a turn request after async compaction applied");
+    assert!(
+        post_compact_req.contains("Activity During Compaction")
+            && post_compact_req.contains("IN-FLIGHT-POST-FORK-STEP"),
+        "in-flight post-fork activity must be folded into <handoff>: {post_compact_req}"
+    );
+    assert!(
+        post_compact_req.contains("RESTORED-SPEC-BODY-77"),
+        "named context_files must be restored through MayAgent's restore_roots: {post_compact_req}"
+    );
+    assert!(
+        post_compact_req.contains("## Context and compaction"),
+        "named bundled skills must be restored through MayAgent's skill_registry: {post_compact_req}"
+    );
+
+    let final_req = requests
+        .last()
+        .expect("final request after post-compaction recall");
+    assert!(
+        final_req.contains("NOTE-RECALL-PAYLOAD-99"),
+        "post-compaction recall `cat note.txt` must execute instead of being refused by UnchangedFileReads: {final_req}"
+    );
+    assert!(
+        !final_req.contains("has not changed since the last time this command read it"),
+        "UnchangedFileReads must not refuse post-compaction recall: {final_req}"
     );
 }

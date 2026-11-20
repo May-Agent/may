@@ -453,6 +453,7 @@ async fn build_exec_shell(
                 may_agent::AgentEnvironment::Container { .. }
             )),
             refused: may_agent::command_policy::RefusedReads::default(),
+            read_epochs: may_agent::command_policy::FileReadEpochs::default(),
             checkout_reads: None,
         },
         slot: ShellSlot::new(),

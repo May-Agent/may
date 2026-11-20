@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use aither_agent::context::{CacheLifetime, HandoffDocument};
 use aither_agent::{
-    AfterTool, Agent, AgentError, AgentEvent, AgentPath, ChildAgent, ChildEvents, Hooks, Run,
-    RunOutcome, ToolDecision, ToolInvocation, ToolOutcome, TurnBoundaryAction, TurnBoundaryContext,
+    AfterTool, Agent, AgentError, AgentEvent, AgentPath, ChildAgent, ChildEvents,
+    CompactionOutcome, Hooks, Run, RunOutcome, ToolDecision, ToolInvocation, ToolOutcome,
+    TurnBoundaryAction, TurnBoundaryContext,
 };
 use aither_core::LanguageModel;
 use aither_core::llm::Message;
@@ -155,6 +156,8 @@ pub struct ChildParts {
     pub read_tool: &'static str,
     /// Where the run's token usage is credited.
     pub usage: Option<RunUsage>,
+    /// Shared per-agent unchanged-read epochs, bumped when this child compacts.
+    pub read_epochs: crate::command_policy::FileReadEpochs,
 }
 
 /// What the driver of one run credits its events to.
@@ -163,6 +166,7 @@ struct Credit {
     valve: Option<Arc<CompactSignal>>,
     floor: usize,
     usage: Option<RunUsage>,
+    read_epochs: crate::command_policy::FileReadEpochs,
 }
 
 /// What a wait for background commands ended on.
@@ -279,6 +283,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             valve: self.parts.valve.clone(),
             floor: self.parts.floor,
             usage: self.parts.usage.clone(),
+            read_epochs: self.parts.read_epochs.clone(),
         }
     }
 
@@ -315,6 +320,12 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
                                     credit.floor,
                                 );
                             }
+                        }
+                        AgentEvent::CompactionEnded {
+                            outcome: CompactionOutcome::Applied(_),
+                            ..
+                        } => {
+                            credit.read_epochs.bump(own);
                         }
                         _ => {}
                     }
