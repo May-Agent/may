@@ -213,7 +213,11 @@ impl Bootstrap<'_> {
                 let tarball = crate::update::this_build_tarball_for(
                     CiPlatform::LinuxX64,
                     self.github_token.to_owned(),
-                    |line| tracing::info!(step = line, "cloud home build"),
+                    |progress| {
+                        if let crate::update::Progress::Step(step) = progress {
+                            tracing::info!(step, "cloud home build");
+                        }
+                    },
                 )
                 .await
                 .map_err(|error| CloudError::Install(error.to_string()))?;
