@@ -40,8 +40,12 @@ impl<Args, Response> ToolRequest<Args, Response> {
     }
 
     /// Resolves once the requester has dropped its response receiver.
+    ///
+    /// The sender is cloned before the wait so `&self` is not held across
+    /// the `.await` — the returned future stays `Send` even when `Args`
+    /// is not `Sync`.
     pub async fn closed(&self) {
-        self.response_tx.closed().await;
+        self.response_tx.clone().closed().await;
     }
 }
 

@@ -1022,30 +1022,21 @@ impl AskUserApprover {
         // or a lost client can never answer, and its persisted request is
         // cleared the way a drain clears it, or it would pin the session in
         // waiting_ask_user forever.
-        enum Wait {
-            Answers(Vec<QuestionAnswer>),
-            Gone,
-        }
-        let wait = {
+        let answers = {
             let recv = rx.recv();
             let gone = request.closed();
             futures::pin_mut!(recv, gone);
             match futures::future::select(recv, gone).await {
-                futures::future::Either::Left((Ok(answers), _)) => Wait::Answers(answers),
-                _ => Wait::Gone,
+                futures::future::Either::Left((result, _)) => result.ok(),
+                futures::future::Either::Right(_) => None,
             }
         };
-        match wait {
-            Wait::Answers(answers) => {
-                let _ = request.respond(answers);
-            }
-            Wait::Gone => {
-                if let Some(session_id) = request_session_id.as_deref() {
-                    self.interrupt(session_id, &request_id).await;
-                } else {
-                    self.live_responses.take(&request_id);
-                }
-            }
+        if let Some(answers) = answers {
+            let _ = request.respond(answers);
+        } else if let Some(session_id) = request_session_id.as_deref() {
+            self.interrupt(session_id, &request_id).await;
+        } else {
+            self.live_responses.take(&request_id);
         }
     }
 

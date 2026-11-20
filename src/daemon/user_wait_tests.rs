@@ -185,8 +185,8 @@ async fn a_prompt_a_run_blocks_on_announces_its_question() {
 
 /// The asking run that goes away before an answer arrives leaves no
 /// blocking prompt behind: its persisted request is cleared and the
-/// session returns to idle instead of pinning itself to waiting_ask_user
-/// forever.
+/// session returns to idle instead of pinning itself to
+/// `waiting_ask_user` forever.
 #[tokio::test]
 async fn a_blocking_prompt_is_cleared_when_the_asking_run_is_gone() {
     let mut fixture = Fixture::new().await;

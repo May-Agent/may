@@ -108,13 +108,13 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             Ok(verdict) => tracing::info!(
                 session_id,
                 ?verdict,
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "repo gate: done"
             ),
             Err(error) => tracing::info!(
                 session_id,
                 %error,
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "repo gate: failed"
             ),
         }
@@ -284,7 +284,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             .await;
             tracing::debug!(
                 session_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "repo gate: checkout state inspected"
             );
             inspected
