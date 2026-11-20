@@ -117,7 +117,11 @@ jobs:
             exit 1
           fi
       - name: Free runner disk
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        run: |
+          sudo bash -c 'for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
+          done
+          rm -rf /tmp/gc-* &'
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -137,9 +141,9 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         uses: ./.github/actions/install-nasm
       - name: cargo clippy (default features)
-        run: cargo clippy --locked --all-targets --timings -- -D warnings
+        run: cargo clippy --locked --profile ci-check --all-targets --timings -- -D warnings
       - name: cargo clippy (ui)
-        run: cargo clippy --locked --all-targets --features ui --timings -- -D warnings
+        run: cargo clippy --locked --profile ci-check --all-targets --features ui --timings -- -D warnings
       - name: Upload cargo timings
         if: always()
         uses: actions/upload-artifact@v4
@@ -153,11 +157,16 @@ jobs:
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: read
+      # The test action retires superseded generations of the job's cache.
+      actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Full debuginfo for this dependency tree overflows the hosted runner's disk;
       # line tables keep test backtraces readable.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/test
@@ -176,10 +185,14 @@ jobs:
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # See test-ubuntu.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/test

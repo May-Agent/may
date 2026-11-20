@@ -343,6 +343,13 @@ opt-level = 3
 [profile.dev.package.lzma-rust2]
 opt-level = 3
 
+# The check jobs compile nothing for debugging: clippy skips debuginfo and
+# incremental state entirely, which halves what each check run carries.
+[profile.ci-check]
+inherits = "dev"
+debug = false
+incremental = false
+
 # syntect parses and highlights each fenced code line of the TUI markdown
 # tests through fancy-regex; at opt-level 0 those tests take 20-30 s each.
 [profile.dev.package.syntect]
