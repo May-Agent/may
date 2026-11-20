@@ -96,6 +96,9 @@ pub struct SessionRuntimeService {
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, aither_sandbox::Grants>>>,
     /// Popups announcing they wait on the user; see [`Self::announce_user_wait`].
     user_waits: tokio::sync::broadcast::Sender<UserWait>,
+    /// The calls the unchanged-read policy refused, shared with the session's
+    /// agents so the UI can show a refusal as a notice, not a failure.
+    refused_reads: crate::command_policy::RefusedReads,
     /// Session id → the inbox its main agent's `tasks.md` takes state
     /// changes from. It outlives any one agent build, so an answer committed
     /// while no agent runs reaches the next one.
@@ -132,10 +135,17 @@ impl SessionRuntimeService {
                 std::collections::HashMap::new(),
             )),
             user_waits: tokio::sync::broadcast::channel(USER_WAIT_CAPACITY).0,
+            refused_reads: crate::command_policy::RefusedReads::default(),
             task_events: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }
+    }
+
+    /// The session's record of calls the unchanged-read policy refused.
+    #[must_use]
+    pub fn refused_reads(&self) -> crate::command_policy::RefusedReads {
+        self.refused_reads.clone()
     }
 
     /// The `tasks.md` inbox of `session_id`'s main agent, created on first

@@ -42,6 +42,9 @@ pub enum ToolStatus {
     Done,
     /// Tool call failed with an error message.
     Failed(String),
+    /// The call's result is a policy refusal, not a failure — an unchanged
+    /// re-read the sandbox rejected; the task it read stays running.
+    Refused(String),
 }
 
 /// An image produced by a tool call, rendered as an overlay when the
@@ -1297,6 +1300,33 @@ impl ChatStream {
         }
     }
 
+    /// Mark the call `id` as refused — its result is a policy refusal, not
+    /// a failure, so it shows as a notice. The refusal rides the end event
+    /// of a live call and the persisted record of a replayed one.
+    pub fn set_tool_refused(&mut self, id: &str) {
+        let Some(index) = self.tool_index(id) else {
+            return;
+        };
+        let touched = if let ChatElement::ToolCall { display, .. } = &mut self.elements[index] {
+            let status = match display {
+                ToolDisplay::Terminal { status, .. }
+                | ToolDisplay::Action { status, .. }
+                | ToolDisplay::Builtin { status, .. } => status,
+            };
+            if let ToolStatus::Failed(message) = status {
+                *status = ToolStatus::Refused(std::mem::take(message));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if touched {
+            self.touch(index);
+        }
+    }
+
     /// Attach the card of a terminal call that ran one of May's commands, or
     /// take it away so the call shows as the ordinary command row.
     pub fn set_tool_card(&mut self, id: &str, card: Option<Card>) {
@@ -2376,6 +2406,7 @@ fn body_status_text(status: &ToolStatus) -> Option<String> {
         ToolStatus::Running => Some("running".to_string()),
         ToolStatus::Done => None,
         ToolStatus::Failed(e) => Some(format!("failed: {e}")),
+        ToolStatus::Refused(e) => Some(format!("refused: {e}")),
     }
 }
 
@@ -2389,6 +2420,7 @@ fn collapsed_status_suffix(display: &ToolDisplay, open: bool) -> String {
         ToolStatus::Running => " — running".to_string(),
         ToolStatus::Done => String::new(),
         ToolStatus::Failed(e) => format!(" — failed: {e}"),
+        ToolStatus::Refused(e) => format!(" — refused: {e}"),
     }
 }
 
@@ -4033,12 +4065,14 @@ fn status_icon(status: &ToolStatus, spinner_frame: usize, unsafe_exec: bool) -> 
             ToolStatus::Running => Color::DarkGray,
             ToolStatus::Done => Color::Green,
             ToolStatus::Failed(_) => Color::Red,
+            ToolStatus::Refused(_) => Color::Yellow,
         }
     };
     let icon = match status {
         ToolStatus::Running => SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()],
         ToolStatus::Done => '✓',
         ToolStatus::Failed(_) => '✗',
+        ToolStatus::Refused(_) => '!',
     };
     (icon, Style::default().fg(state_color))
 }
@@ -4163,10 +4197,10 @@ fn tool_header_line<'a>(
     }
     let suffix = collapsed_status_suffix(display, open);
     if !suffix.is_empty() {
-        let style = if matches!(display.status(), ToolStatus::Failed(_)) {
-            Style::default().fg(Color::Red)
-        } else {
-            dim
+        let style = match display.status() {
+            ToolStatus::Failed(_) => Style::default().fg(Color::Red),
+            ToolStatus::Refused(_) => Style::default().fg(Color::Yellow),
+            _ => dim,
         };
         spans.push(Span::styled(suffix, style));
     }
@@ -4793,6 +4827,10 @@ pub fn render_tool_fullscreen(
         ToolStatus::Failed(e) => Span::styled(
             format!("Status: Failed - {e}"),
             Style::default().fg(Color::Red),
+        ),
+        ToolStatus::Refused(e) => Span::styled(
+            format!("Status: Refused - {e}"),
+            Style::default().fg(Color::Yellow),
         ),
     };
     lines.push(Line::from(status_line));
@@ -6292,6 +6330,25 @@ mod tests {
     fn a_finished_read_folds_to_its_headline() {
         let rows = call_rows(&finished(read_call("cat src/lib.rs")));
         assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[test]
+    fn a_refused_call_flips_from_failed_to_a_refused_notice() {
+        let mut stream = ChatStream::new();
+        let mut display = read_call("cat a.rs");
+        if let ToolDisplay::Terminal { status, .. } = &mut display {
+            *status = ToolStatus::Failed("re-read refused".to_string());
+        }
+        stream.push_tool("c1".to_string(), display);
+        stream.set_tool_refused("c1");
+        let Some(ChatElement::ToolCall { display, .. }) = stream.elements.first() else {
+            panic!("terminal call expected");
+        };
+        assert!(matches!(display.status(), ToolStatus::Refused(_)));
+        // A refused call keeps its message but leaves the failure icon.
+        let (icon, style) = super::status_icon(display.status(), 0, false);
+        assert_eq!(icon, '!');
+        assert_eq!(style.fg, Some(Color::Yellow));
     }
 
     #[test]

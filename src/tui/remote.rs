@@ -704,6 +704,14 @@ async fn forward_agent_frame(
                     .await;
             }
         }
+        SessionAgentBody::ToolEnd { call_id, refused } => {
+            if let Some(turn) = current.as_mut() {
+                let _ = turn
+                    .events
+                    .send(TuiEvent::ToolEnd { call_id, refused })
+                    .await;
+            }
+        }
         SessionAgentBody::ToolCard { call_id, card } => {
             // Between turns the card still changes (an answer arrives), so
             // it reaches the chat directly.

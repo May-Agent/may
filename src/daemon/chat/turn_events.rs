@@ -666,10 +666,14 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 let name = self.tool_names.remove(&id).unwrap_or_default();
                 self.log_first_agent_event("tool_end");
                 self.saw_tool_activity = true;
+                // A refusal the policy recorded is persisted with the end:
+                // the reloaded transcript shows it as a notice, not a failure.
+                let refused = self.state.runtime_service.refused_reads().peek(&call);
                 let record = ToolEventRecord::End {
                     id: id.clone(),
                     name: name.clone(),
                     result: result.clone(),
+                    refused,
                 };
                 let serialized = serde_json::to_string(&record)
                     .map_err(|e| ChatDbError::Storage(e.to_string()))?;
@@ -690,7 +694,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.pending_tool_streams.remove(&id);
                 if !self
                     .sink
-                    .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
+                    .on_tool_end(&id, &name, arguments.as_deref(), &result, refused, summary)
                     .await
                 {
                     return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));

@@ -2127,8 +2127,16 @@ impl App {
                                 self.chat.set_tool_card(&id, msg.card.clone());
                             }
                         }
-                        Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
+                        Ok(crate::session::ToolEventRecord::End {
+                            id,
+                            result,
+                            refused,
+                            ..
+                        }) => {
                             self.show_tool_end(&id, &result);
+                            if refused {
+                                self.chat.set_tool_refused(&id);
+                            }
                         }
                         Ok(crate::session::ToolEventRecord::Stopped { id, .. }) => {
                             self.show_tool_end(
@@ -6516,6 +6524,7 @@ mod tests {
                 id: id.to_string(),
                 name: "terminal".to_string(),
                 result: aither_core::llm::ToolResult::text("done"),
+                refused: false,
             };
             [
                 ChatMessage::tool(
@@ -6582,6 +6591,7 @@ mod tests {
                 id: id.to_string(),
                 name: "terminal".to_string(),
                 result: aither_core::llm::ToolResult::text("done"),
+                refused: false,
             };
             [
                 ChatMessage::tool(

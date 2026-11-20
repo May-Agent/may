@@ -167,6 +167,7 @@ trait ChatSink {
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
+        refused: bool,
         summary: crate::daemon::tool_summary::ToolSummary,
     ) -> impl Future<Output = bool> + Send;
     /// The terminal call `id` ran one of May's commands, and `card` shows
@@ -538,6 +539,7 @@ impl ChatSink for HubSink {
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
+        refused: bool,
         summary: crate::daemon::tool_summary::ToolSummary,
     ) -> bool {
         let seq = self.next_seq();
@@ -551,9 +553,14 @@ impl ChatSink for HubSink {
                 variant: ToolVariant::infer(name),
                 arguments,
                 result,
+                refused,
                 summary,
             },
         );
+        self.publish_agent(crate::client::SessionAgentBody::ToolEnd {
+            call_id: id.to_string(),
+            refused,
+        });
         true
     }
 
@@ -5228,6 +5235,7 @@ mod tests {
             _n: &str,
             _a: Option<&str>,
             _r: &ToolResult,
+            _f: bool,
             _s: crate::daemon::tool_summary::ToolSummary,
         ) -> impl Future<Output = bool> + Send {
             std::future::ready(true)
