@@ -2352,16 +2352,25 @@ async fn create_container_profile(harness: &TestHarness) -> String {
     let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
         .await
         .expect("session persistence should initialize");
+    // The profile's id and name feed the session and task container names,
+    // and every test in this pool shares the host's one Docker daemon, so
+    // each harness names its own or their containers would collide.
+    static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = format!(
+        "e2e-{}-{}",
+        std::process::id(),
+        NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     if let Some(existing) = db
-        .get_profile("e2e-container")
+        .get_profile(&key)
         .await
         .expect("profile lookup should succeed")
     {
         return existing.id;
     }
     db.create_profile(CreateProfileParams {
-        id: "e2e-container",
-        name: "e2e-container",
+        id: &key,
+        name: &key,
         environment: ProfileEnvironmentKind::Container,
         slug: None,
         icon: None,
