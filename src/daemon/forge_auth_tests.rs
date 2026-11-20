@@ -31,10 +31,9 @@ async fn call(
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
-        .body(match body {
-            Some(body) => skyzen::Body::from(body.to_string()),
-            None => skyzen::Body::empty(),
-        })
+        .body(body.map_or_else(skyzen::Body::empty, |body| {
+            skyzen::Body::from(body.to_string())
+        }))
         .expect("request");
     router.go(request).await.map_err(|error| error.to_string())
 }

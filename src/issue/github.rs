@@ -38,13 +38,16 @@ pub struct GhCliTokenSource;
 
 impl GitHubTokenSource for GhCliTokenSource {
     async fn token(&self) -> Result<String, IssueError> {
-        let config = crate::config::MayConfig::load()
-            .await
-            .map_err(|error| IssueError::GitHubAuth(error.to_string()))?;
-        crate::forge::ForgeAuth::new(&config)
-            .token_for(crate::forge::GITHUB_HOST)
-            .await
-            .map_err(|error| IssueError::GitHubAuth(error.to_string()))
+        Box::pin(async {
+            let config = crate::config::MayConfig::load()
+                .await
+                .map_err(|error| IssueError::GitHubAuth(error.to_string()))?;
+            crate::forge::ForgeAuth::new(&config)
+                .token_for(crate::forge::GITHUB_HOST)
+                .await
+                .map_err(|error| IssueError::GitHubAuth(error.to_string()))
+        })
+        .await
     }
 }
 
