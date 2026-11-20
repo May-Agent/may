@@ -437,6 +437,9 @@ pub struct DaemonState {
     /// (display, stream, input) lives in that respawnable process.
     pub(crate) computer: Arc<crate::computer::ComputerAgent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
+    /// The daemon's TCP binds: the `[daemon] port` local listener, the
+    /// `[daemon] listen` extras and a `rest` run's explicit address.
+    pub(crate) tcp_listeners: super::TcpListeners,
     /// The cloud sessions this daemon fronts: their codespaces, hosts and
     /// the steps of bringing them up.
     pub(crate) cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
@@ -1454,6 +1457,7 @@ impl DaemonState {
         let live_limits = crate::agent::LiveLimits::of(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
+            tcp_listeners: super::TcpListeners::new(),
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
                 config.clone(),
                 crate::session::MayHomePaths::new(may_dir.to_path_buf()),

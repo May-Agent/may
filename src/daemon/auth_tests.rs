@@ -463,7 +463,7 @@ async fn upstream() -> SocketAddr {
 async fn tunnel_referer(state: &Arc<DaemonState>) -> String {
     state
         .remote_access_manager
-        .set_local_listener_addr(LOCAL_HOST.parse().expect("local listener address"));
+        .set_local_listener_addr(Some(LOCAL_HOST.parse().expect("local listener address")));
     let tunnel = open_tunnel(state).await;
     format!("http://{LOCAL_HOST}{}", tunnel.path)
 }
@@ -493,7 +493,9 @@ async fn a_tunnels_local_url_is_served_by_the_local_listener_on_its_bound_port()
     // the port it actually got, not a configured one.
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the local listener");
     let bound = listener.local_addr().expect("local listener address");
-    state.remote_access_manager.set_local_listener_addr(bound);
+    state
+        .remote_access_manager
+        .set_local_listener_addr(Some(bound));
     let tunnel = open_tunnel(&state).await;
     assert_eq!(
         tunnel.local_url,
@@ -877,7 +879,6 @@ async fn the_served_web_ui_and_identified_clients_without_origin_keep_working() 
 fn tcp_routers(state: &Arc<DaemonState>) -> TcpRouters {
     let source = tailscale_source(&["owner@example.com"]);
     TcpRouters {
-        state: state.clone(),
         loopback: Arc::new(local_router(state)),
         direct: Arc::new(direct_router(state, &source)),
     }

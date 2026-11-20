@@ -25,7 +25,7 @@ cargo run --bin may -- daemon stop
 cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 ```
 
-- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user: it answers only a loopback `Host` and, when the request carries one, a loopback `Origin`. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live; a non-loopback address, from it or from `--host`, is served directly: it answers only a `Host` naming the node itself (its tailnet addresses and `MagicDNS` name from `tailscale status --json`, re-read when a `Host` does not match, and the address the connection arrived on) and identifies each peer through tailscaled's `WhoIs`. Each listener's access policy is the outermost layer of its router (`src/daemon/auth.rs`).
+- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs); TCP is optional. `[daemon] port` names the local listener `may gui`/`may rest` serve: the first such run picks a free port and pins it into the configuration, a later run on a taken port fails until the config changes or the port is freed. The local listener trusts the machine's own user: it answers only a loopback `Host` and, when the request carries one, a loopback `Origin`. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live; a non-loopback address, from it or from `--host`, is served directly: it answers only a `Host` naming the node itself (its tailnet addresses and `MagicDNS` name from `tailscale status --json`, re-read when a `Host` does not match, and the address the connection arrived on) and identifies each peer through tailscaled's `WhoIs`. Each listener's access policy is the outermost layer of its router (`src/daemon/auth.rs`).
 - `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
 - Any `may` invocation outside the test harness, `--version` included, runs with `HOME` set to a fresh temporary directory: a client run against the real `~/.may` replaces the user's running daemon.
 - Remote access is `tailscale serve` in front of the remote listener (`[remote_access]`): every remote request needs a trusted identity — a listed `Tailscale-User-Login` today — or gets a 401, and an identified request whose `Origin` is not the origin it was addressed to gets a 403. The one public entry is `[remote_access] funnel`: `tailscale funnel --set-path` exposes `/api/tasks/webhook` through a separate loopback listener whose router holds the webhook route alone (`build_webhook_router`); deliveries authenticate by token and signature.
@@ -34,14 +34,14 @@ cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 
 Use this workflow when iterating on `may rest` + web UI together:
 
-1. Run the daemon in the foreground in API-only mode (default, fastest); `may rest` is the same as `may daemon`:
+1. Run the daemon in the foreground in API-only mode (default, fastest); `may rest` also serves the TCP listener a `may daemon` run only binds once `[daemon] port` is pinned:
 
 ```bash
 cargo run --bin may -- rest --port 8787
 ```
 
 - The `ui` Cargo feature is **off by default**, so `build.rs` skips `web-ui` production build/embed.
-- `may ui` fails fast without that feature; use `may rest` for API-only iteration.
+- `may gui` fails fast without that feature; use `may rest` for API-only iteration.
 - This keeps Rust incremental compiles fast.
 - After completing any Rust code change, restart the Rust API server before validation (`may daemon stop`, or just restart the foreground process).
 
@@ -61,7 +61,7 @@ MAY_API_TARGET=http://127.0.0.1:8787 bun run dev
 ```bash
 cargo build --features ui
 # or
-cargo run --features ui --bin may -- ui --port 8787
+cargo run --features ui --bin may -- gui --port 8787
 ```
 
 - Enabling feature `ui` triggers `build.rs` to run `bun run build` and embed `web-ui/dist`.
@@ -119,7 +119,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 **Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `tools` (the pinned tool distribution, `heel` and repo-search included), `cache_lifetime` (provider prompt-cache lifetime)
 
 **`src/daemon/`** - The resident daemon and its API
-- `mod.rs`: `run_daemon`, single-instance lock, listeners, auto-index
+- `mod.rs`: `run_daemon`, single-instance lock, `TcpListeners` (the `[daemon] port`/`listen` binds plus a `rest` run's explicit one), auto-index
 - `serve.rs`: hyper accept loops (unix socket, TCP) calling skyzen's `Router::go`
 - `lifecycle.rs`: `ensure_running` (auto-spawn, build-id replacement), service install/uninstall, stop
 - `server.rs`: `start` builds `DaemonState`, the REST/SSE router and background workers

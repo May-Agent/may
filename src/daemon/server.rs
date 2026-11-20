@@ -53,7 +53,7 @@ impl DaemonMode {
         match self {
             Self::Rest => Ok(()),
             Self::Ui => Err(anyhow!(
-                "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+                "`may gui` requires the `ui` cargo feature; use `may rest` for the REST API server"
             )),
         }
     }
@@ -320,6 +320,7 @@ pub async fn start(
         browser_lifecycle_tx,
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
+        tcp_listeners: super::TcpListeners::new(),
         cloud_sessions,
         pushed_providers,
         sleep: Arc::new(crate::sleep::SleepState::load(
@@ -483,7 +484,10 @@ fn api_routes() -> Route {
     Route::new((
         Route::new((
             "/health".at(health),
-            "/daemon/shutdown".post(shutdown_daemon),
+            "/daemon".route(Route::new((
+                "/shutdown".post(shutdown_daemon),
+                "/local-listener".put(ensure_local_listener),
+            ))),
             "/artifact-runtime.js".at(get_artifact_runtime_bridge),
             "/bootstrap".at(get_bootstrap),
             "/models".route(Route::new((
@@ -750,7 +754,7 @@ pub(super) fn build_router(
             {
                 let _ = (api, relay);
                 panic!(
-                    "`may ui` should fail before router construction when the `ui` feature is disabled"
+                    "`may gui` should fail before router construction when the `ui` feature is disabled"
                 );
             }
         }
@@ -767,6 +771,10 @@ async fn health(
         pid: std::process::id(),
         build: state.build_id.clone(),
         search_index: state.search_index_status.snapshot(),
+        local_listener: state
+            .remote_access_manager
+            .local_listener_addr()
+            .map(|addr| addr.to_string()),
     }))
 }
 
@@ -776,6 +784,25 @@ async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Jso
         .store(true, std::sync::atomic::Ordering::SeqCst);
     state.daemon_shutdown.notify_one();
     Ok(Json(super::types::API_OK))
+}
+
+/// `PUT /api/daemon/local-listener`: binds the loopback listener the web UI
+/// is served on (`rest`/`gui`), pinning its port into `[daemon] port`.
+async fn ensure_local_listener(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<super::types::LocalListenerRequest>,
+) -> SkyResult<Json<super::types::LocalListenerResponse>> {
+    let addr = state
+        .tcp_listeners
+        .ensure_local(req.port, &state)
+        .await
+        .map_err(|error| super::error::bad_request_error(error.to_string()))?;
+    let updated = state.update_config(|config| config.daemon.port = Some(addr.port()));
+    state.save_config(&updated).await.map_err(internal_error)?;
+    state.notify_ui_events(crate::ui_event_bus::UiEventTopics::CONFIG);
+    Ok(Json(super::types::LocalListenerResponse {
+        port: addr.port(),
+    }))
 }
 
 async fn get_request_logs(
@@ -1190,7 +1217,7 @@ mod tests {
             .expect_err("ui mode should fail without the ui feature");
         assert_eq!(
             error.to_string(),
-            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+            "`may gui` requires the `ui` cargo feature; use `may rest` for the REST API server"
         );
     }
 }

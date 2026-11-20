@@ -46,9 +46,9 @@ Each session has `~/.may/profiles/<profile>/sessions/<id>/`, which is the sandbo
 
 ## Daemon
 
-- Listens on the unix socket `~/.may/daemon.sock` (mode 0600) and on `127.0.0.1:8787` (`[daemon] port`); both trust the local user. A third loopback listener on a random port serves the same routes behind an identity check and is what `tailscale serve` forwards to for remote access. Addresses in `[daemon] listen` are applied live; a non-loopback address requires the peer to be identified through Tailscale (WhoIs), whatever the doc comment on `DaemonConfig.listen` says.
+- Listens on the unix socket `~/.may/daemon.sock` (mode 0600), which trusts the local user. TCP is optional: `[daemon] port` names the local listener `may gui`/`may rest` serve — the first such run picks a free port and pins it, a later run on a taken port fails until the config changes or the port is freed. A third loopback listener on a random port serves the same routes behind an identity check and is what `tailscale serve` forwards to for remote access. Addresses in `[daemon] listen` are applied live; a non-loopback address requires the peer to be identified through Tailscale (WhoIs), whatever the doc comment on `DaemonConfig.listen` says.
 - `~/.may/daemon.lock` keeps it to one instance. Clients start it on demand and replace it when its build id differs, draining running turns first (30 seconds, then the runs are interrupted).
-- `may daemon [install|uninstall|status|stop]` manages it; `may rest` runs it API-only; `may ui` needs the `ui` build feature.
+- `may daemon [install|uninstall|status|stop]` manages it; `may rest` runs it API-only; `may gui` serves its web UI and needs the `ui` build feature.
 - A turn starts with `POST /api/sessions/{id}/messages` and is followed on the `/api/events` stream, which every client shares, with replay of the turn in progress for late subscribers. A client disconnecting does not stop a turn. `POST /api/chat/enqueue` takes mode `steer` (default; interrupts the current turn) or `queue` (runs after it).
 - Configuration is `~/.may/config.toml`, applied live without a restart.
 - One-shot runs mark the session non-interactive: permission prompts are refused instead of asked.
