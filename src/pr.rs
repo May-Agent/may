@@ -357,33 +357,29 @@ impl PrStore {
                 "several session clones exist; pass --repo".to_string(),
             ));
         }
-        // No clones yet: clone the cwd's repo on demand, as its trust level
-        // decides (`CloneSource::of`).
+        // No clones yet: clone the cwd's repo on demand, resolving its
+        // trust first (a persisted decision wins; the rest resolves from
+        // the viewer's GitHub access).
         let worktree = crate::repo_search::worktree_root(&self.context.cwd)
             .ok_or_else(|| PrError::Resolve("not inside a repository".to_string()))?;
-        let repo_key = crate::issue::repository_identity(&worktree)
-            .map_err(|e| PrError::Resolve(format!("repository identity: {e}")))?;
-        // First-contact gate: no binding before a persisted trust decision.
-        match crate::trust::trust_for(&self.context.workspace_config, &repo_key, &worktree) {
-            None => {
-                return Err(PrError::Resolve(
-                    "repository trust undecided — the launch gate asks on startup, or run `repo trust set <full|prs-only|local-branch|local>`".to_string(),
-                ));
-            }
-            Some(level) if !level.clones_work() => {
-                return Err(PrError::Resolve(
-                    "local trust writes the checkout; `pr` is for full, prs-only and local-branch"
-                        .to_string(),
-                ));
-            }
-            Some(_) => {}
+        let config_path =
+            crate::session::SessionPaths::new(self.context.session_root.clone()).workspace_config();
+        let level =
+            crate::trust::resolve_checkout(&config_path, &worktree, &self.context.github_api)
+                .await
+                .map_err(|e| PrError::Resolve(format!("repository trust: {e}")))?;
+        if !level.clones_work() {
+            return Err(PrError::Resolve(
+                "local trust writes the checkout; `pr` is for full, prs-only and local-branch"
+                    .to_string(),
+            ));
         }
+        // The resolution may have persisted a level: read the config afresh
+        // so a GitHub level picks the remote clone.
+        let config = crate::workspace::WorkspaceConfig::load(&config_path)
+            .map_err(|e| PrError::Resolve(format!("workspace config: {e}")))?;
         let dir = repos
-            .ensure_clone_of(
-                &worktree,
-                &self.context.workspace_config,
-                &self.context.scratch_root,
-            )
+            .ensure_clone_of(&worktree, &config, &self.context.scratch_root)
             .await?
             .ok_or_else(|| {
                 PrError::Resolve("trust binds no clone for this repository".to_string())
@@ -3198,8 +3194,10 @@ mod tests {
             sandbox
         }
 
+        /// `<home>/sessions/<id>`: `SessionPaths::workspace_config` lands on
+        /// `<tmp>/workspace.toml`, where `config_at` writes.
         fn session_root(&self, id: &str) -> PathBuf {
-            self.tmp.path().join(id)
+            self.tmp.path().join("sessions").join(id)
         }
 
         fn scratch_root(&self) -> PathBuf {
@@ -3908,7 +3906,7 @@ mod tests {
         add_github_origin(&fx);
         // A `prs-only` project as existing files carry it: no `repository`
         // key and no GitHub issue backend.
-        let config_path = fx.tmp.path().join("legacy-workspace.toml");
+        let config_path = fx.tmp.path().join("workspace.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -3919,7 +3917,7 @@ mod tests {
         .unwrap();
         let config = WorkspaceConfig::load(&config_path).unwrap();
         assert_eq!(
-            crate::trust::trust_for(&config, &fx.repo_key, &fx.checkout),
+            crate::trust::persisted_for(&config, &fx.repo_key),
             Some(crate::trust::TrustLevel::PrsOnly)
         );
         let store = trusted_store(
@@ -4972,7 +4970,7 @@ mod tests {
         let secret = "provider-pr-secret-443322";
         let fx = Fixture::new().await;
         add_github_origin(&fx);
-        let config_path = fx.tmp.path().join("pr-review-workspace.toml");
+        let config_path = fx.tmp.path().join("workspace.toml");
         std::fs::write(
             &config_path,
             format!(

@@ -182,10 +182,15 @@ pub enum CloneSource {
 }
 
 impl CloneSource {
-    /// The source `checkout`'s clone is made from, as its repository's trust
-    /// level in `config` decides: `full` and `prs-only` clone a GitHub
-    /// `origin` from the remote, `local-branch` always clones the checkout
-    /// locally, and `local` or an undecided repository binds no clone.
+    /// The source `checkout`'s clone is made from, as its repository's
+    /// effective trust in `config` decides.
+    ///
+    /// `full` and `prs-only` clone a GitHub `origin` from the remote,
+    /// `local-branch` clones the checkout locally, and `local` binds no
+    /// clone. An unpersisted checkout resolves to `local-branch`, the same
+    /// fallback [`crate::trust::resolve_checkout`] gives an undecided
+    /// repository — a non-GitHub one, or a GitHub one whose access lookup
+    /// failed — so it clones locally too.
     ///
     /// # Errors
     /// Fails when the checkout's identity cannot be read.
@@ -195,9 +200,7 @@ impl CloneSource {
     ) -> Result<Option<Self>, RepoCloneError> {
         let identity = crate::issue::repository_identity(checkout)
             .map_err(|error| RepoCloneError::Io(std::io::Error::other(error)))?;
-        let Some(trust) = crate::trust::trust_for(config, &identity, checkout) else {
-            return Ok(None);
-        };
+        let trust = crate::trust::effective_for(config, &identity);
         if !trust.clones_work() {
             return Ok(None);
         }
@@ -504,10 +507,12 @@ impl SessionRepos {
                 let owner_repo = repository.to_string();
                 let publishes = {
                     let (config, owner_repo) = (config.clone(), owner_repo.clone());
-                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
-                        .await
+                    blocking::unblock(move || {
+                        crate::trust::effective_for_github(&config, &owner_repo)
+                    })
+                    .await
                 }
-                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                .publishes_to_github();
                 if !publishes {
                     return Ok(None);
                 }
@@ -684,10 +689,12 @@ impl SessionRepos {
                 // executor.
                 let publishes = {
                     let (config, owner_repo) = (config.clone(), owner_repo.clone());
-                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
-                        .await
+                    blocking::unblock(move || {
+                        crate::trust::effective_for_github(&config, &owner_repo)
+                    })
+                    .await
                 }
-                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                .publishes_to_github();
                 if !publishes {
                     return Ok(None);
                 }
@@ -705,14 +712,10 @@ impl SessionRepos {
                     return Ok(None);
                 };
                 let clones = {
-                    let (config, identity, checkout) =
-                        (config.clone(), identity.clone(), checkout.clone());
-                    blocking::unblock(move || {
-                        crate::trust::trust_for(&config, &identity, &checkout)
-                    })
-                    .await
+                    let (config, identity) = (config.clone(), identity.clone());
+                    blocking::unblock(move || crate::trust::effective_for(&config, &identity)).await
                 }
-                .is_some_and(crate::trust::TrustLevel::clones_work);
+                .clones_work();
                 if !clones {
                     return Ok(None);
                 }
@@ -1653,7 +1656,7 @@ mod tests {
         for (level, expected) in [
             (TrustLevel::Full, remote.clone()),
             (TrustLevel::PrsOnly, remote),
-            (TrustLevel::LocalBranch, local),
+            (TrustLevel::LocalBranch, local.clone()),
             (TrustLevel::Local, None),
         ] {
             let config = crate::trust::config_at(tmp.path(), &checkout, level);
@@ -1663,10 +1666,11 @@ mod tests {
                 "{level:?}"
             );
         }
-        // An undecided repository binds nothing.
+        // An unpersisted GitHub checkout — an offline access lookup falls
+        // back to `local-branch` without persisting — clones locally.
         assert_eq!(
             CloneSource::of(&checkout, &crate::workspace::WorkspaceConfig::default()).unwrap(),
-            None
+            local
         );
     }
 

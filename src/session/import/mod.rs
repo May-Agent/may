@@ -312,6 +312,7 @@ pub(super) fn tool_end(
         id: call_id.to_string(),
         name: "terminal".to_string(),
         result,
+        refused: false,
     };
     ChatMessage {
         id: None,

@@ -130,6 +130,8 @@ export const enUS = {
       label: 'Model',
       empty: 'No models available',
       searchPlaceholder: 'Search models…',
+      showOutdated: 'Show {count} outdated models',
+      hideOutdated: 'Hide outdated models',
     },
     machinePicker: {
       label: 'Where the session runs',

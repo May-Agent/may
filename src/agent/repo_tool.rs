@@ -30,6 +30,8 @@ pub struct RepoContext {
     pub host: crate::host_git::HostGit,
     /// Daemon-held default-branch checkouts used to derive GitHub workspaces.
     pub checkouts: Option<crate::repo_clone::DaemonCheckouts>,
+    /// Reads GitHub repository access while default trust is derived.
+    pub github: crate::issue::github::GitHubRest<crate::pr::PrTokenSource>,
     /// Whether the directory a command runs in is a host path. A container
     /// session's commands run under the container's paths, so its `repo`
     /// acts on the launch repository alone.
@@ -77,8 +79,6 @@ struct RepoCloneReport<'a> {
 enum CloneOutcome {
     /// The session's clone, new or existing, is at this path.
     Cloned(String),
-    /// The repository has no trust decision.
-    Undecided,
     /// `local` trust: the session writes the checkout and holds no clone.
     WritesCheckout,
 }
@@ -102,10 +102,7 @@ fn target_dir(context: &RepoContext, cx: &ToolContext, path: Option<&str>) -> Pa
 /// `repo clone` for the repository containing `dir`, falling back to the
 /// session's repository binding when no checkout sits at `dir`.
 async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -> String {
-    let config = match crate::workspace::WorkspaceConfig::load(&config_path(context)) {
-        Ok(config) => config,
-        Err(e) => return format!("failed to read the workspace config: {e}"),
-    };
+    let config_path = config_path(context);
     let mut repos = crate::repo_clone::SessionRepos::new(
         &context.session_root,
         context.session_id.clone(),
@@ -116,29 +113,44 @@ async fn clone_repository(context: &RepoContext, dir: &Path, create_new: bool) -
         repos = repos.with_checkouts(checkouts.clone());
     }
     let (worktree_display, outcome) = match worktree_and_key(dir) {
-        Ok((worktree, key)) => {
+        Ok((worktree, _key)) => {
             let display = worktree.to_string_lossy().into_owned();
-            let outcome = match trust::trust_for(&config, &key, &worktree) {
-                None => CloneOutcome::Undecided,
-                Some(level) if !level.clones_work() => CloneOutcome::WritesCheckout,
-                Some(_) => {
-                    match repos
-                        .request_clone_of(&worktree, &config, &context.scratch_root, create_new)
-                        .await
-                    {
-                        Ok(Some(clone)) => {
-                            CloneOutcome::Cloned(clone.to_string_lossy().into_owned())
-                        }
-                        Ok(None) => CloneOutcome::WritesCheckout,
-                        Err(e) => {
-                            return format!("failed to clone {}: {e}", worktree.display());
-                        }
-                    }
+            let level =
+                match trust::resolve_checkout(&config_path, &worktree, &context.github).await {
+                    Ok(level) => level,
+                    Err(e) => return format!("failed to resolve the repository trust: {e}"),
+                };
+            if !level.clones_work() {
+                return RepoCloneReport {
+                    worktree: &display,
+                    outcome: CloneOutcome::WritesCheckout,
+                }
+                .render()
+                .expect("the repo clone report renders");
+            }
+            // The resolution may have persisted a level: read the config
+            // afresh so a GitHub level picks the remote clone.
+            let config = match crate::workspace::WorkspaceConfig::load(&config_path) {
+                Ok(config) => config,
+                Err(e) => return format!("failed to read the workspace config: {e}"),
+            };
+            let outcome = match repos
+                .request_clone_of(&worktree, &config, &context.scratch_root, create_new)
+                .await
+            {
+                Ok(Some(clone)) => CloneOutcome::Cloned(clone.to_string_lossy().into_owned()),
+                Ok(None) => CloneOutcome::WritesCheckout,
+                Err(e) => {
+                    return format!("failed to clone {}: {e}", worktree.display());
                 }
             };
             (display, outcome)
         }
         Err(err) => {
+            let config = match crate::workspace::WorkspaceConfig::load(&config_path) {
+                Ok(config) => config,
+                Err(e) => return format!("failed to read the workspace config: {e}"),
+            };
             let binding = context
                 .db
                 .get_session(&context.session_id)
@@ -250,19 +262,27 @@ impl Tool for RepoTool {
                 .await
             }
             RepoArgs::Trust { set } => {
-                let (worktree, key) = match worktree_and_key(&target_dir(&self.context, &cx, None))
+                let (worktree, _key) = match worktree_and_key(&target_dir(&self.context, &cx, None))
                 {
                     Ok(v) => v,
                     Err(e) => return Ok(ToolResult::text(e)),
                 };
                 let Some(value) = set else {
-                    return Ok(ToolResult::text(
-                        trust::trust_for(&self.context.workspace_config, &key, &worktree)
-                            .map_or_else(
-                                || "trust undecided — the launch gate asks on startup; `repo trust set` decides it here".to_string(),
-                                |level| format!("trust: {}", level.as_str()),
-                            ),
-                    ));
+                    let level = match trust::resolve_checkout(
+                        &config_path(&self.context),
+                        &worktree,
+                        &self.context.github,
+                    )
+                    .await
+                    {
+                        Ok(level) => level,
+                        Err(e) => {
+                            return Ok(ToolResult::text(format!(
+                                "failed to resolve the repository trust: {e}"
+                            )));
+                        }
+                    };
+                    return Ok(ToolResult::text(format!("trust: {}", level.as_str())));
                 };
                 let Some(level) = TrustLevel::parse(&value) else {
                     return Ok(ToolResult::text(
@@ -310,14 +330,14 @@ impl Tool for SubagentRepoTool {
                 "session clones are the main agent's; work where `subagent` granted you".to_string()
             }
             RepoArgs::Trust { set: None } => {
-                let (worktree, key) = match worktree_and_key(&target_dir(&self.context, &cx, None))
+                let (_worktree, key) = match worktree_and_key(&target_dir(&self.context, &cx, None))
                 {
                     Ok(v) => v,
                     Err(e) => return Ok(ToolResult::text(e)),
                 };
-                trust::trust_for(&self.context.workspace_config, &key, &worktree).map_or_else(
-                    || "trust undecided — the launch gate asks on startup".to_string(),
-                    |level| format!("trust: {}", level.as_str()),
+                format!(
+                    "trust: {}",
+                    trust::effective_for(&self.context.workspace_config, &key).as_str()
                 )
             }
         }))
@@ -345,6 +365,11 @@ pub mod tests {
             scratch_root: scratch.join("staging"),
             host: crate::host_git::HostGit::inherit(),
             checkouts: None,
+            // The probe always fails like an offline `gh`: resolution
+            // falls back without persisting.
+            github: crate::issue::github::GitHubRest::new(
+                crate::pr::PrTokenSource::Unauthenticated,
+            ),
             host_paths: true,
         }
     }
@@ -373,8 +398,8 @@ pub mod tests {
         ToolContext::new().with_working_dir(dir.to_string_lossy())
     }
 
-    /// `repo clone` run in a second repository clones that one, once, and
-    /// only after its trust is decided; trust follows where it runs too.
+    /// `repo clone` run in a second repository resolves its trust and
+    /// clones it, once; `repo trust` reports the level in force.
     #[tokio::test(flavor = "multi_thread")]
     async fn repo_clone_clones_the_repository_it_runs_in() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -389,17 +414,7 @@ pub mod tests {
             new: false,
         };
 
-        let undecided = tool.call(clone(), at(&other)).await.expect("call");
-        assert!(
-            undecided.as_text().unwrap().contains("no trust decision"),
-            "{undecided:?}"
-        );
-        assert!(!session_root.join("repos").exists());
-
-        let set = RepoArgs::Trust {
-            set: Some("local-branch".to_string()),
-        };
-        tool.call(set, at(&other)).await.expect("set");
+        // A non-GitHub repository defaults to `local-branch` and clones.
         let first = tool.call(clone(), at(&other)).await.expect("clone");
         let text = first.as_text().unwrap().to_string();
         assert!(
@@ -421,15 +436,78 @@ pub mod tests {
             .await
             .expect("again");
         assert_eq!(again.as_text().unwrap(), text);
-        // The launch repository is still undecided: trust is per repository.
+        // `repo trust` reports the effective level: the launch repository,
+        // undecided, reads its `local-branch` default.
         let launch_trust = tool
             .call(RepoArgs::Trust { set: None }, at(&launch))
             .await
             .expect("trust");
+        assert_eq!(launch_trust.as_text(), Some("trust: local-branch"));
+        // An explicit decision wins and persists.
+        tool.call(
+            RepoArgs::Trust {
+                set: Some("local".to_string()),
+            },
+            at(&launch),
+        )
+        .await
+        .expect("set");
+        let launch_trust = tool
+            .call(RepoArgs::Trust { set: None }, at(&launch))
+            .await
+            .expect("trust");
+        assert_eq!(launch_trust.as_text(), Some("trust: local"));
+    }
+
+    /// A GitHub checkout whose access lookup fails — offline or an
+    /// unauthenticated `gh`, which `context`'s probe is — falls back to
+    /// `local-branch` without persisting: `repo clone` still makes a
+    /// session clone and writes no `[[projects]]` entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offline_github_checkout_clones_without_persisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = dunce::canonicalize(tmp.path()).expect("canonical");
+        let repo = tmp.join("repo");
+        init_repo(&repo);
         assert!(
-            launch_trust.as_text().unwrap().contains("undecided"),
-            "{launch_trust:?}"
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", "https://github.com/acme/app.git"])
+                .current_dir(&repo)
+                .status()
+                .expect("git remote")
+                .success()
         );
+        let session_root = tmp.join("profile/sessions/s1");
+        let context = context(&repo, &session_root, &tmp).await;
+        let config_path = config_path(&context);
+        let tool = RepoTool::new(context);
+
+        let result = tool
+            .call(
+                RepoArgs::Clone {
+                    path: None,
+                    new: false,
+                },
+                at(&repo),
+            )
+            .await
+            .expect("clone");
+        let text = result.as_text().unwrap().to_string();
+        assert!(
+            text.contains("is this session's writable workspace"),
+            "{text}"
+        );
+        let clones: Vec<_> = std::fs::read_dir(session_root.join("repos"))
+            .expect("repos")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(clones.len(), 1);
+        assert!(clones[0].starts_with(session_root.join("repos")));
+        assert!(clones[0].join(".git").is_dir());
+
+        // The transient lookup failure persists nothing.
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        assert!(loaded.projects.is_empty());
     }
 
     /// `local` trust works in the checkout itself: no clone.

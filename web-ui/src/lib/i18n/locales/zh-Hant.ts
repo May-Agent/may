@@ -132,6 +132,8 @@ export const zhHant: Messages = {
       label: '模型',
       empty: '沒有可用的模型',
       searchPlaceholder: '搜尋模型…',
+      showOutdated: '顯示 {count} 個過時模型',
+      hideOutdated: '隱藏過時模型',
     },
     machinePicker: {
       label: '工作階段的執行位置',

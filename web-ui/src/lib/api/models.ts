@@ -9,6 +9,8 @@ export interface ModelInfoItem {
   tier?: string | null;
   /** Reasoning-effort levels the model accepts, lowest first; empty when it has no effort control. */
   effortLadder?: string[];
+  /** Retired or superseded by a newer generation of its line; pickers hide it by default. */
+  outdated?: boolean;
 }
 
 export interface ModelsResponse {

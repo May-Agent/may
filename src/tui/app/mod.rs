@@ -190,6 +190,9 @@ pub struct App {
     pub model_select_list: Vec<String>,
     /// Search query in the model select popup
     pub model_select_query: String,
+    /// Whether the model select popup also lists models a newer generation
+    /// of their line replaced; `!` toggles it.
+    pub model_select_show_outdated: bool,
     /// Last fetched provider catalog; seeds the next `/model` open so the
     /// picker does not paint the configured-only list while a fetch lands
     pub model_catalog: Vec<FetchedModel>,
@@ -236,6 +239,9 @@ pub struct App {
     pub tier_picker_models: Vec<FetchedModel>,
     /// Filtered models based on search query
     pub tier_picker_filtered: Vec<usize>,
+    /// Whether the picker also lists models a newer generation of their
+    /// line replaced; `!` toggles it.
+    pub tier_picker_show_outdated: bool,
     /// Selected index in filtered list
     pub tier_picker_selected: usize,
     /// Search query in tier picker
@@ -701,6 +707,7 @@ impl App {
             model_select_index: 0,
             model_select_list: Vec::new(),
             model_select_query: String::new(),
+            model_select_show_outdated: false,
             model_catalog: Vec::new(),
             effort_ladder: Vec::new(),
             family_effort_rungs: std::collections::HashMap::new(),
@@ -722,6 +729,7 @@ impl App {
             tier_picker_tier: None,
             tier_picker_models: Vec::new(),
             tier_picker_filtered: Vec::new(),
+            tier_picker_show_outdated: false,
             tier_picker_selected: 0,
             tier_picker_query: String::new(),
             tier_picker_loading: false,
@@ -1124,12 +1132,15 @@ impl App {
         let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
         let config =
             crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()).ok();
-        let trust = config.as_ref().and_then(|config| {
-            let worktree = crate::repo_search::worktree_root(&self.cwd)?;
-            let key = crate::issue::repository_identity(&worktree).ok()?;
-            crate::trust::trust_for(config, &key, &worktree)
-        });
-        let clones_work = trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        // Inside a worktree the effective trust decides: only an explicit
+        // `local` decision writes the checkout directly.
+        let clones_work = crate::repo_search::worktree_root(&self.cwd)
+            .and_then(|worktree| crate::issue::repository_identity(&worktree).ok())
+            .is_some_and(|key| {
+                config
+                    .as_ref()
+                    .is_none_or(|config| crate::trust::effective_for(config, &key).clones_work())
+            });
         self.sidebar_file_changes = !clones_work;
         // With clones, the daemon's registry names the roots; they join
         // tracking when its answer arrives.
@@ -2130,8 +2141,16 @@ impl App {
                                 self.chat.set_tool_card(&id, msg.card.clone());
                             }
                         }
-                        Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
+                        Ok(crate::session::ToolEventRecord::End {
+                            id,
+                            result,
+                            refused,
+                            ..
+                        }) => {
                             self.show_tool_end(&id, &result);
+                            if refused {
+                                self.chat.set_tool_refused(&id);
+                            }
                         }
                         Ok(crate::session::ToolEventRecord::Stopped { id, .. }) => {
                             self.show_tool_end(
@@ -2360,9 +2379,8 @@ impl App {
                 }
             };
             let kind = crate::trust::repo_kind(&worktree);
-            let mut ask = AskUserState::for_open_question(crate::trust::question_for(
-                &kind, &worktree, false,
-            ));
+            let mut ask =
+                AskUserState::for_open_question(crate::trust::question_for(&kind, &worktree));
             if let Some(cursor) = current.and_then(|level| {
                 ask.questions[0]
                     .option
@@ -2376,14 +2394,24 @@ impl App {
                 worktree,
                 kind,
                 config_path,
-                redecide: true,
             });
         } else {
+            let config = match crate::workspace::WorkspaceConfig::load(&config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    self.chat.push_error(&format!(
+                        "Cannot read workspace config from {}: {error}",
+                        config_path.display()
+                    ));
+                    return;
+                }
+            };
+            // Writable directories open on the grant option, read-only ones
+            // on "keep it read-only".
             self.mode = AppMode::LaunchGrant(crate::tui::state::LaunchGrantState {
                 path: self.cwd.clone(),
                 config_path,
-                redecide: true,
-                selected: 0,
+                selected: usize::from(!config.has_write_access(&self.cwd)),
             });
         }
     }
@@ -4189,6 +4217,7 @@ impl App {
                 command: format!("! {masked}"),
                 mode: aither_sandbox::SandboxMode::Unsandboxed,
                 location: None,
+                interpreter: aither_sandbox::Interpreter::Shell,
                 reading: None,
                 card: None,
                 status: super::ui::chat::ToolStatus::Running,
@@ -4685,11 +4714,13 @@ impl App {
                 script,
                 mode,
                 location,
+                interpreter,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
                 location,
+                interpreter,
                 // The daemon's reading arrives right after the start.
                 reading: None,
                 card: None,
@@ -6541,6 +6572,7 @@ mod tests {
                 id: id.to_string(),
                 name: "terminal".to_string(),
                 result: aither_core::llm::ToolResult::text("done"),
+                refused: false,
             };
             [
                 ChatMessage::tool(
@@ -6607,6 +6639,7 @@ mod tests {
                 id: id.to_string(),
                 name: "terminal".to_string(),
                 result: aither_core::llm::ToolResult::text("done"),
+                refused: false,
             };
             [
                 ChatMessage::tool(

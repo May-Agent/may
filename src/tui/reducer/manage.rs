@@ -355,16 +355,12 @@ pub fn handle_launch_grant_key(app: &mut App, code: KeyCode) -> Option<SendActio
             }
             None
         }
-        // A re-asked gate (opened by `/permission`) cancels on Esc — a
-        // recorded decision must not silently downgrade; on the launch
-        // gate Esc stays, the only way out is answering or quitting.
-        KeyCode::Esc => match &app.mode {
-            crate::tui::state::AppMode::LaunchGrant(state) if state.redecide => {
-                app.mode = crate::tui::state::AppMode::Chat;
-                None
-            }
-            _ => None,
-        },
+        // Esc cancels the `/permission` sheet — a recorded decision must
+        // not silently downgrade.
+        KeyCode::Esc => {
+            app.mode = crate::tui::state::AppMode::Chat;
+            None
+        }
         _ => None,
     }
 }

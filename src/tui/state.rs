@@ -469,22 +469,19 @@ impl AskUserState {
     }
 }
 
-/// Startup prompt offering to grant the agent read/write access to the
-/// directory May was launched in.
+/// `/permission` sheet offering to grant the agent read/write access to
+/// the directory May was launched in.
 #[derive(Debug)]
 pub struct LaunchGrantState {
     /// The launch directory being offered.
     pub path: std::path::PathBuf,
     /// `workspace.toml` the decision is written to.
     pub config_path: std::path::PathBuf,
-    /// `/permission` re-asks an answered gate: Esc cancels rather than
-    /// downgrading a recorded decision.
-    pub redecide: bool,
     /// Cursor over the grant options — grant first, read-only second.
     pub selected: usize,
 }
 
-/// Startup prompt deciding the launch repository's trust level. The
+/// `/permission` sheet deciding the launch repository's trust level. The
 /// option list renders through the `ask_user` sheet; the answer is
 /// persisted by the client and never reaches the agent.
 #[derive(Debug)]
@@ -497,9 +494,6 @@ pub struct RepoTrustState {
     pub kind: crate::trust::RepoKind,
     /// `workspace.toml` the decision is written to.
     pub config_path: std::path::PathBuf,
-    /// `/permission` re-asks an answered gate: no `exit` option and Esc
-    /// cancels instead of quitting.
-    pub redecide: bool,
 }
 
 /// Pending workspace-access confirmation shown in the TUI.

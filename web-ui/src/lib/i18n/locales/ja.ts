@@ -132,6 +132,8 @@ export const ja: Messages = {
       label: 'モデル',
       empty: '利用可能なモデルがありません',
       searchPlaceholder: 'モデルを検索…',
+      showOutdated: '古いモデル {count} 件を表示',
+      hideOutdated: '古いモデルを隠す',
     },
     machinePicker: {
       label: 'セッションの実行場所',

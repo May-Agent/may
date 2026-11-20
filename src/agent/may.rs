@@ -40,7 +40,7 @@ use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
-use crate::command_policy::{PolicySet, RefusedReads};
+use crate::command_policy::PolicySet;
 use crate::config::MayConfig;
 use crate::db::{ChatDb, RunFence};
 use crate::harness::compact_tool::CompactSignal;
@@ -315,6 +315,11 @@ pub struct MayAgentConfig {
     pub rules_import: Option<crate::rules_import::RulesImport>,
     /// The daemon's live limits, shared by every agent it builds.
     pub limits: super::LiveLimits,
+    /// Builds a model for an explicit `provider::model` selector, serving
+    /// `subagent --model` and `model = "..."` definitions.
+    pub subagent_models: Option<crate::subagent::SubagentModelResolver<ProviderLlm>>,
+    /// What the `models` command lists.
+    pub model_listing: crate::agent::models_tool::ModelListing,
     /// The repo-search handle and PR land locks the daemon shares.
     pub services: crate::terminal_commands::SharedServices,
     /// Daemon-wide sleep state observed by the session's sleep context source.
@@ -641,8 +646,14 @@ impl MayAgent {
         .await?;
         let catalog = tools.catalog().clone();
 
+        let call_interpreters = super::hooks::CallInterpreters::default();
+        // Every derived approver clone shares the call→interpreter record.
+        let permission_approver = config
+            .permission_approver
+            .clone()
+            .map(|approver| approver.with_interpreters(call_interpreters.clone()));
         let permissions = TerminalPermissionHandler::for_agent(
-            config.permission_approver.clone(),
+            permission_approver.clone(),
             config.network_policy.clone(),
             config.profile_id.clone(),
         )
@@ -669,7 +680,15 @@ impl MayAgent {
                 target: s.target.clone(),
             })
             .collect();
-        let refused_reads = RefusedReads::default();
+        // The session's runtime service owns one refused-read record so the
+        // UI can tell a refused read from a failed call.
+        let refused_reads = config
+            .permission_approver
+            .as_ref()
+            .and_then(|approver| approver.runtime_service.clone())
+            .map_or_else(crate::command_policy::RefusedReads::default, |runtime| {
+                runtime.refused_reads()
+            });
         let budgets = config.limits.shell();
         let assembly = ShellAssembly {
             tools: tools.clone(),
@@ -748,7 +767,7 @@ impl MayAgent {
                 hosts.agents(
                     config.session_id.as_str(),
                     super::acp_sandbox::SessionServices::new(
-                        config.permission_approver.clone(),
+                        permission_approver.clone(),
                         config
                             .job_server
                             .broker()
@@ -860,9 +879,9 @@ impl MayAgent {
                 let cfg = workspace.config.clone();
                 let key = owner_repo.clone();
                 let publishes =
-                    blocking::unblock(move || crate::trust::trust_for_github(&cfg, &key))
+                    blocking::unblock(move || crate::trust::effective_for_github(&cfg, &key))
                         .await
-                        .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                        .publishes_to_github();
                 publishes.then(|| {
                     (
                         owner_repo.clone(),
@@ -897,11 +916,15 @@ impl MayAgent {
                     .map(Path::to_path_buf);
                 checkout
                     .map_or_else(
-                        || blocking::unblock(|| None),
-                        |c| blocking::unblock(move || crate::trust::trust_for(&cfg, &id, &c)),
+                        || blocking::unblock(|| crate::trust::TrustLevel::LocalBranch),
+                        |_| {
+                            let cfg = cfg.clone();
+                            let id = id.clone();
+                            blocking::unblock(move || crate::trust::effective_for(&cfg, &id))
+                        },
                     )
                     .await
-                    .is_some_and(crate::trust::TrustLevel::clones_work)
+                    .clones_work()
             }
             (Some(crate::session::RepoBinding::Github(_)), _) => github_target.is_some(),
             (None, Some(worktree)) => matches!(
@@ -1002,15 +1025,14 @@ impl MayAgent {
         let publish_gate = config
             .live_config
             .clone()
-            .zip(config.permission_approver.clone())
+            .zip(permission_approver.clone())
             .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator.clone(),
             artifacts_dir: session_paths.artifacts_dir(),
         };
         let agent_messaging = config.agent_messaging.clone();
-        let hook_runtime = config
-            .permission_approver
+        let hook_runtime = permission_approver
             .as_ref()
             .and_then(|approver| approver.runtime_service.clone());
 
@@ -1082,6 +1104,8 @@ impl MayAgent {
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
+                subagent_models: config.subagent_models.clone(),
+                model_listing: Some(config.model_listing.clone()),
                 services: config.services.clone(),
             },
         ))
@@ -1153,6 +1177,7 @@ impl MayAgent {
             session_id: config.session_id.clone(),
             redactor: SecretRedactor::for_session(&config.may_dir, config.session_id.as_str()),
             refused: refused_reads,
+            interpreters: call_interpreters,
             jobs: shell.jobs(),
             valve: valve.clone(),
             compaction: compaction_requested.clone(),
@@ -1466,9 +1491,72 @@ impl MayAgent {
             may_config,
             session_id.as_str(),
         )?;
+        let subagent_models = {
+            let may_config = Arc::new(may_config.clone());
+            let pushed_providers = pushed_providers.clone();
+            let redactor = redactor.clone();
+            let resolve = crate::subagent::SubagentModelResolver::new(
+                move |selector: &crate::ModelSelector| {
+                    let may_config = may_config.clone();
+                    let pushed_providers = pushed_providers.clone();
+                    let redactor = redactor.clone();
+                    let selector = selector.clone();
+                    Box::pin(async move {
+                        let providers = super::Providers::new(&may_config, &pushed_providers);
+                        let provider_id = selector.provider_id().to_string();
+                        let provider = providers.get(&provider_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "provider '{provider_id}' is not configured; run `models` to see the models a call may run on"
+                            )
+                        })?;
+                        let llm = super::provider::build_cloud_provider_from_instance(
+                            &provider_id,
+                            &provider,
+                            selector.model_id(),
+                            &redactor,
+                        )
+                        .await
+                        .map_err(|error| anyhow::anyhow!("failed to build '{selector}': {error}"))?
+                        .with_context_window(
+                            crate::models::resolve_context_window(
+                                &[],
+                                &provider_id,
+                                selector.model_id(),
+                            ),
+                        );
+                        Ok(crate::agent::ModelSlot::new(
+                            llm,
+                            super::provider::request_parameters_for(
+                                &provider_id,
+                                Some(&provider.instance),
+                                selector.model_id(),
+                                None,
+                            ),
+                        ))
+                    })
+                },
+            );
+            Some(resolve)
+        };
+        let model_listing = crate::agent::models_tool::ModelListing {
+            session: crate::ModelSelector::new(
+                provider_id.clone(),
+                selector.model_id().to_string(),
+            ),
+            tiers: [
+                crate::subagent::Tier::Advanced,
+                crate::subagent::Tier::Balanced,
+                crate::subagent::Tier::Fast,
+            ]
+            .into_iter()
+            .map(|tier| (tier, providers.tier(tier.as_model_tier())))
+            .collect(),
+        };
         Ok(MayAgentConfig {
             subagent_tracker,
             connectivity,
+            subagent_models,
+            model_listing,
             tool_distribution,
             tool_environments,
             job_server,

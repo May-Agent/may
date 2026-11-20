@@ -56,13 +56,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_tier_model_picker(frame, area, app);
             return;
         }
-        // The launch gates own the frame — the decision happens before
-        // the session, not over the chat. `/permission` re-asks the same
-        // decision mid-session, where it pops a bottom sheet instead.
-        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if !is_gate_sheet(mode) => {
-            render_gate_screen(frame, area, app);
-            return;
-        }
         // The OAuth device/browser flows are steps of the settings screen
         // (entered from a provider there and returning to it), so they keep
         // its full-screen frame rather than popping a sheet over the chat.
@@ -400,12 +393,10 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             pct(70),
         ),
         AppMode::QuitConfirm(_) => (9, pct(70)),
-        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if is_gate_sheet(mode) => {
+        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) => {
             (rows(gate_sheet_rows(mode)), pct(60))
         }
-        AppMode::LaunchGrant(_)
-        | AppMode::RepoTrust(_)
-        | AppMode::Chat
+        AppMode::Chat
         | AppMode::ImageView(_)
         | AppMode::Config
         | AppMode::TierModelPicker
@@ -467,17 +458,31 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
             render_connect_picker(frame, sheet, state, app.spinner_frame, app.band_bg);
         }
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
-        AppMode::JobDetail(state) => render_job_detail(frame, sheet, state, app.band_bg),
+        AppMode::JobDetail(state) => {
+            render_job_detail(
+                frame,
+                sheet,
+                state,
+                &app.chat.assets().highlighting,
+                app.band_bg,
+            );
+        }
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state, app.band_bg),
         AppMode::Progress(state) => render_progress_popup(frame, sheet, state, app.band_bg),
         AppMode::PermissionConfirm(state) => {
-            render_permission_confirm(frame, sheet, state, app.band_bg);
+            render_permission_confirm(
+                frame,
+                sheet,
+                state,
+                &app.chat.assets().highlighting,
+                app.band_bg,
+            );
         }
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason, app.band_bg);
         }
         AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet, app.band_bg),
-        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if is_gate_sheet(mode) => {
+        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) => {
             render_gate_sheet(frame, sheet, mode, app.band_bg);
         }
         _ => {}
@@ -888,8 +893,20 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
             })
             .collect();
 
+        let hidden = if app.tier_picker_show_outdated {
+            0
+        } else {
+            app.tier_picker_models
+                .iter()
+                .filter(|model| model.outdated)
+                .count()
+        };
         let title = if total > 0 {
-            format!(" {tier_name} ({total}) ")
+            if hidden > 0 {
+                format!(" {tier_name} ({total}, {hidden} outdated hidden, ! shows all) ")
+            } else {
+                format!(" {tier_name} ({total}) ")
+            }
         } else {
             format!(" {tier_name} (no models) ")
         };
@@ -1148,7 +1165,10 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                         .take(48)
                         .collect();
                     (
-                        format!("{prefix}◉ subagent {}", run.agent),
+                        vec![Span::styled(
+                            format!("{prefix}◉ subagent {}", run.agent),
+                            title_style,
+                        )],
                         format!(
                             "    {} · {} tok (in {}, out {}) · {}",
                             chat::format_elapsed(run.elapsed_secs()),
@@ -1178,14 +1198,24 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                     };
                     let first_line = job.script.lines().next().unwrap_or("");
                     let cmd: String = first_line.chars().take(60).collect();
-                    (
-                        format!("{prefix}{icon} pid {} · {cmd}", job.pid),
-                        job_row_detail(job, &status),
-                    )
+                    let mut title = vec![Span::styled(
+                        format!("{prefix}{icon} pid {} · ", job.pid),
+                        title_style,
+                    )];
+                    title.extend(
+                        app.chat
+                            .assets()
+                            .highlighting
+                            .spans(chat::interpreter_syntax(job.interpreter), &cmd)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default(),
+                    );
+                    (title, job_row_detail(job, &status))
                 }
             };
             ListItem::new(vec![
-                Line::from(Span::styled(title, title_style)),
+                Line::from(title),
                 Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
             ])
         })
@@ -1201,11 +1231,17 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Job/subagent detail: bottom drawer with live stats or buffered output.
-fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: Option<Color>) {
-    let (title, body): (String, Vec<Line<'_>>) = match state.target {
+fn render_job_detail(
+    frame: &mut Frame,
+    area: Rect,
+    state: &JobDetailState,
+    highlighting: &super::highlight::Highlighting,
+    bg: Option<Color>,
+) {
+    let (title, body): (Vec<Span<'_>>, Vec<Line<'_>>) = match state.target {
         JobDetailTarget::Job(pid) => {
             let title = state.job.as_ref().map_or_else(
-                || format!("job {pid} — gone"),
+                || vec![Span::raw(format!("job {pid} — gone"))],
                 |job| {
                     let status = match &job.status {
                         aither_sandbox::JobStatus::Running => format!(
@@ -1220,17 +1256,24 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
                         }
                         aither_sandbox::JobStatus::Killed { .. } => "killed".to_string(),
                     };
-                    format!(
-                        "job {} · {} — {status}",
-                        job.pid,
-                        job.script
-                            .lines()
+                    let cmd: String = job
+                        .script
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect();
+                    let mut spans = vec![Span::raw(format!("job {} · ", job.pid))];
+                    spans.extend(
+                        highlighting
+                            .spans(chat::interpreter_syntax(job.interpreter), &cmd)
+                            .into_iter()
                             .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(48)
-                            .collect::<String>(),
-                    )
+                            .unwrap_or_default(),
+                    );
+                    spans.push(Span::raw(format!(" — {status}")));
+                    spans
                 },
             );
             let mut lines: Vec<Line<'_>> = Vec::new();
@@ -1252,7 +1295,7 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
         JobDetailTarget::Subagent(_) => state.subagent.as_ref().map_or_else(
             || {
                 (
-                    "subagent — gone".to_string(),
+                    vec![Span::raw("subagent — gone")],
                     vec![Line::from(Span::styled(
                         "(finished)",
                         Style::default().fg(Color::DarkGray),
@@ -1281,7 +1324,7 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
                     Style::default().fg(Color::DarkGray),
                 ))];
                 lines.extend(run.prompt.lines().map(|line| Line::from(line.to_string())));
-                (title, lines)
+                (vec![Span::raw(title)], lines)
             },
         ),
     };
@@ -1291,13 +1334,9 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: 
     let scroll = state.scroll.min(body.len().saturating_sub(inner_height));
     let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
 
-    let block = panel(
-        Some(Span::raw(format!(
-            "{title} (Esc back · ↑↓ scroll · x stop · r refresh)"
-        ))),
-        Color::Cyan,
-        bg,
-    );
+    let mut title_spans = title;
+    title_spans.push(Span::raw(" (Esc back · ↑↓ scroll · x stop · r refresh)"));
+    let block = panel(Some(Line::from(title_spans)), Color::Cyan, bg);
     frame.render_widget(
         Paragraph::new(body).block(block).scroll((scroll, 0)),
         panel_area,
@@ -2217,22 +2256,11 @@ fn render_workspace_confirm(
     frame.render_widget(widget, area);
 }
 
-/// Whether the launch gate shows as a bottom sheet — only a `/permission`
-/// re-ask (`redecide`); the startup gate owns the whole frame.
-const fn is_gate_sheet(mode: &AppMode) -> bool {
-    match mode {
-        AppMode::LaunchGrant(state) => state.redecide,
-        AppMode::RepoTrust(state) => state.redecide,
-        _ => false,
-    }
-}
-
-/// The launch gate's content — label, path, question, option list, hint —
-/// shared by the full-screen gate that opens before the session and the
-/// `/permission` bottom sheet over it. The hint differs: the startup gate
-/// only quits, while a mid-session re-ask cancels on Esc.
+/// The `/permission` sheet's content — label, path, question, option list,
+/// hint — for the workspace grant and the repository trust alike. Esc
+/// cancels the sheet: the decision in force stays.
 fn gate_lines(mode: &AppMode) -> Option<Vec<Line<'static>>> {
-    let (label, path, question, description, options, selected, redecide) = match mode {
+    let (label, path, question, description, options, selected) = match mode {
         AppMode::LaunchGrant(state) => (
             "Accessing workspace:",
             state.path.display().to_string(),
@@ -2243,7 +2271,6 @@ fn gate_lines(mode: &AppMode) -> Option<Vec<Line<'static>>> {
                 "No, keep it read-only".to_string(),
             ],
             state.selected,
-            state.redecide,
         ),
         AppMode::RepoTrust(state) => {
             let question = &state.ask.questions[state.ask.current_question];
@@ -2254,7 +2281,6 @@ fn gate_lines(mode: &AppMode) -> Option<Vec<Line<'static>>> {
                 " works in an isolated clone; the choice is remembered.".to_string(),
                 question.option.clone(),
                 state.ask.question_states[state.ask.current_question].cursor,
-                state.redecide,
             )
         }
         _ => return None,
@@ -2286,52 +2312,22 @@ fn gate_lines(mode: &AppMode) -> Option<Vec<Line<'static>>> {
         lines.push(Line::from(Span::styled(format!("{prefix}{option}"), style)));
     }
     lines.push(Line::from(""));
-    let (key, action) = if redecide {
-        ("esc", " Cancel")
-    } else {
-        ("ctrl+c", " Quit")
-    };
     lines.push(Line::from(vec![
         Span::styled("↑/↓ Navigate · ", Style::default().fg(Color::DarkGray)),
         Span::styled("enter", Style::default().fg(Color::Cyan)),
         Span::styled(" Confirm · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(key, Style::default().fg(Color::Cyan)),
-        Span::styled(action, Style::default().fg(Color::DarkGray)),
+        Span::styled("esc", Style::default().fg(Color::Cyan)),
+        Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
     ]));
     Some(lines)
 }
 
-/// The launch gate — workspace write access or repository trust — owns
-/// the frame: label, path, question, option list, hint.
-fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(lines) = gate_lines(&app.mode) else {
-        return;
-    };
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines), area);
-    // The model reads like the reference's bottom-right status text.
-    let model_area = Rect {
-        y: area.y + area.height.saturating_sub(1),
-        height: 1,
-        ..area
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            app.model_display(),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .alignment(Alignment::Right),
-        model_area,
-    );
-}
-
-/// Rows the launch-gate sheet takes: its content lines plus the border.
+/// Rows the `/permission` sheet takes: its content lines plus the border.
 fn gate_sheet_rows(mode: &AppMode) -> usize {
     gate_lines(mode).map_or(3, |lines| lines.len() + 2)
 }
 
-/// The launch gate as a bottom sheet: `/permission` re-asks the launch
-/// decision over the running session instead of owning the frame.
+/// The `/permission` decision as a bottom sheet over the running session.
 fn render_gate_sheet(frame: &mut Frame, area: Rect, mode: &AppMode, bg: Option<Color>) {
     let Some(lines) = gate_lines(mode) else {
         return;
@@ -2385,6 +2381,7 @@ fn render_permission_confirm(
     frame: &mut Frame,
     area: Rect,
     state: &crate::tui::state::PermissionConfirmState,
+    highlighting: &super::highlight::Highlighting,
     bg: Option<Color>,
 ) {
     let mut content = vec![
@@ -2411,10 +2408,17 @@ fn render_permission_confirm(
             "Script:",
             Style::default().fg(Color::White),
         )));
-        content.push(Line::from(Span::styled(
-            format!("  {}", state.request.script.as_str()),
-            Style::default().fg(Color::Yellow),
-        )));
+        let language = chat::interpreter_syntax(
+            state
+                .request
+                .interpreter
+                .unwrap_or(aither_sandbox::Interpreter::Shell),
+        );
+        for spans in highlighting.spans(language, state.request.script.as_str()) {
+            let mut line_spans = vec![Span::raw("  ")];
+            line_spans.extend(spans);
+            content.push(Line::from(line_spans));
+        }
     }
     content.push(Line::from(""));
     let mut keys = vec![
@@ -3283,44 +3287,28 @@ mod tests {
         assert!(shown.iter().any(|row| row.contains(IMAGE_MARK)));
     }
 
-    fn launch_grant(redecide: bool) -> AppMode {
+    fn launch_grant() -> AppMode {
         AppMode::LaunchGrant(LaunchGrantState {
             path: PathBuf::from("/work/dir"),
             config_path: PathBuf::from("/cfg/workspace.toml"),
-            redecide,
             selected: 0,
         })
     }
 
-    fn repo_trust(redecide: bool) -> AppMode {
+    fn repo_trust() -> AppMode {
         let worktree = PathBuf::from("/work/repo");
         let kind = crate::trust::RepoKind::Git;
         AppMode::RepoTrust(RepoTrustState {
-            ask: AskUserState::for_open_question(crate::trust::question_for(
-                &kind, &worktree, false,
-            )),
+            ask: AskUserState::for_open_question(crate::trust::question_for(&kind, &worktree)),
             worktree,
             kind,
             config_path: PathBuf::from("/cfg/workspace.toml"),
-            redecide,
         })
     }
 
-    /// Only a `/permission` re-ask is a bottom sheet; the startup gate and
-    /// every other mode are not.
+    /// The `/permission` sheet cancels on Esc.
     #[test]
-    fn gate_sheet_is_only_the_permission_redecide() {
-        assert!(super::is_gate_sheet(&launch_grant(true)));
-        assert!(super::is_gate_sheet(&repo_trust(true)));
-        assert!(!super::is_gate_sheet(&launch_grant(false)));
-        assert!(!super::is_gate_sheet(&repo_trust(false)));
-        assert!(!super::is_gate_sheet(&AppMode::Chat));
-    }
-
-    /// The redecide sheet cancels on Esc; the startup gate offers no cancel
-    /// — its only way out unanswered is ctrl+c.
-    #[test]
-    fn gate_hint_esc_cancels_a_redecide_and_ctrl_c_quits_at_launch() {
+    fn gate_hint_esc_cancels_the_sheet() {
         let hint = |mode: &AppMode| {
             let lines = super::gate_lines(mode).expect("gate lines");
             lines
@@ -3331,16 +3319,15 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         };
-        assert!(hint(&launch_grant(true)).contains("esc Cancel"));
-        assert!(hint(&launch_grant(false)).contains("ctrl+c Quit"));
-        assert!(hint(&repo_trust(true)).contains("esc Cancel"));
+        assert!(hint(&launch_grant()).contains("esc Cancel"));
+        assert!(hint(&repo_trust()).contains("esc Cancel"));
     }
 
-    /// The `/permission` sheet renders the gate inside a bordered box, not
-    /// over the whole frame.
+    /// The `/permission` sheet renders the decision inside a bordered box,
+    /// not over the whole frame.
     #[test]
     fn permission_gate_renders_as_a_bordered_sheet() {
-        let mode = launch_grant(true);
+        let mode = launch_grant();
         let mut terminal = Terminal::new(ScreenBackend::new(60, 20)).unwrap();
         terminal
             .draw(|frame| {
@@ -3700,7 +3687,15 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
         terminal
-            .draw(|frame| super::render_permission_confirm(frame, frame.area(), state, None))
+            .draw(|frame| {
+                super::render_permission_confirm(
+                    frame,
+                    frame.area(),
+                    state,
+                    &super::super::highlight::Highlighting::default(),
+                    None,
+                );
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -3753,6 +3748,7 @@ mod tests {
             command: "cargo test --workspace".to_string(),
             mode: aither_sandbox::SandboxMode::Sandboxed,
             location: None,
+            interpreter: aither_sandbox::Interpreter::Shell,
             reading: None,
             card: None,
             status: ToolStatus::Done,

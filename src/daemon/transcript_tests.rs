@@ -200,6 +200,7 @@ async fn a_tool_call_folds_start_end_and_stopped_rows_into_one_entry() {
         id: "c1".into(),
         name: "terminal".into(),
         result: aither_core::llm::ToolResult::text("done!"),
+        refused: false,
     };
     let stopped = ToolEventRecord::Stopped {
         id: "c2".into(),
@@ -480,6 +481,7 @@ async fn a_call_completing_after_the_page_still_shows_its_result() {
         id: "c1".into(),
         name: "terminal".into(),
         result: aither_core::llm::ToolResult::text("done!"),
+        refused: false,
     };
     let rows = vec![
         ChatMessage::user("a"),

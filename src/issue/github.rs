@@ -241,6 +241,34 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
         Ok(user.login)
     }
 
+    /// The authenticated user's access to `repository`: ownership or admin
+    /// permission, push access, and whether GitHub Issues are enabled on it.
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors, a missing repository
+    /// included.
+    pub async fn repository_access(
+        &self,
+        repository: &GitHubRepository,
+    ) -> Result<RepositoryAccess, IssueError> {
+        let url = format!("{}/repos/{repository}", self.api_base);
+        let (viewer, details) = futures_lite::future::try_zip(self.viewer_login(), async {
+            self.request(Method::GET, url, None)
+                .await?
+                .into_json::<GhRepository>()
+                .await
+                .map_err(|error| IssueError::GitHub(error.to_string()))
+        })
+        .await?;
+        let owned = details.owner.login.eq_ignore_ascii_case(&viewer)
+            || details.permissions.as_ref().is_some_and(|p| p.admin);
+        Ok(RepositoryAccess {
+            owned,
+            can_push: owned || details.permissions.as_ref().is_some_and(|p| p.push),
+            has_issues: details.has_issues,
+        })
+    }
+
     /// Whether the authenticated user owns `repository`: the owner's login
     /// is theirs, or they hold admin permission on it.
     ///
@@ -251,17 +279,9 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
         &self,
         repository: &GitHubRepository,
     ) -> Result<bool, IssueError> {
-        let url = format!("{}/repos/{repository}", self.api_base);
-        let (viewer, details) = futures_lite::future::try_zip(self.viewer_login(), async {
-            self.request(Method::GET, url, None)
-                .await?
-                .into_json::<GhRepository>()
-                .await
-                .map_err(|error| IssueError::GitHub(error.to_string()))
-        })
-        .await?;
-        Ok(details.owner.login.eq_ignore_ascii_case(&viewer)
-            || details.permissions.is_some_and(|p| p.admin))
+        self.repository_access(repository)
+            .await
+            .map(|access| access.owned)
     }
 
     /// Whether the authenticated user's account opened issue or pull
@@ -294,16 +314,40 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
     }
 }
 
+/// The authenticated user's access to a GitHub repository, as
+/// [`GitHubRest::repository_access`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepositoryAccess {
+    /// The owner's login matches the authenticated viewer, or the viewer
+    /// holds `admin` permission.
+    pub owned: bool,
+    /// The viewer may push branches to this repository (`owned` or
+    /// `permissions.push`).
+    pub can_push: bool,
+    /// GitHub Issues are enabled on this repository (`has_issues`).
+    pub has_issues: bool,
+}
+
+/// GitHub omits `has_issues` in some responses; Issues exist unless
+/// explicitly disabled.
+const fn default_has_issues() -> bool {
+    true
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct GhRepository {
     owner: GhUser,
     permissions: Option<GhPermissions>,
+    #[serde(default = "default_has_issues")]
+    has_issues: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct GhPermissions {
     #[serde(default)]
     admin: bool,
+    #[serde(default)]
+    push: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1597,6 +1641,108 @@ mod tests {
         })
         .await
         .0
+    }
+
+    /// A mock API where the authenticated user is `me` and `GET /repos/o/r`
+    /// answers `repo`.
+    async fn access_api(repo: serde_json::Value) -> String {
+        mock_api(move |method, path, _body| match (method, path) {
+            ("GET", "/user") => (200, serde_json::json!({"login": "me"})),
+            ("GET", "/repos/o/r") => (200, repo.clone()),
+            _ => panic!("unexpected request {method} {path}"),
+        })
+        .await
+        .0
+    }
+
+    fn rest(api_base: &str) -> GitHubRest<StaticToken> {
+        GitHubRest::with_api_base(StaticToken, api_base)
+    }
+
+    #[tokio::test]
+    async fn repository_access_reports_ownership_push_and_issues() {
+        let repository: GitHubRepository = "o/r".parse().expect("repository");
+        for (repo, expected) in [
+            // Owned with issues.
+            (
+                serde_json::json!({"owner": {"login": "me"}}),
+                RepositoryAccess {
+                    owned: true,
+                    can_push: true,
+                    has_issues: true,
+                },
+            ),
+            // An owned fork with Issues disabled.
+            (
+                serde_json::json!({"owner": {"login": "me"}, "has_issues": false}),
+                RepositoryAccess {
+                    owned: true,
+                    can_push: true,
+                    has_issues: false,
+                },
+            ),
+            // A collaborator: not owned, push permission.
+            (
+                serde_json::json!({"owner": {"login": "org"}, "permissions": {"push": true}}),
+                RepositoryAccess {
+                    owned: false,
+                    can_push: true,
+                    has_issues: true,
+                },
+            ),
+            // Admin permission counts as owned.
+            (
+                serde_json::json!({"owner": {"login": "org"}, "permissions": {"admin": true}}),
+                RepositoryAccess {
+                    owned: true,
+                    can_push: true,
+                    has_issues: true,
+                },
+            ),
+            // Read-only third-party repository.
+            (
+                serde_json::json!({"owner": {"login": "org"}, "permissions": {"push": false}}),
+                RepositoryAccess {
+                    owned: false,
+                    can_push: false,
+                    has_issues: true,
+                },
+            ),
+        ] {
+            let api_base = access_api(repo).await;
+            assert_eq!(
+                rest(&api_base)
+                    .repository_access(&repository)
+                    .await
+                    .expect("access"),
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_access_lookup_is_an_error() {
+        let repository: GitHubRepository = "o/r".parse().expect("repository");
+        let (api_base, _requests) = mock_api(|_method, path, _body| match path {
+            "/user" => (200, serde_json::json!({"login": "me"})),
+            _ => (500, serde_json::json!({"message": "boom"})),
+        })
+        .await;
+        assert!(
+            rest(&api_base)
+                .repository_access(&repository)
+                .await
+                .is_err()
+        );
+        let (api_base, _requests) =
+            mock_api(|_method, _path, _body| (404, serde_json::json!({"message": "Not Found"})))
+                .await;
+        assert!(
+            rest(&api_base)
+                .repository_access(&repository)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
