@@ -1,6 +1,5 @@
 {% for pr in prs -%}
-PR #{{ pr.number }} [{{ pr.state }}] {{ pr.title }}
-{%- if let Some(ext) = pr.external_number %} (GitHub #{{ ext }}){% endif %}
+PR {{ pr.sigil }}{{ pr.number }} [{{ pr.state }}] {{ pr.title }}
 {%- if let Some(sha) = pr.merge_commit_sha %} → {{ sha }}{% endif %}
 {%- if pr.orphaned %} — orphaned{% endif %}
   repo {{ pr.repo_key }} · backend {{ pr.backend }} · session {{ pr.session_id }}

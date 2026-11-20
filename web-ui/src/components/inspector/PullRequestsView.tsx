@@ -128,7 +128,10 @@ function PullRequestRow({
       ) : (
         <span className="size-3.5 shrink-0" aria-hidden />
       )}
-      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">#{pr.number}</span>
+      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+        {pr.backend === 'gitlab' ? '!' : '#'}
+        {pr.number}
+      </span>
       <span className="min-w-0 flex-1 truncate text-[13px]" title={pr.title}>
         {pr.title}
       </span>

@@ -484,10 +484,8 @@ pub struct ApiPr {
     pub(crate) title: String,
     /// Where the PR stands.
     pub(crate) state: crate::db::PrState,
-    /// `may` or `github`.
+    /// `may`, `github` or `gitlab`.
     pub(crate) backend: String,
-    /// External PR number, when the backend created one.
-    pub(crate) external_number: Option<i64>,
     /// Associated issue number, when linked.
     pub(crate) issue_number: Option<i64>,
     /// Whether the PR merges itself once checks pass.

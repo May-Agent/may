@@ -127,15 +127,14 @@ impl ChatDb {
     /// # Errors
     /// Fails on database errors.
     pub async fn live_github_prs(&self) -> Result<Vec<super::pr::PrRow>, ChatDbError> {
-        Ok(query!(
-            self.db,
-            "SELECT * FROM prs WHERE backend = 'github' AND external_number IS NOT NULL"
+        Ok(
+            query!(self.db, "SELECT * FROM prs WHERE backend = 'github'")
+                .fetch_all::<super::pr::PrRow>()
+                .await?
+                .into_iter()
+                .filter(|row| row.state.is_in_flight())
+                .collect(),
         )
-        .fetch_all::<super::pr::PrRow>()
-        .await?
-        .into_iter()
-        .filter(|row| row.state.is_in_flight())
-        .collect())
     }
 }
 

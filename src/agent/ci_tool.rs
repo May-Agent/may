@@ -39,6 +39,7 @@ pub enum CiArgs {
     /// A PR's or a run's checks broken down by job, step and test.
     Slow {
         /// The PR number, or the workflow run id with `--run`.
+        #[serde(deserialize_with = "crate::pr::deserialize_pr_number")]
         number: i64,
         /// `number` is a GitHub workflow run id.
         #[serde(default)]
@@ -295,7 +296,7 @@ mod tests {
             "{stats}"
         );
         let slow = tool.slow(pr.number, false).await.unwrap();
-        assert!(slow.contains("PR #1, by job, slowest first"), "{slow}");
+        assert!(slow.contains("PR #9, by job, slowest first"), "{slow}");
         assert!(
             slow.contains("baseline 1m 30s; abnormal: past 2x its baseline"),
             "{slow}"
@@ -316,7 +317,7 @@ mod tests {
         );
         let queue = tool.queue().await.unwrap();
         assert!(
-            queue.contains("PR #1: waited 10m 00s in the queue after a 3m 20s run."),
+            queue.contains("PR #9: waited 10m 00s in the queue after a 3m 20s run."),
             "{queue}"
         );
     }

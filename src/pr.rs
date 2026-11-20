@@ -645,7 +645,7 @@ impl PrStore {
         }
         // GitHub-bound: push the session branch before recording, so the
         // row never points at a PR that failed to exist upstream.
-        let external_number = if backend == "github" {
+        let upstream_number = if backend == "github" {
             let owner_repo = github_repo
                 .as_deref()
                 .ok_or_else(|| PrError::Resolve("github backend without a repo".to_string()))?;
@@ -673,7 +673,7 @@ impl PrStore {
                 backend,
                 !effective_hold,
                 issue_number,
-                external_number,
+                upstream_number,
             )
             .await?;
         // The PR owns its commit from here on: pin it once, land only it.
@@ -693,7 +693,7 @@ impl PrStore {
             &pr,
             crate::harness::working_document::WorkEvent::PullRequestOpened,
         );
-        if let Some(n) = external_number {
+        if let Some(n) = upstream_number {
             self.event(&pr, "opened", Some(&format!("github PR #{n}")))
                 .await;
         }
@@ -701,6 +701,7 @@ impl PrStore {
             self.event(&pr, "issue_linked", Some(&format!("issue #{n}")))
                 .await;
         }
+        let sigil = pr.sigil();
         if require_review && !hold && !config_hold {
             self.event(
                 &pr,
@@ -708,10 +709,10 @@ impl PrStore {
                 Some("user review required before merge"),
             )
             .await;
-            return Ok(format!("opened PR #{} (awaiting review)", pr.number));
+            return Ok(format!("opened PR {sigil}{} (awaiting review)", pr.number));
         }
         if effective_hold {
-            return Ok(format!("opened PR #{} (hold)", pr.number));
+            return Ok(format!("opened PR {sigil}{} (hold)", pr.number));
         }
         self.merge(pr.number, Some(resolved.record.dir.as_str()))
             .await
@@ -862,10 +863,7 @@ impl PrStore {
         if pr.backend == "github" {
             let owner_repo = github_owner_repo(&resolved.record.source)
                 .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
-            let external = pr
-                .external_number
-                .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
-            self.close_github(&owner_repo, external).await?;
+            self.close_github(&owner_repo, pr.number).await?;
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
@@ -1004,10 +1002,10 @@ impl PrStore {
             let detail = pr_failure_detail(&events, pr.state, check_state.as_ref());
             let checks = format_cached_checks(check_state.as_ref());
             items.push(PrListItemView {
+                sigil: crate::db::pr_sigil(&pr.backend),
                 number: pr.number,
                 state: pr.state,
                 title: pr.title,
-                external_number: pr.external_number,
                 merge_commit_sha: pr.merge_commit_sha,
                 orphaned: pr.orphaned,
                 repo_key: pr.repo_key,
@@ -1070,18 +1068,17 @@ impl PrStore {
         // states GitHub no longer reports checks on.
         let checks = if pr.backend == "github"
             && pr.state.is_in_flight()
-            && let (Some(owner_repo), Some(external)) =
-                (github_owner_repo(&pr.repo_key), pr.external_number)
+            && let Some(owner_repo) = github_owner_repo(&pr.repo_key)
         {
             let github = merge_watch::GithubPr {
                 api: &self.context.github_api,
                 owner_repo: &owner_repo,
-                number: external,
+                number: pr.number,
             };
             let section = match merge_watch::Upstream::snapshot(&github).await {
                 Ok(snapshot) => {
                     let report = checks::ChecksReport::of(&snapshot);
-                    let failures = checks::failure_details(&owner_repo, external, &report).await;
+                    let failures = checks::failure_details(&owner_repo, pr.number, &report).await;
                     checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
                 }
                 Err(error) => checks::ChecksSection::Unreadable(error.to_string()),
@@ -1106,10 +1103,10 @@ impl PrStore {
             })
             .collect();
         PrShowTemplate {
+            sigil: crate::db::pr_sigil(&pr.backend),
             number: pr.number,
             state: pr.state,
             title: &pr.title,
-            external_number: pr.external_number,
             repo_key: &pr.repo_key,
             session_id: &pr.session_id,
             orphaned: pr.orphaned,
@@ -1280,18 +1277,16 @@ impl PrStore {
     ) -> Result<String, PrError> {
         let owner_repo = github_owner_repo(&resolved.record.source)
             .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
-        let external = pr
-            .external_number
-            .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
+        let upstream_number = pr.number;
         let lock = self.context.land_locks.get(&resolved.record.repo_key);
         let github = merge_watch::GithubPr {
             api: &self.context.github_api,
             owner_repo: &owner_repo,
-            number: external,
+            number: upstream_number,
         };
         // Read before queueing: the bound and the removals that predate it.
         let before = merge_watch::Upstream::snapshot(&github).await?;
-        ensure_head_pinned(external, head_sha, &before.head_sha)?;
+        ensure_head_pinned(upstream_number, head_sha, &before.head_sha)?;
         let expected = merge_watch::Upstream::expected_checks(&github).await?;
         self.event(pr, "queued", None).await;
         // Serialized land: the lock covers queueing the PR, not the wait for
@@ -1301,7 +1296,7 @@ impl PrStore {
             let head_sha = head_sha.to_string();
             move || -> Result<(), String> {
                 let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
-                let args = merge_args(external, &owner_repo, &head_sha);
+                let args = merge_args(upstream_number, &owner_repo, &head_sha);
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 gh(&args).map(drop).map_err(|e| e.to_string())
             }
@@ -1741,12 +1736,10 @@ impl PrStore {
     /// abnormally long job. A recording failure is reported, never fatal: the
     /// PR lands or fails on its checks, not on their timing.
     async fn observe_github_checks(&self, pr: &crate::db::PrRow, owner_repo: &str, head_sha: &str) {
-        let (Some((watch, limits)), Ok(db), Some(external)) =
-            (self.ci_limits().await, self.db(), pr.external_number)
-        else {
+        let (Some((watch, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
             return;
         };
-        let actions = crate::ci::github::GhActions::new(owner_repo, external);
+        let actions = crate::ci::github::GhActions::new(owner_repo, pr.number);
         let recorder = crate::ci::record::Recorder {
             db,
             actions: &actions,
@@ -1973,10 +1966,7 @@ pub async fn user_close_pr(context: &PrContext, pr_id: i64) -> Result<crate::db:
     if pr.backend == "github" {
         let owner_repo = github_owner_repo(&repo_key)
             .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
-        let external = pr
-            .external_number
-            .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
-        close_github_api(&context.github_api, &owner_repo, external).await?;
+        close_github_api(&context.github_api, &owner_repo, pr.number).await?;
     }
     let updated = db.close_pr(pr.id).await?;
     record_user_event(db, context, &updated, "closed", None).await;
@@ -2008,17 +1998,15 @@ async fn user_merge_github(
 ) -> Result<crate::db::PrRow, PrError> {
     let owner_repo = github_owner_repo(repo_key)
         .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
-    let external = pr
-        .external_number
-        .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
+    let upstream_number = pr.number;
     let lock = context.land_locks.get(repo_key);
     let github = merge_watch::GithubPr {
         api: &context.github_api,
         owner_repo: &owner_repo,
-        number: external,
+        number: upstream_number,
     };
     let before = merge_watch::Upstream::snapshot(&github).await?;
-    ensure_head_pinned(external, head_sha, &before.head_sha)?;
+    ensure_head_pinned(upstream_number, head_sha, &before.head_sha)?;
     let expected = merge_watch::Upstream::expected_checks(&github).await?;
     record_user_event(db, context, pr, "queued", None).await;
     blocking::unblock({
@@ -2026,7 +2014,7 @@ async fn user_merge_github(
         let head_sha = head_sha.to_string();
         move || -> Result<(), String> {
             let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
-            let args = merge_args(external, &owner_repo, &head_sha);
+            let args = merge_args(upstream_number, &owner_repo, &head_sha);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             gh(&args).map(drop).map_err(|e| e.to_string())
         }
@@ -2303,12 +2291,62 @@ struct PrOpenProvenance {
     created_at: String,
 }
 
+/// Deserializes a PR or MR number from a JSON integer or a string with an
+/// optional leading `#` or `!` sigil.
+///
+/// # Errors
+/// Fails when the value is neither an integer nor a positive `#N`/`!N`/`N` string.
+pub fn deserialize_pr_number<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct PrNumberVisitor;
+
+    impl serde::de::Visitor<'_> for PrNumberVisitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a positive PR or MR number (optionally prefixed with `#` or `!`)")
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            if value > 0 {
+                Ok(value)
+            } else {
+                Err(E::custom(format!(
+                    "PR number must be positive, got {value}"
+                )))
+            }
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            let signed = i64::try_from(value)
+                .map_err(|_| E::custom(format!("PR number {value} overflows i64")))?;
+            self.visit_i64(signed)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            let trimmed = value.trim();
+            let digits = trimmed
+                .strip_prefix('#')
+                .or_else(|| trimmed.strip_prefix('!'))
+                .unwrap_or(trimmed);
+            let parsed = digits
+                .parse::<i64>()
+                .map_err(|_| E::custom(format!("invalid PR number: {value:?}")))?;
+            self.visit_i64(parsed)
+        }
+    }
+
+    deserializer.deserialize_any(PrNumberVisitor)
+}
+
 #[derive(Debug, Clone)]
 struct PrListItemView {
+    sigil: char,
     number: i64,
     state: PrState,
     title: String,
-    external_number: Option<i64>,
     merge_commit_sha: Option<String>,
     orphaned: bool,
     repo_key: String,
@@ -2337,10 +2375,10 @@ struct PrEventView {
 #[derive(Template)]
 #[template(path = "pr_show.txt", escape = "none")]
 struct PrShowTemplate<'a> {
+    sigil: char,
     number: i64,
     state: PrState,
     title: &'a str,
-    external_number: Option<i64>,
     repo_key: &'a str,
     session_id: &'a str,
     orphaned: bool,
@@ -3120,7 +3158,7 @@ mod tests {
 
         async fn pr_state(&self) -> PrState {
             self.db
-                .get_pr("https://github.com/o/r.git", 1)
+                .get_pr("https://github.com/o/r.git", 7)
                 .await
                 .unwrap()
                 .unwrap()
@@ -3488,7 +3526,7 @@ mod tests {
         let fx = Fixture::new().await;
         let (base, requests) = mock_api(200).await;
         let store = fx.github_store("s1", &base, PrState::Open).await;
-        store.close(1, None).await.unwrap();
+        store.close(7, None).await.unwrap();
         let seen = requests.lock().unwrap().clone();
         assert_eq!(
             seen,
@@ -3507,7 +3545,7 @@ mod tests {
         let fx = Fixture::new().await;
         let (base, requests) = mock_api(422).await;
         let store = fx.github_store("s1", &base, PrState::Open).await;
-        let err = store.close(1, None).await.unwrap_err();
+        let err = store.close(7, None).await.unwrap_err();
         assert!(err.to_string().contains("422"), "{err}");
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(fx.pr_state().await, PrState::Open);
@@ -3519,7 +3557,7 @@ mod tests {
             let fx = Fixture::new().await;
             let (base, requests) = mock_api(200).await;
             let store = fx.github_store("s1", &base, state).await;
-            let err = store.close(1, None).await.unwrap_err();
+            let err = store.close(7, None).await.unwrap_err();
             assert!(err.to_string().contains(state.as_str()), "{err}");
             assert!(requests.lock().unwrap().is_empty());
             assert_eq!(fx.pr_state().await, state);
@@ -3634,7 +3672,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pr.backend, "may");
-        assert_eq!(pr.external_number, None);
         assert_eq!(git(Some(&origin_repo), &["for-each-ref"]).unwrap(), "");
         assert!(requests.lock().unwrap().is_empty());
     }

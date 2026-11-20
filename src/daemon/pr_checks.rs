@@ -158,13 +158,10 @@ async fn read_checks(state: &DaemonState, row: &PrRow) -> PrChecksRead {
                 row.number
             )
         })?;
-    let external = row
-        .external_number
-        .ok_or_else(|| format!("PR #{} has no GitHub number", row.number))?;
     let github = GithubPr {
         api: &state.github_api,
         owner_repo: &repo_key,
-        number: external,
+        number: row.number,
     };
     github
         .snapshot()
