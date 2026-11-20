@@ -592,6 +592,23 @@ where
         builder.main_only(|reserved| reserved.configure_tool(task));
     }
 
+    describe_arguments::<crate::agent::serve_tool::ServeArgs>(&mut descriptions, "serve");
+    {
+        // A service's alerts land on the session's main agent: a subagent
+        // has no `serve`.
+        let session_id = config.session_id.clone();
+        let tunnel_broker = config.tunnel_broker.clone();
+        builder.main_only(|reserved| {
+            reserved.configure_bound_tool("serve", move |binding| {
+                crate::agent::serve_tool::ServeTool::new(
+                    binding.shell.cloned(),
+                    session_id.clone(),
+                    tunnel_broker.clone(),
+                )
+            });
+        });
+    }
+
     if let Some(tunnel_broker) = config.tunnel_broker {
         register_tool_with_description(
             builder,
