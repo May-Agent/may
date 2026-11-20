@@ -12,7 +12,8 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
 };
-use tokio::time::Instant;
+use futures_lite::StreamExt;
+use std::time::Instant;
 
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
@@ -286,13 +287,13 @@ impl ContainerManager {
     /// the directory's canonical path.
     async fn ensure_memories_dir(home_paths: &MayHomePaths) -> Result<PathBuf, ContainerError> {
         let memories_dir = home_paths.memories_dir();
-        tokio::fs::create_dir_all(&memories_dir).await?;
+        async_fs::create_dir_all(&memories_dir).await?;
         let memory_file = home_paths.memory_file();
-        if tokio::fs::metadata(&memory_file).await.is_err() {
-            tokio::fs::write(&memory_file, "").await?;
+        if async_fs::metadata(&memory_file).await.is_err() {
+            async_fs::write(&memory_file, "").await?;
         }
 
-        tokio::fs::canonicalize(home_paths.root())
+        async_fs::canonicalize(home_paths.root())
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
@@ -300,7 +301,7 @@ impl ContainerManager {
                     home_paths.root().display()
                 ))
             })?;
-        let canonical = tokio::fs::canonicalize(&memories_dir)
+        let canonical = async_fs::canonicalize(&memories_dir)
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
@@ -488,19 +489,19 @@ impl ContainerManager {
         let timeout = std::time::Duration::from_secs(timeout_minutes * 60);
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = async_io::Timer::interval(std::time::Duration::from_secs(60));
             loop {
-                interval.tick().await;
+                interval.next().await;
 
                 let now = Instant::now();
                 let snapshot = activity.load();
-                let idle_containers: Vec<String> = snapshot
+                let idle_containers: Vec<(String, Instant)> = snapshot
                     .iter()
                     .filter(|(_, last_seen)| now.duration_since(**last_seen) > timeout)
-                    .map(|(container_id, _)| container_id.clone())
+                    .map(|(container_id, last_seen)| (container_id.clone(), *last_seen))
                     .collect();
 
-                for container_id in idle_containers {
+                for (container_id, seen) in idle_containers {
                     let opts = StopContainerOptionsBuilder::default().t(10).build();
                     match runtime
                         .client
@@ -508,9 +509,7 @@ impl ContainerManager {
                         .await
                     {
                         Ok(()) => {
-                            let mut next_activity = activity.load().as_ref().clone();
-                            next_activity.remove(&container_id);
-                            activity.store(Arc::new(next_activity));
+                            Self::remove_activity_if_unchanged(&activity, &container_id, seen);
                             tracing::info!(
                                 container_id = %container_id,
                                 "Auto-stopped idle container"
@@ -523,9 +522,7 @@ impl ContainerManager {
                                 error = %e,
                                 "Failed to auto-stop container"
                             );
-                            let mut next_activity = activity.load().as_ref().clone();
-                            next_activity.remove(&container_id);
-                            activity.store(Arc::new(next_activity));
+                            Self::remove_activity_if_unchanged(&activity, &container_id, seen);
                         }
                     }
                 }
@@ -533,10 +530,35 @@ impl ContainerManager {
         })
     }
 
-    fn update_activity(&self, update: impl FnOnce(&mut HashMap<String, Instant>)) {
-        let mut activity = self.activity.load().as_ref().clone();
-        update(&mut activity);
-        self.activity.store(Arc::new(activity));
+    /// Removes `container_id`'s activity entry only when it still holds
+    /// `seen`: a touch during the stop window wins the entry back and the
+    /// container keeps its fresh idle clock. The compare-and-swap retries
+    /// under contention, so a concurrent touch is never lost.
+    fn remove_activity_if_unchanged(
+        activity: &ArcSwap<HashMap<String, Instant>>,
+        container_id: &str,
+        seen: Instant,
+    ) {
+        activity.rcu(|current| {
+            if current.get(container_id) == Some(&seen) {
+                let mut next = current.as_ref().clone();
+                next.remove(container_id);
+                Arc::new(next)
+            } else {
+                Arc::clone(current)
+            }
+        });
+    }
+
+    /// Apply `update` to the shared activity map atomically: `rcu` retries
+    /// the clone-update-swap under contention, so a concurrent touch is
+    /// never overwritten by a stale snapshot.
+    fn update_activity(&self, update: impl Fn(&mut HashMap<String, Instant>)) {
+        self.activity.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            update(&mut next);
+            Arc::new(next)
+        });
     }
 
     /// Check if a container is currently running.
@@ -633,6 +655,50 @@ mod tests {
 
         let odd = container_hostname("may-Work_Profile.v2-session");
         assert_eq!(odd, "may-work-profile-v2-session");
+    }
+
+    /// A touch during the stop window keeps the container's entry, so its
+    /// fresh activity is not lost and the idle clock restarts from it.
+    #[test]
+    fn an_activity_touch_during_stop_keeps_the_entry() {
+        let activity = ArcSwap::from_pointee(HashMap::<String, Instant>::new());
+        let seen = Instant::now();
+        activity.rcu(|_| HashMap::from([("c1".to_owned(), seen)]));
+        // The touch lands between the stop decision and the removal.
+        activity.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert("c1".to_owned(), seen + std::time::Duration::from_secs(1));
+            next
+        });
+
+        ContainerManager::remove_activity_if_unchanged(&activity, "c1", seen);
+        assert!(activity.load().contains_key("c1"));
+
+        // An untouched entry is removed.
+        let now = *activity.load().get("c1").unwrap();
+        ContainerManager::remove_activity_if_unchanged(&activity, "c1", now);
+        assert!(activity.load().is_empty());
+    }
+
+    /// Concurrent touches are never lost to a stale load-clone-store.
+    #[test]
+    fn concurrent_activity_updates_keep_every_touch() {
+        let activity = Arc::new(ArcSwap::from_pointee(HashMap::<String, Instant>::new()));
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let activity = activity.clone();
+                scope.spawn(move || {
+                    for round in 0..250 {
+                        activity.rcu(|current| {
+                            let mut next = current.as_ref().clone();
+                            next.insert(format!("c{worker}-{round}"), Instant::now());
+                            next
+                        });
+                    }
+                });
+            }
+        });
+        assert_eq!(activity.load().len(), 4 * 250);
     }
 
     #[test]

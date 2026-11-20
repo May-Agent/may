@@ -23,9 +23,9 @@ mod surface;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::StreamCodec;
@@ -374,49 +374,66 @@ impl VideoCodec {
 
 // ── Encoder requests ───────────────────────────────────────────────────────────
 
-/// What the transport asks of the encoder.
-#[derive(Debug)]
-enum EncoderRequest {
-    Keyframe,
-    Bitrate {
-        peer: String,
-        bits_per_second: u32,
-    },
-    /// The peer's RTCP reception counters.
-    Reception {
-        peer: String,
-        reception: Reception,
-        at: Instant,
-    },
-    PeerGone {
-        peer: String,
-    },
+/// RTCP-derived state the encoder has not applied yet.
+///
+/// Requests coalesce instead of queueing: the encoder drains them only
+/// between frames, and a chatty peer's feedback (REMB every congestion
+/// event, receiver reports each second, PLI bursts) would pile up
+/// unboundedly while the surface is static and no frame arrives. Latest
+/// wins per peer and keyframes collapse to a flag, so the pending state
+/// stays a small map bounded by the live peer count.
+#[derive(Debug, Default)]
+struct PendingControl {
+    keyframe: bool,
+    peers: HashMap<String, PendingPeer>,
+}
+
+/// One peer's latest not-yet-applied state.
+#[derive(Debug, Default)]
+struct PendingPeer {
+    /// The peer's latest REMB estimate.
+    estimate: Option<u32>,
+    /// The peer's latest RTCP reception counters.
+    reception: Option<(Reception, Instant)>,
+    /// The peer's RTCP reader ended; the encoder drops its state. A peer
+    /// id is unique per connection, so this is always chronologically last.
+    gone: bool,
 }
 
 /// The transport's handle on a stream's encoder: keyframe requests and
 /// bitrate estimates, delivered to the encoder thread between frames.
 #[derive(Debug, Clone)]
 pub struct EncoderControl {
-    tx: Sender<EncoderRequest>,
+    pending: Arc<Mutex<PendingControl>>,
 }
 
 /// The encoder thread's end of an [`EncoderControl`].
 #[derive(Debug)]
 pub struct EncoderRequests {
-    rx: Receiver<EncoderRequest>,
+    pending: Arc<Mutex<PendingControl>>,
 }
 
 /// A control handle and the receiving end for the encoder thread.
 pub fn encoder_control() -> (EncoderControl, EncoderRequests) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    (EncoderControl { tx }, EncoderRequests { rx })
+    let pending = Arc::new(Mutex::new(PendingControl::default()));
+    (
+        EncoderControl {
+            pending: pending.clone(),
+        },
+        EncoderRequests { pending },
+    )
 }
 
 impl EncoderControl {
     /// The next frame is an IDR (viewer join, PLI, FIR).
     pub fn request_keyframe(&self) {
-        // The encoder thread is gone when the stream stops; nothing to ask.
-        let _ = self.tx.send(EncoderRequest::Keyframe);
+        self.pending().keyframe = true;
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, PendingControl> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Follows `peer`'s feedback on `sender` until the peer goes away: PLI and
@@ -434,10 +451,11 @@ impl EncoderControl {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let bits_per_second = remb.bitrate as u32;
                     tracing::trace!(%peer, bits_per_second, ssrcs = ?remb.ssrcs, "REMB");
-                    let _ = self.tx.send(EncoderRequest::Bitrate {
-                        peer: peer.clone(),
-                        bits_per_second,
-                    });
+                    self.pending()
+                        .peers
+                        .entry(peer.clone())
+                        .or_default()
+                        .estimate = Some(bits_per_second);
                 } else if let Some(report) = any
                     .downcast_ref::<ReceiverReport>()
                     .and_then(|report| report.reports.first())
@@ -449,22 +467,26 @@ impl EncoderControl {
                         total_lost: report.total_lost,
                     };
                     tracing::trace!(%peer, ?reception, "receiver report");
-                    let _ = self.tx.send(EncoderRequest::Reception {
-                        peer: peer.clone(),
-                        reception,
-                        at: Instant::now(),
-                    });
+                    self.pending()
+                        .peers
+                        .entry(peer.clone())
+                        .or_default()
+                        .reception = Some((reception, Instant::now()));
                 }
             }
         }
-        let _ = self.tx.send(EncoderRequest::PeerGone { peer });
+        self.pending().peers.entry(peer).or_default().gone = true;
     }
 }
 
 impl EncoderRequests {
-    fn try_next(&self) -> Option<EncoderRequest> {
-        // Empty, or the transport side is gone: either way nothing to apply.
-        self.rx.try_recv().ok()
+    /// The requests coalesced since the last drain.
+    fn take(&self) -> PendingControl {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *pending)
     }
 }
 
@@ -492,26 +514,30 @@ pub fn encode_loop(
     // a `spawn_blocking` task. It blocks the current OS thread (which
     // is the blocking-pool thread we own here) until a frame arrives.
     while let Some(frame) = frame_rx.blocking_recv() {
-        while let Some(request) = requests.try_next() {
-            let new_bitrate = match request {
-                EncoderRequest::Keyframe => {
-                    keyframe = true;
-                    None
-                }
-                EncoderRequest::Bitrate {
-                    peer,
-                    bits_per_second,
-                } => target.estimate(peer, bits_per_second),
-                EncoderRequest::Reception {
-                    peer,
-                    reception,
-                    at,
-                } => target.reception(&peer, reception, at),
-                EncoderRequest::PeerGone { peer } => target.peer_gone(&peer),
-            };
-            if let Some(bitrate) = new_bitrate {
-                tracing::debug!(bits_per_second = bitrate.bits_per_second().get(), "bitrate");
-                if let Err(error) = pipeline.set_bitrate(bitrate) {
+        let pending = requests.take();
+        if pending.keyframe {
+            keyframe = true;
+        }
+        for (peer, update) in pending.peers {
+            // Estimate and reception apply in the order they can arrive;
+            // `gone` is always the peer's last word.
+            for new_bitrate in [
+                update
+                    .estimate
+                    .and_then(|bits| target.estimate(peer.clone(), bits)),
+                update
+                    .reception
+                    .and_then(|(reception, at)| target.reception(&peer, reception, at)),
+                update.gone.then(|| target.peer_gone(&peer)).flatten(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                tracing::debug!(
+                    bits_per_second = new_bitrate.bits_per_second().get(),
+                    "bitrate"
+                );
+                if let Err(error) = pipeline.set_bitrate(new_bitrate) {
                     tracing::warn!(%error, "setting the encoder bitrate failed");
                 }
             }
@@ -547,4 +573,54 @@ pub fn encode_loop(
     }
 
     tracing::info!("encoder thread stopped");
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    /// A static surface sends no frames, so nothing drains the pending
+    /// state: feedback still coalesces into one entry per peer instead of
+    /// queueing without bound.
+    #[test]
+    fn feedback_coalesces_instead_of_accumulating() {
+        let (control, requests) = encoder_control();
+        for _ in 0..10_000 {
+            control.request_keyframe();
+            control
+                .pending()
+                .peers
+                .entry("a".to_owned())
+                .or_default()
+                .estimate = Some(500_000);
+            control
+                .pending()
+                .peers
+                .entry("a".to_owned())
+                .or_default()
+                .reception = Some((
+                Reception {
+                    highest_sequence: 42,
+                    total_lost: 0,
+                },
+                Instant::now(),
+            ));
+        }
+        control
+            .pending()
+            .peers
+            .entry("gone".to_owned())
+            .or_default()
+            .gone = true;
+
+        let pending = requests.take();
+        assert!(pending.keyframe);
+        assert_eq!(pending.peers.len(), 2);
+        assert_eq!(pending.peers["a"].estimate, Some(500_000));
+        assert!(pending.peers["gone"].gone);
+
+        let pending = requests.take();
+        assert!(!pending.keyframe);
+        assert!(pending.peers.is_empty());
+    }
 }

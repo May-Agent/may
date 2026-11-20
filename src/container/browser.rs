@@ -7,10 +7,8 @@
 //! 4. Encoded video streamed to clients via WebRTC media tracks (RTP/UDP)
 //! 5. User input received via WebRTC `DataChannel`, forwarded as CDP commands
 //!
-//! Encoding backend:
-//! - Default: `OpenH264` (compiled from C source, Screen Content Real-Time mode)
-//! - Optional: `GStreamer` (hardware accel via VideoToolbox/NVENC/VAAPI, AV1 SCC)
-//!   Enable with `--features gstreamer`. Requires `GStreamer` installed on system.
+//! Encoding: `mediax-codec` — hardware H.264 where the host has an encoder,
+//! software AV1 otherwise (see `crate::video`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +21,7 @@ use crate::video::{
     StreamFormat, VideoCodec, encode_loop, encoder_control,
 };
 use arc_swap::ArcSwapOption;
+use askama::Template;
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::accessibility::{
@@ -381,13 +380,18 @@ struct ManagedBrowserPaths {
 }
 
 impl ManagedBrowserPaths {
-    fn discover(may_dir: &Path) -> Option<Self> {
+    async fn discover(may_dir: &Path) -> Option<Self> {
         let profile_dir =
             crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_profile_dir();
-        managed_browser_executable(may_dir).map(|executable| Self {
-            executable,
-            profile_dir,
-        })
+        // The executable walk hits every cached browser directory; keep it
+        // off the executor.
+        let may_dir = may_dir.to_path_buf();
+        blocking::unblock(move || managed_browser_executable(&may_dir))
+            .await
+            .map(|executable| Self {
+                executable,
+                profile_dir,
+            })
     }
 
     fn owns_process_command(&self, command_line: &str) -> bool {
@@ -1083,7 +1087,7 @@ impl BrowserManager {
 /// Returns [`BrowserError`] when the cache directory cannot be created or the fetcher fails to download the browser.
 pub async fn provision_managed_browser(may_dir: &Path) -> Result<PathBuf, BrowserError> {
     let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
-    tokio::fs::create_dir_all(&cache_dir)
+    async_fs::create_dir_all(&cache_dir)
         .await
         .map_err(|error| BrowserError::provisioning_operation("create browser cache dir", error))?;
 
@@ -1136,8 +1140,17 @@ async fn seed_system_profile_if_empty(
 ) -> Result<(), BrowserError> {
     let target = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_profile_dir();
 
-    let already_seeded = match tokio::fs::read_dir(&target).await {
-        Ok(mut iter) => iter.next_entry().await.ok().flatten().is_some(),
+    let already_seeded = match async_fs::read_dir(&target).await {
+        Ok(mut entries) => match entries.next().await {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => {
+                return Err(BrowserError::browser_operation(
+                    "inspect managed browser profile dir",
+                    error,
+                ));
+            }
+            None => false,
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
             return Err(BrowserError::browser_operation(
@@ -1151,7 +1164,7 @@ async fn seed_system_profile_if_empty(
     }
 
     let source = seed.path.clone();
-    if tokio::fs::metadata(&source).await.is_err() {
+    if async_fs::metadata(&source).await.is_err() {
         return Err(BrowserError::browser_operation(
             "stat system browser profile source",
             std::io::Error::new(
@@ -1162,21 +1175,14 @@ async fn seed_system_profile_if_empty(
     }
 
     if seed.copy_on_first_use {
-        tokio::fs::create_dir_all(&target).await.map_err(|error| {
+        async_fs::create_dir_all(&target).await.map_err(|error| {
             BrowserError::browser_operation("prepare managed browser profile dir", error)
         })?;
         let target_clone = target.clone();
         // fs_extra is a sync API and copying a Chrome profile can move
         // hundreds of MB; do it on the blocking pool so the actor isn't
         // pinned during seeding.
-        tokio::task::spawn_blocking(move || copy_dir_recursive(&source, &target_clone))
-            .await
-            .map_err(|error| {
-                BrowserError::browser_operation(
-                    "join system profile copy task",
-                    std::io::Error::other(error.to_string()),
-                )
-            })??;
+        blocking::unblock(move || copy_dir_recursive(&source, &target_clone)).await?;
         tracing::info!(
             target = %target.display(),
             "Seeded managed browser profile from system Chrome"
@@ -1185,13 +1191,13 @@ async fn seed_system_profile_if_empty(
         // In-place mode: symlink the source into the managed location
         // so May reads/writes the user's real profile directly.
         if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            async_fs::create_dir_all(parent).await.map_err(|error| {
                 BrowserError::browser_operation("prepare managed browser profile parent", error)
             })?;
         }
         let source_for_symlink = source.clone();
         let target_for_symlink = target.clone();
-        tokio::task::spawn_blocking(move || {
+        blocking::unblock(move || {
             #[cfg(unix)]
             {
                 std::os::unix::fs::symlink(&source_for_symlink, &target_for_symlink)
@@ -1205,12 +1211,6 @@ async fn seed_system_profile_if_empty(
             }
         })
         .await
-        .map_err(|error| {
-            BrowserError::browser_operation(
-                "join system profile symlink task",
-                std::io::Error::other(error.to_string()),
-            )
-        })?
         .map_err(|error| {
             BrowserError::browser_operation("symlink system profile in place", error)
         })?;
@@ -1254,7 +1254,7 @@ pub fn provisioned_browser_executable(may_dir: &Path) -> Option<PathBuf> {
 
 /// Kill a stale managed Chrome process on `port` and remove profile lock files left by an unclean shutdown.
 pub async fn stop_managed_browser(port: u16, may_dir: &Path) {
-    let paths = ManagedBrowserPaths::discover(may_dir);
+    let paths = ManagedBrowserPaths::discover(may_dir).await;
     cleanup_stale_chrome(port, paths.as_ref()).await;
     cleanup_profile_lock_files(
         crate::session::MayHomePaths::new(may_dir.to_path_buf())
@@ -1294,8 +1294,9 @@ impl BrowserRuntime {
         let (mut browser, mut handler, backing) = match config.backend {
             BrowserBackendKind::Managed => {
                 prepare_browser_runtime(config, may_dir).await?;
-                let paths =
-                    ManagedBrowserPaths::discover(may_dir).ok_or(BrowserError::NotProvisioned)?;
+                let paths = ManagedBrowserPaths::discover(may_dir)
+                    .await
+                    .ok_or(BrowserError::NotProvisioned)?;
                 match inspect_managed_browser_listener_state(config.port, &paths).await? {
                     ManagedBrowserListenerState::Managed => {
                         tracing::info!(
@@ -1334,7 +1335,7 @@ impl BrowserRuntime {
                     ManagedBrowserListenerState::NotListening => {
                         cleanup_stale_chrome(config.port, Some(&paths)).await;
                         cleanup_profile_lock_files(paths.profile_dir.as_path()).await;
-                        tokio::fs::create_dir_all(&paths.profile_dir)
+                        async_fs::create_dir_all(&paths.profile_dir)
                             .await
                             .map_err(|error| {
                                 BrowserError::browser_operation("create browser profile dir", error)
@@ -1379,19 +1380,31 @@ impl BrowserRuntime {
         let page = Arc::new(match &backing {
             BrowserSessionBacking::Managed { owns_process } => {
                 let timeout = managed_browser_start_operation_timeout();
-                tokio::time::timeout(timeout, browser.new_page("about:blank"))
-                    .await
-                    .map_err(|_| {
-                        managed_browser_start_timeout_error(
+                match futures_lite::future::or(
+                    async { Some(browser.new_page("about:blank").await) },
+                    async {
+                        async_io::Timer::after(timeout).await;
+                        None
+                    },
+                )
+                .await
+                {
+                    Some(Ok(page)) => page,
+                    Some(Err(error)) => {
+                        return Err(BrowserError::browser_operation(
+                            "create managed browser page",
+                            error,
+                        ));
+                    }
+                    None => {
+                        return Err(managed_browser_start_timeout_error(
                             &mut browser,
                             *owns_process,
                             "create managed browser page",
                             timeout,
-                        )
-                    })?
-                    .map_err(|error| {
-                        BrowserError::browser_operation("create managed browser page", error)
-                    })?
+                        ));
+                    }
+                }
             }
             BrowserSessionBacking::RemoteCdp => acquire_browser_page(&mut browser).await?,
         });
@@ -1555,14 +1568,20 @@ impl BrowserRuntime {
             .await
             .map_err(|error| BrowserError::web_rtc_operation("set local description", error))?;
 
-        tokio::time::timeout(Duration::from_secs(10), gather_complete.recv())
-            .await
-            .map_err(|_| {
-                BrowserError::web_rtc_operation(
-                    "wait for ice gathering",
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "ICE gathering timed out"),
-                )
-            })?;
+        futures_lite::future::or(
+            async { gather_complete.recv().await.ok_or(()) },
+            async {
+                async_io::Timer::after(Duration::from_secs(10)).await;
+                Err(())
+            },
+        )
+        .await
+        .map_err(|()| {
+            BrowserError::web_rtc_operation(
+                "wait for ice gathering",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "ICE gathering timed out"),
+            )
+        })?;
 
         let local_desc = peer_connection.local_description().await.ok_or_else(|| {
             BrowserError::web_rtc_operation(
@@ -1614,26 +1633,10 @@ async fn inspect_managed_browser_listener_state(
     port: u16,
     paths: &ManagedBrowserPaths,
 ) -> Result<ManagedBrowserListenerState, BrowserError> {
-    let paths = paths.clone();
-    tokio::task::spawn_blocking(move || {
-        inspect_managed_browser_listener_state_blocking(port, &paths)
-    })
-    .await
-    .map_err(|error| {
-        BrowserError::browser_operation(
-            "inspect managed browser listener state",
-            std::io::Error::other(error.to_string()),
-        )
-    })?
-}
-
-fn inspect_managed_browser_listener_state_blocking(
-    port: u16,
-    paths: &ManagedBrowserPaths,
-) -> Result<ManagedBrowserListenerState, BrowserError> {
-    let output = std::process::Command::new("lsof")
+    let output = async_process::Command::new("lsof")
         .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
         .output()
+        .await
         .map_err(|error| BrowserError::browser_operation("run lsof", error))?;
     if !output.status.success() && output.stdout.is_empty() {
         return Ok(ManagedBrowserListenerState::NotListening);
@@ -1645,9 +1648,10 @@ fn inspect_managed_browser_listener_state_blocking(
     }
 
     for pid in pids.split_whitespace() {
-        let command = std::process::Command::new("ps")
+        let command = async_process::Command::new("ps")
             .args(["-p", pid, "-o", "args="])
             .output()
+            .await
             .map_err(|error| BrowserError::browser_operation("run ps", error))?;
         if !command.status.success() {
             return Err(BrowserError::browser_operation(
@@ -1727,8 +1731,11 @@ fn build_managed_browser_launch_config(
     let mut builder = BrowserConfig::builder()
         .new_headless_mode()
         .port(port)
-        .arg("--remote-allow-origins=*")
-        .arg("--remote-debugging-address=0.0.0.0")
+        // The CDP endpoint is unauthenticated: it binds loopback only so
+        // neither the LAN/tailnet nor a page crossing origins can drive it.
+        // `--remote-allow-origins` stays unset; the websocket client sends
+        // no Origin header, which is what Chrome allows by default.
+        .arg("--remote-debugging-address=127.0.0.1")
         .user_data_dir(paths.profile_dir.clone())
         .chrome_executable(paths.executable.clone());
     if stealth_enabled {
@@ -1785,7 +1792,7 @@ async fn wait_for_local_browser_websocket_endpoint(
             return Err(ManagedBrowserStartupError::Timeout { port, timeout }.into());
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        async_io::Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -1809,13 +1816,28 @@ async fn shutdown_managed_browser_session(
         return Ok(());
     }
 
-    match tokio::time::timeout(Duration::from_secs(3), browser.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(BrowserError::browser_operation(
+    match futures_lite::future::or(
+        async {
+            Some(
+                browser
+                    .wait()
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        },
+        async {
+            async_io::Timer::after(Duration::from_secs(3)).await;
+            None
+        },
+    )
+    .await
+    {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(error)) => Err(BrowserError::browser_operation(
             "wait for managed browser shutdown",
-            error,
+            std::io::Error::other(error),
         )),
-        Err(_) => match browser.kill().await {
+        None => match browser.kill().await {
             Some(Ok(())) | None => Ok(()),
             Some(Err(error)) => Err(BrowserError::browser_operation(
                 "kill managed browser after shutdown timeout",
@@ -1851,7 +1873,7 @@ async fn acquire_browser_page(browser: &mut Browser) -> Result<Page, BrowserErro
                     target_id
                 }
                 Err(_) if start.elapsed() < timeout => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    async_io::Timer::after(Duration::from_millis(100)).await;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1875,7 +1897,7 @@ async fn acquire_browser_page(browser: &mut Browser) -> Result<Page, BrowserErro
             return Err(BrowserPageReadyError::Timeout { timeout }.into());
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        async_io::Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -1903,11 +1925,18 @@ async fn read_page_capture(
     page.goto(trimmed_url)
         .await
         .map_err(|error| BrowserError::browser_operation("navigate page for read", error))?;
-    tokio::time::sleep(limits.settle_delay).await;
+    async_io::Timer::after(limits.settle_delay).await;
 
-    let page_summary = read_page_summary(page.as_ref(), limits).await?;
-    let accessibility = read_accessibility_snapshot(page.as_ref(), limits).await?;
-    let screenshot = capture_page_screenshot(page.as_ref(), options.screenshot).await?;
+    // The three reads are independent CDP calls over one page: run them
+    // together instead of paying three round trips in sequence.
+    let (page_summary, accessibility, screenshot) = futures::join!(
+        read_page_summary(page.as_ref(), limits),
+        read_accessibility_snapshot(page.as_ref(), limits),
+        capture_page_screenshot(page.as_ref(), options.screenshot),
+    );
+    let page_summary = page_summary?;
+    let accessibility = accessibility?;
+    let screenshot = screenshot?;
 
     Ok(BrowserPageCapture {
         page: BrowserPageSummary {
@@ -1949,16 +1978,26 @@ const fn capture_limits(detail: BrowserReadDetail) -> BrowserCaptureLimits {
     }
 }
 
+/// The script `read_page_summary` evaluates, bounded by the capture limits.
+#[derive(askama::Template)]
+#[template(path = "browser_page_summary.js", escape = "none")]
+struct PageSummaryScript {
+    text_excerpt_chars: usize,
+    interactive_elements: usize,
+}
+
 async fn read_page_summary(
     page: &Page,
     limits: BrowserCaptureLimits,
 ) -> Result<BrowserDomSummary, BrowserError> {
-    let summary_script = format!(
-        "() => {{ const normalize = (value) => typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : ''; const excerptChars = {}; const maxInteractiveElements = {}; const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((node) => normalize(node.innerText)).filter(Boolean).slice(0, 12); const interactiveElements = Array.from(document.querySelectorAll('a, button, input, select, textarea, summary, [role=\"button\"], [role=\"link\"], [role=\"menuitem\"], [tabindex]')).map((node) => {{ const role = normalize(node.getAttribute('role')) || normalize(node.tagName).toLowerCase(); const text = normalize(node.innerText || node.textContent || ''); const accessibleName = normalize(node.getAttribute('aria-label')) || normalize(node.getAttribute('title')) || text || null; const href = node instanceof HTMLAnchorElement ? (node.href || null) : null; const inputType = node instanceof HTMLInputElement ? (node.type || null) : null; return {{ role, tagName: normalize(node.tagName).toLowerCase(), text: text || null, accessibleName, href, inputType, disabled: Boolean(node.disabled) }}; }}).filter((item) => item.accessibleName || item.href || item.tagName === 'input').slice(0, maxInteractiveElements); const bodyText = normalize(document.body ? document.body.innerText : '').slice(0, excerptChars); return {{ url: location.href, title: normalize(document.title), mainHeading: headings[0] ?? null, headings, textExcerpt: bodyText, interactiveElements }}; }}",
-        limits.text_excerpt_chars, limits.interactive_elements
-    );
+    let script = PageSummaryScript {
+        text_excerpt_chars: limits.text_excerpt_chars,
+        interactive_elements: limits.interactive_elements,
+    }
+    .render()
+    .map_err(|error| BrowserError::browser_operation("render page summary script", error))?;
 
-    page.evaluate(summary_script.as_str())
+    page.evaluate(script.as_str())
         .await
         .map_err(|error| BrowserError::browser_operation("evaluate page summary script", error))?
         .into_value()
@@ -2215,15 +2254,32 @@ async fn capture_page_screenshot(
         )
         .await
         .map_err(|error| BrowserError::browser_operation("capture browser screenshot", error))?;
-    let dimensions = image::load_from_memory(screenshot_bytes.as_slice())
-        .map_err(|error| BrowserError::browser_operation("decode browser screenshot", error))?;
+    let (width, height) = png_dimensions(&screenshot_bytes).ok_or_else(|| {
+        BrowserError::browser_operation(
+            "read browser screenshot dimensions",
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "screenshot is not a PNG"),
+        )
+    })?;
 
     Ok(Some(BrowserCapturedScreenshot {
         mime_type: "image/png".to_string(),
-        width: dimensions.width(),
-        height: dimensions.height(),
+        width,
+        height,
         data_base64: base64::engine::general_purpose::STANDARD.encode(screenshot_bytes),
     }))
+}
+
+/// A PNG's dimensions, read out of its IHDR header without decoding the
+/// pixels: signature, then the first chunk's length+type+width+height.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    let header = bytes.get(..24)?;
+    if !header.starts_with(PNG_SIGNATURE) || header.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(header.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(header.get(20..24)?.try_into().ok()?);
+    Some((width, height))
 }
 
 /// The clip scale that keeps a snapshot of a `viewport` (CSS pixels) at
@@ -2301,12 +2357,12 @@ async fn start_encoding_pipeline(
     });
 
     // Encoder is CPU-bound so it goes on the blocking pool, not the
-    // tokio worker threads. spawn_blocking returns a JoinHandle the same
-    // shape as tokio::spawn, so the rest of the pipeline lifecycle
-    // (abort on session stop) is uniform.
-    tokio::task::spawn_blocking(move || {
+    // tokio worker threads. The detached task ends with the frame and
+    // sample channels when the session drops them.
+    blocking::unblock(move || {
         encode_loop(jpeg_rx, &sample_tx, codec, &requests);
-    });
+    })
+    .detach();
 
     let sample_writer = tokio::spawn(async move {
         while let Some(encoded) = sample_rx.recv().await {
@@ -2519,50 +2575,54 @@ async fn cleanup_stale_chrome(port: u16, paths: Option<&ManagedBrowserPaths>) {
     let Some(paths) = paths.cloned() else {
         return;
     };
-    let _ = tokio::task::spawn_blocking(move || {
-        let Ok(output) = std::process::Command::new("lsof")
-            .args(["-ti", &format!(":{port}")])
-            .output()
-        else {
-            return;
+    let Ok(output) = async_process::Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output()
+        .await
+    else {
+        return;
+    };
+    let pids_str = String::from_utf8_lossy(&output.stdout);
+    for pid_str in pids_str.split_whitespace() {
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            continue;
         };
-        let pids_str = String::from_utf8_lossy(&output.stdout);
-        for pid_str in pids_str.split_whitespace() {
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                continue;
-            };
-            let Ok(cmdline) = std::process::Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "args="])
-                .output()
-            else {
-                continue;
-            };
-            let args = String::from_utf8_lossy(&cmdline.stdout);
-            if paths.owns_process_command(args.as_ref()) {
-                tracing::info!(pid, "Killing stale Chrome process on port {port}");
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .status();
+        let Ok(cmdline) = async_process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .output()
+            .await
+        else {
+            continue;
+        };
+        let args = String::from_utf8_lossy(&cmdline.stdout);
+        if paths.owns_process_command(args.as_ref()) {
+            tracing::info!(pid, "Killing stale Chrome process on port {port}");
+            if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
             }
         }
-    })
-    .await;
+    }
 }
 
+/// Remove Chromium's `Singleton*` lock files from an unclean shutdown.
+///
+/// They are dangling symlinks — `path.exists()` follows the link and
+/// misses them, so each is removed unconditionally and only `NotFound`
+/// is ignored.
 async fn cleanup_profile_lock_files(profile_dir: &Path) {
-    let profile_dir = profile_dir.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-            let path = profile_dir.join(name);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        match async_fs::remove_file(profile_dir.join(name)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, "removing a stale browser profile lock failed");
             }
         }
-    })
-    .await;
+    }
 }
 
-/// Resolve the provisioned browser binary path. Runs in `spawn_blocking` since it does filesystem I/O.
+/// Resolve the provisioned browser binary path. Callers run it through
+/// `blocking::unblock` since the directory walk does filesystem I/O.
 fn managed_browser_executable(may_dir: &Path) -> Option<PathBuf> {
     let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
     if !cache_dir.exists() {
@@ -2631,5 +2691,36 @@ mod tests {
         assert!(takeover_allows_input("session-a", &owner));
         owner.store(None);
         assert!(!takeover_allows_input("session-a", &owner));
+    }
+
+    #[test]
+    fn png_dimensions_come_from_the_header() {
+        // IHDR of a 320x240 PNG; the pixel data is never looked at.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&320u32.to_be_bytes());
+        png.extend_from_slice(&240u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(super::png_dimensions(&png), Some((320, 240)));
+        assert_eq!(super::png_dimensions(b"not a png"), None);
+        assert_eq!(super::png_dimensions(&png[..12]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_profile_lock_symlinks_are_removed() {
+        futures_lite::future::block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let lock = dir.path().join("SingletonLock");
+            // A lock left by an unclean shutdown is a dangling symlink:
+            // `exists()` follows it and reports false.
+            std::os::unix::fs::symlink(dir.path().join("gone"), &lock).expect("symlink");
+            assert!(!lock.exists());
+            assert!(lock.symlink_metadata().is_ok());
+
+            super::cleanup_profile_lock_files(dir.path()).await;
+            assert!(lock.symlink_metadata().is_err());
+        });
     }
 }

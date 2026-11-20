@@ -309,7 +309,10 @@ impl ContainerRuntime {
     /// Try connecting to a Docker-compatible endpoint: a Unix socket on Unix
     /// hosts, a named pipe on Windows hosts.
     async fn try_connect(socket_path: &Path, kind: ContainerRuntimeKind) -> Option<Self> {
-        if !socket_path.exists() {
+        // A named pipe is not a filesystem object and `exists()` is
+        // unreliable on one, so on Windows the connect + ping probe alone
+        // decides whether the endpoint is there.
+        if cfg!(not(windows)) && !socket_path.exists() {
             return None;
         }
 
