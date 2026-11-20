@@ -32,6 +32,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
             app.compaction.clear_expired(std::time::Instant::now());
+            app.history.poll_load();
+            app.completion.refresh_file_matches();
+            // Image keys come from the last frame's layout; scanning here
+            // on the tick cadence keeps the work off the draw path.
+            app.scan_and_fetch_images();
             app.sync_profile_follow();
             if app.new_year.check_due(std::time::Instant::now()) {
                 let zone = crate::tui::new_year::user_zone(&app.config.time);
@@ -262,6 +267,17 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 app.chat
                     .push_error(&format!("Failed to save config: {error}"));
                 app.set_status("Config save failed");
+            }
+            Ok(None)
+        }
+        AppEvent::ConfigPushed(config) => {
+            app.apply_pushed_config(*config);
+            Ok(None)
+        }
+        AppEvent::ClipboardCopied(result) => {
+            match result {
+                Ok(()) => app.set_status("Copied selection"),
+                Err(error) => app.set_status(error.to_string()),
             }
             Ok(None)
         }

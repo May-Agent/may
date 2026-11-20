@@ -125,6 +125,15 @@ const streamdownComponents = {
   code: InlineCode,
 };
 
+/**
+ * Only http(s), mailto, fragment and relative links may reach `href`;
+ * anything else (`javascript:`, `data:`, `vbscript:`…) renders inert.
+ */
+const SAFE_LINK = /^(https?:|mailto:|#|\/|\.\.?\/)/i;
+function urlTransform(url: string): string {
+  return SAFE_LINK.test(url.trim()) ? url : '';
+}
+
 export const MessageText = memo(function MessageText({
   text,
   streaming,
@@ -142,7 +151,9 @@ export const MessageText = memo(function MessageText({
     <div>
       {visibleText.length > 0 && (
         <div className="prose prose-sm dark:prose-invert max-w-none">
-          <Streamdown components={streamdownComponents}>{visibleText}</Streamdown>
+          <Streamdown components={streamdownComponents} urlTransform={urlTransform}>
+            {visibleText}
+          </Streamdown>
         </div>
       )}
       {sessionId && tunnels.length > 0 && (

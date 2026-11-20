@@ -15,6 +15,24 @@ use super::error::TuiError;
 
 const ERR_TUI_EVENT_POLL: &str = include_str!("../texts/event_poll_failed.txt");
 
+/// A `config` topic push: the parts of the daemon's config response the
+/// TUI mirrors into `App::config`.
+#[derive(Debug)]
+pub struct PushedConfig {
+    /// The full config payload (`PUT /api/config` shape).
+    pub full: crate::daemon::types::UiFullConfig,
+    /// Preconfigured SSH targets.
+    pub ssh_servers: Vec<crate::config::SshServerConfig>,
+    /// Top-level iteration cap, same as `full.max_iterations`.
+    pub max_iterations: usize,
+    /// UI font family.
+    pub ui_font: String,
+    /// UI theme name.
+    pub ui_theme: String,
+    /// The effective timezone the daemon reports.
+    pub timezone: String,
+}
+
 /// Application events.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -66,6 +84,11 @@ pub enum AppEvent {
 
     /// Background config save completed.
     ConfigSaved(Result<(), TuiError>),
+    /// The daemon pushed a config change another client (the web UI or
+    /// another TUI) saved; the TUI applies it to its local snapshot.
+    ConfigPushed(Box<PushedConfig>),
+    /// The selection copy running on the clipboard worker finished.
+    ClipboardCopied(Result<(), TuiError>),
 
     /// An `/ssh add` probe finished; the error is the probe's message.
     SshProbed {
@@ -289,6 +312,8 @@ impl AppEvent {
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ProfileSessionsPushed(_) => "profile_sessions_pushed",
             Self::ConfigSaved(_) => "config_saved",
+            Self::ConfigPushed(_) => "config_pushed",
+            Self::ClipboardCopied(_) => "clipboard_copied",
             Self::SshProbed { .. } => "ssh_probed",
             Self::CloudConfigured(_) => "cloud_configured",
             Self::CloudCatalog(_) => "cloud_catalog",

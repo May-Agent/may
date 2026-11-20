@@ -114,9 +114,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ..column
     });
 
-    // Scan chat content for images and request fetches for any not yet cached
+    // Image fetches are scheduled on the event tick, not per frame — the
+    // keys come from this layout after `chat_layout.sync` below.
     let t = std::time::Instant::now();
-    app.scan_and_fetch_images();
     app.frame_stats.image_scan = t.elapsed();
 
     // Build queue message previews

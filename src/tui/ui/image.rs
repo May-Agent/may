@@ -442,9 +442,31 @@ pub fn pin_escape_cells(buf: &mut Buffer, area: Rect) {
 /// Fetch an image from a URL or path asynchronously.
 /// Returns the image bytes if successful and the data is a valid image format.
 pub async fn fetch_image(url: &str) -> Option<Vec<u8>> {
+    Box::pin(fetch_image_with_policy(
+        url,
+        &crate::network_policy::NetworkPolicyConfig::default(),
+    ))
+    .await
+}
+
+/// [`fetch_image`] under `policy`: a remote URL the policy does not allow,
+/// or one that resolves to a loopback/private address, is refused before
+/// any request goes out; the body is read with a hard size cap.
+pub async fn fetch_image_with_policy(
+    url: &str,
+    policy: &crate::network_policy::NetworkPolicyConfig,
+) -> Option<Vec<u8>> {
+    // The policy compiles once; `None` means unrestricted.
+    let compiled = match policy.compile() {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            tracing::debug!("Image fetch policy could not be compiled: {}", error);
+            return None;
+        }
+    };
     // HTTP(S) URL
     let bytes = if url.starts_with("http://") || url.starts_with("https://") {
-        match fetch_image_http(url).await {
+        match Box::pin(fetch_image_http(url, compiled.as_ref())).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::debug!("Failed to fetch image: {}", e);
@@ -452,12 +474,25 @@ pub async fn fetch_image(url: &str) -> Option<Vec<u8>> {
             }
         }
     } else {
-        // Try to load as local file
-        let path = url.strip_prefix("file://").unwrap_or(url);
-        match async_fs::read(path).await {
+        // Try to load as local file: `file://` URLs decode percent escapes
+        // (spaces, CJK) through `Url::to_file_path`; bare paths read as-is.
+        let path = if url.starts_with("file://") {
+            if let Some(path) = url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.to_file_path().ok())
+            {
+                path
+            } else {
+                tracing::debug!("Failed to decode file URL: {}", url);
+                return None;
+            }
+        } else {
+            std::path::PathBuf::from(url)
+        };
+        match async_fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::debug!("Failed to read image file: {}", e);
+                tracing::debug!("Failed to read image file {}: {}", path.display(), e);
                 return None;
             }
         }
@@ -532,11 +567,37 @@ fn is_valid_image_format(data: &[u8]) -> bool {
 }
 
 /// Fetch image bytes from HTTP URL using zenwave.
-async fn fetch_image_http(url: &str) -> Result<Vec<u8>, ImageFetchError> {
+async fn fetch_image_http(
+    url: &str,
+    policy: Option<&crate::network_policy::CompiledNetworkPolicy>,
+) -> Result<Vec<u8>, ImageFetchError> {
+    use futures_lite::AsyncReadExt;
     use zenwave::{Client, client, header};
 
+    // The body is read with a hard cap: a declared-but-unbounded body
+    // (chunked, no length) cannot exhaust the TUI's memory.
+    const MAX_BODY: usize = 64 * 1024 * 1024;
+
+    let parsed =
+        url::Url::parse(url).map_err(|error| ImageFetchError::Request(error.to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ImageFetchError::Request("image URL has no host".to_string()))?;
+    if host_is_private(host) {
+        return Err(ImageFetchError::Download(format!(
+            "refusing to fetch an image from a private address: {host}"
+        )));
+    }
+    if let Some(policy) = policy
+        && !policy.allows_domain(host)
+    {
+        return Err(ImageFetchError::Download(format!(
+            "network policy does not allow fetching images from {host}"
+        )));
+    }
+
     let mut backend = client();
-    let bytes = backend
+    let response = backend
         .get(url)
         .map_err(|error| ImageFetchError::Request(error.to_string()))?
         .header(
@@ -546,11 +607,76 @@ async fn fetch_image_http(url: &str) -> Result<Vec<u8>, ImageFetchError> {
         .map_err(|error| ImageFetchError::Request(error.to_string()))?
         .header(header::ACCEPT.as_str(), "image/*,*/*")
         .map_err(|error| ImageFetchError::Request(error.to_string()))?
-        .bytes()
         .await
         .map_err(|error| ImageFetchError::Download(error.to_string()))?;
 
-    Ok(bytes.to_vec())
+    let mut data = Vec::new();
+    let mut reader = response.into_body().into_reader();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| ImageFetchError::Download(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..read]);
+        if data.len() > MAX_BODY {
+            return Err(ImageFetchError::Download(format!(
+                "image exceeds {MAX_BODY} bytes"
+            )));
+        }
+    }
+    Ok(data)
+}
+
+/// Whether `host` is a loopback or private-use address a remote image URL
+/// must never reach (SSRF guard): localhost names, IPv4 loopback/private/
+/// link-local/shared-address blocks, IPv6 loopback/link-local/unique-local.
+fn host_is_private(host: &str) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let lower = host.to_ascii_lowercase();
+    if matches!(lower.as_str(), "localhost" | "localhost.") {
+        return true;
+    }
+    let Ok(ip) = lower.parse::<IpAddr>() else {
+        // A name like `foo.local` or `foo.internal` is a private name too.
+        return matches!(
+            lower.rsplit('.').next(),
+            Some("local" | "internal" | "localhost")
+        );
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0
+                // 100.64.0.0/10 — CGNAT shared address space.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+                // 169.254.0.0/16 — link-local (also caught above; kept for
+                // clarity), 192.168/10.0/172.16 via is_private.
+                || v4 == Ipv4Addr::new(169, 254, 169, 254)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local, fc00::/7 unique-local, ::ffff:v4
+                // mapped to a private v4.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || v6.to_ipv4_mapped().is_some_and(|v4: Ipv4Addr| {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                })
+                || v6 == Ipv6Addr::LOCALHOST
+        }
+    }
 }
 
 /// Render image placeholder when actual rendering is not possible.

@@ -123,6 +123,8 @@ export const ja: Messages = {
     send: '送信',
     stop: '停止',
     attach: 'ファイルを添付',
+    attachmentUploading: '添付ファイルをアップロード中…',
+    attachmentUploadFailed: '添付ファイルのアップロードに失敗しました: {error}',
     queued: 'キュー',
     queueHint: '現在のターン完了後に送信',
     immediateHint: '現在のターンを中断して送信',

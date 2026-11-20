@@ -21,7 +21,9 @@ impl App {
 
         // Check for @ file mention - find the last @ that starts a mention
         if let Some(at_byte_pos) = self.find_active_mention() {
-            let query = &self.input[at_byte_pos + 1..]; // +1 is safe since @ is ASCII
+            // The query is the mention text typed so far — up to the cursor,
+            // never past it, and always on the boundary both offsets share.
+            let query = &self.input[at_byte_pos + 1..self.cursor];
             if self.completion.mode == CompletionMode::File {
                 self.completion.update_query(query);
             } else {
@@ -44,12 +46,16 @@ impl App {
     }
 
     /// Byte offset of the active @ mention (one that's being typed).
+    ///
+    /// Only the text before the cursor counts: a mention continues while the
+    /// cursor sits inside it, whatever follows it is the input's own text.
+    /// `self.cursor` is always a grapheme boundary, so slicing at it is safe.
     fn find_active_mention(&self) -> Option<usize> {
         // Look for @ that's not followed by whitespace and is at cursor or before it
         let mut last_at = None;
         let mut prev_is_space = true;
 
-        for (i, c) in self.input.char_indices() {
+        for (i, c) in self.input[..self.cursor].char_indices() {
             if c == '@' {
                 // Check if this @ is the start of a mention (not in middle of word)
                 if prev_is_space {

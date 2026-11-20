@@ -55,6 +55,10 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState('');
   const [attachments, setAttachments] = useState<ApiAttachment[]>([]);
+  /** Attachment uploads in flight; sending waits for them. */
+  const [uploading, setUploading] = useState(0);
+  /** Last failed upload's reason, shown until the next attempt or send. */
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [deliveryMode, setDeliveryMode] = useState<'steer' | 'queue'>('steer');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -82,17 +86,28 @@ export function Composer({
   const send = useCallback(() => {
     const trimmed = value.trim();
     if (!trimmed && attachments.length === 0) return;
-    if (disabled) return;
+    // A send must not outrun an upload still in flight — its record would
+    // leave the composer before its attachment exists server-side.
+    if (disabled || uploading > 0) return;
     onSend(trimmed, attachments, deliveryMode);
     setValue('');
     setAttachments([]);
     setDeliveryMode('steer');
-  }, [value, attachments, deliveryMode, disabled, onSend]);
+    setUploadError(null);
+  }, [value, attachments, deliveryMode, disabled, uploading, onSend]);
 
   const addFiles = async (files: FileList | File[]) => {
     const list = Array.from(files);
-    const mapped = await Promise.all(list.map((file) => fileToAttachment(sessionId, file)));
-    setAttachments((prev) => [...prev, ...mapped]);
+    setUploading((count) => count + 1);
+    setUploadError(null);
+    try {
+      const mapped = await Promise.all(list.map((file) => fileToAttachment(sessionId, file)));
+      setAttachments((prev) => [...prev, ...mapped]);
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUploading((count) => count - 1);
+    }
   };
 
   const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -122,6 +137,13 @@ export function Composer({
       onDragOver={(e) => e.preventDefault()}
       onDrop={handleDrop}
     >
+      {(uploading > 0 || uploadError) && (
+        <div className="border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+          {uploadError
+            ? t('composer.attachmentUploadFailed', { error: uploadError })
+            : t('composer.attachmentUploading')}
+        </div>
+      )}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-1.5 border-b border-border px-3 py-2">
           {attachments.map((a) => (
