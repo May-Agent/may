@@ -235,7 +235,11 @@ impl Agent {
     /// Starts a job holding `bytes`, named `name` by the test.
     async fn job(&mut self, name: &'static str, bytes: u64) -> u32 {
         let (job, pid) = self.terminal.sleeping_job().await;
-        self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
+        self.footprints
+            .by_pid
+            .lock()
+            .unwrap()
+            .insert(host_pid(pid), bytes);
         self.jobs.push((name, job));
         pid
     }
@@ -334,6 +338,67 @@ impl Agent {
             .find(|(id, _)| *id == task_id)
             .is_some_and(|(_, rx)| rx.try_recv().is_ok())
     }
+}
+
+/// The host pid of the live process a host sandbox reports as `pid`. A
+/// Linux host sandbox runs its jobs in a nested pid namespace where the two
+/// ids differ, and `/proc/*/status` maps them through `NSpid`; elsewhere
+/// they are the same pid.
+#[cfg(target_os = "linux")]
+fn host_pid(pid: u32) -> u32 {
+    /// Whether the process `/proc/<pid>` belongs to this test binary's own
+    /// sandbox: its sandbox runner is a direct child of this process, so a
+    /// job's parent chain reaches it. Another test's sandbox can hold a job
+    /// with the same inner pid, so the `NSpid` match alone is not enough.
+    fn owned_by_this_process(mut pid: u32) -> bool {
+        for _ in 0..16 {
+            if pid == std::process::id() {
+                return true;
+            }
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+                return false;
+            };
+            let Some(ppid) = status.lines().find_map(|line| {
+                line.strip_prefix("PPid:")
+                    .and_then(|field| field.trim().parse::<u32>().ok())
+            }) else {
+                return false;
+            };
+            if ppid <= 1 {
+                return false;
+            }
+            pid = ppid;
+        }
+        false
+    }
+
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let Some(nspid) = status.lines().find_map(|line| line.strip_prefix("NSpid:")) else {
+            continue;
+        };
+        let innermost = nspid
+            .split_whitespace()
+            .next_back()
+            .and_then(|field| field.parse::<u32>().ok());
+        if innermost != Some(pid) {
+            continue;
+        }
+        let Ok(host) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if owned_by_this_process(host) {
+            return host;
+        }
+    }
+    pid
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn host_pid(pid: u32) -> u32 {
+    pid
 }
 
 struct Clock {
