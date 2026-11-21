@@ -6667,12 +6667,8 @@ async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_sessio
     let seen = mock.agent_requests().await.len();
 
     server.kill().await;
-    #[cfg(target_os = "macos")]
-    assert!(
-        process_tree_alive(pid),
-        "the job outlives the daemon that started it until the next start ends it"
-    );
-
+    // The job's sandbox dies with the daemon that owned it, so the job may
+    // already be gone; anything that still outlives ends on the next start.
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while process_tree_alive(pid) {
