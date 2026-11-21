@@ -27,10 +27,7 @@ use acpsub::{
     AgentProcess, Executor, PermissionHandler, PermissionRequest, ProcessControl,
     SpawnSpec as AcpSpawn, TerminalProcess,
 };
-use aither_acp::{
-    Open, PermissionOutcome,
-    domain::{CancelledOutcome, PermissionOption, PermissionOptionKind, SelectedOutcome},
-};
+use aither_acp::{PermissionOption, PermissionOptionKind, RequestPermissionOutcome};
 use aither_sandbox::{
     Backend, ChildExit, CommandFifo, Grants, JobBroker, SandboxMode, SandboxedChild, SpawnGrant,
     SpawnSpec, TreeLifetime,
@@ -563,11 +560,11 @@ impl ApprovalPermissions {
 }
 
 impl PermissionHandler for ApprovalPermissions {
-    async fn decide(&self, request: PermissionRequest) -> PermissionOutcome {
+    async fn decide(&self, request: PermissionRequest) -> RequestPermissionOutcome {
         let approved = match &self.sandbox.approver {
             Some(approver) => {
                 let script = PermissionText {
-                    title: &request.params.title,
+                    title: &request.params.tool_call.title,
                     cwd: &request.cwd,
                 }
                 .render()
@@ -594,7 +591,7 @@ impl PermissionHandler for ApprovalPermissions {
 /// The option answering one request: the user approved or refused this one
 /// call, so a "once" option wins over an "always" one wherever the agent
 /// lists it, and "always" is taken only when "once" is not offered.
-fn choose(options: &[PermissionOption], approved: bool) -> PermissionOutcome {
+fn choose(options: &[PermissionOption], approved: bool) -> RequestPermissionOutcome {
     let preference = if approved {
         [
             PermissionOptionKind::AllowOnce,
@@ -608,20 +605,12 @@ fn choose(options: &[PermissionOption], approved: bool) -> PermissionOutcome {
     };
     preference
         .iter()
-        .find_map(|kind| {
-            options
-                .iter()
-                .find(|option| option.kind == Open::Known(*kind))
+        .find_map(|kind| options.iter().find(|option| option.kind == *kind))
+        .map_or(RequestPermissionOutcome::Cancelled, |option| {
+            RequestPermissionOutcome::Selected {
+                option_id: option.option_id.clone(),
+            }
         })
-        .map_or_else(
-            || PermissionOutcome::Cancelled(CancelledOutcome { meta: None }),
-            |option| {
-                PermissionOutcome::Selected(SelectedOutcome {
-                    option_id: option.option_id.clone(),
-                    meta: None,
-                })
-            },
-        )
 }
 
 /// The sandbox of a session rooted in `root` that reads the fixtures, writes
@@ -647,8 +636,6 @@ pub(crate) async fn test_sandbox(root: &Path) -> aither_sandbox::Sandbox {
 
 #[cfg(test)]
 mod tests {
-    use aither_acp::domain::PermissionOptionId;
-
     use super::*;
 
     fn fake_agent_spec(cwd: &Path) -> AcpSpawn {
@@ -835,18 +822,17 @@ mod tests {
 
     fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption {
-            option_id: PermissionOptionId::from(id),
+            option_id: id.to_string(),
             name: id.to_string(),
-            kind: Open::Known(kind),
+            kind,
             meta: None,
-            extra: std::collections::BTreeMap::new(),
         }
     }
 
-    fn selected(outcome: &PermissionOutcome) -> Option<&str> {
+    fn selected(outcome: &RequestPermissionOutcome) -> Option<&str> {
         match outcome {
-            PermissionOutcome::Selected(selected) => Some(selected.option_id.as_str()),
-            _ => None,
+            RequestPermissionOutcome::Selected { option_id } => Some(option_id),
+            RequestPermissionOutcome::Cancelled => None,
         }
     }
 
