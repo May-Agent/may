@@ -4,6 +4,13 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The terminal E2E tests race their daemon on the shared macOS runner: a
+# request or stream deadline can expire on pure schedule pressure, so a test
+# gets two retries before it counts as failed.
+[[profile.default.overrides]]
+filter = "binary(terminal_first_e2e)"
+retries = 2
+
 # Native Apple Vision / GPU OCR tests serialize so they do not contend on
 # Neural Engine / Metal initialization under parallel nextest workers.
 [test-groups.vision-ocr]
