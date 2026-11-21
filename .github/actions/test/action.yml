@@ -50,13 +50,22 @@ runs:
           echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "${GITHUB_ENV}"
         fi
     # ld64.lld is to Apple's linker what mold is to GNU ld; a brewed
-    # `ld64.lld` on PATH is what clang's -fuse-ld=lld resolves.
+    # `ld64.lld` on PATH is what clang's -fuse-ld=lld resolves. Apple's
+    # linker adds the Swift runtime's library path itself — dependencies
+    # carry Swift objects — so lld gets the two `runtimeLibraryPaths`
+    # `swiftc -print-target-info` reports, as -L for resolution and -rpath
+    # for the tests' own runs.
     - name: Link test binaries with lld
       if: runner.os == 'macOS'
       shell: bash
       run: |
         brew install lld
-        echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "${GITHUB_ENV}"
+        toolchain="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx"
+        flags="-C link-arg=-fuse-ld=lld"
+        for lib in "${toolchain}" /usr/lib/swift; do
+          flags="${flags} -C link-arg=-L${lib} -C link-arg=-Wl,-rpath,${lib}"
+        done
+        echo "RUSTFLAGS=${flags}" >> "${GITHUB_ENV}"
     - uses: dtolnay/rust-toolchain@stable
     # Only main saves; a PR or merge-group cache lives in a scope nothing else
     # restores, and its size evicts main's under the cache limit. Keyed by the
