@@ -108,6 +108,7 @@ impl SearchBackend for RepoSearch {
 /// session's clone of it.
 #[derive(Debug, Clone)]
 pub struct CodeSearchTool<B = RepoSearch> {
+    name: &'static str,
     backend: B,
     cwd: PathBuf,
     db: Option<ChatDb>,
@@ -132,6 +133,7 @@ impl<B: SearchBackend> CodeSearchTool<B> {
         workspace: WorkspaceConfig,
     ) -> Self {
         Self {
+            name: "search",
             backend,
             cwd,
             db,
@@ -139,6 +141,15 @@ impl<B: SearchBackend> CodeSearchTool<B> {
             checkouts: None,
             workspace,
         }
+    }
+
+    /// The command name this tool answers under: `search` normally, `rag`
+    /// when the experimental hashline mode gives `search` to the hashline
+    /// search binary.
+    #[must_use]
+    pub const fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     /// Use `checkouts` to search a GitHub repo's daemon default-branch checkout
@@ -269,7 +280,7 @@ fn request_for(args: &CodeSearchArgs, worktree: PathBuf) -> Request {
 
 impl<B: SearchBackend> Tool for CodeSearchTool<B> {
     fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("search")
+        Cow::Borrowed(self.name)
     }
 
     type Arguments = CodeSearchArgs;

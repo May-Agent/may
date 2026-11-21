@@ -1379,6 +1379,7 @@ impl TaskRuntime {
                         crate::tools::ToolEnvironments::prepare_host(
                             &self.tool_distribution,
                             &tools_dir,
+                            config.experimental.hashline,
                         )
                         .await
                     }
@@ -1388,6 +1389,7 @@ impl TaskRuntime {
                             id,
                             &self.tool_distribution,
                             &tools_dir,
+                            config.experimental.hashline,
                         )
                         .await
                     }

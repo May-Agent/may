@@ -264,6 +264,8 @@ pub struct MayAgentConfig {
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     /// Execution environment (local heel sandbox or container).
     pub environment: AgentEnvironment,
+    /// `[experimental] hashline`: `search`/`edit` on PATH, no `apply_patch`.
+    pub hashline: bool,
     /// Optional profile persona overlay injected into the agent context.
     pub profile_persona: Option<String>,
     /// Optional profile memories (preference + recency) injected as read-only context.
@@ -543,7 +545,12 @@ async fn session_tools(
         Acquired::Prepare(lease) => {
             let tools = match &config.environment {
                 AgentEnvironment::Local => {
-                    ToolEnvironments::prepare_host(&config.tool_distribution, &tools_dir).await
+                    ToolEnvironments::prepare_host(
+                        &config.tool_distribution,
+                        &tools_dir,
+                        config.hashline,
+                    )
+                    .await
                 }
                 AgentEnvironment::Container {
                     container_id,
@@ -555,6 +562,7 @@ async fn session_tools(
                         container_id,
                         &config.tool_distribution,
                         &tools_dir,
+                        config.hashline,
                     )
                     .await
                 }
@@ -836,7 +844,7 @@ impl MayAgent {
             aither_models::lookup(config.model_id.as_str()),
             config.ssh_servers.clone(),
         );
-        let terminal = build_terminal(&config.environment);
+        let terminal = build_terminal(&config.environment, config.hashline);
         let permissions_block = build_permissions(
             &config.environment,
             config.secrets.names(),
@@ -863,7 +871,10 @@ impl MayAgent {
             .with_instruction(tag::IDENTITY, build_identity())
             .with_instruction(tag::ENVIRONMENT, environment_block)
             .with_instruction(tag::TERMINAL, terminal)
-            .with_instruction(tag::PREPARED_TOOLS, build_prepared_tools(&catalog)?)
+            .with_instruction(
+                tag::PREPARED_TOOLS,
+                build_prepared_tools(&catalog, config.hashline)?,
+            )
             .with_instruction(tag::PERMISSIONS, permissions_block)
             .with_instruction(tag::HARNESS, harness)
             .with_instruction(tag::EVIDENCE, evidence)
@@ -1180,7 +1191,10 @@ impl MayAgent {
         )
         .await?;
         runtime_system_context = runtime_system_context
-            .with_instruction(tag::EFFICIENCY, build_efficiency(&command_descriptions))
+            .with_instruction(
+                tag::EFFICIENCY,
+                build_efficiency(&command_descriptions, config.hashline),
+            )
             .with_instruction(tag::CAPABILITIES, capabilities)
             .with_instruction(
                 tag::COMMANDS,
@@ -1642,6 +1656,7 @@ impl MayAgent {
             live_config,
             agent_messaging,
             environment,
+            hashline: may_config.experimental.hashline,
             profile_persona,
             profile_memories,
             memory_off,

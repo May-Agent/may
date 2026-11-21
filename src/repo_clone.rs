@@ -1519,7 +1519,7 @@ pub(crate) mod test_sandbox {
             let cache = crate::tools::test_tool_cache();
             std::fs::create_dir_all(&cache).unwrap();
             std::fs::create_dir_all(session_root).unwrap();
-            let tools = crate::tools::ToolEnvironments::prepare_host(&distribution, &cache)
+            let tools = crate::tools::ToolEnvironments::prepare_host(&distribution, &cache, false)
                 .await
                 .expect("the baseline tools prepare");
             let audit = tempfile::tempdir().expect("an audit directory");

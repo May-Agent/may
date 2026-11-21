@@ -2,7 +2,16 @@
 These commands are already on PATH in the initialized execution environment:
 {% for tool in tools %}- {{ tool.listed_name() }}
 {% endfor %}
-{% if self.has("ast-grep") %}Prefer `ast-grep` patterns over text search for code constructs (`ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`).
+{% if hashline %}Search for lines with `search rg` (`search rg 'pattern' src`, `search rg -F`, `-i`, `-C N`, `-g 'glob'`, `-l`), for code structure with `search sg` (`search sg 'fn $NAME($$$ARGS) { $$$ }' --lang rust src`); both print `[path#TAG]` sections of numbered lines.
+Every change to an existing file goes through `edit`, which reads a hashline patch on stdin and verifies the `[path#TAG]` it names before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command; `edit --help` gives the patch language:
+```sh
+edit <<'PATCH'
+[src/main.rs#1A2B]
+PUT 3.=5:
++    new_call();
+PATCH
+```
+{% elif self.has("ast-grep") %}Prefer `ast-grep` patterns over text search for code constructs (`ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`).
 {% endif %}{% if self.has("apply_patch") %}Every change to an existing file goes through `apply_patch`; it validates a contextual patch before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command:
 ```sh
 apply_patch <<'PATCH'

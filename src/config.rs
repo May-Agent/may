@@ -1415,6 +1415,18 @@ pub struct MayConfig {
     /// — no CLI, keychain or environment is probed for it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub forge: BTreeMap<String, crate::forge::ForgeHostConfig>,
+    /// Experimental, opt-in behavior switches.
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
+}
+
+/// `[experimental]` section: features that are opt-in and may change shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    /// Hashline search and editing: `search`/`edit` binaries on PATH,
+    /// `apply_patch` absent, and semantic search answered by `rag`.
+    pub hashline: bool,
 }
 
 /// What publishing one kind of text asks of the user.
@@ -2116,6 +2128,7 @@ impl Default for MayConfig {
             acp_agents: BTreeMap::new(),
             issue_approval: IssueApprovalConfig::default(),
             forge: BTreeMap::new(),
+            experimental: ExperimentalConfig::default(),
         }
     }
 }

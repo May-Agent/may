@@ -1,0 +1,38 @@
+search — line and structural search with hashline anchors
+
+USAGE:
+    search rg [options] <pattern> [path…]        line search (ripgrep engine)
+    search sg <pattern> --lang <lang> [options] [path…]
+                                               structural search (ast-grep)
+
+Every matching file prints as a `[path#TAG]` section of `N:content` lines:
+the tag validates a later `edit` patch that anchors the numbered lines.
+
+RG OPTIONS:
+    -F, --literal            match the pattern literally
+    -i, --ignore-case        case-insensitive search
+    -S, --smart-case         insensitive unless the pattern has uppercase
+    -C, --context <n>        lines of context around each match
+    -g, --glob <glob>        filter searched paths by glob (repeatable, ! negates)
+    -m, --limit <n>          stop after <n> result lines total (default 200)
+    -l, --files-with-matches print only the [path#TAG] headers
+        --hidden             include hidden files
+        --                   end of options
+
+SG OPTIONS:
+    -l, --lang <lang>        language of pattern and files (required)
+    -C, --context <n>        lines of context around each matched node
+    -g, --glob <glob>        filter searched paths by glob (repeatable)
+    -m, --limit <n>          stop after <n> matched nodes (default 200)
+        --hidden             include hidden files
+        --                   end of options
+
+A `-` pattern reads the pattern from stdin (`search sg` only).
+
+EXAMPLES:
+    search rg 'fn parse' src
+    search rg -F 'a.b' -C 2 .
+    search sg 'fn $NAME($$$ARGS) { $$$ }' --lang rust src
+
+SEE ALSO:
+    edit --help   the hashline patch language these anchors feed

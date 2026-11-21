@@ -441,7 +441,7 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         environment.contains(&format!("the user's home is {}", home.display())),
         "{environment}"
     );
-    let terminal = super::build_terminal(&AgentEnvironment::Local);
+    let terminal = super::build_terminal(&AgentEnvironment::Local, false);
     assert!(
         terminal.contains("means `outputs/…` in the session directory given in `<session>`"),
         "{terminal}"
@@ -556,7 +556,7 @@ fn container_clone_outside_the_session_directory_panics() {
 
 #[test]
 fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
-    let prompt = build_efficiency(&[]);
+    let prompt = build_efficiency(&[], false);
     assert!(
         prompt.contains("Fix with automated tools before hand edits"),
         "{prompt}"
@@ -570,7 +570,7 @@ fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
 
 #[test]
 fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
-    let prompt = build_efficiency(&[]);
+    let prompt = build_efficiency(&[], false);
     assert!(
         prompt.contains(
             "When answering means reading across many files and only the conclusion matters"
@@ -666,9 +666,9 @@ fn rendered_instructions(
         )
         .with_instruction(
             tag::TERMINAL,
-            super::build_terminal(&AgentEnvironment::Local),
+            super::build_terminal(&AgentEnvironment::Local, false),
         )
-        .with_instruction(tag::EFFICIENCY, build_efficiency(&[]))
+        .with_instruction(tag::EFFICIENCY, build_efficiency(&[], false))
         .with_instruction(tag::WORK, build_work(&issues, true))
         .with_instruction(
             tag::SESSION,

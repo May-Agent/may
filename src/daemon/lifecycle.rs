@@ -136,6 +136,55 @@ pub fn ensure_tasks_link(paths: &DaemonPaths) -> std::io::Result<()> {
     std::os::unix::fs::symlink(&target, &link)
 }
 
+/// The binaries the `[experimental] hashline` switch serves on `PATH`.
+const HASHLINE_COMMANDS: [&str; 2] = ["search", "edit"];
+
+/// Keeps `~/.may/bin/{search,edit}` symlinks to the hashline binaries built
+/// next to this executable while `enabled` holds, and takes the links away
+/// when it does not.
+///
+/// # Errors
+/// Fails when the directory or a link cannot be written or removed.
+pub fn ensure_hashline_links(paths: &DaemonPaths, enabled: bool) -> std::io::Result<()> {
+    let directory = bin_dir(paths);
+    if enabled {
+        std::fs::create_dir_all(&directory)?;
+    }
+    let exe_dir = current_exe()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| std::io::Error::other("this executable has no directory"))?;
+    for command in HASHLINE_COMMANDS {
+        let link = directory.join(command);
+        let target = exe_dir.join(command);
+        match std::fs::read_link(&link) {
+            Ok(current) if enabled && current == target => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !enabled {
+                    continue;
+                }
+                // Enabled and absent: falls through to the link creation.
+            }
+            // Pointing elsewhere or not a symlink.
+            Ok(_) | Err(_) => {
+                std::fs::remove_file(&link)?;
+                if !enabled {
+                    continue;
+                }
+            }
+        }
+        if target.is_file() {
+            std::os::unix::fs::symlink(&target, &link)?;
+        } else {
+            tracing::warn!(
+                "experimental.hashline is on but {command} was not built next to {}",
+                exe_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The calling process's environment as text. A launchd job starts with
 /// launchd's default environment, so the daemon is given the client's.
 ///
@@ -898,6 +947,32 @@ mod launchd_job_tests {
                 .count(),
             1
         );
+    }
+
+    /// Disabled hashline mode removes stale links and tolerates absent ones;
+    /// the switch leaves a missing link a no-op, never an error.
+    #[test]
+    fn disabled_hashline_links_are_removed_when_present() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths::new(home.path().to_path_buf());
+        // Absent links are a no-op when disabled.
+        super::ensure_hashline_links(&paths, false).expect("absent links are a no-op");
+        // Stale links are removed when disabled.
+        std::fs::create_dir_all(home.path().join("bin")).unwrap();
+        for command in super::HASHLINE_COMMANDS {
+            let link = home.path().join("bin").join(command);
+            std::os::unix::fs::symlink("/nonexistent", &link).unwrap();
+        }
+        super::ensure_hashline_links(&paths, false).expect("stale links are removed");
+        for command in super::HASHLINE_COMMANDS {
+            assert!(
+                home.path()
+                    .join("bin")
+                    .join(command)
+                    .symlink_metadata()
+                    .is_err()
+            );
+        }
     }
 
     #[test]

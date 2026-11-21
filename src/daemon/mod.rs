@@ -586,6 +586,11 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let _instance = acquire_single_instance(&paths)?;
     lifecycle::ensure_tasks_link(&paths)
         .context("failed to link `tasks` to the daemon's executable")?;
+    let hashline = crate::config::MayConfig::load()
+        .await
+        .is_ok_and(|config| config.experimental.hashline);
+    lifecycle::ensure_hashline_links(&paths, hashline)
+        .context("failed to link the hashline `search`/`edit` binaries")?;
 
     // Agents of relocated homes whose runs were killed before they could
     // retire them, swept before the daemon answers so a client never sees

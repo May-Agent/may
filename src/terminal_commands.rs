@@ -339,6 +339,11 @@ where
             ),
             config.workspace_config.clone(),
         )
+        .named(if may_config.experimental.hashline {
+            "rag"
+        } else {
+            "search"
+        })
         .with_checkouts(config.services.checkouts.clone()),
     );
     let issue_search = IssueSearch::new(
