@@ -30,6 +30,10 @@ runs:
           echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
           exit 1
         fi
+    - name: Enable unprivileged user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
     # mv returns at once and the delete runs in the background while the
     # toolchain installs; rm -rf used to block checkout for up to two minutes.
     - name: Free runner disk

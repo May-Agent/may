@@ -23,7 +23,6 @@ function job(pid: number, state: BackgroundJob['status']['state'], elapsedMs = 1
         : { state };
   return {
     pid,
-    taskId: `task-${pid}`,
     script: `sleep ${pid}`,
     interpreter: 'shell',
     mode: 'sandboxed',

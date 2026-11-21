@@ -206,12 +206,12 @@ pub enum JobEnd {
     },
 }
 
-/// The message that wakes a subagent for a finished background task.
+/// The message that wakes a subagent for a finished background job.
 #[derive(Template)]
 #[template(path = "subagent/job_ended.txt", escape = "none")]
 pub struct JobEnded<'a> {
-    /// The task.
-    pub task_id: &'a str,
+    /// Process ID of the job.
+    pub pid: u32,
     /// How it ended.
     pub end: JobEnd,
     /// The tool that reads its output.
@@ -282,12 +282,12 @@ mod tests {
     #[test]
     fn a_background_task_end_names_how_to_read_it() {
         let text = render(&JobEnded {
-            task_id: "ember",
+            pid: 4242,
             end: JobEnd::Exited { code: 2 },
             read_tool: "terminal_read",
         });
         assert!(
-            text.contains("ember") && text.contains("code 2") && text.contains("terminal_read"),
+            text.contains("4242") && text.contains("code 2") && text.contains("terminal_read"),
             "{text}"
         );
     }

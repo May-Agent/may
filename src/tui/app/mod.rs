@@ -462,8 +462,8 @@ pub enum PendingPaste {
 /// job-registry task.
 #[derive(Debug)]
 pub struct LiveRead {
-    /// Registry task the call was bound to.
-    pub task_id: String,
+    /// Registry job PID the call was bound to.
+    pub pid: u32,
     /// Byte cursor into the task's output buffer.
     pub cursor: usize,
     /// Trailing bytes of an incomplete multi-byte UTF-8 sequence, held for
@@ -1619,11 +1619,8 @@ impl App {
             // Bind each unbound running call to the newest unbound running
             // job executing the same script. Two concurrent calls with an
             // identical script bind in order of `started_at`.
-            let mut bound: std::collections::HashSet<String> = self
-                .live_reads
-                .values()
-                .map(|read| read.task_id.clone())
-                .collect();
+            let mut bound: std::collections::HashSet<u32> =
+                self.live_reads.values().map(|read| read.pid).collect();
             for (call_id, command) in self.chat.running_terminal_calls() {
                 if self.live_reads.contains_key(&call_id) {
                     continue;
@@ -1634,15 +1631,15 @@ impl App {
                     .filter(|job| {
                         matches!(job.status, aither_sandbox::JobStatus::Running)
                             && job.script.trim() == command.trim()
-                            && !bound.contains(&job.task_id)
+                            && !bound.contains(&job.pid)
                     })
                     .max_by_key(|job| job.started_at);
                 if let Some(job) = job {
-                    bound.insert(job.task_id.clone());
+                    bound.insert(job.pid);
                     self.live_reads.insert(
                         call_id,
                         LiveRead {
-                            task_id: job.task_id.clone(),
+                            pid: job.pid,
                             cursor: 0,
                             pending: Vec::new(),
                         },
@@ -1658,15 +1655,15 @@ impl App {
             if !self.live_reads.is_empty() && read_due {
                 self.live_output_read_at = Some(std::time::Instant::now());
                 let tx = self.event_tx.clone();
-                let reads: Vec<(String, String, usize)> = self
+                let reads: Vec<(String, u32, usize)> = self
                     .live_reads
                     .iter()
-                    .map(|(call_id, read)| (call_id.clone(), read.task_id.clone(), read.cursor))
+                    .map(|(call_id, read)| (call_id.clone(), read.pid, read.cursor))
                     .collect();
                 spawn(async move {
                     let mut deltas = Vec::with_capacity(reads.len());
-                    for (call_id, task_id, cursor) in reads {
-                        if let Ok(delta) = background.read(&task_id, cursor).await {
+                    for (call_id, pid, cursor) in reads {
+                        if let Ok(delta) = background.read(pid, cursor).await {
                             deltas.push(super::event::TerminalOutputDelta {
                                 call_id,
                                 cursor: delta.cursor,
@@ -1929,18 +1926,16 @@ impl App {
         }
     }
 
-    /// Resolve a background task id into a user-facing label: the job's
+    /// Resolve a background job PID into a user-facing label: the job's
     /// script when the registry knows it, else the description (or command)
-    /// of the call whose output introduced the id — the `terminal` result
-    /// that named it. The id itself is never surfaced.
-    fn resolve_task_label(&self, task_id: &str) -> Option<String> {
+    /// of the call whose output introduced the PID.
+    fn resolve_job_label(&self, pid: Option<u32>) -> Option<String> {
         use super::ui::chat::ChatElement;
-        if task_id.is_empty() {
-            return None;
-        }
-        if let Some(job) = self.jobs.iter().find(|job| job.task_id == task_id) {
+        let pid = pid?;
+        if let Some(job) = self.jobs.iter().find(|job| job.pid == pid) {
             return job.script.lines().next().map(str::to_string);
         }
+        let needle = format!("PID {pid}");
         self.chat.elements().iter().find_map(|element| {
             let ChatElement::ToolCall {
                 display:
@@ -1956,7 +1951,7 @@ impl App {
                 return None;
             };
             let info = output.as_ref()?;
-            info.output.contains(task_id).then(|| {
+            info.output.contains(&needle).then(|| {
                 if description.is_empty() {
                     command.lines().next().unwrap_or_default().to_string()
                 } else {
@@ -4773,9 +4768,9 @@ impl App {
                 diffs: Vec::new(),
                 pinned: None,
             },
-            ToolStartKind::Stdin { task_id, input } => {
+            ToolStartKind::Stdin { pid, input } => {
                 let mut detail: Vec<String> = Vec::new();
-                if let Some(target) = self.resolve_task_label(&task_id) {
+                if let Some(target) = self.resolve_job_label(pid) {
                     detail.push(format!("→ {target}"));
                 }
                 if input.lines().count() > 1 {
@@ -4783,7 +4778,6 @@ impl App {
                 }
                 ToolDisplay::Action {
                     chip: "stdin".to_string(),
-                    task_id: Some(task_id),
                     summary: input.lines().next().unwrap_or_default().to_string(),
                     detail,
                     status: super::ui::chat::ToolStatus::Running,
@@ -4791,12 +4785,12 @@ impl App {
                     pinned: None,
                 }
             }
-            ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
+            ToolStartKind::JobControl { action, pid } => ToolDisplay::Action {
                 chip: action.chip().to_string(),
-                task_id: Some(task_id.clone()),
                 summary: self
-                    .resolve_task_label(&task_id)
-                    .unwrap_or_else(|| "background task".to_string()),
+                    .resolve_job_label(pid)
+                    .or_else(|| pid.map(|id| format!("PID {id}")))
+                    .unwrap_or_else(|| "background job".to_string()),
                 detail: Vec::new(),
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
@@ -4811,7 +4805,6 @@ impl App {
                 detail.extend(pretty_arguments(&arguments));
                 ToolDisplay::Action {
                     chip: name,
-                    task_id: None,
                     summary: "invalid arguments".to_string(),
                     detail,
                     status: super::ui::chat::ToolStatus::Failed(format!(
@@ -4833,7 +4826,6 @@ impl App {
                     pretty_arguments(&arguments)
                 },
                 chip: name,
-                task_id: None,
                 summary,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
@@ -5585,7 +5577,7 @@ mod tests {
     async fn a_terminal_call_with_malformed_arguments_renders_with_its_error() {
         let dir = tempfile::tempdir().expect("dir");
         let (mut app, _id) = app_with_session(dir.path()).await;
-        for tool in ["terminal", "terminal_kill"] {
+        for tool in ["terminal", "terminal_input", "terminal_read"] {
             let kind =
                 crate::tui::agent_event_adapter::parse_tool_start(tool, r#"{"command":"ls"}"#);
             app.show_tool_start(format!("call-{tool}"), kind);
@@ -7149,7 +7141,6 @@ mod tests {
     fn background_job(status: aither_sandbox::JobStatus) -> aither_sandbox::JobInfo {
         aither_sandbox::JobInfo {
             pid: 4242,
-            task_id: "brisk-otter".to_string(),
             execution_key: "key".to_string(),
             script: "sleep 300".to_string(),
             interpreter: aither_sandbox::Interpreter::Shell,

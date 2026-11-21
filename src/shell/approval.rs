@@ -84,7 +84,7 @@ mod tests {
             let remote = policy
                 .check(
                     &ScriptCheck {
-                        task_id: "task-1",
+                        launch: aither_sandbox::LaunchLease::fresh().id(),
                         script: "uname -a",
                         interpreter: Interpreter::Shell,
                         shell: None,
@@ -107,7 +107,7 @@ mod tests {
             let local = policy
                 .check(
                     &ScriptCheck {
-                        task_id: "task-2",
+                        launch: aither_sandbox::LaunchLease::fresh().id(),
                         script: "echo ok",
                         interpreter: Interpreter::Shell,
                         shell: None,

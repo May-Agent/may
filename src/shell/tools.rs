@@ -1,5 +1,6 @@
-//! The native tools of an agent on a shell: `terminal`, `monitor`, the three
-//! job controls and, when the agent carries one, `compact`.
+//! The native tools of an agent on a shell: `terminal`, `monitor`, the two
+//! job controls (`terminal_read`, `terminal_input`) and, when the agent carries
+//! one, `compact`.
 //!
 //! Every agent registers them through [`ShellToolkit::register`], so a fork
 //! presents the tool definitions of the request it starts from.
@@ -7,8 +8,8 @@
 use aither_agent::{AgentBuilder, Hooks, context::HandoffSchema};
 use aither_core::LanguageModel;
 use aither_sandbox::{
-    AnyShellWording, JobInputTool, JobKillTool, JobReadTool, MonitorSettings, MonitorTool,
-    OutputPolicy, ShellToolSettings,
+    AnyShellWording, JobInputTool, JobReadTool, MonitorSettings, MonitorTool, OutputPolicy,
+    ShellToolSettings,
 };
 use std::sync::Arc;
 
@@ -60,12 +61,7 @@ impl ShellToolkit {
                 wording.clone(),
                 self.output.clone(),
             ))
-            .tool(JobInputTool::new(
-                self.tools.input.clone(),
-                jobs.clone(),
-                wording.clone(),
-            ))
-            .tool(JobKillTool::new(self.tools.kill.clone(), jobs, wording));
+            .tool(JobInputTool::new(self.tools.input.clone(), jobs, wording));
         match compact {
             Some(signal) => builder.tool(CompactTool::new(signal)),
             None => builder,

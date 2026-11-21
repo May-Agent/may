@@ -196,7 +196,7 @@ impl ChatDb {
         }
         query!(
             tx,
-            "UPDATE session_runtimes SET state = 'idle', run_id = NULL, terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE session_id = ?",
+            "UPDATE session_runtimes SET state = 'idle', run_id = NULL, terminal_pid = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE session_id = ?",
             jiff::Timestamp::now().to_string(),
             session_id
         )

@@ -26,7 +26,7 @@ function inferVariant(name?: string): string {
   switch (name) {
     case 'websearch': return 'web_search';
     case 'webfetch': return 'web_fetch';
-    case 'terminal': case 'terminal_input': case 'terminal_kill':
+    case 'terminal': case 'terminal_input':
     case 'terminal_read': case 'browser': case 'web_search':
     case 'web_fetch': case 'ask': case 'session': case 'task':
       return name!;

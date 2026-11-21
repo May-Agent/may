@@ -14,8 +14,6 @@ pub const SHELL_TOOL: &str = "terminal";
 pub const READ_TOOL: &str = "terminal_read";
 /// Name of the tool that writes to a job's stdin.
 pub const INPUT_TOOL: &str = "terminal_input";
-/// Name of the tool that kills a job.
-pub const KILL_TOOL: &str = "terminal_kill";
 /// Name of the tool that watches a source.
 pub const MONITOR_TOOL: &str = "monitor";
 
@@ -24,7 +22,6 @@ pub const MONITOR_TOOL: &str = "monitor";
 struct ShellDescription {
     read: &'static str,
     input: &'static str,
-    kill: &'static str,
     timeout_cap_minutes: u64,
     foreground_secs: u64,
 }
@@ -42,10 +39,6 @@ struct ReadDescription;
 #[derive(Template)]
 #[template(path = "shell/tool_input.txt", escape = "none")]
 struct InputDescription;
-
-#[derive(Template)]
-#[template(path = "shell/tool_kill.txt", escape = "none")]
-struct KillDescription;
 
 fn rendered(template: &impl Template) -> Cow<'static, str> {
     template
@@ -92,11 +85,11 @@ fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
         ),
         (
             "background",
-            "Start the command detached and return at once with its task id instead of waiting in the foreground. Default false: the call waits up to the foreground window and promotes a still-running command to a background task.",
+            "Start the command detached and return at once with its PID instead of waiting in the foreground. Default false: the call waits up to the foreground window and promotes a still-running command to a background job.",
         ),
         (
-            "task_id",
-            "The task identifier returned when the command was backgrounded.",
+            "pid",
+            "The process ID returned when the command was backgrounded.",
         ),
         (
             "cursor",
@@ -152,7 +145,7 @@ fn identity(name: &'static str, description: Cow<'static, str>) -> ToolIdentity 
     }
 }
 
-/// The identities of the shell tool and its three job tools, describing the
+/// The identities of the shell tool and its two job tools, describing the
 /// bounds `budgets` holds now.
 #[must_use]
 pub fn shell_tool_settings(budgets: &ShellBudgets) -> ShellToolSettings {
@@ -163,14 +156,12 @@ pub fn shell_tool_settings(budgets: &ShellBudgets) -> ShellToolSettings {
             rendered(&ShellDescription {
                 read: READ_TOOL,
                 input: INPUT_TOOL,
-                kill: KILL_TOOL,
                 timeout_cap_minutes: limits.timeout_cap.get().as_secs() / 60,
                 foreground_secs: limits.foreground_wait.get().as_secs(),
             }),
         ),
         read: identity(READ_TOOL, rendered(&ReadDescription)),
         input: identity(INPUT_TOOL, rendered(&InputDescription)),
-        kill: identity(KILL_TOOL, rendered(&KillDescription)),
     }
 }
 

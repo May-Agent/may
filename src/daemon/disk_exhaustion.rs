@@ -1090,7 +1090,7 @@ mod tests {
                     "/workspace",
                     kill_rx,
                     stdin_rx,
-                    ExecLifetime::Foreground,
+                    ExecLifetime::Foreground { pid: None },
                 )
                 .await
         };

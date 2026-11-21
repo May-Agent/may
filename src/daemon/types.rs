@@ -68,7 +68,6 @@ pub struct ApiErrorBody {
 pub enum ToolVariant {
     Terminal,
     TerminalInput,
-    TerminalKill,
     TerminalRead,
     Browser,
     WebSearch,
@@ -88,7 +87,6 @@ impl ToolVariant {
         match tool_name {
             "terminal" => Self::Terminal,
             "terminal_input" => Self::TerminalInput,
-            "terminal_kill" => Self::TerminalKill,
             "terminal_read" => Self::TerminalRead,
             "browser" => Self::Browser,
             "web_search" | "websearch" => Self::WebSearch,
@@ -1396,7 +1394,7 @@ pub struct BrowserInteractionResponse {
 #[derive(Debug, Clone, Default, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInteractionResponse {
-    pub(crate) task_id: Option<String>,
+    pub(crate) pid: Option<u32>,
     pub(crate) output_file: Option<String>,
     pub(crate) output_preview: Option<String>,
     pub(crate) input_notice: Option<String>,
@@ -1421,7 +1419,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                     takeover_active: summary.interactions.browser.takeover_active,
                 },
                 terminal: TerminalInteractionResponse {
-                    task_id: summary.interactions.terminal.task_id,
+                    pid: summary.interactions.terminal.pid,
                     output_file: summary.interactions.terminal.output_file,
                     output_preview: summary.interactions.terminal.output_preview,
                     input_notice: summary.interactions.terminal.input_notice,

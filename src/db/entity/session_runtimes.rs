@@ -13,8 +13,8 @@ pub struct Model {
     pub browser_takeover_active: bool,
     /// Whether a takeover-ended alert still needs to surface.
     pub browser_takeover_alert_pending: bool,
-    /// Id of the live terminal task, when one is running.
-    pub terminal_task_id: Option<String>,
+    /// PID of the live terminal job, when one is running.
+    pub terminal_pid: Option<i64>,
     /// Path of the captured terminal output file.
     pub terminal_output_file: Option<String>,
     /// Tail preview of the terminal output.

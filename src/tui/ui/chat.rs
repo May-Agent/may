@@ -179,14 +179,10 @@ pub enum ToolDisplay {
         pinned: Option<bool>,
     },
     /// A labelled action: a terminal control call (`terminal_input`,
-    /// `terminal_read`, `terminal_kill`) or any other tool invocation.
+    /// `terminal_read`) or any other tool invocation.
     Action {
-        /// Chip label shown in brackets — `stdin`, `read`, `kill`, or the
-        /// tool name.
+        /// Chip label shown in brackets — `stdin`, `read`, or the tool name.
         chip: String,
-        /// Background task id the call acts on, kept only to scrub it from
-        /// the result text — the id itself is never rendered.
-        task_id: Option<String>,
         /// One-line user-facing summary.
         summary: String,
         /// Extra body lines rendered in the expanded body, above the output.
@@ -1442,7 +1438,6 @@ impl ChatStream {
                 ToolDisplay::Action {
                     status: s,
                     chip,
-                    task_id,
                     output: out,
                     ..
                 } => {
@@ -1450,10 +1445,7 @@ impl ChatStream {
                     if let Some(output_text) = output {
                         *out = Some(TerminalCallInfo {
                             command: chip.clone(),
-                            output: task_id.as_ref().map_or_else(
-                                || output_text.to_string(),
-                                |id| scrub_task_id(output_text, id),
-                            ),
+                            output: output_text.to_string(),
                             output_file: None,
                             image: None,
                         });
@@ -2388,15 +2380,6 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
     lines
-}
-
-/// Remove a background task id from a tool's result text, replacing its
-/// quoted and bare occurrences with a readable referent.
-fn scrub_task_id(text: &str, task_id: &str) -> String {
-    text.replace(&format!("task '{task_id}'"), "task")
-        .replace(&format!("Task '{task_id}'"), "Task")
-        .replace(&format!("task_id={task_id}"), "task")
-        .replace(task_id, "the task")
 }
 
 /// Status shown inside an expanded body (`↳ running`), or `None` when the
@@ -5579,7 +5562,7 @@ mod tests {
             },
         );
         chat.push_text("后台任务运行正常，已输出到第 7 行（约每秒一行）。再等它跑完：\n");
-        chat.push_text("可用的后台操作还有：\n\n- `terminal_read` - 按字节偏移增量读取（不读已读部分）\n- `terminal_input` - 向后台任务的 stdin 写数据（适合交互式进程）\n- `terminal_kill` - 中途终止任务\n- `timeout` 参数控制后台任务最长存活时间（最多 7200 秒）\n\n要不要继续测某个具体场景？比如交互式 stdin、或者并发跑多个后台任务？\n");
+        chat.push_text("可用的后台操作还有：\n\n- `terminal_read` - 按字节偏移增量读取（不读已读部分）\n- `terminal_input` - 向后台任务的 stdin 写数据（适合交互式进程）\n- `kill <pid>` - 发送原生信号终止任务\n- `timeout` 参数控制后台任务最长存活时间（最多 7200 秒）\n\n要不要继续测某个具体场景？比如交互式 stdin、或者并发跑多个后台任务？\n");
 
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         let area = Rect::new(0, 0, 80, 30);
@@ -6396,9 +6379,8 @@ mod tests {
 
         // Action/Builtin calls expand only when they carry detail or output.
         let bare = ToolDisplay::Action {
-            chip: "kill".to_string(),
-            task_id: None,
-            summary: "task".to_string(),
+            chip: "read".to_string(),
+            summary: "PID 42".to_string(),
             detail: Vec::new(),
             status: ToolStatus::Done,
             output: None,
@@ -7591,7 +7573,6 @@ mod tests {
             "s1".to_string(),
             ToolDisplay::Action {
                 chip: "websearch".to_string(),
-                task_id: None,
                 summary: "may agent".to_string(),
                 detail: vec!["{\"query\":\"may agent\"}".to_string()],
                 status: ToolStatus::Running,
@@ -8083,7 +8064,6 @@ mod tests {
             "c1".to_string(),
             ToolDisplay::Action {
                 chip: "compact".to_string(),
-                task_id: None,
                 summary: String::new(),
                 detail: Vec::new(),
                 status: ToolStatus::Running,

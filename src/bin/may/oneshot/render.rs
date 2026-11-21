@@ -52,11 +52,11 @@ impl fmt::Display for Elapsed {
     }
 }
 
-enum ToolOutcome<'a> {
+enum ToolOutcome {
     Done,
     Exited { code: i32 },
-    Background { task_id: &'a str },
-    Killed { task_id: &'a str },
+    Background { pid: u32 },
+    Killed { pid: u32 },
 }
 
 enum LineKind<'a> {
@@ -76,7 +76,7 @@ enum LineKind<'a> {
         name: &'a str,
         label: &'a str,
         elapsed: Option<Elapsed>,
-        outcome: ToolOutcome<'a>,
+        outcome: ToolOutcome,
     },
     ToolFailed {
         name: &'a str,
@@ -322,11 +322,11 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                             Some(CommandOutcome::Exited { code }) => {
                                 ToolOutcome::Exited { code: *code }
                             }
-                            Some(CommandOutcome::Running { task_id, .. }) => {
-                                ToolOutcome::Background { task_id }
+                            Some(CommandOutcome::Running { pid, .. }) => {
+                                ToolOutcome::Background { pid: *pid }
                             }
-                            Some(CommandOutcome::Killed { task_id, .. }) => {
-                                ToolOutcome::Killed { task_id }
+                            Some(CommandOutcome::Killed { pid, .. }) => {
+                                ToolOutcome::Killed { pid: *pid }
                             }
                             None => ToolOutcome::Done,
                         };

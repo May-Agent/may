@@ -139,11 +139,31 @@ impl ChatDb {
 
     async fn apply_schema(db: &SkyDb) -> Result<(), ChatDbError> {
         Self::initialize_schema(db).await?;
+        Self::migrate_session_runtimes_pid(db).await?;
         Self::migrate_session_repo_clones(db).await?;
         Self::migrate_pr_external_numbers(db).await?;
         Self::ensure_session_context_snapshot_table(db).await?;
         Self::ensure_search_outbox(db).await?;
         Self::ensure_session_interval_triggers(db).await
+    }
+
+    async fn migrate_session_runtimes_pid(db: &SkyDb) -> Result<(), ChatDbError> {
+        let has_pid = query!(
+            db,
+            "SELECT 1 AS value FROM pragma_table_info('session_runtimes') WHERE name = 'terminal_pid'"
+        )
+        .fetch_optional::<I64ValueRow>()
+        .await?
+        .is_some();
+        if !has_pid {
+            query!(
+                db,
+                "ALTER TABLE session_runtimes ADD COLUMN terminal_pid INTEGER"
+            )
+            .execute()
+            .await?;
+        }
+        Ok(())
     }
 
     async fn initialize_schema(db: &SkyDb) -> Result<(), ChatDbError> {

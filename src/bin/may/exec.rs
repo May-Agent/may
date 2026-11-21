@@ -145,12 +145,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         })
         .await
         .map_err(ExecError::TerminalCall)?;
-    let task_id = job.task_id().to_owned();
+    let pid = job.pid();
     let result = job
         .wait()
         .await
         .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?;
-    render_exec_result(&task_id, &result)?;
+    render_exec_result(pid, &result)?;
     Ok(exit_code(&result.outcome))
 }
 
@@ -618,7 +618,7 @@ const fn exit_code(outcome: &RunOutcome) -> i32 {
     }
 }
 
-fn render_exec_result(task_id: &str, result: &ScriptResult) -> Result<(), ExecError> {
+fn render_exec_result(pid: u32, result: &ScriptResult) -> Result<(), ExecError> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
@@ -648,7 +648,7 @@ fn render_exec_result(task_id: &str, result: &ScriptResult) -> Result<(), ExecEr
     match &result.outcome {
         RunOutcome::Exited { .. } => {}
         RunOutcome::Killed(_) => stderr
-            .write_all(format!("background task: {task_id} (killed)\n").as_bytes())
+            .write_all(format!("background job PID {pid} (killed)\n").as_bytes())
             .map_err(ExecError::WriteStderr)?,
     }
     stderr.flush().map_err(ExecError::WriteStderr)?;

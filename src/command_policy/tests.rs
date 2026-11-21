@@ -3,14 +3,14 @@ use aither_sandbox::{Carry, Interpreter, SandboxMode, ScriptDir, ShellParseError
 use super::*;
 
 fn check_with<'a>(
-    task_id: &'a str,
+    launch: aither_sandbox::LaunchId,
     script: &'a str,
     shell: Option<Result<&'a ShellScript, &'a ShellParseError>>,
     origin: ScriptOrigin,
     start: &'a ScriptDir,
 ) -> ScriptCheck<'a> {
     ScriptCheck {
-        task_id,
+        launch,
         script,
         interpreter: Interpreter::Shell,
         shell,
@@ -36,7 +36,8 @@ async fn decide<P: ScriptPolicy>(
 ) -> ScriptDecision {
     let shell = ShellScript::parse(script);
     let start = ScriptDir::Host(PathBuf::from("/"));
-    let check = check_with("task-a", script, Some(shell.as_ref()), origin, &start);
+    let launch = aither_sandbox::LaunchLease::fresh().id();
+    let check = check_with(launch, script, Some(shell.as_ref()), origin, &start);
     policy.check(&check, state).await
 }
 
@@ -48,9 +49,9 @@ fn refusal(decision: &ScriptDecision) -> Option<&str> {
     }
 }
 
-fn ended<'a>(task_id: &'a str, code: i32, end: &'a ScriptDir) -> ScriptEnd<'a> {
+fn ended(launch: aither_sandbox::LaunchId, code: i32, end: &ScriptDir) -> ScriptEnd<'_> {
     ScriptEnd {
-        task_id,
+        launch,
         outcome: ScriptOutcome::Exited { code },
         end,
         carry: Carry::Unchanged,
@@ -101,7 +102,7 @@ async fn a_shell_script_that_does_not_parse_is_refused_and_python_is_not_checked
     );
     let start = ScriptDir::Host(PathBuf::from("/"));
     let mut python = check_with(
-        "task-a",
+        aither_sandbox::LaunchLease::fresh().id(),
         "import os",
         None,
         ScriptOrigin::Foreground,
@@ -157,29 +158,35 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
         aither_core::llm::tool::ToolCallId::new("call-c"),
         aither_core::llm::tool::AgentIdentity::Main,
     );
-    let check = |task_id| {
+    let check = |launch| {
         check_with(
-            task_id,
+            launch,
             "tail -50 log.txt",
             Some(Ok(&shell)),
             ScriptOrigin::Foreground,
             &start,
         )
     };
+    let (launch_a, launch_b, launch_c, launch_d) = (
+        aither_sandbox::LaunchLease::fresh().id(),
+        aither_sandbox::LaunchLease::fresh().id(),
+        aither_sandbox::LaunchLease::fresh().id(),
+        aither_sandbox::LaunchLease::fresh().id(),
+    );
 
     assert_eq!(
-        policy.check(&check("task-a"), &state).await,
+        policy.check(&check(launch_a), &state).await,
         ScriptDecision::Pass
     );
-    policy.ended(&ended("task-a", 1, &start), &state).await;
+    policy.ended(&ended(launch_a, 1, &start), &state).await;
     assert_eq!(
-        policy.check(&check("task-b"), &state).await,
+        policy.check(&check(launch_b), &state).await,
         ScriptDecision::Pass,
         "a failed read records nothing"
     );
-    policy.ended(&ended("task-b", 0, &start), &state).await;
+    policy.ended(&ended(launch_b, 0, &start), &state).await;
 
-    let mut repeated = check("task-c");
+    let mut repeated = check(launch_c);
     repeated.call = Some(&call);
     let ScriptDecision::Refuse(refused) = policy.check(&repeated, &state).await else {
         panic!("the unchanged re-read is refused");
@@ -200,7 +207,7 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
 
     std::fs::write(&log, "v1 and more").expect("rewrite");
     assert_eq!(
-        policy.check(&check("task-d"), &state).await,
+        policy.check(&check(launch_d), &state).await,
         ScriptDecision::Pass,
         "a changed file reads again"
     );
@@ -215,7 +222,7 @@ async fn a_follow_or_a_missing_file_is_no_reread() {
     for script in ["tail -f log.txt", "cat missing.txt"] {
         let shell = ShellScript::parse(script).expect("parses");
         let check = check_with(
-            "task-a",
+            aither_sandbox::LaunchLease::fresh().id(),
             script,
             Some(Ok(&shell)),
             ScriptOrigin::Foreground,
@@ -242,15 +249,16 @@ async fn read_in(
 ) -> ScriptDecision {
     let shell = ShellScript::parse(script);
     let start = ScriptDir::Host(dir.to_path_buf());
+    let launch = aither_sandbox::LaunchLease::fresh().id();
     let check = check_with(
-        script,
+        launch,
         script,
         Some(shell.as_ref()),
         ScriptOrigin::Foreground,
         &start,
     );
     let decision = policy.check(&check, state).await;
-    policy.ended(&ended(script, 0, &start), state).await;
+    policy.ended(&ended(launch, 0, &start), state).await;
     decision
 }
 
@@ -504,7 +512,7 @@ async fn patch_in(syntaxes: &Syntaxes, files: &[(&str, &str)], body: &str) -> Sc
     let shell = ShellScript::parse(&script);
     let start = ScriptDir::Host(dir.path().to_path_buf());
     let check = check_with(
-        "task-a",
+        aither_sandbox::LaunchLease::fresh().id(),
         &script,
         Some(shell.as_ref()),
         ScriptOrigin::Foreground,

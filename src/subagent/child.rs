@@ -196,7 +196,7 @@ struct Credit {
 
 /// What a wait for background commands ended on.
 enum Woke {
-    Ended(String, JobEnd),
+    Ended(u32, JobEnd),
     KeepAlive,
     Cancelled,
 }
@@ -445,7 +445,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
         for info in jobs.list().await {
             if (matches!(info.status, aither_sandbox::JobStatus::Running)
                 || info.status.completion_pending())
-                && let Some(job) = jobs.get(&info.task_id).await
+                && let Some(job) = jobs.get(info.pid).await
             {
                 waiting.push(job);
                 infos.push(info);
@@ -455,8 +455,8 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             return None;
         }
         self.last_idle = Some(format!(
-            "waiting on background task {}",
-            waiting[0].task_id()
+            "waiting on background job PID {}",
+            waiting[0].pid()
         ));
         // The keep-alive is due where the main session's refresh is: before
         // the entry the provider's cache lifetime bounds goes cold, and only
@@ -471,12 +471,13 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             _ => None,
         };
         let ended = async {
-            let (finished, _, _) =
-                select_all(waiting.iter().map(|job| {
-                    Box::pin(async move { (job.task_id().to_owned(), job.wait().await) })
-                }))
-                .await;
-            let (task_id, result) = finished;
+            let (finished, _, _) = select_all(
+                waiting
+                    .iter()
+                    .map(|job| Box::pin(async move { (job.pid(), job.wait().await) })),
+            )
+            .await;
+            let (pid, result) = finished;
             let end = match result {
                 Ok(script) => match script.outcome {
                     aither_sandbox::RunOutcome::Exited { code } => JobEnd::Exited { code },
@@ -487,7 +488,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
                     error: other.to_string(),
                 },
             };
-            Woke::Ended(task_id, end)
+            Woke::Ended(pid, end)
         };
         let timer = async {
             match keep_alive {
@@ -543,9 +544,9 @@ impl<LLM: LanguageModel + 'static> ChildAgent for ChildSession<LLM> {
                     }
                     self.sent += 1;
                 }
-                Some(Woke::Ended(task_id, end)) => {
+                Some(Woke::Ended(pid, end)) => {
                     let text = render(&JobEnded {
-                        task_id: &task_id,
+                        pid,
                         end,
                         read_tool: self.parts.read_tool,
                     });

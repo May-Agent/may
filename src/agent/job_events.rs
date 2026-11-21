@@ -36,29 +36,23 @@ enum JobAlertText<'a> {
     /// A foreground command left processes running; they were killed.
     DescendantsKilled { processes: &'a [JobProcess] },
     /// The job crossed the long-running threshold.
-    LongRunning { task_id: &'a str, elapsed: String },
+    LongRunning { pid: u32, elapsed: String },
     /// The job is waiting for input on its stdin.
-    StdinBlocked { task_id: &'a str },
+    StdinBlocked { pid: u32 },
     /// Watching the job's stdin failed.
-    StdinWatchFailed { task_id: &'a str, error: &'a str },
+    StdinWatchFailed { pid: u32, error: &'a str },
     /// A monitor delivered new output lines.
-    MonitorIncrement {
-        task_id: &'a str,
-        lines: &'a [String],
-    },
+    MonitorIncrement { pid: u32, lines: &'a [String] },
     /// A monitor saw no output for its stall window.
-    MonitorStalled { task_id: &'a str, stall_secs: u64 },
+    MonitorStalled { pid: u32, stall_secs: u64 },
     /// A monitor ended.
-    MonitorEnded {
-        task_id: &'a str,
-        end: &'a MonitorEnd,
-    },
+    MonitorEnded { pid: u32, end: &'a MonitorEnd },
 }
 
 #[derive(Template)]
 #[template(path = "job_ended.txt", escape = "none")]
 struct JobEndedText<'a> {
-    task_id: &'a str,
+    pid: u32,
     script: &'a str,
     outcome: JobOutcome<'a>,
     output: Option<&'a str>,
@@ -81,8 +75,8 @@ enum JobOutcome<'a> {
 pub enum JobFact {
     /// A job was detached.
     Started {
-        /// Its task id.
-        task_id: String,
+        /// Its PID.
+        pid: u32,
         /// First lines of its output.
         output_preview: String,
         /// The file receiving its output, relative to the session sandbox.
@@ -90,8 +84,8 @@ pub enum JobFact {
     },
     /// A job ended; the agent reads how in its context.
     Ended {
-        /// Its task id.
-        task_id: String,
+        /// Its PID.
+        pid: u32,
     },
 }
 
@@ -116,31 +110,29 @@ impl JobReport {
         match event {
             ShellEvent::JobStarted(started) => {
                 let _ = facts.try_send(JobFact::Started {
-                    task_id: started.task_id().to_string(),
+                    pid: started.pid(),
                     output_preview: started.output_preview().to_string(),
                     output_file: started.output_file().url.clone(),
                 });
             }
             ShellEvent::JobEnded(ended) => {
-                let task_id = ended.info().task_id.clone();
+                let pid = ended.info().pid;
                 self.alerts.push(render_ended(&ended));
                 let (_, _, _, pending) = (*ended).into_parts();
                 self.pending.extend(pending);
                 self.needs_model = true;
-                let _ = facts.try_send(JobFact::Ended { task_id });
+                let _ = facts.try_send(JobFact::Ended { pid });
             }
             ShellEvent::LongRunning(job) => self.alert(&JobAlertText::LongRunning {
-                task_id: job.task_id(),
+                pid: job.pid(),
                 elapsed: elapsed_text(job.after()),
             }),
             ShellEvent::StdinBlocked(job) => {
-                self.alert(&JobAlertText::StdinBlocked {
-                    task_id: job.task_id(),
-                });
+                self.alert(&JobAlertText::StdinBlocked { pid: job.pid() });
                 self.needs_model = true;
             }
             ShellEvent::StdinWatchFailed(job) => self.alert(&JobAlertText::StdinWatchFailed {
-                task_id: job.task_id(),
+                pid: job.pid(),
                 error: job.error(),
             }),
             ShellEvent::DescendantsKilled(killed) => {
@@ -150,21 +142,21 @@ impl JobReport {
             }
             ShellEvent::MonitorIncrement(increment) => {
                 self.alert(&JobAlertText::MonitorIncrement {
-                    task_id: increment.task_id(),
+                    pid: increment.pid(),
                     lines: increment.lines(),
                 });
                 self.needs_model = true;
             }
             ShellEvent::MonitorStalled(stalled) => {
                 self.alert(&JobAlertText::MonitorStalled {
-                    task_id: stalled.task_id(),
+                    pid: stalled.pid(),
                     stall_secs: stalled.stall_secs(),
                 });
                 self.needs_model = true;
             }
             ShellEvent::MonitorEnded(ended) => {
                 self.alert(&JobAlertText::MonitorEnded {
-                    task_id: ended.task_id(),
+                    pid: ended.pid(),
                     end: ended.end(),
                 });
                 self.needs_model = true;
@@ -242,7 +234,7 @@ fn render_ended(ended: &JobEnded) -> String {
         }
     };
     JobEndedText {
-        task_id: &info.task_id,
+        pid: info.pid,
         script: quoted(&info.script),
         outcome,
         output: output.as_deref(),
