@@ -44,26 +44,14 @@ runs:
           mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
         done
         rm -rf /tmp/gc-* &'
-    # The default linker spends minutes on the multi-GB test binaries; mold
-    # is preinstalled on the hosted runners and links them in seconds.
-    - name: Link test binaries with mold
-      if: runner.os == 'Linux' && runner.arch == 'X64'
-      shell: bash
-      run: |
-        if command -v mold > /dev/null; then
-          echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "${GITHUB_ENV}"
-        fi
     - uses: dtolnay/rust-toolchain@stable
-    # Only main saves; a PR or merge-group cache lives in a scope nothing else
-    # restores, and its size evicts main's under the cache limit. Keyed by the
-    # job id (`test-ubuntu`, `test-macos`), it is the one Rust cache per OS,
-    # so main's caches fit under the limit together.
-    - uses: Swatinem/rust-cache@v2
+    # Signed public prebuilts (water-rs/stow@main, including managed mold on
+    # Linux) plus a main-owned local stow store for git and uncovered crates.
+    - id: stow
+      uses: ./.github/actions/restore-stow-cache
       with:
-        save-if: ${{ github.ref == 'refs/heads/main' }}
-    # rust-cache prunes the files under target/tmp but keeps its directories,
-    # so a restored cache holds an empty skeleton of the tests' shared tool
-    # cache that the tests would take for a prepared one.
+        lane: ${{ github.job }}
+    # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
       shell: bash
       run: |
@@ -102,7 +90,11 @@ runs:
       if: inputs.upload-e2e-bin == 'true'
       shell: bash
       run: |
-        path="$(find target/debug -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
+        path="$(find target/debug "${HOME}/.stow/build-dir" -type f -perm /111 -name 'terminal_first_e2e-*' ! -name '*.d' ! -name '*.o' 2>/dev/null | head -1)"
+        if [ -z "${path}" ]; then
+          path="$(find target/debug "${HOME}/.stow/build-dir" -type f -perm +111 -name 'terminal_first_e2e-*' ! -name '*.d' ! -name '*.o' 2>/dev/null | head -1)"
+        fi
+        test -n "${path}"
         tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
     - name: Upload the e2e test binary
       if: inputs.upload-e2e-bin == 'true'
@@ -125,12 +117,16 @@ runs:
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
       run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+    # Uses the exact same target flags (`inputs.cargo-flags`) as the build and
+    # nextest steps above: passing `--test terminal_first_e2e` narrows Cargo's
+    # feature unification and triggers a full multi-minute recompile of may-agent
+    # just to run one acceptance test.
     - name: Verify baseline tools
       if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
       shell: bash
       run: >
-        cargo nextest run --locked --test terminal_first_e2e --run-ignored only
-        -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
+        cargo nextest run --locked ${{ inputs.cargo-flags }} --run-ignored only
+        -E 'binary(terminal_first_e2e) & test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
         --no-capture
     - name: Upload cargo timings
       if: always()
@@ -147,17 +143,13 @@ runs:
       with:
         path: ${{ steps.downloads.outputs.tools-path }}
         key: ${{ steps.downloads.outputs.tools-key }}
-    # The Rust cache this job saves is written after the run, so every
-    # earlier generation under the job's prefix can go now; without this the
-    # generations accumulate past the repository's cache quota and evict the
-    # hot one.
-    - name: Retire superseded Rust caches
-      if: github.ref == 'refs/heads/main'
+    - name: Report stow cache stats
+      if: always()
       shell: bash
-      run: |
-        prefix="v0-rust-${{ github.job }}-"
-        gh api --paginate "repos/${{ github.repository }}/actions/caches?key=${prefix}" \
-          -q ".actions_caches[] | select(.key | startswith(\"${prefix}\")) | .id" \
-          | while read -r id; do
-              gh api -X DELETE "repos/${{ github.repository }}/actions/caches/${id}" || true
-            done
+      run: stow stats || true
+    - uses: ./.github/actions/save-stow-cache
+      if: success()
+      with:
+        cache-prefix: ${{ steps.stow.outputs.cache-prefix }}
+        cache-key: ${{ steps.stow.outputs.cache-key }}
+        cache-hit: ${{ steps.stow.outputs.cache-hit }}
