@@ -48,6 +48,7 @@ pub fn combined_manifest_bytes() -> serde_json::Result<Vec<u8>> {
 }
 
 /// Extract the `version` field of the `heel` package entry in `Cargo.lock`.
+#[must_use]
 pub fn heel_version_in_lockfile(lockfile: &str) -> Option<String> {
     let mut in_heel_package = false;
     for line in lockfile.lines() {

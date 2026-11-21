@@ -1,0 +1,51 @@
+name: Save stow cache
+description: Report stow cache stats, and on successful main-branch runs flush the SQLite WAL, save the lane's stow and Cargo caches when missed, and retire superseded generations.
+inputs:
+  job-status:
+    description: Outer job status (`${{ job.status }}`).
+    required: true
+  cache-prefix:
+    description: Prefix from restore-stow-cache.
+    required: true
+  cache-key:
+    description: Exact key from restore-stow-cache.
+    required: true
+  cache-hit:
+    description: Exact-hit flag from restore-stow-cache.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Report stow cache stats
+      if: always()
+      shell: bash
+      run: stow stats || true
+    - name: Checkpoint stow state before saving
+      if: inputs.job-status == 'success' && inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      shell: bash
+      run: |
+        rm -rf ~/.stow/build-dir
+        if command -v sqlite3 > /dev/null && [ -f ~/.stow/state-v3.sqlite3 ]; then
+          sqlite3 ~/.stow/state-v3.sqlite3 "PRAGMA wal_checkpoint(PASSIVE);" || true
+        fi
+    - name: Retire superseded stow caches
+      if: inputs.job-status == 'success' && inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      shell: bash
+      run: |
+        prefix="${{ inputs.cache-prefix }}"
+        gh api --paginate "repos/${{ github.repository }}/actions/caches?key=${prefix}" \
+          -q ".actions_caches[] | select(.key | startswith(\"${prefix}\")) | select(.ref == \"refs/heads/main\") | .id" \
+          | while read -r id; do
+              [ -n "${id}" ] && gh api -X DELETE "repos/${{ github.repository }}/actions/caches/${id}" || true
+            done
+    - if: inputs.job-status == 'success' && inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.stow
+          !~/.stow/build-dir
+          ~/.cargo/git/db
+          ~/.cargo/git/checkouts
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+        key: ${{ inputs.cache-key }}
