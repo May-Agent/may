@@ -6,7 +6,8 @@ use super::super::state::{
     AppMode, ConfigEditMode, ConfigSection, ConfigTextTarget, detect_api_key_from_env,
 };
 use super::{App, SendAction};
-use crate::config::{ModelTier, ProviderType, get_model_tier};
+use crate::config::{ModelTier, NativeToolsConfig, ProviderInstance, ProviderType, get_model_tier};
+use crate::daemon::types::{SecretUpdate, UiFullConfig, UiModelsConfig, UiProviderConfig};
 use crate::model_selector::ModelSelector;
 use crate::tui::grapheme;
 
@@ -462,15 +463,18 @@ impl App {
             }
             ConfigSection::Models => {
                 // Parse comma-separated model list
-                let models: Vec<ModelSelector> = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        s.parse::<ModelSelector>()
-                            .expect("tui config edit must receive explicit model selectors")
-                    })
-                    .collect();
+                let mut models = Vec::new();
+                for entry in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    match entry.parse::<ModelSelector>() {
+                        Ok(selector) => models.push(selector),
+                        Err(error) => {
+                            // The edit stays open so the user can fix it;
+                            // nothing is persisted from a partial parse.
+                            self.set_status(format!("Invalid model selector: {error}"));
+                            return None;
+                        }
+                    }
+                }
                 match selected {
                     0 => self.config.models.advanced = models,
                     1 => self.config.models.balanced = models,
@@ -552,6 +556,66 @@ impl App {
         None
     }
 
+    /// Apply a `config` topic push: the daemon is authoritative, so the
+    /// local snapshot takes every field the UI surface carries. API keys
+    /// are the exception — a push never contains key material, so a
+    /// provider the daemon still has a key for keeps the locally stored
+    /// material; one the daemon dropped loses its local copy too.
+    pub(in crate::tui) fn apply_pushed_config(&mut self, pushed: crate::tui::event::PushedConfig) {
+        let full = pushed.full;
+        self.config.ssh_servers = pushed.ssh_servers;
+        self.config.max_iterations = pushed.max_iterations;
+        self.config.appearance.font = full.appearance.font;
+        self.config.appearance.theme = full.appearance.theme;
+        if let Ok(timezone) = pushed.timezone.parse() {
+            self.config.time.timezone = Some(timezone);
+        }
+        self.config.last_model = full.last_model.and_then(|model| model.parse().ok());
+        self.config.preferences.warn_on_model_change = full.preferences.warn_on_model_change;
+        self.config.preferences.show_token_usage = full.preferences.show_token_usage;
+        self.config.preferences.show_decode_speed = full.preferences.show_decode_speed;
+        self.config.preferences.network_policy.mode = full.preferences.network_policy_mode;
+        self.config.preferences.network_policy.hosts = full.preferences.network_policy_hosts;
+        self.config.sandbox.job_pool_size = full
+            .sandbox
+            .job_pool_size
+            .and_then(std::num::NonZeroUsize::new);
+        self.config.models.advanced = parse_selectors(&full.models.advanced);
+        self.config.models.balanced = parse_selectors(&full.models.balanced);
+        self.config.models.fast = parse_selectors(&full.models.fast);
+        self.config.models.image_generation = parse_selectors(&full.models.image_generation);
+        self.config.models.compaction_model = full
+            .models
+            .compaction_model
+            .and_then(|model| model.parse().ok());
+        let mut providers = std::collections::HashMap::with_capacity(full.providers.len());
+        for pushed_provider in full.providers {
+            let api_key = if pushed_provider.has_api_key {
+                self.config
+                    .provider
+                    .get(&pushed_provider.id)
+                    .and_then(|old| old.api_key.clone())
+            } else {
+                None
+            };
+            providers.insert(
+                pushed_provider.id.clone(),
+                ProviderInstance {
+                    provider_type: Some(pushed_provider.provider_type),
+                    api_key,
+                    native_tools: NativeToolsConfig::from(&pushed_provider.native_tools),
+                    api: pushed_provider.api,
+                    base_url: pushed_provider.base_url,
+                    display_name: pushed_provider.display_name,
+                    enabled: pushed_provider.enabled,
+                    cache_lifetime: pushed_provider.cache_lifetime,
+                },
+            );
+        }
+        self.config.provider = providers;
+        self.config_state.load_providers(&self.config);
+    }
+
     /// Auto-populate models from the first configured provider if models are empty.
     fn auto_populate_models_if_empty(&mut self) {
         if self.config.models.has_any_models() {
@@ -606,4 +670,121 @@ impl App {
             return;
         }
     }
+}
+
+/// The selectors of a UI model list, in order; a selector that does not
+/// parse is dropped rather than killing the push.
+fn parse_selectors(list: &[String]) -> Vec<ModelSelector> {
+    list.iter().filter_map(|entry| entry.parse().ok()).collect()
+}
+
+/// `GET /api/config`'s body carries the UI-shaped config under `fullConfig`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigEnvelope {
+    full_config: UiFullConfig,
+}
+
+/// Write `config` through the daemon: fetch its full config, overwrite the
+/// sections the TUI manages from `config`, and `PUT` the result back so
+/// sections the TUI never edits keep the daemon's own values.
+pub(in crate::tui) async fn persist_config_via_daemon(
+    client: &crate::client::DaemonClient,
+    config: &crate::config::MayConfig,
+) -> Result<(), crate::tui::error::TuiError> {
+    let envelope: ConfigEnvelope = client.get("/api/config").await?;
+    let mut full = envelope.full_config;
+    overlay_tui_config(&mut full, config);
+    client
+        .put::<_, serde_json::Value>("/api/config", &full)
+        .await
+        .map(|_| ())?;
+    Ok(())
+}
+
+/// Overlay `config`'s TUI-managed sections onto `full` — providers, model
+/// lists, the preference flags, appearance, `last_model`, `max_iterations`
+/// and the jobserver pool size — leaving everything else (browser, remote
+/// access, stream, suggestions, recap, sessions, command priority) at the
+/// daemon's own values.
+fn overlay_tui_config(full: &mut UiFullConfig, config: &crate::config::MayConfig) {
+    full.models = UiModelsConfig {
+        advanced: config
+            .models
+            .advanced
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        balanced: config
+            .models
+            .balanced
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        fast: config.models.fast.iter().map(ToString::to_string).collect(),
+        image_generation: config
+            .models
+            .image_generation
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        compaction_model: config
+            .models
+            .compaction_model
+            .as_ref()
+            .map(ToString::to_string),
+    };
+    full.preferences.warn_on_model_change = config.preferences.warn_on_model_change;
+    full.preferences.show_token_usage = config.preferences.show_token_usage;
+    full.preferences.show_decode_speed = config.preferences.show_decode_speed;
+    full.preferences.network_policy_mode = config.preferences.network_policy.mode;
+    full.preferences
+        .network_policy_hosts
+        .clone_from(&config.preferences.network_policy.hosts);
+    full.appearance = crate::daemon::types::UiAppearanceConfig {
+        font: config.appearance.font.clone(),
+        theme: config.appearance.theme.clone(),
+    };
+    full.last_model = config.last_model.as_ref().map(ToString::to_string);
+    full.max_iterations = config.max_iterations;
+    full.sandbox.job_pool_size = config
+        .sandbox
+        .job_pool_size
+        .map(std::num::NonZeroUsize::get);
+
+    // Which providers the daemon stores key material for, so a locally
+    // keyless instance is `Keep` rather than `Remove`.
+    let keyed: std::collections::HashMap<String, bool> = full
+        .providers
+        .iter()
+        .map(|pushed| (pushed.id.clone(), pushed.has_api_key))
+        .collect();
+    full.providers = config
+        .provider
+        .iter()
+        .map(|(id, instance)| {
+            let daemon_keyed = keyed.get(id).copied().unwrap_or(false);
+            let (has_api_key, api_key) = match &instance.api_key {
+                Some(key) => (true, Some(SecretUpdate::Replace(key.clone()))),
+                None if daemon_keyed => (true, Some(SecretUpdate::Keep)),
+                None => (false, Some(SecretUpdate::Remove)),
+            };
+            UiProviderConfig {
+                id: id.clone(),
+                provider_type: instance
+                    .provider_type
+                    .unwrap_or_else(|| ProviderType::from_id(id)),
+                has_api_key,
+                api_key,
+                base_url: instance.base_url.clone(),
+                display_name: instance.display_name.clone(),
+                enabled: instance.enabled,
+                native_tools: crate::daemon::types::UiNativeToolsConfig::from(
+                    &instance.native_tools,
+                ),
+                cache_lifetime: instance.cache_lifetime,
+                api: instance.api,
+            }
+        })
+        .collect();
 }

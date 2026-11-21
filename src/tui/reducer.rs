@@ -32,6 +32,17 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
             app.compaction.clear_expired(std::time::Instant::now());
+            app.history.poll_load();
+            app.completion.refresh_file_matches();
+            // Image keys come from the last frame's layout; scanning runs
+            // only when that layout's entries changed — new messages,
+            // attachments, refolds, width or session changes — not on
+            // every idle tick.
+            let scan_version = app.chat_layout.scan_version();
+            if app.last_image_scan_version != scan_version {
+                app.last_image_scan_version = scan_version;
+                app.scan_and_fetch_images();
+            }
             app.sync_profile_follow();
             if app.new_year.check_due(std::time::Instant::now()) {
                 let zone = crate::tui::new_year::user_zone(&app.config.time);
@@ -265,8 +276,23 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ConfigPushed(config) => {
+            app.apply_pushed_config(*config);
+            Ok(None)
+        }
+        AppEvent::ClipboardCopied(result) => {
+            match result {
+                Ok(()) => app.set_status("Copied selection"),
+                Err(error) => app.set_status(error.to_string()),
+            }
+            Ok(None)
+        }
         AppEvent::ImageDecoded { key, state } => {
             app.handle_image_decoded(key, state);
+            Ok(None)
+        }
+        AppEvent::ImageEncoded { key, proto } => {
+            app.handle_image_encoded(key, proto);
             Ok(None)
         }
 
