@@ -172,6 +172,10 @@ pub struct SharedServices {
     /// The forge authenticator `pr` pushes and GitHub calls read; the daemon
     /// keeps it in step with its live config.
     pub forge_auth: crate::forge::LiveForgeAuth,
+    /// Working directories granted signing: a subagent space provisioned a
+    /// working copy and signer is granted here, and `sign-commit` checks
+    /// a subagent's working directory against the same set.
+    pub signer_roots: crate::commit_signing::SignerRoots,
 }
 
 impl SharedServices {
@@ -185,6 +189,7 @@ impl SharedServices {
                 crate::session::MayHomePaths::new(may_dir.to_path_buf()).checkouts_dir(),
             ),
             forge_auth: crate::forge::LiveForgeAuth::default(),
+            signer_roots: crate::commit_signing::SignerRoots::default(),
         }
     }
 
@@ -412,7 +417,8 @@ where
         config.git.clone(),
         &config.may_dir,
         config.session_id.clone(),
-    );
+    )
+    .with_signing_roots(config.services.signer_roots.clone());
     let container_mount = matches!(config.task_runtime, TaskRuntimeKind::Container)
         .then(|| crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone()));
     signing

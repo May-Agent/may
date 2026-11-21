@@ -215,17 +215,41 @@ fn normalize_target(raw: &str) -> Result<url::Url, String> {
     };
     let (mut url, _scheme, _port) =
         parse_local_proxy_target(&candidate).map_err(|error| error.to_string())?;
-    let all_interfaces = matches!(url.host_str(), Some("0.0.0.0" | "::"));
-    if all_interfaces {
-        let loopback = if url.host_str() == Some("0.0.0.0") {
-            "127.0.0.1"
-        } else {
-            "::1"
-        };
+    let loopback = match url.host_str() {
+        Some("0.0.0.0") => Some("127.0.0.1"),
+        Some("::" | "[::]") => Some("[::1]"),
+        _ => None,
+    };
+    if let Some(loopback) = loopback {
         url.set_host(Some(loopback))
             .map_err(|error| error.to_string())?;
     }
     Ok(url)
+}
+
+fn allows_tunnel_target_host(environment: crate::db::ProfileEnvironmentKind, host: &str) -> bool {
+    match environment {
+        crate::db::ProfileEnvironmentKind::Local => super::auth::is_loopback_name(host),
+        crate::db::ProfileEnvironmentKind::Container => is_container_local_proxy_host(host),
+    }
+}
+
+const TUNNEL_DOCUMENT_CSP: &str = "sandbox allow-scripts allow-forms";
+
+fn needs_tunnel_document_sandbox(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return true;
+    };
+    let essence = content_type
+        .split(';')
+        .next()
+        .map_or("", str::trim)
+        .to_ascii_lowercase();
+    essence.is_empty()
+        || essence == "text/html"
+        || essence == "text/xml"
+        || essence == "application/xml"
+        || essence.ends_with("+xml")
 }
 
 /// Registers a tunnel for a session; shared by the IPC broker, the REST
@@ -236,11 +260,9 @@ pub async fn handle_tunnel_request(
 ) -> Result<TunnelResult, String> {
     let url = normalize_target(&request.url)?;
     let environment = session_environment(state, &request.session_id).await?;
-    if environment == crate::db::ProfileEnvironmentKind::Container
-        && !is_container_local_proxy_host(url.host_str().unwrap_or_default())
-    {
+    if !allows_tunnel_target_host(environment, url.host_str().unwrap_or_default()) {
         return Err(
-            "container sessions may only tunnel loopback endpoints (localhost/127.x)".to_string(),
+            "sessions may only tunnel loopback endpoints (localhost, 127.x, [::1])".to_string(),
         );
     }
     // Links meant for this machine name the address the local listener is
@@ -291,6 +313,11 @@ async fn resolve_upstream(state: &DaemonState, entry: &TunnelEntry) -> SkyResult
                 .url
                 .host_str()
                 .ok_or_else(|| Error::msg("tunnel target has no host"))?;
+            if !allows_tunnel_target_host(environment, host) {
+                return Err(bad_request_error(
+                    "local sessions may only tunnel loopback endpoints",
+                ));
+            }
             Ok(Upstream {
                 authority: format!("{host}:{port}"),
                 host_header: target_host_header(&entry.url, port),
@@ -298,6 +325,12 @@ async fn resolve_upstream(state: &DaemonState, entry: &TunnelEntry) -> SkyResult
             })
         }
         crate::db::ProfileEnvironmentKind::Container => {
+            let host = entry.url.host_str().unwrap_or_default();
+            if !allows_tunnel_target_host(environment, host) {
+                return Err(bad_request_error(
+                    "container sessions may only tunnel loopback endpoints",
+                ));
+            }
             let resolved = resolve_container_proxy_target(state, &entry.session_id).await?;
             Ok(Upstream {
                 authority: format!("{}:{port}", resolved.container_ip),
@@ -422,6 +455,20 @@ async fn proxy_http(
             };
             response.headers_mut().append(name.clone(), value);
         }
+    }
+    response.headers_mut().insert(
+        skyzen::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    let content_type = response
+        .headers()
+        .get(skyzen::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if needs_tunnel_document_sandbox(content_type) {
+        response.headers_mut().append(
+            skyzen::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(TUNNEL_DOCUMENT_CSP),
+        );
     }
     Ok(response)
 }
@@ -689,6 +736,10 @@ mod tests {
             normalize_target("0.0.0.0:5173").expect("valid").host_str(),
             Some("127.0.0.1")
         );
+        assert_eq!(
+            normalize_target("[::]:5173").expect("valid").host_str(),
+            Some("[::1]")
+        );
         assert!(normalize_target("ftp://localhost:3000").is_err());
     }
 
@@ -701,5 +752,187 @@ mod tests {
         );
         let root = url::Url::parse("http://localhost:3000").expect("url");
         assert_eq!(upstream_path(&root, "", None), "/");
+    }
+
+    #[tokio::test]
+    async fn local_sessions_reject_non_loopback_tunnel_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(
+            DaemonState::for_test(dir.path(), crate::config::MayConfig::default())
+                .await
+                .expect("daemon state"),
+        );
+        state
+            .remote_access_manager
+            .set_local_listener_addr(Some("127.0.0.1:8787".parse().expect("addr")));
+        let local_profile = state
+            .db()
+            .ensure_default_profiles()
+            .await
+            .expect("profiles");
+        state
+            .db()
+            .create_session_in_profile("s-local", Some("Local"), None, Some(&local_profile))
+            .await
+            .expect("session");
+
+        for disallowed in [
+            "http://192.168.1.50:3000",
+            "http://169.254.169.254:80",
+            "http://example.com:8080",
+            "http://127.evil.example:3000",
+            "http://host.docker.internal:3000",
+        ] {
+            let err = handle_tunnel_request(
+                &state,
+                TunnelRequest {
+                    session_id: "s-local".to_string(),
+                    url: disallowed.to_string(),
+                },
+            )
+            .await
+            .expect_err("non-loopback target must be refused");
+            assert!(
+                err.contains("loopback"),
+                "unexpected error for {disallowed}: {err}"
+            );
+        }
+
+        for allowed in [
+            "localhost:3000",
+            "127.0.0.1:3000",
+            "[::1]:3000",
+            "0.0.0.0:3000",
+        ] {
+            handle_tunnel_request(
+                &state,
+                TunnelRequest {
+                    session_id: "s-local".to_string(),
+                    url: allowed.to_string(),
+                },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{allowed} should register: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn proxied_tunnel_html_carries_csp_sandbox_without_same_origin() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind upstream");
+        let upstream_addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(|req| async move {
+                        let (ct, body) = match req.uri().path() {
+                            "/app.js" => (Some("application/javascript"), "console.log(1);"),
+                            "/raw" => (None, "<html>untyped</html>"),
+                            _ => (
+                                Some("text/html; charset=utf-8"),
+                                "<!doctype html><script>fetch('/api/sessions')</script>",
+                            ),
+                        };
+                        let mut builder = hyper::Response::builder().status(200);
+                        if let Some(ct) = ct {
+                            builder = builder.header("Content-Type", ct);
+                        }
+                        Ok::<_, std::convert::Infallible>(
+                            builder
+                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                .expect("response"),
+                        )
+                    }),
+                ));
+            }
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(
+            DaemonState::for_test(dir.path(), crate::config::MayConfig::default())
+                .await
+                .expect("daemon state"),
+        );
+        state
+            .remote_access_manager
+            .set_local_listener_addr(Some("127.0.0.1:8787".parse().expect("addr")));
+        let local_profile = state
+            .db()
+            .ensure_default_profiles()
+            .await
+            .expect("profiles");
+        state
+            .db()
+            .create_session_in_profile("s-csp", Some("CSP"), None, Some(&local_profile))
+            .await
+            .expect("session");
+        let registered = handle_tunnel_request(
+            &state,
+            TunnelRequest {
+                session_id: "s-csp".to_string(),
+                url: format!("http://{upstream_addr}"),
+            },
+        )
+        .await
+        .expect("tunnel registers");
+        let key = TunnelKey {
+            session_id: "s-csp".to_string(),
+            id: registered.id,
+        };
+        let entry = state.tunnels.resolve(&key).await.expect("entry");
+
+        for path in ["/", "/raw"] {
+            let resp = proxy_http(
+                &state,
+                &key,
+                &entry,
+                &Method::GET,
+                path,
+                &HeaderMap::new(),
+                Body::empty(),
+            )
+            .await
+            .expect("proxy succeeds");
+            assert_eq!(
+                resp.headers()
+                    .get(skyzen::header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            let csp = resp
+                .headers()
+                .get(skyzen::header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .expect("HTML/untyped tunnel response must carry CSP");
+            assert_eq!(csp, "sandbox allow-scripts allow-forms");
+            assert!(!csp.contains("allow-same-origin"));
+        }
+
+        let js_resp = proxy_http(
+            &state,
+            &key,
+            &entry,
+            &Method::GET,
+            "/app.js",
+            &HeaderMap::new(),
+            Body::empty(),
+        )
+        .await
+        .expect("js proxy succeeds");
+        assert_eq!(
+            js_resp
+                .headers()
+                .get(skyzen::header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert!(
+            js_resp
+                .headers()
+                .get(skyzen::header::CONTENT_SECURITY_POLICY)
+                .is_none()
+        );
     }
 }

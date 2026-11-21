@@ -33,12 +33,39 @@ use serde::de::DeserializeOwned;
 
 use crate::daemon::DaemonHealth;
 
+/// Percent-encodes a single URL path segment so reserved characters (`/`, `?`,
+/// `#`, `%`, spaces, control bytes, non-ASCII) and dot-traversal segments
+/// (`.` / `..`) never alter route structure or fail URI parsing.
+#[must_use]
+pub fn encode_path_segment(segment: &str) -> String {
+    use std::fmt::Write as _;
+
+    if segment == "." {
+        return "%2E".to_string();
+    }
+    if segment == ".." {
+        return "%2E%2E".to_string();
+    }
+    let mut encoded = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 /// Path of the session endpoint `tail` (such as `/stop`) under
-/// `/api/sessions/{session_id}`.
+/// `/api/sessions/{session_id}`, with `session_id` validated and URL-encoded
+/// as a single path segment.
 #[must_use]
 pub fn session_path(session_id: &str, tail: &str) -> String {
-    let mut path = String::from("/api/sessions/");
-    path.push_str(session_id);
+    let encoded_id = encode_path_segment(session_id);
+    let mut path = String::with_capacity(14 + encoded_id.len() + tail.len());
+    path.push_str("/api/sessions/");
+    path.push_str(&encoded_id);
     path.push_str(tail);
     path
 }
@@ -71,6 +98,9 @@ pub enum DaemonClientError {
         /// Response body.
         message: String,
     },
+    /// Why: `session_id` must be non-empty before hitting `/api/sessions/{id}/...`.
+    #[error("session id must not be empty")]
+    InvalidSessionId,
     /// A body was not the expected JSON.
     #[error("unexpected daemon response: {0}")]
     Json(#[from] serde_json::Error),
@@ -188,8 +218,10 @@ impl DaemonClient {
         &self,
         session_id: &str,
     ) -> Result<WireTranscriptPage, DaemonClientError> {
-        self.get(&format!("/api/sessions/{session_id}/transcript"))
-            .await
+        if session_id.trim().is_empty() {
+            return Err(DaemonClientError::InvalidSessionId);
+        }
+        self.get(&session_path(session_id, "/transcript")).await
     }
 
     /// `GET path`, decoding the JSON answer.
@@ -413,6 +445,9 @@ impl DaemonClient {
         after: Option<&str>,
         owns_turn: bool,
     ) -> Result<EventStream, DaemonClientError> {
+        if session_id.trim().is_empty() {
+            return Err(DaemonClientError::InvalidSessionId);
+        }
         let path = session_events_url(session_id, after, owns_turn);
         self.stream(&path).await
     }
@@ -479,7 +514,7 @@ mod tests {
     fn a_resumed_session_stream_names_its_cursor() {
         assert_eq!(
             session_events_url("s 1", Some("42.7"), false),
-            "/api/sessions/s 1/events?after=42.7"
+            "/api/sessions/s%201/events?after=42.7"
         );
         assert_eq!(
             session_events_url("s", Some("a/b?c=d"), false),
@@ -491,5 +526,25 @@ mod tests {
             "/api/sessions/s/events?",
             "a new session passes no after"
         );
+    }
+
+    #[test]
+    fn session_path_encodes_reserved_cjk_and_dot_segments_into_valid_uris() {
+        for (raw, expected) in [
+            ("plain-id_1", "/api/sessions/plain-id_1/stop"),
+            ("a/b?c=1#frag", "/api/sessions/a%2Fb%3Fc%3D1%23frag/stop"),
+            ("..", "/api/sessions/%2E%2E/stop"),
+            (".", "/api/sessions/%2E/stop"),
+            (
+                "会话-テスト-세션",
+                "/api/sessions/%E4%BC%9A%E8%AF%9D-%E3%83%86%E3%82%B9%E3%83%88-%EC%84%B8%EC%85%98/stop",
+            ),
+        ] {
+            let built = super::session_path(raw, "/stop");
+            assert_eq!(built, expected, "for {raw}");
+            built
+                .parse::<hyper::Uri>()
+                .unwrap_or_else(|err| panic!("{built} must parse as a valid hyper::Uri: {err}"));
+        }
     }
 }

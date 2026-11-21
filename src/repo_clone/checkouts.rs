@@ -280,11 +280,23 @@ impl DaemonCheckouts {
     ) -> Result<CheckoutRefresh, RepoCloneError> {
         let entry = self.entry_for(repo_key);
         let _guard = entry.lock.lock().await;
+        self.refresh_locked(repo_key, remote_url, &entry).await
+    }
+
+    /// [`Self::refresh`] for a caller already holding `entry`'s lock: a
+    /// generation is made, swapped and pruned under the same lock, so a
+    /// reader that keeps the lock can lease the result with no prune window.
+    async fn refresh_locked(
+        &self,
+        repo_key: &str,
+        remote_url: &str,
+        entry: &Arc<RepoEntry>,
+    ) -> Result<CheckoutRefresh, RepoCloneError> {
         let repo_dir = self.repo_dir(repo_key);
         let host = self.host_for_remote(remote_url).await?;
         let repo_key_owned = repo_key.to_string();
         let remote_url_owned = remote_url.to_string();
-        let entry_ref = Arc::clone(&entry);
+        let entry_ref = Arc::clone(entry);
 
         blocking::unblock(move || {
             write_repo_key_file(&repo_dir, &repo_key_owned)?;
@@ -368,15 +380,30 @@ impl DaemonCheckouts {
         remote_url: &str,
         dst: &Path,
     ) -> Result<CheckoutSnapshot, RepoCloneError> {
-        let refresh = self.refresh(repo_key, remote_url).await?;
+        let entry = self.entry_for(repo_key);
+        // The snapshot's generation is leased before the lock is released:
+        // a generation is pruned only under this lock (or while leased out
+        // from under it never), so the copy below cannot race a deletion.
+        let guard = entry.lock.lock().await;
+        let refresh = self.refresh_locked(repo_key, remote_url, &entry).await?;
         let snapshot = refresh.snapshot;
-        let lease = self.acquire_lease_for_snapshot(repo_key, &snapshot);
+        let Some(lease) = self.acquire_lease_for_snapshot(repo_key, &snapshot) else {
+            // The generation that was just made current is gone: something
+            // outside the lease removed it. Fail rather than copy a
+            // half-pruned checkout.
+            return Err(RepoCloneError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "the checkout generation {} of {repo_key} was removed before it could be leased",
+                    snapshot.generation
+                ),
+            )));
+        };
+        drop(guard);
         let src_dir = snapshot.generation_dir.clone();
         let dst_buf = dst.to_path_buf();
         let copy_res = blocking::unblock(move || cow_copy_dir(&src_dir, &dst_buf)).await;
-        if let Some(lease) = lease {
-            lease.release().await;
-        }
+        lease.release().await;
         copy_res?;
         Ok(snapshot)
     }
@@ -386,6 +413,10 @@ impl DaemonCheckouts {
     pub async fn acquire_lease(&self, repo_key: &str) -> Option<GenerationLease> {
         let repo_dir = self.repo_dir(repo_key);
         let entry = self.entry_for(repo_key);
+        // Reading `current` and recording the lease happen under the lock
+        // that pruning also takes, so the generation cannot be deleted
+        // between the read and the lease.
+        let _guard = entry.lock.lock().await;
         let generation_dir = blocking::unblock({
             let repo_dir = repo_dir.clone();
             move || {
@@ -412,7 +443,7 @@ impl DaemonCheckouts {
             repo_dir,
             generation,
             generation_dir,
-            entry,
+            entry: Arc::clone(&entry),
         })
     }
 

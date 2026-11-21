@@ -246,6 +246,8 @@ mod tests {
             queue_position: None,
             removals: 0,
             last_removal: None,
+            removal_checks: Vec::new(),
+            merge_state: None,
             head_sha: head.to_string(),
             checks: conclusions
                 .iter()

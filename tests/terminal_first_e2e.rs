@@ -6300,25 +6300,38 @@ async fn tokens_held_by_exec_probe(
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Leases words of `session_id`'s pool in the daemon, on one connection,
-/// until every free one is taken; returns the pool and the leases.
+/// Leases words of `session_id`'s pool in the daemon, over four connections
+/// at once, until every free one is taken. Every lease is one blocking round
+/// trip on its connection, so a few at once shorten the drain — and the
+/// time a tested job must outlive — without changing what the drain covers.
+/// Each connection's entry keeps its `SessionIds` paired with the leases it
+/// took, so a caller can fence a release on the connection that carries it
+/// before the connection closes.
 async fn lease_every_free_word(
     socket: &Path,
     session_id: &str,
-) -> (may_agent::model_ids::SessionIds, Vec<aither_core::IdLease>) {
-    let ids = may_agent::client::ids::DaemonIds::connect(socket)
+) -> Vec<(may_agent::model_ids::SessionIds, Vec<aither_core::IdLease>)> {
+    let connect_and_drain = || async {
+        let ids = may_agent::client::ids::DaemonIds::connect(socket)
+            .await
+            .expect("the daemon id connection")
+            .session(session_id);
+        tokio::task::spawn_blocking(move || {
+            let mut leases = Vec::new();
+            while let Ok(lease) = ids.lease() {
+                leases.push(lease);
+            }
+            (ids, leases)
+        })
         .await
-        .expect("the daemon id connection")
-        .session(session_id);
-    tokio::task::spawn_blocking(move || {
-        let mut leases = Vec::new();
-        while let Ok(lease) = ids.lease() {
-            leases.push(lease);
-        }
-        (ids, leases)
-    })
-    .await
-    .expect("leasing finishes")
+        .expect("leasing finishes")
+    };
+    let ((first, second), (third, fourth)) = futures_lite::future::zip(
+        futures_lite::future::zip(connect_and_drain(), connect_and_drain()),
+        futures_lite::future::zip(connect_and_drain(), connect_and_drain()),
+    )
+    .await;
+    [first, second, third, fourth].into()
 }
 
 /// Returns `ids` once the daemon served every request sent on its connection
@@ -6384,24 +6397,31 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     };
 
     // While exec's job holds its word, the daemon hands out every other word.
+    // Its timeout needs to outlive only the drain below: the job is killed
+    // when it ends, which is when exec reports the word.
     let started = session.sandbox_dir.join("tmp/started");
     let running = tokio::spawn(exec(
         &session.id,
         format!("touch {}; while :; do sleep 0.1; done", started.display()),
-        "60",
+        "15",
     ));
     let deadline = Instant::now() + Duration::from_secs(60);
     while !started.exists() {
         assert!(Instant::now() < deadline, "exec's job never started");
         sleep(Duration::from_millis(50)).await;
     }
-    let (ids, leases) = lease_every_free_word(&socket, &session.id).await;
-    let daemon_words: std::collections::BTreeSet<String> =
-        leases.iter().map(ToString::to_string).collect();
+    let drained = lease_every_free_word(&socket, &session.id).await;
+    let daemon_words: std::collections::BTreeSet<String> = drained
+        .iter()
+        .flat_map(|(_, leases)| leases.iter().map(ToString::to_string))
+        .collect();
     // The words go back before exec's job ends, which stores its output
-    // under words of its own.
-    drop(leases);
-    drop(served(ids).await);
+    // under words of its own; each connection's releases are fenced before
+    // it closes.
+    for (ids, leases) in drained {
+        drop(leases);
+        drop(served(ids).await);
+    }
     let output = running
         .await
         .expect("exec task")
@@ -6419,7 +6439,8 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     // While the daemon holds every word of the other session but a few,
     // exec's job there gets one of those. A few, since the killed job's
     // output is stored under words too.
-    let (ids, mut held) = lease_every_free_word(&socket, &other.id).await;
+    let mut drained = lease_every_free_word(&socket, &other.id).await;
+    let (ids, mut held) = drained.remove(0);
     let free: std::collections::BTreeSet<String> =
         held.drain(..4).map(|lease| lease.to_string()).collect();
     let ids = served(ids).await;
@@ -6431,7 +6452,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
         free.contains(&exec_word),
         "exec took {exec_word}, not one of the words the daemon did not hold: {free:?}"
     );
-    drop((ids, held));
+    drop((drained, ids, held));
 
     let stop = Command::new(&binary)
         .args(["daemon", "stop"])

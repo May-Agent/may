@@ -356,3 +356,85 @@ fn roots_parsing_stops_at_the_next_heading() {
     assert_eq!(parse_roots(tasks), ["a#1 x", "b#2"]);
     assert_eq!(parse_roots("## Open\n- c#3\n"), Vec::<String>::new());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resolve_prompt_path_blocks_container_and_local_symlink_escapes() {
+    use aither_sandbox::{ContainerPath, MountRoot};
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let sandbox = temp.path().join("sandbox");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&sandbox).expect("sandbox");
+    std::fs::create_dir_all(&outside).expect("outside");
+    let host_secret = outside.join("secret.txt");
+    std::fs::write(&host_secret, "host secret").expect("secret");
+    std::fs::write(sandbox.join("real.md"), "inside").expect("real");
+
+    symlink(&host_secret, sandbox.join("escape.md")).expect("escape symlink");
+    symlink(&outside, sandbox.join("linked_dir")).expect("dir symlink");
+    symlink("/nonexistent/host/probe", sandbox.join("dangling_host.md")).expect("dangling");
+    symlink("real.md", sandbox.join("inside_link.md")).expect("inside symlink");
+
+    let mount = MountRoot {
+        host_root: sandbox.clone(),
+        container_root: ContainerPath::new("/workspace").expect("container path"),
+    };
+
+    for bad in [
+        "/workspace/escape.md",
+        "escape.md",
+        "/workspace/linked_dir/secret.txt",
+        "/workspace/dangling_host.md",
+        "/etc/passwd",
+        "../outside/secret.txt",
+    ] {
+        assert!(
+            matches!(
+                super::resolve_prompt_path(&sandbox, Some(&mount), bad),
+                Err(AgentLinkError::OutsideSandbox(_))
+            ),
+            "sync container resolve must reject {bad}"
+        );
+        assert!(
+            matches!(
+                super::resolve_prompt_path_async(&sandbox, Some(&mount), bad).await,
+                Err(AgentLinkError::OutsideSandbox(_))
+            ),
+            "async container resolve must reject {bad}"
+        );
+    }
+
+    for bad_local in [
+        "escape.md",
+        "linked_dir/secret.txt",
+        "dangling_host.md",
+        "../outside/secret.txt",
+        host_secret.to_str().expect("utf8"),
+    ] {
+        assert!(
+            matches!(
+                super::resolve_prompt_path(&sandbox, None, bad_local),
+                Err(AgentLinkError::OutsideSandbox(_))
+            ),
+            "sync local resolve must reject {bad_local}"
+        );
+        assert!(
+            matches!(
+                super::resolve_prompt_path_async(&sandbox, None, bad_local).await,
+                Err(AgentLinkError::OutsideSandbox(_))
+            ),
+            "async local resolve must reject {bad_local}"
+        );
+    }
+
+    let ok_container =
+        super::resolve_prompt_path_async(&sandbox, Some(&mount), "/workspace/inside_link.md")
+            .await
+            .expect("intra-sandbox symlink is permitted");
+    assert_eq!(
+        ok_container,
+        std::fs::canonicalize(sandbox.join("real.md")).expect("canonical")
+    );
+}

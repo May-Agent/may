@@ -107,6 +107,9 @@ pub async fn start(
     mode.ensure_supported()?;
 
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
+    crate::session::ensure_private_dir_async(&may_dir)
+        .await
+        .with_context(|| format!("Failed to secure {}", may_dir.display()))?;
 
     let mcp_manager = McpManager::load()
         .await
@@ -317,7 +320,8 @@ pub async fn start(
         live_limits,
         ui_event_bus: ui_event_bus.clone(),
         container_prepare,
-        container_manager,
+        container_manager: arc_swap::ArcSwapOption::from(container_manager),
+        pending_transcripts: super::disk_exhaustion::PendingTranscriptStore::default(),
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
         browser_lifecycle_tx,
@@ -384,9 +388,10 @@ pub async fn start(
 
     // Spawn background tasks
     super::archive::spawn(state.clone());
-    if let Some(ref cm) = state.container_manager {
+    if let Some(cm) = state.container_manager.load_full() {
         let _auto_stop = cm.spawn_auto_stop_task();
     }
+    super::disk_exhaustion::spawn_pending_transcript_flusher(&state);
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
     super::user_wait::spawn_notifier(&state);
@@ -395,6 +400,7 @@ pub async fn start(
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
+    super::config::spawn_config_file_watcher(&state);
     super::pr_checks::spawn(state.clone());
     super::auto_update::spawn(state.clone());
     // The tailscale-serve listener trusts Serve's identity header; a direct
@@ -417,11 +423,14 @@ pub async fn start(
     );
     let node_names =
         super::auth::NodeNamesCache::new(super::remote_access::TailscaleNodeNames(state.clone()));
+    let whois_cache =
+        super::auth::WhoisCache::new(super::remote_access::TailscalePeerWhois(state.clone()));
     let direct_router = build_router(
         state.clone(),
         mode,
-        super::auth::DirectListener::new(
+        super::auth::DirectListener::with_whois(
             node_names,
+            whois_cache,
             super::auth::RequireIdentity::new(vec![Box::new(
                 state
                     .remote_access_manager
@@ -796,7 +805,10 @@ async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Jso
     state
         .draining
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    state.daemon_shutdown.notify_one();
+    // Wake every shutdown waiter — the drain task and the background loops —
+    // not just one; the `draining` flag latches shutdown for waiters that
+    // have not registered yet.
+    state.daemon_shutdown.notify_waiters();
     Ok(Json(super::types::API_OK))
 }
 
@@ -811,8 +823,10 @@ async fn ensure_local_listener(
         .ensure_local(req.port, &state)
         .await
         .map_err(|error| super::error::bad_request_error(error.to_string()))?;
-    let updated = state.update_config(|config| config.daemon.port = Some(addr.port()));
-    state.save_config(&updated).await.map_err(internal_error)?;
+    state
+        .save_and_update_config(|config| config.daemon.port = Some(addr.port()))
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(crate::ui_event_bus::UiEventTopics::CONFIG);
     Ok(Json(super::types::LocalListenerResponse {
         port: addr.port(),

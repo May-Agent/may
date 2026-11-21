@@ -1,0 +1,1 @@
+The container runtime for this session is currently unavailable ({{ detail }}). Once the container runtime is running again, the session will reconnect and restore its container automatically.

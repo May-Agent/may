@@ -1,1 +1,1 @@
-git log --reverse -z --format=%h%n%B {{ base }}..{{ head }}
+git log --reverse -z --format=%h%n%B {{ head }}{% for exclude in excludes %} ^{{ exclude }}{% endfor %}
