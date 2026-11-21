@@ -38,6 +38,10 @@ pub struct TerminalPermissionHandler {
     /// subagent shells a session builds share the handler aither hands them,
     /// so the boundary is enforced per request by the call's agent identity.
     subagent_approver: Arc<std::sync::OnceLock<Option<PermissionApprover>>>,
+    /// The requests subagents put to the agent that launched them: a child's
+    /// unsandboxed escalation waits on its parent's `subagent approve`/`deny`
+    /// before it reaches the session's user.
+    child_approvals: crate::subagent::ChildApprovals,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
@@ -64,6 +68,7 @@ impl TerminalPermissionHandler {
             ssh: SshLocations::Deny,
             approver,
             subagent_approver: Arc::new(std::sync::OnceLock::new()),
+            child_approvals: crate::subagent::ChildApprovals::new(),
             runtime_service,
             session_id,
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
@@ -92,6 +97,7 @@ impl TerminalPermissionHandler {
             ssh: SshLocations::Allow,
             approver: None,
             subagent_approver: Arc::new(std::sync::OnceLock::new()),
+            child_approvals: crate::subagent::ChildApprovals::new(),
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
@@ -103,6 +109,21 @@ impl TerminalPermissionHandler {
     /// Replaces the live outbound network policy used by subsequent requests.
     pub fn set_network_policy(&self, policy: Option<CompiledNetworkPolicy>) {
         self.network_policy.store(Arc::new(policy));
+    }
+
+    /// Shares `approvals` with the session's `subagent` command: the requests
+    /// subagents put to their parents park there and this handler waits on
+    /// them.
+    #[must_use]
+    pub fn with_child_approvals(mut self, approvals: crate::subagent::ChildApprovals) -> Self {
+        self.child_approvals = approvals;
+        self
+    }
+
+    /// The registry the session's `subagent` command answers.
+    #[must_use]
+    pub const fn child_approvals(&self) -> &crate::subagent::ChildApprovals {
+        &self.child_approvals
     }
 
     /// The handler a subagent's approvals go through: the same session's
@@ -202,6 +223,25 @@ impl Approver for TerminalPermissionHandler {
         });
         match request.kind().as_str() {
             UNSANDBOXED_KIND if subagent => {
+                // The parent agent decides first: the request parks until its
+                // `subagent approve`/`deny`, and only an approval reaches the
+                // session's user. A parent not watching gets the request as a
+                // prompt to its session.
+                match self.child_approvals.open(request.clone()) {
+                    Ok((approval, decision)) => {
+                        if !self.child_approvals.watched(approval.parent()) {
+                            self.child_approvals.alert_unwatched(&approval).await;
+                        }
+                        match decision.recv().await {
+                            Ok(Approval::Approved) | Err(_) => {}
+                            Ok(denied) => return Ok(denied),
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "a subagent request could not be put to its parent"
+                    ),
+                }
                 let approver = self
                     .subagent_approver
                     .get_or_init(|| self.approver.clone().map(PermissionApprover::for_subagent));

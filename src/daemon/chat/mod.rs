@@ -4785,6 +4785,7 @@ fn build_session_agent<'a>(
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),
+                session_prompts: Some(state.session_prompts.clone()),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
                 acp_host: Some(state.acp_host.clone()),

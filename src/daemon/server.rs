@@ -249,6 +249,8 @@ pub async fn start(
     // Prompts that task runs store for their sessions; dispatched once the
     // daemon state exists.
     let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
+    let session_prompts =
+        crate::task_wake::SessionPrompts::new(runtime_service.clone(), task_wake_tx);
     let mut task_runtime = crate::scheduler::TaskRuntime::load(
         db_for_archive.clone(),
         may_dir.clone(),
@@ -262,10 +264,7 @@ pub async fn start(
     .map_err(|error| anyhow!(error))?
     .with_connectivity(connectivity.clone())
     .with_job_server(job_server.clone())
-    .with_session_prompts(crate::task_wake::SessionPrompts::new(
-        runtime_service.clone(),
-        task_wake_tx,
-    ));
+    .with_session_prompts(session_prompts.clone());
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
@@ -341,6 +340,7 @@ pub async fn start(
         title_generation_queue,
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
+        session_prompts,
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),

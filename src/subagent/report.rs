@@ -100,6 +100,41 @@ pub struct SubagentBrief<'a> {
     pub brief: &'a str,
 }
 
+/// The request a run parked for its caller's decision, returned as the
+/// launching call's result while the run continues.
+#[derive(Template)]
+#[template(path = "subagent/approval_needed.txt", escape = "none")]
+pub struct ApprovalNeeded<'a> {
+    /// The subagent asking.
+    pub subagent: &'a str,
+    /// The request's id, to answer it with.
+    pub id: &'a str,
+    /// What it asks to do.
+    pub subject: &'a str,
+    /// Why it asks.
+    pub reason: Option<&'a str>,
+}
+
+/// What answering a parked request tells the caller.
+#[derive(Template)]
+#[template(path = "subagent/approval_answered.txt", escape = "none")]
+pub struct ApprovalAnswered<'a> {
+    /// The request's id.
+    pub id: &'a str,
+    /// Whether it was approved.
+    pub approved: bool,
+}
+
+/// A parked run's report, delivered to its session when it ends.
+#[derive(Template)]
+#[template(path = "subagent/run_finished.txt", escape = "none")]
+pub struct RunFinished<'a> {
+    /// The subagent.
+    pub subagent: &'a str,
+    /// Its report.
+    pub report: &'a str,
+}
+
 /// Why a fork was not started.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ForkRefusal {

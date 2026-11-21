@@ -19,18 +19,29 @@ use serde::Deserialize;
 ///
 /// The brief is always read from a file: write it to a file first, then pass
 /// its path. Inline prompt text is not a file path and is rejected.
+///
+/// `subagent approve --id <request>` and `subagent deny --id <request>`
+/// answer a permission request one of your subagents put to you; `deny`
+/// takes `--reason` for the reason the subagent reads.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentArgs {
-    /// The subagent to run, or `fork`, `resume` or `external`.
+    /// The subagent to run, or `fork`, `resume`, `external`, `approve` or
+    /// `deny`.
     pub name: String,
     /// Path to a file holding the brief, or for `resume` the follow-up. The
     /// file must exist and be non-empty.
+    #[serde(default)]
     pub prompt_file: String,
     /// `resume` only: the id from a finished subagent's result, a single
-    /// word. Ids expire with the provider's prompt cache.
+    /// word. Ids expire with the provider's prompt cache. `approve` and
+    /// `deny` take it too: the id the subagent's request reported.
     #[serde(default)]
     pub id: Option<String>,
+    /// `deny` only: why the request is refused, the reason the subagent
+    /// reads.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// `external` only: the connected agent to run.
     #[serde(default)]
     pub agent: Option<String>,
@@ -88,6 +99,18 @@ pub enum Call<'a> {
     Resume {
         /// Its id.
         id: &'a str,
+    },
+    /// Approves a subagent's pending permission request.
+    Approve {
+        /// The request's id.
+        id: &'a str,
+    },
+    /// Denies a subagent's pending permission request.
+    Deny {
+        /// The request's id.
+        id: &'a str,
+        /// The reason the subagent reads.
+        reason: Option<&'a str>,
     },
 }
 
@@ -172,6 +195,35 @@ impl SubagentArgs {
                 anyhow::anyhow!("{error}; run `models` to see the models a call may run on")
             })?;
         let choosing = model.is_some() || self.tier.is_some();
+        if matches!(name, "approve" | "deny") {
+            if choosing {
+                anyhow::bail!("`subagent {name}` takes no `--model` or `--tier`");
+            }
+            if !grant.is_empty() || self.agent.is_some() {
+                anyhow::bail!("`subagent {name}` answers a request: it takes only `--id`");
+            }
+            if !self.prompt_file.is_empty() {
+                anyhow::bail!("`subagent {name}` takes no `--prompt-file`");
+            }
+            let Some(id) = self.id.as_deref() else {
+                anyhow::bail!(
+                    "`subagent {name}` takes the `--id` of the subagent's request to answer"
+                );
+            };
+            if name == "approve" && self.reason.is_some() {
+                anyhow::bail!("only `subagent deny` takes a `--reason`");
+            }
+            return Ok(match name {
+                "approve" => Call::Approve { id },
+                _ => Call::Deny {
+                    id,
+                    reason: self.reason.as_deref(),
+                },
+            });
+        }
+        if self.reason.is_some() {
+            anyhow::bail!("only `subagent deny` takes a `--reason`");
+        }
         Ok(match name {
             "resume" => {
                 let Some(id) = self.id.as_deref() else {

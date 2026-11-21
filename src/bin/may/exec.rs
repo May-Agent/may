@@ -116,6 +116,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
     let model = select_exec_model(&may_config);
     let sandbox = select_exec_mode(&args, &environment);
+    let child_approvals = may_agent::subagent::ChildApprovals::new();
     let shell = Box::pin(build_exec_shell(
         &context,
         &environment,
@@ -123,6 +124,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &model,
         args.ssh_server_id.as_deref(),
         tool_distribution,
+        child_approvals.clone(),
     ))
     .await?;
 
@@ -299,6 +301,7 @@ async fn build_exec_shell(
     model: &may_agent::ModelSelector,
     ssh_server_id: Option<&str>,
     tool_distribution: Arc<may_agent::tools::ToolDistribution>,
+    child_approvals: may_agent::subagent::ChildApprovals,
 ) -> Result<Arc<SessionShell>, ExecError> {
     // Only the targeted server is registered, so a local exec never depends
     // on the state of the profile's other attached servers.
@@ -332,7 +335,8 @@ async fn build_exec_shell(
             .profile_model
             .as_ref()
             .map(|profile| profile.id.clone()),
-    );
+    )
+    .with_child_approvals(child_approvals.clone());
     let audit_log = aither_sandbox::open_network_audit_log(
         context
             .may_dir
@@ -432,6 +436,7 @@ async fn build_exec_shell(
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
+        child_approvals.clone(),
     ))
     .await?;
     let grants = Grants::new();
@@ -474,6 +479,7 @@ async fn build_exec_commands<LLM>(
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
+    child_approvals: may_agent::subagent::ChildApprovals,
 ) -> Result<may_agent::ipc::CommandRegistry, ExecError>
 where
     LLM: aither_core::LanguageModel + Clone + Sync + 'static,
@@ -499,6 +505,7 @@ where
             rules_import: None,
             subagent_models: None,
             model_listing: None,
+            child_approvals,
             services: may_agent::SharedServices::new(&context.may_dir)
                 .with_forge_auth(forge_auth.clone()),
             llm,

@@ -59,6 +59,7 @@ where
             name: EXPLORE.to_string(),
             prompt_file: args.prompt_file,
             id: None,
+            reason: None,
             agent: None,
             model: None,
             tier: None,

@@ -278,6 +278,9 @@ pub struct MayAgentConfig {
     pub location: Option<crate::location::LocationInfo>,
     /// Optional broker for `task` command requests.
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
+    /// The session's prompt queue: a subagent's approval request and a
+    /// parked run's result are delivered to the parent through it.
+    pub session_prompts: Option<crate::task_wake::SessionPrompts>,
     /// Optional broker for `tunnel` command requests.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Optional broker for `browser` command requests.
@@ -373,6 +376,8 @@ pub struct MayAgentSessionInput<'a> {
     pub location: Option<crate::location::LocationInfo>,
     /// Channel for scheduled-task create requests.
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
+    /// The session's prompt queue, when the daemon hosts it.
+    pub session_prompts: Option<crate::task_wake::SessionPrompts>,
     /// Channel for tunnel registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// The daemon's ACP hosts; connected ACP agents run on them, inside the
@@ -656,6 +661,14 @@ impl MayAgent {
                 .with_interpreters(call_interpreters.clone())
                 .with_approval_pause(approval_pause.clone())
         });
+        // Subagent escalations are decided by the agent that launched them
+        // before they reach the user: one registry shared by the handler and
+        // the `subagent` command.
+        let mut child_approvals = crate::subagent::ChildApprovals::new();
+        if let Some(prompts) = &config.session_prompts {
+            child_approvals = child_approvals
+                .with_session(prompts.clone(), config.session_id.as_str().to_string());
+        }
         let permissions = TerminalPermissionHandler::for_agent(
             permission_approver.clone(),
             config.network_policy.clone(),
@@ -666,7 +679,8 @@ impl MayAgent {
             config.ask_user_broker.clone(),
             config.db.clone(),
             approval_pause.clone(),
-        ));
+        ))
+        .with_child_approvals(child_approvals.clone());
         // Local and container commands draw from the pool: a container
         // command's fifo is made in the container's kernel and brokered by
         // aither's relay over its exec, so it works on VM-backed runtimes
@@ -1100,6 +1114,7 @@ impl MayAgent {
             SharedTerminalCommandConfig {
                 llm: terminal_command_llm,
                 subagent_tracker: subagent_tracker.clone(),
+                child_approvals: child_approvals.clone(),
                 ask_flagship,
                 ask_balanced,
                 ask_fast,
@@ -1461,6 +1476,7 @@ impl MayAgent {
             plan_state,
             location,
             task_broker,
+            session_prompts,
             tunnel_broker,
             browser_broker,
             acp_host,
@@ -1638,6 +1654,7 @@ impl MayAgent {
             secrets,
             location,
             task_broker,
+            session_prompts,
             tunnel_broker,
             browser_broker,
             acp: acp_host,
