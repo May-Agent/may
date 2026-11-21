@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/May-Agent/may/compare/patch/v0.1.2...patch/v0.2.0) - 2026-11-21
+
+### Added
+
+- *(patch)* [**breaking**] match exactly first, then with all whitespace removed, and report each ambiguity
+
+### Other
+
+- Harden git tools, merge flow, and sandbox task editing
+
 ## [0.1.2](https://github.com/May-Agent/may/compare/patch/v0.1.1...patch/v0.1.2) - 2026-11-12
 
 ### Added
