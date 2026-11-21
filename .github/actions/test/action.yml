@@ -53,6 +53,23 @@ runs:
         if command -v mold > /dev/null; then
           echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "${GITHUB_ENV}"
         fi
+    # ld64.lld is to Apple's linker what mold is to GNU ld; a brewed
+    # `ld64.lld` on PATH is what clang's -fuse-ld=lld resolves. Apple's
+    # linker adds the Swift runtime's library path itself — dependencies
+    # carry Swift objects — so lld gets the two `runtimeLibraryPaths`
+    # `swiftc -print-target-info` reports, as -L for resolution and -rpath
+    # for the tests' own runs.
+    - name: Link test binaries with lld
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install lld
+        toolchain="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx"
+        flags="-C link-arg=-fuse-ld=lld"
+        for lib in "${toolchain}" /usr/lib/swift; do
+          flags="${flags} -C link-arg=-L${lib} -C link-arg=-Wl,-rpath,${lib}"
+        done
+        echo "RUSTFLAGS=${flags}" >> "${GITHUB_ENV}"
     - uses: dtolnay/rust-toolchain@stable
     # Only main saves; a PR or merge-group cache lives in a scope nothing else
     # restores, and its size evicts main's under the cache limit. Keyed by the
@@ -125,11 +142,16 @@ runs:
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
       run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+    # The same `--all-targets` resolution the build and nextest steps used:
+    # `--test` selects a narrower target set, which re-resolves features and
+    # recompiles may-agent (five minutes on macOS) to run a fifteen-second
+    # test. Running the binary directly would skip the cargo environment the
+    # tests read (`CARGO_BIN_EXE_may`).
     - name: Verify baseline tools
       if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
       shell: bash
       run: >
-        cargo nextest run --locked --test terminal_first_e2e --run-ignored only
+        cargo nextest run --locked --all-targets --run-ignored only
         -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
         --no-capture
     - name: Upload cargo timings
