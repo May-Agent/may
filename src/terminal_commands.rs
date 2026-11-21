@@ -59,6 +59,9 @@ pub struct SubagentAssembly {
     pub instructions: Vec<String>,
     /// Shared native OCR runtime for subagents launched in this session.
     pub vision_ocr: crate::vision_ocr::VisionOcr,
+    /// The session's permission handler: a read-only subagent's shell is
+    /// given its confined variant.
+    pub permissions: crate::terminal_permission_handler::TerminalPermissionHandler,
 }
 
 /// Dependencies every shared terminal IPC command needs from the host runtime.
@@ -685,6 +688,7 @@ where
         keep_alive,
         instructions,
         vision_ocr,
+        permissions,
     } = config.subagents;
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
@@ -716,6 +720,7 @@ where
         base_dir: config.sandbox_dir.clone(),
         fork_source: fork_source.clone(),
         toolkit,
+        read_only_permissions: permissions.for_read_only_subagent(),
         redactor: crate::secrets::SecretRedactor::for_session(
             &config.may_dir,
             config.session_id.as_str(),
@@ -894,6 +899,9 @@ mod tests {
             keep_alive: None,
             instructions: Vec::new(),
             vision_ocr: crate::vision_ocr::VisionOcr::new(),
+            permissions: crate::terminal_permission_handler::TerminalPermissionHandler::for_agent(
+                None, None, None,
+            ),
         }
     }
 
@@ -975,7 +983,7 @@ mod tests {
         let ask_user_runtime = test_runtime(temp.path()).await;
         let mut builder = CommandRegistryBuilder::new();
 
-        let descriptions = register_shared_terminal_commands(
+        let descriptions = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1023,7 +1031,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register");
         let usages = descriptions.usages;
@@ -1074,7 +1082,7 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let mut builder = CommandRegistryBuilder::new();
 
-        let descriptions = register_shared_terminal_commands(
+        let descriptions = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1119,7 +1127,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register")
         .descriptions;
@@ -1146,7 +1154,7 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let mut builder = CommandRegistryBuilder::new();
 
-        let descriptions = register_shared_terminal_commands(
+        let descriptions = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1191,7 +1199,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register")
         .descriptions;
@@ -1212,7 +1220,7 @@ mod tests {
         let mut request_parameters = Parameters::default();
         request_parameters.native_tools.claude.web_fetch = true;
 
-        let descriptions = register_shared_terminal_commands(
+        let descriptions = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1257,7 +1265,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register")
         .descriptions;
@@ -1273,7 +1281,7 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let ask_user_runtime = test_runtime(temp.path()).await;
         let mut builder = CommandRegistryBuilder::new();
-        register_shared_terminal_commands(
+        Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1318,7 +1326,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register");
         let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
@@ -1447,7 +1455,7 @@ mod tests {
         };
 
         let mut builder = CommandRegistryBuilder::new();
-        let shared = register_shared_terminal_commands(
+        let shared = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1492,7 +1500,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register");
         let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
@@ -1579,7 +1587,7 @@ mod tests {
         let (task_broker, _queue) = crate::agent::task_tool::channel();
         let mut builder = CommandRegistryBuilder::new();
 
-        register_shared_terminal_commands(
+        Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1624,7 +1632,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register");
         let commands = TestCommands::build(builder, session_dir.join("outputs")).await;
@@ -1642,7 +1650,7 @@ mod tests {
         let session_dir = temp.path().join("sessions/session-1");
         let mut builder = CommandRegistryBuilder::new();
 
-        let descriptions = register_shared_terminal_commands(
+        let descriptions = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1687,7 +1695,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await
         .expect("commands should register")
         .descriptions;
@@ -1709,7 +1717,7 @@ mod tests {
         git: crate::host_git::HostGit,
     ) -> Result<(CommandRegistryBuilder, SharedTerminalCommands), TerminalCommandsError> {
         let mut builder = CommandRegistryBuilder::new();
-        let commands = register_shared_terminal_commands(
+        let commands = Box::pin(register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
@@ -1754,7 +1762,7 @@ mod tests {
                 .limits()
                 .timeout_cap,
             },
-        )
+        ))
         .await?;
         Ok((builder, commands))
     }

@@ -432,6 +432,7 @@ async fn build_exec_shell(
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
+        permissions.clone(),
     ))
     .await?;
     let grants = Grants::new();
@@ -474,6 +475,7 @@ async fn build_exec_commands<LLM>(
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
+    permissions: TerminalPermissionHandler,
 ) -> Result<may_agent::ipc::CommandRegistry, ExecError>
 where
     LLM: aither_core::LanguageModel + Clone + Sync + 'static,
@@ -529,6 +531,7 @@ where
                 keep_alive: None,
                 instructions: Vec::new(),
                 vision_ocr: may_agent::vision_ocr::VisionOcr::new(),
+                permissions,
             },
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.

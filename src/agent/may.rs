@@ -1127,6 +1127,7 @@ impl MayAgent {
                     keep_alive,
                     instructions: subagent_instructions,
                     vision_ocr: crate::vision_ocr::VisionOcr::new(),
+                    permissions: permissions.clone(),
                 },
                 issue_store: issue_store.clone(),
                 task_events: task_events.clone(),
@@ -1200,6 +1201,11 @@ impl MayAgent {
                 shared_terminal_commands.fork_launcher.clone(),
                 toolkit.clone(),
                 config.languages,
+                permissions.for_read_only_subagent(),
+                crate::secrets::SecretRedactor::for_session(
+                    &config.may_dir,
+                    config.session_id.as_str(),
+                ),
             )
         });
 
