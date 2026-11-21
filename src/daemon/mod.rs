@@ -588,8 +588,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .context("failed to link `tasks` to the daemon's executable")?;
     let hashline = crate::config::MayConfig::load()
         .await
-        .map(|config| config.experimental.hashline)
-        .unwrap_or_default();
+        .is_ok_and(|config| config.experimental.hashline);
     lifecycle::ensure_hashline_links(&paths, hashline)
         .context("failed to link the hashline `search`/`edit` binaries")?;
 
