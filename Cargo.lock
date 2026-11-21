@@ -5732,9 +5732,13 @@ dependencies = [
  "libc",
  "linkify",
  "lzma-rust2 0.24.0",
+ "may-command-policy",
+ "may-config",
  "may-container-image",
  "may-patch",
+ "may-protocol",
  "may-tasks",
+ "may-tool-dist",
  "mediax-codec",
  "mime",
  "mime_guess",
@@ -5808,6 +5812,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "may-command-policy"
+version = "0.1.0"
+dependencies = [
+ "aither-core",
+ "aither-sandbox",
+ "askama 0.16.1",
+ "async-fs",
+ "blocking",
+ "futures-util",
+ "may-protocol",
+ "regex",
+ "syntect",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "may-config"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "aither-core",
+ "aither-models",
+ "aither-sandbox",
+ "anyhow",
+ "arc-swap",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "async-lock",
+ "base64 0.22.1",
+ "blocking",
+ "clap",
+ "dirs",
+ "dunce",
+ "executor-core",
+ "fs_extra",
+ "futures",
+ "futures-lite",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "humantime",
+ "include_dir",
+ "jiff",
+ "keyring",
+ "libc",
+ "may-protocol",
+ "may-tasks",
+ "percent-encoding",
+ "regex",
+ "reqwest 0.12.28",
+ "rustix 1.1.6",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "skyzen",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "url",
+ "utoipa",
+ "whatlang",
+ "zenwave",
+]
+
+[[package]]
 name = "may-container-image"
 version = "0.1.0"
 dependencies = [
@@ -5827,6 +5904,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "may-protocol"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "aither-core",
+ "arc-swap",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "brush-parser",
+ "executor-core",
+ "fastrand",
+ "futures-lite",
+ "futures-util",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "jiff",
+ "may-patch",
+ "may-tasks",
+ "petname",
+ "regex",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "skyzen",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tiktoken",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+ "zenwave",
+]
+
+[[package]]
 name = "may-sed"
 version = "0.3.0"
 dependencies = [
@@ -5843,6 +5959,43 @@ dependencies = [
  "askama 0.16.1",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "may-tool-dist"
+version = "0.1.0"
+dependencies = [
+ "aither-sandbox",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "async-process",
+ "blocking",
+ "executor-core",
+ "fd-lock",
+ "flate2",
+ "futures",
+ "futures-lite",
+ "heel",
+ "hex",
+ "lzma-rust2 0.24.0",
+ "may-container-image",
+ "percent-encoding",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "shell-words",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "zenwave",
+ "zip 9.5.0",
 ]
 
 [[package]]

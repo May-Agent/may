@@ -27,7 +27,7 @@ pub struct SystemReader(platform::State);
 impl SystemReader {
     /// The machine load this platform's reading is high at by default; see
     /// [`MachineLoad`] for what it measures.
-    pub const DEFAULT_LOAD_THRESHOLD: f64 = platform::DEFAULT_LOAD_THRESHOLD;
+    pub const DEFAULT_LOAD_THRESHOLD: f64 = super::DEFAULT_LOAD_THRESHOLD;
 
     /// A reader of this host.
     ///
@@ -93,8 +93,6 @@ mod apple {
     use std::io;
 
     use super::{MachineLoad, MemoryPressure, ReadError};
-
-    pub const DEFAULT_LOAD_THRESHOLD: f64 = 1.0;
 
     const PRESSURE_LEVEL: &CStr = c"kern.memorystatus_vm_pressure_level";
 
@@ -173,7 +171,6 @@ mod linux {
 
     /// Stall time of the last ten seconds at which tasks waiting for a CPU
     /// are a load worth telling the agent about.
-    pub const DEFAULT_LOAD_THRESHOLD: f64 = 0.3;
 
     const MEMORY: &str = "/proc/pressure/memory";
     const CPU: &str = "/proc/pressure/cpu";
@@ -228,7 +225,6 @@ mod windows {
 
     /// The share of CPU time not spent idle at which load is worth telling
     /// the agent about.
-    pub const DEFAULT_LOAD_THRESHOLD: f64 = 0.9;
 
     /// Cumulative CPU time in 100 ns ticks.
     #[derive(Debug, Clone, Copy)]
@@ -334,8 +330,6 @@ mod windows {
 )))]
 mod unsupported {
     use super::{MachineLoad, MemoryPressure, ReadError};
-
-    pub const DEFAULT_LOAD_THRESHOLD: f64 = 1.0;
 
     #[derive(Debug)]
     pub struct State;

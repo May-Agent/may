@@ -216,6 +216,19 @@ impl ChatDb {
     }
 }
 
+impl may_command_policy::CheckoutReadStore for ChatDb {
+    type Error = ChatDbError;
+
+    async fn record_checkout_read_files(
+        &self,
+        session_id: &str,
+        repo_key: &str,
+        paths: &[String],
+    ) -> Result<(), ChatDbError> {
+        Self::record_checkout_read_files(self, session_id, repo_key, paths).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;

@@ -1782,7 +1782,7 @@ fn shared_cache_ready_marker(shared: &Path) -> PathBuf {
     ] {
         std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/tools")
+                .join("tool-dist/src")
                 .join(name),
         )
         .expect("tool pin file should read")

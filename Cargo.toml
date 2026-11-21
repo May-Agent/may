@@ -17,16 +17,16 @@ path = "src/bin/may/main.rs"
 dist = true
 
 [workspace]
-members = [".", "tasks", "patch", "sed", "container-image"]
+members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy"]
 # `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
-default-members = [".", "tasks", "patch", "sed", "container-image"]
+default-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy"]
 
 [features]
 default = ["vision-ocr"]
 ui = []
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
 # release, so its update channel defaults to `stable` instead of `dev`.
-release-build = []
+release-build = ["may-config/release-build"]
 # On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
 vision-ocr = ["dep:waterkit-vision"]
 
@@ -34,6 +34,14 @@ vision-ocr = ["dep:waterkit-vision"]
 # The `tasks.md` parser and the `tasks` command; the container image tag is
 # derived from this crate's directory.
 may-tasks = { path = "tasks" }
+# The foundational wire types and leaf utilities extracted from this crate.
+may-protocol = { path = "protocol" }
+# The pinned tool distribution every execution backend prepares.
+may-tool-dist = { path = "tool-dist" }
+# The configuration layer: config.toml and everything it touches.
+may-config = { path = "config" }
+# The terminal script policies checked before a script runs.
+may-command-policy = { path = "command-policy" }
 # The content-addressed container image references.
 may-container-image = { path = "container-image" }
 libc = "0.2.191"
@@ -65,7 +73,7 @@ acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-fe
 
 # repo-search daemon client; the daemon refuses a client of another version,
 # so it is the version inside the v0.0.15 binary pinned in
-# `src/tools/host-programs.json`.
+# `tool-dist/src/host-programs.json`.
 repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
 async-lock = "3"
 
@@ -251,6 +259,11 @@ dispatch2 = { version = "0.3", default-features = false, features = ["std", "obj
 may-container-image = { path = "container-image" }
 
 [dev-dependencies]
+# Test-support helpers: the `serve_api` server, the fixture tool
+# distribution.
+may-protocol = { path = "protocol", features = ["testing"] }
+may-tool-dist = { path = "tool-dist", features = ["test-fixtures"] }
+may-config = { path = "config", features = ["test-fixtures"] }
 # Builds the tar.xz artifacts the distribution tests extract.
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 # Checks that every model-facing id word is one o200k_base token.

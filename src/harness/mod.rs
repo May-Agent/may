@@ -18,7 +18,7 @@ pub mod pressure;
 pub mod publish_review;
 pub mod runaway;
 pub mod secret_guard;
-pub mod subagent_file;
+pub use may_config::subagent_file;
 pub mod tool_request;
 pub mod working_document;
 pub mod workspace_request;

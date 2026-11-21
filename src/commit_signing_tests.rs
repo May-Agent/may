@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::test_user::{EMAIL, NAME, TestUser};
-use super::{CommitSigning, SIGNER_DIR, SIGNER_FILE, SignCommitArgs, SignCommitTool, SigningError};
+use crate::commit_signing::test_user::{EMAIL, NAME, TestUser};
+use crate::commit_signing::{
+    CommitSigning, SIGNER_DIR, SIGNER_FILE, SignCommitArgs, SignCommitTool, SigningError,
+};
 use crate::repo_clone::test_sandbox::TestTerminal;
 
 fn canonical_tempdir() -> tempfile::TempDir {
@@ -251,7 +253,10 @@ async fn a_container_is_given_the_signer_at_its_in_container_path() {
         "/workspace/.config/may/ssh-sign"
     );
     let script = std::fs::read_to_string(root.join(".config/may/ssh-sign")).unwrap();
-    assert!(script.contains(super::SIGN_COMMAND), "{script}");
+    assert!(
+        script.contains(crate::commit_signing::SIGN_COMMAND),
+        "{script}"
+    );
     // A directory outside the mount is an error, not a guessed path.
     let elsewhere = tmp.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -269,12 +274,12 @@ async fn a_container_is_given_the_signer_at_its_in_container_path() {
 #[test]
 fn a_signing_key_is_a_file_or_a_literal() {
     assert!(matches!(
-        super::SigningKey::parse("/abs/key").unwrap(),
-        super::SigningKey::File(_)
+        crate::commit_signing::SigningKey::parse("/abs/key").unwrap(),
+        crate::commit_signing::SigningKey::File(_)
     ));
     assert!(matches!(
-        super::SigningKey::parse("key::ssh-ed25519 AAAA").unwrap(),
-        super::SigningKey::Literal(_)
+        crate::commit_signing::SigningKey::parse("key::ssh-ed25519 AAAA").unwrap(),
+        crate::commit_signing::SigningKey::Literal(_)
     ));
 }
 
@@ -284,9 +289,15 @@ fn a_signing_key_is_a_file_or_a_literal() {
 fn the_requester_is_the_main_agent_or_a_named_subagent() {
     use aither_core::llm::tool::{AgentIdentity, CallIdentity, SubagentIdentity, ToolCallId};
     let call = |agent| CallIdentity::new(ToolCallId::new("c1"), agent);
-    assert_eq!(super::requester(Some(&call(AgentIdentity::Main))), "main");
+    assert_eq!(
+        crate::commit_signing::requester(Some(&call(AgentIdentity::Main))),
+        "main"
+    );
     let subagent = AgentIdentity::Subagent(SubagentIdentity::new("explore", None));
-    assert_eq!(super::requester(Some(&call(subagent))), "subagent explore");
+    assert_eq!(
+        crate::commit_signing::requester(Some(&call(subagent))),
+        "subagent explore"
+    );
 }
 
 /// A commit the host cannot sign fails; no unsigned commit is made.

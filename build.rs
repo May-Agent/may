@@ -10,9 +10,9 @@ use may_container_image::{combined_manifest_bytes, heel_version_in_lockfile, ima
 /// The manifest files the workspace image's tag hashes, through
 /// `manifest::combined_manifest_bytes`.
 const TOOL_DISTRIBUTION_MANIFESTS: [&str; 3] = [
-    "src/tools/third-party-tools.json",
-    "src/tools/tool-artifacts.json",
-    "src/tools/host-programs.json",
+    "tool-dist/src/third-party-tools.json",
+    "tool-dist/src/tool-artifacts.json",
+    "tool-dist/src/host-programs.json",
 ];
 
 fn main() {

@@ -764,8 +764,10 @@ impl MayAgent {
                 managed_bash: crate::command_policy::runs_managed_bash(is_container),
                 refused: refused_reads.clone(),
                 checkout_reads: Some(crate::command_policy::CheckoutReadTracker {
-                    checkouts: config.services.checkouts.clone(),
-                    db: config.db.clone(),
+                    checkouts: crate::command_policy::AnyCheckoutRegistry::new(
+                        config.services.checkouts.clone(),
+                    ),
+                    db: crate::command_policy::AnyCheckoutReadStore::new(config.db.clone()),
                     session_id: config.session_id.as_str().to_string(),
                 }),
             },

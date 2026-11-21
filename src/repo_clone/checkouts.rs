@@ -899,3 +899,21 @@ fn normalize_repo_rel(path: &Path) -> Option<String> {
     }
     Some(parts.join("/"))
 }
+
+impl may_command_policy::CheckoutLease for GenerationLease {
+    async fn release(self) {
+        Self::release(self).await;
+    }
+}
+
+impl may_command_policy::CheckoutRegistry for DaemonCheckouts {
+    type Lease = GenerationLease;
+
+    fn identify_path(&self, path: &Path) -> Option<(String, String)> {
+        Self::identify_path(self, path)
+    }
+
+    async fn acquire_lease(&self, repo_key: &str) -> Option<GenerationLease> {
+        Self::acquire_lease(self, repo_key).await
+    }
+}

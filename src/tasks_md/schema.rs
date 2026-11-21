@@ -14,7 +14,7 @@ use crate::harness::working_document::{DocumentRow, DocumentSchema, DocumentSpec
 use super::{FILE, TasksFile, violation_sentence};
 
 /// Lines `tasks.md` may hold unless `[tasks] line_limit` says otherwise.
-pub const DEFAULT_LINE_LIMIT: usize = 60;
+pub use may_tasks::DEFAULT_LINE_LIMIT;
 
 /// Lines `tasks.md` may hold; an edit that leaves it past them earns an
 /// alert asking for a rewrite.

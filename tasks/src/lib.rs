@@ -15,6 +15,9 @@
 //! the format's violations. [`edit`] is the `tasks` command's editing of the
 //! file, which refuses at write time what the parser reports as a violation.
 
+/// Lines `tasks.md` may hold unless `[tasks] line_limit` says otherwise.
+pub const DEFAULT_LINE_LIMIT: usize = 60;
+
 pub mod edit;
 mod reference;
 

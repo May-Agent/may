@@ -8,15 +8,15 @@ pub mod agent;
 /// Main agents on one machine discover each other and exchange messages.
 pub mod agent_link;
 /// Persistent storage for OAuth credentials.
-pub mod auth_store;
+pub use may_config::auth_store;
 
-pub mod bash;
+pub use may_config::bash;
 /// Managed browser sessions backing the browser tool.
 pub mod browser_service;
 /// Bundled resources shipped with the binary.
 pub mod bundle;
 /// Provider prompt-cache lifetime.
-pub mod cache_lifetime;
+pub use may_protocol::cache_lifetime;
 /// `ChatGPT` subscription OAuth flow.
 pub mod chatgpt;
 pub mod ci;
@@ -24,15 +24,15 @@ pub mod ci;
 pub mod client;
 /// Cloud machines: providers, their catalogs and machine lifecycles.
 pub mod cloud;
-/// Configuration loading and types.
-pub mod command_output;
 /// May's rules on what a terminal script may run.
-pub mod command_policy;
+pub use may_command_policy as command_policy;
+/// Streamed command output for the model.
+pub use may_protocol::command_output;
 /// How a terminal call's script is read before it runs.
-pub mod command_reading;
+pub use may_protocol::command_reading;
 /// One virtual desktop per session — computer use.
 pub mod computer;
-pub mod config;
+pub use may_config::config;
 /// Container runtime detection, images, and lifecycle.
 pub mod container;
 /// GitHub Copilot OAuth flow.
@@ -43,25 +43,25 @@ pub mod crash_signal;
 pub mod daemon;
 /// SQLite persistence for sessions, messages, and app state.
 pub mod db;
-/// Live decode-speed measurement for streamed model output.
-pub mod decode_meter;
-mod file_tracker;
 /// Forge coordinates and per-host authentication (GitHub, GitLab).
-pub mod forge;
-mod fs_utils;
+pub use may_config::forge;
+pub use may_config::fs_utils;
+/// Live decode-speed measurement for streamed model output.
+pub use may_protocol::decode_meter;
+pub use may_protocol::file_tracker;
 /// xAI Grok subscription OAuth flow.
 pub mod grok;
 /// The one way git runs on the host.
-pub mod host_git;
-mod id;
+pub use may_config::host_git;
+pub use may_protocol::id;
 /// Issue tracking: may issues by default, GitHub when configured.
 pub mod issue;
 /// The machine-wide jobserver token pool shared by every terminal.
-pub mod jobserver;
-mod live_response;
+pub use may_config::jobserver;
+pub use may_protocol::live_response;
 /// Location lookup for location-aware profiles.
-pub mod location;
-pub mod log_ring;
+pub use may_protocol::location;
+pub use may_protocol::log_ring;
 #[cfg(test)]
 mod managed_environment_tests;
 /// MCP server configuration, connections, and management.
@@ -69,22 +69,22 @@ pub mod mcp;
 /// Profile memory extraction and injection.
 pub mod memory;
 /// Model-facing ids: session names and each session's pool of words.
-pub mod model_ids;
+pub use may_protocol::model_ids;
 /// Model selection and filtering helpers.
-pub mod model_selector;
+pub use may_protocol::model_selector;
 /// Model listing and metadata.
 pub mod models;
 pub use aither_sandbox::network_policy;
 /// Signing of the commits agents make in their sandbox.
-pub mod commit_signing;
+pub use may_config::commit_signing;
 /// Web-push notification delivery and mailbox.
 pub mod notification;
 /// `OpenRouter` OAuth login flow.
-pub mod openrouter;
-/// Catches a panic at the boundary of the operation that raised it.
-pub mod panic_boundary;
+pub use may_config::openrouter;
 /// Large pasted text rendered for the model.
-pub mod pasted_text;
+pub use may_config::pasted_text;
+/// Catches a panic at the boundary of the operation that raised it.
+pub use may_protocol::panic_boundary;
 /// `pr` — the session's landing object: numbered, session-owned PRs.
 pub mod pr;
 /// Profile model and environment resolution.
@@ -92,7 +92,7 @@ pub mod profile;
 /// `@`-mention extraction and prompt text building.
 pub mod prompt_mentions;
 
-mod quota;
+pub use may_protocol::quota;
 /// Per-session repository clones inside the session sandbox.
 pub mod repo_clone;
 pub mod repo_gate;
@@ -111,7 +111,7 @@ pub mod trust;
 /// May's IPC command bridge.
 pub mod harness;
 pub mod ipc;
-pub mod secrets;
+pub use may_config::secrets;
 /// Session model, history, and on-disk layout.
 pub mod session;
 pub mod shell;
@@ -137,7 +137,7 @@ pub mod terminal_permission_handler;
 /// Tool request dispatch to session handlers.
 pub mod tool_dispatch;
 /// Miscellaneous tool helpers.
-pub mod tools;
+pub use may_tool_dist as tools;
 /// Terminal user interface.
 pub mod tui;
 /// Event bus publishing UI-facing state changes.
@@ -151,10 +151,10 @@ pub mod vision_ocr;
 /// HTTP/SSE server backing the web UI.
 /// Workspace request handling.
 pub mod workspace;
-/// XML block serialization for prompt/context payloads.
-pub mod xml;
 pub use harness::ask_user;
 pub use harness::workspace_request;
+/// XML block serialization for prompt/context payloads.
+pub use may_protocol::xml;
 
 pub use agent::{
     AgentEnvironment, ContextCategory, ContextCategoryRow, ContextReport, MayAgent,
@@ -181,135 +181,16 @@ pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
 pub use xml::{XmlBlock, XmlBlockError};
 
+#[cfg(test)]
+mod commit_signing_tests;
+
 /// Test support shared by the crate's `#[cfg(test)]` code.
 #[cfg(test)]
 mod test_support {
-    /// Installs the process-wide executor the production binary installs at
-    /// startup. Idempotent: every nextest test runs in its own process, so a
-    /// test that reaches the global executor must install it itself.
-    pub fn install_global_executor() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-    }
-
-    /// One request a [`serve_api`] server received.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ApiRequest {
-        /// The method, e.g. `GET`.
-        pub method: String,
-        /// The path and query.
-        pub path: String,
-        /// The `Authorization` header, empty when absent.
-        pub authorization: String,
-        /// The body, as text.
-        pub body: String,
-    }
-
-    /// What a [`serve_api`] server answers one request with.
-    #[derive(Debug, Clone)]
-    pub struct ApiReply {
-        /// The HTTP status.
-        pub status: u16,
-        /// Headers beyond `content-type: application/json`.
-        pub headers: Vec<(&'static str, String)>,
-        /// The body.
-        pub body: String,
-    }
-
-    impl ApiReply {
-        /// A JSON `body` answered with `status`.
-        pub fn json(status: u16, body: impl Into<String>) -> Self {
-            Self {
-                status,
-                headers: Vec::new(),
-                body: body.into(),
-            }
-        }
-
-        /// The reply with header `name` set to `value`.
-        #[must_use]
-        pub fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-            self.headers.push((name, value.into()));
-            self
-        }
-    }
-
-    /// Every request a [`serve_api`] server received, in arrival order.
-    pub type ApiRequests = std::sync::Arc<std::sync::Mutex<Vec<ApiRequest>>>;
-
-    /// Serves an HTTP API on a loopback port: `handler` answers each request,
-    /// given it and the server's base URL. Resolves to the base URL and the
-    /// log of requests.
-    pub async fn serve_api(
-        handler: impl Fn(&ApiRequest, &str) -> ApiReply + Send + Sync + 'static,
-    ) -> (String, ApiRequests) {
-        use std::sync::{Arc, Mutex};
-
-        let handler = Arc::new(handler);
-        let requests: ApiRequests = Arc::new(Mutex::new(Vec::new()));
-        let log = requests.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the loopback API");
-        let base = format!("http://{}", listener.local_addr().expect("local address"));
-        let served_base = base.clone();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.expect("accept");
-                let handler = handler.clone();
-                let log = log.clone();
-                let base = served_base.clone();
-                let service = hyper::service::service_fn(
-                    move |request: hyper::Request<hyper::body::Incoming>| {
-                        let handler = handler.clone();
-                        let log = log.clone();
-                        let base = base.clone();
-                        async move {
-                            let (parts, body) = request.into_parts();
-                            let body = http_body_util::BodyExt::collect(body)
-                                .await
-                                .map_or_default(http_body_util::Collected::to_bytes);
-                            let request = ApiRequest {
-                                method: parts.method.to_string(),
-                                path: parts
-                                    .uri
-                                    .path_and_query()
-                                    .map_or("", |pq| pq.as_str())
-                                    .to_string(),
-                                authorization: parts
-                                    .headers
-                                    .get(hyper::header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                body: String::from_utf8_lossy(&body).into_owned(),
-                            };
-                            let reply = handler(&request, &base);
-                            log.lock().expect("requests").push(request);
-                            let mut response = hyper::Response::builder()
-                                .status(reply.status)
-                                .header("content-type", "application/json");
-                            for (name, value) in reply.headers {
-                                response = response.header(name, value);
-                            }
-                            Ok::<_, std::convert::Infallible>(
-                                response
-                                    .body(http_body_util::Full::new(hyper::body::Bytes::from(
-                                        reply.body,
-                                    )))
-                                    .expect("response"),
-                            )
-                        }
-                    },
-                );
-                tokio::spawn(async move {
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                        .await;
-                });
-            }
-        });
-        (base, requests)
-    }
+    #[allow(unused_imports)]
+    pub use may_protocol::test_support::{
+        ApiReply, ApiRequest, ApiRequests, install_global_executor, serve_api,
+    };
 
     /// An output store in `dir` with the default model-facing id allocator.
     pub async fn test_output_store(

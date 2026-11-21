@@ -16,8 +16,6 @@ use crate::session::SessionPaths;
 
 // Embed the skills directory at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
-// The subagent definitions, one TOML file each.
-static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/subagents");
 
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
@@ -57,17 +55,7 @@ impl Bundle {
     /// Panics when an embedded definition is invalid, which a test rules out.
     #[must_use]
     pub fn subagent_definitions() -> Vec<crate::harness::subagent_file::SubagentDefinition> {
-        SUBAGENTS_DIR
-            .files()
-            .map(|file| {
-                let path = file.path().display();
-                let source = file
-                    .contents_utf8()
-                    .unwrap_or_else(|| panic!("subagent definition {path} is not UTF-8"));
-                crate::harness::subagent_file::SubagentDefinition::parse(source)
-                    .unwrap_or_else(|error| panic!("subagent definition {path}: {error}"))
-            })
-            .collect()
+        crate::harness::subagent_file::bundled_definitions()
     }
 
     /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.
@@ -177,7 +165,7 @@ impl Bundle {
 mod tests {
     use include_dir::{Dir, DirEntry};
 
-    use super::{Bundle, SKILLS_DIR, SUBAGENTS_DIR};
+    use super::{Bundle, SKILLS_DIR};
 
     fn collect_dirs<'a>(dir: &'a Dir<'a>, found: &mut Vec<&'a std::path::Path>) {
         for entry in dir.entries() {
@@ -216,7 +204,6 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect();
-        assert_eq!(names.len(), SUBAGENTS_DIR.files().count());
         assert!(names.iter().any(|name| name == "explore"));
     }
 
