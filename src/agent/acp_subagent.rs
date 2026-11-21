@@ -840,16 +840,18 @@ pub async fn probe_agent(
     let answer = tokio::time::timeout(limit, probe_with(&launch, services))
         .await
         .map_err(|_| ProbeError::TimedOut(limit))??;
-    let info = answer.agent_info.unwrap_or_default();
+    let info = answer.info;
     Ok(AgentIdentity {
-        name: info.title.unwrap_or_else(|| {
-            if info.name.is_empty() {
-                command.to_string()
-            } else {
-                info.name
-            }
-        }),
-        version: info.version,
+        name: info
+            .as_ref()
+            .and_then(|impl_info| impl_info.title.clone())
+            .or_else(|| {
+                info.as_ref()
+                    .filter(|impl_info| !impl_info.name.is_empty())
+                    .map(|impl_info| impl_info.name.clone())
+            })
+            .unwrap_or_else(|| command.to_string()),
+        version: info.map_or_default(|impl_info| impl_info.version),
     })
 }
 

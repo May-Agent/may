@@ -5824,18 +5824,23 @@ mod tests {
     /// holds it once.
     #[tokio::test]
     async fn a_failed_first_attempt_retries_without_repeating_the_user_message() {
-        // One failure more than the OpenAI client retries on its own, so the
-        // turn retries; the cache is warm, so it stays on provider A.
-        let mut script = vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS];
+        // Warm provider A's prompt cache first, then fail one attempt more than
+        // the OpenAI client retries on its own: the cache is warm, so the turn
+        // retries on provider A instead of failing over to provider B.
+        let mut script = vec![sse_text("warmed")];
+        script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
         script.push(sse_text("done"));
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("warm provider A");
 
         let req = ChatRequest {
             session_id: "session".to_string(),
-            content: "hello".to_string(),
+            content: "follow-up".to_string(),
             attachments: Vec::new(),
             hidden_context_xml: None,
             delivery_mode: crate::session::PendingUserMessageMode::default(),
@@ -5860,7 +5865,7 @@ mod tests {
         .await;
         assert!(result.is_ok(), "the retry must succeed: {result:?}");
 
-        let body = last_body(&provider_a, OPENAI_CLIENT_ATTEMPTS + 1).await;
+        let body = last_body(&provider_a, OPENAI_CLIENT_ATTEMPTS + 2).await;
         let messages: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&body)
             .expect("request json")["messages"]
             .as_array()
@@ -5869,7 +5874,7 @@ mod tests {
         let user_messages = messages
             .iter()
             .filter(|message| {
-                message["role"] == "user" && message["content"].to_string().contains("hello")
+                message["role"] == "user" && message["content"].to_string().contains("follow-up")
             })
             .count();
         assert_eq!(
@@ -5883,7 +5888,7 @@ mod tests {
         let stored = history
             .messages()
             .iter()
-            .filter(|m| matches!(m.role, super::MessageRole::User) && m.content == "hello")
+            .filter(|m| matches!(m.role, super::MessageRole::User) && m.content == "follow-up")
             .count();
         assert_eq!(stored, 1, "history holds the user message once");
     }

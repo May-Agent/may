@@ -40,6 +40,7 @@ libc = "0.2.191"
 # Aither framework
 aither-core = { version = "0.31.0" }
 aither-agent = { version = "0.31.0", features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
+aither-skills = { version = "0.31.0", default-features = false }
 aither-connectivity = { version = "0.31.0" }
 # The parser the harness applies `apply_patch` with; a call's reading uses it
 # to place each hunk in the file it edits.
@@ -358,22 +359,22 @@ inherits = "release"
 lto = "thin"
 
 [patch.crates-io]
-aither-acp = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-agent = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-attachments = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-browser = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-claude = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-codex = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-core = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-derive = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-gemini = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-models = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-openai = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-skills = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
-aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-agent = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-attachments = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-browser = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-claude = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-codex = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-derive = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-gemini = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-models = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-skills = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "main" }
 

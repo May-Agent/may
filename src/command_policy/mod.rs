@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
+use aither_agent::AgentPath;
 use aither_core::llm::tool::{CallIdentity, ToolCallId};
 use aither_sandbox::{
     ScriptCheck, ScriptDecision, ScriptEnd, ScriptOrigin, ScriptOutcome, ScriptPolicy,
@@ -95,8 +96,44 @@ pub struct PolicySet {
     pub managed_bash: bool,
     /// The record the agent's turn boundary reads.
     pub refused: RefusedReads,
+    /// Per-agent epochs invalidating unchanged-read records when a context
+    /// compacts, clears, or restores a checkpoint.
+    pub read_epochs: FileReadEpochs,
     /// Optional tracker recording terminal file reads inside daemon checkouts.
     pub checkout_reads: Option<CheckoutReadTracker>,
+}
+
+/// Per-agent epochs invalidating [`UnchangedFileReads`] across a compaction,
+/// history clear, or checkpoint restore so post-compaction recall reads run
+/// cleanly instead of being refused as repeats.
+#[derive(Debug, Clone, Default)]
+pub struct FileReadEpochs(Arc<Mutex<HashMap<AgentPath, u64>>>);
+
+impl FileReadEpochs {
+    /// Advances `agent`'s read epoch so any pre-compaction or pre-reset file
+    /// stamps recorded for `agent` are discarded on its next check.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal mutex was poisoned.
+    pub fn bump(&self, agent: &AgentPath) {
+        let mut guard = self
+            .0
+            .lock()
+            .expect("the file read epoch map is never held across a panic");
+        let entry = guard.entry(agent.clone()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        drop(guard);
+    }
+
+    fn current(&self, agent: &AgentPath) -> u64 {
+        self.0
+            .lock()
+            .expect("the file read epoch map is never held across a panic")
+            .get(agent)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl PolicySet {
@@ -111,6 +148,7 @@ impl PolicySet {
             .policy(ForegroundSleep)
             .policy(UnchangedFileReads {
                 refused: self.refused,
+                read_epochs: self.read_epochs,
             })
             .policy(PythonWithUv)
             .policy(WhitespacePatch);
@@ -376,12 +414,21 @@ pub struct FileReads {
     inner: Mutex<FileReadsInner>,
 }
 
+#[derive(Debug)]
+struct PendingRead {
+    epoch: u64,
+    identity: ReadIdentity,
+    stamps: Vec<(PathBuf, Fingerprint)>,
+}
+
 #[derive(Debug, Default)]
 struct FileReadsInner {
+    /// Epoch of this agent's context window when `recorded` was populated.
+    epoch: u64,
     /// Read → the stamps of its files when it last succeeded.
     recorded: HashMap<ReadIdentity, Vec<(PathBuf, Fingerprint)>>,
-    /// Task id → the read its script was admitted as, with its stamps.
-    pending: HashMap<String, (ReadIdentity, Vec<(PathBuf, Fingerprint)>)>,
+    /// Task id → the epoch and read its script was admitted as, with its stamps.
+    pending: HashMap<String, PendingRead>,
 }
 
 impl FileReads {
@@ -407,6 +454,7 @@ struct UnchangedFileReadRefused<'a> {
 #[derive(Debug, Clone)]
 pub struct UnchangedFileReads {
     refused: RefusedReads,
+    read_epochs: FileReadEpochs,
 }
 
 /// The stamp of every file `reads` names, relative paths resolved against
@@ -445,6 +493,11 @@ impl ScriptPolicy for UnchangedFileReads {
         let Some(stamps) = fingerprints(start, &files).await else {
             return ScriptDecision::Pass;
         };
+        let agent = script
+            .call
+            .as_ref()
+            .map_or_else(AgentPath::main, |call| AgentPath::of(call.agent()));
+        let current_epoch = self.read_epochs.current(&agent);
         let identity = ReadIdentity {
             dir: start.to_path_buf(),
             links: reading.steps.iter().map(|step| step.link).collect(),
@@ -454,7 +507,26 @@ impl ScriptPolicy for UnchangedFileReads {
                 .map(|command| command.argv().to_vec())
                 .collect(),
         };
-        let unchanged = state.inner().recorded.get(&identity) == Some(&stamps);
+        let unchanged = {
+            let mut inner = state.inner();
+            if inner.epoch != current_epoch {
+                inner.recorded.clear();
+                inner.pending.clear();
+                inner.epoch = current_epoch;
+            }
+            let same = inner.recorded.get(&identity) == Some(&stamps);
+            if !same {
+                inner.pending.insert(
+                    script.task_id.to_string(),
+                    PendingRead {
+                        epoch: current_epoch,
+                        identity,
+                        stamps: stamps.clone(),
+                    },
+                );
+            }
+            same
+        };
         if unchanged {
             let paths: Vec<&Path> = stamps.iter().map(|(path, _)| path.as_path()).collect();
             if let Some(call) = script.call {
@@ -462,22 +534,25 @@ impl ScriptPolicy for UnchangedFileReads {
             }
             return refuse(&UnchangedFileReadRefused { paths: &paths });
         }
-        state
-            .inner()
-            .pending
-            .insert(script.task_id.to_string(), (identity, stamps));
         ScriptDecision::Pass
     }
 
     fn ended(&self, end: &ScriptEnd<'_>, state: &FileReads) -> impl Future<Output = ()> + Send {
-        let read = state.inner().pending.remove(end.task_id);
-        // Only a read that succeeded counts: a denied or failed read must
-        // run again and show its failure.
-        if let Some((identity, stamps)) = read
+        let mut inner = state.inner();
+        let read = inner.pending.remove(end.task_id);
+        // Only a read that succeeded in the active epoch counts: a denied,
+        // failed, or pre-compaction read must not block post-compaction recall.
+        if let Some(PendingRead {
+            epoch: started_epoch,
+            identity,
+            stamps,
+        }) = read
+            && started_epoch == inner.epoch
             && end.outcome == (ScriptOutcome::Exited { code: 0 })
         {
-            state.inner().recorded.insert(identity, stamps);
+            inner.recorded.insert(identity, stamps);
         }
+        drop(inner);
         std::future::ready(())
     }
 }

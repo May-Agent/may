@@ -22,6 +22,6 @@ pub use settings::{
     INPUT_TOOL, KILL_TOOL, MONITOR_TOOL, READ_TOOL, SHELL_TOOL, monitor_settings,
     shell_tool_settings,
 };
-pub use tools::ShellToolkit;
+pub use tools::{ShellFileReferences, ShellToolkit, shell_restore_roots};
 pub use wording::MayShellWording;
 pub use writable_dirs::WritableDirs;

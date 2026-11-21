@@ -216,7 +216,8 @@ async fn fetch_models_for_provider(
                 .await?
                 .ok_or(ModelFetchError::ChatgptNotAuthenticated)?;
             if credentials.is_expired(std::time::Duration::from_secs(60)) {
-                credentials = aither_codex::auth::refresh_tokens(&credentials.refresh_token)
+                let refresh_token = credentials.refresh_token.as_deref().unwrap_or_default();
+                credentials = aither_codex::auth::refresh_tokens(refresh_token)
                     .await
                     .map_err(crate::chatgpt::ChatgptAuthError::Codex)?;
                 crate::chatgpt::save_credentials(&credentials).await?;

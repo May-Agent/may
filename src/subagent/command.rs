@@ -663,6 +663,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                 keep_alive: settings.keep_alive,
                 read_tool: READ_TOOL,
                 usage: Some(usage),
+                read_epochs: settings.toolkit.read_epochs().clone(),
             },
         );
         Held {

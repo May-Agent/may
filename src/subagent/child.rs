@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use aither_agent::context::{CacheLifetime, HandoffDocument};
 use aither_agent::{
-    AfterTool, Agent, AgentError, AgentEvent, AgentPath, ChildAgent, ChildEvents, Hooks, Run,
-    RunOutcome, ToolDecision, ToolInvocation, ToolOutcome, TurnBoundaryAction, TurnBoundaryContext,
+    AfterTool, Agent, AgentError, AgentEvent, AgentPath, ChildAgent, ChildEvents,
+    CompactionOutcome, Hooks, Run, RunOutcome, ToolDecision, ToolInvocation, ToolOutcome,
+    TurnBoundaryAction, TurnBoundaryContext,
 };
 use aither_core::LanguageModel;
 use aither_core::llm::Message;
@@ -181,6 +182,8 @@ pub struct ChildParts {
     pub read_tool: &'static str,
     /// Where the run's token usage is credited.
     pub usage: Option<RunUsage>,
+    /// Shared per-agent unchanged-read epochs, bumped when this child compacts.
+    pub read_epochs: crate::command_policy::FileReadEpochs,
 }
 
 /// What the driver of one run credits its events to.
@@ -189,6 +192,7 @@ struct Credit {
     valve: Option<Arc<CompactSignal>>,
     floor: usize,
     usage: Option<RunUsage>,
+    read_epochs: crate::command_policy::FileReadEpochs,
     /// The last reported prompt tokens, so compaction events can keep the
     /// valve's accounting current.
     tokens: Arc<std::sync::atomic::AtomicUsize>,
@@ -309,6 +313,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             floor: self.parts.floor,
             usage: self.parts.usage.clone(),
+            read_epochs: self.parts.read_epochs.clone(),
         }
     }
 
@@ -354,8 +359,12 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
                             }
                         }
                         AgentEvent::CompactionEnded { outcome, .. } => {
+                            let applied = matches!(outcome, CompactionOutcome::Applied(_));
+                            if applied {
+                                credit.read_epochs.bump(own);
+                            }
                             if let Some(valve) = &credit.valve {
-                                if matches!(outcome, aither_agent::CompactionOutcome::Applied(_)) {
+                                if applied {
                                     valve.sync(false, 0, credit.floor);
                                     valve.landed();
                                 } else {
