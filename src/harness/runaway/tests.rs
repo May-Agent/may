@@ -36,7 +36,12 @@ impl FootprintReader for Footprints {
         let by_pid = self.by_pid.lock().unwrap();
         Ok(roots
             .iter()
-            .map(|root| by_pid.get(&sandbox_pid(*root)).copied().unwrap_or(0))
+            .map(|root| {
+                sandbox_pids(*root)
+                    .iter()
+                    .find_map(|pid| by_pid.get(pid).copied())
+                    .unwrap_or(0)
+            })
             .collect())
     }
 
@@ -336,32 +341,51 @@ impl Agent {
     }
 }
 
-/// The pid a job's shell reports for the host process `host_pid`: the
-/// footprint reader is handed host pids, while the test scripts footprints
-/// by the pid the sandbox reports. A Linux host sandbox runs its jobs in a
-/// nested pid namespace and `/proc/*/status` maps the two through `NSpid`;
-/// elsewhere they are the same pid.
+/// The pids a job's shell may report for the process tree under the host
+/// `root`: the footprint reader is handed the host pid of a job's exec root,
+/// while the test scripts footprints by the pid the sandbox reports, which
+/// is a descendant's inner pid. A Linux host sandbox runs its commands in a
+/// nested pid namespace where every process's `NSpid` maps the two, so the
+/// inner pid of `root` and of its descendants are all candidates; elsewhere
+/// the two are the same pid.
 #[cfg(target_os = "linux")]
-fn sandbox_pid(host_pid: u32) -> u32 {
-    std::fs::read_to_string(format!("/proc/{host_pid}/status"))
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("NSpid:").map(str::to_owned))
-        })
-        .and_then(|nspid| {
-            nspid
-                .split_whitespace()
-                .next_back()
-                .and_then(|field| field.parse::<u32>().ok())
-        })
-        .unwrap_or(host_pid)
+fn sandbox_pids(root: u32) -> Vec<u32> {
+    let inner = |pid: u32| -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .and_then(|nspid| {
+                nspid
+                    .split_whitespace()
+                    .next_back()
+                    .and_then(|field| field.parse::<u32>().ok())
+            })
+    };
+    let mut candidates = Vec::new();
+    let mut stack = vec![root];
+    for _ in 0..64 {
+        let Some(pid) = stack.pop() else { break };
+        if let Some(inner) = inner(pid) {
+            candidates.push(inner);
+        }
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+            stack.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|field| field.parse::<u32>().ok()),
+            );
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(root);
+    }
+    candidates
 }
 
 #[cfg(not(target_os = "linux"))]
-const fn sandbox_pid(pid: u32) -> u32 {
-    pid
+fn sandbox_pids(pid: u32) -> Vec<u32> {
+    vec![pid]
 }
 
 struct Clock {
