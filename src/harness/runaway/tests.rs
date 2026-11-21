@@ -350,24 +350,24 @@ fn host_pid(pid: u32) -> u32 {
     /// sandbox: its sandbox runner is a direct child of this process, so a
     /// job's parent chain reaches it. Another test's sandbox can hold a job
     /// with the same inner pid, so the `NSpid` match alone is not enough.
-    fn owned_by_this_process(mut pid: u32) -> bool {
+    fn owned_by_this_process(mut current: u32) -> bool {
         for _ in 0..16 {
-            if pid == std::process::id() {
+            if current == std::process::id() {
                 return true;
             }
-            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{current}/status")) else {
                 return false;
             };
-            let Some(ppid) = status.lines().find_map(|line| {
+            let Some(parent) = status.lines().find_map(|line| {
                 line.strip_prefix("PPid:")
                     .and_then(|field| field.trim().parse::<u32>().ok())
             }) else {
                 return false;
             };
-            if ppid <= 1 {
+            if parent <= 1 {
                 return false;
             }
-            pid = ppid;
+            current = parent;
         }
         false
     }
