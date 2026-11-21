@@ -41,7 +41,7 @@ pub struct ServeArgs {
 #[derive(Debug, Template)]
 #[template(path = "serve_started.txt", escape = "none")]
 struct ServeStarted {
-    task_id: String,
+    pid: u32,
     tunnel: Option<ServeTunnel>,
     /// `None` for no `--ready-regex`, else whether the pattern matched.
     ready: Option<bool>,
@@ -239,7 +239,7 @@ impl Tool for ServeTool {
         };
 
         let text = ServeStarted {
-            task_id: job.task_id().to_string(),
+            pid: job.pid(),
             tunnel,
             ready,
         }

@@ -1123,12 +1123,12 @@ fn prompt_preview(content: &str) -> String {
 fn job_row_detail(job: &aither_sandbox::JobInfo, status: &str) -> String {
     if matches!(job.status, aither_sandbox::JobStatus::Running) {
         format!(
-            "    {status} · {} · task {}",
+            "    {status} · {} · pid {}",
             chat::format_elapsed(job.started_at.elapsed().as_secs()),
-            job.task_id
+            job.pid
         )
     } else {
-        format!("    {status} · task {}", job.task_id)
+        format!("    {status} · pid {}", job.pid)
     }
 }
 
@@ -3012,7 +3012,6 @@ mod tests {
     fn job(status: aither_sandbox::JobStatus, age_secs: u64) -> aither_sandbox::JobInfo {
         aither_sandbox::JobInfo {
             pid: 1,
-            task_id: "amber".to_string(),
             execution_key: String::new(),
             script: "true".to_string(),
             interpreter: aither_sandbox::Interpreter::Shell,
@@ -3038,7 +3037,7 @@ mod tests {
             },
             135,
         );
-        assert_eq!(job_row_detail(&done, "exit 0"), "    exit 0 · task amber");
+        assert_eq!(job_row_detail(&done, "exit 0"), "    exit 0 · pid 1");
         let running = job(aither_sandbox::JobStatus::Running, 135);
         assert!(job_row_detail(&running, "running").contains("2m"));
     }

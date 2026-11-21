@@ -1039,7 +1039,6 @@ mod tests {
         let mut state = StreamState::default();
         let job = crate::client::background::WireJob {
             pid: 42,
-            task_id: "t".to_string(),
             execution_key: "k".to_string(),
             script: "sleep 1".to_string(),
             mode: aither_sandbox::SandboxMode::Sandboxed,

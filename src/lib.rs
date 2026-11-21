@@ -327,7 +327,11 @@ mod test_support {
 
     /// The launch of a sandboxed script the main agent's call started.
     pub fn main_launch() -> aither_sandbox::LaunchInfo {
-        aither_sandbox::LaunchInfo::new("task", None, aither_sandbox::SandboxMode::Sandboxed)
+        aither_sandbox::LaunchInfo::new(
+            aither_sandbox::LaunchLease::fresh().id(),
+            None,
+            aither_sandbox::SandboxMode::Sandboxed,
+        )
     }
 
     /// The launch of a sandboxed script a subagent's call started.
@@ -339,7 +343,7 @@ mod test_support {
             )),
         );
         aither_sandbox::LaunchInfo::new(
-            "task",
+            aither_sandbox::LaunchLease::fresh().id(),
             Some(identity),
             aither_sandbox::SandboxMode::Sandboxed,
         )

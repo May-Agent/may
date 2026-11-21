@@ -92,7 +92,7 @@ impl ToolTransport for ContainerToolTransport {
             "/",
             kill_rx,
             input_rx,
-            ExecLifetime::Foreground,
+            ExecLifetime::Foreground { pid: None },
         );
         let result = futures_lite::future::or(
             async { execution.await.map_err(ToolRuntimeError::Container) },

@@ -56,7 +56,6 @@ mod tests {
     fn job(status: JobStatus, timeout: Option<Duration>) -> JobInfo {
         JobInfo {
             pid: 1,
-            task_id: "amber".to_string(),
             execution_key: String::new(),
             script: "sleep 9999".to_string(),
             interpreter: Interpreter::Shell,

@@ -50,7 +50,7 @@ pub enum WireJobStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireKillCause {
-    /// A request ended it: `terminal_kill` or the shutdown of its terminal.
+    /// A request ended it: user kill or the shutdown of its terminal.
     User,
     /// Its `timeout` passed.
     #[serde(rename_all = "camelCase")]
@@ -253,8 +253,6 @@ impl From<WireJobStatus> for JobStatus {
 pub struct WireJob {
     /// Process id.
     pub pid: u32,
-    /// Task id the model sees.
-    pub task_id: String,
     /// Execution key that owns the job.
     pub execution_key: String,
     /// The script it runs.
@@ -296,7 +294,6 @@ impl From<&JobInfo> for WireJob {
     fn from(job: &JobInfo) -> Self {
         Self {
             pid: job.pid,
-            task_id: job.task_id.clone(),
             execution_key: job.execution_key.clone(),
             script: job.script.clone(),
             interpreter: job.interpreter,
@@ -316,7 +313,6 @@ impl From<WireJob> for JobInfo {
     fn from(job: WireJob) -> Self {
         Self {
             pid: job.pid,
-            task_id: job.task_id,
             execution_key: job.execution_key,
             script: job.script,
             interpreter: job.interpreter,
@@ -551,17 +547,17 @@ impl RemoteBackground {
         Ok(answer.ok)
     }
 
-    /// Output of task `task_id` since `cursor`.
+    /// Output of job `pid` since `cursor`.
     ///
     /// # Errors
-    /// Fails when the daemon is unreachable or the task is unknown.
+    /// Fails when the daemon is unreachable or the job is unknown.
     pub async fn read(
         &self,
-        task_id: &str,
+        pid: u32,
         cursor: usize,
     ) -> Result<WireTerminalDelta, super::DaemonClientError> {
         let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("taskId", task_id)
+            .append_pair("pid", &pid.to_string())
             .append_pair("cursor", &cursor.to_string())
             .finish();
         self.client
@@ -625,7 +621,6 @@ mod tests {
     fn a_session_resumes_while_work_runs_or_a_wake_is_served() {
         let job = |status| WireJob {
             pid: 1,
-            task_id: "t".into(),
             execution_key: "k".into(),
             script: "sleep 1".into(),
             interpreter: Interpreter::Shell,
@@ -654,7 +649,6 @@ mod tests {
     fn a_job_keeps_its_age_across_the_socket() {
         let job = JobInfo {
             pid: 7,
-            task_id: "t1".into(),
             execution_key: "k".into(),
             script: "sleep 30".into(),
             interpreter: Interpreter::Shell,

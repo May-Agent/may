@@ -4,16 +4,16 @@
 
 use aither_core::llm::CommandStream;
 use aither_sandbox::{
-    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked, JobRead,
-    JobStatus, JsonAsTsv, MonitorRefusal, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines,
+    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobRead, JobStatus,
+    JsonAsTsv, MonitorRefusal, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines,
     RunFailure, ShellWording, StoredBinaryPart, TerminalError,
 };
 use askama::Template;
 
 #[derive(Template)]
 #[template(path = "shell/unchanged_task_read.txt", escape = "none")]
-struct UnchangedTaskRead<'a> {
-    task_id: &'a str,
+struct UnchangedTaskRead {
+    pid: u32,
 }
 
 #[derive(Template)]
@@ -22,7 +22,7 @@ struct JobReadText<'a> {
     delta: &'a str,
     has_more: bool,
     cursor: usize,
-    task_id: &'a str,
+    pid: u32,
     status_text: &'a str,
     bytes_read: usize,
     total_bytes: usize,
@@ -30,15 +30,8 @@ struct JobReadText<'a> {
 
 #[derive(Template)]
 #[template(path = "shell/job_input.txt", escape = "none")]
-struct JobInputText<'a> {
-    task_id: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "shell/job_kill.txt", escape = "none")]
-struct JobKillText<'a> {
-    task_id: &'a str,
-    killed: bool,
+struct JobInputText {
+    pid: u32,
 }
 
 #[derive(Template)]
@@ -62,8 +55,8 @@ struct MonitorRefused<'a> {
 
 #[derive(Template)]
 #[template(path = "shell/monitor_started.txt", escape = "none")]
-struct MonitorStartedText<'a> {
-    task_id: &'a str,
+struct MonitorStartedText {
+    pid: u32,
     interval_secs: u64,
 }
 
@@ -166,7 +159,7 @@ impl MayShellWording {
 impl ShellWording for MayShellWording {
     fn job_read(&self, read: &JobRead) -> String {
         match read {
-            JobRead::Unchanged { task_id } => rendered(&UnchangedTaskRead { task_id }),
+            JobRead::Unchanged { pid } => rendered(&UnchangedTaskRead { pid: *pid }),
             JobRead::Delta(delta) => {
                 let output = CommandStream::Inline {
                     text: String::from_utf8_lossy(&delta.bytes).into_owned(),
@@ -176,7 +169,7 @@ impl ShellWording for MayShellWording {
                     delta: &output,
                     has_more: delta.cursor < delta.total_bytes,
                     cursor: delta.cursor,
-                    task_id: &delta.task_id,
+                    pid: delta.pid,
                     status_text: &job_status_text(&delta.status),
                     bytes_read: delta.bytes.len(),
                     total_bytes: delta.total_bytes,
@@ -185,17 +178,8 @@ impl ShellWording for MayShellWording {
         }
     }
 
-    fn job_input(&self, sent: &JobInputSent<'_>) -> String {
-        rendered(&JobInputText {
-            task_id: sent.task_id,
-        })
-    }
-
-    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
-        rendered(&JobKillText {
-            task_id: kill.task_id,
-            killed: kill.killed,
-        })
+    fn job_input(&self, sent: &JobInputSent) -> String {
+        rendered(&JobInputText { pid: sent.pid })
     }
 
     fn call_refused(&self, refusal: &CallRefusal) -> String {
@@ -205,8 +189,7 @@ impl ShellWording for MayShellWording {
                 CallRefusal::EmptyDescription
                     | CallRefusal::InterpreterNotConfigured { .. }
                     | CallRefusal::TimeoutOutOfRange { .. }
-                    | CallRefusal::EmptyTaskId
-                    | CallRefusal::UnknownTask { .. }
+                    | CallRefusal::UnknownJob { .. }
                     | CallRefusal::ZeroMaxBytes
                     | CallRefusal::NoStdin { .. }
             ),
@@ -241,9 +224,9 @@ impl ShellWording for MayShellWording {
         })
     }
 
-    fn monitor_started(&self, started: &MonitorStarted<'_>) -> String {
+    fn monitor_started(&self, started: &MonitorStarted) -> String {
         rendered(&MonitorStartedText {
-            task_id: started.task_id,
+            pid: started.pid,
             interval_secs: started.interval_secs,
         })
     }
@@ -339,21 +322,17 @@ mod tests {
 
     #[test]
     fn a_repeated_read_is_refused_with_the_way_to_follow_a_job() {
-        let text = MayShellWording.job_read(&JobRead::Unchanged {
-            task_id: "amber-forest-thunder-pearl".into(),
-        });
-        assert!(text.contains("'amber-forest-thunder-pearl' produced no new output"));
+        let text = MayShellWording.job_read(&JobRead::Unchanged { pid: 4242 });
+        assert!(text.contains("PID 4242 produced no new output"), "{text}");
         assert!(text.contains("`monitor`"));
     }
 
     #[test]
     fn input_to_a_foreground_task_is_refused_through_the_template() {
-        let text = MayShellWording.call_refused(&CallRefusal::NoStdin {
-            task_id: "amber-forest-thunder-pearl".into(),
-        });
+        let text = MayShellWording.call_refused(&CallRefusal::NoStdin { pid: 4242 });
         assert_eq!(
             text,
-            "task amber-forest-thunder-pearl takes no input: it started in the foreground, where stdin reads end of file; only a job started with background: true has a stdin to write to"
+            "job with PID 4242 takes no input: it started in the foreground, where stdin reads end of file; only a job started with background: true has a stdin to write to"
         );
     }
 

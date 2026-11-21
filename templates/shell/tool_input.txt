@@ -1,1 +1,1 @@
-Send input to a terminal task that was started with `background: true` and is waiting on stdin. A task started in the foreground, promoted or not, reads end of file and takes no input.
+Send input to a terminal job (by its PID) that was started with `background: true` and is waiting on stdin. A job started in the foreground, promoted or not, reads end of file and takes no input.

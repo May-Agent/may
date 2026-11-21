@@ -313,8 +313,8 @@ pub enum HostLoadEvent {
     JobKilledForMemory {
         /// Whose memory it is.
         domain: MemoryDomain,
-        /// The job's task ID.
-        task_id: String,
+        /// The job's PID.
+        pid: u32,
         /// The script the job ran.
         command: String,
         /// What its processes held.

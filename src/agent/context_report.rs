@@ -357,7 +357,7 @@ mod tests {
     }
 
     fn native_tools() -> Vec<ToolDefinition> {
-        ["terminal", "terminal_kill"]
+        ["terminal", "terminal_read"]
             .into_iter()
             .map(|name| {
                 ToolDefinition::from_parts(

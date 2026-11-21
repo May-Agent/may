@@ -194,18 +194,8 @@ impl SessionBackgrounds {
             let Some(info) = jobs.list().await.into_iter().find(|job| job.pid == pid) else {
                 continue;
             };
-            if let Some(job) = jobs.get(&info.task_id).await {
+            if let Some(job) = jobs.get(info.pid).await {
                 return Some((job, info));
-            }
-        }
-        None
-    }
-
-    /// The job `task_id` of `session_id`, newest shell first.
-    async fn job_with_task(&self, session_id: &str, task_id: &str) -> Option<Job> {
-        for (_, jobs) in self.registries(session_id).into_iter().rev() {
-            if let Some(job) = jobs.get(task_id).await {
-                return Some(job);
             }
         }
         None
@@ -480,8 +470,8 @@ pub async fn kill_job(
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadJobQuery {
-    /// Task id of the job.
-    pub task_id: String,
+    /// Process ID of the job.
+    pub pid: u32,
     /// Cursor from the previous read.
     #[serde(default)]
     pub cursor: usize,
@@ -494,9 +484,9 @@ pub async fn read_job(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<WireTerminalDelta>> {
     let session_id = session_id_param(&params)?;
-    let job = state
+    let (job, _) = state
         .session_background
-        .job_with_task(&session_id, &query.task_id)
+        .job_with(&session_id, query.pid)
         .await
         .ok_or_else(|| bad_request_error("no such job"))?;
     match job

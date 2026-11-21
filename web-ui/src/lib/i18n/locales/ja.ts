@@ -194,7 +194,6 @@ export const ja: Messages = {
   tools: {
     terminal: 'タスクを実行中',
     terminalInput: '入力を送信',
-    terminalKill: 'タスクを停止',
     terminalRead: '出力を確認',
     browser: 'ブラウザを操作',
     webSearch: 'ウェブを検索',

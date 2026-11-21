@@ -10,7 +10,7 @@
 //! variant cares about. Each projection is `Option<String>` — `None` when
 //! the field hasn't streamed in yet, `Some(value)` once readable.
 
-use aither_sandbox::{JobInputArgs, JobKillArgs, JobReadArgs, ShellArgs};
+use aither_sandbox::{JobInputArgs, JobReadArgs, ShellArgs};
 use partial_json_fixer::fix_json;
 use serde_json::Value;
 
@@ -20,7 +20,7 @@ use crate::daemon::types::ToolVariant;
 /// Per-variant subset of tool arguments shown in the UI summary chip.
 ///
 /// Fields are populated based on `ToolVariant`:
-/// - `terminal/terminal_input/terminal_read/terminal_kill` → `description`, `script`
+/// - `terminal/terminal_input/terminal_read` → `description`, `script`
 /// - `web_search` → `query`
 /// - `web_fetch` → `url`
 /// - browser → `action`, `target`
@@ -52,7 +52,7 @@ pub struct ToolSummary {
     /// is shell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<String>,
-    /// Why a `terminal`, `terminal_input`, `terminal_kill` or `terminal_read`
+    /// Why a `terminal`, `terminal_input` or `terminal_read`
     /// call's complete arguments do not deserialize into the tool's argument
     /// type. Present only once the arguments are complete.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,7 +110,6 @@ fn arguments_error(arguments: &str, variant: ToolVariant) -> Option<String> {
     match variant {
         ToolVariant::Terminal => check::<ShellArgs>(arguments),
         ToolVariant::TerminalInput => check::<JobInputArgs>(arguments),
-        ToolVariant::TerminalKill => check::<JobKillArgs>(arguments),
         ToolVariant::TerminalRead => check::<JobReadArgs>(arguments),
         _ => None,
     }
@@ -189,13 +188,11 @@ fn project_fields(fields: &Value, variant: ToolVariant, complete: bool) -> ToolS
                 ..ToolSummary::default()
             }
         }
-        ToolVariant::TerminalInput | ToolVariant::TerminalRead | ToolVariant::TerminalKill => {
-            ToolSummary {
-                description: pick("description"),
-                script: pick("script"),
-                ..ToolSummary::default()
-            }
-        }
+        ToolVariant::TerminalInput | ToolVariant::TerminalRead => ToolSummary {
+            description: pick("description"),
+            script: pick("script"),
+            ..ToolSummary::default()
+        },
         ToolVariant::WebSearch => ToolSummary {
             query: pick("query"),
             ..ToolSummary::default()
@@ -329,11 +326,7 @@ mod tests {
         let summary = project_tool_summary(missing, ToolVariant::Terminal);
         let error = summary.arguments_error.expect("script is missing");
         assert!(error.contains("script"), "{error}");
-        for variant in [
-            ToolVariant::TerminalInput,
-            ToolVariant::TerminalKill,
-            ToolVariant::TerminalRead,
-        ] {
+        for variant in [ToolVariant::TerminalInput, ToolVariant::TerminalRead] {
             assert!(
                 project_tool_summary("{}", variant)
                     .arguments_error

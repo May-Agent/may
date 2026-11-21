@@ -112,9 +112,9 @@ impl core::str::FromStr for SessionRuntimeState {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalRuntimeState {
-    /// Id of the live terminal task, when one is running.
+    /// PID of the live terminal job, when one is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
+    pub pid: Option<u32>,
     /// Path of the captured terminal output file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_file: Option<String>,
@@ -130,17 +130,17 @@ impl TerminalRuntimeState {
     /// Whether no terminal state is recorded.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.task_id.is_none()
+        self.pid.is_none()
             && self.output_file.is_none()
             && self.output_preview.is_none()
             && self.input_notice.is_none()
     }
 
-    /// Return a copy with `input_notice` (and `task_id`, when provided) set.
+    /// Return a copy with `input_notice` (and `pid`, when provided) set.
     #[must_use]
-    pub fn with_input_notice(mut self, task_id: Option<String>, notice: String) -> Self {
-        if let Some(task_id) = task_id {
-            self.task_id = Some(task_id);
+    pub fn with_input_notice(mut self, pid: Option<u32>, notice: String) -> Self {
+        if let Some(pid) = pid {
+            self.pid = Some(pid);
         }
         self.input_notice = Some(notice);
         self

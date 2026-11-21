@@ -11,7 +11,6 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
-use aither_sandbox::test_ids::lease;
 use aither_sandbox::{
     AnyContainerMemory, CgroupMemory, ContainerMemory, FootprintError, FootprintReader,
     FootprintRegistry, JobPlace, JobStatus, KillCause, MemoryDomain,
@@ -37,7 +36,12 @@ impl FootprintReader for Footprints {
         let by_pid = self.by_pid.lock().unwrap();
         Ok(roots
             .iter()
-            .map(|pid| by_pid.get(pid).copied().unwrap_or(0))
+            .map(|root| {
+                sandbox_pids(*root)
+                    .iter()
+                    .find_map(|pid| by_pid.get(pid).copied())
+                    .unwrap_or(0)
+            })
             .collect())
     }
 
@@ -129,7 +133,7 @@ struct Cgroup(Arc<Mutex<CgroupState>>);
 struct CgroupState {
     limit: Option<u64>,
     pressure: &'static str,
-    jobs: HashMap<String, u64>,
+    jobs: HashMap<u32, u64>,
 }
 
 const CALM: &str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
@@ -149,12 +153,8 @@ impl Cgroup {
         self.0.lock().unwrap().pressure = pressure;
     }
 
-    fn hold(&self, task_id: &str, bytes: u64) {
-        self.0
-            .lock()
-            .unwrap()
-            .jobs
-            .insert(task_id.to_string(), bytes);
+    fn hold(&self, pid: u32, bytes: u64) {
+        self.0.lock().unwrap().jobs.insert(pid, bytes);
     }
 }
 
@@ -170,12 +170,12 @@ impl ContainerMemory for Cgroup {
 
     fn job_footprints(
         &self,
-        task_ids: &[String],
+        pids: &[u32],
     ) -> impl Future<Output = Result<Vec<u64>, FootprintError>> + Send {
         let state = self.0.lock().unwrap();
-        std::future::ready(Ok(task_ids
+        std::future::ready(Ok(pids
             .iter()
-            .map(|id| state.jobs.get(id).copied().unwrap_or(0))
+            .map(|pid| state.jobs.get(pid).copied().unwrap_or(0))
             .collect()))
     }
 }
@@ -245,9 +245,9 @@ impl Agent {
         pid
     }
 
-    /// The task id the shell gave the job the test named `name`.
-    fn task(&self, name: &str) -> String {
-        self.job_named(name).task_id().to_string()
+    /// The PID the shell gave the job the test named `name`.
+    fn pid_of(&self, name: &str) -> u32 {
+        self.job_named(name).pid()
     }
 
     fn job_named(&self, name: &str) -> &aither_sandbox::Job {
@@ -259,9 +259,9 @@ impl Agent {
             .1
     }
 
-    /// Whether `task_id` is the id of the job the test named `name`.
-    fn is(&self, task_id: &str, name: &str) -> bool {
-        task_id == self.task(name)
+    /// Whether `pid` is the PID of the job the test named `name`.
+    fn is(&self, pid: u32, name: &str) -> bool {
+        pid == self.pid_of(name)
     }
 
     /// Changes what the machine's physical memory reads as, and the guard
@@ -294,27 +294,16 @@ impl Agent {
 impl Agent {
     /// Starts a job inside the container holding `bytes`. A container job
     /// is killed through its kill switch, which the test keeps.
-    async fn container_job(&mut self, cgroup: &Cgroup, task_id: &'static str, bytes: u64) {
+    async fn container_job(&mut self, cgroup: &Cgroup, name: &'static str, bytes: u64) -> u32 {
         let pid = self.next_pid();
         let jobs = self.shell.jobs();
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-        jobs.place_for_test(
-            JobPlace::Container,
-            pid,
-            &lease(task_id),
-            task_id,
-            Some(kill_tx),
-        )
-        .await;
+        jobs.place_for_test(JobPlace::Container, pid, name, Some(kill_tx))
+            .await;
         self.jobs
-            .push((task_id, jobs.get(task_id).await.expect("the job is held")));
-        self.switches.push((task_id, kill_rx));
-        cgroup
-            .0
-            .lock()
-            .unwrap()
-            .jobs
-            .insert(task_id.to_string(), bytes);
+            .push((name, jobs.get(pid).await.expect("the job is held")));
+        self.switches.push((name, kill_rx));
+        cgroup.0.lock().unwrap().jobs.insert(pid, bytes);
         // The container's pid means nothing to the host: if it were read
         // there, this is what it would find.
         self.footprints
@@ -322,18 +311,18 @@ impl Agent {
             .lock()
             .unwrap()
             .insert(pid, 500 * GIB);
+        pid
     }
 
     /// Starts a job on a remote host holding `bytes` there. Its local `ssh`
     /// stand-in is a real process, which must never be killed.
-    async fn remote_job(&mut self, task_id: &'static str, bytes: u64) -> u32 {
+    async fn remote_job(&mut self, name: &'static str, bytes: u64) -> u32 {
         let sleeper = Sleeper::start();
         let pid = sleeper.pid();
         let jobs = self.shell.jobs();
-        jobs.place_for_test(JobPlace::Remote, pid, &lease(task_id), task_id, None)
-            .await;
+        jobs.place_for_test(JobPlace::Remote, pid, name, None).await;
         self.jobs
-            .push((task_id, jobs.get(task_id).await.expect("the job is held")));
+            .push((name, jobs.get(pid).await.expect("the job is held")));
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
         self.sleepers.push(sleeper);
         pid
@@ -350,6 +339,53 @@ impl Agent {
             .find(|(id, _)| *id == task_id)
             .is_some_and(|(_, rx)| rx.try_recv().is_ok())
     }
+}
+
+/// The pids a job's shell may report for the process tree under the host
+/// `root`: the footprint reader is handed the host pid of a job's exec root,
+/// while the test scripts footprints by the pid the sandbox reports, which
+/// is a descendant's inner pid. A Linux host sandbox runs its commands in a
+/// nested pid namespace where every process's `NSpid` maps the two, so the
+/// inner pid of `root` and of its descendants are all candidates; elsewhere
+/// the two are the same pid.
+#[cfg(target_os = "linux")]
+fn sandbox_pids(root: u32) -> Vec<u32> {
+    let inner = |pid: u32| -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .and_then(|nspid| {
+                nspid
+                    .split_whitespace()
+                    .next_back()
+                    .and_then(|field| field.parse::<u32>().ok())
+            })
+    };
+    let mut candidates = Vec::new();
+    let mut stack = vec![root];
+    for _ in 0..64 {
+        let Some(pid) = stack.pop() else { break };
+        if let Some(inner) = inner(pid) {
+            candidates.push(inner);
+        }
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+            stack.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|field| field.parse::<u32>().ok()),
+            );
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(root);
+    }
+    candidates
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_pids(pid: u32) -> Vec<u32> {
+    vec![pid]
 }
 
 struct Clock {
@@ -385,7 +421,7 @@ fn names<'a>(
         .map(|footprint| {
             started
                 .iter()
-                .find(|(_, job)| job.task_id() == footprint.task_id)
+                .find(|(_, job)| job.pid() == footprint.pid)
                 .expect("a job of this agent")
                 .0
         })
@@ -454,7 +490,7 @@ async fn an_agent_over_physical_memory_loses_its_largest_job_when_the_window_end
     let [HostLoadEvent::MemoryFinalWarning { job, window, .. }] = warned.as_slice() else {
         panic!("the final warning: {warned:?}");
     };
-    assert_eq!((agent.is(&job.task_id, "large"), *window), (true, WINDOW));
+    assert_eq!((agent.is(job.pid, "large"), *window), (true, WINDOW));
 
     clock.advance(59);
     assert!(
@@ -474,7 +510,7 @@ async fn an_agent_over_physical_memory_loses_its_largest_job_when_the_window_end
     assert!(
         matches!(
             killed.as_slice(),
-            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if agent.is(task_id, "large")
+            [HostLoadEvent::JobKilledForMemory { pid, .. }] if agent.is(*pid, "large")
         ),
         "{killed:?}"
     );
@@ -596,7 +632,7 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     assert!(
         big_events.iter().any(|event| matches!(
             event,
-            HostLoadEvent::MemoryFinalWarning { job, .. } if big.is(&job.task_id, "anchor")
+            HostLoadEvent::MemoryFinalWarning { job, .. } if big.is(job.pid, "anchor")
         )),
         "{big_events:?}"
     );
@@ -609,7 +645,7 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     assert!(
         matches!(
             killed.as_slice(),
-            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if big.is(task_id, "anchor")
+            [HostLoadEvent::JobKilledForMemory { pid, .. }] if big.is(*pid, "anchor")
         ),
         "{killed:?}"
     );
@@ -687,7 +723,7 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     assert!(
         next.iter().any(|event| matches!(
             event,
-            HostLoadEvent::MemoryFinalWarning { job, .. } if second_only.is(&job.task_id, "second")
+            HostLoadEvent::MemoryFinalWarning { job, .. } if second_only.is(job.pid, "second")
         )),
         "{next:?}"
     );
@@ -704,10 +740,9 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
 
 #[test]
 fn the_alerts_read_as_plain_text() {
-    let job = |task: &str, gib| aither_sandbox::JobFootprint {
-        task_id: task.to_string(),
-        command: format!("run {task}"),
-        pid: 1,
+    let job = |pid: u32, name: &str, gib| aither_sandbox::JobFootprint {
+        command: format!("run {name}"),
+        pid,
         footprint_bytes: gib * GIB,
     };
     let yellow_idle = HostLoadEvent::MemoryYellow {
@@ -720,11 +755,11 @@ fn the_alerts_read_as_plain_text() {
     );
     let yellow_busy = HostLoadEvent::MemoryYellow {
         domain: MemoryDomain::Machine,
-        jobs: vec![job("small", 1)],
+        jobs: vec![job(101, "small", 1)],
     };
     assert_eq!(
         yellow_busy.alert_text(),
-        "The machine's memory is getting tight (pressure: warning). Hold back memory-hungry work and stop jobs you no longer need. Your running jobs by memory, largest first:\n- 'small' (`run small`): 1.0 GiB"
+        "The machine's memory is getting tight (pressure: warning). Hold back memory-hungry work and stop jobs you no longer need. Your running jobs by memory, largest first:\n- PID 101 (`run small`): 1.0 GiB"
     );
     let red_idle = HostLoadEvent::MemoryRed {
         domain: MemoryDomain::Machine,
@@ -736,32 +771,32 @@ fn the_alerts_read_as_plain_text() {
     );
     let red = HostLoadEvent::MemoryRed {
         domain: MemoryDomain::Machine,
-        jobs: vec![job("big", 36), job("small", 1)],
+        jobs: vec![job(202, "big", 36), job(101, "small", 1)],
     };
     assert_eq!(
         red.alert_text(),
-        "The machine's memory is critically tight (pressure: critical). Stop the jobs you can do without now; a job that keeps growing may be killed. Your running jobs by memory, largest first:\n- 'big' (`run big`): 36.0 GiB\n- 'small' (`run small`): 1.0 GiB"
+        "The machine's memory is critically tight (pressure: critical). Stop the jobs you can do without now; a job that keeps growing may be killed. Your running jobs by memory, largest first:\n- PID 202 (`run big`): 36.0 GiB\n- PID 101 (`run small`): 1.0 GiB"
     );
     let killed = HostLoadEvent::JobKilledForMemory {
         domain: MemoryDomain::Machine,
-        task_id: "big".to_string(),
+        pid: 202,
         command: "run big".to_string(),
         footprint: MemorySize(36 * GIB),
         capacity: MemorySize(32 * GIB),
     };
     assert_eq!(
         killed.alert_text(),
-        "Job 'big' (`run big`) was killed with everything it started: it held 36.0 GiB of the 32.0 GiB of memory the machine has, and the final warning went unanswered."
+        "Job PID 202 (`run big`) was killed with everything it started: it held 36.0 GiB of the 32.0 GiB of memory the machine has, and the final warning went unanswered."
     );
     let container = HostLoadEvent::MemoryFinalWarning {
         domain: MemoryDomain::Container,
-        job: job("big", 3),
+        job: job(202, "big", 3),
         window: WINDOW,
         capacity: MemorySize(4 * GIB),
     };
     assert_eq!(
         container.alert_text(),
-        "Final memory warning: job 'big' (`run big`) holds 3.0 GiB of memory and is killed in 60s, with everything it started, unless you stop it or free memory yourself. The container has 4.0 GiB of memory in all."
+        "Final memory warning: job PID 202 (`run big`) holds 3.0 GiB of memory and is killed in 60s, with everything it started, unless you stop it or free memory yourself. The container has 4.0 GiB of memory in all."
     );
 }
 
@@ -876,7 +911,7 @@ async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
         panic!("the final warning: {warned:?}");
     };
     assert_eq!(*domain, MemoryDomain::Container);
-    assert_eq!((job.task_id.as_str(), *window), ("large", WINDOW));
+    assert_eq!((agent.is(job.pid, "large"), *window), (true, WINDOW));
     assert_eq!(*capacity, MemorySize(4 * GIB));
 
     clock.advance(59);
@@ -890,9 +925,9 @@ async fn a_container_is_judged_against_its_own_limit_not_the_machines_memory() {
             killed.as_slice(),
             [HostLoadEvent::JobKilledForMemory {
                 domain: MemoryDomain::Container,
-                task_id,
+                pid,
                 ..
-            }] if task_id == "large"
+            }] if agent.is(*pid, "large")
         ),
         "{killed:?}"
     );
@@ -916,13 +951,13 @@ async fn a_container_job_the_agent_stopped_in_time_is_not_killed() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
     let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
-    agent.container_job(&cgroup, "large", 4 * GIB).await;
+    let large_pid = agent.container_job(&cgroup, "large", 4 * GIB).await;
     let normal = Some(MemoryPressure::Normal);
 
     assert_eq!(agent.guard.observe(clock.now(), normal).await.len(), 1);
     clock.advance(30);
     assert!(agent.job_named("large").kill().await);
-    cgroup.hold("large", 0);
+    cgroup.hold(large_pid, 0);
 
     clock.advance(120);
     assert!(agent.guard.observe(clock.now(), normal).await.is_empty());
@@ -1008,7 +1043,7 @@ async fn the_machine_and_the_container_are_judged_apart() {
     else {
         panic!("only the machine warns: {events:?}");
     };
-    assert!(agent.is(&job.task_id, "local"));
+    assert!(agent.is(job.pid, "local"));
     assert!(!events.iter().any(is_container));
 }
 
@@ -1066,9 +1101,9 @@ async fn a_remote_job_in_a_container_terminal_is_still_never_judged() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
     let mut agent = Agent::containerized(10 * GIB, &cgroup).await;
-    agent.remote_job("remote", 500 * GIB).await;
+    let remote_pid = agent.remote_job("remote", 500 * GIB).await;
     // The container's cgroup knows nothing of the remote job either.
-    cgroup.hold("remote", 500 * GIB);
+    cgroup.hold(remote_pid, 500 * GIB);
     cgroup.pressure(THRASHING);
 
     let events = agent

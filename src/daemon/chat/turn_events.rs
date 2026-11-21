@@ -298,7 +298,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
     pub(super) async fn job_fact(&mut self, fact: crate::agent::JobFact) -> ControlFlow<TurnStop> {
         let shown = match fact {
             crate::agent::JobFact::Started {
-                task_id,
+                pid,
                 output_preview,
                 output_file,
             } => {
@@ -307,7 +307,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     self.state,
                     self.session_id.as_str(),
                     TerminalRuntimeState {
-                        task_id: Some(task_id),
+                        pid: Some(pid),
                         output_file: Some(output_file),
                         output_preview: Some(output_preview),
                         input_notice: None,
@@ -591,7 +591,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.decode_meter.note_boundary();
                 if matches!(
                     name.as_str(),
-                    "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
+                    "terminal" | "terminal_input" | "terminal_read"
                 ) {
                     mark_run_running(self.state, self.guard.fence()).await?;
                 }

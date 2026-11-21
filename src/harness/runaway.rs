@@ -36,7 +36,7 @@ mod tests;
 /// The final warning an agent has not yet acted on.
 #[derive(Debug)]
 struct Warned {
-    task_id: String,
+    pid: u32,
     since: Instant,
     window: Duration,
 }
@@ -106,16 +106,12 @@ impl Watch {
             Some(warned) => {
                 // A job that is gone was acted on; the next tick warns about
                 // the next one if the conditions still hold.
-                if let Some(job) = snapshot
-                    .jobs
-                    .iter()
-                    .find(|job| job.task_id == warned.task_id)
-                {
+                if let Some(job) = snapshot.jobs.iter().find(|job| job.pid == warned.pid) {
                     if now.duration_since(warned.since) >= warned.window {
                         if memory.kill_runaway(job, snapshot).await {
                             events.push(HostLoadEvent::JobKilledForMemory {
                                 domain,
-                                task_id: job.task_id.clone(),
+                                pid: job.pid,
                                 command: job.command.clone(),
                                 footprint: MemorySize(job.footprint_bytes),
                                 capacity: MemorySize(capacity),
@@ -130,7 +126,7 @@ impl Watch {
                 if let Some(job) = snapshot.jobs.first().filter(|job| job.footprint_bytes > 0) {
                     let window = memory.response_window();
                     self.warned = Some(Warned {
-                        task_id: job.task_id.clone(),
+                        pid: job.pid,
                         since: now,
                         window,
                     });

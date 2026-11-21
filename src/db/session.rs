@@ -348,9 +348,10 @@ impl ChatDb {
                         .is_some_and(|row| row.browser_takeover_alert_pending),
                 },
                 terminal: TerminalRuntimeState {
-                    task_id: runtime_row
+                    pid: runtime_row
                         .as_ref()
-                        .and_then(|row| row.terminal_task_id.clone()),
+                        .and_then(|row| row.terminal_pid)
+                        .and_then(|pid| u32::try_from(pid).ok()),
                     output_file: runtime_row
                         .as_ref()
                         .and_then(|row| row.terminal_output_file.clone()),
@@ -942,9 +943,9 @@ impl ChatDb {
         let now = jiff::Timestamp::now().to_string();
         query!(
             self.db,
-            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, 'idle', 0, 0, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_pid, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, 'idle', 0, 0, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET terminal_pid = excluded.terminal_pid, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
             session_id,
-            terminal.task_id.as_deref(),
+            terminal.pid.map(i64::from),
             terminal.output_file.as_deref(),
             terminal.output_preview.as_deref(),
             terminal.input_notice.as_deref(),
@@ -1823,7 +1824,7 @@ impl ChatDb {
         .await?;
         query!(
             tx,
-            "UPDATE session_runtimes SET state = 'idle', run_id = NULL, terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE run_id IS NOT NULL OR state = 'running'",
+            "UPDATE session_runtimes SET state = 'idle', run_id = NULL, terminal_pid = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE run_id IS NOT NULL OR state = 'running'",
             jiff::Timestamp::now().to_string()
         )
         .execute()

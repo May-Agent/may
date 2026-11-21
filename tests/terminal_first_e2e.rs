@@ -92,6 +92,10 @@ enum MockChatScenario {
     /// The first request starts the script as a background terminal job;
     /// every later request gets a plain text reply.
     StartsBackgroundJob(&'static str),
+    /// Starts a detached background sleeper, parses its real OS PID from the
+    /// tool result, stops it with native `kill -TERM <pid>` inside `terminal`,
+    /// and verifies the job clears from the session.
+    NativeKillByPid,
     /// The first request runs the script as a foreground terminal command and
     /// the next replies with text, failing the turn when the command's result
     /// reports a denied operation.
@@ -376,7 +380,7 @@ impl Drop for MockOpenAiServer {
 struct MockScenarioState {
     scenario: MockChatScenario,
     request_index: usize,
-    task_id: Option<String>,
+    pid: Option<u32>,
     output_file: Option<String>,
     /// Set once a probe script served its final response, so the test can
     /// wait for a turn the job's completion resumed on its own.
@@ -396,7 +400,7 @@ impl MockScenarioState {
         Self {
             scenario,
             request_index: 0,
-            task_id: None,
+            pid: None,
             output_file: None,
             probe_done: false,
             probe_steps: 0,
@@ -602,11 +606,9 @@ impl MockScenarioState {
                     done_frame(Duration::from_millis(10)),
                 ]),
                 1 => {
-                    let task_id =
-                        terminal_task_id_from_latest_tool_output(request).ok_or_else(|| {
-                            "terminal tool result did not include a task_id".to_string()
-                        })?;
-                    self.task_id = Some(task_id.clone());
+                    let pid = terminal_pid_from_latest_tool_output(request)
+                        .ok_or_else(|| "terminal tool result did not include a PID".to_string())?;
+                    self.pid = Some(pid);
                     self.output_file = Some(
                         terminal_output_file_from_latest_tool_output(request).ok_or_else(|| {
                             "terminal tool result did not include an output file".to_string()
@@ -618,7 +620,7 @@ impl MockScenarioState {
                                 "call-terminal-input",
                                 "terminal_input",
                                 &serde_json::json!({
-                                    "task_id": task_id,
+                                    "pid": pid,
                                     "input": "lexo",
                                     "append_newline": true
                                 }),
@@ -770,6 +772,67 @@ impl MockScenarioState {
                     Duration::from_millis(10),
                 )),
             },
+            MockChatScenario::NativeKillByPid => {
+                verify_native_tool_surface(request)?;
+                match self.request_index {
+                    0 => MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                "call-detach-sleeper",
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Start a detached sleeper",
+                                    "script": "sleep 600",
+                                    "mode": "default",
+                                    "background": true,
+                                    "timeout": 600,
+                                }),
+                            ),
+                            Duration::from_millis(10),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ]),
+                    1 => {
+                        let pid =
+                            terminal_pid_from_latest_tool_output(request).ok_or_else(|| {
+                                "detached terminal result did not include a PID".to_string()
+                            })?;
+                        self.pid = Some(pid);
+                        MockHttpResponse::sse(vec![
+                            delayed_sse_frame(
+                                tool_call_chunk(
+                                    "call-native-kill",
+                                    "terminal",
+                                    &serde_json::json!({
+                                        "description": "Stop the sleeper by PID",
+                                        "script": format!("kill -TERM {pid}"),
+                                        "mode": "default",
+                                        "raw": true,
+                                        "timeout": 10,
+                                    }),
+                                ),
+                                Duration::from_millis(200),
+                            ),
+                            done_frame(Duration::from_millis(10)),
+                        ])
+                    }
+                    2 => {
+                        let kill_output = latest_tool_output(request)
+                            .ok_or_else(|| "native kill command result missing".to_string())?;
+                        if tool_output_reports_failure(&kill_output) {
+                            return Err(format!("native kill command failed: {kill_output}"));
+                        }
+                        MockHttpResponse::sse(text_stream_frames(
+                            vec!["stopped background job".to_string()],
+                            Duration::from_millis(10),
+                        ))
+                    }
+                    _ => MockHttpResponse::sse(text_stream_frames(
+                        vec!["acknowledged".to_string()],
+                        Duration::from_millis(10),
+                    )),
+                }
+            }
             MockChatScenario::WritesTasksFile => {
                 // The run loop keeps the model going while `tasks.md` has
                 // open rows (`Doing`, `Queued`), so the mock writes two rows,
@@ -1036,7 +1099,6 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
             "monitor",
             "terminal",
             "terminal_input",
-            "terminal_kill",
             "terminal_read",
         ]
     {
@@ -2064,7 +2126,7 @@ fn launch_job_finished(request: &Value) -> bool {
                 .iter()
                 .filter_map(|message| message.get("content").and_then(Value::as_str))
                 .any(|content| {
-                    content.contains("Background task")
+                    content.contains("Background job PID ")
                         && (content.contains("finished") || content.contains("failed"))
                 })
         })
@@ -2086,12 +2148,15 @@ fn tool_output_reports_failure(output: &str) -> bool {
     output.contains("Exit code: ")
 }
 
-fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
+fn terminal_pid_from_latest_tool_output(request: &Value) -> Option<u32> {
     let output = latest_tool_output(request)?;
-    let marker = "Started in background as task '";
+    let marker = "Started in background with PID ";
     let start = output.find(marker)? + marker.len();
-    let end = output[start..].find('\'')?;
-    Some(output[start..start + end].to_string())
+    let digits: String = output[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 fn terminal_output_file_from_latest_tool_output(request: &Value) -> Option<String> {
@@ -4033,18 +4098,17 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
                 .get("interactions")
                 .and_then(|interactions| interactions.get("terminal"))
                 .unwrap_or(&Value::Null);
-            terminal.get("taskId").and_then(Value::as_str).is_some()
+            terminal.get("pid").and_then(Value::as_u64).is_some()
                 && terminal.get("outputFile").and_then(Value::as_str).is_some()
         },
     )
     .await;
-    let task_id = runtime_during_background
+    let pid = runtime_during_background
         .get("interactions")
         .and_then(|interactions| interactions.get("terminal"))
-        .and_then(|terminal| terminal.get("taskId"))
-        .and_then(Value::as_str)
-        .expect("runtime should expose active terminal task id")
-        .to_string();
+        .and_then(|terminal| terminal.get("pid"))
+        .and_then(Value::as_u64)
+        .expect("runtime should expose active terminal job pid");
     let output_file = runtime_during_background
         .get("interactions")
         .and_then(|interactions| interactions.get("terminal"))
@@ -4105,10 +4169,7 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         mock.request_count().await >= 4,
         "expected terminal round trip to make multiple LLM requests"
     );
-    assert!(
-        !task_id.trim().is_empty(),
-        "terminal task id should not be empty"
-    );
+    assert!(pid > 0, "terminal job pid should be positive");
 
     let agent_requests = mock.agent_requests().await;
     let context_heading = environment.context_heading();
@@ -6349,18 +6410,28 @@ async fn served(ids: may_agent::model_ids::SessionIds) -> may_agent::model_ids::
     .expect("the claim finishes")
 }
 
-/// The word `may exec` named its job by, from the notice of a job killed at
+/// The word `may exec` leased from the session's pool for its background job's
+/// output file (`outputs/<word>.txt`), after verifying the job was killed at
 /// its timeout.
-fn killed_job_word(output: &std::process::Output) -> String {
+fn killed_exec_output_word(sandbox_dir: &Path, output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    stderr
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("background task: ")
-                .and_then(|rest| rest.strip_suffix(" (killed)"))
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("background job PID ") && line.ends_with(" (killed)")),
+        "exec reports its killed job PID: {stderr}"
+    );
+    std::fs::read_dir(sandbox_dir.join("outputs"))
+        .expect("exec creates the session outputs directory")
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
         })
-        .unwrap_or_else(|| panic!("exec reports its killed job: {stderr}"))
-        .to_string()
+        .expect("exec writes its background job output under a leased word")
 }
 
 /// `may exec` leases its ids from the daemon's pool of the session: a word
@@ -6426,7 +6497,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
         .await
         .expect("exec task")
         .expect("may exec should run");
-    let exec_word = killed_job_word(&output);
+    let exec_word = killed_exec_output_word(&session.sandbox_dir, &output);
     assert!(
         !daemon_words.contains(&exec_word),
         "the daemon handed out exec's word {exec_word}"
@@ -6447,7 +6518,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     let output = exec(&other.id, "while :; do sleep 0.1; done".to_string(), "1")
         .await
         .expect("may exec should run");
-    let exec_word = killed_job_word(&output);
+    let exec_word = killed_exec_output_word(&other.sandbox_dir, &output);
     assert!(
         free.contains(&exec_word),
         "exec took {exec_word}, not one of the words the daemon did not hold: {free:?}"
@@ -6596,12 +6667,8 @@ async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_sessio
     let seen = mock.agent_requests().await.len();
 
     server.kill().await;
-    #[cfg(target_os = "macos")]
-    assert!(
-        process_tree_alive(pid),
-        "the job outlives the daemon that started it until the next start ends it"
-    );
-
+    // The job's sandbox dies with the daemon that owned it, so the job may
+    // already be gone; anything that still outlives ends on the next start.
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while process_tree_alive(pid) {
@@ -6857,6 +6924,64 @@ async fn a_graceful_stop_does_not_alert() {
         "no alert after a graceful stop: {:?}",
         message_texts(next)
     );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+#[tokio::test]
+async fn agent_stops_background_job_with_native_kill_by_pid() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::NativeKillByPid).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "start and stop sleeper" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "native kill by pid turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "events: {events:?}"
+    );
+    let captured_pid = mock
+        .state
+        .lock()
+        .await
+        .pid
+        .expect("scenario should capture real PID");
+    assert!(captured_pid > 0, "captured PID must be positive");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let background = background_of(&client, &server, &session_id).await;
+        let running = background
+            .get("jobs")
+            .and_then(Value::as_array)
+            .is_some_and(|jobs| {
+                jobs.iter().any(|job| {
+                    job.get("pid").and_then(Value::as_u64) == Some(u64::from(captured_pid))
+                        && job.pointer("/status/state").and_then(Value::as_str) == Some("running")
+                })
+            });
+        if !running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native kill should stop background job PID {captured_pid}: {background}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
     server.stop().await;
     environment.release(&harness, &session_id).await;
 }

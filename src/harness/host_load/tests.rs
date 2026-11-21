@@ -257,7 +257,7 @@ async fn conditions_and_events_go_through_their_own_channels() {
     };
     let killed = HostLoadEvent::JobKilledForMemory {
         domain: aither_sandbox::MemoryDomain::Machine,
-        task_id: "amber-forest-thunder-pearl".to_string(),
+        pid: 4242,
         command: "cargo build".to_string(),
         footprint: aither_sandbox::MemorySize(8 << 30),
         capacity: aither_sandbox::MemorySize(32 << 30),

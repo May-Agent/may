@@ -1,7 +1,7 @@
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, ToolResult, tool::ToolResultPart,
 };
-use aither_sandbox::{Interpreter, JobInputArgs, JobKillArgs, JobReadArgs, SandboxMode, ShellArgs};
+use aither_sandbox::{Interpreter, JobInputArgs, JobReadArgs, SandboxMode, ShellArgs};
 use partial_json_fixer::fix_json;
 
 /// Frontend-agnostic start event for a tool call.
@@ -21,21 +21,20 @@ pub enum ToolStartKind {
         /// Interpreter the script runs under; decides its highlighting.
         interpreter: Interpreter,
     },
-    /// A `terminal_input` invocation: text written to a background task's
-    /// stdin. The task id is kept for the frontend to resolve into a
-    /// user-facing label; it is never rendered itself.
+    /// A `terminal_input` invocation: text written to a background job's
+    /// stdin.
     Stdin {
-        /// Task identifier of the target background job.
-        task_id: String,
-        /// The text written to the task's stdin.
+        /// Process ID of the target background job; `None` while still streaming.
+        pid: Option<u32>,
+        /// The text written to the job's stdin.
         input: String,
     },
-    /// A `terminal_read` or `terminal_kill` invocation on a background task.
+    /// A `terminal_read` invocation on a background job.
     JobControl {
         /// Which control action runs.
         action: JobControlAction,
-        /// Task identifier of the target background job.
-        task_id: String,
+        /// Process ID of the target background job; `None` while still streaming.
+        pid: Option<u32>,
     },
     /// A known terminal tool whose model-written arguments did not match
     /// its schema. The daemon returns an argument error to the model; the
@@ -59,13 +58,11 @@ pub enum ToolStartKind {
     },
 }
 
-/// A control action on a background terminal task.
+/// A control action on a background terminal job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobControlAction {
     /// `terminal_read`: incremental output read.
     Read,
-    /// `terminal_kill`: task termination.
-    Kill,
 }
 
 impl JobControlAction {
@@ -74,7 +71,6 @@ impl JobControlAction {
     pub const fn chip(self) -> &'static str {
         match self {
             Self::Read => "read",
-            Self::Kill => "kill",
         }
     }
 }
@@ -147,19 +143,13 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
             interpreter: args.interpreter,
         }),
         "terminal_input" => parse(name, arguments, |args: JobInputArgs| ToolStartKind::Stdin {
-            task_id: args.task_id,
+            pid: Some(args.pid),
             input: args.input,
-        }),
-        "terminal_kill" => parse(name, arguments, |args: JobKillArgs| {
-            ToolStartKind::JobControl {
-                action: JobControlAction::Kill,
-                task_id: args.task_id,
-            }
         }),
         "terminal_read" => parse(name, arguments, |args: JobReadArgs| {
             ToolStartKind::JobControl {
                 action: JobControlAction::Read,
-                task_id: args.task_id,
+                pid: Some(args.pid),
             }
         }),
         _ => ToolStartKind::Generic {
@@ -197,16 +187,12 @@ pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
                 .unwrap_or_default(),
         },
         "terminal_input" => ToolStartKind::Stdin {
-            task_id: pick(&value, "task_id"),
+            pid: pick_u32(&value, "pid"),
             input: pick(&value, "input"),
-        },
-        "terminal_kill" => ToolStartKind::JobControl {
-            action: JobControlAction::Kill,
-            task_id: pick(&value, "task_id"),
         },
         "terminal_read" => ToolStartKind::JobControl {
             action: JobControlAction::Read,
-            task_id: pick(&value, "task_id"),
+            pid: pick_u32(&value, "pid"),
         },
         _ => ToolStartKind::Generic {
             name: name.to_string(),
@@ -233,6 +219,13 @@ fn pick(value: &serde_json::Value, key: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn pick_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 /// Argument keys inspected for a one-line summary of an unknown tool call,
@@ -412,8 +405,8 @@ mod tests {
 
     #[test]
     fn parse_tool_start_malformed_other_terminal_tools() {
-        for tool in ["terminal_input", "terminal_kill", "terminal_read"] {
-            let ToolStartKind::Malformed { name, error, .. } = parse_tool_start(tool, "[1]") else {
+        for tool in ["terminal_input", "terminal_read"] {
+            let ToolStartKind::Malformed { name, error, .. } = parse_tool_start(tool, "{}") else {
                 panic!("expected malformed start kind for {tool}");
             };
             assert_eq!(name, tool);
@@ -516,30 +509,22 @@ mod tests {
 
         match parse_tool_start(
             "terminal_input",
-            r#"{"task_id":"finch-comet","input":"Friday","append_newline":true}"#,
+            r#"{"pid":4242,"input":"Friday","append_newline":true}"#,
         ) {
-            ToolStartKind::Stdin { task_id, input } => {
-                assert_eq!(task_id, "finch-comet");
+            ToolStartKind::Stdin { pid, input } => {
+                assert_eq!(pid, Some(4242));
                 assert_eq!(input, "Friday");
             }
             _ => panic!("expected stdin start event"),
         }
 
-        match parse_tool_start("terminal_kill", r#"{"task_id":"finch-comet"}"#) {
-            ToolStartKind::JobControl { action, task_id } => {
-                assert_eq!(action, super::JobControlAction::Kill);
-                assert_eq!(task_id, "finch-comet");
-            }
-            _ => panic!("expected kill start event"),
-        }
-
         match parse_tool_start(
             "terminal_read",
-            r#"{"task_id":"finch-comet","cursor":0,"max_bytes":1024}"#,
+            r#"{"pid":4242,"cursor":0,"max_bytes":1024}"#,
         ) {
-            ToolStartKind::JobControl { action, task_id } => {
+            ToolStartKind::JobControl { action, pid } => {
                 assert_eq!(action, super::JobControlAction::Read);
-                assert_eq!(task_id, "finch-comet");
+                assert_eq!(pid, Some(4242));
             }
             _ => panic!("expected read start event"),
         }
@@ -623,28 +608,21 @@ mod tests {
 
     #[test]
     fn parse_tool_start_partial_covers_terminal_family() {
-        let ToolStartKind::Stdin { task_id, input } =
-            parse_tool_start_partial("terminal_input", r#"{"task_id":"finch-comet","input":"Fri"#)
+        let ToolStartKind::Stdin { pid, input } =
+            parse_tool_start_partial("terminal_input", r#"{"pid":4242,"input":"Fri"#)
         else {
             panic!("expected stdin start kind");
         };
-        assert_eq!(task_id, "finch-comet");
+        assert_eq!(pid, Some(4242));
         assert_eq!(input, "Fri");
 
-        let ToolStartKind::JobControl { action, task_id } =
-            parse_tool_start_partial("terminal_kill", "{\"task_id\":\"finch-com")
-        else {
-            panic!("expected job-control start kind");
-        };
-        assert_eq!(action, super::JobControlAction::Kill);
-        assert_eq!(task_id, "finch-com");
-
-        let ToolStartKind::JobControl { action, .. } =
+        let ToolStartKind::JobControl { action, pid } =
             parse_tool_start_partial("terminal_read", "{}")
         else {
             panic!("expected job-control start kind");
         };
         assert_eq!(action, super::JobControlAction::Read);
+        assert_eq!(pid, None);
     }
 
     #[test]
@@ -758,14 +736,14 @@ mod tests {
             (CommandOutcome::Exited { code: 2 }, Some("exit 2")),
             (
                 CommandOutcome::Killed {
-                    task_id: "t".to_string(),
+                    pid: 4242,
                     notice: "killed at its timeout".to_string(),
                 },
                 Some("killed at its timeout"),
             ),
             (
                 CommandOutcome::Running {
-                    task_id: "t".to_string(),
+                    pid: 4242,
                     output: stored("outputs/log", "/tmp/log"),
                 },
                 None,
