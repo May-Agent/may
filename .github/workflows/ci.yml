@@ -184,7 +184,7 @@ jobs:
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: write
