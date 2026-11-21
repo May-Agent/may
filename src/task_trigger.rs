@@ -24,6 +24,8 @@ const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
 pub const WEBHOOK_MOUNT: &str = "/api/tasks/webhook";
 /// The webhook route with its token replaced, for records that must not hold the token.
 pub const WEBHOOK_ROUTE_REDACTED: &str = "/api/tasks/webhook/{token}";
+/// Placeholder substituted for the secret webhook token in script-visible payloads.
+pub const WEBHOOK_TOKEN_REDACTED: &str = "{token}";
 
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     format!("{prefix}{error}")
@@ -514,6 +516,32 @@ impl PersistedTaskTrigger {
             },
         }
     }
+
+    /// API-shaped trigger metadata safe to expose to task scripts via
+    /// `$MAY_TASK_TRIGGER_FILE`, with the webhook bearer token and path redacted.
+    #[must_use]
+    pub fn redacted_response(
+        &self,
+        run_at_utc: Option<String>,
+        cron_utc: Option<String>,
+    ) -> TaskTriggerResponse {
+        match self {
+            Self::Time { trigger_type } => TaskTriggerResponse::Time {
+                trigger_type: *trigger_type,
+                run_at_utc,
+                cron_utc,
+            },
+            Self::Event { event_name } => TaskTriggerResponse::Event {
+                event_name: event_name.clone(),
+            },
+            Self::Webhook { signature, .. } => TaskTriggerResponse::Webhook {
+                token: WEBHOOK_TOKEN_REDACTED.to_string(),
+                webhook_path: WEBHOOK_ROUTE_REDACTED.to_string(),
+                public_url: None,
+                signature: signature.clone(),
+            },
+        }
+    }
 }
 
 /// Validated trigger definition produced by [`normalize_trigger`].
@@ -655,6 +683,30 @@ pub enum TaskInvocation {
         /// Captured HTTP request data.
         request: TaskWebhookRequest,
     },
+}
+
+impl TaskInvocation {
+    /// Returns a copy safe to serialize into `$MAY_TASK_TRIGGER_FILE`: redacts
+    /// the secret webhook URL path and bearer authorization headers.
+    #[must_use]
+    pub fn redacted_for_script(self) -> Self {
+        match self {
+            Self::Webhook { mut request } => {
+                request.path = WEBHOOK_ROUTE_REDACTED.to_string();
+                for (name, values) in &mut request.headers {
+                    if name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("proxy-authorization")
+                    {
+                        for value in values {
+                            *value = "[REDACTED]".to_string();
+                        }
+                    }
+                }
+                Self::Webhook { request }
+            }
+            other => other,
+        }
+    }
 }
 
 /// API-facing view of a trigger definition, tagged by `kind`.

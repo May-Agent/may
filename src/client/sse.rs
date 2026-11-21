@@ -11,10 +11,12 @@ pub struct ServerEvent {
     pub id: Option<String>,
 }
 
-/// Buffers stream bytes and yields complete events.
+/// Buffers stream bytes and yields complete events, tracking the scan cursor
+/// so partial multi-chunk payloads are scanned in O(n) total time.
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
+    scanned: usize,
 }
 
 impl SseParser {
@@ -27,9 +29,17 @@ impl SseParser {
     /// data (comments, keep-alives) are skipped.
     pub fn next_event(&mut self) -> Option<ServerEvent> {
         loop {
-            let end = find_frame_end(&self.buffer)?;
-            let frame: Vec<u8> = self.buffer.drain(..end.frame).collect();
+            let start = self.scanned.min(self.buffer.len());
+            let Some(end) = find_frame_end(&self.buffer[start..]) else {
+                // Keep up to 3 trailing bytes unscanned so a split `\n\n` or
+                // `\r\n\r\n` across chunk boundaries is matched on the next push.
+                self.scanned = self.buffer.len().saturating_sub(3);
+                return None;
+            };
+            let frame_len = start + end.frame;
+            let frame: Vec<u8> = self.buffer.drain(..frame_len).collect();
             self.buffer.drain(..end.separator);
+            self.scanned = 0;
             let text = String::from_utf8_lossy(&frame);
             let mut kind = None;
             let mut id = None;
@@ -115,6 +125,26 @@ mod tests {
         assert_eq!(
             parser.next_event().and_then(|event| event.id).as_deref(),
             Some("17")
+        );
+    }
+
+    #[test]
+    fn cursor_scanner_reassembles_crlf_and_lf_separators_split_byte_by_byte() {
+        let mut parser = SseParser::default();
+        let stream = b"event: alpha\r\ndata: one\r\n\r\n:comment\n\nevent: beta\ndata: two\n\n";
+        let mut out = Vec::new();
+        for &byte in stream {
+            parser.push(std::slice::from_ref(&byte));
+            while let Some(ev) = parser.next_event() {
+                out.push((ev.kind, ev.data));
+            }
+        }
+        assert_eq!(
+            out,
+            vec![
+                ("alpha".to_string(), "one".to_string()),
+                ("beta".to_string(), "two".to_string()),
+            ]
         );
     }
 }

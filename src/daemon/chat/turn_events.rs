@@ -669,6 +669,14 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 // A refusal the policy recorded is persisted with the end:
                 // the reloaded transcript shows it as a notice, not a failure.
                 let refused = self.state.runtime_service.refused_reads().peek(&call);
+                let result_text = result.render_for_model();
+                if let Some(cause) =
+                    crate::daemon::disk_exhaustion::classify_error_text(&result_text)
+                {
+                    self.state
+                        .pending_transcripts
+                        .arm_alert(self.session_id.as_str(), cause);
+                }
                 let record = ToolEventRecord::End {
                     id: id.clone(),
                     name: name.clone(),

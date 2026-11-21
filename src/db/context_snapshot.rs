@@ -283,9 +283,11 @@ impl ChatDb {
         let updated_at = jiff::Timestamp::now().to_string();
         let checkpoint_blob = rmp_serde::to_vec_named(&snapshot.checkpoint)
             .map_err(|error| storage_error(format!("failed to encode checkpoint blob: {error}")))?;
-        let mut tx = match fence {
-            Some(fence) => self.begin_fenced(fence).await?,
-            None => self.db.begin().await?,
+        let mut tx = if let Some(fence) = fence {
+            self.begin_fenced(fence).await?
+        } else {
+            self.check_write_fault()?;
+            self.db.begin().await?
         };
         for entry in &snapshot.transcript_entries {
             query!(

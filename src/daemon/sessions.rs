@@ -254,12 +254,12 @@ pub(super) async fn get_session(
 
     let mut summary = crate::session::SessionSummary::from_db_model(db_session);
 
-    // Fetch runtime and messages in parallel — they are independent queries
-    let (runtime_result, messages_result) =
-        tokio::join!(db.get_session_runtime(&id), db.get_messages(&id),);
-    summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
+    summary.runtime = db
+        .get_session_runtime(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
-    let _ = messages_result.map_err(internal_error)?;
 
     let mut session = ApiSession::from_summary(summary, model);
     session.cursor = Some(cursor);
@@ -575,12 +575,18 @@ pub(super) async fn create_session(
             .set_session_cwd(&id, cwd)
             .await
             .map_err(internal_error)?;
-        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
+        let cwd_path = std::path::PathBuf::from(cwd);
+        if let Some(worktree) =
+            blocking::unblock(move || crate::repo_search::worktree_root(&cwd_path)).await
+        {
             let _ = state.db().touch_repo_usage(&worktree).await;
         }
     }
 
-    if let Some(repo) = resolve_repo_binding(req.repo.as_deref()).map_err(bad_request_error)? {
+    let resolved_repo = resolve_repo_binding_async(req.repo.clone())
+        .await
+        .map_err(bad_request_error)?;
+    if let Some(ref repo) = resolved_repo {
         state
             .db()
             .set_session_repo(&id, Some(repo.as_str()))
@@ -616,7 +622,7 @@ pub(super) async fn create_session(
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
 
     let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
-    session.repo = resolve_repo_binding(req.repo.as_deref()).ok().flatten();
+    session.repo = resolved_repo;
     session.location = location;
     Ok(Json(session))
 }
@@ -715,6 +721,16 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
     Err(format!("invalid repo spec '{spec}'"))
 }
 
+async fn resolve_repo_binding_async(spec: Option<String>) -> Result<Option<String>, String> {
+    let Some(trimmed) = spec.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.starts_with("local:") {
+        return resolve_repo_binding(Some(trimmed));
+    }
+    blocking::unblock(move || resolve_repo_binding(spec.as_deref())).await
+}
+
 pub(super) async fn delete_session(
     params: Params,
     State(state): State<Arc<DaemonState>>,
@@ -771,6 +787,7 @@ pub(super) async fn delete_session(
     state.runtime_service.forget_terminal_grants(&id);
     state.runtime_service.forget_task_events(&id);
     state.tunnels.remove_session(&id);
+    state.local_url_port_mapper.remove_session(&id);
     #[cfg(target_os = "macos")]
     if state.computer.is_running() {
         // No helper means no display to release; never launch one to say so.
@@ -803,6 +820,7 @@ pub(super) async fn delete_all_sessions(
     // Delete all from DB
     let db = state.db();
     state.tunnels.remove_all();
+    state.local_url_port_mapper.remove_all();
     // Every live PR outlives its session — mark them `orphaned` first.
     if let Ok(prs) = db.list_prs(None, crate::db::PrFilter::Open).await {
         for pr in prs {
@@ -925,9 +943,15 @@ pub(super) async fn patch_session(
     {
         return Err(bad_request_error(format!("unknown model {model}")));
     }
-    if let Some(super::types::NullableStringPatch::Set(spec)) = req.repo.as_ref() {
-        resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?;
-    }
+    let validated_repo_patch = match req.repo.as_ref() {
+        Some(super::types::NullableStringPatch::Set(spec)) => Some(Some(
+            resolve_repo_binding_async(Some(spec.clone()))
+                .await
+                .map_err(bad_request_error)?,
+        )),
+        Some(super::types::NullableStringPatch::Null) => Some(None),
+        None => None,
+    };
     if req.memory_off == Some(false) {
         return Err(bad_request_error(
             "memory stays off for the rest of the session once turned off",
@@ -1002,17 +1026,15 @@ pub(super) async fn patch_session(
         .filter(|cwd| !cwd.is_empty())
     {
         db.set_session_cwd(&id, cwd).await.map_err(internal_error)?;
-        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
+        let cwd_path = std::path::PathBuf::from(cwd);
+        if let Some(worktree) =
+            blocking::unblock(move || crate::repo_search::worktree_root(&cwd_path)).await
+        {
             let _ = db.touch_repo_usage(&worktree).await;
         }
     }
-    if let Some(patch) = req.repo.as_ref() {
-        let next_repo = match patch {
-            super::types::NullableStringPatch::Null => None,
-            super::types::NullableStringPatch::Set(spec) => {
-                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
-            }
-        };
+    if let Some(next_repo) = validated_repo_patch {
+        let next_repo = next_repo.flatten();
         db.set_session_repo(&id, next_repo.as_deref())
             .await
             .map_err(internal_error)?;

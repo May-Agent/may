@@ -80,6 +80,30 @@ impl From<SkyDbError> for ChatDbError {
     }
 }
 
+impl ChatDbError {
+    /// Whether this failure stems from home-environment disk exhaustion
+    /// (`ENOSPC`, `EDQUOT`, `SQLITE_FULL`, or storage `EIO`).
+    #[must_use]
+    pub fn is_disk_exhausted(&self) -> bool {
+        match self {
+            Self::Storage(message) => {
+                crate::daemon::disk_exhaustion::classify_error_text(message).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn disk_exhaustion_cause(
+        &self,
+    ) -> Option<crate::daemon::disk_exhaustion::DiskExhaustionCause> {
+        match self {
+            Self::Storage(message) => crate::daemon::disk_exhaustion::classify_error_text(message),
+            _ => None,
+        }
+    }
+}
+
 /// Parameters for creating a new profile.
 #[derive(Debug)]
 pub struct CreateProfileParams<'a> {

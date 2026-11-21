@@ -85,19 +85,10 @@ impl TurnPersister {
         });
     }
 
-    /// Flush all buffered messages to the database.
-    ///
-    /// Returns the ID of the last inserted message, or `None` if nothing was flushed.
-    pub async fn flush(&mut self, db: &ChatDb) -> Result<Option<i64>, crate::db::ChatDbError> {
-        if self.pending.is_empty() {
-            return Ok(None);
-        }
-
-        let messages = std::mem::take(&mut self.pending);
-        let mut last_id = None;
-
-        for msg in &messages {
-            let chat_msg = ChatMessage {
+    fn build_chat_messages(&self) -> Vec<ChatMessage> {
+        self.pending
+            .iter()
+            .map(|msg| ChatMessage {
                 id: None,
                 role: msg.role.clone(),
                 content: msg.content.clone(),
@@ -111,13 +102,30 @@ impl TurnPersister {
                 reading: None,
                 card: None,
                 thinking: msg.thinking.clone(),
-            };
-            let row = db
-                .append_chat_message_as_run(&self.fence, &chat_msg)
-                .await?;
-            last_id = Some(i64::from(row.id));
+            })
+            .collect()
+    }
+
+    pub fn take_pending_chat_messages(&mut self) -> Vec<ChatMessage> {
+        let built = self.build_chat_messages();
+        self.pending.clear();
+        built
+    }
+
+    /// Flush all buffered messages atomically in a single fenced transaction.
+    ///
+    /// On failure, `self.pending` remains intact so a retry or deferred flush
+    /// never loses buffered turn messages.
+    pub async fn flush(&mut self, db: &ChatDb) -> Result<Option<i64>, crate::db::ChatDbError> {
+        if self.pending.is_empty() {
+            return Ok(None);
         }
 
+        let chat_messages = self.build_chat_messages();
+        let last_id = db
+            .append_chat_messages_as_run(&self.fence, &chat_messages)
+            .await?;
+        self.pending.clear();
         Ok(last_id)
     }
 }
@@ -303,5 +311,55 @@ mod tests {
                 Some(answer_at)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn flush_is_atomic_on_mid_batch_failure_and_retains_pending_for_retry() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-atomic-flush";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(db.claim_session_run(&fence).await.expect("claim"));
+
+        // Abort on the second message insert so a non-transactional loop would
+        // leave the first message committed and lose `self.pending`.
+        db.execute_for_test(
+            "CREATE TRIGGER abort_second_msg BEFORE INSERT ON messages WHEN NEW.content = 'second' BEGIN SELECT RAISE(ABORT, 'mid-turn failure'); END;",
+        )
+        .await
+        .expect("trigger created");
+
+        let at = Timestamp::now();
+        let mut persister = TurnPersister::new(fence);
+        persister.push_assistant("first".to_string(), at);
+        persister.push_assistant("second".to_string(), at);
+
+        assert!(persister.flush(&db).await.is_err());
+        let rows_after_fail = db.get_messages(session_id).await.expect("rows");
+        assert!(
+            rows_after_fail.is_empty(),
+            "single-transaction flush must roll back earlier rows on mid-batch error"
+        );
+
+        db.execute_for_test("DROP TRIGGER abort_second_msg;")
+            .await
+            .expect("trigger dropped");
+        let last_id = persister
+            .flush(&db)
+            .await
+            .expect("retained pending messages must flush on retry");
+        assert!(last_id.is_some());
+        let rows = db.get_messages(session_id).await.expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content, "first");
+        assert_eq!(rows[1].content, "second");
     }
 }

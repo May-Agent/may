@@ -183,13 +183,12 @@ pub(super) async fn connect(
             });
         }
     }
-    let updated = state.update_config(|config| {
-        config
-            .connect_acp_agent(request.name, agent)
-            .expect("the name was checked above");
-    });
     state
-        .save_config(&updated)
+        .save_and_update_config(|config| {
+            config
+                .connect_acp_agent(request.name, agent)
+                .expect("the name was checked above");
+        })
         .await
         .map_err(ConnectError::Save)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
@@ -228,10 +227,12 @@ pub(super) async fn disconnect_acp_agent(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let updated = state.update_config(|config| {
-        let _ = config.disconnect_acp_agent(name);
-    });
-    state.save_config(&updated).await.map_err(internal_error)?;
+    let _ = state
+        .save_and_update_config(|config| {
+            let _ = config.disconnect_acp_agent(name);
+        })
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }

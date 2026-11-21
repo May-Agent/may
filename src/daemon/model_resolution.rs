@@ -44,11 +44,11 @@ pub(super) async fn persist_last_model(
     }
 
     let selector = model.parse::<ModelSelector>()?;
-    let updated = state.update_config(|config| {
-        config.last_model = Some(selector);
-    });
-
-    state.save_config(&updated).await?;
+    let _ = state
+        .save_and_update_config(|config| {
+            config.last_model = Some(selector);
+        })
+        .await?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(())
 }
@@ -63,10 +63,11 @@ pub(super) async fn persist_last_effort(
     if state.config_snapshot().last_effort.as_deref() == Some(effort) {
         return Ok(());
     }
-    let updated = state.update_config(|config| {
-        config.last_effort = Some(effort.to_string());
-    });
-    state.save_config(&updated).await?;
+    let _ = state
+        .save_and_update_config(|config| {
+            config.last_effort = Some(effort.to_string());
+        })
+        .await?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(())
 }

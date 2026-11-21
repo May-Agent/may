@@ -353,7 +353,7 @@ pub struct PersistedWorkspaceRequest {
 }
 
 /// Persisted runtime summary used by session lists and runtime endpoints.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSummary {
     /// Top-level runtime state.

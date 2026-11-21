@@ -586,10 +586,8 @@ impl ChatDb {
         self.load_session_runtime_summary(session_id).await
     }
 
-    /// List session runtime summaries.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    /// List session runtime summaries in a single batched transaction across
+    /// `session_ids` instead of N+1 per-session queries.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
@@ -597,15 +595,309 @@ impl ChatDb {
         &self,
         session_ids: &[String],
     ) -> Result<HashMap<String, SessionRuntimeSummary>, ChatDbError> {
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct BatchMessageEntryRow {
+            session_id: String,
+            id: i64,
+            delivery_mode: String,
+            content: String,
+            hidden_context_xml: Option<String>,
+            created_at: String,
+            state: String,
+            claim_error: Option<String>,
+        }
+
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct BatchMessageAttachmentRow {
+            session_id: String,
+            message_id: i64,
+            attachment_id: String,
+            name: String,
+            attachment_type: String,
+            url: String,
+            text_content: Option<String>,
+        }
+
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct BatchAskUserRequestRow {
+            session_id: String,
+            request_id: String,
+            blocking: bool,
+        }
+
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct BatchAskUserQuestionRow {
+            request_id: String,
+            ordinal: i64,
+            section: String,
+            question: String,
+            multi_select: bool,
+            secret_name: Option<String>,
+            secret_scope: Option<String>,
+        }
+
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct BatchAskUserOptionRow {
+            request_id: String,
+            question_ordinal: i64,
+            value: String,
+        }
+
         if session_ids.is_empty() {
             return Ok(HashMap::new());
         }
+
+        let ids_json = serde_json::to_string(session_ids)
+            .map_err(|error| storage_error(format!("failed to encode session ids: {error}")))?;
+        let mut tx = self.db.begin().await?;
+
+        let mut runtime_by_session: HashMap<String, session_runtimes::Model> = query!(
+            tx,
+            "SELECT * FROM session_runtimes WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_runtimes::Model>()
+        .await?
+        .into_iter()
+        .map(|row| (row.session_id.clone(), row))
+        .collect();
+
+        let mut messages_by_session: HashMap<String, Vec<PendingMessageEntryRow>> = HashMap::new();
+        for row in query!(
+            tx,
+            "SELECT session_id, id, delivery_mode, content, hidden_context_xml, created_at, state, claim_error FROM session_pending_message_entries WHERE session_id IN (SELECT value FROM json_each(?)) AND state != 'committed' ORDER BY id ASC",
+            ids_json.as_str()
+        )
+        .fetch_all::<BatchMessageEntryRow>()
+        .await?
+        {
+            messages_by_session
+                .entry(row.session_id)
+                .or_default()
+                .push(PendingMessageEntryRow {
+                    id: row.id,
+                    delivery_mode: row.delivery_mode,
+                    content: row.content,
+                    hidden_context_xml: row.hidden_context_xml,
+                    created_at: row.created_at,
+                    state: row.state,
+                    claim_error: row.claim_error,
+                });
+        }
+
+        let mut attachments_by_session: HashMap<String, Vec<PendingMessageAttachmentRow>> =
+            HashMap::new();
+        for row in query!(
+            tx,
+            "SELECT entries.session_id AS session_id, attachments.message_id, attachments.attachment_id, attachments.name, attachments.attachment_type, attachments.url, attachments.text_content FROM session_pending_message_attachments AS attachments INNER JOIN session_pending_message_entries AS entries ON entries.id = attachments.message_id WHERE entries.session_id IN (SELECT value FROM json_each(?)) ORDER BY attachments.message_id ASC, attachments.ordinal ASC",
+            ids_json.as_str()
+        )
+        .fetch_all::<BatchMessageAttachmentRow>()
+        .await?
+        {
+            attachments_by_session
+                .entry(row.session_id)
+                .or_default()
+                .push(PendingMessageAttachmentRow {
+                    message_id: row.message_id,
+                    attachment_id: row.attachment_id,
+                    name: row.name,
+                    attachment_type: row.attachment_type,
+                    url: row.url,
+                    text_content: row.text_content,
+                });
+        }
+
+        let mut permission_by_session: HashMap<String, session_pending_permissions::Model> =
+            HashMap::new();
+        for row in query!(
+            tx,
+            "SELECT * FROM session_pending_permissions WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_pending_permissions::Model>()
+        .await?
+        {
+            permission_by_session
+                .entry(row.session_id.clone())
+                .or_insert(row);
+        }
+
+        let mut workspace_by_session: HashMap<String, session_pending_workspace::Model> =
+            HashMap::new();
+        for row in query!(
+            tx,
+            "SELECT * FROM session_pending_workspace WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_pending_workspace::Model>()
+        .await?
+        {
+            workspace_by_session
+                .entry(row.session_id.clone())
+                .or_insert(row);
+        }
+
+        let mut blocking_ask_by_session: HashMap<String, String> = HashMap::new();
+        let mut open_asks_by_session: HashMap<String, Vec<String>> = HashMap::new();
+        let mut request_ids: Vec<String> = Vec::new();
+        for row in query!(
+            tx,
+            "SELECT session_id, request_id, blocking FROM session_pending_ask_user_requests_v2 WHERE session_id IN (SELECT value FROM json_each(?)) ORDER BY created_at ASC, rowid ASC",
+            ids_json.as_str()
+        )
+        .fetch_all::<BatchAskUserRequestRow>()
+        .await?
+        {
+            if row.blocking {
+                use std::collections::hash_map::Entry;
+                if let Entry::Vacant(vacant) = blocking_ask_by_session.entry(row.session_id) {
+                    request_ids.push(row.request_id.clone());
+                    vacant.insert(row.request_id);
+                }
+            } else {
+                request_ids.push(row.request_id.clone());
+                open_asks_by_session
+                    .entry(row.session_id)
+                    .or_default()
+                    .push(row.request_id);
+            }
+        }
+
+        let mut questions_by_request: HashMap<String, Vec<PendingAskUserQuestionRow>> =
+            HashMap::new();
+        let mut options_by_request: HashMap<String, Vec<PendingAskUserQuestionOptionRow>> =
+            HashMap::new();
+        if !request_ids.is_empty() {
+            let req_ids_json = serde_json::to_string(&request_ids).map_err(|error| {
+                storage_error(format!("failed to encode ask_user request ids: {error}"))
+            })?;
+            for row in query!(
+                tx,
+                "SELECT request_id, ordinal, section, question, multi_select, secret_name, secret_scope FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT value FROM json_each(?)) ORDER BY ordinal ASC",
+                req_ids_json.as_str()
+            )
+            .fetch_all::<BatchAskUserQuestionRow>()
+            .await?
+            {
+                questions_by_request
+                    .entry(row.request_id)
+                    .or_default()
+                    .push(PendingAskUserQuestionRow {
+                        ordinal: row.ordinal,
+                        section: row.section,
+                        question: row.question,
+                        multi_select: row.multi_select,
+                        secret_name: row.secret_name,
+                        secret_scope: row.secret_scope,
+                    });
+            }
+            for row in query!(
+                tx,
+                "SELECT request_id, question_ordinal, value FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT value FROM json_each(?)) ORDER BY question_ordinal ASC, option_ordinal ASC",
+                req_ids_json.as_str()
+            )
+            .fetch_all::<BatchAskUserOptionRow>()
+            .await?
+            {
+                options_by_request
+                    .entry(row.request_id)
+                    .or_default()
+                    .push(PendingAskUserQuestionOptionRow {
+                        question_ordinal: row.question_ordinal,
+                        value: row.value,
+                    });
+            }
+        }
+
+        let plan_by_session: HashMap<String, session_plans::Model> = query!(
+            tx,
+            "SELECT * FROM session_plans WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_plans::Model>()
+        .await?
+        .into_iter()
+        .map(|row| (row.session_id.clone(), row))
+        .collect();
+
+        let yolo_by_session: HashMap<String, session_yolo::Model> = query!(
+            tx,
+            "SELECT * FROM session_yolo WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_yolo::Model>()
+        .await?
+        .into_iter()
+        .map(|row| (row.session_id.clone(), row))
+        .collect();
+
+        let memory_by_session: HashMap<String, session_memory::Model> = query!(
+            tx,
+            "SELECT * FROM session_memory WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_memory::Model>()
+        .await?
+        .into_iter()
+        .map(|row| (row.session_id.clone(), row))
+        .collect();
+
+        tx.commit().await?;
+
         let mut summaries = HashMap::with_capacity(session_ids.len());
         for session_id in session_ids {
-            summaries.insert(
-                session_id.clone(),
-                self.load_session_runtime_summary(session_id).await?,
+            if summaries.contains_key(session_id) {
+                continue;
+            }
+            let blocking_request_id = blocking_ask_by_session.remove(session_id);
+            let (ask_row, ask_questions, ask_options) = blocking_request_id.map_or_else(
+                || (None, Vec::new(), Vec::new()),
+                |request_id| {
+                    let questions = questions_by_request.remove(&request_id).unwrap_or_default();
+                    let options = options_by_request.remove(&request_id).unwrap_or_default();
+                    (
+                        Some(PendingAskUserRequestRow { request_id }),
+                        questions,
+                        options,
+                    )
+                },
             );
+            let open_questions = open_asks_by_session
+                .remove(session_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|request_id| {
+                    let questions = questions_by_request.remove(&request_id).unwrap_or_default();
+                    let options = options_by_request.remove(&request_id).unwrap_or_default();
+                    Self::persisted_ask_user_request_from_parts(
+                        PendingAskUserRequestRow { request_id },
+                        questions,
+                        options,
+                    )
+                })
+                .collect();
+            let summary = Self::build_session_runtime_summary(
+                runtime_by_session.remove(session_id),
+                messages_by_session.remove(session_id).unwrap_or_default(),
+                attachments_by_session
+                    .remove(session_id)
+                    .unwrap_or_default(),
+                permission_by_session.remove(session_id),
+                workspace_by_session.remove(session_id),
+                PendingAskUserParts {
+                    row: ask_row,
+                    open_questions,
+                    questions: ask_questions,
+                    options: ask_options,
+                },
+                SessionModeRows {
+                    plan: plan_by_session.get(session_id),
+                    yolo: yolo_by_session.get(session_id),
+                    memory: memory_by_session.get(session_id),
+                },
+            )?;
+            summaries.insert(session_id.clone(), summary);
         }
 
         Ok(summaries)
@@ -1629,7 +1921,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::{ChatDb, query};
-    use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+    use crate::session::{
+        AttachmentKind, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
+        PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment, SessionPlanState,
+        SessionRuntimeState,
+    };
 
     fn ask_user_request(id: &str) -> PersistedAskUserRequest {
         PersistedAskUserRequest {
@@ -1887,5 +2183,75 @@ mod tests {
             .waiting_ask_user
             .expect("the request should be waiting");
         assert_eq!(waiting.id, "req-1");
+    }
+
+    #[tokio::test]
+    async fn batched_list_session_runtime_summaries_matches_single_session_loads() {
+        let dir = tempdir().expect("tempdir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        for id in ["s-empty", "s-rich", "s-open"] {
+            db.create_session(id, Some(id), Some("model"))
+                .await
+                .expect("create");
+        }
+        db.set_session_runtime_state("s-rich", SessionRuntimeState::Running)
+            .await
+            .expect("state");
+        db.set_session_plan_state("s-rich", SessionPlanState::Draft)
+            .await
+            .expect("plan");
+        db.set_session_yolo("s-rich", true).await.expect("yolo");
+        db.set_session_memory_off("s-rich")
+            .await
+            .expect("memory_off");
+        db.push_queued_message(
+            "s-rich",
+            PendingUserMessage {
+                id: None,
+                state: PendingMessageState::Pending,
+                error: None,
+                content: "queued msg".to_string(),
+                attachments: vec![PersistedAttachment {
+                    id: "att-1".to_string(),
+                    name: "note.txt".to_string(),
+                    attachment_type: AttachmentKind::Text,
+                    url: "file:///tmp/note.txt".to_string(),
+                    text_content: Some("hello".to_string()),
+                }],
+                hidden_context_xml: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                delivery_mode: PendingUserMessageMode::Queue,
+            },
+        )
+        .await
+        .expect("queue");
+        db.register_ask_user_request("s-rich", &ask_user_request("blocking-req"))
+            .await
+            .expect("blocking ask_user");
+        db.open_ask_user_question("s-open", &ask_user_request("open-req-1"))
+            .await
+            .expect("open ask_user 1");
+        db.open_ask_user_question("s-open", &ask_user_request("open-req-2"))
+            .await
+            .expect("open ask_user 2");
+
+        let ids = vec![
+            "s-empty".to_string(),
+            "s-rich".to_string(),
+            "s-open".to_string(),
+        ];
+        let batched = db
+            .list_session_runtime_summaries(&ids)
+            .await
+            .expect("batched summaries");
+        for id in &ids {
+            let single = db
+                .load_session_runtime_summary(id)
+                .await
+                .expect("single summary");
+            assert_eq!(batched.get(id), Some(&single), "mismatch for {id}");
+        }
     }
 }
