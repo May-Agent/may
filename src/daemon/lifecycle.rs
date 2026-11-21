@@ -965,7 +965,13 @@ mod launchd_job_tests {
         }
         super::ensure_hashline_links(&paths, false).expect("stale links are removed");
         for command in super::HASHLINE_COMMANDS {
-            assert!(home.path().join("bin").join(command).symlink_metadata().is_err());
+            assert!(
+                home.path()
+                    .join("bin")
+                    .join(command)
+                    .symlink_metadata()
+                    .is_err()
+            );
         }
     }
 
