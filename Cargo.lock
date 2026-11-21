@@ -5689,7 +5689,7 @@ dependencies = [
 
 [[package]]
 name = "may-agent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "acpsub",
  "ahash",
@@ -5852,7 +5852,7 @@ dependencies = [
 
 [[package]]
 name = "may-patch"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "askama 0.16.1",
  "tempfile",
@@ -5861,7 +5861,7 @@ dependencies = [
 
 [[package]]
 name = "may-sed"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "askama 0.16.1",
  "clap",
