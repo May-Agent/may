@@ -17,7 +17,9 @@ use aither_sandbox::{
 };
 
 use super::distribution::ToolDistribution;
-use super::runtime::{HostProgram, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget};
+use super::runtime::{
+    HostProgram, ManagedTool, PreparedTools, ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
+};
 use super::transport::{
     ContainerToolTransport, LocalToolTransport, SshToolTransport, ToolTransport,
     ensure_command_line_tools, probe_tool_environment, successful_output,
@@ -57,6 +59,17 @@ pub struct ToolEnvironments {
     home: PreparedHome,
     catalog: ToolCatalog,
     source: Arc<ToolSource>,
+    /// `[experimental] hashline`: `apply_patch` stays out of every backend.
+    hashline: bool,
+}
+
+/// The bundle a backend gets: `apply_patch` stripped under hashline mode.
+fn strip_for_hashline(bundle: ToolBundle, hashline: bool) -> ToolBundle {
+    if hashline {
+        bundle.without(ManagedTool::ApplyPatch)
+    } else {
+        bundle
+    }
 }
 
 impl ToolEnvironments {
@@ -68,6 +81,7 @@ impl ToolEnvironments {
     pub async fn prepare_host(
         distribution: &ToolDistribution,
         cache_root: &Path,
+        hashline: bool,
     ) -> Result<Self, ToolRuntimeError> {
         let target = ToolTarget::native()?;
         ensure_command_line_tools(&LocalToolTransport, &target).await?;
@@ -76,7 +90,7 @@ impl ToolEnvironments {
             distribution.load(&target, &artifacts),
             distribution.prepare_host_program(HostProgram::Heel, &target, cache_root),
         )?;
-        let tools = bundle
+        let tools = strip_for_hashline(bundle, hashline)
             .prepare_local(&cache_root.join("runtimes"))
             .await?
             .with_heel(heel);
@@ -84,6 +98,7 @@ impl ToolEnvironments {
             PreparedHome::Local(tools),
             distribution,
             cache_root,
+            hashline,
         ))
     }
 
@@ -98,13 +113,17 @@ impl ToolEnvironments {
         container_id: &str,
         distribution: &ToolDistribution,
         cache_root: &Path,
+        hashline: bool,
     ) -> Result<Self, ToolRuntimeError> {
         let transport = ContainerToolTransport::new(exec, container_id);
         let info = probe_tool_environment(&transport).await?;
-        let tools = distribution
-            .image_tools(&info.target)?
-            .verify(&transport)
-            .await?;
+        let image_tools = distribution.image_tools(&info.target)?;
+        let image_tools = if hashline {
+            image_tools.without(ManagedTool::ApplyPatch)
+        } else {
+            image_tools
+        };
+        let tools = image_tools.verify(&transport).await?;
         Ok(Self::new(
             PreparedHome::Container {
                 container_id: container_id.into(),
@@ -112,10 +131,16 @@ impl ToolEnvironments {
             },
             distribution,
             cache_root,
+            hashline,
         ))
     }
 
-    fn new(home: PreparedHome, distribution: &ToolDistribution, cache_root: &Path) -> Self {
+    fn new(
+        home: PreparedHome,
+        distribution: &ToolDistribution,
+        cache_root: &Path,
+        hashline: bool,
+    ) -> Self {
         Self {
             catalog: home.catalog().clone(),
             home,
@@ -123,6 +148,7 @@ impl ToolEnvironments {
                 distribution: distribution.clone(),
                 cache_root: cache_root.to_path_buf(),
             }),
+            hashline,
         }
     }
 
@@ -185,15 +211,18 @@ impl ToolEnvironments {
         if let PreparedHome::Local(tools) = &self.home {
             return Ok(tools.clone());
         }
-        self.source
-            .distribution
-            .load(
-                &ToolTarget::native()?,
-                &self.source.cache_root.join("artifacts"),
-            )
-            .await?
-            .prepare_local(&self.source.cache_root.join("runtimes"))
-            .await
+        strip_for_hashline(
+            self.source
+                .distribution
+                .load(
+                    &ToolTarget::native()?,
+                    &self.source.cache_root.join("artifacts"),
+                )
+                .await?,
+            self.hashline,
+        )
+        .prepare_local(&self.source.cache_root.join("runtimes"))
+        .await
     }
 
     /// The commands verified in the home environment, to describe to the
@@ -212,11 +241,13 @@ impl ToolEnvironments {
         let transport = SshToolTransport::new(server.clone());
         let info = probe_tool_environment(&transport).await?;
         ensure_command_line_tools(&transport, &info.target).await?;
-        let bundle = self
-            .source
-            .distribution
-            .load(&info.target, &self.source.cache_root.join("artifacts"))
-            .await?;
+        let bundle = strip_for_hashline(
+            self.source
+                .distribution
+                .load(&info.target, &self.source.cache_root.join("artifacts"))
+                .await?,
+            self.hashline,
+        );
         let (tools, heel) = futures::try_join!(
             bundle.prepare_remote(&transport, &info.cache_root),
             remote_heel(&transport, &info.target, &self.source),
@@ -234,7 +265,7 @@ impl ToolEnvironments {
         distribution: &ToolDistribution,
         cache_root: &Path,
     ) -> Self {
-        Self::new(PreparedHome::Local(tools), distribution, cache_root)
+        Self::new(PreparedHome::Local(tools), distribution, cache_root, false)
     }
 }
 

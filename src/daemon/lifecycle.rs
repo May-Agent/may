@@ -136,6 +136,48 @@ pub fn ensure_tasks_link(paths: &DaemonPaths) -> std::io::Result<()> {
     std::os::unix::fs::symlink(&target, &link)
 }
 
+/// The binaries the `[experimental] hashline` switch serves on `PATH`.
+const HASHLINE_COMMANDS: [&str; 2] = ["search", "edit"];
+
+/// Keeps `~/.may/bin/{search,edit}` symlinks to the hashline binaries built
+/// next to this executable while `enabled` holds, and takes the links away
+/// when it does not.
+///
+/// # Errors
+/// Fails when the directory or a link cannot be written or removed.
+pub fn ensure_hashline_links(paths: &DaemonPaths, enabled: bool) -> std::io::Result<()> {
+    let directory = bin_dir(paths);
+    if enabled {
+        std::fs::create_dir_all(&directory)?;
+    }
+    let exe_dir = current_exe()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| std::io::Error::other("this executable has no directory"))?;
+    for command in HASHLINE_COMMANDS {
+        let link = directory.join(command);
+        let target = exe_dir.join(command);
+        match std::fs::read_link(&link) {
+            Ok(current) if enabled && current == target => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && enabled => {}
+            // Pointing elsewhere, not a symlink, or the feature is off.
+            Ok(_) | Err(_) => {
+                std::fs::remove_file(&link)?;
+                continue;
+            }
+        }
+        if target.is_file() {
+            std::os::unix::fs::symlink(&target, &link)?;
+        } else {
+            tracing::warn!(
+                "experimental.hashline is on but {command} was not built next to {}",
+                exe_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The calling process's environment as text. A launchd job starts with
 /// launchd's default environment, so the daemon is given the client's.
 ///

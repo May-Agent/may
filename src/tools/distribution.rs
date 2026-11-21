@@ -1604,8 +1604,8 @@ pub mod tests {
             .unwrap();
         assert_eq!(bundle.catalog(), baseline.catalog());
         assert_eq!(
-            bundle.catalog().render().unwrap(),
-            baseline.catalog().render().unwrap()
+            bundle.catalog().render(false).unwrap(),
+            baseline.catalog().render(false).unwrap()
         );
         let local = bundle
             .prepare_local(&fixture.directory.path().join("local"))

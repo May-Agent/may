@@ -868,15 +868,18 @@ struct TerminalTemplate {
     /// Whether scripts run in the managed bash, which May's command policy
     /// confines to `rg`, `fd` and a `sed` that writes no file.
     managed_bash: bool,
+    /// `[experimental] hashline`: `search rg`/`edit` replace `rg`/`apply_patch`.
+    hashline: bool,
 }
 
 /// The terminal section: how to run commands.
-pub fn build_terminal(environment: &AgentEnvironment) -> String {
+pub fn build_terminal(environment: &AgentEnvironment, hashline: bool) -> String {
     TerminalTemplate {
         managed_bash: crate::command_policy::runs_managed_bash(matches!(
             environment,
             AgentEnvironment::Container { .. }
         )),
+        hashline,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render terminal: {error}"))
@@ -949,20 +952,32 @@ pub fn build_languages(languages: &crate::harness::language::Languages) -> Optio
 ///
 /// # Errors
 /// Fails when the catalog does not render.
-pub fn build_prepared_tools(catalog: &crate::tools::ToolCatalog) -> Result<String, MayAgentError> {
-    Ok(catalog.render()?)
+pub fn build_prepared_tools(
+    catalog: &crate::tools::ToolCatalog,
+    hashline: bool,
+) -> Result<String, MayAgentError> {
+    Ok(catalog.render(hashline)?)
 }
 
 #[derive(Template)]
 #[template(path = "prompt/efficiency.md", escape = "none")]
 struct EfficiencyTemplate {
-    has_search_command: bool,
+    /// The indexed-search command's name: `search`, or `rag` under hashline.
+    search_command: &'static str,
+    /// `[experimental] hashline`: `search rg`/`search sg`/`edit` on PATH.
+    hashline: bool,
 }
 
 /// The efficiency section: concurrent calls, the cheapest search, `explore`.
-pub fn build_efficiency(commands: &[(String, String)]) -> String {
+pub fn build_efficiency(commands: &[(String, String)], hashline: bool) -> String {
+    let indexed = if hashline { "rag" } else { "search" };
     EfficiencyTemplate {
-        has_search_command: commands.iter().any(|(name, _)| name == "search"),
+        search_command: if commands.iter().any(|(name, _)| name == indexed) {
+            indexed
+        } else {
+            ""
+        },
+        hashline,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render efficiency: {error}"))

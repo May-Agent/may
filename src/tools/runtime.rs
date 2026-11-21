@@ -581,6 +581,26 @@ impl ToolBundle {
         })
     }
 
+    /// The bundle with `tool` left out — a verified bundle stays verified,
+    /// and its dropped binary changes the cache key, so the stripped bundle
+    /// prepares its own content-addressed directory.
+    ///
+    /// Used by the experimental hashline mode to serve sessions an
+    /// environment without `apply_patch`.
+    #[must_use]
+    pub fn without(&self, tool: ManagedTool) -> Self {
+        Self {
+            target: self.target.clone(),
+            binaries: self
+                .binaries
+                .iter()
+                .filter(|binary| binary.tool != tool)
+                .cloned()
+                .collect(),
+            python: self.python.clone(),
+        }
+    }
+
     /// The target platform; never inferred from the coordinator for a remote backend.
     #[must_use]
     pub const fn target(&self) -> &ToolTarget {
@@ -923,6 +943,22 @@ impl ImageTools {
                 .map(|python| (python.version(), python.interpreter_sha256())),
         };
         Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
+    }
+
+    /// The pinned tools with `tool` left out, for the experimental hashline
+    /// mode's `apply_patch`-free images.
+    #[must_use]
+    pub fn without(&self, tool: ManagedTool) -> Self {
+        Self {
+            target: self.target.clone(),
+            tools: self
+                .tools
+                .iter()
+                .filter(|entry| entry.tool != tool)
+                .cloned()
+                .collect(),
+            python: self.python.clone(),
+        }
     }
 
     /// Where the image carries these tools: `/opt/aither/tools/<cache key>`.
@@ -1390,6 +1426,8 @@ impl ToolInfo {
 #[template(path = "prepared_tools.txt", escape = "none")]
 struct ToolCatalogTemplate<'a> {
     tools: &'a [ToolInfo],
+    /// `[experimental] hashline`: `search`/`edit` replace `apply_patch`.
+    hashline: bool,
 }
 
 impl ToolCatalogTemplate<'_> {
@@ -1403,8 +1441,12 @@ impl ToolCatalog {
     ///
     /// # Errors
     /// Returns a template rendering error.
-    pub fn render(&self) -> Result<String, ToolRuntimeError> {
-        Ok(ToolCatalogTemplate { tools: &self.tools }.render()?)
+    pub fn render(&self, hashline: bool) -> Result<String, ToolRuntimeError> {
+        Ok(ToolCatalogTemplate {
+            tools: &self.tools,
+            hashline,
+        }
+        .render()?)
     }
 }
 
@@ -2814,8 +2856,8 @@ printf '%s\n' 'uv @VERSION@'
     #[test]
     fn prompt_catalog_is_operational_and_stable() {
         let catalog = bundle().catalog();
-        let first = catalog.render().unwrap();
-        assert_eq!(first, catalog.render().unwrap());
+        let first = catalog.render(false).unwrap();
+        assert_eq!(first, catalog.render(false).unwrap());
         for command in native_tools() {
             let listed = if *command == ManagedTool::Sed {
                 "sed"

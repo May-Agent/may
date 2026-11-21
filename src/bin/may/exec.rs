@@ -387,12 +387,17 @@ async fn build_exec_shell(
                         container_id,
                         &tool_distribution,
                         &tools_dir,
+                        may_config.experimental.hashline,
                     )
                     .await
                 }
                 may_agent::AgentEnvironment::Local => {
-                    may_agent::tools::ToolEnvironments::prepare_host(&tool_distribution, &tools_dir)
-                        .await
+                    may_agent::tools::ToolEnvironments::prepare_host(
+                        &tool_distribution,
+                        &tools_dir,
+                        may_config.experimental.hashline,
+                    )
+                    .await
                 }
             }
             .map_err(ExecError::InitializeBaselineTools)
