@@ -159,11 +159,18 @@ pub fn ensure_hashline_links(paths: &DaemonPaths, enabled: bool) -> std::io::Res
         let target = exe_dir.join(command);
         match std::fs::read_link(&link) {
             Ok(current) if enabled && current == target => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && enabled => {}
-            // Pointing elsewhere, not a symlink, or the feature is off.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !enabled {
+                    continue;
+                }
+                // Enabled and absent: falls through to the link creation.
+            }
+            // Pointing elsewhere or not a symlink.
             Ok(_) | Err(_) => {
                 std::fs::remove_file(&link)?;
-                continue;
+                if !enabled {
+                    continue;
+                }
             }
         }
         if target.is_file() {
@@ -940,6 +947,26 @@ mod launchd_job_tests {
                 .count(),
             1
         );
+    }
+
+    /// Disabled hashline mode removes stale links and tolerates absent ones;
+    /// the switch leaves a missing link a no-op, never an error.
+    #[test]
+    fn disabled_hashline_links_are_removed_when_present() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths::new(home.path().to_path_buf());
+        // Absent links are a no-op when disabled.
+        super::ensure_hashline_links(&paths, false).expect("absent links are a no-op");
+        // Stale links are removed when disabled.
+        std::fs::create_dir_all(home.path().join("bin")).unwrap();
+        for command in super::HASHLINE_COMMANDS {
+            let link = home.path().join("bin").join(command);
+            std::os::unix::fs::symlink("/nonexistent", &link).unwrap();
+        }
+        super::ensure_hashline_links(&paths, false).expect("stale links are removed");
+        for command in super::HASHLINE_COMMANDS {
+            assert!(home.path().join("bin").join(command).symlink_metadata().is_err());
+        }
     }
 
     #[test]
