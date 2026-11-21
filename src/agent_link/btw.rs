@@ -170,6 +170,7 @@ impl ForkHosts {
     /// `session_id`'s btw questions, until the returned registration drops
     /// or a later agent of the session registers.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         session_id: &str,
@@ -343,6 +344,9 @@ impl AgentMessaging {
     ///
     /// # Errors
     /// See [`AgentLinkError`].
+    ///
+    /// # Panics
+    /// When the compile-time question template fails to render.
     pub async fn side_answer(
         &self,
         session_id: &str,
