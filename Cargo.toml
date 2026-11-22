@@ -4,7 +4,6 @@ version = "0.1.1"
 edition = "2024"
 description = "May - A warm, boundaried AI assistant"
 license = "MIT"
-build = "build.rs"
 repository = "https://github.com/May-Agent/may"
 publish = false
 
@@ -17,247 +16,119 @@ path = "src/bin/may/main.rs"
 dist = true
 
 [workspace]
-members = [".", "tasks", "patch", "sed", "container-image"]
+members = [".", "agent-core", "daemon", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
 # `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
-default-members = [".", "tasks", "patch", "sed", "container-image"]
+default-members = [".", "agent-core", "daemon", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
 
 [features]
 default = ["vision-ocr"]
-ui = []
+ui = ["may-daemon/ui"]
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
 # release, so its update channel defaults to `stable` instead of `dev`.
-release-build = []
+release-build = ["may-config/release-build", "may-harness/release-build"]
 # On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
-vision-ocr = ["dep:waterkit-vision"]
+vision-ocr = ["may-agent-core/vision-ocr", "may-daemon/vision-ocr"]
 
 [dependencies]
+# The agent core: the whole library surface except the daemon and the TUI.
+may-agent-core = { path = "agent-core" }
+# The resident daemon and its API.
+may-daemon = { path = "daemon" }
+# The terminal user interface.
+may-tui = { path = "tui" }
 # The `tasks.md` parser and the `tasks` command; the container image tag is
 # derived from this crate's directory.
 may-tasks = { path = "tasks" }
-# The content-addressed container image references.
-may-container-image = { path = "container-image" }
-libc = "0.2.191"
+# SQLite persistence for sessions, messages, and app state.
+may-db = { path = "db" }
+# The media layer's permission helper the binary re-enters.
+may-media = { path = "media" }
+# Feature edge the release build's update channel reads.
+may-config = { path = "config" }
+# Feature edge the release build's update channel reads.
+may-harness = { path = "harness" }
 # Aither framework
 aither-core = { version = "0.31.0" }
-aither-agent = { version = "0.31.0", features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
-aither-connectivity = { version = "0.31.0" }
-# The parser the harness applies `apply_patch` with; a call's reading uses it
-# to place each hunk in the file it edits.
-may-patch = { path = "patch" }
-aither-sandbox = { version = "0.31.0", features = ["code-folding", "connectivity", "jobserver"] }
-aither-cloud = { version = "0.31.0" }
+aither-agent = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0" }
 aither-copilot = { version = "0.31.0" }
 aither-codex = { version = "0.31.0" }
-aither-models = { version = "0.31.0" }
-aither-mcp = { version = "0.31.0" }
-aither-browser = { version = "0.31.0" }
 # Exact token counts (`LanguageModel::count_text`) for the decode meter.
 aither-openai = { version = "0.31.0", default-features = false, features = ["tokenizer"] }
-# Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
-# builds on.
-aither-acp = { version = "0.31.0" }
-# The sandbox ACP agents and their terminal commands run in; the version
-# aither-sandbox builds its own sandboxes with.
-heel = { version = "0.10.1", default-features = false }
-
-# ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
-acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
 
 # repo-search daemon client; the daemon refuses a client of another version,
 # so it is the version inside the v0.0.15 binary pinned in
-# `src/tools/host-programs.json`.
+# `tool-dist/src/host-programs.json`.
 repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
-async-lock = "3"
-
-# Container runtime (Docker/OrbStack/Podman)
-bollard = "0.21"
-tar = "0.4"
-flate2 = "1"
-zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-# The tool distribution's artifacts: versions, xz archives, concurrent loads.
-semver = { version = "1.0.28", features = ["serde"] }
-percent-encoding = "2.3"
-lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz"] }
-futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures-lite = "2.6"
-futures-util = "0.3"
 bytes = "1"
 async-stream = "0.3"
-event-listener = "5"
 executor-core = { version = "0.7", features = ["tokio"] }
 async-fs = "2.1"
 async-io = "2.6"
 async-process = "2.5"
-humantime = { version = "2.4", default-features = false }
-async-net = "2"
 async-channel = "2"
-strsim = { version = "0.11", default-features = false }
 blocking = "1"
-terminal-colorsaurus = { version = "1.0.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-schemars = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yml = "0.0.12"
-rmp-serde = "1.3"
 toml = "0.8"
-dashmap = "6"
-# Partial JSON repair for streaming tool-call argument projection.
-partial-json-fixer = "0.5"
 
 # Utils
 jiff = { version = "0.2", features = ["serde"] }
-petname = "2"
-cron = "0.15"
-chrono = "0.4"
-shell-escape = "0.1"
-shell-words = "1.1"
-arc-swap = { version = "1", features = ["weak"] }
-aho-corasick = { version = "1.1.5", features = ["std", "perf-literal"] }
-whatlang = { version = "0.18", default-features = false }
-similar = "3"
-fastrand = "2"
-
-# Web Push notifications
-web-push = "0.11"
-p256 = "0.13"
+libc = "0.2.191"
 dirs = "6"
-which = { version = "8", default-features = false }
-shlex = "2"
+shell-escape = "0.1"
+arc-swap = { version = "1", features = ["weak"] }
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
-url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-getrandom = "0.4"
-
-# Markdown parsing
-# - streamdown-parser: incremental / streaming renderer for assistant output
-# - pulldown-cmark: CommonMark AST parser for structured input (checklists,
-#   prompt @-mentions, tasks.md, etc.) where one-shot correctness matters
-#   more than streaming
-streamdown-parser = "0.1"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-
-# TUI
-ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
-crossterm = "0.28"
-ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
-unicode-width = "0.2"
-unicode-segmentation = { version = "1.13", default-features = false }
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-ahash = "0.8"
-
-# Clipboard, image, and browser
-arboard = "3"
-base64 = "0.22"
-open = "5"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["text"], optional = true }
-
-# HTTP client for fetching images
-zenwave = "0.7"
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-# hyper over futures-io streams, for daemon connections outside tokio
-smol-hyper = { version = "0.1.1", default-features = false }
-http-body-util = "0.1"
-
-# Browser automation (CDP) and WebRTC live streaming
-chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
-chromiumoxide_fetcher = "0.9.1"
-webrtc = "0.17"
-# webrtc-rs interceptors are `async_trait` traits.
-async-trait = { version = "0.1.92", default-features = false }
-# Hardware H.264 (software AV1 on hosts without an encoder) and the
-# platform JPEG decode that feeds it.
-mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "dev", default-features = false, features = ["software-encode"] }
-# RGB/BGRA to NV12 for the frames that cannot go to the encoder as surfaces;
-# already in the lockfile through mediax-codec.
-yuv = { version = "0.8", default-features = false }
-
-# Web server for `may gui`/`may rest`
-skyzen = { version = "0.5.1", features = ["hyper"] }
-# The daemon serves the router itself and renders errors as skyzen does.
-skyzen-core = "0.2"
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
-skyzen-services = { version = "0.3.1", default-features = false, features = ["runtime-tokio", "sqlite"] }
-
-# File picker
-nucleo = "0.5"
-ignore = "0.4"
-
-# Logging
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Per-session open lock (flock)
-fd-lock = "4.0.4"
-
-# Templating
-askama = "0.16"
-
-# Shell parsing: terminal calls are read before they run
-brush-parser = { version = "0.3.0", default-features = false }
-
-# Embedded resources
-include_dir = "0.7"
-itertools = "0.14.0"
 tempfile = "3.24.0"
 git2 = "0.20.3"
-mime = "0.3"
-mime_guess = "2"
 rustls = { version = "0.23", features = ["ring"] }
-regex = "1.12"
-globset = "0.4"
-notify = "8"
-fs_extra = "1.3"
-reflink-copy = { version = "0.1.33", default-features = false }
-walkdir = "2"
-sha2 = "0.10"
-hmac = { version = "0.12", default-features = false }
-subtle = { version = "2.6", default-features = false }
-hex = { version = "0.4", default-features = false, features = ["alloc"] }
-# devcontainer.json is JSON with comments and trailing commas.
-jsonc-parser = { version = "0.34", default-features = false, features = ["serde"] }
-
 dunce = "1.0.5"
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
-linkify = { version = "0.11.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 clap_complete = { version = "4.6.11", default-features = false }
 indicatif = { version = "0.18.6", default-features = false }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
-# that arboard's get_image performs on every clipboard image.
-block2 = "0.6"
-objc2 = "0.6"
-objc2-app-kit = "0.3"
-objc2-foundation = "0.3"
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
-objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
-objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
-waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["display-stream"] }
-waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
-waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
-dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+# TUI
+ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
+crossterm = "0.28"
+arboard = "3"
+open = "5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
-[build-dependencies]
-may-container-image = { path = "container-image" }
+# Browser automation (CDP)
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+
+# Logging
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Templating
+askama = "0.16"
 
 [dev-dependencies]
+# Test-support helpers the integration tests drive.
+may-protocol = { path = "protocol", features = ["testing"] }
+may-tool-dist = { path = "tool-dist", features = ["test-fixtures"] }
+may-config = { path = "config", features = ["test-fixtures"] }
+may-harness = { path = "harness", features = ["testing"] }
+# Places jobs in a container or on a remote host for the memory guard's tests.
+aither-sandbox = { version = "0.31.0", features = ["test-util"] }
 # Builds the tar.xz artifacts the distribution tests extract.
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 # Checks that every model-facing id word is one o200k_base token.
 tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio-test = "0.4"
-# Places jobs in a container or on a remote host for the memory guard's tests.
-aither-sandbox = { version = "0.31.0", features = ["test-util"] }
 
 [workspace.lints]
 rust.missing_docs = "warn"
@@ -378,4 +249,3 @@ aither-skills = { git = "https://github.com/May-Agent/aither", branch = "serve-j
 aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "serve-job-base" }
 heel = { git = "https://github.com/May-Agent/heel", branch = "main" }
 heel-shim = { git = "https://github.com/May-Agent/heel", branch = "main" }
-

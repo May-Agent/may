@@ -16,10 +16,9 @@ use aither_sandbox::{
 use may_agent::ipc::{CommandRegistryBuilder, SessionShell, ShellSlot};
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::{
-    ChatDb, MayConfig, ProfileEnvironment, ProfileInfo, SessionId, SessionStore,
-    SharedTerminalCommandConfig, TaskRuntimeKind, TerminalPermissionHandler,
-    register_shared_terminal_commands, resolve_agent_environment_for_session,
-    resolve_provider_runtime,
+    ChatDb, MayConfig, ProfileEnvironment, SessionId, SessionStore, SharedTerminalCommandConfig,
+    TaskRuntimeKind, TerminalPermissionHandler, register_shared_terminal_commands,
+    resolve_agent_environment_for_session, resolve_provider_runtime,
 };
 
 use super::cli::ExecArgs;
@@ -225,15 +224,20 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
                 source,
             })?;
             Some(
-                ProfileInfo::from_db_parts(model, preferences.clone(), attachments, cloud)
-                    .map_err(|source| ExecError::InvalidProfile {
-                        profile_id: profile_id
-                            .clone()
-                            .expect("profile id present when model exists"),
-                        source,
-                    })?
-                    .environment
-                    .into_kind(),
+                may_db::profile::profile_from_db_parts(
+                    model,
+                    preferences.clone(),
+                    attachments,
+                    cloud,
+                )
+                .map_err(|source| ExecError::InvalidProfile {
+                    profile_id: profile_id
+                        .clone()
+                        .expect("profile id present when model exists"),
+                    source,
+                })?
+                .environment
+                .into_kind(),
             )
         }
         (None, None) => None,

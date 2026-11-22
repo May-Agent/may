@@ -14,7 +14,7 @@
 #
 # Writes <out-dir>/bash-<version>-<target>.tar.gz containing the executable,
 # plus <name>.sha256 and <name>.json metadata, and prints the metadata on
-# stdout. The metadata is the pin an entry of src/tools/tool-artifacts.json
+# stdout. The metadata is the pin an entry of tool-dist/src/tool-artifacts.json
 # carries.
 set -euo pipefail
 

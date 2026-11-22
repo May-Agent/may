@@ -10,7 +10,7 @@ Command output has each run of blank lines collapsed before the agent reads it. 
 
 ## What May provides
 
-May embeds a hash-pinned tool distribution assembled from its own pin files: the third-party tools and the Python interpreters in `src/tools/third-party-tools.json`, and `bash`, `apply_patch` and `aither-sed` in `src/tools/tool-artifacts.json` (`bash`, which `patch/bash` builds, and `apply_patch` from May's own `patch/v<version>` release; `aither-sed` from its `sed/v<version>` release). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them. The agent reads the prepared tools as a list of command names (no versions; `aither-sed` appears as `sed`), and the `terminal` tool description sends it to `rg`, `head` and `tail`, or `ask` for a summary, for saved output, since the managed shell refuses `grep`.
+May embeds a hash-pinned tool distribution assembled from its own pin files: the third-party tools and the Python interpreters in `tool-dist/src/third-party-tools.json`, and `bash`, `apply_patch` and `aither-sed` in `tool-dist/src/tool-artifacts.json` (`bash`, which `patch/bash` builds, and `apply_patch` from May's own `patch/v<version>` release; `aither-sed` from its `sed/v<version>` release). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them. The agent reads the prepared tools as a list of command names (no versions; `aither-sed` appears as `sed`), and the `terminal` tool description sends it to `rg`, `head` and `tail`, or `ask` for a summary, for saved output, since the managed shell refuses `grep`.
 
 | command | what | version |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ May embeds a hash-pinned tool distribution assembled from its own pin files: the
 | `uv` | Python package and project manager | 0.13.7 |
 | `python3` | CPython installed by `uv` when the tools are prepared | 3.13.18 |
 
-Not every platform has every tool: macOS arm64, Linux arm64 and Linux x86_64 get all of them; Windows gets only `rg`, `ast-grep`, `jq` and `apply_patch`. Separately, `src/tools/host-programs.json` pins programs the harness itself runs (the repo-search daemon, `search`, version 0.0.15, and on macOS arm64 the `podman` client of the managed container runtime, which is downloaded on first use, hash-verified and re-verified before every start); they are never put on a command `PATH`.
+Not every platform has every tool: macOS arm64, Linux arm64 and Linux x86_64 get all of them; Windows gets only `rg`, `ast-grep`, `jq` and `apply_patch`. Separately, `tool-dist/src/host-programs.json` pins programs the harness itself runs (the repo-search daemon, `search`, version 0.0.15, and on macOS arm64 the `podman` client of the managed container runtime, which is downloaded on first use, hash-verified and re-verified before every start); they are never put on a command `PATH`.
 
 ## Where they live
 
