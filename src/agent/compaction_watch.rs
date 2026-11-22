@@ -250,7 +250,8 @@ impl<F> MayRun<F>
 where
     F: std::future::Future<Output = Result<(), AgentError>>,
 {
-    pub(crate) const fn new(run: Run<F>, watch: RunWatch) -> Self {
+    /// A run of `run` watched by `watch`.
+    pub const fn new(run: Run<F>, watch: RunWatch) -> Self {
         Self { run, watch }
     }
 

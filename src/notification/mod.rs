@@ -6,11 +6,13 @@
 //! - [`service::NotificationService`] wraps the manager with a durable
 //!   mailbox so pending notifications survive may restarts.
 
+pub use may_protocol::notification::*;
+
 pub mod service;
 mod user_wait;
 
+pub use may_protocol::notification::UserNotification;
 pub use service::{NotificationService, NotificationServiceError};
-pub use user_wait::UserNotification;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,26 +26,6 @@ use web_push::{
 };
 
 use crate::db::ChatDb;
-
-/// Push notification payload delivered to browser service workers.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NotificationPayload {
-    /// ID assigned when the notification was created.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notification_id: Option<String>,
-    /// Notification title.
-    pub title: String,
-    /// Notification body text.
-    pub body: String,
-    /// Session the notification relates to, when any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    /// Profile of that session; opening the notification goes to the session
-    /// under it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-}
 
 /// Error type for notification operations.
 #[derive(Debug, thiserror::Error)]

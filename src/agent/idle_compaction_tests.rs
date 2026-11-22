@@ -26,18 +26,19 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use super::live_settings::AgentLiveSettings;
 use super::may::{
     AgentEnvironment, HostReaderSource, MayAgent, MayAgentConfig, MayAgentSessionInput,
 };
-use super::tool_environment_cache::ToolEnvironmentCache;
+use crate::agent::AgentLiveSettings;
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
 use crate::harness::host_load::{
     AnyHostReader, HostReader, MachineLoad, MemoryPressure, ReadError,
 };
 use crate::model_selector::ModelSelector;
 use crate::session::{SessionId, SessionPlanState};
+use may_client::tool_environment_cache::ToolEnvironmentCache;
 
+/// The provider name used for the session's own turns.
 pub const SESSION_PROVIDER: &str = "session";
 const COMPACTION_PROVIDER: &str = "compaction";
 pub const SESSION_MODEL: &str = "session-model";
@@ -254,7 +255,7 @@ impl HostReader for ScriptedHost {
 pub struct SessionParts {
     dir: std::path::PathBuf,
     pub db: crate::db::ChatDb,
-    pub(crate) session_id: SessionId,
+    pub session_id: SessionId,
     /// The runtime the session persists its interactions through, when it has one.
     pub runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
@@ -429,7 +430,7 @@ impl Session {
 
     /// Starts a session whose agent is one of the main agents `messaging`
     /// connects.
-    pub(crate) async fn start_with_messaging(
+    pub async fn start_with_messaging(
         config: &MayConfig,
         messaging: crate::agent_link::AgentMessaging,
     ) -> Self {
@@ -515,7 +516,7 @@ impl Session {
 
     /// Replaces the agent with one that continues the prompt-cache epoch of
     /// the agent it replaces, which had reached `epoch`.
-    pub(crate) async fn rebuild_at_epoch(&mut self, config: &MayConfig, epoch: u32) {
+    pub async fn rebuild_at_epoch(&mut self, config: &MayConfig, epoch: u32) {
         self.agent = Box::pin(Self::build(config, &self.parts, &self.clock, epoch)).await;
     }
 

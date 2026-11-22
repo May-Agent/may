@@ -71,7 +71,7 @@ struct OpenQuestionsText<'a> {
 }
 
 /// Asks the user a question without waiting for the answer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
@@ -316,7 +316,7 @@ pub struct WithdrawAskUserArgs {
 }
 
 /// Withdraws a question that is still open.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WithdrawAskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
@@ -397,12 +397,13 @@ impl Tool for WithdrawAskUserTool {
     }
 }
 
-/// Resolves `BLOCKING <what>` payloads in `tasks.md` against the session's
-/// `ask_user` history: a mark naming a still-pending question holds; one
-/// naming a request the session issued that is answered or withdrawn does
-/// not — the item is runnable work again. A payload naming no request the
-/// session issued is free text and trusted.
-#[derive(Clone)]
+/// Resolves `BLOCKING <what>` payloads against `ask_user` history.
+///
+/// A mark naming a still-pending question holds; one naming a request the
+/// session issued that is answered or withdrawn does not — the item is
+/// runnable work again. A payload naming no request the session issued is
+/// free text and trusted.
+#[derive(Clone, Debug)]
 pub struct AskUserBlockerResolver {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
@@ -445,9 +446,12 @@ impl BlockerResolver for AskUserBlockerResolver {
     }
 }
 
-/// Lists the session's open questions in every request, so they are present
-/// after compaction like `tasks.md`: this is session state, rebuilt from the
-/// database each time rather than raised once as an alert.
+/// Lists the session's open questions in every request.
+///
+/// They stay present after compaction like `tasks.md`: this is session
+/// state, rebuilt from the database each time rather than raised once as an
+/// alert.
+#[derive(Debug)]
 pub struct OpenQuestionsContext {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,

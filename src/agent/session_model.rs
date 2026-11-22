@@ -121,7 +121,7 @@ impl std::fmt::Debug for PushedModel {
 impl PushedModel {
     /// `model` of the provider whose token `access` holds, at `base_url`
     /// when the configuration overrides it.
-    pub(crate) fn new(access: AccessCell, base_url: Option<&str>, model: &str) -> Self {
+    pub fn new(access: AccessCell, base_url: Option<&str>, model: &str) -> Self {
         Self {
             access,
             base_url: base_url.map(str::to_owned),

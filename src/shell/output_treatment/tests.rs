@@ -7,7 +7,7 @@ use aither_sandbox::{
 };
 
 use super::*;
-use crate::repo_clone::test_sandbox::TestTerminal;
+use crate::client_tests::test_sandbox::TestTerminal;
 
 fn treatment_of(script: &str, interpreter: Interpreter) -> OutputTreatment {
     let shell = (interpreter == Interpreter::Shell).then(|| ShellScript::parse(script));

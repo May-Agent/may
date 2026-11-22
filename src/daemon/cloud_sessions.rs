@@ -118,7 +118,7 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// The listener at `addr`, admitting `token`.
-    pub(crate) fn new(addr: SocketAddr, token: &str) -> Self {
+    pub fn new(addr: SocketAddr, token: &str) -> Self {
         Self {
             addr,
             token: token.into(),
@@ -358,7 +358,7 @@ pub struct CloudHost {
 
 impl CloudHost {
     /// Where the session's location is, for its API object.
-    pub(crate) fn location(&self) -> SessionLocation {
+    pub fn location(&self) -> SessionLocation {
         SessionLocation {
             provider: CloudProviderName::Codespaces,
             machine: self.row.machine_id.clone(),
@@ -406,7 +406,7 @@ impl<B: CloudBackend> CloudSessions<B> {
     ///
     /// # Errors
     /// Fails when the records cannot be read.
-    pub(crate) async fn load(
+    pub async fn load(
         db: ChatDb,
         backend: B,
         config: Arc<ArcSwap<MayConfig>>,
@@ -440,18 +440,18 @@ impl<B: CloudBackend> CloudSessions<B> {
     }
 
     /// Every step of every cloud session's machine, as it happens.
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<CloudSessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<CloudSessionEvent> {
         self.events.subscribe()
     }
 
     /// The host of `session_id`, when it is a cloud session.
-    pub(crate) fn host(&self, session_id: &str) -> Option<CloudHost> {
+    pub fn host(&self, session_id: &str) -> Option<CloudHost> {
         self.hosts.get(session_id).map(|host| host.clone())
     }
 
     /// The runtime state the codespace daemon reports for `session_id`,
     /// while its events are followed and it is not idle.
-    pub(crate) fn mirrored_runtime(&self, session_id: &str) -> Option<serde_json::Value> {
+    pub fn mirrored_runtime(&self, session_id: &str) -> Option<serde_json::Value> {
         self.mirror
             .runtimes
             .get(session_id)
@@ -461,7 +461,7 @@ impl<B: CloudBackend> CloudSessions<B> {
     /// The cloud session whose codespace daemon holds the pending request
     /// `request_id` (a permission, workspace or question), going by the
     /// runtime state mirrored from it.
-    pub(crate) fn session_awaiting(&self, request_id: &str) -> Option<String> {
+    pub fn session_awaiting(&self, request_id: &str) -> Option<String> {
         self.mirror.runtimes.iter().find_map(|runtime| {
             let pending: PendingRequests = serde_json::from_value(runtime.value().clone()).ok()?;
             pending
@@ -506,7 +506,7 @@ impl<B: CloudBackend> CloudSessions<B> {
     ///
     /// # Errors
     /// Fails when the provider cannot be reached or refuses.
-    pub(crate) async fn catalog(
+    pub async fn catalog(
         &self,
         account: &CodespacesAccount,
         project: Option<&GitHubRepository>,
@@ -523,7 +523,7 @@ impl<B: CloudBackend> CloudSessions<B> {
     ///
     /// # Errors
     /// Fails when the codespace cannot be created or recorded.
-    pub(crate) async fn create(
+    pub async fn create(
         &self,
         session_id: &str,
         account: &CodespacesAccount,
@@ -594,7 +594,7 @@ impl<B: CloudBackend> CloudSessions<B> {
     /// # Errors
     /// Fails when the provider refuses the deletion or the record cannot be
     /// removed.
-    pub(crate) async fn delete(&self, session_id: &str) -> Result<(), CloudSessionError> {
+    pub async fn delete(&self, session_id: &str) -> Result<(), CloudSessionError> {
         let Some((_, host)) = self.hosts.remove(session_id) else {
             return Ok(());
         };
@@ -1402,7 +1402,7 @@ pub struct CloudSessionRelay<B: CloudBackend = GitHubCloud> {
 
 impl<B: CloudBackend> CloudSessionRelay<B> {
     /// The relay of `sessions`.
-    pub(crate) const fn new(sessions: Arc<CloudSessions<B>>) -> Self {
+    pub const fn new(sessions: Arc<CloudSessions<B>>) -> Self {
         Self { sessions }
     }
 }

@@ -283,7 +283,7 @@ impl Middleware for RequireIdentity {
 /// request did not cross Tailscale Funnel, which is never trusted. The
 /// allow-list swaps out whole so the remote-access actor can refresh it when
 /// settings change or the node owner resolves.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TailscaleServeIdentitySource {
     /// Swapped whole when the remote-access actor refreshes the allow-list.
     allowed: Arc<arc_swap::ArcSwap<HashSet<String>>>,
@@ -632,7 +632,7 @@ impl<S: NodeNamesSource, W: WhoisSource> Middleware for DirectListener<S, W> {
 
 /// The connection's `WhoIs`-resolved login on a direct tailnet bind, accepted
 /// only when it is in the allow-list shared with [`TailscaleServeIdentitySource`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TailnetWhoisIdentitySource {
     allowed: Arc<arc_swap::ArcSwap<HashSet<String>>>,
 }

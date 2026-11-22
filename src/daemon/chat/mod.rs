@@ -16,8 +16,9 @@ pub use background::{
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
 pub use hosts::{ParkedAgents, context_report, release_agent, usage_report};
 pub use hub::TurnHub;
-pub use progress::ProgressReport;
-pub use recap::{RecapRecord, RecapSchedules};
+pub use may_protocol::progress::ProgressReport;
+pub use may_protocol::recap::RecapRecord;
+pub use recap::RecapSchedules;
 pub use sidecar::AuxTasks;
 mod tool_dispatch;
 mod turn_events;
@@ -4853,7 +4854,7 @@ fn build_session_agent<'a>(
             for message in &ctx.seed_messages {
                 agent.push_message(message.clone());
             }
-            crate::session::persist_agent_context_snapshot(&state.db(), fence, &mut agent)
+            crate::session::persist_agent_context_snapshot(&state.db(), fence, agent.inner_mut())
                 .await
                 .map_err(|error| {
                     UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(

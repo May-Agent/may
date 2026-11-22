@@ -319,7 +319,7 @@ async fn the_same_runtime_value_publishes_once_to_every_subscriber() {
 /// The agent taking the completion of job `pid`, which ended in
 /// `terminal`'s shell: the end the shell raises for it is received and its
 /// completion taken, returning once the registry recorded the take.
-async fn take_completion(terminal: &crate::repo_clone::test_sandbox::TestTerminal, pid: u32) {
+async fn take_completion(terminal: &crate::client_tests::test_sandbox::TestTerminal, pid: u32) {
     let events = terminal.shell().jobs().events();
     loop {
         let event = events
@@ -345,7 +345,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let terminal =
-        crate::repo_clone::test_sandbox::TestTerminal::new(&dir.path().join("first")).await;
+        crate::client_tests::test_sandbox::TestTerminal::new(&dir.path().join("first")).await;
     state
         .session_background
         .add_jobs(SESSION, terminal.shell().jobs());
@@ -364,7 +364,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     // is taken and it is no longer the newest: the job leaves as a removal.
     assert!(job.kill().await, "the job was running");
     take_completion(&terminal, pid).await;
-    let next = crate::repo_clone::test_sandbox::TestTerminal::new(&dir.path().join("next")).await;
+    let next = crate::client_tests::test_sandbox::TestTerminal::new(&dir.path().join("next")).await;
     state
         .session_background
         .add_jobs(SESSION, next.shell().jobs());

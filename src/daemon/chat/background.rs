@@ -44,6 +44,7 @@ struct SessionBackground {
 /// resuming until this drops. It holds the completions the wake recorded,
 /// whose jobs read as owed a turn until the turn the wake starts settles
 /// them ([`Self::settle`]).
+#[derive(Debug)]
 #[must_use]
 pub struct ResumePending {
     resuming: Arc<std::sync::atomic::AtomicUsize>,
@@ -54,7 +55,7 @@ impl ResumePending {
     /// Settles the wake once the turn it started released the session: its
     /// completions are taken, returning once their registries recorded it,
     /// and the session stops reading as resuming.
-    pub(crate) async fn settle(mut self) {
+    pub async fn settle(mut self) {
         futures_util::future::join_all(
             std::mem::take(&mut self.completions)
                 .into_iter()
@@ -99,7 +100,7 @@ impl SessionBackgrounds {
     }
 
     /// The subagent tracker `session_id`'s agents are built with.
-    pub(crate) fn subagents(&self, session_id: &str) -> SubagentTracker {
+    pub fn subagents(&self, session_id: &str) -> SubagentTracker {
         self.sessions()
             .entry(session_id.to_string())
             .or_default()
@@ -108,7 +109,7 @@ impl SessionBackgrounds {
     }
 
     /// Records the jobs of the shell of an agent just built for `session_id`.
-    pub(crate) fn add_jobs(&self, session_id: &str, jobs: Jobs) {
+    pub fn add_jobs(&self, session_id: &str, jobs: Jobs) {
         let id = self
             .next_registry
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -121,7 +122,7 @@ impl SessionBackgrounds {
 
     /// Marks `session_id` as resuming until the guard drops, which holds the
     /// `completions` of the wake being served.
-    pub(crate) fn resume_pending(
+    pub fn resume_pending(
         &self,
         session_id: &str,
         completions: Vec<aither_sandbox::PendingCompletion>,
@@ -220,7 +221,7 @@ impl SessionBackgrounds {
 
     /// Kills every running job of `session_id`'s agents and cancels its
     /// subagent runs; returns how many it stopped.
-    pub(crate) async fn stop_all(&self, session_id: &str) -> usize {
+    pub async fn stop_all(&self, session_id: &str) -> usize {
         let mut stopped = 0;
         for (_, jobs) in self.registries(session_id) {
             stopped += jobs.kill_all().await;
@@ -253,7 +254,7 @@ impl SessionBackgrounds {
     /// turn end, so a daemon killed after that end never finds the finished
     /// session recorded as interrupted. Before the watcher runs nothing is
     /// recorded, so there is nothing to bring up to date.
-    pub(crate) async fn record_now(&self) {
+    pub async fn record_now(&self) {
         let Some(requests) = self.record.get() else {
             return;
         };
@@ -551,7 +552,7 @@ pub async fn cancel_subagents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_clone::test_sandbox::TestTerminal;
+    use crate::client_tests::test_sandbox::TestTerminal;
 
     /// A real session shell in its own directory, running a `sleep` job in
     /// the background: the shell, the job and the job's pid.

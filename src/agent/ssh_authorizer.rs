@@ -5,10 +5,10 @@ use askama::Template;
 
 use super::permission::PermissionError;
 
-use crate::PermissionHistoryMode;
 use crate::ask_user::{
     AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, QuestionAnswer,
 };
+use may_protocol::permission::PermissionHistoryMode;
 
 /// The options a permission prompt offers.
 ///

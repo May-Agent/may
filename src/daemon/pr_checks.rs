@@ -18,7 +18,8 @@ use futures_util::StreamExt;
 use super::state::DaemonState;
 use super::types::PrChecksRead;
 use crate::db::{PrCheckState, PrRow};
-use crate::pr::checks::{ChecksEvent, ChecksReport};
+use crate::pr::checks::ChecksEvent;
+
 use crate::pr::merge_watch::{GithubPr, Upstream};
 
 /// PRs read from GitHub at once.
@@ -184,7 +185,7 @@ async fn read_checks(state: &DaemonState, row: &PrRow) -> PrChecksRead {
         };
         mr.snapshot()
             .await
-            .map(|snapshot| ChecksReport::of(&snapshot))
+            .map(|snapshot| crate::pr::checks::checks_report_of(&snapshot))
             .map_err(|e| e.to_string())
     } else {
         let github = GithubPr {
@@ -195,7 +196,7 @@ async fn read_checks(state: &DaemonState, row: &PrRow) -> PrChecksRead {
         github
             .snapshot()
             .await
-            .map(|snapshot| ChecksReport::of(&snapshot))
+            .map(|snapshot| crate::pr::checks::checks_report_of(&snapshot))
             .map_err(|e| e.to_string())
     }
 }
@@ -234,14 +235,13 @@ async fn apply(state: &DaemonState, row: &PrRow, read: PrChecksRead) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pr::checks::ChecksReport;
     use crate::pr::merge_watch::{
         CheckConclusion, CheckContext, PullRequestState, RunStatus, Snapshot,
     };
 
     #[allow(clippy::unnecessary_wraps)]
     fn read(head: &str, conclusions: &[Option<CheckConclusion>]) -> PrChecksRead {
-        Ok(ChecksReport::of(&Snapshot {
+        Ok(crate::pr::checks::checks_report_of(&Snapshot {
             state: PullRequestState::Open,
             queue_position: None,
             removals: 0,

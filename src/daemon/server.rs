@@ -59,33 +59,36 @@ impl DaemonMode {
     }
 }
 
-/// TCP port the daemon serves the API and web UI on by default.
-pub const DEFAULT_PORT: u16 = 8787;
-
 /// A started server: shared state with its background work running, and
 /// the router that serves it.
 pub struct StartedDaemon {
     /// Shared server state.
-    pub(crate) state: Arc<DaemonState>,
+    pub state: Arc<DaemonState>,
     /// Router serving the API (and the web UI when embedded) on the unix
     /// socket, whose file mode is its access control.
-    pub(crate) socket_router: Router,
+    pub socket_router: Router,
     /// The same routes for loopback TCP binds, admitting only loopback
     /// `Host` and `Origin` headers.
-    pub(crate) loopback_router: Router,
+    pub loopback_router: Router,
     /// The same routes behind the identity layer, for the remote listener
     /// `tailscale serve` targets.
-    pub(crate) remote_router: Router,
+    pub remote_router: Router,
     /// The same routes behind an identity layer accepting the peer's
     /// `WhoIs`-resolved login, for non-loopback TCP binds (`--host` and
     /// `[daemon] listen`), answering only requests addressed to the node.
-    pub(crate) direct_router: Router,
+    pub direct_router: Router,
     /// This machine's cloud home record, when a fronting daemon bootstrapped
     /// it: the remote listener binds its port.
-    pub(crate) cloud_home: Option<crate::cloud::home::CloudHome>,
+    pub cloud_home: Option<crate::cloud::home::CloudHome>,
     /// The webhook routes alone, for the public listener Tailscale Funnel
     /// targets. It holds no other route.
-    pub(crate) webhook_router: Router,
+    pub webhook_router: Router,
+}
+
+impl std::fmt::Debug for StartedDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartedDaemon").finish_non_exhaustive()
+    }
 }
 
 /// Builds the server state, starts its background work (scheduler, title

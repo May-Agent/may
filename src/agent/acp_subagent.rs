@@ -728,7 +728,8 @@ pub async fn try_connection(
 
 /// A trial session ready to run: its scratch directory, the host that knows
 /// only the candidate agent and the session to open.
-pub(crate) struct PreparedTrial {
+#[derive(Debug)]
+pub struct PreparedTrial {
     scratch: tempfile::TempDir,
     host: SandboxedHost,
     spec: SessionSpec,
@@ -740,7 +741,7 @@ pub(crate) struct PreparedTrial {
 /// # Errors
 /// Returns [`TrialError`] when the directory, the sandbox or the host cannot
 /// be prepared.
-pub(crate) async fn prepare_trial(
+pub async fn prepare_trial(
     name: &str,
     agent: &AcpAgentConfig,
     heel: heel::HeelBinary,
@@ -770,7 +771,7 @@ pub(crate) async fn prepare_trial(
 ///
 /// # Errors
 /// As [`try_connection`], except preparation failures.
-pub(crate) async fn run_trial(
+pub async fn run_trial(
     runtime: &Handle,
     limit: std::time::Duration,
     trial: PreparedTrial,
@@ -1461,7 +1462,7 @@ mod tests {
             ..fake_connection()
         };
 
-        let terminal = crate::repo_clone::test_sandbox::TestTerminal::new(&session).await;
+        let terminal = crate::client_tests::test_sandbox::TestTerminal::new(&session).await;
         let run = terminal
             .shell()
             .subagent(SubagentGrant::new().with_worktree(&granted), None, "fake")

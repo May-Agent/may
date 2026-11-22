@@ -13,6 +13,8 @@ const WEBFETCH_DESCRIPTION: &str = include_str!("../texts/webfetch_description.t
 pub struct MayWebFetch(WebFetchTool);
 
 impl MayWebFetch {
+    /// A `web_fetch` tool over the provider web-fetch implementation.
+    #[must_use]
     pub fn new() -> Self {
         Self(WebFetchTool::new())
     }

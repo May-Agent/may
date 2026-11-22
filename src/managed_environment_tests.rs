@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use aither_sandbox::SubagentGrant;
 
-use crate::repo_clone::test_sandbox::TestTerminal;
+use crate::client_tests::test_sandbox::TestTerminal;
 
 /// Commands the managed tools directory provides, coreutils included.
 const MANAGED: &[&str] = &[

@@ -58,7 +58,11 @@ impl NotificationService {
                 (None, None)
             }
         };
-        let notification = UserNotification::new(wait, title.as_deref(), profile_id);
+        let notification = crate::notification::user_wait::user_notification_new(
+            wait,
+            title.as_deref(),
+            profile_id,
+        );
         // No attached terminal is fine: browsers still get the push.
         let _ = self.user_notifications.send(notification.clone());
         let payload = NotificationPayload {

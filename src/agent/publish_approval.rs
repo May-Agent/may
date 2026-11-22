@@ -15,39 +15,9 @@ use askama::Template;
 use crate::agent::permission::{OnTimeout, PermissionApprover};
 use crate::config::{ApprovalPolicy, IssueApprovalConfig, MayConfig};
 use crate::issue::github::{GitHubRest, GitHubTokenSource};
-use crate::issue::gitlab::{GitLabRest, GitLabTokenSource};
 use crate::issue::{IssueError, IssueKind, IssueStore};
 use crate::workspace::GitHubRepository;
-
-/// Ownership lookup over a forge's REST client, for the publish gate.
-pub trait RemoteOwnership: std::fmt::Debug + Sync {
-    /// Whether the authenticated user owns `repository`.
-    fn repository_owned(
-        &self,
-        repository: &crate::forge::ForgeRepo,
-    ) -> impl std::future::Future<Output = Result<bool, IssueError>> + Send;
-}
-
-impl<T: GitHubTokenSource> RemoteOwnership for GitHubRest<T> {
-    async fn repository_owned(
-        &self,
-        repository: &crate::forge::ForgeRepo,
-    ) -> Result<bool, IssueError> {
-        let github: GitHubRepository = repository.full_path().parse().map_err(
-            |error: crate::workspace::GitHubRepositoryError| IssueError::Invalid(error.to_string()),
-        )?;
-        Self::repository_owned(self, &github).await
-    }
-}
-
-impl<T: GitLabTokenSource> RemoteOwnership for GitLabRest<T> {
-    async fn repository_owned(
-        &self,
-        repository: &crate::forge::ForgeRepo,
-    ) -> Result<bool, IssueError> {
-        Self::repository_owned(self, repository).await
-    }
-}
+use may_git_forge::publish::{PublishDenied, PublishError, RemoteOwnership};
 
 /// What the agent is about to publish.
 #[derive(Debug, Clone, Copy)]
@@ -77,17 +47,6 @@ pub enum Publication<'a> {
         /// Comment body.
         body: &'a str,
     },
-}
-
-/// Publishing was refused; the text tells the agent why.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct PublishDenied(String);
-
-impl From<PublishDenied> for IssueError {
-    fn from(denied: PublishDenied) -> Self {
-        Self::ApprovalDenied(denied.0)
-    }
 }
 
 /// The text the user is shown for a pending publication.
@@ -307,23 +266,12 @@ impl PublishGate {
             Ok(false) => "the user denied it".to_string(),
             Err(error) => error.to_string(),
         };
-        Err(PublishDenied(
+        Err(PublishDenied::new(
             PublishDeniedText { reason: &reason }
                 .render()
                 .unwrap_or_else(|error| panic!("failed to render the refusal: {error}")),
         ))
     }
-}
-
-/// Why a pull request could not be approved.
-#[derive(Debug, thiserror::Error)]
-pub enum PublishError {
-    /// Ownership could not be looked up.
-    #[error(transparent)]
-    Lookup(#[from] IssueError),
-    /// The user refused, or the question went unanswered.
-    #[error(transparent)]
-    Denied(PublishDenied),
 }
 
 #[cfg(test)]

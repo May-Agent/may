@@ -13,6 +13,8 @@ use super::idle_compaction_tests::{
     SESSION_MODEL, Session, StubModel, run_short_turn, saved_config,
 };
 use super::runner::{AgentWorker, spawn_worker};
+use crate::MayAgent;
+use crate::agent::{ModelSlot, ProviderLlm};
 use crate::cache_lifetime::CacheLifetime;
 use crate::config::MayConfig;
 
@@ -155,7 +157,7 @@ async fn eventually(limit: Duration, what: &str, mut condition: impl AsyncFnMut(
 /// An idle worker over a session's agent, with what keeps the session's
 /// database and directory alive.
 struct Idle {
-    worker: AgentWorker,
+    worker: AgentWorker<ModelSlot<ProviderLlm>, MayAgent>,
     db: crate::db::ChatDb,
     session_id: String,
     _job: aither_sandbox::Job,

@@ -614,7 +614,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -625,7 +625,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1702,7 +1702,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 2.0.1",
 ]
 
 [[package]]
@@ -2457,7 +2457,7 @@ dependencies = [
  "openssl-sys",
  "schannel",
  "socket2 0.6.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2473,7 +2473,7 @@ dependencies = [
  "openssl-sys",
  "pkg-config",
  "vcpkg",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2785,7 +2785,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3138,7 +3138,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3831,7 +3831,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.58.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4441,7 +4441,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.5.3",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -4471,7 +4471,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -5467,9 +5467,9 @@ checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
 name = "linkify"
-version = "0.11.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92f9ae2f3d31697697311f016320fe984127e636b45cf5eb5c175b7eb103dadb"
+checksum = "f1dfa36d52c581e9ec783a7ce2a5e0143da6237be5811a0b3153fedfdbe9f780"
 dependencies = [
  "memchr",
 ]
@@ -5728,21 +5728,25 @@ dependencies = [
  "jsonc-parser",
  "keyring",
  "libc",
- "linkify",
  "lzma-rust2 0.24.0",
+ "may-client",
  "may-command-policy",
  "may-config",
  "may-container-image",
+ "may-db",
+ "may-git-forge",
  "may-harness",
  "may-media",
  "may-patch",
  "may-protocol",
+ "may-providers",
+ "may-repo-search",
  "may-tasks",
  "may-tool-dist",
+ "may-tui",
  "mime",
  "mime_guess",
  "notify",
- "nucleo",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
@@ -5754,7 +5758,6 @@ dependencies = [
  "petname",
  "pulldown-cmark",
  "ratatui",
- "ratatui-image",
  "reflink-copy",
  "regex",
  "repo-search-client",
@@ -5770,19 +5773,17 @@ dependencies = [
  "sha2 0.10.9",
  "shell-escape",
  "shell-words",
- "shlex",
+ "shlex 2.0.1",
  "similar",
  "skyzen",
  "skyzen-core",
  "skyzen-services",
  "smol-hyper",
- "streamdown-parser",
  "strsim",
  "subtle",
  "syntect",
  "tar",
  "tempfile",
- "terminal-colorsaurus",
  "thiserror 2.0.21",
  "tiktoken",
  "tokio",
@@ -5800,6 +5801,90 @@ dependencies = [
  "which 8.0.6",
  "zenwave",
  "zip 9.5.0",
+]
+
+[[package]]
+name = "may-client"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "aither-core",
+ "aither-mcp",
+ "aither-models",
+ "aither-sandbox",
+ "anyhow",
+ "arc-swap",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "async-lock",
+ "async-net",
+ "async-process",
+ "base64 0.22.1",
+ "blocking",
+ "bollard",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "dirs",
+ "dunce",
+ "event-listener",
+ "executor-core",
+ "fd-lock",
+ "fs_extra",
+ "futures",
+ "futures-lite",
+ "futures-util",
+ "getrandom 0.4.3",
+ "git2",
+ "heel",
+ "hex",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "include_dir",
+ "jiff",
+ "libc",
+ "may-command-policy",
+ "may-config",
+ "may-db",
+ "may-harness",
+ "may-patch",
+ "may-protocol",
+ "may-repo-search",
+ "may-tasks",
+ "may-tool-dist",
+ "mime",
+ "mime_guess",
+ "partial-json-fixer",
+ "percent-encoding",
+ "petname",
+ "reflink-copy",
+ "regex",
+ "repo-search-client",
+ "rmp-serde",
+ "rustix 1.1.6",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "sha2 0.10.9",
+ "shell-words",
+ "skyzen",
+ "smol-hyper",
+ "strsim",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "url",
+ "utoipa",
+ "walkdir",
+ "zenwave",
 ]
 
 [[package]]
@@ -5883,6 +5968,80 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "may-db"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "aither-core",
+ "aither-sandbox",
+ "anyhow",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "async-lock",
+ "async-net",
+ "blocking",
+ "bytes",
+ "chrono",
+ "fastrand",
+ "futures",
+ "futures-lite",
+ "futures-util",
+ "getrandom 0.4.3",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "jiff",
+ "may-command-policy",
+ "may-config",
+ "may-harness",
+ "may-protocol",
+ "may-tasks",
+ "mime",
+ "petname",
+ "rmp-serde",
+ "schemars",
+ "serde",
+ "serde_json",
+ "skyzen",
+ "skyzen-services",
+ "smol-hyper",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "utoipa",
+]
+
+[[package]]
+name = "may-git-forge"
+version = "0.1.0"
+dependencies = [
+ "askama 0.16.1",
+ "async-io",
+ "async-process",
+ "blocking",
+ "futures-lite",
+ "futures-util",
+ "jiff",
+ "may-client",
+ "may-config",
+ "may-db",
+ "may-protocol",
+ "rustix 1.1.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "zenwave",
 ]
 
 [[package]]
@@ -6010,6 +6169,7 @@ version = "0.1.0"
 dependencies = [
  "aither-agent",
  "aither-core",
+ "aither-sandbox",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -6024,8 +6184,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "libc",
  "may-patch",
  "may-tasks",
+ "mime",
  "petname",
  "regex",
  "schemars",
@@ -6039,8 +6201,57 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "utoipa",
  "zenwave",
+]
+
+[[package]]
+name = "may-providers"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "aither-cloud",
+ "aither-codex",
+ "aither-core",
+ "aither-models",
+ "async-io",
+ "futures-lite",
+ "futures-util",
+ "may-config",
+ "may-harness",
+ "may-protocol",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "may-repo-search"
+version = "0.1.0"
+dependencies = [
+ "askama 0.16.1",
+ "async-channel",
+ "async-io",
+ "async-lock",
+ "blocking",
+ "dunce",
+ "futures-lite",
+ "git2",
+ "jiff",
+ "may-db",
+ "may-protocol",
+ "may-tool-dist",
+ "repo-search-client",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]
@@ -6097,6 +6308,85 @@ dependencies = [
  "url",
  "zenwave",
  "zip 9.5.0",
+]
+
+[[package]]
+name = "may-tui"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "aither-agent",
+ "aither-core",
+ "aither-models",
+ "aither-sandbox",
+ "arboard",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "base64 0.22.1",
+ "blocking",
+ "bytes",
+ "chrono",
+ "crossterm 0.28.1",
+ "dirs",
+ "dunce",
+ "event-listener",
+ "executor-core",
+ "fastrand",
+ "futures",
+ "futures-lite",
+ "futures-util",
+ "humantime",
+ "hyper",
+ "ignore",
+ "image",
+ "itertools 0.14.0",
+ "jiff",
+ "libc",
+ "linkify",
+ "may-client",
+ "may-command-policy",
+ "may-config",
+ "may-db",
+ "may-harness",
+ "may-protocol",
+ "may-providers",
+ "may-tasks",
+ "mime",
+ "mime_guess",
+ "nucleo",
+ "nucleo-matcher",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "open",
+ "partial-json-fixer",
+ "pulldown-cmark",
+ "ratatui",
+ "ratatui-image",
+ "regex",
+ "repo-search-client",
+ "rustix 1.1.6",
+ "schemars",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "shlex 1.3.0",
+ "streamdown-parser",
+ "syntect",
+ "tempfile",
+ "terminal-colorsaurus",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width",
+ "url",
+ "utoipa",
+ "whatlang",
+ "zenwave",
 ]
 
 [[package]]
@@ -6690,7 +6980,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8211,7 +8501,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -8250,9 +8540,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8727,7 +9017,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "rustix 1.1.6",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9095,7 +9385,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9154,7 +9444,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9638,6 +9928,12 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
@@ -9975,7 +10271,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10241,7 +10537,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10623,7 +10919,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10654,7 +10950,7 @@ dependencies = [
  "parking_lot",
  "rustix 1.1.6",
  "signal-hook",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10690,7 +10986,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.6",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11356,7 +11652,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset 0.9.1",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12558,7 +12854,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

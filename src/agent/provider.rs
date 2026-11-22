@@ -230,6 +230,11 @@ impl<M> RedactedModel<M> {
 }
 
 /// Fails `fut` with `on_timeout` when it has not finished within `timeout`.
+///
+/// The bound covers the whole future, not each poll.
+///
+/// # Errors
+/// `on_timeout`'s error when `fut` runs past `timeout`, else `fut`'s.
 pub async fn bounded<T, E>(
     timeout: std::time::Duration,
     fut: impl Future<Output = Result<T, E>>,
@@ -424,6 +429,7 @@ pub(super) fn session_request_parameters(
 /// An explicit effort asks for it on every provider. A model that reasons by
 /// default gets it too — except on Anthropic, where asking alone would turn
 /// adaptive thinking on for models whose default is off.
+#[must_use]
 pub fn reasoning_text_requested(
     provider_type: Option<ProviderType>,
     model_id: &str,

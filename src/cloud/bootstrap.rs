@@ -9,6 +9,7 @@
 //! (never a build on the machine), a release the same release through its
 //! installer.
 
+use may_protocol::cloud::BootstrapStep;
 use std::future::Future;
 use std::time::Duration;
 
@@ -59,21 +60,6 @@ pub trait RemoteShell: Send + Sync {
         input: Option<Vec<u8>>,
         deadline: Duration,
     ) -> impl Future<Output = Result<String, CloudError>> + Send;
-}
-
-/// A step of a bootstrap, for the caller's loading indicator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootstrapStep {
-    /// Checking which build the machine has.
-    Checking,
-    /// Downloading the build the machine needs.
-    Downloading,
-    /// Installing it on the machine.
-    Installing,
-    /// Cloning the session's repository.
-    Cloning,
-    /// Starting the machine's daemon.
-    StartingDaemon,
 }
 
 /// The build a cloud home gets: the fronting daemon's own.

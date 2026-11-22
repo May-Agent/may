@@ -45,14 +45,22 @@ pub struct MemoryProcessor {
     db: ChatDb,
 }
 
+/// Why a memory extraction could not run to completion.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum MemoryProcessingError {
+pub enum MemoryProcessingError {
+    /// The database read or write failed.
     #[error("database error: {0}")]
     Database(#[from] crate::db::ChatDbError),
+    /// No extraction model could be resolved.
     #[error("no memory extraction model is available: {0}")]
     NoModel(#[source] crate::agent::MayAgentError),
+    /// Every provider the extraction tried failed.
     #[error("all memory extraction providers failed: {details}")]
-    AllProvidersFailed { details: String },
+    AllProvidersFailed {
+        /// Why each provider failed.
+        details: String,
+    },
+    /// The extraction LLM call itself failed.
     #[error("memory extraction LLM error: {0}")]
     Llm(#[from] crate::agent::RedactedError<aither_cloud::CloudError>),
 }
@@ -181,7 +189,10 @@ impl MemoryProcessor {
     /// Extracts `profile_id`'s memories from its recent conversation, on
     /// the models `models` resolves now; a profile with no conversation
     /// has nothing to extract.
-    pub(crate) async fn refresh_profile(
+    ///
+    /// # Errors
+    /// Fails when the conversation cannot be read or extraction fails.
+    pub async fn refresh_profile(
         db: &ChatDb,
         models: &MemoryModels,
         profile_id: &str,
@@ -200,7 +211,11 @@ impl MemoryProcessor {
         .await
     }
 
-    pub(crate) async fn build_profile_conversation(
+    /// The recent conversation of `profile_id`, as extraction reads it.
+    ///
+    /// # Errors
+    /// Fails when the messages cannot be read.
+    pub async fn build_profile_conversation(
         db: &ChatDb,
         profile_id: &str,
     ) -> Result<String, MemoryProcessingError> {

@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::client_tests::test_sandbox::TestTerminal;
 use crate::commit_signing::test_user::{EMAIL, NAME, TestUser};
 use crate::commit_signing::{
     CommitSigning, SIGNER_DIR, SIGNER_FILE, SignCommitArgs, SignCommitTool, SigningError,
 };
-use crate::repo_clone::test_sandbox::TestTerminal;
 
 fn canonical_tempdir() -> tempfile::TempDir {
     tempfile::tempdir_in(dunce::canonicalize(std::env::temp_dir()).unwrap()).unwrap()

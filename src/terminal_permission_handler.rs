@@ -6,12 +6,14 @@ use aither_sandbox::{DomainApprover, DomainRequest};
 use arc_swap::ArcSwap;
 
 use crate::agent::PermissionApprover;
-use crate::agent::permission::{PermissionError, SSH_KIND, UNSANDBOXED_KIND};
+use crate::agent::permission::PermissionError;
+use crate::agent::permission::UNSANDBOXED_KIND;
 use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::SessionRuntimeService;
 use crate::ui_event_bus::UiEventTopics;
+use may_protocol::layout_consts::SSH_KIND;
 
 /// How the first command on an SSH server is decided.
 #[derive(Debug, Clone)]

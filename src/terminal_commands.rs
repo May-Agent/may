@@ -19,13 +19,14 @@ use crate::agent::subagent_tracker::SubagentTracker;
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::agent::webfetch_tool::MayWebFetch;
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
+use crate::code_search::CodeSearchTool;
 use crate::ipc::ask::AskCommand;
 use crate::ipc::{CommandRegistryBuilder, schema_to_help};
 use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
-use crate::repo_search::{CodeSearchTool, RepoSearch, RepoSearchCollections};
+use crate::repo_search::{RepoSearch, RepoSearchCollections};
 use crate::subagent::{
     ExternalAgents, PromptFiles, SubagentArgs, SubagentCommand, SubagentFileMount, SubagentService,
     SubagentSettings, TierModels,
@@ -354,7 +355,7 @@ where
     let issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
         .with_search(issue_search.clone());
     let issue_targets = || {
-        crate::issue::target::IssueTargets::new(
+        crate::issue::IssueTargets::new(
             config.db.clone(),
             config.cwd.clone(),
             crate::session::SessionPaths::new(config.sandbox_dir.clone()).workspace_config(),
@@ -862,7 +863,7 @@ fn describe_arguments<A: schemars::JsonSchema>(
 /// A sentence ends at a `.` followed by whitespace or the end of the text,
 /// outside a code span, so `` `computer <action> ...` `` or a version
 /// number does not cut it short.
-pub(crate) fn short_description(description: &str) -> String {
+pub fn short_description(description: &str) -> String {
     // Both markers are ASCII, so a byte scan finds them on char boundaries.
     let bytes = description.as_bytes();
     let mut in_code = false;

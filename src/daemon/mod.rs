@@ -8,7 +8,7 @@
 //! address of a foreground `may rest`. Every UI is a client, so any number
 //! of them can attach to one session.
 
-pub mod lifecycle;
+pub use may_client::daemon::lifecycle;
 pub mod serve;
 
 mod acp_agents;
@@ -27,7 +27,7 @@ mod cloud_home;
 mod cloud_sessions;
 mod computer;
 mod config;
-pub(crate) mod disk_exhaustion;
+pub mod disk_exhaustion;
 mod error;
 mod error_chain;
 mod events;
@@ -43,7 +43,7 @@ mod github_repos;
 mod github_repos_tests;
 mod helpers;
 mod interaction;
-pub use interaction::ASK_USER_NOT_OPEN;
+pub use may_protocol::daemon_api::ASK_USER_NOT_OPEN;
 #[cfg(test)]
 mod attachments_tests;
 mod local_url_mapper;
@@ -61,7 +61,7 @@ mod server;
 mod session_commands_tests;
 #[cfg(test)]
 mod session_directory_tests;
-pub(crate) mod session_events;
+pub mod session_events;
 #[cfg(test)]
 mod session_events_tests;
 mod session_ids;
@@ -71,12 +71,12 @@ mod state;
 mod tasks;
 mod terminal_parsing;
 mod title_generation;
-mod tool_summary;
+pub use may_client::daemon::tool_summary;
 mod transcript;
 #[cfg(test)]
 mod transcript_tests;
 mod tunnel;
-pub(crate) mod types;
+pub use may_client::daemon::types;
 mod user_wait;
 
 #[cfg(test)]
@@ -104,20 +104,20 @@ pub use chat::{
     BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, ProgressReport,
     RecapRecord,
 };
-pub use server::{DEFAULT_PORT, DaemonMode};
-pub(crate) use server::{start, sync_remote_access};
+pub use may_protocol::daemon_api::DEFAULT_PORT;
+pub use server::DaemonMode;
+pub use server::{start, sync_remote_access};
 pub use types::{DaemonHealth, LocalListenerResponse};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use skyzen::routing::Router;
 
-use crate::config::MayConfig;
 use crate::repo_search::RepoSearchCollections;
 use crate::repo_search::auto_index::AutoIndexer;
 use crate::repo_search::indexer::{IndexerStatus, SearchIndexer};
@@ -165,94 +165,7 @@ async fn release_pending_interactions(state: &crate::daemon::state::DaemonState)
     }
 }
 
-/// Files the daemon keeps under `~/.may`.
-#[derive(Debug, Clone)]
-pub struct DaemonPaths {
-    root: PathBuf,
-    socket: PathBuf,
-}
-
-impl DaemonPaths {
-    /// Paths under `may_dir`.
-    #[must_use]
-    pub fn new(may_dir: PathBuf) -> Self {
-        Self {
-            socket: may_dir.join("daemon.sock"),
-            root: may_dir,
-        }
-    }
-
-    /// Paths under the user's `~/.may`.
-    ///
-    /// # Errors
-    /// Fails when the home directory cannot be determined or resolved.
-    pub fn user() -> anyhow::Result<Self> {
-        Self::for_home(dirs::home_dir().context("no home directory")?)
-    }
-
-    /// Paths under `home`'s `.may`. Files live at the resolved home, which
-    /// is what the sandbox grants; the socket keeps `home`'s own spelling,
-    /// since a unix socket path is limited to about 104 bytes and the
-    /// resolved spelling of a home reached through a link can exceed it.
-    fn for_home(home: PathBuf) -> anyhow::Result<Self> {
-        let socket = home.join(".may").join("daemon.sock");
-        let root = MayConfig::resolve_home(home)
-            .context("failed to resolve ~/.may")?
-            .join(".may");
-        Ok(Self { root, socket })
-    }
-
-    /// The unix socket clients connect to.
-    #[must_use]
-    pub fn socket(&self) -> PathBuf {
-        self.socket.clone()
-    }
-
-    /// The single-instance lock.
-    #[must_use]
-    pub fn lock(&self) -> PathBuf {
-        self.root.join("daemon.lock")
-    }
-
-    /// The log a spawned daemon writes to.
-    #[must_use]
-    pub fn log(&self) -> PathBuf {
-        self.root.join("logs").join("daemon.log")
-    }
-
-    /// The `~/.may` directory itself.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-/// Identity of an executable build: device, inode, size and mtime of the
-/// file. A client whose own build differs from the running daemon's
-/// replaces the daemon, so a rebuilt `may` never talks to a stale one.
-///
-/// # Errors
-/// Fails when the file's metadata cannot be read.
-pub fn build_id_of(path: &Path) -> std::io::Result<String> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = std::fs::metadata(path)?;
-    Ok(format!(
-        "{}:{}:{}:{}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.size(),
-        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000
-    ))
-}
-
-/// Build id of the running executable.
-///
-/// # Errors
-/// Fails when the executable path or its metadata cannot be read.
-pub fn current_build_id() -> std::io::Result<String> {
-    build_id_of(&dunce::canonicalize(std::env::current_exe()?)?)
-}
+pub use may_client::daemon::{DaemonPaths, build_id_of, current_build_id};
 
 /// How a daemon run is configured.
 #[derive(Debug, Clone)]
@@ -378,12 +291,14 @@ impl TcpRouters {
     }
 }
 
-/// The daemon's TCP listeners. The unix socket is the always-on transport
-/// for the TUI and one-shot runs; TCP is optional and arrives by three
-/// routes — the `[daemon] port` local listener a `gui` or `rest` run pins
-/// and serves, the `[daemon] listen` addresses, and the explicit address a
-/// foreground `may rest` asks for.
-pub(crate) struct TcpListeners {
+/// The daemon's TCP listeners.
+///
+/// The unix socket is the always-on transport for the TUI and one-shot
+/// runs; TCP is optional and arrives by three routes — the `[daemon] port`
+/// local listener a `gui` or `rest` run pins and serves, the `[daemon]
+/// listen` addresses, and the explicit address a foreground `may rest`
+/// asks for.
+pub struct TcpListeners {
     /// The routers serving every bind, wired once the daemon's routers exist.
     routers: std::sync::OnceLock<TcpRouters>,
     inner: tokio::sync::Mutex<TcpListenersInner>,
@@ -408,10 +323,23 @@ impl TcpListenersInner {
     }
 }
 
+impl std::fmt::Debug for TcpListeners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpListeners").finish_non_exhaustive()
+    }
+}
+
+impl Default for TcpListeners {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TcpListeners {
     /// An empty registry; the routers are wired by [`Self::set_routers`]
     /// before the daemon serves.
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             routers: std::sync::OnceLock::new(),
             inner: tokio::sync::Mutex::new(TcpListenersInner {
@@ -524,7 +452,7 @@ impl TcpListeners {
     ///
     /// # Errors
     /// Fails when the resolved port cannot be bound.
-    pub(crate) async fn ensure_local(
+    pub async fn ensure_local(
         &self,
         port: Option<u16>,
         state: &Arc<state::DaemonState>,

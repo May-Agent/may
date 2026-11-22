@@ -10,6 +10,7 @@
 //! Encoding: `mediax-codec` — hardware H.264 where the host has an encoder,
 //! software AV1 otherwise (see `crate::video`).
 
+pub use may_protocol::cloud::BrowserLifecycleEvent;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -470,64 +471,6 @@ enum BrowserCommand {
         height: u32,
         device_scale_factor: f64,
         reply: oneshot::Sender<Result<(), BrowserError>>,
-    },
-}
-
-/// Sequential, transient lifecycle facts produced by the browser actor.
-///
-/// Unlike `BrowserStatusEventPayload`, which is a snapshot reconciled on
-/// every topic notification, lifecycle events are point-in-time and must
-/// be streamed in order. They ride the existing `/api/events` SSE stream
-/// as the `browser_lifecycle` event kind (see `AGENTS.md`).
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum BrowserLifecycleEvent {
-    /// Managed browser binary is being downloaded.
-    ChromeFetching {
-        /// Bytes downloaded so far.
-        progress_bytes: u64,
-        /// Total download size when the server reports it.
-        total_bytes: Option<u64>,
-    },
-    /// Browser process is launching.
-    Starting,
-    /// Browser is up and the encoding pipeline is running.
-    Ready,
-    /// The page is navigating to a new URL.
-    Navigating {
-        /// URL being navigated to.
-        url: String,
-    },
-    /// A navigation finished and the page is interactive.
-    PageLoaded {
-        /// URL that finished loading.
-        url: String,
-        /// Document title after load, when known.
-        title: Option<String>,
-    },
-    /// A WebRTC peer attached to the video stream.
-    PeerConnected {
-        /// Number of peers attached after this connect.
-        count: usize,
-    },
-    /// A WebRTC peer detached.
-    PeerDisconnected {
-        /// Number of peers still attached after this disconnect.
-        count: usize,
-    },
-    /// Input takeover ownership moved to another session.
-    TakeoverChanged {
-        /// Session that now owns input takeover; `None` means the agent owns the page.
-        session_id: Option<String>,
-    },
-    /// The H.264 encoder produced no frame within its watchdog window.
-    EncoderStalled,
-    /// The browser session shut down.
-    Stopped,
-    /// An unrecoverable runtime failure occurred.
-    Error {
-        /// Human-readable failure description.
-        message: String,
     },
 }
 

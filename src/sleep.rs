@@ -15,6 +15,8 @@
 // the file land in the order the changes were made.
 #![allow(clippy::significant_drop_tightening)]
 
+pub use may_protocol::sleep::*;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,21 +60,6 @@ const NIGHT_OFFSET: jiff::SignedDuration = jiff::SignedDuration::from_hours(12);
 const REMINDER_SPACING_MS: i64 = 12 * 60 * 60 * 1000;
 
 const MINUTES_PER_DAY: u32 = 24 * 60;
-
-/// What clients see of the state.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SleepStatus {
-    /// Whether the user is asleep.
-    pub asleep: bool,
-    /// The session `/sleep` was run in, while the user is asleep.
-    #[serde(default)]
-    pub origin: Option<String>,
-    /// How many health reminders this daemon has raised; a client shows the
-    /// reminder when the count grows.
-    #[serde(default)]
-    pub reminders: u64,
-}
 
 /// The version of the persisted file; a file of another version is dropped
 /// at load and the state starts fresh.
@@ -305,7 +292,7 @@ impl SleepState {
     }
 
     /// Reads the current sleep state for a [`SleepConditions`] context source.
-    pub(crate) async fn read(&self) -> SleepReading {
+    pub async fn read(&self) -> SleepReading {
         let inner = self.inner.lock().await;
         SleepReading {
             asleep: inner.asleep,
@@ -316,7 +303,7 @@ impl SleepState {
     }
 
     /// Whether `session_id` has been recorded as told about the current sleep.
-    pub(crate) async fn is_told(&self, session_id: &str) -> bool {
+    pub async fn is_told(&self, session_id: &str) -> bool {
         self.inner.lock().await.told.contains(session_id)
     }
 
@@ -324,7 +311,7 @@ impl SleepState {
     ///
     /// # Errors
     /// When the state cannot be persisted.
-    pub(crate) async fn set_told(&self, session_id: &str, told: bool) -> std::io::Result<()> {
+    pub async fn set_told(&self, session_id: &str, told: bool) -> std::io::Result<()> {
         let mut inner = self.inner.lock().await;
         let changed = if told {
             inner.told.insert(session_id.to_owned())
@@ -414,18 +401,24 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Current sleep state read by a session's [`SleepConditions`] source.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SleepReading {
+pub struct SleepReading {
+    /// `true` while the user is asleep.
     pub asleep: bool,
+    /// The sleep cycle's epoch.
     pub epoch: u64,
+    /// The session that ran `/sleep`, if any.
     pub origin: Option<String>,
+    /// How the user woke.
     pub woke: WakeCause,
 }
 
-/// Sleep mode as state: nothing enters the context while idle, each
-/// transition emits one alert before the next request, and a cold-cache
-/// reassembly repeats the sleep notice only when the user is still asleep.
+/// Sleep mode as state.
+///
+/// Nothing enters the context while idle, each transition emits one alert
+/// before the next request, and a cold-cache reassembly repeats the sleep
+/// notice only when the user is still asleep.
 #[derive(Debug)]
-pub(crate) struct SleepConditions {
+pub struct SleepConditions {
     sleep: Arc<SleepState>,
     session_id: String,
     /// Sleep epoch last seen by the model in this context window (`0` = awake).

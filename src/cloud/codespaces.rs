@@ -9,12 +9,11 @@
 //! Endpoints and shapes are GitHub's published Codespaces REST API
 //! (`2022-11-28`): <https://docs.github.com/en/rest/codespaces>.
 
+pub use may_protocol::cloud::*;
 use serde::{Deserialize, Serialize};
 use zenwave::{Method, ResponseExt};
 
-use super::{
-    CloudError, CloudMachine, CloudProvider, MachineId, MachineState, MachineType, NewMachine,
-};
+use super::{CloudError, CloudMachine, CloudProvider, MachineId, NewMachine};
 use crate::issue::github::{ForgeTokenSource, GitHubRest, GitHubTokenSource};
 use crate::workspace::GitHubRepository;
 
@@ -69,15 +68,6 @@ pub struct CodespaceSource {
     /// The session's repository, when its devcontainer has no SSH server
     /// and the codespace is created from the environment repository.
     pub clone: Option<GitHubRepository>,
-}
-
-/// The GitHub account a profile's codespaces belong to, as `/cloud` set it
-/// up.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CodespacesAccount {
-    /// The account's login, one of the `gh` login's accounts.
-    pub login: String,
 }
 
 /// GitHub Codespaces for one account.

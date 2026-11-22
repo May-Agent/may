@@ -27,47 +27,7 @@ const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// bollard's own default.
 const DOCKER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Error type for container operations.
-#[derive(Debug, thiserror::Error)]
-pub enum ContainerError {
-    /// Docker API error.
-    #[error("Docker API error: {0}")]
-    Docker(#[from] bollard::errors::Error),
-    /// No container runtime found (tried `OrbStack`, Podman, Docker).
-    #[error("No container runtime found (tried OrbStack, Podman, Docker)")]
-    NoRuntime,
-    /// IO error.
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[doc = "Managed tools failed integrity or read-only preparation."]
-    #[error("baseline tools preparation failed: {0}")]
-    Tools(#[from] crate::tools::ToolRuntimeError),
-    /// Container not found.
-    #[error("Container not found: {0}")]
-    NotFound(String),
-    /// Image pull failed.
-    #[error("Image pull failed: {0}")]
-    ImagePullFailed(String),
-    /// Container runtime bootstrap failed.
-    #[error("Container runtime bootstrap failed: {0}")]
-    Bootstrap(String),
-    /// Managed Podman download requires explicit user approval before downloading binaries.
-    #[error("Managed Podman download requires explicit user approval before downloading binaries")]
-    ManagedPodmanDownloadApprovalRequired,
-    /// The container exposes no gateway the host bridge can bind.
-    #[error("container {0} exposes no gateway for the host IPC bridge")]
-    IpcRouteNoGateway(String),
-    /// The container's networks report different gateway addresses.
-    #[error("container {0} reports conflicting gateways for the host IPC bridge: {1:?}")]
-    IpcRouteConflictingGateways(String, Vec<String>),
-    /// The container's gateway cannot bind the host bridge.
-    #[error("container {0} gateway {1} is not a usable bridge bind: {2}")]
-    IpcRouteUnusableGateway(String, String, String),
-    /// The host platform has no container IPC bridge route: neither a
-    /// Docker Desktop-family host (macOS, Windows) nor native Linux.
-    #[error("container IPC bridge routes are unsupported on this platform")]
-    IpcRouteUnsupportedPlatform,
-}
+pub use may_client::container::ContainerError;
 
 /// The hostname that resolves to the host machine from inside a container of
 /// `kind`.
@@ -97,8 +57,12 @@ fn docker_desktop_ipc_route(kind: ContainerRuntimeKind) -> aither_sandbox::HostR
 /// The gateway address a container uses to reach its host, selected from the
 /// container's own inspection: exactly one distinct non-empty reported
 /// gateway, and that address binds the IPC bridge.
+///
+/// # Errors
+/// Fails when the container reports no gateway, multiple conflicting gateways,
+/// or a gateway that is not a valid usable host route.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn select_ipc_gateway(
+pub fn select_ipc_gateway(
     inspect: &bollard::models::ContainerInspectResponse,
     container_id: &str,
     host_name: &str,

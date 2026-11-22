@@ -1,0 +1,62 @@
+[package]
+name = "may-db"
+version = "0.1.0"
+edition = "2024"
+description = "May's SQLite persistence for sessions, messages, and app state"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[dependencies]
+# The foundational wire types the persisted rows round-trip through.
+may-protocol = { path = "../protocol" }
+# The configuration layer: `MayConfig`, secrets, forge auth.
+may-config = { path = "../config" }
+# The checkout-read policy store `checkout_state` implements.
+may-command-policy = { path = "../command-policy" }
+# The tasks.md trigger rows the scheduler reads back.
+may-harness = { path = "../harness" }
+# The tasks.md rows stored per session.
+may-tasks = { path = "../tasks" }
+aither-agent = { version = "0.31.0" }
+aither-core = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0" }
+anyhow = "1"
+askama = "0.16"
+async-channel = "2"
+async-fs = "2.1"
+async-io = "2.6"
+async-net = "2"
+async-lock = "3"
+blocking = "1"
+bytes = "1"
+chrono = "0.4"
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+futures-lite = "2.6"
+futures-util = "0.3"
+fastrand = "2"
+rmp-serde = "1"
+getrandom = "0.4"
+humantime = { version = "2.4", default-features = false }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+jiff = { version = "0.2", features = ["serde"] }
+petname = "2"
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+skyzen = { version = "0.5.1" }
+smol-hyper = { version = "0.1.1", default-features = false }
+skyzen-services = { version = "0.3.1", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+
+[dev-dependencies]
+mime = "0.3"
+tempfile = "3.24.0"
+
+[lints]
+workspace = true

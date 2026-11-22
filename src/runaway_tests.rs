@@ -16,10 +16,10 @@ use aither_sandbox::{
 
 use aither_agent::{AnyClock, Instant, ManualClock};
 
+use crate::client_tests::test_sandbox::TestTerminal;
 use crate::harness::host_load::{HostLoadEvent, MemoryPressure};
 use crate::harness::runaway::RunawayGuard;
 use crate::ipc::SessionShell;
-use crate::repo_clone::test_sandbox::TestTerminal;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const WINDOW: Duration = Duration::from_secs(60);

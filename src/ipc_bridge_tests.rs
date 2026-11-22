@@ -9,8 +9,8 @@ mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
+    use crate::client_tests::test_sandbox::TestTerminal;
     use crate::ipc::CommandRegistryBuilder;
-    use crate::repo_clone::test_sandbox::TestTerminal;
 
     #[derive(Debug, Deserialize, JsonSchema)]
     struct NoteArgs {

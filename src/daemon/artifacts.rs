@@ -38,8 +38,13 @@ const ARTIFACT_RUNTIME_BRIDGE_SRC: &str = "/api/artifact-runtime.js";
 const ARTIFACT_RUNTIME_BRIDGE: &str = include_str!("../texts/artifact_runtime_bridge.js");
 const ARTIFACT_RUNTIME_BRIDGE_TEMPLATE: &str =
     include_str!("../../templates/artifact_runtime_bridge.html");
-const SLIDEV_TOOLCHAIN_PACKAGE_JSON: &str =
-    include_str!("../../skills/slide/assets/template/package.json");
+fn slidev_toolchain_package_json() -> &'static str {
+    may_client::bundle::SKILLS_DIR
+        .get_file("slide/assets/template/package.json")
+        .expect("slide toolchain package.json embedded")
+        .contents_utf8()
+        .expect("slide toolchain package.json is utf8")
+}
 const GENERIC_VALIDATION_PROFILE: &str = "generic";
 const SLIDEV_VALIDATION_PROFILE: &str = "slidev";
 
@@ -630,7 +635,7 @@ async fn ensure_slidev_toolchain_dir(toolchain_dir: &Path) -> Result<(), skyzen:
         Err(error) => return Err(internal_error(error)),
     };
     if needs_manifest {
-        async_fs::write(&package_json, SLIDEV_TOOLCHAIN_PACKAGE_JSON)
+        async_fs::write(&package_json, slidev_toolchain_package_json())
             .await
             .map_err(internal_error)?;
     }
@@ -1548,8 +1553,8 @@ pub(super) fn is_container_local_proxy_host(host: &str) -> bool {
 
 #[derive(Debug)]
 pub(super) struct ResolvedContainerProxyTarget {
-    pub(crate) container_id: String,
-    pub(crate) container_ip: String,
+    pub container_id: String,
+    pub container_ip: String,
 }
 
 pub(super) async fn resolve_container_proxy_target(

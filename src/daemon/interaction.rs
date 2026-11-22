@@ -1,3 +1,4 @@
+use may_protocol::daemon_api::ASK_USER_NOT_OPEN;
 use std::sync::Arc;
 
 use skyzen::Result as SkyResult;
@@ -90,13 +91,6 @@ async fn resolve_permission(
 
     Ok(Json(runtime.into()))
 }
-
-/// The status of a question that is no longer open.
-///
-/// Withdrawn or already answered; clients tell it apart from a failure to
-/// store the answer, a `5xx`, and from an answer that does not fit the
-/// question, a `400`.
-pub const ASK_USER_NOT_OPEN: skyzen::StatusCode = skyzen::StatusCode::NOT_FOUND;
 
 fn ask_user_not_open_error() -> skyzen::Error {
     skyzen::Error::msg("ask_user request not found or withdrawn").set_status(ASK_USER_NOT_OPEN)

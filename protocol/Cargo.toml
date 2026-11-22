@@ -23,6 +23,7 @@ testing = [
 [dependencies]
 aither-agent = { version = "0.31.0" }
 aither-core = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0" }
 arc-swap = { version = "1", features = ["weak"] }
 askama = "0.16"
 async-channel = "2"
@@ -57,9 +58,14 @@ tokio = { version = "1", features = ["full"], optional = true }
 
 [dev-dependencies]
 futures-lite = "2.6"
+mime = "0.3"
 tempfile = "3.24.0"
 tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

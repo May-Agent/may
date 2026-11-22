@@ -32,105 +32,7 @@ use crate::terminal_commands::CoreCommandUsage;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 
 /// The slots of the blocks May writes, and the order of the whole prompt.
-pub mod tag {
-    use aither_agent::{ExternalSlot, InstructionSlot, SystemLayout};
-
-    pub const IDENTITY: InstructionSlot = InstructionSlot::new("identity");
-    pub const PROFILE_PERSONA: InstructionSlot = InstructionSlot::new("profile_persona");
-    pub const ENVIRONMENT: InstructionSlot = InstructionSlot::new("environment");
-    pub const SESSION: InstructionSlot = InstructionSlot::new("session");
-    pub const REPO_CLONES: InstructionSlot = InstructionSlot::new("repo_clones");
-    pub const TERMINAL: InstructionSlot = InstructionSlot::new("terminal");
-    pub const EFFICIENCY: InstructionSlot = InstructionSlot::new("efficiency");
-    pub const CAPABILITIES: InstructionSlot = InstructionSlot::new("capabilities");
-    pub const BROWSER: InstructionSlot = InstructionSlot::new("browser");
-    pub const WORK: InstructionSlot = InstructionSlot::new("work");
-    pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
-    pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
-    pub const PERMISSIONS: InstructionSlot = InstructionSlot::new("permissions");
-    pub const HARNESS: InstructionSlot = InstructionSlot::new("harness");
-    pub const EVIDENCE: InstructionSlot = InstructionSlot::new("evidence");
-    pub const TIME: InstructionSlot = InstructionSlot::new("knowledge_and_time");
-    /// The prepared tools of the home environment.
-    pub const PREPARED_TOOLS: InstructionSlot = InstructionSlot::new("prepared_tools");
-    /// The table of the commands a script can call.
-    pub const COMMANDS: InstructionSlot = InstructionSlot::new("commands");
-    /// The languages the session talks and works in.
-    pub const LANGUAGES: InstructionSlot = InstructionSlot::new("languages");
-
-    pub const MEMORY: ExternalSlot = ExternalSlot::new("memory");
-    pub const PROFILE_MEMORIES: ExternalSlot = ExternalSlot::new("profile_memories");
-    pub const GLOBAL_AGENTS_MD: ExternalSlot = ExternalSlot::new("global_agents_md");
-    pub const AGENTS_MD: ExternalSlot = ExternalSlot::new("agents_md");
-    pub const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
-    pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
-
-    /// The instruction slots May writes, in prompt order.
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
-        IDENTITY,
-        HARNESS,
-        EVIDENCE,
-        PROFILE_PERSONA,
-        ENVIRONMENT,
-        TERMINAL,
-        PREPARED_TOOLS,
-        EFFICIENCY,
-        CAPABILITIES,
-        COMMANDS,
-        BROWSER,
-        WORK,
-        PERMISSIONS,
-        TIME,
-        LANGUAGES,
-        SESSION,
-        REPO_CLONES,
-        PLAN_MODE,
-        PROJECT_RULES,
-    ];
-
-    /// The system prompt's order, from most shared to least shared, so
-    /// sessions share the longest cached prefix. Text every session of a
-    /// build has comes first: identity, harness and evidence. Text that
-    /// depends on the installation and its configuration follows: persona,
-    /// environment, terminal, prepared tools, efficiency, capabilities and
-    /// the command table, browser, work, permissions, time and languages.
-    /// Text specific to the session comes last: the session section, repo
-    /// clones, plan mode and project rules, then the external content.
-    #[must_use]
-    pub fn layout() -> SystemLayout {
-        SystemLayout::new(
-            [
-                IDENTITY,
-                HARNESS,
-                EVIDENCE,
-                PROFILE_PERSONA,
-                ENVIRONMENT,
-                TERMINAL,
-                PREPARED_TOOLS,
-                EFFICIENCY,
-                CAPABILITIES,
-                COMMANDS,
-                BROWSER,
-                WORK,
-                PERMISSIONS,
-                TIME,
-                LANGUAGES,
-                SESSION,
-                REPO_CLONES,
-                PLAN_MODE,
-                PROJECT_RULES,
-            ],
-            [
-                MEMORY,
-                PROFILE_MEMORIES,
-                GLOBAL_AGENTS_MD,
-                AGENTS_MD,
-                HANDOFF_AGENTS_MD,
-                WORKSPACE_WORKDIRS,
-            ],
-        )
-    }
-}
+pub use may_protocol::context_tag::tag;
 
 /// Where memory lives as the shell sees it, the source label of its block.
 const MEMORY_SOURCE: &str = "~/.may/memories/MEMORY.md";
@@ -165,7 +67,7 @@ pub struct RuntimeSystemContext {
 }
 
 impl RuntimeSystemContext {
-    pub(crate) fn new(memory_path: PathBuf, memory_content: String) -> Self {
+    pub fn new(memory_path: PathBuf, memory_content: String) -> Self {
         Self {
             instructions: BTreeMap::new(),
             profile_memories: None,
@@ -188,7 +90,7 @@ impl RuntimeSystemContext {
     ///
     /// # Panics
     /// Panics on a slot May does not write this way: a mistake in the caller.
-    pub(crate) fn with_instruction(mut self, slot: InstructionSlot, text: String) -> Self {
+    pub fn with_instruction(mut self, slot: InstructionSlot, text: String) -> Self {
         assert!(
             tag::MAY_INSTRUCTIONS.contains(&slot) && slot != tag::PROJECT_RULES,
             "`{}` is not an instruction block May renders at build",
@@ -200,26 +102,26 @@ impl RuntimeSystemContext {
 
     /// Replaces the command table; the next [`reconcile`](Self::reconcile)
     /// announces the change.
-    pub(crate) fn set_commands(&mut self, table: String) {
+    pub fn set_commands(&mut self, table: String) {
         self.instructions.insert(tag::COMMANDS, table);
     }
 
     /// Replaces the capabilities and skill catalog; the next
     /// [`reconcile`](Self::reconcile) announces any change without breaking the
     /// warm system prefix.
-    pub(crate) fn set_capabilities(&mut self, capabilities: String) {
+    pub fn set_capabilities(&mut self, capabilities: String) {
         self.instructions.insert(tag::CAPABILITIES, capabilities);
     }
 
     /// Replaces the environment block; the next [`reconcile`](Self::reconcile)
     /// announces any change without breaking the warm system prefix.
-    pub(crate) fn set_environment(&mut self, environment: String) {
+    pub fn set_environment(&mut self, environment: String) {
         self.instructions.insert(tag::ENVIRONMENT, environment);
     }
 
     /// Replaces or removes an optional instruction block; the next
     /// [`reconcile`](Self::reconcile) announces any change as live content.
-    pub(crate) fn set_instruction_opt(&mut self, slot: InstructionSlot, text: Option<String>) {
+    pub fn set_instruction_opt(&mut self, slot: InstructionSlot, text: Option<String>) {
         assert!(
             tag::MAY_INSTRUCTIONS.contains(&slot) && slot != tag::PROJECT_RULES,
             "`{}` is not a May-managed instruction block",
@@ -237,29 +139,29 @@ impl RuntimeSystemContext {
 
     /// Replaces or removes extracted profile memories; the next
     /// [`reconcile`](Self::reconcile) announces any change as live content.
-    pub(crate) fn set_profile_memories(&mut self, memories: Option<ExternalContent>) {
+    pub fn set_profile_memories(&mut self, memories: Option<ExternalContent>) {
         self.profile_memories = memories;
     }
 
     /// Replaces or removes approved workspace directories; the next
     /// [`reconcile`](Self::reconcile) announces any change as live content.
-    pub(crate) fn set_workdirs(&mut self, workdirs: Option<ExternalContent>) {
+    pub fn set_workdirs(&mut self, workdirs: Option<ExternalContent>) {
         self.workdirs = workdirs;
     }
 
-    pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
+    pub fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
         self.profile_memories = self.memory_enabled.then_some(memories).flatten();
         self
     }
 
-    pub(crate) const fn with_memory_enabled(mut self, enabled: bool) -> Self {
+    pub const fn with_memory_enabled(mut self, enabled: bool) -> Self {
         self.memory_enabled = enabled;
         self
     }
 
     /// Enables or disables memory blocks (`MEMORY.md` and profile memories);
     /// the next [`reconcile`](Self::reconcile) reconciles the live blocks.
-    pub(crate) fn set_memory_enabled(&mut self, enabled: bool) {
+    pub fn set_memory_enabled(&mut self, enabled: bool) {
         self.memory_enabled = enabled;
         if !enabled {
             self.profile_memories = None;
@@ -268,12 +170,12 @@ impl RuntimeSystemContext {
         }
     }
 
-    pub(crate) fn with_workdirs(mut self, workdirs: Option<ExternalContent>) -> Self {
+    pub fn with_workdirs(mut self, workdirs: Option<ExternalContent>) -> Self {
         self.workdirs = workdirs;
         self
     }
 
-    pub(crate) fn with_agents_md(mut self, agents: AgentsMdBlocks) -> Self {
+    pub fn with_agents_md(mut self, agents: AgentsMdBlocks) -> Self {
         self.agents = agents;
         self
     }
@@ -281,7 +183,7 @@ impl RuntimeSystemContext {
     /// Marks the launch directory `AGENTS.md` is discovered from, so
     /// [`Self::sync_agents_md`] can rescan it every turn. `label` is the
     /// launch directory as the model sees it, when it sees the host path.
-    pub(crate) fn with_agents_source(mut self, workdir: PathBuf, label: Option<&str>) -> Self {
+    pub fn with_agents_source(mut self, workdir: PathBuf, label: Option<&str>) -> Self {
         self.agents_workdir = Some(workdir);
         self.agents_root_source = agents_md_source(label);
         self
@@ -289,13 +191,13 @@ impl RuntimeSystemContext {
 
     /// Marks the global rules file, so [`Self::sync_agents_md`] re-reads it
     /// every turn.
-    pub(crate) fn with_global_agents_source(mut self, path: PathBuf) -> Self {
+    pub fn with_global_agents_source(mut self, path: PathBuf) -> Self {
         self.global_agents_path = Some(path);
         self
     }
 
     /// The source label of the launch directory's `AGENTS.md` block.
-    pub(crate) fn agents_root_source(&self) -> &str {
+    pub fn agents_root_source(&self) -> &str {
         &self.agents_root_source
     }
 
@@ -307,7 +209,7 @@ impl RuntimeSystemContext {
     /// Brings the blocks of `context` to this state. A context no request
     /// has carried yet takes them as they are; a later one stages the
     /// difference and announces it once.
-    pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
+    pub fn reconcile(&self, context: &mut aither_agent::Context) {
         {
             let instructions = context.instructions_mut();
             for slot in &tag::MAY_INSTRUCTIONS {
@@ -355,7 +257,7 @@ impl RuntimeSystemContext {
     /// the `AGENTS.md` files it links to. The reconcile stages any difference
     /// with a diff alert, so the cached prefix stays warm until reassembly
     /// folds it in.
-    pub(crate) async fn sync_agents_md(&mut self, handoff: Option<&str>) {
+    pub async fn sync_agents_md(&mut self, handoff: Option<&str>) {
         let workdir = self.agents_workdir.clone();
         let reload = handoff != self.last_handoff.as_deref();
         let global_fut = async {
@@ -396,7 +298,7 @@ impl RuntimeSystemContext {
 
     /// Re-read the memory index and watch the whole memories directory,
     /// alerting on changes to files this session has actually seen.
-    pub(crate) async fn sync_memory_content(&mut self, context: &mut aither_agent::Context) {
+    pub async fn sync_memory_content(&mut self, context: &mut aither_agent::Context) {
         if !self.memory_enabled {
             self.last_memory_content.clear();
             self.memories_snapshot = None;
@@ -501,31 +403,39 @@ struct MemoriesChanges {
 
 /// Durable alert telling the agent the user fell asleep; `greet` is set in
 /// the session that ran `/sleep`.
-#[derive(Template)]
+#[derive(Debug, Template)]
 #[template(path = "alert_sleep.txt", escape = "none")]
 pub struct SleepAlert {
-    pub(crate) greet: bool,
+    /// Whether the session ran `/sleep`.
+    pub greet: bool,
 }
 
 /// Durable alert telling the agent the user woke and how.
-#[derive(Template)]
+#[derive(Debug, Template)]
 #[template(path = "alert_wake.txt", escape = "none")]
 pub struct WakeAlert {
-    pub(crate) cause: crate::sleep::WakeCause,
+    /// How the user woke.
+    pub cause: crate::sleep::WakeCause,
 }
 
 impl SleepAlert {
     /// Renders the sleep alert text.
+    ///
+    /// # Panics
+    /// Panics when the template fails to render.
     #[must_use]
-    pub(crate) fn render_text(&self) -> String {
+    pub fn render_text(&self) -> String {
         self.render().expect("sleep alert template must render")
     }
 }
 
 impl WakeAlert {
     /// Renders the wake alert text.
+    ///
+    /// # Panics
+    /// Panics when the template fails to render.
     #[must_use]
-    pub(crate) fn render_text(&self) -> String {
+    pub fn render_text(&self) -> String {
         self.render().expect("wake alert template must render")
     }
 }

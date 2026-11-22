@@ -12,8 +12,8 @@ use crate::agent_link::{
     AgentDirectory, AgentLinkError, AgentMessaging, CacheLifetimes, ForkHosts,
 };
 use crate::cache_lifetime::CacheLifetime;
+use crate::client_tests::test_sandbox::TestTerminal;
 use crate::db::{ChatDb, PromptCacheRequest};
-use crate::repo_clone::test_sandbox::TestTerminal;
 use crate::session::SessionRuntimeService;
 use crate::ui_event_bus::UiEventBus;
 

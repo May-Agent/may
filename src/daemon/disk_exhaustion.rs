@@ -31,81 +31,6 @@ use crate::container::lifecycle::ContainerManager;
 use crate::db::{ChatDb, ChatDbError, MessageStatsParams, SessionContextSnapshotUpsert};
 use crate::session::ChatMessage;
 
-/// Why a home-environment write or container runtime call failed on storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiskExhaustionCause {
-    /// `ENOSPC` / `SQLITE_FULL` — no free blocks or inodes remain.
-    NoSpaceLeft,
-    /// `EDQUOT` — user, group, or project filesystem quota reached.
-    QuotaExceeded,
-    /// `EIO` — underlying storage or virtualized container disk I/O error.
-    RuntimeIoError,
-}
-
-impl DiskExhaustionCause {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::NoSpaceLeft => "no space left on device",
-            Self::QuotaExceeded => "disk quota exceeded",
-            Self::RuntimeIoError => "storage input/output error",
-        }
-    }
-}
-
-/// Classifies an [`std::io::Error`] caused by home-environment disk exhaustion.
-#[cfg(test)]
-#[must_use]
-pub fn classify_io_error(error: &std::io::Error) -> Option<DiskExhaustionCause> {
-    if error.kind() == std::io::ErrorKind::StorageFull {
-        return Some(DiskExhaustionCause::NoSpaceLeft);
-    }
-    #[cfg(unix)]
-    if let Some(code) = error.raw_os_error() {
-        if code == libc::ENOSPC {
-            return Some(DiskExhaustionCause::NoSpaceLeft);
-        }
-        if code == libc::EDQUOT {
-            return Some(DiskExhaustionCause::QuotaExceeded);
-        }
-        if code == libc::EIO {
-            return Some(DiskExhaustionCause::RuntimeIoError);
-        }
-    }
-    classify_error_text(&error.to_string())
-}
-
-/// Classifies a driver, SQLite, tool, or container runtime error string caused
-/// by disk exhaustion or storage I/O failure.
-#[must_use]
-pub fn classify_error_text(text: &str) -> Option<DiskExhaustionCause> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("no space left on device")
-        || lower.contains("database or disk is full")
-        || lower.contains("sqlite_full")
-        || lower.contains("os error 28")
-        || lower.contains("enospc")
-    {
-        return Some(DiskExhaustionCause::NoSpaceLeft);
-    }
-    if lower.contains("disk quota exceeded")
-        || lower.contains("filesystem quota exceeded")
-        || lower.contains("edquot")
-        || lower.contains("os error 69")
-        || lower.contains("os error 122")
-    {
-        return Some(DiskExhaustionCause::QuotaExceeded);
-    }
-    if lower.contains("input/output error")
-        || lower.contains("disk i/o error")
-        || lower.contains("sqlite_ioerr")
-        || lower.contains("os error 5")
-    {
-        return Some(DiskExhaustionCause::RuntimeIoError);
-    }
-    None
-}
-
 #[derive(Template)]
 #[template(path = "disk_exhausted_tool_notice.txt", escape = "none")]
 struct HomeDiskExhaustedToolNotice<'a> {
@@ -123,43 +48,6 @@ struct HomeDiskExhaustedAlert<'a> {
 #[template(path = "container_runtime_unavailable.txt", escape = "none")]
 struct ContainerRuntimeUnavailableNotice<'a> {
     detail: &'a str,
-}
-
-/// Renders the natural-language error returned to the model when an output
-/// store or container execution fails due to home-environment disk exhaustion.
-#[must_use]
-pub fn format_disk_exhausted_tool_error(cause: DiskExhaustionCause, detail: &str) -> String {
-    HomeDiskExhaustedToolNotice {
-        cause: cause.label(),
-        detail: detail.trim(),
-    }
-    .render()
-    .expect("disk exhaustion tool notice template must render")
-}
-
-/// Renders a one-shot `<system-reminder>` block telling the model that the home
-/// environment's disk is exhausted.
-#[must_use]
-pub fn format_disk_exhausted_alert(cause: DiskExhaustionCause) -> String {
-    HomeDiskExhaustedAlert {
-        cause: cause.label(),
-    }
-    .render()
-    .expect("disk exhaustion alert template must render")
-}
-
-/// Renders a natural-language notice when a container runtime crashed and has
-/// not yet come back up.
-#[must_use]
-pub fn format_container_unavailable_error(detail: &str) -> String {
-    if let Some(cause) = classify_error_text(detail) {
-        return format_disk_exhausted_tool_error(cause, detail);
-    }
-    ContainerRuntimeUnavailableNotice {
-        detail: detail.trim(),
-    }
-    .render()
-    .expect("container runtime unavailable notice template must render")
 }
 
 #[derive(Debug, Default)]
@@ -203,6 +91,9 @@ impl PendingTranscriptStore {
 
     /// Queues a one-shot `<system-reminder>` alert for `session_id` if one is
     /// not already queued.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     pub fn arm_alert(&self, session_id: &str, cause: DiskExhaustionCause) {
         let mut sessions = self.sessions.lock().expect("pending transcript lock");
         let entry = sessions.entry(session_id.to_string()).or_default();
@@ -214,6 +105,10 @@ impl PendingTranscriptStore {
 
     /// Takes the queued one-shot `<system-reminder>` alert for `session_id`, if any.
     #[must_use]
+    /// Takes the queued alert for `session_id`, if one is armed.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     pub fn take_alert(&self, session_id: &str) -> Option<String> {
         let mut sessions = self.sessions.lock().expect("pending transcript lock");
         let alert = sessions
@@ -230,6 +125,9 @@ impl PendingTranscriptStore {
     }
 
     /// Defers chat messages that could not be committed to SQLite.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     pub fn defer_messages(
         &self,
         session_id: &str,
@@ -253,6 +151,9 @@ impl PendingTranscriptStore {
     }
 
     /// Defers the latest agent checkpoint when SQLite cannot persist it.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     pub fn defer_checkpoint(
         &self,
         session_id: &str,
@@ -275,6 +176,9 @@ impl PendingTranscriptStore {
     }
 
     /// Defers assistant token/latency stats when SQLite cannot persist them.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     pub fn defer_stats(
         &self,
         session_id: &str,
@@ -296,7 +200,7 @@ impl PendingTranscriptStore {
     /// Whether `session_id` has deferred transcript writes waiting for space.
     #[cfg(test)]
     #[must_use]
-    pub fn has_pending(&self, session_id: &str) -> bool {
+    pub(crate) fn has_pending(&self, session_id: &str) -> bool {
         self.sessions
             .lock()
             .expect("pending transcript lock")
@@ -304,6 +208,10 @@ impl PendingTranscriptStore {
             .is_some_and(|entry| !entry.is_empty())
     }
 
+    /// Sessions with deferred writes waiting for disk space.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     #[must_use]
     pub fn pending_session_ids(&self) -> Vec<String> {
         self.sessions
@@ -318,6 +226,12 @@ impl PendingTranscriptStore {
     /// Attempts to flush deferred writes for `session_id` to `db`.
     ///
     /// Any write that still fails stays buffered in order for the next retry.
+    ///
+    /// # Errors
+    /// Fails when a deferred write still cannot be committed.
+    ///
+    /// # Panics
+    /// Panics when the pending-transcript lock is poisoned.
     pub async fn flush_session(&self, db: &ChatDb, session_id: &str) -> Result<bool, ChatDbError> {
         let (messages, snapshot, stats) = {
             let mut sessions = self.sessions.lock().expect("pending transcript lock");
@@ -498,6 +412,7 @@ pub fn is_container_runtime_disconnect(error: &str) -> bool {
 
 /// Reconnects to a container runtime and ensures the target container is running.
 pub trait ContainerReconnect: Send + Sync + 'static {
+    /// Re-establishes the container exec, returning it and its container id.
     fn reconnect(&self) -> impl Future<Output = Result<(AnyContainerExec, String), String>> + Send;
 }
 
@@ -509,7 +424,16 @@ pub struct ResilientContainerExec<R> {
     reconnect: R,
 }
 
+impl<R: std::fmt::Debug> std::fmt::Debug for ResilientContainerExec<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResilientContainerExec")
+            .field("reconnect", &self.reconnect)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<R: ContainerReconnect> ResilientContainerExec<R> {
+    /// A resilient exec over `initial_exec`, reconnecting through `reconnect`.
     #[must_use]
     pub const fn new(
         initial_exec: AnyContainerExec,
@@ -641,12 +565,14 @@ impl<R: ContainerReconnect> ContainerExec for ResilientContainerExec<R> {
 
 /// Production [`ContainerReconnect`] for daemon chat sessions: re-detects the
 /// container runtime when needed and restarts or recreates `launch_spec`.
+#[derive(Debug)]
 pub struct DaemonContainerReconnect {
     state: Weak<DaemonState>,
     launch_spec: ContainerLaunchSpec,
 }
 
 impl DaemonContainerReconnect {
+    /// A reconnect holding `state` for `launch_spec`.
     #[must_use]
     pub const fn new(state: Weak<DaemonState>, launch_spec: ContainerLaunchSpec) -> Self {
         Self { state, launch_spec }
@@ -678,6 +604,7 @@ impl ContainerReconnect for DaemonContainerReconnect {
 /// [`ContainerReconnect`] for scheduled container tasks: re-detects a live
 /// runtime into `may_dir` if the cached manager's runtime disappeared, and
 /// ensures `launch_spec` is running.
+#[derive(Debug)]
 pub struct TaskContainerReconnect {
     may_dir: std::path::PathBuf,
     cached_manager: Arc<ContainerManager>,
@@ -685,6 +612,7 @@ pub struct TaskContainerReconnect {
 }
 
 impl TaskContainerReconnect {
+    /// A reconnect re-detecting into `may_dir` for `launch_spec`.
     #[must_use]
     pub const fn new(
         may_dir: std::path::PathBuf,
@@ -732,6 +660,54 @@ impl ContainerReconnect for TaskContainerReconnect {
     }
 }
 
+/// Renders the natural-language error returned to the model when an output
+/// store or container execution fails due to home-environment disk exhaustion.
+///
+/// # Panics
+/// Panics when the notice template fails to render.
+#[must_use]
+pub fn format_disk_exhausted_tool_error(cause: DiskExhaustionCause, detail: &str) -> String {
+    HomeDiskExhaustedToolNotice {
+        cause: cause.label(),
+        detail: detail.trim(),
+    }
+    .render()
+    .expect("disk exhaustion tool notice template must render")
+}
+
+/// Renders a one-shot `<system-reminder>` block telling the model that the home
+/// environment's disk is exhausted.
+///
+/// # Panics
+/// Panics when the alert template fails to render.
+#[must_use]
+pub fn format_disk_exhausted_alert(cause: DiskExhaustionCause) -> String {
+    HomeDiskExhaustedAlert {
+        cause: cause.label(),
+    }
+    .render()
+    .expect("disk exhaustion alert template must render")
+}
+
+/// Renders a natural-language notice when a container runtime crashed and has
+/// not yet come back up.
+///
+/// # Panics
+/// Panics when the notice template fails to render.
+#[must_use]
+pub fn format_container_unavailable_error(detail: &str) -> String {
+    if let Some(cause) = classify_error_text(detail) {
+        return format_disk_exhausted_tool_error(cause, detail);
+    }
+    ContainerRuntimeUnavailableNotice {
+        detail: detail.trim(),
+    }
+    .render()
+    .expect("container runtime unavailable notice template must render")
+}
+
+pub use may_protocol::disk_exhaustion::*;
+
 #[cfg(test)]
 mod tests {
     use std::process::{ExitStatus, Output};
@@ -746,7 +722,7 @@ mod tests {
 
     use super::{
         ContainerReconnect, DiskExhaustionCause, ResilientContainerExec, classify_error_text,
-        classify_io_error, format_disk_exhausted_alert, format_disk_exhausted_tool_error,
+        format_disk_exhausted_alert, format_disk_exhausted_tool_error,
     };
     use crate::config::MayConfig;
     use crate::daemon::chat::TurnKind;
@@ -754,6 +730,7 @@ mod tests {
     use crate::daemon::types::ChatRequest;
     use crate::db::{MessageStatsParams, RunFence};
     use crate::session::{ChatMessage, PendingUserMessageMode, load_history_from_db};
+    use may_protocol::disk_exhaustion::classify_io_error;
 
     #[cfg(unix)]
     fn ok_status() -> ExitStatus {

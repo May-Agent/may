@@ -19,7 +19,6 @@ use executor_core::DefaultExecutor;
 use super::agents_md;
 use super::compaction_report::CompactionReporter;
 use super::compaction_watch::{MayRun, PreCompactionAlert, RunWatch, WindowGauge};
-use super::context_dump::ContextDump;
 use super::hooks::MayHooks;
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::job_events::{BackgroundWake, JobFact, JobReport, JobReports};
@@ -32,9 +31,6 @@ use super::runtime_context::{
     build_harness, build_identity, build_languages, build_permissions, build_plan_mode_context,
     build_prepared_tools, build_profile_memories, build_profile_persona, build_repo_clones_context,
     build_session, build_terminal, build_time, build_work, build_workspace_workdirs_context, tag,
-};
-use super::tool_environment_cache::{
-    Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -70,6 +66,10 @@ use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::tools::ToolEnvironments;
 use crate::workspace::Workspace as MayWorkspace;
 use crate::workspace_request::WorkspaceRequestBroker;
+use may_client::tool_environment_cache::{
+    Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError,
+};
+use may_protocol::context_dump::ContextDump;
 
 /// How many keep-alives in one run count as idling frequently.
 const FREQUENT_IDLE_THRESHOLD: usize = 3;
@@ -199,7 +199,7 @@ impl std::fmt::Debug for HostReaderSource {
 #[derive(Debug)]
 pub struct MayAgentConfig {
     /// The session's subagent tracker; `None` starts a fresh one.
-    pub subagent_tracker: Option<crate::agent::subagent_tracker::SubagentTracker>,
+    pub subagent_tracker: Option<may_client::subagent_tracker::SubagentTracker>,
     /// The daemon's connectivity source: the agent abandons a response on
     /// sleep or network loss, and its shell records the outages commands ran
     /// through.
@@ -403,7 +403,7 @@ pub struct MayAgentSessionInput<'a> {
     /// Which provider candidate this build should try (retry counter).
     pub provider_attempt: usize,
     /// The session's subagent tracker; `None` starts a fresh one.
-    pub subagent_tracker: Option<crate::agent::subagent_tracker::SubagentTracker>,
+    pub subagent_tracker: Option<may_client::subagent_tracker::SubagentTracker>,
     /// The daemon's connectivity source.
     pub connectivity: aither_connectivity::Connectivity,
     /// The rules this session imports, for a session `/import-claude` or
@@ -420,7 +420,7 @@ pub struct MayAgentSessionInput<'a> {
     pub sleep: Option<Arc<crate::sleep::SleepState>>,
 }
 
-type MayAgentInner = Agent<ProviderLlm, MayHooks, ProviderLlm>;
+pub type MayAgentInner = Agent<ProviderLlm, MayHooks, ProviderLlm>;
 
 /// The May agent.
 pub struct MayAgent {
@@ -474,7 +474,7 @@ pub struct MayAgent {
     /// `/context` sizes them.
     native_tools: Vec<aither_core::llm::tool::ToolDefinition>,
     runtime_system_context: RuntimeSystemContext,
-    subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
+    subagent_tracker: may_client::subagent_tracker::SubagentTracker,
     /// Model clone reserved for `/btw` side questions.
     btw_llm: ModelSlot<ProviderLlm>,
     language_guard: LanguageGuard,
@@ -504,6 +504,7 @@ fn session_prompt_cache(session_id: &str, epoch: u32) -> PromptCache {
 /// `model` for a side request of `session_id`'s agent at prompt-cache
 /// `epoch`: its requests carry the key the agent's own take, so the provider
 /// places both on the same cache shard.
+#[must_use]
 pub fn side_slot(
     model: &ModelSlot<ProviderLlm>,
     session_id: &str,
@@ -1466,7 +1467,7 @@ impl MayAgent {
     ///
     /// Returns [`MayAgentError`] when resolving the provider runtime fails
     /// or the SSH attachments for the profile cannot be loaded.
-    pub(crate) async fn session_config(
+    pub async fn session_config(
         may_config: &MayConfig,
         input: MayAgentSessionInput<'_>,
     ) -> Result<MayAgentConfig, MayAgentError> {
@@ -1732,7 +1733,7 @@ impl MayAgent {
     /// The loop that made the last run end, once: the turn runner tells the
     /// session's clients why the turn ended.
     #[must_use]
-    pub(crate) fn take_loop_stop(&self) -> Option<LoopPattern> {
+    pub fn take_loop_stop(&self) -> Option<LoopPattern> {
         self.loops.take_stop()
     }
 
@@ -1799,7 +1800,7 @@ impl MayAgent {
         let compacted = self.compact_reporting(None, reporter).await;
         if let Ok(Some(_)) = &compacted
             && let Err(error) =
-                crate::session::persist_agent_context_snapshot(db, fence, self).await
+                crate::session::persist_agent_context_snapshot(db, fence, self.inner_mut()).await
         {
             tracing::warn!(session_id = %fence.session_id, %error, "failed to persist the compacted context");
         }
@@ -1932,13 +1933,13 @@ impl MayAgent {
     /// during initialization.
     pub async fn context_report(
         &mut self,
-    ) -> Result<super::context_report::ContextReport, AgentError> {
+    ) -> Result<may_protocol::context_report::ContextReport, AgentError> {
         self.sync_runtime_context().await;
         let snapshot = self.inner.snapshot_context_window().await?;
-        Ok(super::context_report::ContextReport::assemble(
+        Ok(may_protocol::context_report::ContextReport::assemble(
             &self.model_id,
             &self.provider_id,
-            &super::context_report::ToolInventory {
+            &may_protocol::context_report::ToolInventory {
                 named_commands: &self.named_commands,
                 native_tools: &self.native_tools,
             },
@@ -1993,7 +1994,7 @@ impl MayAgent {
 
     /// Shared handle to the session's runtime grants.
     #[must_use]
-    pub(crate) fn grants(&self) -> Grants {
+    pub fn grants(&self) -> Grants {
         self.grants.clone()
     }
 
@@ -2005,7 +2006,7 @@ impl MayAgent {
 
     /// Execution environment of this running agent (`Local` or `Container`).
     #[must_use]
-    pub(crate) const fn environment(&self) -> &AgentEnvironment {
+    pub const fn environment(&self) -> &AgentEnvironment {
         &self.environment
     }
 
@@ -2013,6 +2014,11 @@ impl MayAgent {
     #[must_use]
     pub const fn shell(&self) -> &Arc<SessionShell> {
         &self.shell
+    }
+
+    /// The wrapped agent, for context-snapshot persistence.
+    pub(crate) const fn inner_mut(&mut self) -> &mut MayAgentInner {
+        &mut self.inner
     }
 
     /// Background jobs of this session's shell. Cloneable handle — the TUI
@@ -2058,7 +2064,7 @@ impl MayAgent {
     /// Tracker shared with this session's `subagent` IPC command — the TUI
     /// reads live per-run stats off it for the jobs panel and status bar.
     #[must_use]
-    pub fn subagent_tracker(&self) -> crate::agent::subagent_tracker::SubagentTracker {
+    pub fn subagent_tracker(&self) -> may_client::subagent_tracker::SubagentTracker {
         self.subagent_tracker.clone()
     }
 
@@ -2099,19 +2105,23 @@ impl MayAgent {
         self.shell.jobs().kill_all().await
     }
 
-    pub(crate) async fn export_checkpoint(
-        &mut self,
-    ) -> Result<aither_agent::AgentCheckpoint, AgentError> {
+    /// Exports the agent's restart-safe checkpoint.
+    ///
+    /// # Errors
+    /// Fails when the checkpoint cannot be serialized.
+    pub async fn export_checkpoint(&mut self) -> Result<aither_agent::AgentCheckpoint, AgentError> {
         self.inner.export_checkpoint().await
     }
 
-    pub(crate) fn push_message(&mut self, message: aither_core::llm::Message) {
+    /// Appends `message` to the conversation.
+    pub fn push_message(&mut self, message: aither_core::llm::Message) {
         self.inner.push_message(message);
     }
 
     /// How long from now the idle compaction is due; see
     /// [`Agent::idle_compaction_due_in`].
-    pub(crate) fn idle_compaction_due_in(&self) -> Option<std::time::Duration> {
+    #[must_use]
+    pub fn idle_compaction_due_in(&self) -> Option<std::time::Duration> {
         self.inner.idle_compaction_due_in()
     }
 
@@ -2119,7 +2129,7 @@ impl MayAgent {
     /// `None` when no refresh is due: the entry is cold or permanent, or
     /// every running background job ends before it cools. See
     /// [`super::keep_warm::refresh_in`].
-    pub(crate) async fn keep_warm_due_in(&self) -> Option<std::time::Duration> {
+    pub async fn keep_warm_due_in(&self) -> Option<std::time::Duration> {
         let aither_agent::context::CacheLifetime::Limited(lifetime) = self.inner.cache_lifetime()
         else {
             return None;
@@ -2142,22 +2152,29 @@ impl MayAgent {
     /// Refreshes the idle agent's cache entry with a one-token request whose
     /// output is dropped; see [`Agent::keep_cache_warm`]. `None` when there
     /// was nothing to refresh.
-    pub(crate) async fn keep_cache_warm(
-        &mut self,
-    ) -> Result<Option<aither_core::llm::Usage>, AgentError> {
+    ///
+    /// # Errors
+    /// Fails when the refresh request cannot run.
+    pub async fn keep_cache_warm(&mut self) -> Result<Option<aither_core::llm::Usage>, AgentError> {
         self.inner.keep_cache_warm().await
     }
 
     /// Compacts the idle session once it is due; see
     /// [`Agent::compact_when_idle`].
+    ///
+    /// # Errors
+    /// Fails when the compaction request cannot run.
     #[cfg(test)]
-    pub(crate) async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
+    pub async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
         self.compact_when_idle_reporting(&CompactionReporter::silent())
             .await
     }
 
     /// [`Self::compact_when_idle`], reporting its progress to `reporter`.
-    pub(crate) async fn compact_when_idle_reporting(
+    ///
+    /// # Errors
+    /// Fails when the compaction request cannot run.
+    pub async fn compact_when_idle_reporting(
         &mut self,
         reporter: &CompactionReporter,
     ) -> Result<Option<CompactResult>, AgentError> {
@@ -2168,7 +2185,10 @@ impl MayAgent {
     }
 
     /// Compacts the conversation, reporting its progress to `reporter`.
-    pub(crate) async fn compact_reporting(
+    ///
+    /// # Errors
+    /// Fails when the compaction request cannot run.
+    pub async fn compact_reporting(
         &mut self,
         focus: Option<&str>,
         reporter: &CompactionReporter,
@@ -2203,7 +2223,11 @@ impl MayAgent {
             .await
     }
 
-    pub(crate) fn restore_checkpoint(
+    /// Restores `checkpoint` into the agent and reconciles runtime context.
+    ///
+    /// # Errors
+    /// Fails when the checkpoint cannot be applied.
+    pub fn restore_checkpoint(
         &mut self,
         checkpoint: aither_agent::AgentCheckpoint,
     ) -> Result<(), AgentError> {
@@ -2221,7 +2245,10 @@ impl MayAgent {
     /// Synchronizes the sleep source's seen state after restoring a warm
     /// checkpoint so an already-delivered sleep alert is not repeated until
     /// sleep ends or cold reassembly clears it.
-    pub(crate) async fn mark_restored_sleep_seen(&self) {
+    ///
+    /// # Panics
+    /// Panics when the sleep reading cannot be interpreted.
+    pub async fn mark_restored_sleep_seen(&self) {
         let Some(sleep) = &self.sleep else {
             return;
         };
@@ -2234,7 +2261,8 @@ impl MayAgent {
         }
     }
 
-    pub(crate) async fn sync_runtime_context(&mut self) {
+    /// Synchronizes runtime-generated system context into the agent's context.
+    pub async fn sync_runtime_context(&mut self) {
         self.runtime_system_context
             .sync_memory_content(self.inner.context_mut())
             .await;
@@ -2284,10 +2312,7 @@ impl MayAgent {
     ///
     /// Returns [`MayAgentError`] when resolving an updated model/provider,
     /// workspace configuration, network policy, or session secrets fails.
-    pub(crate) async fn sync_for_turn(
-        &mut self,
-        input: TurnSyncInput<'_>,
-    ) -> Result<(), MayAgentError> {
+    pub async fn sync_for_turn(&mut self, input: TurnSyncInput<'_>) -> Result<(), MayAgentError> {
         let providers = super::Providers::new(input.may_config, input.pushed_providers);
         let selector = super::provider::parse_model_selector(input.current_model)?;
         let request_parameters = super::provider::session_request_parameters(
@@ -2407,7 +2432,7 @@ impl MayAgent {
     }
     /// Synchronizes the session's active SSH servers with the live shell and
     /// `<environment>` context block without breaking the cached system prefix.
-    pub(crate) fn sync_ssh_servers(&mut self, servers: &[crate::config::SshServerConfig]) {
+    pub fn sync_ssh_servers(&mut self, servers: &[crate::config::SshServerConfig]) {
         let sessions = self.shell.shell_sessions();
         let existing = sessions.ssh_servers();
         for current in &existing {
@@ -2534,20 +2559,35 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
 }
 
 /// Session inputs synchronized onto a running [`MayAgent`] before each turn.
+#[derive(Debug)]
 pub struct TurnSyncInput<'a> {
+    /// The session's configuration.
     pub may_config: &'a MayConfig,
+    /// Cloud providers pushed to the session.
     pub pushed_providers: &'a crate::cloud::access::PushedProviders,
+    /// The model id the turn runs under.
     pub current_model: &'a str,
+    /// The reasoning effort the session configured.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The model's context window, when known.
     pub model_context_window: Option<u32>,
+    /// The provider attempt count of the turn.
     pub provider_attempt: usize,
+    /// The active profile's id.
     pub profile_id: Option<&'a str>,
+    /// The active profile's persona text.
     pub profile_persona: Option<&'a str>,
+    /// The active profile's remembered notes.
     pub profile_memories: Option<&'a crate::memory::ProfileMemories>,
+    /// `true` when profile memory is disabled for the turn.
     pub memory_off: bool,
+    /// The session's plan state.
     pub plan_state: SessionPlanState,
+    /// The session's resolved location.
     pub location: Option<&'a crate::location::LocationInfo>,
+    /// The session's working directory.
     pub cwd: &'a Path,
+    /// The session's configured SSH servers.
     pub ssh_servers: &'a [crate::config::SshServerConfig],
 }
 

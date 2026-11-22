@@ -12,13 +12,14 @@ use tempfile::TempDir;
 
 use super::state::WorkspaceApprover;
 use crate::agent::PermissionApprover;
-use crate::agent::permission::{SSH_KIND, UNSANDBOXED_KIND};
+use crate::agent::permission::UNSANDBOXED_KIND;
 use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{ChatDb, CreateScheduledTaskParams};
 use crate::session::SessionRuntimeService;
 use crate::task_trigger::PersistedTaskTrigger;
 use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::ui_event_bus::UiEventBus;
+use may_protocol::layout_consts::SSH_KIND;
 
 /// A request to run `script` outside the sandbox.
 fn unsandboxed(script: &str) -> ApprovalRequest {

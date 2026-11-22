@@ -50,7 +50,7 @@ impl EnvSource for CommandEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_clone::test_sandbox::TestTerminal;
+    use crate::client_tests::test_sandbox::TestTerminal;
     use crate::secrets::SecretStore;
 
     fn env_of(dir: &std::path::Path, tasks_md: &str) -> CommandEnv {

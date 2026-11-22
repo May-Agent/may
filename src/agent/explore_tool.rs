@@ -32,6 +32,7 @@ pub struct ExploreArgs {
 }
 
 /// The `explore` command, delegating to a `subagent` tool.
+#[derive(Debug)]
 pub struct ExploreTool<T> {
     subagent: T,
 }

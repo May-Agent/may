@@ -29,7 +29,7 @@ const REMINDER_BODY: &str =
 #[serde(rename_all = "camelCase")]
 pub struct SleepRequest {
     /// The session `/sleep` was run in.
-    pub(crate) session_id: String,
+    pub session_id: String,
 }
 
 /// `GET /api/sleep`: the current state.

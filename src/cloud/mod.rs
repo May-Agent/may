@@ -10,6 +10,8 @@
 //! Which provider a profile uses, and as which account, is the profile's
 //! [`ProfileCloud`], set with `/cloud`.
 
+pub use may_protocol::cloud::*;
+
 pub mod access;
 pub mod bootstrap;
 pub mod codespaces;
@@ -23,7 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::workspace::GitHubRepository;
 
-pub use codespaces::{Codespaces, CodespacesAccount};
+pub use codespaces::Codespaces;
+pub use may_protocol::cloud::CodespacesAccount;
 
 /// A cloud provider: where machines come from and how their lifecycle is
 /// driven.
@@ -210,22 +213,6 @@ impl fmt::Display for MachineId {
     }
 }
 
-/// One machine type of a provider's catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineType {
-    /// The provider's name of the type, which a create or resize names.
-    pub name: String,
-    /// What the provider calls it in a picker.
-    pub display_name: String,
-    /// CPU cores.
-    pub cpus: u32,
-    /// Memory, in bytes.
-    pub memory_bytes: u64,
-    /// Disk, in bytes.
-    pub storage_bytes: u64,
-}
-
 /// What a new machine is created with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMachine {
@@ -245,28 +232,6 @@ pub struct CloudMachine {
     pub state: MachineState,
     /// The type it runs on, when the provider has assigned one.
     pub machine_type: Option<MachineType>,
-}
-
-/// Where a machine is in its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum MachineState {
-    /// Being created, started, stopped or changed; it settles on its own.
-    Provisioning,
-    /// Running and reachable.
-    Running,
-    /// Not running; its disk is kept and a start resumes it.
-    Suspended,
-    /// Deleted, or dead where it is: nothing starts it again.
-    Gone,
-}
-
-/// The cloud provider accounts a profile uses, one field per provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfileCloud {
-    /// The GitHub account the profile's codespaces belong to, when set up.
-    pub codespaces: Option<CodespacesAccount>,
 }
 
 /// Why a cloud provider operation failed.

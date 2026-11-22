@@ -10,6 +10,10 @@
 //! that finishes, or one blocked on stdin, starts a turn of its own
 //! ([`super::start_background_turn`]).
 
+pub use may_client::daemon::types::{
+    BtwMessage, BtwRequest, BtwResponse, CompactRequest, CompactResponse, ContextDumpResponse,
+};
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -18,11 +22,13 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use crate::MayAgent;
+use crate::agent::ProviderLlm;
 use crate::agent::{AgentWorker, TuiEvent, spawn_idle_worker};
 use crate::daemon::error::{
     bad_request_error, internal_error, internal_error_message, json_ok_response,
 };
 use crate::daemon::state::DaemonState;
+use may_protocol::model_slot::ModelSlot;
 
 /// Tells every client of `session_id` how its compaction stands, on the
 /// `session_compaction` frame kind.
@@ -41,10 +47,13 @@ pub(super) fn publish_compaction(
     }
 }
 
+/// An idle session's parked agent worker.
+type ParkedWorker = Arc<AgentWorker<ModelSlot<ProviderLlm>, crate::MayAgent>>;
+
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
 pub struct ParkedAgents {
-    workers: Mutex<HashMap<String, Arc<AgentWorker>>>,
+    workers: Mutex<HashMap<String, ParkedWorker>>,
 }
 
 impl std::fmt::Debug for ParkedAgents {
@@ -54,14 +63,14 @@ impl std::fmt::Debug for ParkedAgents {
 }
 
 impl ParkedAgents {
-    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AgentWorker>>> {
+    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, ParkedWorker>> {
         self.workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Keeps `agent` as `session_id`'s idle agent.
-    pub(crate) fn park(
+    pub fn park(
         &self,
         state: &Arc<DaemonState>,
         session_id: &str,
@@ -116,7 +125,7 @@ impl ParkedAgents {
     /// one: its terminal jobs are killed and its subagent runs cancelled,
     /// and their completions wait for the user's next input instead of
     /// starting a turn. The agent stays parked, its prompt cache warm.
-    pub(crate) async fn stop_background(&self, state: &Arc<DaemonState>, session_id: &str) {
+    pub async fn stop_background(&self, state: &Arc<DaemonState>, session_id: &str) {
         let Some(worker) = self.workers().remove(session_id) else {
             return;
         };
@@ -138,7 +147,7 @@ impl ParkedAgents {
     }
 
     /// Stops `session_id`'s idle agent, if any.
-    pub(crate) fn evict(&self, session_id: &str) {
+    pub fn evict(&self, session_id: &str) {
         let worker = self.workers().remove(session_id);
         if let Some(worker) = worker {
             worker.shutdown();
@@ -146,7 +155,7 @@ impl ParkedAgents {
     }
 
     /// Takes `session_id`'s idle agent for a turn.
-    pub(crate) async fn take(&self, session_id: &str) -> Option<MayAgent> {
+    pub async fn take(&self, session_id: &str) -> Option<MayAgent> {
         let worker = self.workers().remove(session_id)?;
         let (reply, agent) = async_channel::bounded(1);
         worker.release(reply);
@@ -154,16 +163,19 @@ impl ParkedAgents {
     }
 
     /// Whether `session_id` has an idle agent.
-    pub(crate) fn contains(&self, session_id: &str) -> bool {
+    pub fn contains(&self, session_id: &str) -> bool {
         self.workers().contains_key(session_id)
     }
 
     /// The prompt-cache entry of `session_id`'s idle agent, when it has one.
-    pub(crate) fn cache_warmth(&self, session_id: &str) -> Option<aither_agent::CacheWarmth> {
+    pub fn cache_warmth(&self, session_id: &str) -> Option<aither_agent::CacheWarmth> {
         self.get(session_id)?.cache_warmth().cloned()
     }
 
-    pub(super) fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
+    pub(super) fn get(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<AgentWorker<ModelSlot<ProviderLlm>, crate::MayAgent>>> {
         self.workers().get(session_id).cloned()
     }
 }
@@ -177,7 +189,7 @@ pub(super) fn session_id_param(params: &Params) -> SkyResult<String> {
 pub(super) async fn idle_agent(
     state: &Arc<DaemonState>,
     session_id: &str,
-) -> SkyResult<Arc<AgentWorker>> {
+) -> SkyResult<Arc<AgentWorker<ModelSlot<ProviderLlm>, crate::MayAgent>>> {
     if let Some(worker) = state.parked_agents.get(session_id) {
         return Ok(worker);
     }
@@ -242,35 +254,15 @@ pub(super) async fn idle_agent(
 }
 
 /// Waits for the worker's answer to one command.
-async fn answer(handle: crate::agent::AgentHandle) -> Option<TuiEvent> {
+async fn answer(
+    handle: crate::agent::AgentHandle<ModelSlot<ProviderLlm>, crate::MayAgent>,
+) -> Option<TuiEvent<ModelSlot<ProviderLlm>>> {
     while let Some(event) = handle.recv().await {
         if !matches!(event, TuiEvent::Complete) {
             return Some(event);
         }
     }
     None
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CompactRequest {
-    /// What the summary should keep in focus.
-    #[serde(default)]
-    focus: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-/// Answer of `POST /api/sessions/{id}/compact`.
-pub struct CompactResponse {
-    /// Whether anything was compacted.
-    pub compacted: bool,
-    /// Messages folded into the summary.
-    pub messages_compacted: usize,
-    /// Messages kept verbatim.
-    pub messages_remaining: usize,
-    /// The summary.
-    pub summary: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/compact`.
@@ -363,16 +355,6 @@ pub async fn usage_report(
     ))
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-/// Answer of `POST /api/sessions/{id}/context-dump`.
-pub struct ContextDumpResponse {
-    /// Where the dump was written.
-    pub path: String,
-    /// Messages in the dump.
-    pub message_count: usize,
-}
-
 /// `POST /api/sessions/{id}/context-dump`: writes the assembled context to
 /// the session's `outputs/context-dump.md`.
 pub async fn context_dump_inner(
@@ -397,32 +379,6 @@ pub async fn context_dump_inner(
         path: path.display().to_string(),
         message_count: dump.messages.len(),
     }))
-}
-
-/// One message of a `/btw` request.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct BtwMessage {
-    /// `system`, `user` or `assistant`.
-    pub role: String,
-    /// Message text.
-    pub content: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-/// Body of `POST /api/sessions/{id}/btw`.
-pub struct BtwRequest {
-    /// The side question with the context it is asked in, oldest first.
-    pub messages: Vec<BtwMessage>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-/// Answer of `POST /api/sessions/{id}/btw`.
-pub struct BtwResponse {
-    /// The answer.
-    pub answer: String,
 }
 
 /// `POST /api/sessions/{id}/btw`: answers a side question with the

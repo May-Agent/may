@@ -30,62 +30,8 @@ use crate::issue::github::{ForgeTokenSource, GitHubRest, GitHubTokenSource};
 use crate::issue::gitlab::{ForgeGitLabAuth, GitLabRest, GitLabTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
-pub(crate) mod checks;
-pub(crate) mod gitlab;
-pub(crate) mod merge_watch;
-mod pull_sync;
-
-use pull_sync::SyncedCheckout;
-
-/// Error type for `pr` operations.
-#[derive(Debug, thiserror::Error)]
-pub enum PrError {
-    /// Database layer failure.
-    #[error(transparent)]
-    Db(#[from] crate::db::ChatDbError),
-    /// Clone layer failure.
-    #[error(transparent)]
-    RepoClone(#[from] crate::repo_clone::RepoCloneError),
-    /// The repo could not be resolved to a session clone.
-    #[error("{0}")]
-    Resolve(String),
-    /// The PR is owned by another session or has no write path here.
-    #[error("{0}")]
-    Ownership(String),
-    /// The PR is in a state that refuses the operation.
-    #[error("{0}")]
-    State(String),
-    /// Merge conflicts or dirty checkout overlap — the file list.
-    #[error("rejected: {0}")]
-    Rejected(String),
-    /// The clone holds uncommitted or untracked work — nothing is lost silently.
-    #[error("uncommitted changes would be lost on merge: {0}")]
-    DirtyClone(String),
-    /// Local check command failed.
-    #[error("check failed: {0}")]
-    CheckFailed(String),
-    /// The outbound screen blocked published text.
-    #[error("outbound screen blocked: {0}")]
-    Screened(String),
-    /// A GitHub API call failed.
-    #[error("github {0}")]
-    Gh(String),
-    /// A GitLab API call failed.
-    #[error("gitlab {0}")]
-    Gl(String),
-    /// A commit of the PR's range is not signed by the user.
-    #[error(transparent)]
-    Signing(#[from] crate::commit_signing::SigningError),
-    /// Filesystem failure while staging.
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    /// A subagent called an action only the main agent has.
-    #[error("`pr {0}` is the main agent's; a subagent has `pr list` and `pr show`")]
-    MainAgentOnly(&'static str),
-    /// The user's approval to open the PR was refused or could not be had.
-    #[error(transparent)]
-    Publish(#[from] crate::agent::publish_approval::PublishError),
-}
+use may_git_forge::pr::pull_sync::{self, SyncedCheckout};
+pub use may_git_forge::pr::{PrError, RemoteBranch, checks, gitlab, merge_watch};
 
 /// `pr`-side workspace fields the land path reads.
 #[derive(Clone)]
@@ -124,7 +70,7 @@ pub struct PrContext {
     pub task_events: Option<crate::harness::working_document::WorkEvents>,
     /// Asks the user before a PR is opened on a repository they do not own;
     /// `None` publishes without asking.
-    pub publish: Option<crate::agent::publish_approval::PublishGate>,
+    pub(crate) publish: Option<crate::agent::publish_approval::PublishGate>,
     /// Records the durations of the PR's checks, when the session keeps
     /// them; `None` records nothing.
     pub ci: Option<CiWatch>,
@@ -202,7 +148,8 @@ impl PrContext {
 
     /// The REST client of GitLab `host`: `gitlab_api` for tests, else the
     /// host's `api/v4` endpoint with its `[forge]` credential.
-    pub(crate) fn gitlab_rest(&self, host: &str) -> GitLabRest<PrGitLabToken> {
+    #[must_use]
+    pub fn gitlab_rest(&self, host: &str) -> GitLabRest<PrGitLabToken> {
         self.gitlab_api.clone().unwrap_or_else(|| {
             GitLabRest::new(
                 PrGitLabToken::Forge(ForgeGitLabAuth::new(
@@ -1229,7 +1176,7 @@ impl PrStore {
             );
             let section = match merge_watch::Upstream::snapshot(&github).await {
                 Ok(snapshot) => {
-                    let report = checks::ChecksReport::of(&snapshot);
+                    let report = checks::checks_report_of(&snapshot);
                     let failures = checks::failure_details(&actions, &report).await;
                     checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
                 }
@@ -1256,7 +1203,7 @@ impl PrStore {
                         crate::ci::gitlab::GitLabCi::new(rest.clone(), repo.clone(), pr.number);
                     match merge_watch::Upstream::snapshot(&mr).await {
                         Ok(snapshot) => {
-                            let report = checks::ChecksReport::of(&snapshot);
+                            let report = checks::checks_report_of(&snapshot);
                             let failures = checks::failure_details(&ci, &report).await;
                             checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
                         }
@@ -2169,7 +2116,7 @@ impl PrStore {
 }
 
 /// Announces to live Web UI and TUI subscribers that PR lists may have changed.
-pub(crate) fn notify_prs_bus(bus: &crate::ui_event_bus::UiEventBus, session_id: &str) {
+pub fn notify_prs_bus(bus: &crate::ui_event_bus::UiEventBus, session_id: &str) {
     bus.publish(crate::ui_event_bus::UiEventTopics::PRS);
     if !session_id.is_empty() {
         bus.publish_session_change(
@@ -2182,7 +2129,7 @@ pub(crate) fn notify_prs_bus(bus: &crate::ui_event_bus::UiEventBus, session_id: 
 /// Whether the repository configuration requires explicit user review before
 /// merging PRs from this backend/repository.
 #[must_use]
-pub(crate) fn pr_requires_review(
+pub fn pr_requires_review(
     workspace: &crate::workspace::WorkspaceConfig,
     backend: &str,
     repo_key: &str,
@@ -3445,17 +3392,6 @@ enum CloneFate {
     Kept,
 }
 
-/// What became of a merged PR's branch on the remote.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RemoteBranch {
-    /// A local PR has no remote branch.
-    Local,
-    /// The branch is gone from the remote.
-    Deleted(String),
-    /// The branch could not be deleted, and why.
-    NotDeleted(String, String),
-}
-
 /// The title and body of a PR: the given title, else the first commit's
 /// subject (the only commit's when there is one).
 fn pr_text(
@@ -3520,7 +3456,8 @@ struct RemoveCheckClone {
 }
 
 /// `owner/repo` from a GitHub remote URL (https or ssh), or `None`.
-pub(crate) fn github_owner_repo(url: &str) -> Option<String> {
+#[must_use]
+pub fn github_owner_repo(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches(".git");
     let tail = url
         .strip_prefix("https://github.com/")
@@ -3570,9 +3507,9 @@ mod tests {
         BranchState, GitHubRest, LandLocks, PrContext, PrStore, PrTokenSource, git,
         github_owner_repo, host_git, push_pinned, remote_branch,
     };
+    use crate::client_tests::test_sandbox::{TestTerminal, arm_hostile_config, markers};
     use crate::commit_signing::test_user::TestUser;
     use crate::db::{PrFilter, PrState};
-    use crate::repo_clone::test_sandbox::{TestTerminal, arm_hostile_config, markers};
     use crate::repo_clone::{CloneSandbox, SessionRepos};
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
     use hyper::body::Bytes;

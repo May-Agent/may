@@ -5,7 +5,7 @@ use std::future::Future;
 use aither_core::llm::{ApprovalKind, ApprovalRequest};
 use aither_sandbox::{ScriptCheck, ScriptDecision, ScriptPolicy, ShellSessionRegistry};
 
-use crate::agent::permission::SSH_KIND;
+use may_protocol::layout_consts::SSH_KIND;
 
 /// Asks before the first script runs on a server the session's user has not
 /// approved: the request carries the server's target as its reason, which the

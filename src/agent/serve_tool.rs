@@ -114,6 +114,7 @@ fn script(command: &[String], port: Option<u16>) -> String {
     )
 }
 
+/// The `serve` tool: serving files from the session's shell.
 #[derive(Clone)]
 pub struct ServeTool {
     shell: Option<SessionShell>,
@@ -121,7 +122,16 @@ pub struct ServeTool {
     tunnel: Option<TunnelBroker>,
 }
 
+impl std::fmt::Debug for ServeTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeTool")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ServeTool {
+    /// A serve tool for `session_id` on `shell`, tunneling via `tunnel`.
     #[must_use]
     pub const fn new(
         shell: Option<SessionShell>,

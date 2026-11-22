@@ -41,9 +41,10 @@ pub struct RepoContext {
     pub host_paths: bool,
 }
 
-/// Repository trust and session clones. Each acts on the repository the
-/// command runs in, or the launch repository when it runs inside the
-/// session directory:
+/// Repository trust and session clones.
+///
+/// Each acts on the repository the command runs in, or the launch
+/// repository when it runs inside the session directory:
 /// `repo trust` shows its level, `repo trust set <full|prs-only|local-branch|local>`
 /// persists the decision, and `repo clone [--path <dir>]` gives the session
 /// its own clone of it (or names the one it has), where the work is edited,
@@ -367,7 +368,7 @@ impl Tool for SubagentRepoTool {
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workspace::WorkspaceConfig;
 

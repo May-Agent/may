@@ -178,7 +178,7 @@ impl AgentDirectory {
     ///
     /// # Errors
     /// [`AgentLinkError`] on storage failure or an unreadable `tasks.md`.
-    pub(crate) async fn agent_tasks(&self) -> Result<Vec<AgentTasks>, AgentLinkError> {
+    pub async fn agent_tasks(&self) -> Result<Vec<AgentTasks>, AgentLinkError> {
         let mut live = Vec::new();
         for session in self.runtime_service.db().list_sessions().await? {
             if session.archived {
@@ -224,7 +224,8 @@ impl AgentDirectory {
     }
 
     /// The daemon's chat database.
-    pub(crate) fn db(&self) -> crate::db::ChatDb {
+    #[must_use]
+    pub fn db(&self) -> crate::db::ChatDb {
         self.runtime_service.db()
     }
 
@@ -234,11 +235,10 @@ impl AgentDirectory {
     }
 
     /// Store `text` in the queue of `session_id` as a steer and wake it.
-    pub(crate) async fn deliver(
-        &self,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), AgentLinkError> {
+    ///
+    /// # Errors
+    /// Fails when the text cannot be parsed or queued.
+    pub async fn deliver(&self, session_id: &str, text: String) -> Result<(), AgentLinkError> {
         let message = PendingUserMessage {
             id: None,
             state: PendingMessageState::default(),
@@ -259,15 +259,17 @@ impl AgentDirectory {
 
 /// A live agent with its session's live `tasks.md`.
 #[derive(Debug, Clone)]
-pub(crate) struct AgentTasks {
-    pub(crate) status: AgentStatus,
+pub struct AgentTasks {
+    /// The agent's status snapshot.
+    pub status: AgentStatus,
     /// The repository the session is bound to, if it is.
-    pub(crate) binding: Option<crate::session::RepoBinding>,
+    pub binding: Option<crate::session::RepoBinding>,
     /// The session's `workspace.toml`.
-    pub(crate) workspace_config: PathBuf,
-    pub(crate) tasks_path: PathBuf,
+    pub workspace_config: PathBuf,
+    /// The session's `tasks.md`.
+    pub tasks_path: PathBuf,
     /// Contents of `tasks.md`; `None` while the file is absent.
-    pub(crate) tasks: Option<String>,
+    pub tasks: Option<String>,
 }
 
 async fn status_name(
@@ -356,12 +358,14 @@ const FRAMING_TAGS: [&str; 4] = [
     "task-message",
 ];
 
-/// Text written by another agent. Displaying it turns the `<` of any opening
+/// Text written by another agent, escaped for display.
+///
+/// Displaying it turns the `<` of any opening
 /// or closing `system-reminder` or `agent-message` tag into `&lt;`, so it can
 /// neither close its own block nor open a harness one; all other text,
 /// code included, is verbatim.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UntrustedText<'a>(pub(crate) &'a str);
+pub struct UntrustedText<'a>(pub &'a str);
 
 impl std::fmt::Display for UntrustedText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -383,7 +387,7 @@ impl std::fmt::Display for UntrustedText<'_> {
 
 /// A session name rendered safe inside a double-quoted attribute.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AttributeText<'a>(pub(crate) &'a str);
+pub struct AttributeText<'a>(pub &'a str);
 
 impl std::fmt::Display for AttributeText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -583,10 +587,15 @@ fn symlink_target_escapes_lexically(target: &Path) -> bool {
         })
 }
 
-/// The host file behind a path as the session's terminal spells it. Both local
-/// and container roots are canonicalized on the host and every path component
-/// is checked so symlinks inside the workspace cannot escape to host files.
-pub(crate) fn resolve_prompt_path(
+/// The host file behind a path as the session's terminal spells it.
+///
+/// Both local and container roots are canonicalized on the host and every
+/// path component is checked so symlinks inside the workspace cannot escape
+/// to host files.
+///
+/// # Errors
+/// Fails when the path cannot be resolved inside the sandbox.
+pub fn resolve_prompt_path(
     sandbox_dir: &Path,
     mount: Option<&aither_sandbox::MountRoot>,
     prompt_file: &str,
@@ -673,7 +682,10 @@ pub(crate) fn resolve_prompt_path(
 }
 
 /// Async counterpart of [`resolve_prompt_path`] using non-blocking filesystem metadata.
-pub(crate) async fn resolve_prompt_path_async(
+///
+/// # Errors
+/// Fails when the path cannot be resolved inside the sandbox.
+pub async fn resolve_prompt_path_async(
     sandbox_dir: &Path,
     mount: Option<&aither_sandbox::MountRoot>,
     prompt_file: &str,

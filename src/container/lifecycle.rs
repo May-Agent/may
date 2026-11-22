@@ -1,5 +1,6 @@
 //! Container lifecycle management: create, start, stop, remove, auto-stop.
 
+pub use may_protocol::layout_consts::CONTAINER_WORKSPACE;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -17,11 +18,6 @@ use std::time::Instant;
 
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
-
-/// Where a container's host workspace directory is bind-mounted, and the
-/// working directory of its commands. Every host-to-container workspace path
-/// derives from this one definition.
-pub const CONTAINER_WORKSPACE: &str = "/workspace";
 
 /// The workspace mount of a container session.
 ///

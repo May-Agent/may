@@ -764,7 +764,9 @@ fn create_headless_vision() -> Result<Vision, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{make_photo_png, render_multilingual_text_png};
+    use crate::test_support::make_photo_png;
+    #[cfg(all(feature = "vision-ocr", target_os = "macos"))]
+    use crate::test_support::render_multilingual_text_png;
 
     #[test]
     fn density_classifier_separates_documents_from_incidental_signs() {

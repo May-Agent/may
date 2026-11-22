@@ -72,7 +72,7 @@ impl CallInterpreters {
 
 /// What a May agent decides at the loop's control points.
 #[derive(Debug, Clone)]
-pub(super) struct MayHooks {
+pub struct MayHooks {
     /// The session's persisted runtime, where a waiting steer message shows.
     pub(super) runtime: Option<Arc<SessionRuntimeService>>,
     pub(super) session_id: SessionId,
@@ -245,8 +245,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+    use crate::client_tests::test_sandbox::TestTerminal;
     use crate::ipc::RecordedCallImage;
-    use crate::repo_clone::test_sandbox::TestTerminal;
 
     #[derive(Debug)]
     struct StubErr;

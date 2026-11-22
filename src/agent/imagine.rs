@@ -41,12 +41,15 @@ pub struct ImagineArgs {
     pub size: String,
 }
 
-#[derive(Clone)]
+/// The `imagine` tool: image generation into the session's artifacts.
+#[derive(Clone, Debug)]
 pub struct ImagineTool {
-    pub(crate) generator: Option<ImageGeneratorConfig>,
-    pub(crate) artifacts_dir: PathBuf,
+    /// The image generator the session resolved.
+    pub generator: Option<ImageGeneratorConfig>,
+    /// The directory generated images land in.
+    pub artifacts_dir: PathBuf,
     /// The session's pool of model-facing ids, which names each image.
-    pub(crate) ids: aither_core::AnyIdAllocator,
+    pub ids: aither_core::AnyIdAllocator,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -193,6 +196,8 @@ fn build_image_provider(config: &ImageGeneratorConfig) -> Result<CloudProvider, 
     Ok(provider)
 }
 
+/// The image-generator config `may_config` resolves, when one is set.
+#[must_use]
 pub fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGeneratorConfig> {
     let selector = may_config
         .default_model_for_tier(crate::config::ModelTier::ImageGeneration)?

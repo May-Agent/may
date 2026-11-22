@@ -11,6 +11,8 @@
 //! [`pasted_text`]) and the pure setting types the config names:
 //! [`language`], [`host_load`], [`update`] and [`subagent_file`].
 
+/// Live agent settings derived from `MayConfig`.
+pub mod agent_settings;
 /// Persistent storage for OAuth credentials.
 pub mod auth_store;
 /// The managed bash's outcome rendering and secret injection.
@@ -36,6 +38,8 @@ pub mod openrouter;
 /// Large pasted text rendered for the model.
 pub mod pasted_text;
 /// Keychain access, the names index and secret redaction.
+pub mod repo_kind;
+/// The stored secrets, keyed by their scope.
 pub mod secrets;
 /// Subagent definitions and the names that resolve them.
 pub mod subagent_file;

@@ -15,8 +15,9 @@ use tokio::sync::broadcast::{Receiver, error::TryRecvError};
 
 use super::state::{AskUserApprover, DaemonState, WorkspaceApprover};
 use crate::agent::ask_user_tool::{AskUserArgs as ToolArgs, AskUserTool};
+use crate::agent::permission::OnTimeout;
 use crate::agent::permission::UNSANDBOXED_KIND;
-use crate::agent::{OnTimeout, PermissionApprover, PermissionRequestMode};
+use crate::agent::{PermissionApprover, PermissionRequestMode};
 use crate::config::MayConfig;
 use crate::db::ChatDb;
 use crate::session::{SessionRuntimeService, UserAsk, UserWait};

@@ -3,119 +3,29 @@
 //! session's prompt-cache misses by cause.
 
 use super::cache_miss::CacheMissCause;
-use super::wall_clock::{Interval, IntervalSet, WallClockSplit};
 use crate::db::SessionIntervals;
 use crate::db::entity::{cache_misses, request_logs};
+use may_protocol::cache_miss::{CacheMissCauseRow, CacheMissRow};
+use may_protocol::session_usage::{ModelUsageRow, SessionUsageReport};
+use may_protocol::wall_clock::{Interval, IntervalSet, WallClockSplit};
 
 /// How many of the newest cache misses `/usage` lists one by one.
 const RECENT_CACHE_MISSES: usize = 10;
 
-/// One model's aggregated usage inside a session.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelUsageRow {
-    /// Model id as the provider reported it.
-    pub model: String,
-    /// Requests made to the model.
-    pub requests: u64,
-    /// Input tokens, cached ones included.
-    pub prompt_tokens: u64,
-    /// Completion tokens.
-    pub completion_tokens: u64,
-    /// Input tokens served from the provider cache.
-    pub cache_read_tokens: u64,
-    /// Tokens written to the provider cache.
-    pub cache_write_tokens: u64,
-    /// Provider wall time across the requests, milliseconds.
-    pub api_ms: u64,
-    /// Share of input tokens served from cache.
-    pub cache_hit_rate: f64,
-    /// Requests that read less from the prompt cache than the model's
-    /// previous request had cached.
-    pub cache_misses: u64,
-    /// Cached tokens those requests did not read.
-    pub cache_miss_tokens: u64,
-    /// Cost in USD when the model's pricing is known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<f64>,
-    /// How many of `requests` only refreshed the prompt cache while a
-    /// background command ran; their cost is part of the row's totals.
-    #[serde(default)]
-    pub keep_warm_requests: u64,
-}
-
-/// Aggregated provider usage of one session, answer of `/usage`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionUsageReport {
-    /// Session the report covers.
-    pub session_id: String,
-    /// Sum of provider request wall times, milliseconds.
-    pub api_ms: u64,
-    /// Session age, milliseconds since it was created.
-    pub wall_ms: u64,
-    /// Where the wall clock went; its parts sum to `wall_ms`.
-    pub split: WallClockSplit,
-    /// Total known cost in USD; `None` when no model's pricing is known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_cost_usd: Option<f64>,
-    /// Per-model breakdown, most input first.
-    pub models: Vec<ModelUsageRow>,
-    /// Cache misses by cause, most missed tokens first.
-    pub cache_miss_causes: Vec<CacheMissCauseRow>,
-    /// The newest cache misses, newest first.
-    pub recent_cache_misses: Vec<CacheMissRow>,
-}
-
-/// The cache misses of one cause inside a session.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheMissCauseRow {
-    /// Why those requests missed.
-    pub cause: CacheMissCause,
-    /// How many requests missed for it.
-    pub misses: u64,
-    /// Cached tokens they did not read.
-    pub missed_tokens: u64,
-}
-
-/// One recorded cache miss.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheMissRow {
-    /// When the request's usage arrived (ISO 8601).
-    pub timestamp: String,
-    /// Model the request targeted.
-    pub model: String,
-    /// Why it missed.
-    pub cause: CacheMissCause,
-    /// Cached tokens it did not read.
-    pub missed_tokens: u64,
-    /// Time since the previous request on its route, milliseconds.
-    pub gap_ms: u64,
-    /// Kind of the first prefix block it changed: `tools` or a message role.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diverged_kind: Option<String>,
-    /// Message index of that block.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diverged_index: Option<u64>,
-}
-
-impl CacheMissRow {
-    fn from_model(row: &cache_misses::Model) -> Self {
-        Self {
-            timestamp: row.timestamp.clone(),
-            model: row.model.clone(),
-            cause: stored_cause(row),
-            missed_tokens: row.missed_tokens.max(0).cast_unsigned(),
-            gap_ms: row.gap_ms.max(0).cast_unsigned(),
-            diverged_kind: row.diverged_kind.clone(),
-            diverged_index: row.diverged_index.map(|index| index.max(0).cast_unsigned()),
-        }
+/// A stored miss's cause; only May writes the column.
+/// The row form a stored `cache_misses` row reports.
+fn cache_miss_row_from(row: &cache_misses::Model) -> CacheMissRow {
+    CacheMissRow {
+        timestamp: row.timestamp.clone(),
+        model: row.model.clone(),
+        cause: stored_cause(row),
+        missed_tokens: row.missed_tokens.max(0).cast_unsigned(),
+        gap_ms: row.gap_ms.max(0).cast_unsigned(),
+        diverged_kind: row.diverged_kind.clone(),
+        diverged_index: row.diverged_index.map(|index| index.max(0).cast_unsigned()),
     }
 }
 
-/// A stored miss's cause; only May writes the column.
 fn stored_cause(row: &cache_misses::Model) -> CacheMissCause {
     row.cause
         .parse()
@@ -200,7 +110,7 @@ pub fn assemble_usage_report(
         .iter()
         .rev()
         .take(RECENT_CACHE_MISSES)
-        .map(CacheMissRow::from_model)
+        .map(cache_miss_row_from)
         .collect();
 
     let mut api_ms = 0;

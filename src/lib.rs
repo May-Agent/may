@@ -14,14 +14,17 @@ pub use may_config::bash;
 /// Managed browser sessions backing the browser tool.
 pub mod browser_service;
 /// Bundled resources shipped with the binary.
-pub mod bundle;
+pub use may_client::bundle;
+/// Client of the May daemon over its unix socket.
+pub use may_client::client;
+/// The `search` tool: code search over a session's worktrees.
+pub use may_client::code_search;
+/// CI durations: the jobs, steps and tests of a session PR's checks.
+pub use may_git_forge::ci;
 /// `ChatGPT` subscription OAuth flow.
 pub use may_harness::chatgpt;
 /// Provider prompt-cache lifetime.
 pub use may_protocol::cache_lifetime;
-pub mod ci;
-/// Client of the May daemon over its unix socket.
-pub mod client;
 /// Cloud machines: providers, their catalogs and machine lifecycles.
 pub mod cloud;
 /// May's rules on what a terminal script may run.
@@ -41,13 +44,13 @@ pub use may_harness::copilot;
 pub use may_harness::crash_signal;
 /// The resident daemon that runs every agent loop and serves the UIs.
 pub mod daemon;
-/// SQLite persistence for sessions, messages, and app state.
-pub mod db;
 /// Forge coordinates and per-host authentication (GitHub, GitLab).
 pub use may_config::forge;
 pub use may_config::fs_utils;
 /// The one way git runs on the host.
 pub use may_config::host_git;
+/// SQLite persistence for sessions, messages, and app state.
+pub use may_db as db;
 /// xAI Grok subscription OAuth flow.
 pub use may_harness::grok;
 /// Live decode-speed measurement for streamed model output.
@@ -58,6 +61,10 @@ pub use may_protocol::id;
 pub mod issue;
 /// The machine-wide jobserver token pool shared by every terminal.
 pub use may_config::jobserver;
+pub use may_protocol::daemon_api::{
+    ASK_USER_NOT_OPEN, DEFAULT_PORT, encode_path_segment, session_path,
+};
+pub use may_protocol::layout_consts::{CONTAINER_WORKSPACE, SSH_KIND};
 pub use may_protocol::live_response;
 /// Location lookup for location-aware profiles.
 pub use may_protocol::location;
@@ -68,15 +75,15 @@ mod managed_environment_tests;
 pub use may_harness::mcp;
 /// Profile memory extraction and injection.
 pub mod memory;
+pub use aither_sandbox::network_policy;
+/// Signing of the commits agents make in their sandbox.
+pub use may_config::commit_signing;
 /// Model-facing ids: session names and each session's pool of words.
 pub use may_protocol::model_ids;
 /// Model selection and filtering helpers.
 pub use may_protocol::model_selector;
 /// Model listing and metadata.
-pub mod models;
-pub use aither_sandbox::network_policy;
-/// Signing of the commits agents make in their sandbox.
-pub use may_config::commit_signing;
+pub use may_providers as models;
 /// Web-push notification delivery and mailbox.
 pub mod notification;
 /// `OpenRouter` OAuth login flow.
@@ -92,31 +99,31 @@ pub mod profile;
 /// `@`-mention extraction and prompt text building.
 pub mod prompt_mentions;
 
-pub use may_protocol::quota;
 /// Per-session repository clones inside the session sandbox.
-pub mod repo_clone;
+pub use may_client::repo_clone;
+pub use may_protocol::quota;
 pub mod repo_gate;
 pub use may_harness::repo_preflight;
 /// repo-search daemon: code, session and issue search.
-pub mod repo_search;
+pub use may_repo_search as repo_search;
 /// `/import-claude` and `/import-codex`: another agent's global rules and
 /// skills brought into May.
 pub mod rules_import;
 /// Scheduled task execution.
 pub mod scheduler;
 /// Repository trust: the first-contact decision, resolved per repo.
-pub mod trust;
+pub use may_client::trust;
 
+/// Session model, history, and on-disk layout.
+pub use may_client::session;
 pub use may_config::secrets;
 /// What May's agents do around the loop.
 pub use may_harness::harness;
 /// May's IPC command bridge.
 pub use may_harness::ipc;
-/// Session model, history, and on-disk layout.
-pub mod session;
 pub mod shell;
 /// Agent skill discovery and management.
-pub mod skill;
+pub use may_client::skill;
 pub mod sleep;
 /// Startup validation of configuration files.
 pub mod startup;
@@ -136,24 +143,24 @@ pub mod terminal_commands;
 pub mod terminal_permission_handler;
 /// Tool request dispatch to session handlers.
 pub mod tool_dispatch;
+/// Event bus publishing UI-facing state changes.
+pub use may_client::ui_event_bus;
+/// Self-update from CI artifacts (dev builds) or GitHub releases.
+pub use may_harness::update;
 /// Miscellaneous tool helpers.
 pub use may_tool_dist as tools;
 /// Terminal user interface.
-pub mod tui;
-/// Event bus publishing UI-facing state changes.
-pub mod ui_event_bus;
-/// Self-update from CI artifacts (dev builds) or GitHub releases.
-pub use may_harness::update;
+pub use may_tui as tui;
 
+pub use harness::ask_user;
+pub use harness::workspace_request;
+/// HTTP/SSE server backing the web UI.
+/// Workspace request handling.
+pub use may_client::workspace;
 /// The encoded video pipeline a stream carries.
 pub use may_media::video;
 /// On-device OCR and conditional downscaling for text-dense images.
 pub use may_media::vision_ocr;
-/// HTTP/SSE server backing the web UI.
-/// Workspace request handling.
-pub mod workspace;
-pub use harness::ask_user;
-pub use harness::workspace_request;
 /// XML block serialization for prompt/context payloads.
 pub use may_protocol::xml;
 
@@ -276,3 +283,10 @@ mod test_support {
         }
     }
 }
+
+#[cfg(test)]
+mod client_tests;
+#[cfg(test)]
+mod db_tests;
+#[cfg(test)]
+mod open_questions_tests;

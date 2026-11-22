@@ -174,7 +174,7 @@ impl std::fmt::Debug for RemoteAccessManager {
 }
 
 impl RemoteAccessManager {
-    pub(crate) fn new(ui_event_bus: UiEventBus) -> Self {
+    pub fn new(ui_event_bus: UiEventBus) -> Self {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
         let (remote_listener_addr, remote_listener_addr_rx) = watch::channel(None);
@@ -202,37 +202,37 @@ impl RemoteAccessManager {
 
     /// Records the router of the public Funnel listener, which serves the
     /// webhook routes alone.
-    pub(crate) fn set_webhook_router(&self, router: Arc<skyzen::routing::Router>) {
+    pub fn set_webhook_router(&self, router: Arc<skyzen::routing::Router>) {
         self.webhook_router.send_replace(Some(router));
     }
 
     /// The identity source the remote listener's Tailcheck layer accepts.
-    pub(crate) fn tailscale_identity(&self) -> super::auth::TailscaleServeIdentitySource {
+    pub fn tailscale_identity(&self) -> super::auth::TailscaleServeIdentitySource {
         self.tailscale_identity.clone()
     }
 
     /// Records the remote listener's address; remote access forwards to its
     /// port on loopback.
-    pub(crate) fn set_remote_listener_addr(&self, addr: SocketAddr) {
+    pub fn set_remote_listener_addr(&self, addr: SocketAddr) {
         self.remote_listener_addr.send_replace(Some(addr));
     }
 
     /// Records the address the local listener is actually bound to, or that
     /// no local listener serves.
-    pub(crate) fn set_local_listener_addr(&self, addr: Option<SocketAddr>) {
+    pub fn set_local_listener_addr(&self, addr: Option<SocketAddr>) {
         self.local_listener_addr.send_replace(addr);
     }
 
     /// The local listener's bound address, once it listens.
-    pub(crate) fn local_listener_addr(&self) -> Option<SocketAddr> {
+    pub fn local_listener_addr(&self) -> Option<SocketAddr> {
         *self.local_listener_addr.borrow()
     }
 
-    pub(crate) fn snapshot(&self) -> RemoteAccessStatusResponse {
+    pub fn snapshot(&self) -> RemoteAccessStatusResponse {
         self.status_rx.borrow().clone()
     }
 
-    pub(crate) async fn sync(
+    pub async fn sync(
         &self,
         config: RemoteAccessConfig,
         has_local_profile: bool,
@@ -251,7 +251,7 @@ impl RemoteAccessManager {
             .map_err(|_| "remote access manager response dropped".to_string())?
     }
 
-    pub(crate) async fn stop(&self) -> Result<(), String> {
+    pub async fn stop(&self) -> Result<(), String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteAccessCommand::Stop {

@@ -32,7 +32,8 @@ use super::state::DaemonState;
 use super::types::{ArtifactEntry, SessionRuntimeResponse};
 use crate::client::background::SessionBackgroundSnapshot;
 use crate::session::CancelReason;
-use crate::tui::sidebar::IssueBrief;
+use may_protocol::issue_brief::IssueBrief;
+pub use may_protocol::session_change::*;
 
 /// How long a burst of change notices is held so one recompute serves it.
 const COALESCE: Duration = Duration::from_millis(50);
@@ -40,62 +41,8 @@ const COALESCE: Duration = Duration::from_millis(50);
 /// `Last-Event-ID`, the SSE reconnection header.
 const LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
 
-/// One piece of a session's state the stream diffs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionChange {
-    /// The persisted runtime summary.
-    Runtime,
-    /// Background jobs and subagent runs.
-    Background,
-    /// The `artifacts/` directory listing.
-    Artifacts,
-    /// Issues the session's tasks link.
-    Issues,
-    /// New `ci_findings` rows.
-    Warning,
-    /// The session's PRs, their states and live checks.
-    Prs,
-}
-
-impl SessionChange {
-    const ALL: [Self; 6] = [
-        Self::Runtime,
-        Self::Background,
-        Self::Artifacts,
-        Self::Issues,
-        Self::Warning,
-        Self::Prs,
-    ];
-
-    const fn bit(self) -> u8 {
-        1 << self as u8
-    }
-}
-
-/// A `publish_session_change` notice on the session-change channel.
-#[derive(Debug)]
-pub struct SessionChangeNotice {
-    pub(crate) session_id: String,
-    pub(crate) kind: SessionChange,
-}
-
-pub type SessionChangeSender = async_channel::Sender<SessionChangeNotice>;
+/// Receives the session-change notices the daemon publishes.
 pub type SessionChangeReceiver = async_channel::Receiver<SessionChangeNotice>;
-
-/// Queue `kind` for the session's diff publisher; a closed dispatcher
-/// drops it the way a dead bus drops a notification.
-pub fn notify_change(tx: &SessionChangeSender, session_id: &str, kind: SessionChange) {
-    let _ = tx.try_send(SessionChangeNotice {
-        session_id: session_id.to_string(),
-        kind,
-    });
-}
-
-/// The cursor of `GET /api/sessions/{id}` and every SSE `id` on this
-/// stream: `{epoch}.{index}`.
-pub fn format_cursor(epoch: u64, index: u64) -> String {
-    format!("{epoch}.{index}")
-}
 
 /// The frame index `raw` continues from, when it is a well-formed cursor
 /// of this daemon's epoch.

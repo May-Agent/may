@@ -9,10 +9,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::agent::publish_approval::PublishGate;
+use crate::issue::IssueTargets;
 use crate::issue::owner::{IssueOwner, IssueOwners, OwnerIndex};
 use crate::issue::provenance::{CallOrigin, IssueAction, IssueMarks, IssueProvenance};
 use crate::issue::search::{IssueHit, IssueSearch};
-use crate::issue::target::{IssueTargets, TargetStore};
+use crate::issue::target::TargetStore;
 use crate::issue::{GhCliTokenSource, GitHubTokenSource};
 use crate::issue::{
     IssueDetail, IssueError, IssueKind, IssueListState, IssueRelationKind, IssueState, IssueStore,
@@ -1080,7 +1081,7 @@ struct IssueCommentLine<'a> {
 
 /// Shared checks of the subagent's `issue` tool, run against each backend.
 #[cfg(test)]
-pub mod subagent_checks {
+pub(crate) mod subagent_checks {
     use aither_core::llm::ToolContext;
 
     use super::*;
@@ -1169,7 +1170,7 @@ pub mod subagent_checks {
 
 /// Shared checks of the provenance `issue` leaves, run against each backend.
 #[cfg(test)]
-pub mod provenance_checks {
+pub(crate) mod provenance_checks {
     use aither_core::llm::{AgentIdentity, CallIdentity, ToolCallId, ToolContext};
 
     use crate::db::{ChatDb, MessageMeta};

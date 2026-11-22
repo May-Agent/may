@@ -68,19 +68,29 @@ pub struct TaskCreateRequest {
     pub args: TaskArgs,
 }
 
+/// The script a task runs, by path or inline.
 #[derive(Debug, Clone)]
 pub struct TaskScriptSpec {
+    /// The script's path.
     pub script_path: Option<String>,
+    /// The script's text.
     pub script_inline: Option<String>,
 }
 
+/// A task-create request normalized into the runtime's shape.
 #[derive(Debug, Clone)]
 pub struct NormalizedTaskCreateRequest {
+    /// The session creating the task.
     pub session_id: String,
+    /// The task's name.
     pub name: String,
+    /// What runs the task.
     pub trigger: NormalizedTaskTrigger,
+    /// The task's script.
     pub script: TaskScriptSpec,
+    /// `true` when the task needs the network.
     pub needs_network: bool,
+    /// The task's timeout in seconds.
     pub timeout_secs: u32,
 }
 
@@ -194,6 +204,7 @@ fn normalize_script(args: &TaskArgs) -> Result<TaskScriptSpec, String> {
     }
 }
 
+/// The `task` tool: the session's scheduled tasks.
 #[derive(Debug, Clone)]
 pub struct TaskTool {
     session_id: String,
@@ -202,6 +213,7 @@ pub struct TaskTool {
 }
 
 impl TaskTool {
+    /// A task tool for `session_id` on `runtime`, queueing through `broker`.
     #[must_use]
     pub const fn new(
         session_id: String,

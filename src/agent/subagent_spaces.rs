@@ -223,10 +223,10 @@ async fn resolve(path: &Path) -> Result<PathBuf, SubagentSpaceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_tests::test_sandbox::{TestTerminal, arm_hostile_config, markers};
     use crate::db::ChatDb;
     use crate::host_git::HostGit;
     use crate::repo_clone::CloneSandbox;
-    use crate::repo_clone::test_sandbox::{TestTerminal, arm_hostile_config, markers};
 
     fn git(dir: &Path, args: &[&str]) -> String {
         HostGit::inherit().output(Some(dir), args).unwrap()

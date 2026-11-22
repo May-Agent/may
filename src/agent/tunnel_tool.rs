@@ -80,13 +80,23 @@ struct TunnelOpenText {
     local_url: String,
 }
 
+/// The `tunnel` tool: exposing the session's serves publicly.
 #[derive(Clone)]
 pub struct TunnelTool {
     broker: Option<TunnelBroker>,
     session_id: String,
 }
 
+impl std::fmt::Debug for TunnelTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelTool")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TunnelTool {
+    /// A tunnel tool for `session_id`, queueing through `broker`.
     #[must_use]
     pub const fn new(session_id: String, broker: Option<TunnelBroker>) -> Self {
         Self { broker, session_id }

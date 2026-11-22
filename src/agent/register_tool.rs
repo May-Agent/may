@@ -15,14 +15,19 @@ pub struct RegisterPathArgs {
     pub path: String,
 }
 
+/// A request to register `path` for `session_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
+    /// The session registering the path.
     pub session_id: String,
+    /// The path to register.
     pub path: String,
 }
 
+/// What a handled register request reports back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResult {
+    /// The paths that were registered.
     pub registered: Vec<String>,
 }
 
@@ -33,8 +38,9 @@ struct RegisterDoneText<'a> {
     registered: &'a [String],
 }
 
-/// Unified broker/queue types for register commands.
+/// The broker a register command's requests go through.
 pub type RegisterBroker = ToolRequestBroker<RegisterRequest, Result<RegisterResult, String>>;
+/// The queue the agent reads register requests from.
 pub type RegisterQueue = ToolRequestQueue<RegisterRequest, Result<RegisterResult, String>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +53,7 @@ enum RegisterToolError {
     Rejected(String),
 }
 
+/// The broker/queue pair the `register` commands use.
 #[must_use]
 pub fn skills_channel() -> (RegisterBroker, RegisterQueue) {
     tool_request_channel()
@@ -54,7 +61,9 @@ pub fn skills_channel() -> (RegisterBroker, RegisterQueue) {
 
 /// Marker trait for register tool variants.
 pub trait RegisterKind: Send + Sync + Clone + std::fmt::Debug + 'static {
+    /// The tool's wire name.
     const TOOL_NAME: &'static str;
+    /// The tool's description the model reads.
     const DESCRIPTION: &'static str;
 }
 
@@ -76,6 +85,7 @@ pub struct RegisterTool<K: RegisterKind> {
 }
 
 impl<K: RegisterKind> RegisterTool<K> {
+    /// A register tool of kind `K` for `session_id`, queueing through `broker`.
     #[must_use]
     pub const fn new(session_id: String, broker: Option<RegisterBroker>) -> Self {
         Self {

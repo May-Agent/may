@@ -155,10 +155,10 @@ pub(super) async fn linked_issue_briefs(
     state: &DaemonState,
     session_id: &str,
     paths: &crate::session::SessionPaths,
-) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
+) -> SkyResult<Vec<may_protocol::issue_brief::IssueBrief>> {
     let content = paths.tasks_content().await.map_err(internal_error)?;
     let numbers = content.as_deref().map_or_default(|content| {
-        crate::tui::sidebar::linked_issues(&crate::task_rows::task_rows(content))
+        may_protocol::issue_brief::linked_issues(&crate::task_rows::task_rows(content))
     });
     let mut briefs = issue_briefs(state, session_id, numbers).await?;
     // A failed lookup says nothing new; the client keeps what it shows.
@@ -172,7 +172,7 @@ async fn issue_briefs(
     state: &DaemonState,
     id: &str,
     numbers: Vec<i64>,
-) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
+) -> SkyResult<Vec<may_protocol::issue_brief::IssueBrief>> {
     use crate::issue::IssueStore as _;
     let id = id.to_string();
     let db = state.db();
@@ -208,7 +208,7 @@ async fn issue_briefs(
     let mut briefs = Vec::with_capacity(numbers.len());
     for number in numbers {
         let brief = match issue_store.get(number).await {
-            Ok(detail) => crate::tui::sidebar::IssueBrief {
+            Ok(detail) => may_protocol::issue_brief::IssueBrief {
                 number,
                 title: Some(detail.title),
                 closed: matches!(detail.state, crate::issue::IssueState::Closed),
@@ -225,9 +225,9 @@ async fn issue_briefs(
 pub(super) fn unresolved_issue_brief(
     number: i64,
     error: &dyn std::fmt::Display,
-) -> crate::tui::sidebar::IssueBrief {
+) -> may_protocol::issue_brief::IssueBrief {
     tracing::warn!(%error, number, "issue lookup failed");
-    crate::tui::sidebar::IssueBrief {
+    may_protocol::issue_brief::IssueBrief {
         number,
         title: None,
         closed: false,
@@ -252,7 +252,7 @@ pub(super) async fn get_session(
         .map_err(internal_error)?
         .ok_or_else(|| session_not_found_error(&id))?;
 
-    let mut summary = crate::session::SessionSummary::from_db_model(db_session);
+    let mut summary = crate::session::SessionSummary::from(db_session);
 
     summary.runtime = db
         .get_session_runtime(&id)
@@ -1113,7 +1113,7 @@ pub(super) async fn patch_session(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| session_not_found_error(&id))?;
-    let mut summary = crate::session::SessionSummary::from_db_model(db_session);
+    let mut summary = crate::session::SessionSummary::from(db_session);
     summary.runtime = db
         .get_session_runtime(&id)
         .await

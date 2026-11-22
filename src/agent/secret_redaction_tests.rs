@@ -28,9 +28,9 @@ use tokio::net::TcpListener;
 
 use super::hooks::MayHooks;
 use super::provider::{ProviderLlm, RedactedModel};
+use crate::client_tests::test_sandbox::TestTerminal;
 use crate::command_policy::RefusedReads;
 use crate::harness::compact_tool::CompactSignal;
-use crate::repo_clone::test_sandbox::TestTerminal;
 use crate::secrets::{SecretRedactor, SecretStore};
 use crate::session::SessionId;
 

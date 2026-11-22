@@ -3,11 +3,11 @@
 //! items. Like `/btw`, it runs outside the conversation: nothing enters the
 //! session's history or its next request.
 
+use may_protocol::progress::ProgressReport;
 use std::sync::Arc;
 use std::time::Duration;
 
 use askama::Template;
-use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
 use skyzen::utils::Json;
 
@@ -21,41 +21,6 @@ const ITEM_MAX_CHARS: usize = 300;
 
 /// The remaining work of a session. Doubles as the schema the side model
 /// fills in and as the body of the `/progress` response.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, skyzen::ToSchema,
-)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProgressReport {
-    /// How many items of the session's work are finished.
-    pub done: u32,
-    /// How many items the session's work has in all, finished or not. At
-    /// least `done`.
-    pub total: u32,
-    /// Unfinished items whose work is complete and only waits to land.
-    pub waiting_to_land: Vec<String>,
-    /// Unfinished items blocked on something other than the user.
-    pub waiting_on_other: Vec<String>,
-    /// Unfinished items nobody has started.
-    pub not_started: Vec<String>,
-    /// Unfinished items blocked on an answer or action from the user.
-    pub waiting_on_user: Vec<String>,
-}
-
-impl super::sidecar::AuxOutput for ProgressReport {
-    fn texts(&self) -> Vec<(&str, usize)> {
-        [
-            &self.waiting_to_land,
-            &self.waiting_on_other,
-            &self.not_started,
-            &self.waiting_on_user,
-        ]
-        .into_iter()
-        .flatten()
-        .map(|item| (item.as_str(), ITEM_MAX_CHARS))
-        .collect()
-    }
-}
-
 /// The progress instruction, written in the session's communication
 /// language when one is set.
 #[derive(Template)]
@@ -126,8 +91,24 @@ async fn report(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Progres
         .map_err(internal_error_message)
 }
 
+impl super::sidecar::AuxOutput for ProgressReport {
+    fn texts(&self) -> Vec<(&str, usize)> {
+        [
+            &self.waiting_to_land,
+            &self.waiting_on_other,
+            &self.not_started,
+            &self.waiting_on_user,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|item| (item.as_str(), ITEM_MAX_CHARS))
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::agent::idle_compaction_tests::{SESSION_MODEL, StubModel};
 

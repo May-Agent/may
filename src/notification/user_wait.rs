@@ -2,28 +2,12 @@
 
 use askama::Template;
 
-use crate::agent::PermissionRequestMode;
 use crate::session::{UserAsk, UserWait};
+use may_protocol::permission::PermissionRequestMode;
 
 /// Longest a command, headline, path or question runs in a notification
 /// body, in characters.
 const BRIEF_MAX_CHARS: usize = 160;
-
-/// A notification that a session waits on the user: what push delivers to
-/// browsers and what the daemon streams to attached terminals.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserNotification {
-    /// Session that waits.
-    pub session_id: String,
-    /// Profile of that session, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    /// The session's name.
-    pub title: String,
-    /// What the user is asked.
-    pub body: String,
-}
 
 #[derive(Template)]
 #[template(path = "user_wait_title.txt", escape = "none")]
@@ -36,32 +20,6 @@ struct TitleText<'a> {
 #[template(path = "user_wait_body.txt", escape = "none")]
 struct BodyText<'a> {
     ask: &'a UserAsk,
-}
-
-impl UserNotification {
-    /// Present `wait` for the session named `title` under `profile_id`.
-    ///
-    /// # Panics
-    /// Panics if a template fails to render, which its typed inputs rule out.
-    #[must_use]
-    pub fn new(wait: &UserWait, title: Option<&str>, profile_id: Option<String>) -> Self {
-        let title = title.map(str::trim).filter(|title| !title.is_empty());
-        Self {
-            title: TitleText {
-                title,
-                session_id: &wait.session_id,
-            }
-            .render()
-            .expect("user wait title template must render"),
-            body: BodyText {
-                ask: &brief(&wait.ask),
-            }
-            .render()
-            .expect("user wait body template must render"),
-            session_id: wait.session_id.clone(),
-            profile_id,
-        }
-    }
 }
 
 /// `ask` with every text cut to its first line and [`BRIEF_MAX_CHARS`].
@@ -91,6 +49,31 @@ fn shorten(text: &str) -> String {
     }
 }
 
+/// Build a [`UserNotification`] for `wait`.
+#[must_use]
+pub fn user_notification_new(
+    wait: &UserWait,
+    title: Option<&str>,
+    profile_id: Option<String>,
+) -> may_protocol::notification::UserNotification {
+    let title = title.map(str::trim).filter(|title| !title.is_empty());
+    may_protocol::notification::UserNotification {
+        session_id: wait.session_id.clone(),
+        profile_id,
+        title: TitleText {
+            title,
+            session_id: &wait.session_id,
+        }
+        .render()
+        .expect("user wait title template must render"),
+        body: BodyText {
+            ask: &brief(&wait.ask),
+        }
+        .render()
+        .expect("user wait body template must render"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,7 +87,7 @@ mod tests {
 
     #[test]
     fn a_command_approval_names_the_session_and_the_command() {
-        let notification = UserNotification::new(
+        let notification = user_notification_new(
             &wait(UserAsk::permission(
                 PermissionRequestMode::Unsafe,
                 "rm -rf build\nls",
@@ -119,7 +102,7 @@ mod tests {
 
     #[test]
     fn an_unnamed_session_is_named_by_its_id() {
-        let notification = UserNotification::new(
+        let notification = user_notification_new(
             &wait(UserAsk::Workspace {
                 path: "/srv/data".to_owned(),
             }),
@@ -132,7 +115,7 @@ mod tests {
 
     #[test]
     fn a_publication_approval_shows_its_headline() {
-        let notification = UserNotification::new(
+        let notification = user_notification_new(
             &wait(UserAsk::permission(
                 PermissionRequestMode::Publish,
                 "bug issue on May-Agent/may\n\nTitle: Crash\n\nbody",
@@ -150,7 +133,7 @@ mod tests {
     fn a_long_cjk_question_is_cut_on_a_character_boundary() {
         let text = "确认".repeat(100);
         let notification =
-            UserNotification::new(&wait(UserAsk::Question { text }), Some("調査"), None);
+            user_notification_new(&wait(UserAsk::Question { text }), Some("調査"), None);
         assert_eq!(notification.body.chars().count(), BRIEF_MAX_CHARS + 3);
         assert!(notification.body.ends_with("..."));
     }

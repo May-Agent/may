@@ -17,9 +17,9 @@ path = "src/bin/may/main.rs"
 dist = true
 
 [workspace]
-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness"]
+members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
 # `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
-default-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness"]
+default-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
 
 [features]
 default = ["vision-ocr"]
@@ -44,6 +44,14 @@ may-config = { path = "config" }
 may-command-policy = { path = "command-policy" }
 # The media layer: screen capture, the virtual desktop, WebRTC video, OCR.
 may-media = { path = "media" }
+may-db = { path = "db" }
+may-providers = { path = "providers" }
+may-client = { path = "client" }
+may-tui = { path = "tui" }
+# The repo-search daemon client: code, session and issue search.
+may-repo-search = { path = "repo-search" }
+# The forge clients and check views behind `pr` and `ci`.
+may-git-forge = { path = "git-forge" }
 # The agent harness: IPC commands, working documents, OAuth helpers, update.
 may-harness = { path = "harness" }
 # The content-addressed container image references.
@@ -108,7 +116,6 @@ async-net = "2"
 async-channel = "2"
 strsim = { version = "0.11", default-features = false }
 blocking = "1"
-terminal-colorsaurus = { version = "1.0.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -152,19 +159,17 @@ getrandom = "0.4"
 # - pulldown-cmark: CommonMark AST parser for structured input (checklists,
 #   prompt @-mentions, tasks.md, etc.) where one-shot correctness matters
 #   more than streaming
-streamdown-parser = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # TUI
-ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
-crossterm = "0.28"
-ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
 unicode-segmentation = { version = "1.13", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 ahash = "0.8"
 
 # Clipboard, image, and browser
+ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
+crossterm = "0.28"
 arboard = "3"
 base64 = "0.22"
 open = "5"
@@ -190,7 +195,6 @@ utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 skyzen-services = { version = "0.3.1", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # File picker
-nucleo = "0.5"
 ignore = "0.4"
 
 # Logging
@@ -228,7 +232,6 @@ jsonc-parser = { version = "0.34", default-features = false, features = ["serde"
 
 dunce = "1.0.5"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
-linkify = { version = "0.11.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 clap_complete = { version = "4.6.11", default-features = false }
