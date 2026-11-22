@@ -86,10 +86,15 @@ UI_FEATURE_PACKAGES = frozenset({"may-agent", "may-daemon"})
 # drop it — `-p` cannot be combined with `--exclude`.
 LINUX_EXCLUDED = frozenset()
 
-# The frontend the `ui` feature embeds, and the one in-package file the
-# web-ui tests load outside that tree.
+# The frontend the `ui` feature embeds, and the in-package bridge file the
+# web-ui tests load outside that tree (both pre- and post-daemon extraction).
 WEB_UI_PREFIX = "web-ui/"
-WEB_UI_EXTRA = frozenset({"src/texts/artifact_runtime_bridge.js"})
+WEB_UI_EXTRA = frozenset(
+    {
+        "src/texts/artifact_runtime_bridge.js",
+        "daemon/src/texts/artifact_runtime_bridge.js",
+    }
+)
 
 # `may-hashline` is a separate workspace; nothing in this graph reaches it.
 HASHLINE_PREFIX = "hashline/"
