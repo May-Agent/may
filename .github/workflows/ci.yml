@@ -232,10 +232,14 @@ jobs:
   # parallelism it bought, and the two runners queued for the same scarce
   # macOS capacity. Baseline-tool verification rides this job on macOS the
   # way it does on Ubuntu.
+  #
+  # Pull requests skip it: macOS capacity is the scarcest thing CI has, and
+  # the merge queue runs the job on the tree that lands on main, so a
+  # macOS-only regression costs a queue retry rather than a bad merge.
   test-macos:
     name: test (macos-latest)
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 40
     permissions:
