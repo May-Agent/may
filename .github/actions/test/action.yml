@@ -70,30 +70,33 @@ runs:
     - name: Install nasm
       if: runner.os == 'Linux' && runner.arch == 'X64'
       uses: ./.github/actions/install-nasm
-    # Install nextest up front and build with `cargo nextest run --no-run` so
-    # the build step and the test step share the exact Cargo environment
-    # (`NEXTEST=1` and target selection); building with plain `cargo test
-    # --no-run` first caused nextest's invocation to invalidate fingerprints
-    # and recompile the workspace a second time (~14 min on macOS).
+    # Build and run in a single `cargo nextest` invocation so Cargo runs once
+    # per job (avoiding any cross-step fingerprint or workspace-tree churn).
+    # On a `push` to `main` whose test downloads hit, the merge queue already
+    # ran the suite, so `--no-run` only builds to seed `main`'s stow cache.
     - uses: taiki-e/install-action@nextest
-    - name: cargo build
+    - name: cargo nextest
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
-        cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
+        if [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.downloads.outputs.tools-hit }}" = "true" ]; then
+          cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
+        else
+          cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+        fi
     # Every run keeps the debug may it built, so a commit can be tested on
-    # another machine without building it there. It is packed as a tarball
-    # because artifacts drop the executable bit.
+    # another machine without building it there. Pack archives into runner.temp
+    # so nothing dirties the repository tree.
     - name: Pack the debug may
       if: inputs.upload-may == 'true'
       shell: bash
-      run: tar -czf may-debug.tar.gz -C target/debug may
+      run: tar -czf "${{ runner.temp }}/may-debug.tar.gz" -C target/debug may
     - name: Upload the debug may
       if: inputs.upload-may == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: may-debug.tar.gz
+        path: ${{ runner.temp }}/may-debug.tar.gz
         retention-days: 90
     - name: Pack the e2e test binary
       if: inputs.upload-e2e-bin == 'true'
@@ -109,28 +112,14 @@ runs:
             \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
         )"
         test -n "${path}"
-        tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
+        tar -czf "${{ runner.temp }}/e2e-test-bin.tar.gz" -C "$(dirname "$path")" "$(basename "$path")"
     - name: Upload the e2e test binary
       if: inputs.upload-e2e-bin == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: e2e-test-bin-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: e2e-test-bin.tar.gz
+        path: ${{ runner.temp }}/e2e-test-bin.tar.gz
         retention-days: 30
-    # The merge queue already tested the tree a push to main lands, so that
-    # push only builds, to seed main's caches; it still tests when the test
-    # downloads missed, since the tests are what fetch them.
-    #
-    # nextest runs every test of every binary in one pool, where `cargo test`
-    # runs the binaries one after another. May has no Rust doc-tests (its doc
-    # code blocks are text, bash, toml or `ignore`), so there is no
-    # `cargo test --doc` step.
-    - name: cargo nextest
-      if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
-      shell: bash
-      run: |
-        ulimit -n 65536 2>/dev/null || true
-        cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
     # Invoke the already-built `terminal_first_e2e` binary directly (just as
     # Container Acceptance does): `cargo nextest -E 'binary(terminal_first_e2e)'`
     # narrows Cargo's target selection to `--test terminal_first_e2e`, changing
