@@ -1,9 +1,6 @@
 name: Save stow cache
-description: Report stow cache stats, and on successful main-branch runs flush the SQLite WAL, save the lane's stow and Cargo caches when missed, and retire superseded generations.
+description: Flush the stow SQLite WAL, save the lane's stow and Cargo caches when missed on main, and retire superseded generations.
 inputs:
-  job-status:
-    description: Outer job status (`${{ job.status }}`).
-    required: true
   cache-prefix:
     description: Prefix from restore-stow-cache.
     required: true
@@ -16,12 +13,8 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Report stow cache stats
-      if: always()
-      shell: bash
-      run: stow stats || true
     - name: Checkpoint stow state before saving
-      if: inputs.job-status == 'success' && inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      if: inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       shell: bash
       run: |
         rm -rf ~/.stow/build-dir
@@ -29,7 +22,7 @@ runs:
           sqlite3 ~/.stow/state-v3.sqlite3 "PRAGMA wal_checkpoint(PASSIVE);" || true
         fi
     - name: Retire superseded stow caches
-      if: inputs.job-status == 'success' && inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      if: inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       shell: bash
       run: |
         prefix="${{ inputs.cache-prefix }}"
@@ -38,7 +31,7 @@ runs:
           | while read -r id; do
               [ -n "${id}" ] && gh api -X DELETE "repos/${{ github.repository }}/actions/caches/${id}" || true
             done
-    - if: inputs.job-status == 'success' && inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+    - if: inputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v4
       with:
         path: |

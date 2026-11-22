@@ -85,32 +85,71 @@ fn path_value(name: &'static str, path: &Path) -> Result<String, SessionEnvironm
         })
 }
 
-/// Host toolchain homes a local sandbox reaches: (env var, resolved existing
-/// dir). `CARGO_HOME` and `RUSTUP_HOME` fall back to their `~/.cargo` /
-/// `~/.rustup` defaults; only directories that exist yield, so a toolchain
-/// absent from the host is never granted.
+/// Host toolchain homes a local sandbox reaches: `(env var, resolved existing
+/// dir)`. `CARGO_HOME` and `RUSTUP_HOME` fall back to their `~/.cargo` /
+/// `~/.rustup` defaults, and when `stow` is present on the host its shared
+/// artifact cache (`STOW_CACHE_DIR`, `~/.stow`) and daemon runtime directory
+/// (`STOW_DAEMON_DIR`, `<cache-dir>/stow/run`) ride alongside them so `cargo`
+/// wrappers inside the remapped-`HOME` sandbox reach the host `stow` daemon
+/// and `build-dir`. Only directories that exist yield, so a toolchain absent
+/// from the host is never granted.
 fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
     let home = std::env::home_dir;
+    let stow_cache = std::env::var_os("STOW_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".stow")))
+        .filter(|path| path.is_dir());
+    // On Linux each sandbox runs in a child PID namespace (`CLONE_NEWPID`), so
+    // `stow-rustc-wrapper` reports a namespace-local `cargo` PID that only an
+    // in-namespace `stow-daemon` can verify in `/proc` alongside `SO_PEERCRED`.
+    // Linux sessions therefore get a `0700` `STOW_DAEMON_DIR` inside their own
+    // cache while sharing the host's `STOW_CACHE_DIR`; macOS and Windows share
+    // the host PID space and reach the host daemon directly.
+    #[cfg(not(target_os = "linux"))]
+    let stow_daemon = std::env::var_os("STOW_DAEMON_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            stow_cache
+                .as_ref()
+                .and_then(|_| dirs::cache_dir().map(|cache| cache.join("stow").join("run")))
+        })
+        .inspect(|path| {
+            if stow_cache.is_some() {
+                let _ = std::fs::create_dir_all(path);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+        })
+        .filter(|path| path.is_dir());
+    #[cfg(target_os = "linux")]
+    let stow_daemon: Option<PathBuf> = None;
     [
         std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
-            .or_else(|| home().map(|home| home.join(".cargo")))
+            .or_else(|| home().map(|h| h.join(".cargo")))
+            .filter(|path| path.is_dir())
             .map(|path| ("CARGO_HOME", path)),
         std::env::var_os("RUSTUP_HOME")
             .map(PathBuf::from)
-            .or_else(|| home().map(|home| home.join(".rustup")))
+            .or_else(|| home().map(|h| h.join(".rustup")))
+            .filter(|path| path.is_dir())
             .map(|path| ("RUSTUP_HOME", path)),
+        stow_cache.map(|path| ("STOW_CACHE_DIR", path)),
+        stow_daemon.map(|path| ("STOW_DAEMON_DIR", path)),
     ]
     .into_iter()
     .flatten()
-    .filter(|(_, path)| path.is_dir())
 }
 
 /// The grants the managed tools need: their directory, executable; the shared
 /// `uv` directory, which `uv` writes and the interpreters it installs
-/// execute; and the host toolchain homes, writable and executable since
-/// builds run the binaries and write the caches. Credential files inside them
-/// stay denied by heel's security tables, which emit after grants.
+/// execute; and the host toolchain homes, readable, writable and executable
+/// since builds read configs/caches, connect to `stow`'s daemon socket, run
+/// toolchain binaries and write caches. Credential files inside them stay
+/// denied by heel's security tables, which emit after grants.
 fn tool_grants(tools: &PreparedTools<PathBuf>) -> heel::Result<Vec<Grant>> {
     std::iter::once(Ok(Grant::new(resolved(tools.bin_dir())?, Access::EXEC)))
         .chain(
@@ -118,9 +157,33 @@ fn tool_grants(tools: &PreparedTools<PathBuf>) -> heel::Result<Vec<Grant>> {
                 .uv_dir()
                 .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC))),
         )
+        .chain(host_toolchain_homes().map(|(name, path)| {
+            // `stow-rustc-wrapper` calls `create_dir_all(STOW_DAEMON_DIR)` on
+            // startup, and Linux's seccomp `mkdir` broker checks write access
+            // on the parent directory before returning `EEXIST`. When
+            // `STOW_DAEMON_DIR` lives inside stow's own `<cache>/stow/run`
+            // directory, granting `<cache>/stow` covers that parent check
+            // without exposing sibling cache directories.
+            let grant_root = if name == "STOW_DAEMON_DIR"
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|dir| dir == "stow")
+            {
+                path.parent().unwrap_or(&path)
+            } else {
+                path.as_path()
+            };
+            Ok(Grant::new(
+                resolved(grant_root)?,
+                Access::READ | Access::WRITE | Access::EXEC,
+            ))
+        }))
         .chain(
-            host_toolchain_homes()
-                .map(|(_, path)| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC))),
+            dirs::data_local_dir()
+                .map(|data| data.join("stow").join("tools"))
+                .filter(|path| path.is_dir())
+                .map(|path| Ok(Grant::new(resolved(&path)?, Access::READ | Access::EXEC))),
         )
         .collect()
 }
@@ -160,6 +223,10 @@ fn write_denylist(working_dir: &Path, tools: &PreparedTools<PathBuf>) -> heel::W
     let denylist = heel::WriteDenylist::persistence().except(resolved(working_dir));
     let denylist = match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
         Some((_, cargo_home)) => denylist.except(resolved(&cargo_home).join("git")),
+        None => denylist,
+    };
+    let denylist = match host_toolchain_homes().find(|(name, _)| *name == "STOW_CACHE_DIR") {
+        Some((_, stow_cache)) => denylist.except(resolved(&stow_cache)),
         None => denylist,
     };
     match tools.uv_environment() {
@@ -233,9 +300,25 @@ async fn environment(
     }
     // Point cargo and rustup at the same host homes the grants cover, so the
     // remapped HOME does not strand them under the working dir.
+    let mut has_stow_cache = false;
     for (name, home) in host_toolchain_homes() {
+        if name == "STOW_CACHE_DIR" {
+            has_stow_cache = true;
+        }
         env.push((name.to_string(), path_value(name, &home)?));
     }
+    #[cfg(target_os = "linux")]
+    if has_stow_cache {
+        use std::os::unix::fs::PermissionsExt as _;
+        let stow_run = writable.cache().join("stow").join("run");
+        async_fs::create_dir_all(&stow_run).await?;
+        std::fs::set_permissions(&stow_run, std::fs::Permissions::from_mode(0o700))?;
+        env.push((
+            "STOW_DAEMON_DIR".to_string(),
+            path_value("STOW_DAEMON_DIR", &stow_run)?,
+        ));
+    }
+    let _ = has_stow_cache;
     Ok(env)
 }
 

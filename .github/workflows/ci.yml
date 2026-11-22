@@ -152,10 +152,12 @@ jobs:
         with:
           name: cargo-timings-clippy
           path: target/cargo-timings/
-      - uses: ./.github/actions/save-stow-cache
+      - name: Report stow cache stats
         if: always()
+        run: stow stats || true
+      - uses: ./.github/actions/save-stow-cache
+        if: success()
         with:
-          job-status: ${{ job.status }}
           cache-prefix: ${{ steps.stow.outputs.cache-prefix }}
           cache-key: ${{ steps.stow.outputs.cache-key }}
           cache-hit: ${{ steps.stow.outputs.cache-hit }}
