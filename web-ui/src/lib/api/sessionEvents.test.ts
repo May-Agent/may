@@ -24,7 +24,6 @@ function serve(body: string, seen: string[]) {
 function job(pid: number): SessionBackground['jobs'][number] {
   return {
     pid,
-    taskId: 't',
     executionKey: 'k',
     script: 'sleep 1',
     mode: 'sandboxed',

@@ -1,0 +1,410 @@
+// The wire fields of this protocol are self-describing serde payloads; they
+// were written while the module was crate-internal and carry no per-field
+// documentation.
+#![allow(missing_docs)]
+//! Viewer and agent input into a session desktop: May's wire messages
+//! ([`InputMessage`]) translated into `waterkit_automation` events.
+//!
+//! waterkit delivers them: it resolves the window under each point, stamps
+//! window-local locations and posts straight to the owning process, never
+//! through the HID tap, so the user's cursor and focus stay put. This module
+//! only maps the protocol.
+//!
+//! The display's stream pixels are its points, so an incoming `(x, y)` is a
+//! point on the display. Modifier bits arrive in the web client's CDP-order
+//! bitmap (Alt=1, Ctrl=2, Meta=4, Shift=8).
+
+use std::num::NonZeroU32;
+use std::str::FromStr;
+
+use waterkit_automation::{
+    Code, ElementRef, Input, KeyDown, KeyUp, Modifiers, MouseButton, MouseDown, MouseMove, MouseUp,
+    Point, Scroll, Text,
+};
+
+use super::proto::{
+    ElementListing, InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput,
+    MouseEventKind, MouseInput,
+};
+
+/// Why a wire message was not delivered.
+#[derive(Debug, thiserror::Error)]
+pub enum InputError {
+    /// The keyboard message names no key and carries no text.
+    #[error("keyboard input without a code or text")]
+    NoKey,
+    /// The code is not a W3C `KeyboardEvent.code` value.
+    #[error(
+        "unknown key {0:?}: a key is named by its W3C KeyboardEvent.code value, such as \
+         ArrowRight, Backspace, Delete, Escape, Home, PageDown, KeyA or Digit1"
+    )]
+    UnknownCode(String),
+    /// The modifier bitmap has bits beyond Alt, Ctrl, Meta and Shift.
+    #[error("unknown modifier bits {0:#x}")]
+    UnknownModifiers(u64),
+    /// A click count that is not a positive number.
+    #[error("invalid click count {0}")]
+    ClickCount(i32),
+    /// A point off the display: non-finite or negative coordinates.
+    #[error("coordinate ({0}, {1}) is not on the display")]
+    Coordinate(f64, f64),
+    /// The task that owns the display's input has ended.
+    #[error("the display's input owner is gone")]
+    OwnerGone,
+    /// waterkit could not deliver the event, or could not map the key.
+    #[error(transparent)]
+    Deliver(#[from] waterkit_automation::Error),
+}
+
+/// A mouse message as a waterkit event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MouseEvent {
+    Down(MouseDown),
+    Up(MouseUp),
+    Move(MouseMove),
+    Scroll(Scroll),
+}
+
+/// A keyboard message as a waterkit event.
+#[derive(Debug, Clone, PartialEq)]
+enum KeyEvent {
+    Down(KeyDown),
+    Up(KeyUp),
+    Text(Text),
+}
+
+/// Where a display's input owner reports how a posting went.
+pub type Reply<T> = async_channel::Sender<Result<T, InputError>>;
+
+/// Work for a display's input owner, with where to report how it went.
+///
+/// Element listings and the actions on their references go through the one
+/// owner too: a reference resolves only in the `Input` that listed it.
+#[derive(Debug)]
+pub enum Posting {
+    /// Deliver a wire message; `reply` of `None` logs a failure instead.
+    Message {
+        message: InputMessage,
+        reply: Option<Reply<()>>,
+    },
+    /// List the actionable elements on the display.
+    Elements { reply: Reply<ElementListing> },
+    /// Press a listed element.
+    Press {
+        element: ElementRef,
+        reply: Reply<()>,
+    },
+    /// Focus a listed element, then type `text` at it.
+    TypeInto {
+        element: ElementRef,
+        text: String,
+        reply: Reply<()>,
+    },
+}
+
+/// The one owner of a display's [`Input`], run on a thread of its own:
+/// handles each posting in order and ends when every sender is gone.
+///
+/// A post holds its thread until the target confirms the input arrived,
+/// serving that thread's run loop meanwhile, so it never runs on an
+/// executor thread.
+pub fn own(mut input: Input, postings: &async_channel::Receiver<Posting>) {
+    while let Ok(posting) = postings.recv_blocking() {
+        match posting {
+            Posting::Message { message, reply } => {
+                let result = post(&mut input, message);
+                match reply {
+                    Some(reply) => answer(&reply, result),
+                    None => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "computer input not delivered");
+                        }
+                    }
+                }
+            }
+            Posting::Elements { reply } => answer(&reply, elements(&mut input)),
+            Posting::Press { element, reply } => {
+                answer(&reply, input.press(element).map_err(InputError::from));
+            }
+            Posting::TypeInto {
+                element,
+                text,
+                reply,
+            } => answer(&reply, type_into(&mut input, element, &text)),
+        }
+    }
+}
+
+/// Sends `result` to whoever asked; the asker may have stopped waiting.
+fn answer<T>(reply: &Reply<T>, result: Result<T, InputError>) {
+    let _ = reply.send_blocking(result);
+}
+
+/// Lists the display's actionable elements, logging the reads that failed.
+fn elements(input: &mut Input) -> Result<ElementListing, InputError> {
+    let listed = input.elements()?;
+    for skipped in listed.skipped() {
+        tracing::debug!(%skipped, "computer element read skipped");
+    }
+    Ok(ElementListing::from(&listed))
+}
+
+/// Focuses `element` and types `text` through the same text path a typed
+/// wire message takes. Not `set_value`: web content can echo a written
+/// value its page never saw.
+fn type_into(input: &mut Input, element: ElementRef, text: &str) -> Result<(), InputError> {
+    input.focus(element)?;
+    input.post(Text::new(text))?;
+    Ok(())
+}
+
+/// Posts one wire message into the display `input` drives.
+///
+/// # Errors
+/// Returns [`InputError`] when the message cannot be mapped (unknown key
+/// code, modifier bit or click count) or waterkit cannot deliver it.
+pub fn post(input: &mut Input, message: InputMessage) -> Result<(), InputError> {
+    match message {
+        InputMessage::Mouse(mouse) => match mouse_event(&mouse)? {
+            MouseEvent::Down(event) => input.post(event)?,
+            MouseEvent::Up(event) => input.post(event)?,
+            MouseEvent::Move(event) => input.post(event)?,
+            MouseEvent::Scroll(event) => input.post(event)?,
+        },
+        InputMessage::Keyboard(keyboard) => match key_event(&keyboard)? {
+            KeyEvent::Down(event) => input.post(event)?,
+            KeyEvent::Up(event) => input.post(event)?,
+            KeyEvent::Text(event) => input.post(event)?,
+        },
+    }
+    Ok(())
+}
+
+fn modifiers(bits: Option<u64>) -> Result<Modifiers, InputError> {
+    use super::proto::modifier_bits::{ALT, CTRL, META, SHIFT};
+    let bits = bits.unwrap_or(0);
+    if bits & !(ALT | CTRL | META | SHIFT) != 0 {
+        return Err(InputError::UnknownModifiers(bits));
+    }
+    let mut modifiers = Modifiers::empty();
+    for (bit, modifier) in [
+        (ALT, Modifiers::ALT),
+        (CTRL, Modifiers::CONTROL),
+        (META, Modifiers::META),
+        (SHIFT, Modifiers::SHIFT),
+    ] {
+        if bits & bit != 0 {
+            modifiers |= modifier;
+        }
+    }
+    Ok(modifiers)
+}
+
+const fn button(button: Option<MouseButtonInput>) -> MouseButton {
+    match button {
+        Some(MouseButtonInput::Left) | None => MouseButton::Left,
+        Some(MouseButtonInput::Right) => MouseButton::Right,
+        Some(MouseButtonInput::Middle) => MouseButton::Middle,
+    }
+}
+
+fn clicks(count: Option<i32>) -> Result<NonZeroU32, InputError> {
+    count.map_or(Ok(NonZeroU32::MIN), |count| {
+        u32::try_from(count)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(InputError::ClickCount(count))
+    })
+}
+
+/// A web wheel delta in pixels, rounded and clamped to what an event holds.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "clamped to the i32 range first"
+)]
+fn pixels(delta: Option<f64>) -> i32 {
+    delta
+        .unwrap_or(0.0)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// A point on the display: non-finite or negative coordinates never reach
+/// the window server.
+fn display_point(x: f64, y: f64) -> Result<Point, InputError> {
+    if !(x.is_finite() && y.is_finite()) || x < 0.0 || y < 0.0 {
+        return Err(InputError::Coordinate(x, y));
+    }
+    Ok(Point::new(x, y))
+}
+
+fn mouse_event(input: &MouseInput) -> Result<MouseEvent, InputError> {
+    let at = display_point(input.x, input.y)?;
+    let modifiers = modifiers(input.modifiers)?;
+    Ok(match input.event_type {
+        MouseEventKind::Pressed => MouseEvent::Down(
+            MouseDown::new(at, button(input.button))
+                .clicks(clicks(input.click_count)?)
+                .modifiers(modifiers),
+        ),
+        MouseEventKind::Released => MouseEvent::Up(
+            MouseUp::new(at, button(input.button))
+                .clicks(clicks(input.click_count)?)
+                .modifiers(modifiers),
+        ),
+        MouseEventKind::Moved => MouseEvent::Move(MouseMove::new(at).modifiers(modifiers)),
+        MouseEventKind::Wheel => MouseEvent::Scroll(
+            Scroll::new(at, pixels(input.delta_x), pixels(input.delta_y)).modifiers(modifiers),
+        ),
+    })
+}
+
+fn key_event(input: &KeyboardInput) -> Result<KeyEvent, InputError> {
+    let down = matches!(input.event_type, KeyboardEventKind::KeyDown);
+    // A printable character goes through the text path: layout and IME
+    // agnostic, no key code needed. The web client sends text on key-down
+    // only, and never with Ctrl or Meta held.
+    if down && let Some(text) = input.text.as_deref().filter(|text| !text.is_empty()) {
+        return Ok(KeyEvent::Text(Text::new(text)));
+    }
+    let name = input.code.as_deref().ok_or(InputError::NoKey)?;
+    let code = Code::from_str(name).map_err(|_| InputError::UnknownCode(name.to_owned()))?;
+    let modifiers = modifiers(input.modifiers)?;
+    Ok(if down {
+        KeyEvent::Down(KeyDown::new(code).modifiers(modifiers))
+    } else {
+        KeyEvent::Up(KeyUp::new(code).modifiers(modifiers))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> InputMessage {
+        serde_json::from_str(body).expect("a wire message")
+    }
+
+    fn mouse(body: &str) -> Result<MouseEvent, InputError> {
+        let InputMessage::Mouse(input) = parse(body) else {
+            panic!("expected mouse input");
+        };
+        mouse_event(&input)
+    }
+
+    fn keyboard(body: &str) -> Result<KeyEvent, InputError> {
+        let InputMessage::Keyboard(input) = parse(body) else {
+            panic!("expected keyboard input");
+        };
+        key_event(&input)
+    }
+
+    #[test]
+    fn cdp_modifier_bits_map_to_modifiers() {
+        assert_eq!(modifiers(None).unwrap(), Modifiers::empty());
+        assert_eq!(modifiers(Some(1)).unwrap(), Modifiers::ALT);
+        assert_eq!(modifiers(Some(2)).unwrap(), Modifiers::CONTROL);
+        assert_eq!(modifiers(Some(4)).unwrap(), Modifiers::META);
+        assert_eq!(modifiers(Some(8)).unwrap(), Modifiers::SHIFT);
+        assert_eq!(
+            modifiers(Some(15)).unwrap(),
+            Modifiers::ALT | Modifiers::CONTROL | Modifiers::META | Modifiers::SHIFT
+        );
+    }
+
+    #[test]
+    fn a_modifier_bit_beyond_the_four_is_an_error() {
+        assert!(matches!(
+            modifiers(Some(16)),
+            Err(InputError::UnknownModifiers(16))
+        ));
+    }
+
+    #[test]
+    fn a_press_carries_its_button_clicks_and_modifiers() {
+        let event = mouse(
+            r#"{"type":"mouse","eventType":"mousePressed","x":1.5,"y":2.0,"button":"right","clickCount":2,"modifiers":8}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            MouseEvent::Down(
+                MouseDown::new(Point::new(1.5, 2.0), MouseButton::Right)
+                    .clicks(NonZeroU32::new(2).unwrap())
+                    .modifiers(Modifiers::SHIFT)
+            )
+        );
+    }
+
+    #[test]
+    fn a_wheel_passes_web_deltas_rounded() {
+        let event = mouse(
+            r#"{"type":"mouse","eventType":"mouseWheel","x":3.0,"y":4.0,"deltaX":-1.4,"deltaY":120.6}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            MouseEvent::Scroll(Scroll::new(Point::new(3.0, 4.0), -1, 121))
+        );
+    }
+
+    #[test]
+    fn a_non_positive_click_count_is_an_error() {
+        assert!(matches!(
+            mouse(r#"{"type":"mouse","eventType":"mousePressed","x":0,"y":0,"clickCount":0}"#),
+            Err(InputError::ClickCount(0))
+        ));
+    }
+
+    #[test]
+    fn a_key_goes_by_its_web_code() {
+        let event =
+            keyboard(r#"{"type":"keyboard","eventType":"keyDown","code":"ArrowLeft"}"#).unwrap();
+        assert_eq!(event, KeyEvent::Down(KeyDown::new(Code::ArrowLeft)));
+        let event = keyboard(r#"{"type":"keyboard","eventType":"keyUp","code":"Enter"}"#).unwrap();
+        assert_eq!(event, KeyEvent::Up(KeyUp::new(Code::Enter)));
+    }
+
+    #[test]
+    fn typed_text_wins_over_the_code_on_key_down_only() {
+        let event =
+            keyboard(r#"{"type":"keyboard","eventType":"keyDown","code":"KeyA","text":"a"}"#)
+                .unwrap();
+        assert_eq!(event, KeyEvent::Text(Text::new("a")));
+        let event = keyboard(r#"{"type":"keyboard","eventType":"keyUp","code":"KeyA","text":"a"}"#)
+            .unwrap();
+        assert_eq!(event, KeyEvent::Up(KeyUp::new(Code::KeyA)));
+    }
+
+    #[test]
+    fn a_point_off_the_display_is_an_error() {
+        assert!(matches!(
+            mouse(r#"{"type":"mouse","eventType":"mouseMoved","x":-1.0,"y":0}"#),
+            Err(InputError::Coordinate(-1.0, 0.0))
+        ));
+        assert!(matches!(
+            display_point(f64::NAN, 0.0),
+            Err(InputError::Coordinate(..))
+        ));
+        assert!(matches!(
+            display_point(f64::INFINITY, 0.0),
+            Err(InputError::Coordinate(..))
+        ));
+    }
+
+    #[test]
+    fn unmappable_keyboard_input_is_an_error() {
+        let refused = keyboard(r#"{"type":"keyboard","eventType":"keyDown","code":"right"}"#)
+            .expect_err("`right` is not a KeyboardEvent.code value");
+        assert!(matches!(refused, InputError::UnknownCode(_)));
+        assert_eq!(
+            refused.to_string(),
+            "unknown key \"right\": a key is named by its W3C KeyboardEvent.code value, such as \
+             ArrowRight, Backspace, Delete, Escape, Home, PageDown, KeyA or Digit1"
+        );
+        assert!(matches!(
+            keyboard(r#"{"type":"keyboard","eventType":"keyDown"}"#),
+            Err(InputError::NoKey)
+        ));
+    }
+}

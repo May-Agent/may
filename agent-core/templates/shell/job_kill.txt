@@ -1,0 +1,1 @@
+{% if killed %}Background job PID {{ task_id }} was stopped.{% else %}No running background job PID {{ task_id }} — it already ended or never started.{% endif %}

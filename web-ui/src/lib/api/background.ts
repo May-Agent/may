@@ -10,7 +10,6 @@ export type BackgroundJobStatus =
 /** One background terminal job of a session (`WireJob`). */
 export interface BackgroundJob {
   pid: number;
-  taskId: string;
   executionKey?: string;
   script: string;
   /** The interpreter the script runs under (`"shell"` or `"python"`). */

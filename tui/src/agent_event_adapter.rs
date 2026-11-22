@@ -1,0 +1,797 @@
+use aither_core::llm::{
+    CommandOutcome, CommandResult, CommandStream, ToolResult, tool::ToolResultPart,
+};
+use aither_sandbox::{Interpreter, JobInputArgs, JobReadArgs, SandboxMode, ShellArgs};
+use partial_json_fixer::fix_json;
+
+/// Frontend-agnostic start event for a tool call.
+#[derive(Debug, Clone)]
+pub enum ToolStartKind {
+    /// A `terminal` tool invocation, foreground or detached.
+    Terminal {
+        /// Model-provided summary shown as the call's headline.
+        description: String,
+        /// Command or script being executed.
+        script: String,
+        /// Requested execution backend for the command.
+        mode: SandboxMode,
+        /// Name of the SSH server the command runs on; `None` for the home
+        /// environment.
+        location: Option<String>,
+        /// Interpreter the script runs under; decides its highlighting.
+        interpreter: Interpreter,
+    },
+    /// A `terminal_input` invocation: text written to a background job's
+    /// stdin.
+    Stdin {
+        /// Process ID of the target background job; `None` while still streaming.
+        pid: Option<u32>,
+        /// The text written to the job's stdin.
+        input: String,
+    },
+    /// A `terminal_read` invocation on a background job.
+    JobControl {
+        /// Which control action runs.
+        action: JobControlAction,
+        /// Process ID of the target background job; `None` while still streaming.
+        pid: Option<u32>,
+    },
+    /// A known terminal tool whose model-written arguments did not match
+    /// its schema. The daemon returns an argument error to the model; the
+    /// frontend shows the call as it was written.
+    Malformed {
+        /// Tool name.
+        name: String,
+        /// Raw arguments payload.
+        arguments: String,
+        /// The deserialization error text.
+        error: String,
+    },
+    /// Any other tool invocation.
+    Generic {
+        /// Tool name.
+        name: String,
+        /// Best-effort one-line summary extracted from the arguments.
+        summary: String,
+        /// Raw arguments payload, shown in the expanded body.
+        arguments: String,
+    },
+}
+
+/// A control action on a background terminal job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobControlAction {
+    /// `terminal_read`: incremental output read.
+    Read,
+}
+
+impl JobControlAction {
+    /// Short chip label shown on the call's headline.
+    #[must_use]
+    pub const fn chip(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+        }
+    }
+}
+
+/// An image produced by a tool call, carried alongside its text output.
+#[derive(Debug, Clone)]
+pub enum ToolImage {
+    /// Decoded image bytes taken straight from the result payload.
+    Bytes(Vec<u8>),
+    /// Image data the output store kept on disk.
+    Stored {
+        /// Sandbox-relative reference (for example `outputs/x.png`).
+        url: String,
+        /// Absolute path the store reported.
+        path: String,
+    },
+}
+
+/// Display payload for a completed tool call.
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    /// Text rendered from the result, shown as the output preview.
+    pub text: String,
+    /// Image payload produced by the call, when present.
+    pub image: Option<ToolImage>,
+    /// Why the command failed — a non-zero exit or a killed run; `None`
+    /// when the call succeeded.
+    pub failure: Option<String>,
+}
+
+/// Frontend-agnostic end event for a tool call.
+#[derive(Debug, Clone)]
+pub enum ToolEndKind {
+    /// The tool call completed.
+    Output(ToolOutput),
+    /// The tool call failed; payload is the error message.
+    Error(String),
+}
+
+/// Name of the native `compact` tool.
+pub const COMPACT_TOOL: &str = "compact";
+
+/// Parse tool-call start payload into a minimal start event.
+///
+/// The arguments are written by the model, so a known terminal tool whose
+/// arguments do not deserialize is ordinary input: it becomes
+/// [`ToolStartKind::Malformed`] with the error text.
+#[must_use]
+pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
+    fn parse<T: serde::de::DeserializeOwned>(
+        name: &str,
+        arguments: &str,
+        build: impl FnOnce(T) -> ToolStartKind,
+    ) -> ToolStartKind {
+        serde_json::from_str::<T>(arguments).map_or_else(
+            |error| ToolStartKind::Malformed {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+                error: error.to_string(),
+            },
+            build,
+        )
+    }
+    match name {
+        "terminal" => parse(name, arguments, |args: ShellArgs| ToolStartKind::Terminal {
+            description: args.description,
+            script: args.script,
+            mode: args.sandbox,
+            location: location_name(args.location.as_deref()),
+            interpreter: args.interpreter,
+        }),
+        "terminal_input" => parse(name, arguments, |args: JobInputArgs| ToolStartKind::Stdin {
+            pid: args.task_id.parse().ok(),
+            input: args.input,
+        }),
+        "terminal_read" => parse(name, arguments, |args: JobReadArgs| {
+            ToolStartKind::JobControl {
+                action: JobControlAction::Read,
+                pid: args.task_id.parse().ok(),
+            }
+        }),
+        _ => ToolStartKind::Generic {
+            name: name.to_string(),
+            summary: generic_summary(arguments),
+            arguments: arguments.to_string(),
+        },
+    }
+}
+
+/// Parse still-streaming tool-call arguments into a best-effort start
+/// event for progressive rendering.
+///
+/// `arguments` is the fragment assembled so far — almost never complete
+/// JSON. `partial-json-fixer` repairs it textually, fields that have not
+/// streamed in yet come back empty, and unreadable values fall back to
+/// defaults; nothing panics. The canonical `ToolCallStart` re-parses
+/// with [`parse_tool_start`] and replaces this projection.
+#[must_use]
+pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
+    let repaired = fix_json(arguments.trim());
+    let value: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_default();
+    match name {
+        "terminal" => ToolStartKind::Terminal {
+            description: pick(&value, "description"),
+            script: pick(&value, "script"),
+            mode: value
+                .get("sandbox")
+                .and_then(|mode| serde_json::from_value(mode.clone()).ok())
+                .unwrap_or_default(),
+            location: location_name(value.get("location").and_then(serde_json::Value::as_str)),
+            interpreter: value
+                .get("interpreter")
+                .and_then(|interpreter| serde_json::from_value(interpreter.clone()).ok())
+                .unwrap_or_default(),
+        },
+        "terminal_input" => ToolStartKind::Stdin {
+            pid: pick_u32(&value, "pid"),
+            input: pick(&value, "input"),
+        },
+        "terminal_read" => ToolStartKind::JobControl {
+            action: JobControlAction::Read,
+            pid: pick_u32(&value, "pid"),
+        },
+        _ => ToolStartKind::Generic {
+            name: name.to_string(),
+            summary: generic_summary(&repaired),
+            arguments: repaired,
+        },
+    }
+}
+
+/// The SSH server a `location` argument names; an omitted, empty or blank
+/// value is the home environment.
+fn location_name(location: Option<&str>) -> Option<String> {
+    location
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+/// String field `key` of a repaired arguments object, empty when it has
+/// not streamed in yet.
+fn pick(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn pick_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// Argument keys inspected for a one-line summary of an unknown tool call,
+/// in priority order. Covers the shared command surface (`description`,
+/// `query`, `prompt`, ...) plus free-form MCP payloads.
+const GENERIC_SUMMARY_KEYS: &[&str] = &[
+    "description",
+    "query",
+    "prompt",
+    "question",
+    "input",
+    "url",
+    "path",
+    "title",
+    "command",
+    "name",
+];
+
+/// Extract a best-effort one-line summary from a tool's arguments JSON:
+/// the first line of the first non-empty string field among
+/// [`GENERIC_SUMMARY_KEYS`]. Empty when nothing readable is present.
+fn generic_summary(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    GENERIC_SUMMARY_KEYS
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .and_then(|field| field.lines().next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Parse tool-call completion payload into a minimal end event.
+#[must_use]
+pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
+    if result.is_error() {
+        return ToolEndKind::Error(result.error_message().unwrap_or("tool failed").to_string());
+    }
+
+    let output = result.render_for_model();
+
+    // A bare binary image result (or a parts result containing one) carries
+    // its bytes outside the typed command record.
+    if let Some(image) = binary_tool_image(result) {
+        return ToolEndKind::Output(ToolOutput {
+            text: output,
+            image: Some(image),
+            failure: None,
+        });
+    }
+
+    if let Some(command) = result.command() {
+        return ToolEndKind::Output(extract_tool_output(command));
+    }
+
+    ToolEndKind::Output(ToolOutput {
+        text: output,
+        image: None,
+        failure: None,
+    })
+}
+
+/// Extract raw image bytes when the result is (or contains) an image binary
+/// payload — for example a relayed MCP tool returning a screenshot.
+fn binary_tool_image(result: &ToolResult) -> Option<ToolImage> {
+    fn image_part(mime: &str, content: &[u8]) -> Option<ToolImage> {
+        mime.parse::<mime::Mime>()
+            .ok()
+            .filter(|mime| mime.type_() == mime::IMAGE)
+            .map(|_| ToolImage::Bytes(content.to_vec()))
+    }
+
+    match result {
+        ToolResult::Binary { mime, content } => image_part(mime, content),
+        ToolResult::Parts { parts } => parts.iter().find_map(|part| match part {
+            ToolResultPart::Binary { mime, content } => image_part(mime, content),
+            ToolResultPart::Text { .. } | ToolResultPart::Tsv { .. } => None,
+        }),
+        ToolResult::Done
+        | ToolResult::Text { .. }
+        | ToolResult::Tsv { .. }
+        | ToolResult::Command(_)
+        | ToolResult::Error { .. } => None,
+    }
+}
+
+fn extract_tool_output(result: &CommandResult) -> ToolOutput {
+    // A command that ran to its end reports failure through its outcome —
+    // the same classification the daemon's terminal snapshot and the web
+    // UI's `hasError` apply.
+    let failure = match &result.outcome {
+        CommandOutcome::Exited { code } if *code != 0 => Some(format!("exit {code}")),
+        CommandOutcome::Killed { notice, .. } => Some(notice.clone()),
+        CommandOutcome::Exited { .. } | CommandOutcome::Running { .. } => None,
+    };
+    let mut output = match &result.stdout {
+        CommandStream::Inline { text } => ToolOutput {
+            text: text.clone(),
+            image: None,
+            failure: None,
+        },
+        CommandStream::Image { file, .. } => ToolOutput {
+            text: format!("[image] {}", file.path),
+            image: Some(ToolImage::Stored {
+                url: file.url.clone(),
+                path: file.path.clone(),
+            }),
+            failure: None,
+        },
+        CommandStream::Stored { file, preview, .. } if preview.is_empty() => ToolOutput {
+            text: format!("[stored: {}]", file.url),
+            image: None,
+            failure: None,
+        },
+        CommandStream::Stored { preview, .. } => ToolOutput {
+            text: preview.clone(),
+            image: None,
+            failure: None,
+        },
+    };
+    output.failure = failure;
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ToolEndKind, ToolImage, ToolStartKind, parse_tool_end, parse_tool_start,
+        parse_tool_start_partial,
+    };
+    use aither_core::llm::{
+        CommandOutcome, CommandResult, CommandStream, StoredFile, ToolResult, tool::ToolResultPart,
+    };
+    use aither_sandbox::SandboxMode;
+
+    #[test]
+    fn parse_tool_start_uses_actual_execution_mode() {
+        for (mode_json, expected) in [
+            ("sandboxed", SandboxMode::Sandboxed),
+            ("unsandboxed", SandboxMode::Unsandboxed),
+        ] {
+            let args = format!(
+                r#"{{"description":"say hi","script":"echo hi","sandbox":"{mode_json}","timeout":5}}"#
+            );
+            let start = parse_tool_start("terminal", &args);
+            match start {
+                ToolStartKind::Terminal {
+                    description,
+                    script,
+                    mode,
+                    ..
+                } => {
+                    assert_eq!(description, "say hi");
+                    assert_eq!(script, "echo hi");
+                    assert_eq!(mode, expected);
+                }
+                _ => panic!("expected terminal start event"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_malformed_terminal_arguments() {
+        let ToolStartKind::Malformed {
+            name,
+            arguments,
+            error,
+        } = parse_tool_start("terminal", r#"{"command":"ls"}"#)
+        else {
+            panic!("expected malformed start kind");
+        };
+        assert_eq!(name, "terminal");
+        assert_eq!(arguments, r#"{"command":"ls"}"#);
+        assert!(error.contains("script"), "{error}");
+    }
+
+    #[test]
+    fn parse_tool_start_malformed_other_terminal_tools() {
+        for tool in ["terminal_input", "terminal_read"] {
+            let ToolStartKind::Malformed { name, error, .. } = parse_tool_start(tool, "{}") else {
+                panic!("expected malformed start kind for {tool}");
+            };
+            assert_eq!(name, tool);
+            assert_ne!(error, "");
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_reads_interpreter() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"echo hi","sandbox":"sandboxed","timeout":5,"interpreter":"shell"}"#,
+                aither_sandbox::Interpreter::Shell,
+            ),
+            (
+                r#"{"description":"d","script":"print(1)","sandbox":"sandboxed","timeout":5,"interpreter":"python"}"#,
+                aither_sandbox::Interpreter::Python,
+            ),
+            (
+                r#"{"description":"d","script":"echo hi","sandbox":"sandboxed","timeout":5}"#,
+                aither_sandbox::Interpreter::Shell,
+            ),
+        ] {
+            let ToolStartKind::Terminal { interpreter, .. } =
+                parse_tool_start("terminal", arguments)
+            else {
+                panic!("expected terminal start event");
+            };
+            assert_eq!(interpreter, expected, "{arguments}");
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_partial_reads_interpreter() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"print(1)","interpreter":"python""#,
+                aither_sandbox::Interpreter::Python,
+            ),
+            (
+                r#"{"description":"d","script":"echo hi"}"#,
+                aither_sandbox::Interpreter::Shell,
+            ),
+        ] {
+            let ToolStartKind::Terminal { interpreter, .. } =
+                parse_tool_start_partial("terminal", arguments)
+            else {
+                panic!("expected terminal start kind for {arguments}");
+            };
+            assert_eq!(interpreter, expected, "{arguments}");
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_reads_location() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"ls","timeout":5,"location":"build-box"}"#,
+                Some("build-box"),
+            ),
+            (
+                r#"{"description":"d","script":"ls","timeout":5,"location":""}"#,
+                None,
+            ),
+            (r#"{"description":"d","script":"ls","timeout":5}"#, None),
+        ] {
+            let expected = expected.map(str::to_string);
+            let ToolStartKind::Terminal { location, .. } = parse_tool_start("terminal", arguments)
+            else {
+                panic!("expected terminal start event");
+            };
+            assert_eq!(location, expected);
+            let ToolStartKind::Terminal { location, .. } =
+                parse_tool_start_partial("terminal", arguments)
+            else {
+                panic!("expected terminal start kind");
+            };
+            assert_eq!(location, expected);
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_covers_terminal_family() {
+        match parse_tool_start(
+            "terminal",
+            r#"{"description":"serve","script":"bun dev","timeout":60,"background":true}"#,
+        ) {
+            ToolStartKind::Terminal {
+                description,
+                script,
+                mode,
+                ..
+            } => {
+                assert_eq!(description, "serve");
+                assert_eq!(script, "bun dev");
+                assert_eq!(mode, SandboxMode::Sandboxed);
+            }
+            _ => panic!("expected terminal start event"),
+        }
+
+        match parse_tool_start(
+            "terminal_input",
+            r#"{"pid":4242,"input":"Friday","append_newline":true}"#,
+        ) {
+            ToolStartKind::Stdin { pid, input } => {
+                assert_eq!(pid, Some(4242));
+                assert_eq!(input, "Friday");
+            }
+            _ => panic!("expected stdin start event"),
+        }
+
+        match parse_tool_start(
+            "terminal_read",
+            r#"{"pid":4242,"cursor":0,"max_bytes":1024}"#,
+        ) {
+            ToolStartKind::JobControl { action, pid } => {
+                assert_eq!(action, super::JobControlAction::Read);
+                assert_eq!(pid, Some(4242));
+            }
+            _ => panic!("expected read start event"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_generic_extracts_summary() {
+        match parse_tool_start("websearch", r#"{"query":"may agent","extra":1}"#) {
+            ToolStartKind::Generic {
+                name,
+                summary,
+                arguments,
+            } => {
+                assert_eq!(name, "websearch");
+                assert_eq!(summary, "may agent");
+                assert!(arguments.contains("may agent"));
+            }
+            _ => panic!("expected generic start event"),
+        }
+
+        // Unknown shapes still surface: no summary, raw args kept.
+        match parse_tool_start("mystery", r#"{"foo":42}"#) {
+            ToolStartKind::Generic { summary, .. } => assert_eq!(summary, ""),
+            _ => panic!("expected generic start event"),
+        }
+        match parse_tool_start("mystery", "not json") {
+            ToolStartKind::Generic { summary, .. } => assert_eq!(summary, ""),
+            _ => panic!("expected generic start event"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_partial_grows_terminal_fields() {
+        // Arguments stream in order; each projection surfaces whatever is
+        // readable so far, never panics on the truncated JSON.
+        let frames = [
+            "",
+            "{\"",
+            "{\"description\":\"Get cur",
+            "{\"description\":\"Get current time\",\"script\":\"date",
+            "{\"description\":\"Get current time\",\"script\":\"date +%s\"}",
+        ];
+        let mut previous = String::new();
+        for frame in frames {
+            let ToolStartKind::Terminal {
+                description,
+                script,
+                mode,
+                ..
+            } = parse_tool_start_partial("terminal", frame)
+            else {
+                panic!("expected terminal start kind");
+            };
+            assert_eq!(mode, SandboxMode::Sandboxed);
+            assert!(description.starts_with(previous.as_str()));
+            previous = description;
+            let _ = script;
+        }
+        assert_eq!(previous, "Get current time");
+    }
+
+    #[test]
+    fn parse_tool_start_partial_reads_partial_mode() {
+        let ToolStartKind::Terminal { mode, .. } = parse_tool_start_partial(
+            "terminal",
+            r#"{"description":"x","script":"rm -rf /","sandbox":"unsa"}"#,
+        ) else {
+            panic!("expected terminal start kind");
+        };
+        // Truncated enum text is unreadable — falls back to the default.
+        assert_eq!(mode, SandboxMode::Sandboxed);
+
+        let ToolStartKind::Terminal { mode, .. } = parse_tool_start_partial(
+            "terminal",
+            r#"{"description":"x","script":"rm -rf /","sandbox":"unsandboxed"}"#,
+        ) else {
+            panic!("expected terminal start kind");
+        };
+        assert_eq!(mode, SandboxMode::Unsandboxed);
+    }
+
+    #[test]
+    fn parse_tool_start_partial_covers_terminal_family() {
+        let ToolStartKind::Stdin { pid, input } =
+            parse_tool_start_partial("terminal_input", r#"{"pid":4242,"input":"Fri"#)
+        else {
+            panic!("expected stdin start kind");
+        };
+        assert_eq!(pid, Some(4242));
+        assert_eq!(input, "Fri");
+
+        let ToolStartKind::JobControl { action, pid } =
+            parse_tool_start_partial("terminal_read", "{}")
+        else {
+            panic!("expected job-control start kind");
+        };
+        assert_eq!(action, super::JobControlAction::Read);
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn parse_tool_start_partial_generic_and_garbage() {
+        let ToolStartKind::Generic {
+            name,
+            summary,
+            arguments,
+        } = parse_tool_start_partial("websearch", r#"{"query":"may ag"#)
+        else {
+            panic!("expected generic start kind");
+        };
+        assert_eq!(name, "websearch");
+        assert_eq!(summary, "may ag");
+        assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_ok());
+
+        // Garbage in, empty projection out — no panic.
+        let ToolStartKind::Generic { summary, .. } =
+            parse_tool_start_partial("mystery", "not json at all")
+        else {
+            panic!("expected generic start kind");
+        };
+        assert_eq!(summary, "");
+    }
+
+    fn terminal_result(stdout: CommandStream) -> ToolResult {
+        ToolResult::Command(Box::new(CommandResult {
+            stdout,
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 0 },
+            interruptions: Vec::new(),
+        }))
+    }
+
+    fn stored(url: &str, path: &str) -> StoredFile {
+        StoredFile {
+            url: url.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_extracts_stored_image_path() {
+        let result = terminal_result(CommandStream::Image {
+            media_type: "image/png".to_string(),
+            file: stored("outputs/shot.png", "/session/outputs/shot.png"),
+        });
+        match parse_tool_end(&result) {
+            ToolEndKind::Output(out) => {
+                assert_eq!(out.text, "[image] /session/outputs/shot.png");
+                match out.image {
+                    Some(ToolImage::Stored { url, path }) => {
+                        assert_eq!(url, "outputs/shot.png");
+                        assert_eq!(path, "/session/outputs/shot.png");
+                    }
+                    other => panic!("expected stored image reference, got {other:?}"),
+                }
+            }
+            ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_extracts_binary_image_result() {
+        let result = ToolResult::image(vec![1, 2, 3], "image/png");
+        match parse_tool_end(&result) {
+            ToolEndKind::Output(out) => match out.image {
+                Some(ToolImage::Bytes(bytes)) => assert_eq!(bytes, [1, 2, 3]),
+                other => panic!("expected binary image bytes, got {other:?}"),
+            },
+            ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_extracts_image_part_from_parts_result() {
+        let result = ToolResult::parts(vec![
+            ToolResultPart::text("screenshot taken"),
+            ToolResultPart::image(vec![9, 8, 7], "image/jpeg"),
+        ]);
+        match parse_tool_end(&result) {
+            ToolEndKind::Output(out) => {
+                assert!(out.text.contains("screenshot taken"));
+                match out.image {
+                    Some(ToolImage::Bytes(bytes)) => assert_eq!(bytes, [9, 8, 7]),
+                    other => panic!("expected part image bytes, got {other:?}"),
+                }
+            }
+            ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_keeps_text_output() {
+        let result = terminal_result(CommandStream::Inline {
+            text: "hello".to_string(),
+        });
+        match parse_tool_end(&result) {
+            ToolEndKind::Output(out) => {
+                assert_eq!(out.text, "hello");
+                assert!(out.image.is_none());
+            }
+            ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_marks_command_failures() {
+        for (outcome, expected) in [
+            (CommandOutcome::Exited { code: 0 }, None),
+            (CommandOutcome::Exited { code: 2 }, Some("exit 2")),
+            (
+                CommandOutcome::Killed {
+                    task_id: "4242".to_string(),
+                    notice: "killed at its timeout".to_string(),
+                },
+                Some("killed at its timeout"),
+            ),
+            (
+                CommandOutcome::Running {
+                    task_id: "4242".to_string(),
+                    output: stored("outputs/log", "/tmp/log"),
+                },
+                None,
+            ),
+        ] {
+            let result = ToolResult::Command(Box::new(CommandResult {
+                stdout: CommandStream::Inline {
+                    text: String::new(),
+                },
+                stderr: None,
+                outcome,
+                interruptions: Vec::new(),
+            }));
+            match parse_tool_end(&result) {
+                ToolEndKind::Output(out) => {
+                    assert_eq!(out.failure.as_deref(), expected);
+                }
+                ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_keeps_stored_text_preview() {
+        let result = terminal_result(CommandStream::Stored {
+            file: stored("outputs/log.txt", "/session/outputs/log.txt"),
+            preview: "preview".to_string(),
+            truncated: true,
+        });
+        match parse_tool_end(&result) {
+            ToolEndKind::Output(out) => {
+                assert_eq!(out.text, "preview");
+                assert!(out.image.is_none());
+            }
+            ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_names_stored_output_without_preview() {
+        let result = terminal_result(CommandStream::Stored {
+            file: stored("outputs/blob.bin", "/session/outputs/blob.bin"),
+            preview: String::new(),
+            truncated: false,
+        });
+        match parse_tool_end(&result) {
+            ToolEndKind::Output(out) => assert_eq!(out.text, "[stored: outputs/blob.bin]"),
+            ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+}

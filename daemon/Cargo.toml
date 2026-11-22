@@ -1,0 +1,126 @@
+[package]
+name = "may-daemon"
+version = "0.1.1"
+edition = "2024"
+description = "The resident May daemon: agent loops, the task scheduler, and the REST/SSE API every client attaches to"
+license = "MIT"
+build = "build.rs"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[features]
+default = ["vision-ocr"]
+# Build and embed the `web-ui` production bundle the `gui` routes serve.
+ui = []
+# On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
+vision-ocr = ["may-media/vision-ocr", "may-agent-core/vision-ocr"]
+
+[dependencies]
+# The agent core: agents, tools, containers, sessions the daemon drives.
+may-agent-core = { path = "../agent-core" }
+# The foundational wire types the API and sessions share.
+may-protocol = { path = "../protocol" }
+# The daemon API client types the wire handlers reuse.
+may-client = { path = "../client" }
+# The configuration layer the API reads and writes.
+may-config = { path = "../config" }
+# The media layer: the virtual desktop and on-device OCR.
+may-media = { path = "../media" }
+# Aither framework
+aither-core = { version = "0.31.0" }
+aither-agent = { version = "0.31.0", features = ["serde"] }
+aither-connectivity = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0", features = ["code-folding", "connectivity", "jobserver"] }
+aither-models = { version = "0.31.0" }
+aither-mcp = { version = "0.31.0" }
+aither-copilot = { version = "0.31.0" }
+aither-codex = { version = "0.31.0" }
+heel = { version = "0.10.1", default-features = false }
+# ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
+acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+futures-lite = "2.6"
+futures-util = "0.3"
+bytes = "1"
+event-listener = "5"
+executor-core = { version = "0.7", features = ["tokio"] }
+async-fs = "2.1"
+async-io = "2.6"
+async-net = "2"
+async-process = "2.5"
+async-channel = "2"
+async-lock = "3"
+blocking = "1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+schemars = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+rmp-serde = "1.3"
+toml = "0.8"
+dashmap = "6"
+
+# Utils
+jiff = { version = "0.2", features = ["serde"] }
+shell-escape = "0.1"
+arc-swap = { version = "1", features = ["weak"] }
+thiserror = "2"
+tracing = "0.1"
+anyhow = "1"
+url = "2"
+dunce = "1.0.5"
+which = { version = "8", default-features = false }
+tempfile = "3.24.0"
+git2 = "0.20.3"
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
+libc = "0.2"
+notify = "8"
+hmac = { version = "0.12", default-features = false }
+subtle = "2.6"
+sha2 = "0.10"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+flate2 = "1"
+fd-lock = "4.0.4"
+include_dir = "0.7"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
+
+# Clipboard, image, and browser
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+p256 = "0.13"
+
+# HTTP and SSE plumbing
+zenwave = "0.7"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# hyper over futures-io streams, for daemon connections outside tokio
+smol-hyper = { version = "0.1.1", default-features = false }
+http-body-util = "0.1"
+mime = "0.3"
+mime_guess = "2"
+
+# Web server for `may gui`/`may rest`
+skyzen = { version = "0.5.1", features = ["hyper"] }
+# The daemon serves the router itself and renders errors as skyzen does.
+skyzen-core = "0.2"
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+
+# Logging
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Templating
+askama = "0.16"
+
+[dev-dependencies]
+may-agent-core = { path = "../agent-core", features = ["testing"] }
+may-protocol = { path = "../protocol", features = ["testing"] }
+# The fixture images the attachment tests render.
+may-media = { path = "../media", features = ["testing"] }
+
+[lints]
+workspace = true

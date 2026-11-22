@@ -1,0 +1,9 @@
+<system-reminder>
+Your subagent "{{ subagent }}" asks to run a command outside the sandbox. Answer it with `subagent approve --id {{ id }}` or `subagent deny --id {{ id }} --reason <why>` — it waits for your decision, and a denial returns your reason to it.
+</system-reminder>
+<subagent-approval-request id="{{ id }}" name="{{ subagent }}">
+{{ subject }}
+{% if let Some(reason) = reason %}
+Its reason: {{ reason }}
+{% endif %}
+</subagent-approval-request>

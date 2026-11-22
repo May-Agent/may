@@ -1,0 +1,6 @@
+<system-reminder>
+Your subagent "{{ subagent }}" finished the run you were notified of; this is its report.
+</system-reminder>
+<subagent-run-finished name="{{ subagent }}">
+{{ report }}
+</subagent-run-finished>
