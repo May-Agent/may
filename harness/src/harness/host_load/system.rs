@@ -220,9 +220,6 @@ mod windows {
 
     use super::{MachineLoad, MemoryPressure, ReadError};
 
-    /// The share of CPU time not spent idle at which load is worth telling
-    /// the agent about.
-
     /// Cumulative CPU time in 100 ns ticks.
     #[derive(Debug, Clone, Copy)]
     struct Times {

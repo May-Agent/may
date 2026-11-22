@@ -4,7 +4,7 @@ inputs:
   cargo-flags:
     description: Target selection flags passed to cargo build and cargo nextest run.
     required: false
-    default: '--all-targets'
+    default: '--workspace --all-targets'
   upload-may:
     description: Whether to pack and upload target/debug/may as an artifact.
     required: false
@@ -71,7 +71,9 @@ runs:
     # `may` binary the next steps upload.
     - name: cargo build
       shell: bash
-      run: cargo test --locked ${{ inputs.cargo-flags }} --no-run --timings
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        cargo test --locked ${{ inputs.cargo-flags }} --no-run --timings
     # Every run keeps the debug may it built, so a commit can be tested on
     # another machine without building it there. It is packed as a tarball
     # because artifacts drop the executable bit.
@@ -90,10 +92,15 @@ runs:
       if: inputs.upload-e2e-bin == 'true'
       shell: bash
       run: |
-        path="$(find target/debug "${HOME}/.stow/build-dir" -type f -perm /111 -name 'terminal_first_e2e-*' ! -name '*.d' ! -name '*.o' 2>/dev/null | head -1)"
-        if [ -z "${path}" ]; then
-          path="$(find target/debug "${HOME}/.stow/build-dir" -type f -perm +111 -name 'terminal_first_e2e-*' ! -name '*.d' ! -name '*.o' 2>/dev/null | head -1)"
+        roots=(target/debug)
+        if [ -d "${HOME}/.stow/build-dir" ]; then
+          roots+=("${HOME}/.stow/build-dir")
         fi
+        path="$(
+          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
+            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
+            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
+        )"
         test -n "${path}"
         tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
     - name: Upload the e2e test binary
@@ -116,18 +123,31 @@ runs:
     - name: cargo nextest
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
-      run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
-    # Uses the exact same target flags (`inputs.cargo-flags`) as the build and
-    # nextest steps above: passing `--test terminal_first_e2e` narrows Cargo's
-    # feature unification and triggers a full multi-minute recompile of may-agent
-    # just to run one acceptance test.
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+    # Invoke the already-built `terminal_first_e2e` binary directly (just as
+    # Container Acceptance does): `cargo nextest -E 'binary(terminal_first_e2e)'`
+    # narrows Cargo's target selection to `--test terminal_first_e2e`, changing
+    # workspace feature unification and paying a full ~9-minute recompile of
+    # may-agent and its codec dependencies at the end of the job.
     - name: Verify baseline tools
       if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
       shell: bash
-      run: >
-        cargo nextest run --locked ${{ inputs.cargo-flags }} --run-ignored only
-        -E 'binary(terminal_first_e2e) & test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
-        --no-capture
+      run: |
+        roots=(target/debug)
+        if [ -d "${HOME}/.stow/build-dir" ]; then
+          roots+=("${HOME}/.stow/build-dir")
+        fi
+        bin="$(
+          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
+            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
+            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
+        )"
+        test -n "${bin}"
+        test -x "${PWD}/target/debug/may"
+        CARGO_BIN_EXE_may="${PWD}/target/debug/may" "${bin}" --ignored --exact --nocapture \
+          the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
     - name: Upload cargo timings
       if: always()
       uses: actions/upload-artifact@v4
@@ -143,10 +163,13 @@ runs:
       with:
         path: ${{ steps.downloads.outputs.tools-path }}
         key: ${{ steps.downloads.outputs.tools-key }}
-    - uses: ./.github/actions/save-stow-cache
+    - name: Report stow cache stats
       if: always()
+      shell: bash
+      run: stow stats || true
+    - uses: ./.github/actions/save-stow-cache
+      if: success()
       with:
-        job-status: ${{ job.status }}
         cache-prefix: ${{ steps.stow.outputs.cache-prefix }}
         cache-key: ${{ steps.stow.outputs.cache-key }}
         cache-hit: ${{ steps.stow.outputs.cache-hit }}
