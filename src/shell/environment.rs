@@ -143,9 +143,25 @@ fn tool_grants(tools: &PreparedTools<PathBuf>) -> heel::Result<Vec<Grant>> {
                 .uv_dir()
                 .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC))),
         )
-        .chain(host_toolchain_homes().map(|(_, path)| {
+        .chain(host_toolchain_homes().map(|(name, path)| {
+            // `stow-rustc-wrapper` calls `create_dir_all(STOW_DAEMON_DIR)` on
+            // startup, and Linux's seccomp `mkdir` broker checks write access
+            // on the parent directory before returning `EEXIST`. When
+            // `STOW_DAEMON_DIR` lives inside stow's own `<cache>/stow/run`
+            // directory, granting `<cache>/stow` covers that parent check
+            // without exposing sibling cache directories.
+            let grant_root = if name == "STOW_DAEMON_DIR"
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|dir| dir == "stow")
+            {
+                path.parent().unwrap_or(&path)
+            } else {
+                path.as_path()
+            };
             Ok(Grant::new(
-                resolved(&path)?,
+                resolved(grant_root)?,
                 Access::READ | Access::WRITE | Access::EXEC,
             ))
         }))
