@@ -222,6 +222,7 @@ jobs:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: water-rs/stow@main
+        if: ${{ !(runner.os == 'Windows' && runner.arch == 'ARM64') }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-10-01
