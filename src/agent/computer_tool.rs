@@ -10,7 +10,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use waterkit_automation::ElementRef;
+use may_media::waterkit_automation::ElementRef;
 
 use crate::computer::proto::{
     ElementListing, ElementPoint, InputMessage, KeyboardEventKind, KeyboardInput, LaunchedWindow,

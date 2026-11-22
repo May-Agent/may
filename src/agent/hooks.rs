@@ -337,7 +337,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let terminal = TestTerminal::new(dir.path()).await;
         let screenshot_path = dir.path().join("screen.png");
-        let png = crate::vision_ocr::tests::render_multilingual_text_png(
+        let png = may_media::test_support::render_multilingual_text_png(
             &[
                 "Deployment token leak test hunter2-secret-value",
                 "中文状态：运行正常",

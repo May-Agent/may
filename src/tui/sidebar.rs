@@ -10,6 +10,8 @@
 
 use std::collections::HashSet;
 
+pub use may_protocol::issue_brief::{IssueBrief, linked_issues};
+
 use crate::task_rows::TaskRow;
 
 /// Every collapsible section.
@@ -31,33 +33,6 @@ pub fn task_key(row: &TaskRow) -> String {
 
 /// Terminal width from which the sidebar is shown.
 pub const SIDEBAR_MIN_TERMINAL_WIDTH: u16 = 120;
-
-/// Every issue of the session's repository the rows name, first mention
-/// first, without repeats.
-#[must_use]
-pub fn linked_issues(rows: &[TaskRow]) -> Vec<i64> {
-    let mut out: Vec<i64> = Vec::new();
-    for reference in rows.iter().flat_map(|row| &row.references) {
-        if reference.is_local_issue()
-            && let Ok(number) = i64::try_from(reference.number)
-            && !out.contains(&number)
-        {
-            out.push(number);
-        }
-    }
-    out
-}
-
-/// A linked issue as the sidebar shows it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-pub struct IssueBrief {
-    /// Issue number.
-    pub number: i64,
-    /// Title, when the lookup succeeded.
-    pub title: Option<String>,
-    /// Whether the issue is closed.
-    pub closed: bool,
-}
 
 /// A section of the sidebar that collapses under its heading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

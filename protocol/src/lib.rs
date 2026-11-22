@@ -11,6 +11,8 @@
 pub mod ask_user;
 /// Provider prompt-cache lifetime.
 pub mod cache_lifetime;
+/// The per-tool-call store of images an IPC command produced.
+pub mod call_images;
 /// Streamed command output for the model.
 pub mod command_output;
 /// How a terminal call's script is read before it runs.
@@ -21,6 +23,8 @@ pub mod decode_meter;
 pub mod file_tracker;
 /// Model-facing ids: session names and each session's pool of words.
 pub mod id;
+/// The issues a session's task rows name, as the wire carries them.
+pub mod issue_brief;
 /// An assistant response as it streams: the live row and the settled one.
 pub mod live_response;
 /// Location lookup for location-aware profiles.
@@ -31,12 +35,16 @@ pub mod log_ring;
 pub mod model_ids;
 /// Model selection and filtering helpers.
 pub mod model_selector;
+/// A model and the `Parameters` of the requests sent to it, paired.
+pub mod model_slot;
 /// Catches a panic at the boundary of the operation that raised it.
 pub mod panic_boundary;
 /// Provider quota and rate-limit decoding.
 pub mod quota;
 /// The secret types the wire shares; the store is `may-config`'s.
 pub mod secrets;
+/// The rows of a session's `tasks.md` as clients see them.
+pub mod task_rows;
 /// XML block serialization for prompt/context payloads.
 pub mod xml;
 

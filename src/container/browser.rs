@@ -47,6 +47,7 @@ use chromiumoxide_fetcher::{
     BrowserVersion as ManagedBrowserVersion, Channel as ManagedBrowserChannel,
 };
 use futures_util::StreamExt;
+use may_media::webrtc;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use walkdir::WalkDir;

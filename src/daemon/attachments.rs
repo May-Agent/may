@@ -1103,7 +1103,7 @@ mod file_route_tests {
             .files_dir();
         async_fs::create_dir_all(&files_dir).await.expect("mkdir");
 
-        let shot_bytes = crate::vision_ocr::tests::render_multilingual_text_png(
+        let shot_bytes = may_media::test_support::render_multilingual_text_png(
             &[
                 "Cargo check failed in workspace",
                 "中文错误日志：配置无效",
@@ -1113,7 +1113,7 @@ mod file_route_tests {
             1200,
             600,
         );
-        let photo_bytes = crate::vision_ocr::tests::make_photo_png(1200, 800);
+        let photo_bytes = may_media::test_support::make_photo_png(1200, 800);
         async_fs::write(files_dir.join("shot.png"), &shot_bytes)
             .await
             .expect("write shot");

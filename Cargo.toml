@@ -17,18 +17,18 @@ path = "src/bin/may/main.rs"
 dist = true
 
 [workspace]
-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy"]
+members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness"]
 # `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
-default-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy"]
+default-members = [".", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness"]
 
 [features]
 default = ["vision-ocr"]
 ui = []
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
 # release, so its update channel defaults to `stable` instead of `dev`.
-release-build = ["may-config/release-build"]
+release-build = ["may-config/release-build", "may-harness/release-build"]
 # On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
-vision-ocr = ["dep:waterkit-vision"]
+vision-ocr = ["may-media/vision-ocr"]
 
 [dependencies]
 # The `tasks.md` parser and the `tasks` command; the container image tag is
@@ -42,6 +42,10 @@ may-tool-dist = { path = "tool-dist" }
 may-config = { path = "config" }
 # The terminal script policies checked before a script runs.
 may-command-policy = { path = "command-policy" }
+# The media layer: screen capture, the virtual desktop, WebRTC video, OCR.
+may-media = { path = "media" }
+# The agent harness: IPC commands, working documents, OAuth helpers, update.
+may-harness = { path = "harness" }
 # The content-addressed container image references.
 may-container-image = { path = "container-image" }
 libc = "0.2.191"
@@ -165,7 +169,6 @@ arboard = "3"
 base64 = "0.22"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["text"], optional = true }
 
 # HTTP client for fetching images
 zenwave = "0.7"
@@ -175,18 +178,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 smol-hyper = { version = "0.1.1", default-features = false }
 http-body-util = "0.1"
 
-# Browser automation (CDP) and WebRTC live streaming
+# Browser automation (CDP)
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 chromiumoxide_fetcher = "0.9.1"
-webrtc = "0.17"
-# webrtc-rs interceptors are `async_trait` traits.
-async-trait = { version = "0.1.92", default-features = false }
-# Hardware H.264 (software AV1 on hosts without an encoder) and the
-# platform JPEG decode that feeds it.
-mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "dev", default-features = false, features = ["software-encode"] }
-# RGB/BGRA to NV12 for the frames that cannot go to the encoder as surfaces;
-# already in the lockfile through mediax-codec.
-yuv = { version = "0.8", default-features = false }
 
 # Web server for `may gui`/`may rest`
 skyzen = { version = "0.5.1", features = ["hyper"] }
@@ -248,12 +242,6 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
-objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
-objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
-waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["display-stream"] }
-waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
-waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false }
-dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 
 [build-dependencies]
 may-container-image = { path = "container-image" }
@@ -264,6 +252,10 @@ may-container-image = { path = "container-image" }
 may-protocol = { path = "protocol", features = ["testing"] }
 may-tool-dist = { path = "tool-dist", features = ["test-fixtures"] }
 may-config = { path = "config", features = ["test-fixtures"] }
+# The fixture images the `vision_ocr` and attachment tests render.
+may-media = { path = "media", features = ["testing"] }
+# The `tasks.md` fixtures the session and issue tests build.
+may-harness = { path = "harness", features = ["testing"] }
 # Builds the tar.xz artifacts the distribution tests extract.
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 # Checks that every model-facing id word is one o200k_base token.

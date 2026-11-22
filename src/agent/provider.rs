@@ -392,44 +392,7 @@ where
 /// constructor, so no request leaves May without passing it.
 pub type ProviderLlm = RedactedModel<SessionModel>;
 
-/// A model and the [`Parameters`] of the requests sent to it. aither takes
-/// the parameters next to the model and adds the fields it owns on top.
-#[derive(Debug, Clone)]
-pub struct ModelSlot<M> {
-    /// The model.
-    pub llm: M,
-    /// The parameters its requests carry.
-    pub parameters: Parameters,
-}
-
-impl<M> ModelSlot<M> {
-    /// Pairs `llm` with the `parameters` of its requests.
-    pub const fn new(llm: M, parameters: Parameters) -> Self {
-        Self { llm, parameters }
-    }
-}
-
-impl<M: LanguageModel> ModelSlot<M> {
-    /// Streams the model's answer to a standalone request over `messages`
-    /// (a side question outside any agent) carrying this slot's parameters.
-    pub fn respond(
-        &self,
-        messages: Vec<aither_core::llm::Message>,
-    ) -> impl Stream<Item = Result<LlmEvent, M::Error>> + Send {
-        self.llm
-            .respond(LLMRequest::new(messages).with_parameters(self.parameters.clone()))
-    }
-
-    /// Generates a `T` from `messages` through the model's structured output,
-    /// carrying this slot's parameters.
-    pub fn generate<T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static>(
-        &self,
-        messages: Vec<aither_core::llm::Message>,
-    ) -> impl Future<Output = Result<T, aither_core::llm::GenerateError<M::Error>>> + Send {
-        self.llm
-            .generate(LLMRequest::new(messages).with_parameters(self.parameters.clone()))
-    }
-}
+pub use may_protocol::model_slot::ModelSlot;
 
 /// [`request_parameters_for`] for a session's `selector`, looking the provider
 /// instance up in `config`.

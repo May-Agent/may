@@ -15,10 +15,10 @@ pub use may_config::bash;
 pub mod browser_service;
 /// Bundled resources shipped with the binary.
 pub mod bundle;
+/// `ChatGPT` subscription OAuth flow.
+pub use may_harness::chatgpt;
 /// Provider prompt-cache lifetime.
 pub use may_protocol::cache_lifetime;
-/// `ChatGPT` subscription OAuth flow.
-pub mod chatgpt;
 pub mod ci;
 /// Client of the May daemon over its unix socket.
 pub mod client;
@@ -26,19 +26,19 @@ pub mod client;
 pub mod cloud;
 /// May's rules on what a terminal script may run.
 pub use may_command_policy as command_policy;
+pub use may_config::config;
+/// One virtual desktop per session — computer use.
+pub use may_media::computer;
 /// Streamed command output for the model.
 pub use may_protocol::command_output;
 /// How a terminal call's script is read before it runs.
 pub use may_protocol::command_reading;
-/// One virtual desktop per session — computer use.
-pub mod computer;
-pub use may_config::config;
 /// Container runtime detection, images, and lifecycle.
 pub mod container;
 /// GitHub Copilot OAuth flow.
-pub mod copilot;
+pub use may_harness::copilot;
 #[cfg(unix)]
-pub mod crash_signal;
+pub use may_harness::crash_signal;
 /// The resident daemon that runs every agent loop and serves the UIs.
 pub mod daemon;
 /// SQLite persistence for sessions, messages, and app state.
@@ -46,13 +46,13 @@ pub mod db;
 /// Forge coordinates and per-host authentication (GitHub, GitLab).
 pub use may_config::forge;
 pub use may_config::fs_utils;
+/// The one way git runs on the host.
+pub use may_config::host_git;
+/// xAI Grok subscription OAuth flow.
+pub use may_harness::grok;
 /// Live decode-speed measurement for streamed model output.
 pub use may_protocol::decode_meter;
 pub use may_protocol::file_tracker;
-/// xAI Grok subscription OAuth flow.
-pub mod grok;
-/// The one way git runs on the host.
-pub use may_config::host_git;
 pub use may_protocol::id;
 /// Issue tracking: may issues by default, GitHub when configured.
 pub mod issue;
@@ -65,7 +65,7 @@ pub use may_protocol::log_ring;
 #[cfg(test)]
 mod managed_environment_tests;
 /// MCP server configuration, connections, and management.
-pub mod mcp;
+pub use may_harness::mcp;
 /// Profile memory extraction and injection.
 pub mod memory;
 /// Model-facing ids: session names and each session's pool of words.
@@ -96,7 +96,7 @@ pub use may_protocol::quota;
 /// Per-session repository clones inside the session sandbox.
 pub mod repo_clone;
 pub mod repo_gate;
-pub mod repo_preflight;
+pub use may_harness::repo_preflight;
 /// repo-search daemon: code, session and issue search.
 pub mod repo_search;
 /// `/import-claude` and `/import-codex`: another agent's global rules and
@@ -107,11 +107,11 @@ pub mod scheduler;
 /// Repository trust: the first-contact decision, resolved per repo.
 pub mod trust;
 
-/// The user's global sleep state.
-/// May's IPC command bridge.
-pub mod harness;
-pub mod ipc;
 pub use may_config::secrets;
+/// What May's agents do around the loop.
+pub use may_harness::harness;
+/// May's IPC command bridge.
+pub use may_harness::ipc;
 /// Session model, history, and on-disk layout.
 pub mod session;
 pub mod shell;
@@ -122,14 +122,14 @@ pub mod sleep;
 pub mod startup;
 /// The `subagent` command and the agents it runs.
 pub mod subagent;
-/// The rows of `tasks.md` as clients see them.
-pub mod task_rows;
 /// Scheduled-task trigger definitions.
-pub mod task_trigger;
+pub use may_harness::task_trigger;
+/// The rows of `tasks.md` as clients see them.
+pub use may_protocol::task_rows;
 /// The command a scheduled task's run uses to prompt its session.
 pub mod task_wake;
 /// `tasks.md`: its format and the harness that keeps it current.
-pub mod tasks_md;
+pub use may_harness::tasks_md;
 /// Terminal commands exposed to the agent.
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.
@@ -143,11 +143,12 @@ pub mod tui;
 /// Event bus publishing UI-facing state changes.
 pub mod ui_event_bus;
 /// Self-update from CI artifacts (dev builds) or GitHub releases.
-pub mod update;
+pub use may_harness::update;
 
-pub(crate) mod video;
+/// The encoded video pipeline a stream carries.
+pub use may_media::video;
 /// On-device OCR and conditional downscaling for text-dense images.
-pub mod vision_ocr;
+pub use may_media::vision_ocr;
 /// HTTP/SSE server backing the web UI.
 /// Workspace request handling.
 pub mod workspace;
@@ -183,6 +184,13 @@ pub use xml::{XmlBlock, XmlBlockError};
 
 #[cfg(test)]
 mod commit_signing_tests;
+#[cfg(test)]
+mod ipc_bridge_tests;
+#[cfg(test)]
+mod runaway_tests;
+/// The `vision_ocr` test that drives `may-agent`'s `ChildHooks`.
+#[cfg(all(test, feature = "vision-ocr", target_os = "macos"))]
+mod vision_ocr_tests;
 
 /// Test support shared by the crate's `#[cfg(test)]` code.
 #[cfg(test)]
