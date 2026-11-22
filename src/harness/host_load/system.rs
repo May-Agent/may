@@ -169,9 +169,6 @@ mod linux {
 
     use super::{MachineLoad, MemoryPressure, ReadError, psi_avg10, psi_memory_pressure};
 
-    /// Stall time of the last ten seconds at which tasks waiting for a CPU
-    /// are a load worth telling the agent about.
-
     const MEMORY: &str = "/proc/pressure/memory";
     const CPU: &str = "/proc/pressure/cpu";
 
@@ -222,9 +219,6 @@ mod windows {
     use windows_sys::Win32::System::Threading::GetSystemTimes;
 
     use super::{MachineLoad, MemoryPressure, ReadError};
-
-    /// The share of CPU time not spent idle at which load is worth telling
-    /// the agent about.
 
     /// Cumulative CPU time in 100 ns ticks.
     #[derive(Debug, Clone, Copy)]
