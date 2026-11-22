@@ -4,6 +4,19 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The terminal E2E tests race their daemon on the shared macOS runner: each
+# test spawns a full daemon, sandbox, and subagent tree, so cap concurrent E2E
+# tests at 2 (`test-groups.terminal-e2e`; `threads-required = 2` would divide
+# 3-vCPU macOS runners down to `floor(3 / 2) = 1` serial execution) and allow
+# two retries under schedule load.
+[test-groups.terminal-e2e]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = "binary(terminal_first_e2e)"
+test-group = "terminal-e2e"
+retries = 2
+
 # Native Apple Vision / GPU OCR tests serialize so they do not contend on
 # Neural Engine / Metal initialization under parallel nextest workers.
 [test-groups.vision-ocr]

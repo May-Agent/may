@@ -93,8 +93,8 @@ If the slide doesn't look right:
 3. Capture the same preview URL again and re-verify
 4. Repeat until satisfied
 
-After the final verification, stop the preview server with `terminal_kill` and
-the task id returned in Step 2. Do not close the shared browser; the main agent
+After the final verification, stop the preview server with `kill <pid>` using
+the PID returned in Step 2. Do not close the shared browser; the main agent
 closes it after all slide creators finish.
 
 ### Step 5: Return Final Markdown

@@ -11,13 +11,13 @@ pub mod image_ref;
 
 /// The pinned host programs: `heel`, repo-search and the managed container
 /// runtime's `podman` client, in the pin file the distribution reads.
-const HOST_PROGRAMS: &[u8] = include_bytes!("../../src/tools/host-programs.json");
+const HOST_PROGRAMS: &[u8] = include_bytes!("../../tool-dist/src/host-programs.json");
 
 /// May's own pinned tool artifacts: `apply_patch`, `aither-sed` and bash.
-const MAY_ARTIFACTS: &[u8] = include_bytes!("../../src/tools/tool-artifacts.json");
+const MAY_ARTIFACTS: &[u8] = include_bytes!("../../tool-dist/src/tool-artifacts.json");
 
 /// The pinned third-party tool artifacts and Python interpreters.
-const THIRD_PARTY_TOOLS: &[u8] = include_bytes!("../../src/tools/third-party-tools.json");
+const THIRD_PARTY_TOOLS: &[u8] = include_bytes!("../../tool-dist/src/third-party-tools.json");
 
 /// The manifest assembled from May's pin files alone: the third-party
 /// artifacts and Python pins, then May's own artifacts, and the host
@@ -48,6 +48,7 @@ pub fn combined_manifest_bytes() -> serde_json::Result<Vec<u8>> {
 }
 
 /// Extract the `version` field of the `heel` package entry in `Cargo.lock`.
+#[must_use]
 pub fn heel_version_in_lockfile(lockfile: &str) -> Option<String> {
     let mut in_heel_package = false;
     for line in lockfile.lines() {

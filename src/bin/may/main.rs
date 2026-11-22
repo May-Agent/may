@@ -134,7 +134,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     // The permission helper instances the computer agent launches run this
     // same executable; they do their work and exit before anything else.
     #[cfg(target_os = "macos")]
-    if let Some(code) = waterkit_permission::run_helper_entry_if_requested() {
+    if let Some(code) = may_media::waterkit_permission::run_helper_entry_if_requested() {
         return Ok(code);
     }
     let runtime = tokio_runtime().context("failed to build the tokio runtime")?;

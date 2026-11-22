@@ -192,7 +192,6 @@ export const enUS = {
   tools: {
     terminal: 'Running a task',
     terminalInput: 'Sending input',
-    terminalKill: 'Stopping task',
     terminalRead: 'Checking output',
     browser: 'Using the browser',
     webSearch: 'Searching the web',

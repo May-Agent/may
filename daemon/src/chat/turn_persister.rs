@@ -1,0 +1,365 @@
+//! Atomic turn persistence for the agent event loop.
+//!
+//! Buffers all messages for one agent turn and writes them atomically
+//! at the end of the turn. SSE events continue streaming immediately —
+//! only the DB writes are deferred and batched.
+
+use jiff::Timestamp;
+
+use crate::db::{ChatDb, RunFence};
+use crate::session::history::{ChatMessage, MessageRole, MessageTranslation};
+
+/// A buffered message to be persisted at the end of the turn.
+struct PendingMessage {
+    role: MessageRole,
+    content: String,
+    tool_call_id: Option<String>,
+    /// The reply's display translation, when it drifted from the
+    /// communication language.
+    translation: Option<MessageTranslation>,
+    /// The reasoning streamed before this message.
+    thinking: Option<String>,
+    /// When the event happened, as stamped at its emission.
+    at: Timestamp,
+}
+
+/// Buffers chat messages for a turn and writes them atomically.
+pub struct TurnPersister {
+    fence: RunFence,
+    pending: Vec<PendingMessage>,
+    /// Reasoning streamed since the last assistant message; the next one
+    /// carries it.
+    reasoning: String,
+}
+
+impl TurnPersister {
+    pub const fn new(fence: RunFence) -> Self {
+        Self {
+            fence,
+            pending: Vec::new(),
+            reasoning: String::new(),
+        }
+    }
+
+    /// Collect a streamed reasoning chunk for the next assistant message.
+    pub fn push_reasoning(&mut self, chunk: &str) {
+        self.reasoning.push_str(chunk);
+    }
+
+    /// Buffer an assistant text message emitted at `at`, carrying the
+    /// reasoning streamed before it.
+    pub fn push_assistant(&mut self, content: String, at: Timestamp) {
+        let thinking = std::mem::take(&mut self.reasoning);
+        self.pending.push(PendingMessage {
+            role: MessageRole::Assistant,
+            content,
+            tool_call_id: None,
+            translation: None,
+            thinking: (!thinking.trim().is_empty()).then_some(thinking),
+            at,
+        });
+    }
+
+    /// Attach `translation` to the assistant message buffered last.
+    ///
+    /// # Panics
+    /// When the last buffered message is not an assistant message.
+    pub fn translate_last(&mut self, translation: MessageTranslation) {
+        let last = self
+            .pending
+            .last_mut()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .expect("a translation belongs to the assistant message just buffered");
+        last.translation = Some(translation);
+    }
+
+    /// Buffer a tool event (start or end) with its serialized record, emitted at `at`.
+    pub fn push_tool_event(&mut self, tool_call_id: String, serialized: String, at: Timestamp) {
+        self.pending.push(PendingMessage {
+            role: MessageRole::Tool,
+            content: serialized,
+            tool_call_id: Some(tool_call_id),
+            translation: None,
+            thinking: None,
+            at,
+        });
+    }
+
+    fn build_chat_messages(&self) -> Vec<ChatMessage> {
+        self.pending
+            .iter()
+            .map(|msg| ChatMessage {
+                id: None,
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                attachments: Vec::new(),
+                timestamp: Some(msg.at),
+                tool_call_id: msg.tool_call_id.clone(),
+                stats: None,
+                reasoning: Vec::new(),
+                tool_calls: Vec::new(),
+                translation: msg.translation.clone(),
+                reading: None,
+                card: None,
+                thinking: msg.thinking.clone(),
+            })
+            .collect()
+    }
+
+    pub fn take_pending_chat_messages(&mut self) -> Vec<ChatMessage> {
+        let built = self.build_chat_messages();
+        self.pending.clear();
+        built
+    }
+
+    /// Flush all buffered messages atomically in a single fenced transaction.
+    ///
+    /// On failure, `self.pending` remains intact so a retry or deferred flush
+    /// never loses buffered turn messages.
+    pub async fn flush(&mut self, db: &ChatDb) -> Result<Option<i64>, crate::db::ChatDbError> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+
+        let chat_messages = self.build_chat_messages();
+        let last_id = db
+            .append_chat_messages_as_run(&self.fence, &chat_messages)
+            .await?;
+        self.pending.clear();
+        Ok(last_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+    use tempfile::tempdir;
+
+    use super::TurnPersister;
+    use crate::db::ChatDb;
+    use crate::session::history::ChatMessage;
+    use crate::session::load_history_from_db;
+
+    #[tokio::test]
+    async fn a_reply_translation_is_stored_beside_the_original_and_reaches_clients() {
+        use crate::session::MessageTranslation;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-translated";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
+        let mut persister = TurnPersister::new(fence);
+        persister.push_assistant("All done.".to_string(), Timestamp::now());
+        persister.translate_last(MessageTranslation {
+            text: "全部完成。".to_string(),
+            language: "cmn".to_string(),
+        });
+        persister.push_assistant("Plain reply.".to_string(), Timestamp::now());
+        persister.flush(&db).await.expect("turn should flush");
+
+        // The model's history keeps the original; the translation rides beside it.
+        let history = load_history_from_db(&db, session_id)
+            .await
+            .expect("history should load");
+        let messages = history.messages();
+        assert_eq!(messages[0].content, "All done.");
+        assert_eq!(
+            messages[0].translation,
+            Some(MessageTranslation {
+                text: "全部完成。".to_string(),
+                language: "cmn".to_string(),
+            })
+        );
+        assert_eq!(messages[1].translation, None);
+
+        // A reloaded session shows it through the API message mapping.
+        let rows = db.get_messages(session_id).await.expect("rows load");
+        let api = crate::message_mapping::map_db_messages(&rows).expect("rows map");
+        let translation = api[0]
+            .translation
+            .as_ref()
+            .expect("translation reaches the API");
+        assert_eq!(translation.text, "全部完成。");
+        assert_eq!(translation.language, "cmn");
+        assert_eq!(translation.language_name, "Chinese");
+        assert_eq!(api[0].content, "All done.");
+        assert!(api[1].translation.is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_reaches_the_message_it_precedes_after_reload() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-thinking";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
+        let at = Timestamp::now();
+        let mut persister = TurnPersister::new(fence);
+        persister.push_reasoning("plan the ");
+        persister.push_reasoning("lookup");
+        persister.push_assistant("Checking.".to_string(), at);
+        persister.push_tool_event("call_1".to_string(), "start".to_string(), at);
+        persister.push_tool_event("call_1".to_string(), "end".to_string(), at);
+        persister.push_reasoning("思考 / 考える / 생각");
+        persister.push_assistant("Done.".to_string(), at);
+        persister.push_assistant("No reasoning.".to_string(), at);
+        persister.flush(&db).await.expect("turn should flush");
+
+        let history = load_history_from_db(&db, session_id)
+            .await
+            .expect("history should load");
+        let thinking: Vec<_> = history
+            .messages()
+            .iter()
+            .map(|m| m.thinking.as_deref())
+            .collect();
+        assert_eq!(
+            thinking,
+            [
+                Some("plan the lookup"),
+                None,
+                None,
+                Some("思考 / 考える / 생각"),
+                None
+            ]
+        );
+
+        let rows = db.get_messages(session_id).await.expect("rows load");
+        let api = crate::message_mapping::map_db_messages(&rows).expect("rows map");
+        assert_eq!(api[0].thinking.as_deref(), Some("plan the lookup"));
+        assert_eq!(api[1].thinking.as_deref(), Some("思考 / 考える / 생각"));
+        assert_eq!(api[2].thinking, None);
+    }
+
+    #[tokio::test]
+    async fn restored_entries_keep_their_emission_times() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-times";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+
+        let before_user = Timestamp::now();
+        let user = ChatMessage::user("hello");
+        let after_user = Timestamp::now();
+        let user_at = user
+            .timestamp
+            .expect("a user message is stamped on receipt");
+        assert!(before_user <= user_at && user_at <= after_user);
+        db.append_chat_message(session_id, &user)
+            .await
+            .expect("user message should persist");
+
+        // Emission times well before "now" prove the persister keeps the
+        // stamp it was handed rather than taking its own at flush time.
+        let tool_start_at: Timestamp = "2024-03-01T10:00:01.250Z".parse().expect("valid time");
+        let tool_end_at: Timestamp = "2024-03-01T10:00:04.750Z".parse().expect("valid time");
+        let answer_at: Timestamp = "2024-03-01T10:00:06.500Z".parse().expect("valid time");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
+        let mut persister = TurnPersister::new(fence);
+        persister.push_tool_event("call_1".to_string(), "start".to_string(), tool_start_at);
+        persister.push_tool_event("call_1".to_string(), "end".to_string(), tool_end_at);
+        persister.push_assistant("done".to_string(), answer_at);
+        persister.flush(&db).await.expect("turn should flush");
+
+        let history = load_history_from_db(&db, session_id)
+            .await
+            .expect("history should load");
+        let times: Vec<_> = history.messages().iter().map(|m| m.timestamp).collect();
+        assert_eq!(
+            times,
+            [
+                Some(user_at),
+                Some(tool_start_at),
+                Some(tool_end_at),
+                Some(answer_at)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_is_atomic_on_mid_batch_failure_and_retains_pending_for_retry() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-atomic-flush";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(db.claim_session_run(&fence).await.expect("claim"));
+
+        // Abort on the second message insert so a non-transactional loop would
+        // leave the first message committed and lose `self.pending`.
+        db.execute_for_test(
+            "CREATE TRIGGER abort_second_msg BEFORE INSERT ON messages WHEN NEW.content = 'second' BEGIN SELECT RAISE(ABORT, 'mid-turn failure'); END;",
+        )
+        .await
+        .expect("trigger created");
+
+        let at = Timestamp::now();
+        let mut persister = TurnPersister::new(fence);
+        persister.push_assistant("first".to_string(), at);
+        persister.push_assistant("second".to_string(), at);
+
+        assert!(persister.flush(&db).await.is_err());
+        let rows_after_fail = db.get_messages(session_id).await.expect("rows");
+        assert!(
+            rows_after_fail.is_empty(),
+            "single-transaction flush must roll back earlier rows on mid-batch error"
+        );
+
+        db.execute_for_test("DROP TRIGGER abort_second_msg;")
+            .await
+            .expect("trigger dropped");
+        let last_id = persister
+            .flush(&db)
+            .await
+            .expect("retained pending messages must flush on retry");
+        assert!(last_id.is_some());
+        let rows = db.get_messages(session_id).await.expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content, "first");
+        assert_eq!(rows[1].content, "second");
+    }
+}

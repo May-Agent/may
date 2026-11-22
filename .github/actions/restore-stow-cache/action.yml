@@ -1,0 +1,54 @@
+name: Restore stow cache
+description: Restore the shared stow artifact store and Cargo git/registry caches before setting up water-rs/stow@main. Callers on main save and retire superseded generations at the end of the job using the outputs below.
+inputs:
+  lane:
+    description: Short cache lane identifier (for example `clippy`, `test-ubuntu`, `test-macos`).
+    required: true
+outputs:
+  cache-prefix:
+    description: Prefix matching every generation of this lane's stow cache.
+    value: ${{ steps.key.outputs.prefix }}
+  cache-key:
+    description: Exact cache key for this toolchain and lockfile.
+    value: ${{ steps.key.outputs.key }}
+  cache-hit:
+    description: "'true' when an exact cache entry was restored."
+    value: ${{ steps.restore.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: |
+        set -euo pipefail
+        digest() { sha256sum "$@" 2>/dev/null || shasum -a 256 "$@"; }
+        rustc_hash="$(rustc -vV | digest | cut -c1-12)"
+        lock_hash="$(cat Cargo.lock .cargo/config.toml | digest | cut -c1-16)"
+        prefix="v1-stow-${{ inputs.lane }}-${RUNNER_OS}-${RUNNER_ARCH}-${rustc_hash}-"
+        {
+          echo "prefix=${prefix}"
+          echo "key=${prefix}${lock_hash}"
+        } >> "${GITHUB_OUTPUT}"
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.stow
+          !~/.stow/build-dir
+          ~/.cargo/git/db
+          ~/.cargo/git/checkouts
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: |
+          ${{ steps.key.outputs.prefix }}
+    # macOS GitHub runners ship a 256 soft RLIMIT_NOFILE, which exhausts file
+    # descriptors (`os error 24`) when stow-daemon materializes large dependency
+    # closures concurrently. Raise system limits before stow starts its daemon.
+    - name: Raise macOS open-file limits for stow
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        sudo sysctl -w kern.maxfiles=200000 kern.maxfilesperproc=65536 >/dev/null 2>&1 || true
+        sudo launchctl limit maxfiles 65536 200000 >/dev/null 2>&1 || true
+    - uses: water-rs/stow@main
