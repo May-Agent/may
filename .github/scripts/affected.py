@@ -120,8 +120,8 @@ EMBEDDED_OWNERS = {
         {"may-tui", "may-harness", "may-agent-core", "may-daemon"}
     ),
     # build.rs hashes the container/ contexts; may-container-image's tests
-    # read them, and may-daemon owns the build once it moves.
-    "container/": frozenset({"may-container-image", "may-daemon"}),
+    # read them, and may-agent-core / may-daemon bake the image references.
+    "container/": frozenset({"may-container-image", "may-agent-core", "may-daemon"}),
 }
 EMBEDDED_PREFIXES = tuple(EMBEDDED_OWNERS)
 
