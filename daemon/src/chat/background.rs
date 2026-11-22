@@ -195,7 +195,7 @@ impl SessionBackgrounds {
             let Some(info) = jobs.list().await.into_iter().find(|job| job.pid == pid) else {
                 continue;
             };
-            if let Some(job) = jobs.get(info.pid).await {
+            if let Some(job) = jobs.get(&info.task_id).await {
                 return Some((job, info));
             }
         }

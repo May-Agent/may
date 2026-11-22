@@ -144,7 +144,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         })
         .await
         .map_err(ExecError::TerminalCall)?;
-    let pid = job.pid();
+    let pid = job.task_id().parse().unwrap_or(0);
     let result = job
         .wait()
         .await

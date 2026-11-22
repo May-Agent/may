@@ -480,11 +480,9 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             _ => None,
         };
         let ended = async {
-            let (finished, _, _) = select_all(
-                waiting
-                    .iter()
-                    .map(|job| Box::pin(async move { (job.task_id().parse().unwrap_or(0), job.wait().await) })),
-            )
+            let (finished, _, _) = select_all(waiting.iter().map(|job| {
+                Box::pin(async move { (job.task_id().parse().unwrap_or(0), job.wait().await) })
+            }))
             .await;
             let (pid, result) = finished;
             let end = match result {

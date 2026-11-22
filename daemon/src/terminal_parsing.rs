@@ -139,7 +139,7 @@ mod tests {
         );
         assert_eq!(
             terminal_status_from_result(&command(CommandOutcome::Killed {
-                pid: 4242,
+                task_id: "4242".to_string(),
                 notice: "killed at its timeout".to_string(),
             })),
             TerminalExecutionStatus::Failed

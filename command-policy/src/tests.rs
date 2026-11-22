@@ -102,13 +102,7 @@ async fn a_shell_script_that_does_not_parse_is_refused_and_python_is_not_checked
         "{decision:?}"
     );
     let start = ScriptDir::Host(PathBuf::from("/"));
-    let mut python = check_with(
-        "task",
-        "import os",
-        None,
-        ScriptOrigin::Foreground,
-        &start,
-    );
+    let mut python = check_with("task", "import os", None, ScriptOrigin::Foreground, &start);
     python.interpreter = Interpreter::Python;
     assert_eq!(
         KillByName::new().check(&python, &()).await,

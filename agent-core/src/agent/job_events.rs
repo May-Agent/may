@@ -128,7 +128,9 @@ impl JobReport {
                 elapsed: elapsed_text(job.after()),
             }),
             ShellEvent::StdinBlocked(job) => {
-                self.alert(&JobAlertText::StdinBlocked { pid: job.task_id().parse().unwrap_or(0) });
+                self.alert(&JobAlertText::StdinBlocked {
+                    pid: job.task_id().parse().unwrap_or(0),
+                });
                 self.needs_model = true;
             }
             ShellEvent::StdinWatchFailed(job) => self.alert(&JobAlertText::StdinWatchFailed {

@@ -728,7 +728,8 @@ pub async fn try_connection(
 
 /// A trial session ready to run: its scratch directory, the host that knows
 /// only the candidate agent and the session to open.
-pub(crate) struct PreparedTrial {
+#[derive(Debug)]
+pub struct PreparedTrial {
     scratch: tempfile::TempDir,
     host: SandboxedHost,
     spec: SessionSpec,
@@ -740,7 +741,7 @@ pub(crate) struct PreparedTrial {
 /// # Errors
 /// Returns [`TrialError`] when the directory, the sandbox or the host cannot
 /// be prepared.
-pub(crate) async fn prepare_trial(
+pub async fn prepare_trial(
     name: &str,
     agent: &AcpAgentConfig,
     heel: heel::HeelBinary,
@@ -770,7 +771,7 @@ pub(crate) async fn prepare_trial(
 ///
 /// # Errors
 /// As [`try_connection`], except preparation failures.
-pub(crate) async fn run_trial(
+pub async fn run_trial(
     runtime: &Handle,
     limit: std::time::Duration,
     trial: PreparedTrial,
@@ -895,7 +896,7 @@ mod tests {
             command: "python3".to_string(),
             args: vec![
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/fake_acp_agent.py")
+                    .join("../tests/fixtures/fake_acp_agent.py")
                     .to_string_lossy()
                     .into_owned(),
             ],
@@ -908,7 +909,7 @@ mod tests {
     }
 
     fn fixtures_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures")
     }
 
     /// A sandbox rooted in `root` that reads the fake agent's script and the

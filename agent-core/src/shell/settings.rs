@@ -162,10 +162,7 @@ pub fn shell_tool_settings(budgets: &ShellBudgets) -> ShellToolSettings {
         ),
         read: identity(READ_TOOL, rendered(&ReadDescription)),
         input: identity(INPUT_TOOL, rendered(&InputDescription)),
-        kill: identity(
-            "terminal_kill",
-            "Kills a background job by PID.".into(),
-        ),
+        kill: identity("terminal_kill", "Kills a background job by PID.".into()),
     }
 }
 

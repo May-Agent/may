@@ -630,7 +630,7 @@ fn choose(options: &[PermissionOption], approved: bool) -> PermissionOutcome {
 pub(crate) async fn test_sandbox(root: &Path) -> aither_sandbox::Sandbox {
     let heel = crate::tools::test_heel().await;
     let grants = Grants::new();
-    grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
+    grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures"));
     grants.add_writable(root);
     std::fs::create_dir_all(root).expect("session dir");
     let tmp = std::fs::canonicalize(root)
@@ -656,7 +656,7 @@ mod tests {
             program: "python3".to_string(),
             args: vec![
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/fake_acp_agent.py")
+                    .join("../tests/fixtures/fake_acp_agent.py")
                     .to_string_lossy()
                     .into_owned(),
             ],
@@ -749,7 +749,7 @@ mod tests {
         let mut spec = fake_agent_spec(&root);
         spec.args = vec![
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/job_probe.py")
+                .join("../tests/fixtures/job_probe.py")
                 .to_string_lossy()
                 .into_owned(),
             report.to_string_lossy().into_owned(),

@@ -30,8 +30,8 @@ struct JobReadText<'a> {
 
 #[derive(Template)]
 #[template(path = "shell/job_input.txt", escape = "none")]
-struct JobInputText {
-    pid: u32,
+struct JobInputText<'a> {
+    task_id: &'a str,
 }
 
 #[derive(Template)]
@@ -62,8 +62,8 @@ struct MonitorRefused<'a> {
 
 #[derive(Template)]
 #[template(path = "shell/monitor_started.txt", escape = "none")]
-struct MonitorStartedText {
-    pid: u32,
+struct MonitorStartedText<'a> {
+    task_id: &'a str,
     interval_secs: u64,
 }
 
@@ -186,7 +186,9 @@ impl ShellWording for MayShellWording {
     }
 
     fn job_input(&self, sent: &JobInputSent) -> String {
-        rendered(&JobInputText { pid: sent.pid })
+        rendered(&JobInputText {
+            task_id: sent.task_id,
+        })
     }
 
     fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
@@ -240,7 +242,7 @@ impl ShellWording for MayShellWording {
 
     fn monitor_started(&self, started: &MonitorStarted) -> String {
         rendered(&MonitorStartedText {
-            pid: started.pid,
+            task_id: started.task_id,
             interval_secs: started.interval_secs,
         })
     }
@@ -336,14 +338,18 @@ mod tests {
 
     #[test]
     fn a_repeated_read_is_refused_with_the_way_to_follow_a_job() {
-        let text = MayShellWording.job_read(&JobRead::Unchanged { pid: 4242 });
+        let text = MayShellWording.job_read(&JobRead::Unchanged {
+            task_id: "4242".to_string(),
+        });
         assert!(text.contains("PID 4242 produced no new output"), "{text}");
         assert!(text.contains("`monitor`"));
     }
 
     #[test]
     fn input_to_a_foreground_task_is_refused_through_the_template() {
-        let text = MayShellWording.call_refused(&CallRefusal::NoStdin { pid: 4242 });
+        let text = MayShellWording.call_refused(&CallRefusal::NoStdin {
+            task_id: "4242".to_string(),
+        });
         assert_eq!(
             text,
             "job with PID 4242 takes no input: it started in the foreground, where stdin reads end of file; only a job started with background: true has a stdin to write to"

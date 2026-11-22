@@ -247,6 +247,3 @@ aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-skills = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "main" }
-
-heel = { git = "https://github.com/May-Agent/heel", branch = "main" }
-heel-shim = { git = "https://github.com/May-Agent/heel", branch = "main" }
