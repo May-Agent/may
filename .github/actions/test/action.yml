@@ -2,7 +2,12 @@ name: Test
 description: Build and test the workspace on the runner it runs on. The check job names are fixed by the ruleset, so each runner has a job of its own around these steps.
 inputs:
   cargo-flags:
-    description: Target selection flags passed to cargo build and cargo nextest run.
+    description: >
+      Package and target selection flags passed to cargo test --no-run and
+      cargo nextest run — the scope job's `-p <pkg>`/`--workspace` plus the
+      target kinds (`--all-targets` when the e2e gates run, `--lib --bins`
+      when they do not, so a client-only diff never compiles
+      tests/terminal_first_e2e.rs).
     required: false
     default: '--workspace --all-targets'
   upload-may:
@@ -65,15 +70,17 @@ runs:
     - name: Install nasm
       if: runner.os == 'Linux' && runner.arch == 'X64'
       uses: ./.github/actions/install-nasm
-    # Builds the test targets the nextest step runs, so that step compiles
-    # nothing; `cargo build` would build the non-test libraries instead, which
-    # no test uses. The integration tests and `--all-targets` still build the
-    # `may` binary the next steps upload.
+    # Install nextest up front and build with `cargo nextest run --no-run` so
+    # the build step and the test step share the exact Cargo environment
+    # (`NEXTEST=1` and target selection); building with plain `cargo test
+    # --no-run` first caused nextest's invocation to invalidate fingerprints
+    # and recompile the workspace a second time (~14 min on macOS).
+    - uses: taiki-e/install-action@nextest
     - name: cargo build
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
-        cargo test --locked ${{ inputs.cargo-flags }} --no-run --timings
+        cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
     # Every run keeps the debug may it built, so a commit can be tested on
     # another machine without building it there. It is packed as a tarball
     # because artifacts drop the executable bit.
@@ -118,8 +125,6 @@ runs:
     # runs the binaries one after another. May has no Rust doc-tests (its doc
     # code blocks are text, bash, toml or `ignore`), so there is no
     # `cargo test --doc` step.
-    - if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
-      uses: taiki-e/install-action@nextest
     - name: cargo nextest
       if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash

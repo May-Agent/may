@@ -1,0 +1,158 @@
+[package]
+name = "may-agent-core"
+version = "0.1.1"
+edition = "2024"
+description = "May's agent core: the MayAgent wrapper, tools, containers, and session-adjacent runtimes"
+license = "MIT"
+build = "build.rs"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[features]
+default = ["vision-ocr"]
+# On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
+vision-ocr = ["may-media/vision-ocr"]
+# Sandbox fixtures shared by other crates' `#[cfg(test)]` code.
+testing = [
+    "may-protocol/testing",
+    "may-tool-dist/test-fixtures",
+    "may-config/test-fixtures",
+    "may-media/testing",
+    "may-harness/testing",
+]
+
+[dependencies]
+# The `tasks.md` parser and the `tasks` command; the container image tag is
+# derived from this crate's directory.
+may-tasks = { path = "../tasks" }
+# The foundational wire types and leaf utilities extracted from the root crate.
+may-protocol = { path = "../protocol" }
+# The pinned tool distribution every execution backend prepares.
+may-tool-dist = { path = "../tool-dist" }
+# The configuration layer: config.toml and everything it touches.
+may-config = { path = "../config" }
+# The terminal script policies checked before a script runs.
+may-command-policy = { path = "../command-policy" }
+# The media layer: screen capture, the virtual desktop, WebRTC video, OCR.
+may-media = { path = "../media" }
+may-db = { path = "../db" }
+may-providers = { path = "../providers" }
+may-client = { path = "../client" }
+# The repo-search daemon client: code, session and issue search.
+may-repo-search = { path = "../repo-search" }
+# The forge clients and check views behind `pr` and `ci`.
+may-git-forge = { path = "../git-forge" }
+# The agent harness: IPC commands, working documents, OAuth helpers, update.
+may-harness = { path = "../harness" }
+# The content-addressed container image references.
+may-container-image = { path = "../container-image" }
+# Aither framework
+aither-core = { version = "0.31.0" }
+aither-agent = { version = "0.31.0", features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
+aither-connectivity = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0", features = ["code-folding", "connectivity", "jobserver"] }
+aither-cloud = { version = "0.31.0" }
+aither-codex = { version = "0.31.0" }
+aither-models = { version = "0.31.0" }
+aither-browser = { version = "0.31.0" }
+aither-acp = { version = "0.31.0" }
+# The sandbox ACP agents and their terminal commands run in; the version
+# aither-sandbox builds its own sandboxes with.
+heel = { version = "0.10.1", default-features = false }
+# ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
+acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
+# Container runtime (Docker/OrbStack/Podman)
+bollard = "0.21"
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures-lite = "2.6"
+futures-util = "0.3"
+bytes = "1"
+async-stream = "0.3"
+event-listener = "5"
+executor-core = { version = "0.7", features = ["tokio"] }
+async-fs = "2.1"
+async-io = "2.6"
+async-process = "2.5"
+async-channel = "2"
+async-lock = "3"
+blocking = "1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+schemars = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+dashmap = "6"
+
+# Utils
+jiff = { version = "0.2", features = ["serde"] }
+shell-escape = "0.1"
+shell-words = "1.1"
+shlex = "2"
+arc-swap = { version = "1", features = ["weak"] }
+thiserror = "2"
+tracing = "0.1"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+getrandom = "0.4"
+regex = "1.12"
+walkdir = "2"
+ignore = "0.4"
+dunce = "1.0.5"
+which = { version = "8", default-features = false }
+tempfile = "3.24.0"
+git2 = "0.20.3"
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
+
+# Markdown parsing for structured input where one-shot correctness matters.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
+# Clipboard, image, and browser
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# HTTP client for fetching images and streaming provider calls.
+zenwave = "0.7"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# Web Push notifications
+web-push = "0.11"
+p256 = "0.13"
+dirs = "6"
+
+# Browser automation (CDP)
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide_fetcher = "0.9.1"
+
+# JSON with comments and trailing commas for devcontainer.json.
+jsonc-parser = { version = "0.34", default-features = false, features = ["serde"] }
+
+# Templating
+askama = "0.16"
+skyzen = { version = "0.5.1" }
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+mime_guess = "2"
+sha2 = "0.10"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+[build-dependencies]
+may-container-image = { path = "../container-image" }
+
+[dev-dependencies]
+# Test-support helpers: the `serve_api` server, the fixture tool
+# distribution.
+may-protocol = { path = "../protocol", features = ["testing"] }
+may-tool-dist = { path = "../tool-dist", features = ["test-fixtures"] }
+may-config = { path = "../config", features = ["test-fixtures"] }
+# The fixture images the `vision_ocr` and attachment tests render.
+may-media = { path = "../media", features = ["testing"] }
+# The `tasks.md` fixtures the session and issue tests build.
+may-harness = { path = "../harness", features = ["testing"] }
+tokio-test = "0.4"
+
+[lints]
+workspace = true
