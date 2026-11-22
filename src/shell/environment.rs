@@ -179,6 +179,12 @@ fn tool_grants(tools: &PreparedTools<PathBuf>) -> heel::Result<Vec<Grant>> {
                 Access::READ | Access::WRITE | Access::EXEC,
             ))
         }))
+        .chain(
+            dirs::data_local_dir()
+                .map(|data| data.join("stow").join("tools"))
+                .filter(|path| path.is_dir())
+                .map(|path| Ok(Grant::new(resolved(&path)?, Access::READ | Access::EXEC))),
+        )
         .collect()
 }
 
