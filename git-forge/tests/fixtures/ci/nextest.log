@@ -1,0 +1,15 @@
+##[group]Run cargo nextest run --color never
+cargo nextest run --color never
+##[endgroup]
+2026-11-06T10:14:03.1234567Z     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+2026-11-06T10:14:03.1234567Z ────────────
+2026-11-06T10:14:03.1234567Z  Nextest run ID 76e08c14-3e26-429f-90f6-c1a8f16d3e09 with nextest profile: default
+2026-11-06T10:14:03.1234567Z     Starting 5 tests across 2 binaries
+2026-11-06T10:14:03.1234567Z         PASS [   0.040s] (1/5) sample tests::fast_parse
+2026-11-06T10:14:03.1234567Z         PASS [   0.319s] (2/5) sample::integration roundtrip
+2026-11-06T10:14:03.1234567Z         PASS [   1.226s] (3/5) sample tests::medium_render
+2026-11-06T10:14:03.1234567Z         PASS [   2.125s] (4/5) sample::integration cold_start
+2026-11-06T10:14:03.1234567Z         SLOW [> 60.000s] (───) sample tests::slow_index_rebuild
+2026-11-06T10:14:03.1234567Z         PASS [  62.026s] (5/5) sample tests::slow_index_rebuild
+2026-11-06T10:14:03.1234567Z ────────────
+2026-11-06T10:14:03.1234567Z      Summary [  62.033s] 5 tests run: 5 passed (1 slow), 0 skipped
