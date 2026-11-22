@@ -2,7 +2,12 @@ name: Test
 description: Build and test the workspace on the runner it runs on. The check job names are fixed by the ruleset, so each runner has a job of its own around these steps.
 inputs:
   cargo-flags:
-    description: Target selection flags passed to cargo build and cargo nextest run.
+    description: >
+      Package and target selection flags passed to cargo test --no-run and
+      cargo nextest run — the scope job's `-p <pkg>`/`--workspace` plus the
+      target kinds (`--all-targets` when the e2e gates run, `--lib --bins`
+      when they do not, so a client-only diff never compiles
+      tests/terminal_first_e2e.rs).
     required: false
     default: '--all-targets'
   upload-may:

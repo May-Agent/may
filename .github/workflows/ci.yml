@@ -16,69 +16,90 @@ permissions:
   contents: read
 
 jobs:
-  # Selects the jobs the change reads (.github/scripts/ci-scope.sh holds the
-  # path rules). The ruleset requires one check, `CI result`, which needs
-  # `fmt`, `clippy`, `web-ui` and both test jobs and passes when each of them
-  # succeeded or was skipped by its job-level `if`. Should this job itself
-  # fail, the others run, so a broken scope never skips coverage.
+  # Selects the jobs the change reads: the shared lexoliu/affected-crates
+  # tool marks the workspace packages the merge-base diff affects plus every
+  # reverse dependency (path rules in .github/affected-rules.toml), and
+  # .github/scripts/affected.py turns its report into the job gates and the
+  # cargo `-p` selection below. The ruleset requires one check, `CI result`,
+  # which needs `fmt`, `clippy`, `web-ui` and both test jobs and passes when
+  # each of them succeeded or was skipped by its job-level `if`. Should this
+  # job itself fail, the others run, so a broken scope never skips coverage;
+  # the tool step is allowed to fail for the same reason — affected.py then
+  # widens the gate to the whole workspace.
   scope:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      rust: ${{ steps.scope.outputs.rust }}
       fmt: ${{ steps.scope.outputs.fmt }}
       clippy: ${{ steps.scope.outputs.clippy }}
+      ui-clippy: ${{ steps.scope.outputs.ui-clippy }}
       test: ${{ steps.scope.outputs.test }}
+      e2e: ${{ steps.scope.outputs.e2e }}
       web_ui: ${{ steps.scope.outputs.web_ui }}
       acceptance: ${{ steps.scope.outputs.acceptance }}
+      packages: ${{ steps.scope.outputs.packages }}
+      package-args: ${{ steps.scope.outputs.package-args }}
+      linux-package-args: ${{ steps.scope.outputs.linux-package-args }}
+      cargo-flags: ${{ steps.scope.outputs.cargo-flags }}
+      linux-cargo-flags: ${{ steps.scope.outputs.linux-cargo-flags }}
+      ui-args: ${{ steps.scope.outputs.ui-args }}
     steps:
       # The diff needs the base commit, which a shallow clone lacks.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The affected-crates tool resolves the package graph with cargo.
+      - uses: dtolnay/rust-toolchain@stable
       # A pull request measures from the merge base with its base branch; a
       # merge group from the main commit it is built on; a push from the commit
       # main pointed at before. A push with no previous commit (all zeros) has no
       # base, so it selects everything.
-      - id: scope
+      - id: base
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           GROUP_BASE: ${{ github.event.merge_group.base_sha }}
-          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
           case "${EVENT}" in
-            pull_request) range="${PR_BASE}...${PR_HEAD}" ;;
-            merge_group) range="${GROUP_BASE}..${GROUP_HEAD}" ;;
-            push) range="${PUSH_BEFORE}..${PUSH_AFTER}" ;;
+            pull_request) base="${PR_BASE}" ;;
+            merge_group) base="${GROUP_BASE}" ;;
+            push) base="${PUSH_BEFORE}" ;;
             *) echo "::error::unexpected event ${EVENT}"; exit 1 ;;
           esac
-          if [ "${EVENT}" = push ] && [ "${PUSH_BEFORE}" = 0000000000000000000000000000000000000000 ]; then
-            printf 'fmt=true\nclippy=true\ntest=true\nweb_ui=true\nacceptance=true\n' | tee -a "${GITHUB_OUTPUT}"
-          else
-            files="$(git diff --name-only "${range}")"
-            printf '%s\n' "${files}" | tee /dev/stderr
-            if [ -n "${files}" ] \
-              && ! printf '%s\n' "${files}" | grep -qv -e 'CHANGELOG\.md$' -e '^Cargo\.toml$' -e '^Cargo\.lock$' \
-              && ! git diff -U0 "${range}" -- Cargo.toml Cargo.lock \
-                   | grep '^[+-]' | grep -v '^[+-]\{3\}' | grep -vq 'version *='; then
-              # Version and changelog edits change no compiled code: the
-              # release-plz bump they carry was already green on main.
-              printf 'fmt=false\nclippy=false\ntest=false\nweb_ui=false\nacceptance=false\n' | tee -a "${GITHUB_OUTPUT}"
-            else
-              printf '%s\n' "${files}" | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
-            fi
+          if [ "${base}" = 0000000000000000000000000000000000000000 ]; then
+            base=""
           fi
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
+      # A failed step leaves `report` empty, and affected.py then widens to
+      # the whole workspace instead of failing the gate.
+      - name: Select the affected packages
+        id: shared
+        if: steps.base.outputs.base != ''
+        continue-on-error: true
+        uses: lexoliu/affected-crates@v0.0.1
+        with:
+          base: ${{ steps.base.outputs.base }}
+          rules: .github/affected-rules.toml
+          locked: "true"
+      # The report is written to disk rather than passed through the
+      # environment so a large diff cannot overflow MAX_ARG_STRLEN.
+      - id: scope
+        run: |
+          report_file="${RUNNER_TEMP}/affected-report.json"
+          cat <<'__MAY_AFFECTED_REPORT__' > "${report_file}"
+          ${{ steps.shared.outputs.report }}
+          __MAY_AFFECTED_REPORT__
+          python3 .github/scripts/affected.py --base "${{ steps.base.outputs.base }}" --report-file "${report_file}"
 
   # The container tests in container-acceptance pull the workspace image, whose
   # tag is a content hash of its inputs; it is built and pushed here first, and
   # skipped when that tag already exists. Same scope gate as the tests.
   container-image:
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.acceptance == 'true') }}
     uses: ./.github/workflows/container-image.yml
     permissions:
       contents: read
@@ -97,11 +118,20 @@ jobs:
         with:
           components: rustfmt
       - name: cargo fmt --check
-        run: cargo fmt --check
+        run: |
+          if [ "${{ needs.scope.outputs.packages }}" = "workspace" ]; then
+            cargo fmt --check
+          else
+            cargo fmt --check ${{ needs.scope.outputs.linux-package-args }}
+          fi
 
+  # Two lint legs share the job: the default-features check over the
+  # affected crates (`clippy`), and the `ui` feature check over the crates
+  # that embed the frontend (`ui-clippy`) — a web-ui-only diff runs just the
+  # second leg.
   clippy:
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.clippy == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.clippy == 'true' || needs.scope.outputs.ui-clippy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -135,7 +165,9 @@ jobs:
           lane: clippy
       # The `ui` feature's build script builds and embeds web-ui with bun.
       - uses: ./.github/actions/install-bun
+        if: needs.scope.outputs.ui-clippy == 'true'
       - name: bun install
+        if: needs.scope.outputs.ui-clippy == 'true'
         working-directory: web-ui
         run: bun install --frozen-lockfile
       # rav1e's x86_64 assembly is built with nasm.
@@ -143,9 +175,11 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         uses: ./.github/actions/install-nasm
       - name: cargo clippy (default features)
-        run: cargo clippy --locked --profile ci-check --all-targets --timings -- -D warnings
+        if: needs.scope.outputs.clippy == 'true'
+        run: cargo clippy --locked --profile ci-check --all-targets ${{ needs.scope.outputs.linux-package-args }} --timings -- -D warnings
       - name: cargo clippy (ui)
-        run: cargo clippy --locked --profile ci-check --all-targets --features ui --timings -- -D warnings
+        if: needs.scope.outputs.ui-clippy == 'true'
+        run: cargo clippy --locked --profile ci-check --all-targets --features ui ${{ needs.scope.outputs.ui-args }} --timings -- -D warnings
       - name: Upload cargo timings
         if: always()
         uses: actions/upload-artifact@v4
@@ -182,10 +216,16 @@ jobs:
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
+      # The scoped `-p` selection compiles only the affected crates' test
+      # targets; the e2e artifacts upload only when the diff reaches the
+      # daemon, agent runtime, sandbox or tools (`e2e` — they exist only in
+      # an `--all-targets` build of the root package).
       - uses: ./.github/actions/test
         with:
-          verify-baseline-tools: 'true'
-          upload-e2e-bin: 'true'
+          cargo-flags: ${{ needs.scope.outputs.linux-cargo-flags }}
+          upload-may: ${{ needs.scope.outputs.e2e }}
+          verify-baseline-tools: ${{ needs.scope.outputs.e2e }}
+          upload-e2e-bin: ${{ needs.scope.outputs.e2e }}
 
   # One macOS job covers the whole suite: a second macOS runner used to take
   # the integration tests, but the compile it paid twice costs more than the
@@ -209,10 +249,12 @@ jobs:
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
+      # Same scoped selection as test-ubuntu, minus the Linux filtering.
       - uses: ./.github/actions/test
         with:
-          verify-baseline-tools: 'true'
-
+          cargo-flags: ${{ needs.scope.outputs.cargo-flags }}
+          upload-may: ${{ needs.scope.outputs.e2e }}
+          verify-baseline-tools: ${{ needs.scope.outputs.e2e }}
 
   # Runs a command of a container session through `may exec` in a real
   # Docker container of the workspace image, and checks it runs at the
