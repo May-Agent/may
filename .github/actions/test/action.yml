@@ -150,7 +150,8 @@ runs:
             \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
         )"
         test -n "${bin}"
-        "${bin}" --ignored --exact --nocapture \
+        test -x "${PWD}/target/debug/may"
+        CARGO_BIN_EXE_may="${PWD}/target/debug/may" "${bin}" --ignored --exact --nocapture \
           the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
     - name: Upload cargo timings
       if: always()
