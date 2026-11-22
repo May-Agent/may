@@ -4,11 +4,12 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# The terminal E2E tests race their daemon on the shared macOS runner: a
-# request or stream deadline can expire on pure schedule pressure, so a test
-# gets two retries before it counts as failed.
+# The terminal E2E tests race their daemon on the shared macOS runner: each
+# test spawns a full daemon, sandbox, and subagent tree, so cap concurrent E2E
+# binaries (`threads-required = 2`) and allow two retries under schedule load.
 [[profile.default.overrides]]
 filter = "binary(terminal_first_e2e)"
+threads-required = 2
 retries = 2
 
 # Native Apple Vision / GPU OCR tests serialize so they do not contend on

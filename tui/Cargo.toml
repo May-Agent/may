@@ -1,0 +1,98 @@
+[package]
+name = "may-tui"
+version = "0.1.0"
+edition = "2024"
+description = "May's terminal user interface"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[dependencies]
+# The foundational wire types the views render.
+may-protocol = { path = "../protocol" }
+# The daemon API client, sessions and worker the TUI drives.
+may-client = { path = "../client" }
+# The persisted store history reloads read.
+may-db = { path = "../db" }
+# The configuration layer.
+may-config = { path = "../config" }
+# The script policies the views surface.
+may-command-policy = { path = "../command-policy" }
+# The agent harness: OAuth flows and IPC wording.
+may-harness = { path = "../harness" }
+# The model catalog the selectors render.
+may-providers = { path = "../providers" }
+# The tasks.md rows the sidebar lists.
+may-tasks = { path = "../tasks" }
+aither-agent = { version = "0.31.0" }
+aither-core = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0" }
+arboard = "3"
+askama = "0.16"
+async-channel = "2"
+async-fs = "2.1"
+async-io = "2.6"
+base64 = "0.22"
+blocking = "1"
+bytes = "1"
+chrono = "0.4"
+crossterm = "0.28"
+dirs = "6"
+dunce = "1.0.5"
+event-listener = "5"
+executor-core = { version = "0.7", features = ["tokio"] }
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+futures-lite = "2.6"
+futures-util = "0.3"
+humantime = { version = "2.4", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+itertools = "0.14.0"
+jiff = { version = "0.2", features = ["serde"] }
+mime_guess = "2"
+nucleo = "0.5"
+nucleo-matcher = "0.3"
+open = "5"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
+regex = "1.12"
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+streamdown-parser = "0.1"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+tempfile = "3.24.0"
+terminal-colorsaurus = { version = "1.0.3", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+aither-models = "0.31.0"
+fastrand = "2"
+shlex = "1"
+shell-words = "1"
+mime = "0.3"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+ahash = "0.8"
+linkify = "0.10"
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
+partial-json-fixer = "0.5"
+ignore = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-segmentation = { version = "1.13", default-features = false }
+unicode-width = "0.2"
+url = "2"
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+whatlang = { version = "0.18", default-features = false }
+zenwave = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+
+[dev-dependencies]
+libc = "0.2"
+repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
+
+[lints]
+workspace = true

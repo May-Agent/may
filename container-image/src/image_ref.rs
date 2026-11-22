@@ -26,7 +26,7 @@ const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "python_shim", "tasks", "
 /// The `python3`, `python` and `uv` shim template, relative to the
 /// repository. The workspace image carries it as those three commands, so a
 /// change to it moves the workspace reference.
-pub const PYTHON_SHIM_TEMPLATE: &str = "templates/python_shim";
+pub const PYTHON_SHIM_TEMPLATE: &str = "agent-core/templates/python_shim";
 
 /// The directory, relative to the repository, of the `tasks` crate.
 ///
@@ -222,7 +222,14 @@ mod tests {
         )
         .unwrap();
         fs::write(repository.path().join("Cargo.lock"), "source").unwrap();
-        fs::create_dir_all(repository.path().join("templates")).unwrap();
+        fs::create_dir_all(
+            repository
+                .path()
+                .join(PYTHON_SHIM_TEMPLATE)
+                .parent()
+                .expect("the shim template has a parent directory"),
+        )
+        .unwrap();
         fs::write(repository.path().join(PYTHON_SHIM_TEMPLATE), "shim").unwrap();
         let fixture = || {
             workspace_image_ref(

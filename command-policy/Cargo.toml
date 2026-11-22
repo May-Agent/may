@@ -1,0 +1,29 @@
+[package]
+name = "may-command-policy"
+version = "0.1.0"
+edition = "2024"
+description = "May's rules on what a terminal script may run, as aither script policies"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[dependencies]
+# The command reading every shell policy is checked against.
+may-protocol = { path = "../protocol" }
+aither-core = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0" }
+askama = "0.16"
+async-fs = "2.1"
+blocking = "1"
+futures-util = "0.3"
+regex = "1.12"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true
