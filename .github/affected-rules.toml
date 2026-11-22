@@ -61,10 +61,13 @@ mark-changed = "all"
 globs = ["web-ui/**"]
 mark-changed = []
 
-# `may-hashline` is its own workspace — hashline/Cargo.toml carries
-# `[workspace]` — and nothing in this workspace's package graph reaches it.
+# `may-hashline` and `may-sed` are standalone workspaces — their Cargo.toml
+# files carry `[workspace]` — and nothing in this workspace's package graph
+# reaches them (`aither-sed` is consumed via its hash-pinned release archive).
+# `affected.py` turns `sed/**` source edits into dedicated `sed/Cargo.toml`
+# format, clippy, and test steps without touching the main workspace.
 [[path-rule]]
-globs = ["hashline/**"]
+globs = ["hashline/**", "sed/**"]
 mark-changed = []
 
 # The root package's own sources. Its package directory is the repository

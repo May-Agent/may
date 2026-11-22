@@ -23,18 +23,13 @@ semver_check = false
 name = "may-tasks"
 release = false
 
-# may-patch and may-sed ship as prebuilt executables attached to their GitHub
-# release (.github/workflows/tool-artifacts.yml), never to crates.io, so
-# release-plz reads their latest version from git tags instead of the registry.
+# may-patch ships as prebuilt executables attached to its GitHub release
+# (.github/workflows/tool-artifacts.yml), never to crates.io, so release-plz
+# reads its latest version from git tags instead of the registry. (`may-sed`
+# lives in its own `sed/` workspace with `sed/release-plz.toml`.)
 
 [[package]]
 name = "may-patch"
 git_only = true
 git_tag_name = "patch/v{{ version }}"
-git_release_enable = true
-
-[[package]]
-name = "may-sed"
-git_only = true
-git_tag_name = "sed/v{{ version }}"
 git_release_enable = true

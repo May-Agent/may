@@ -106,17 +106,17 @@ jobs:
             -e '^\.github/workflows/tool-artifacts\.yml$'; then
             tools=true
           elif printf '%s\n' "${files}" | grep -q -e '^Cargo\.toml$' -e '^Cargo\.lock$'; then
-            # The tools' own version lines go away so a release-plz bump of
-            # may-patch/may-sed still counts: the comparison is the closure
-            # of dependencies each tool compiles, not its own version.
+            # The tool's own version line goes away so a release-plz bump of
+            # may-patch still counts (`may-sed` lives in `sed/` with its own
+            # lockfile, already matched by `^sed/` above).
             base_sha="${range%%...*}"
             base_sha="${base_sha%%..*}"
             git worktree add --detach "${RUNNER_TEMP}/base" "${base_sha}" > /dev/null
             (cd "${RUNNER_TEMP}/base" && cargo tree --locked --prefix none --edges normal,build \
-              -p may-patch -p may-sed | grep -v -e '^may-patch ' -e '^may-sed ' | sort -u) \
+              -p may-patch | grep -v -e '^may-patch ' | sort -u) \
               > "${RUNNER_TEMP}/base.tree"
             cargo tree --locked --prefix none --edges normal,build \
-              -p may-patch -p may-sed | grep -v -e '^may-patch ' -e '^may-sed ' | sort -u \
+              -p may-patch | grep -v -e '^may-patch ' | sort -u \
               > "${RUNNER_TEMP}/head.tree"
             if cmp -s "${RUNNER_TEMP}/base.tree" "${RUNNER_TEMP}/head.tree"; then
               tools=false
@@ -221,17 +221,12 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
+      - uses: water-rs/stow@main
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-10-01
           components: rust-src
           targets: ${{ matrix.target }}
-      # Only main saves: a PR cache lives in a scope nothing else restores,
-      # and its size evicts main's under the cache limit.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: tool-artifacts-${{ matrix.target }}
       # The tools .github/scripts/built-tools.json lists for this target, as a JSON array.
       - name: Select the tools of this target
         id: tools
@@ -257,7 +252,7 @@ jobs:
           check="${RUNNER_TEMP}/aither-sed-check"
           mkdir -p "${check}"
           tar -xzf "${RUNNER_TEMP}"/tool-artifacts/aither-sed-*-"${{ matrix.target }}".tar.gz -C "${check}"
-          version="$(cargo metadata --locked --no-deps --format-version 1 \
+          version="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path sed/Cargo.toml \
             | jq -r '.packages[] | select(.name == "may-sed") | .version')"
           [ "$("${check}/aither-sed" --version)" = "aither-sed ${version}" ]
           [ "$(printf 'a\nb\nc\nd\n' | "${check}/aither-sed" -n '2,3p;$p')" = "$(printf 'b\nc\nd')" ]
@@ -343,11 +338,11 @@ jobs:
             crate="${TAG%%/*}"
             version="${TAG#*/v}"
             case "${crate}" in
-              patch) tool=apply_patch; package=may-patch ;;
-              sed) tool=aither-sed; package=may-sed ;;
+              patch) tool=apply_patch; package=may-patch; manifest=Cargo.toml ;;
+              sed) tool=aither-sed; package=may-sed; manifest=sed/Cargo.toml ;;
               *) echo "::error::${TAG} is not a patch/v or sed/v tag"; exit 1 ;;
             esac
-            [ "$(cargo metadata --locked --no-deps --format-version 1 \
+            [ "$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "${manifest}" \
               | jq -r --arg package "${package}" '.packages[] | select(.name == $package) | .version')" = "${version}" ] \
               || { echo "::error::${TAG} does not name the version of ${package}"; exit 1; }
             # Every listed target has its archive and checksum.

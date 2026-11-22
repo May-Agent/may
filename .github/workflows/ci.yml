@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
+      sed: ${{ steps.scope.outputs.sed }}
       fmt: ${{ steps.scope.outputs.fmt }}
       clippy: ${{ steps.scope.outputs.clippy }}
       ui-clippy: ${{ steps.scope.outputs.ui-clippy }}
@@ -121,8 +122,11 @@ jobs:
         run: |
           if [ "${{ needs.scope.outputs.packages }}" = "workspace" ]; then
             cargo fmt --check
-          else
+          elif [ -n "${{ needs.scope.outputs.linux-package-args }}" ]; then
             cargo fmt --check ${{ needs.scope.outputs.linux-package-args }}
+          fi
+          if [ "${{ needs.scope.outputs.sed }}" = "true" ]; then
+            cargo fmt --manifest-path sed/Cargo.toml -- --check
           fi
 
   # Two lint legs share the job: the default-features check over the
@@ -159,10 +163,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - id: stow
-        uses: ./.github/actions/restore-stow-cache
-        with:
-          lane: clippy
+      - uses: water-rs/stow@main
       # The `ui` feature's build script builds and embeds web-ui with bun.
       - uses: ./.github/actions/install-bun
         if: needs.scope.outputs.ui-clippy == 'true'
@@ -172,16 +173,19 @@ jobs:
         run: bun install --frozen-lockfile
       # rav1e's x86_64 assembly is built with nasm.
       - name: Install nasm
-        if: runner.os == 'Linux' && runner.arch == 'X64'
+        if: runner.os == 'Linux' && runner.arch == 'X64' && (needs.scope.outputs.rust == 'true' || needs.scope.outputs.ui-clippy == 'true')
         uses: ./.github/actions/install-nasm
       - name: cargo clippy (default features)
-        if: needs.scope.outputs.clippy == 'true'
+        if: needs.scope.outputs.rust == 'true'
         run: cargo clippy --locked --profile ci-check --all-targets ${{ needs.scope.outputs.linux-package-args }} --timings -- -D warnings
+      - name: cargo clippy (sed)
+        if: needs.scope.outputs.sed == 'true'
+        run: cargo clippy --locked --manifest-path sed/Cargo.toml --profile ci-check --all-targets -- -D warnings
       - name: cargo clippy (ui)
         if: needs.scope.outputs.ui-clippy == 'true'
         run: cargo clippy --locked --profile ci-check --all-targets --features ui ${{ needs.scope.outputs.ui-args }} --timings -- -D warnings
       - name: Upload cargo timings
-        if: always()
+        if: always() && (needs.scope.outputs.rust == 'true' || needs.scope.outputs.ui-clippy == 'true')
         uses: actions/upload-artifact@v4
         with:
           name: cargo-timings-clippy
@@ -189,12 +193,6 @@ jobs:
       - name: Report stow cache stats
         if: always()
         run: stow stats || true
-      - uses: ./.github/actions/save-stow-cache
-        if: success()
-        with:
-          cache-prefix: ${{ steps.stow.outputs.cache-prefix }}
-          cache-key: ${{ steps.stow.outputs.cache-key }}
-          cache-hit: ${{ steps.stow.outputs.cache-hit }}
 
   test-ubuntu:
     name: test (ubuntu-latest)
@@ -222,6 +220,8 @@ jobs:
       # an `--all-targets` build of the root package).
       - uses: ./.github/actions/test
         with:
+          run-workspace: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
+          run-sed: ${{ needs.scope.result != 'success' || needs.scope.outputs.sed == 'true' }}
           cargo-flags: ${{ needs.scope.outputs.linux-cargo-flags }}
           upload-may: ${{ needs.scope.outputs.e2e }}
           verify-baseline-tools: ${{ needs.scope.outputs.e2e }}
@@ -252,6 +252,8 @@ jobs:
       # Same scoped selection as test-ubuntu, minus the Linux filtering.
       - uses: ./.github/actions/test
         with:
+          run-workspace: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
+          run-sed: ${{ needs.scope.result != 'success' || needs.scope.outputs.sed == 'true' }}
           cargo-flags: ${{ needs.scope.outputs.cargo-flags }}
           upload-may: ${{ needs.scope.outputs.e2e }}
           verify-baseline-tools: ${{ needs.scope.outputs.e2e }}

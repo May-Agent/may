@@ -19,8 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import affected
 
-# The workspace as it stands: the root package plus the member crates.
-MEMBERS = ["may-agent", "may-container-image", "may-patch", "may-sed", "may-tasks"]
+# The workspace as it stands: the root package plus the member crates (`sed/`
+# is its own standalone workspace, like `hashline/`).
+MEMBERS = ["may-agent", "may-container-image", "may-patch", "may-tasks"]
 
 # …and the near-future shape once the subsystem crates land.
 FUTURE_MEMBERS = MEMBERS + [
@@ -44,7 +45,6 @@ FUTURE_DEPS = {
     "may-container-image": {"may-agent"},
     "may-tasks": {"may-agent", "may-client", "may-config", "may-harness", "may-tui"},
     "may-patch": {"may-agent", "may-harness"},
-    "may-sed": {"may-agent"},
 }
 
 ROOT = "may-agent"
@@ -163,13 +163,13 @@ class HelperTests(unittest.TestCase):
     def test_reaches_runtime(self):
         # Direct owners: every member is runtime except the client-only set.
         self.assertTrue(affected.reaches_runtime("src/daemon/mod.rs", "may-agent"))
-        self.assertTrue(affected.reaches_runtime("sed/src/main.rs", "may-sed"))
+        self.assertTrue(affected.reaches_runtime("tasks/src/main.rs", "may-tasks"))
         self.assertTrue(affected.reaches_runtime("patch/src/lib.rs", "may-patch"))
         self.assertFalse(affected.reaches_runtime("tui/src/app.rs", "may-tui"))
         # A crate's own prose reaches no runtime even though its owner is real.
         self.assertFalse(affected.reaches_runtime("patch/README.md", "may-patch"))
         # Rule-consumed paths (owner None): the embedded dirs and Cargo.lock
-        # reach the build; prose, web-ui, hashline and metadata files do not.
+        # reach the build; prose, web-ui, standalone workspaces and metadata do not.
         self.assertTrue(affected.reaches_runtime("skills/may/SKILL.md", None))
         self.assertTrue(affected.reaches_runtime("subagents/audit.toml", None))
         self.assertTrue(affected.reaches_runtime("templates/prompt/layout.txt", None))
@@ -178,6 +178,7 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(affected.reaches_runtime("README.md", None))
         self.assertFalse(affected.reaches_runtime("web-ui/src/app.tsx", None))
         self.assertFalse(affected.reaches_runtime("hashline/src/lib.rs", None))
+        self.assertFalse(affected.reaches_runtime("sed/src/main.rs", None))
         self.assertFalse(affected.reaches_runtime("patch/.gitignore", None))
 
     def test_release_only_bump(self):
@@ -211,6 +212,8 @@ class ComputeTests(unittest.TestCase):
     def test_workspace_scope_runs_everything(self):
         out = compute(report(workspace=True, affected=MEMBERS, owners={"x": None}))
         self.assertEqual(out["rust"], "true")
+        # A main-workspace gate change does not touch the standalone sed/ workspace.
+        self.assertEqual(out["sed"], "false")
         self.assertEqual(out["packages"], "workspace")
         self.assertEqual(out["package-args"], "--workspace")
         self.assertEqual(out["linux-package-args"], "--workspace")
@@ -260,16 +263,33 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["cargo-flags"], "-p may-patch --lib --bins")
         self.assertEqual(out["ui-clippy"], "false")
 
+    def test_standalone_sed_workspace_runs_sed_only(self):
+        # `sed/` is a standalone workspace: editing it runs `sed`'s own fmt,
+        # clippy, and test steps without building or testing `may-agent`.
+        out = compute(report(owners={"sed/src/main.rs": None}))
+        self.assertEqual(out["rust"], "false")
+        self.assertEqual(out["sed"], "true")
+        self.assertEqual(out["fmt"], "true")
+        self.assertEqual(out["clippy"], "true")
+        self.assertEqual(out["test"], "true")
+        self.assertEqual(out["packages"], "")
+        self.assertEqual(out["package-args"], "")
+        self.assertEqual(out["e2e"], "false")
+        self.assertEqual(out["acceptance"], "false")
+        self.assertEqual(out["ui-clippy"], "false")
+        self.assertEqual(out["web_ui"], "false")
+
     def test_leaf_tool_crate_keeps_e2e(self):
-        # may-sed ships inside the tool distribution: its sources reach the
-        # sandboxed shell, so the e2e and container gates stay on and the
+        # may-tasks ships inside the workspace and container image: its sources
+        # reach the runtime, so the e2e and container gates stay on and the
         # root package joins the build set for the `may` and e2e binaries.
-        out = compute(report(affected=["may-sed"], owners={"sed/src/main.rs": "may-sed"}))
-        self.assertEqual(out["packages"], "may-sed")
-        self.assertEqual(out["package-args"], "-p may-sed")
+        out = compute(report(affected=["may-tasks"], owners={"tasks/src/main.rs": "may-tasks"}))
+        self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["packages"], "may-tasks")
+        self.assertEqual(out["package-args"], "-p may-tasks")
         self.assertEqual(out["e2e"], "true")
         self.assertEqual(out["acceptance"], "true")
-        self.assertEqual(out["cargo-flags"], "-p may-agent -p may-sed --all-targets")
+        self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tasks --all-targets")
         self.assertEqual(out["ui-clippy"], "false")
         self.assertEqual(out["web_ui"], "false")
 
@@ -329,14 +349,14 @@ class ComputeTests(unittest.TestCase):
     def test_client_only_mixed_with_tool_crate_runs_e2e(self):
         out = compute(
             report(
-                affected=["may-agent", "may-sed", "may-tui"],
-                owners={"tui/src/app.rs": "may-tui", "sed/src/main.rs": "may-sed"},
+                affected=["may-agent", "may-tasks", "may-tui"],
+                owners={"tui/src/app.rs": "may-tui", "tasks/src/main.rs": "may-tasks"},
                 members=FUTURE_MEMBERS,
             )
         )
         self.assertEqual(out["e2e"], "true")
         self.assertEqual(
-            out["cargo-flags"], "-p may-agent -p may-sed -p may-tui --all-targets"
+            out["cargo-flags"], "-p may-agent -p may-tasks -p may-tui --all-targets"
         )
 
     def test_web_ui_only_runs_frontend_and_ui_clippy(self):
@@ -518,12 +538,13 @@ class MainTests(unittest.TestCase):
         self.assertIn("fell back", stderr)
 
     def test_scoped_report(self):
-        r = report(affected=["may-sed"], owners={"sed/src/main.rs": "may-sed"})
+        r = report(affected=["may-tasks"], owners={"tasks/src/main.rs": "may-tasks"})
         path = self.report_file(json.dumps(r))
         with mock.patch.object(affected, "workspace_facts", return_value=(ROOT, UI, {})):
             outputs, _, _ = self.run_main(["--base", "abc123", "--report-file", path])
-        self.assertEqual(outputs["packages"], "may-sed")
-        self.assertEqual(outputs["cargo-flags"], "-p may-agent -p may-sed --all-targets")
+        self.assertEqual(outputs["packages"], "may-tasks")
+        self.assertEqual(outputs["sed"], "false")
+        self.assertEqual(outputs["cargo-flags"], "-p may-agent -p may-tasks --all-targets")
 
     def test_report_from_environment(self):
         r = report(affected=["may-patch"], owners={"patch/README.md": "may-patch"})
