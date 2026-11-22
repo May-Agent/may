@@ -90,10 +90,15 @@ runs:
       if: inputs.upload-e2e-bin == 'true'
       shell: bash
       run: |
-        path="$(find target/debug "${HOME}/.stow/build-dir" -type f -perm /111 -name 'terminal_first_e2e-*' ! -name '*.d' ! -name '*.o' 2>/dev/null | head -1)"
-        if [ -z "${path}" ]; then
-          path="$(find target/debug "${HOME}/.stow/build-dir" -type f -perm +111 -name 'terminal_first_e2e-*' ! -name '*.d' ! -name '*.o' 2>/dev/null | head -1)"
+        roots=(target/debug)
+        if [ -d "${HOME}/.stow/build-dir" ]; then
+          roots+=("${HOME}/.stow/build-dir")
         fi
+        path="$(
+          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
+            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
+            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
+        )"
         test -n "${path}"
         tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
     - name: Upload the e2e test binary
