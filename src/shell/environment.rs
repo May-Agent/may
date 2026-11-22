@@ -99,6 +99,13 @@ fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
         .map(PathBuf::from)
         .or_else(|| home().map(|h| h.join(".stow")))
         .filter(|path| path.is_dir());
+    // On Linux each sandbox runs in a child PID namespace (`CLONE_NEWPID`), so
+    // `stow-rustc-wrapper` reports a namespace-local `cargo` PID that only an
+    // in-namespace `stow-daemon` can verify in `/proc` alongside `SO_PEERCRED`.
+    // Linux sessions therefore get a `0700` `STOW_DAEMON_DIR` inside their own
+    // cache while sharing the host's `STOW_CACHE_DIR`; macOS and Windows share
+    // the host PID space and reach the host daemon directly.
+    #[cfg(not(target_os = "linux"))]
     let stow_daemon = std::env::var_os("STOW_DAEMON_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -117,6 +124,8 @@ fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
             }
         })
         .filter(|path| path.is_dir());
+    #[cfg(target_os = "linux")]
+    let stow_daemon: Option<PathBuf> = None;
     [
         std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -285,9 +294,25 @@ async fn environment(
     }
     // Point cargo and rustup at the same host homes the grants cover, so the
     // remapped HOME does not strand them under the working dir.
+    let mut has_stow_cache = false;
     for (name, home) in host_toolchain_homes() {
+        if name == "STOW_CACHE_DIR" {
+            has_stow_cache = true;
+        }
         env.push((name.to_string(), path_value(name, &home)?));
     }
+    #[cfg(target_os = "linux")]
+    if has_stow_cache {
+        use std::os::unix::fs::PermissionsExt as _;
+        let stow_run = writable.cache().join("stow").join("run");
+        async_fs::create_dir_all(&stow_run).await?;
+        std::fs::set_permissions(&stow_run, std::fs::Permissions::from_mode(0o700))?;
+        env.push((
+            "STOW_DAEMON_DIR".to_string(),
+            path_value("STOW_DAEMON_DIR", &stow_run)?,
+        ));
+    }
+    let _ = has_stow_cache;
     Ok(env)
 }
 
