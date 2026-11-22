@@ -893,8 +893,8 @@ mod tests {
         AcpAgentConfig {
             command: "python3".to_string(),
             args: vec![
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/fake_acp_agent.py")
+                fixtures_dir()
+                    .join("fake_acp_agent.py")
                     .to_string_lossy()
                     .into_owned(),
             ],
@@ -907,7 +907,10 @@ mod tests {
     }
 
     fn fixtures_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("tests/fixtures")
     }
 
     /// A sandbox rooted in `root` that reads the fake agent's script and the

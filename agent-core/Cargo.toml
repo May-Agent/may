@@ -152,6 +152,7 @@ may-config = { path = "../config", features = ["test-fixtures"] }
 may-media = { path = "../media", features = ["testing"] }
 # The `tasks.md` fixtures the session and issue tests build.
 may-harness = { path = "../harness", features = ["testing"] }
+aither-sandbox = { version = "0.31.0", features = ["test-util"] }
 tokio-test = "0.4"
 
 [lints]

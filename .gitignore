@@ -2,7 +2,7 @@
 .DS_Store
 *.png
 *.log
-!/tests/fixtures/ci/*.log
+!/git-forge/tests/fixtures/ci/*.log
 .leash/
 .heel/
 .codex-*

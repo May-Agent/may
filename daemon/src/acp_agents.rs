@@ -250,6 +250,8 @@ mod tests {
         ConnectAcpAgentRequest {
             name: "fake".to_string(),
             command: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("workspace root")
                 .join("tests/fixtures/fake_acp_agent.py")
                 .to_string_lossy()
                 .into_owned(),
