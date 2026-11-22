@@ -42,4 +42,13 @@ runs:
         key: ${{ steps.key.outputs.key }}
         restore-keys: |
           ${{ steps.key.outputs.prefix }}
+    # macOS GitHub runners ship a 256 soft RLIMIT_NOFILE, which exhausts file
+    # descriptors (`os error 24`) when stow-daemon materializes large dependency
+    # closures concurrently. Raise system limits before stow starts its daemon.
+    - name: Raise macOS open-file limits for stow
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        sudo sysctl -w kern.maxfiles=200000 kern.maxfilesperproc=65536 >/dev/null 2>&1 || true
+        sudo launchctl limit maxfiles 65536 200000 >/dev/null 2>&1 || true
     - uses: water-rs/stow@main
