@@ -4,7 +4,7 @@ inputs:
   cargo-flags:
     description: Target selection flags passed to cargo build and cargo nextest run.
     required: false
-    default: '--all-targets'
+    default: '--workspace --all-targets'
   upload-may:
     description: Whether to pack and upload target/debug/may as an artifact.
     required: false
