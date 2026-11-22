@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 describe('artifact runtime bridge', () => {
   test('captures console.error and reports it with the generic artifact type', async () => {
     const source = await Bun.file(
-      new URL('../../../src/texts/artifact_runtime_bridge.js', import.meta.url),
+      new URL('../../../daemon/src/texts/artifact_runtime_bridge.js', import.meta.url),
     ).text();
     const messages: unknown[] = [];
     const listeners = new Map<string, (event: Record<string, unknown>) => void>();

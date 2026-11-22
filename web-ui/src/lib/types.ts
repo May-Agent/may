@@ -26,7 +26,6 @@ export type ApiErrorCode =
 export type ToolVariant =
   | 'terminal'
   | 'terminal_input'
-  | 'terminal_kill'
   | 'terminal_read'
   | 'browser'
   | 'web_search'
@@ -117,7 +116,7 @@ export interface BrowserInteractionState {
 }
 
 export interface TerminalRuntimeState {
-  taskId?: string | null;
+  pid?: number | null;
   outputFile?: string | null;
   outputPreview?: string | null;
   inputNotice?: string | null;

@@ -1,0 +1,109 @@
+# Determinator rules for the CI gate (ci.yml `scope`), read by the shared
+# lexoliu/affected-crates tool.
+#
+# A changed file under a package's directory already belongs to that
+# package — the determinator's ancestor matching covers every source,
+# fixture and asset a crate carries, and its reverse dependencies come
+# along through the package graph. These rules only map what lies outside
+# every package, plus the few kinds of repository-level configuration the
+# determinator's shipped defaults get wrong for this gate:
+#
+# - The defaults mark `clippy.toml` and `rustfmt.toml` as changing nothing.
+#   Lint and format configuration applies to every crate the gate lints, so
+#   the rule below maps them — and their `Clippy.toml` / `.rustfmt.toml`
+#   spellings, which the defaults do not cover at all — to the workspace.
+# - A path no rule matches that resolves only to the root `may-agent`
+#   package by directory (every outside-package path does: its package
+#   directory is the repository root) is treated by the tool as unmatched,
+#   which selects the whole workspace — an unlisted path widens the gate
+#   rather than silently narrowing it.
+
+# The toolchain and cargo-level configuration can change every build the
+# gate might run; the nextest profile selects which tests run.
+[[path-rule]]
+globs = ["rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/**"]
+mark-changed = "all"
+
+# Lint, format and release configuration that applies to every crate's gate
+# run. Lowercase `clippy.toml`/`rustfmt.toml` override the defaults'
+# mark-nothing; the rest are unmatched top-level files made explicit so the
+# choice is visible here rather than implied by the root-package fallback.
+[[path-rule]]
+globs = [
+    "clippy.toml",
+    "Clippy.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "deny.toml",
+    "release-plz.toml",
+    "dist-workspace.toml",
+]
+mark-changed = "all"
+
+# The gate's own machinery — workflows, composite actions, the scripts they
+# run and this rules file — can rewrite what a run does, so a change there
+# is verified against the whole workspace.
+[[path-rule]]
+globs = [
+    ".github/workflows/**",
+    ".github/actions/**",
+    ".github/scripts/**",
+    ".github/affected-rules.toml",
+]
+mark-changed = "all"
+
+# The frontend is compiled into the `may` binary only when the `ui` feature
+# builds it (build.rs embeds web-ui/dist); a default build reads none of
+# it. affected.py turns these paths into the `web-ui` job and the
+# `--features ui` clippy leg, so a frontend-only diff still proves the
+# embed compiles without paying for unrelated Rust suites.
+[[path-rule]]
+globs = ["web-ui/**"]
+mark-changed = []
+
+# `may-hashline` is its own workspace — hashline/Cargo.toml carries
+# `[workspace]` — and nothing in this workspace's package graph reaches it.
+[[path-rule]]
+globs = ["hashline/**"]
+mark-changed = []
+
+# The root package's own sources. Its package directory is the repository
+# root, so the tool's root-package ownership only reaches files sitting
+# directly inside a directory that holds a declared target — `src/*.rs`
+# but not `src/daemon/mod.rs`, `tests/*` but not `tests/fixtures/*` — and
+# everything deeper would fall through to `workspace`. These are the root
+# package's sources by construction, so name it and keep the scope narrow.
+[[path-rule]]
+globs = ["src/**", "tests/**", "examples/**", "benches/**"]
+mark-changed = ["may-agent"]
+
+# Compiled into a crate's build from outside every package directory:
+# `include_dir!` embeds skills/ and the subagent definitions, askama and
+# `include_str!` read templates/, and build.rs hashes the container/
+# contexts into the baked image references. They resolve only to the root
+# package by directory without being part of its declared sources, so name
+# it or every edit would widen to `workspace`. The embedders move with the
+# workspace split (subagents/ to may-config, skills/ to may-client,
+# templates/ to may-tui and may-harness), and mark-changed can spell only
+# names that already exist — affected.py adds the other embedding members
+# and their workspace dependents on top.
+[[path-rule]]
+globs = ["skills/**", "subagents/**", "templates/**", "container/**"]
+mark-changed = ["may-agent"]
+
+# Prose outside every package selects nothing: top-level markdown and
+# license files, the docs tree and issue templates cannot change what
+# compiles. In-package prose still credits its crate — `include_str!` and
+# `#![doc]` may compile it in — through the tool's ancestor attribution.
+[[path-rule]]
+globs = [
+    "*.md",
+    "LICENSE*",
+    "README*",
+    "CONTRIBUTING*",
+    "CODE_OF_CONDUCT*",
+    "SECURITY*",
+    "docs/**",
+    ".github/ISSUE_TEMPLATE/**",
+]
+mark-changed = []

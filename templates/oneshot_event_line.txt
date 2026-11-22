@@ -8,8 +8,8 @@ Tool finished: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if
 {%- match outcome -%}
 {%- when ToolOutcome::Done -%}
 {%- when ToolOutcome::Exited { code } -%}, exit code {{ code }}
-{%- when ToolOutcome::Background { task_id } -%}, running in background as task {{ task_id }}
-{%- when ToolOutcome::Killed { task_id } -%}, killed (task {{ task_id }})
+{%- when ToolOutcome::Background { pid } -%}, running in background with PID {{ pid }}
+{%- when ToolOutcome::Killed { pid } -%}, killed (PID {{ pid }})
 {%- endmatch -%}
 {%- when LineKind::ToolFailed { name, label, elapsed, message } -%}
 Tool failed: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if let Some(elapsed) = elapsed %} in {{ elapsed }}{% endif %}: {{ message }}

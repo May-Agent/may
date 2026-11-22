@@ -2,9 +2,14 @@ name: Test
 description: Build and test the workspace on the runner it runs on. The check job names are fixed by the ruleset, so each runner has a job of its own around these steps.
 inputs:
   cargo-flags:
-    description: Target selection flags passed to cargo build and cargo nextest run.
+    description: >
+      Package and target selection flags passed to cargo test --no-run and
+      cargo nextest run — the scope job's `-p <pkg>`/`--workspace` plus the
+      target kinds (`--all-targets` when the e2e gates run, `--lib --bins`
+      when they do not, so a client-only diff never compiles
+      tests/terminal_first_e2e.rs).
     required: false
-    default: '--all-targets'
+    default: '--workspace --all-targets'
   upload-may:
     description: Whether to pack and upload target/debug/may as an artifact.
     required: false
@@ -30,6 +35,10 @@ runs:
           echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
           exit 1
         fi
+    - name: Enable unprivileged user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
     # mv returns at once and the delete runs in the background while the
     # toolchain installs; rm -rf used to block checkout for up to two minutes.
     - name: Free runner disk
@@ -40,28 +49,14 @@ runs:
           mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
         done
         rm -rf /tmp/gc-* &'
-    # The default linker spends minutes on the multi-GB test binaries; mold
-    # is preinstalled on the hosted runners and links them in seconds.
-    - name: Link test binaries with mold
-      if: runner.os == 'Linux' && runner.arch == 'X64'
-      shell: bash
-      run: |
-        if command -v mold > /dev/null; then
-          echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "${GITHUB_ENV}"
-        fi
     - uses: dtolnay/rust-toolchain@stable
-    # Main and pull requests save; a merge-group cache lives in a deleted
-    # branch's scope nothing restores. A PR's cache is scoped to its own ref,
-    # so only later pushes of the same PR restore it — chiefly the dependency
-    # rebuild a lockfile change would otherwise pay every push. Keyed by the
-    # job id (`test-ubuntu`, `test-macos`), it is the one Rust cache per OS,
-    # so main's caches fit under the limit together.
-    - uses: Swatinem/rust-cache@v2
+    # Signed public prebuilts (water-rs/stow@main, including managed mold on
+    # Linux) plus a main-owned local stow store for git and uncovered crates.
+    - id: stow
+      uses: ./.github/actions/restore-stow-cache
       with:
-        save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
-    # rust-cache prunes the files under target/tmp but keeps its directories,
-    # so a restored cache holds an empty skeleton of the tests' shared tool
-    # cache that the tests would take for a prepared one.
+        lane: ${{ github.job }}
+    # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
       shell: bash
       run: |
@@ -75,61 +70,78 @@ runs:
     - name: Install nasm
       if: runner.os == 'Linux' && runner.arch == 'X64'
       uses: ./.github/actions/install-nasm
-    # Builds the test targets the nextest step runs, so that step compiles
-    # nothing; `cargo build` would build the non-test libraries instead, which
-    # no test uses. The integration tests and `--all-targets` still build the
-    # `may` binary the next steps upload.
-    - name: cargo build
+    # Build and run in a single `cargo nextest` invocation so Cargo runs once
+    # per job (avoiding any cross-step fingerprint or workspace-tree churn).
+    # On a `push` to `main` whose test downloads hit, the merge queue already
+    # ran the suite, so `--no-run` only builds to seed `main`'s stow cache.
+    - uses: taiki-e/install-action@nextest
+    - name: cargo nextest
       shell: bash
-      run: cargo test --locked ${{ inputs.cargo-flags }} --no-run --timings
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        if [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.downloads.outputs.tools-hit }}" = "true" ]; then
+          cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
+        else
+          cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+        fi
     # Every run keeps the debug may it built, so a commit can be tested on
-    # another machine without building it there. It is packed as a tarball
-    # because artifacts drop the executable bit.
+    # another machine without building it there. Pack archives into runner.temp
+    # so nothing dirties the repository tree.
     - name: Pack the debug may
       if: inputs.upload-may == 'true'
       shell: bash
-      run: tar -czf may-debug.tar.gz -C target/debug may
+      run: tar -czf "${{ runner.temp }}/may-debug.tar.gz" -C target/debug may
     - name: Upload the debug may
       if: inputs.upload-may == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: may-debug.tar.gz
+        path: ${{ runner.temp }}/may-debug.tar.gz
         retention-days: 90
     - name: Pack the e2e test binary
       if: inputs.upload-e2e-bin == 'true'
       shell: bash
       run: |
-        path="$(find target/debug -type f -name 'terminal_first_e2e-*' ! -name '*.d' | head -1)"
-        tar -czf e2e-test-bin.tar.gz -C "$(dirname "$path")" "$(basename "$path")"
+        roots=(target/debug)
+        if [ -d "${HOME}/.stow/build-dir" ]; then
+          roots+=("${HOME}/.stow/build-dir")
+        fi
+        path="$(
+          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
+            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
+            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
+        )"
+        test -n "${path}"
+        tar -czf "${{ runner.temp }}/e2e-test-bin.tar.gz" -C "$(dirname "$path")" "$(basename "$path")"
     - name: Upload the e2e test binary
       if: inputs.upload-e2e-bin == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: e2e-test-bin-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: e2e-test-bin.tar.gz
+        path: ${{ runner.temp }}/e2e-test-bin.tar.gz
         retention-days: 30
-    # The merge queue already tested the tree a push to main lands, so that
-    # push only builds, to seed main's caches; it still tests when the test
-    # downloads missed, since the tests are what fetch them.
-    #
-    # nextest runs every test of every binary in one pool, where `cargo test`
-    # runs the binaries one after another. May has no Rust doc-tests (its doc
-    # code blocks are text, bash, toml or `ignore`), so there is no
-    # `cargo test --doc` step.
-    - if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
-      uses: taiki-e/install-action@nextest
-    - name: cargo nextest
-      if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
-      shell: bash
-      run: cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+    # Invoke the already-built `terminal_first_e2e` binary directly (just as
+    # Container Acceptance does): `cargo nextest -E 'binary(terminal_first_e2e)'`
+    # narrows Cargo's target selection to `--test terminal_first_e2e`, changing
+    # workspace feature unification and paying a full ~9-minute recompile of
+    # may-agent and its codec dependencies at the end of the job.
     - name: Verify baseline tools
       if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
       shell: bash
-      run: >
-        cargo nextest run --locked --test terminal_first_e2e --run-ignored only
-        -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
-        --no-capture
+      run: |
+        roots=(target/debug)
+        if [ -d "${HOME}/.stow/build-dir" ]; then
+          roots+=("${HOME}/.stow/build-dir")
+        fi
+        bin="$(
+          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
+            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
+            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
+        )"
+        test -n "${bin}"
+        test -x "${PWD}/target/debug/may"
+        CARGO_BIN_EXE_may="${PWD}/target/debug/may" "${bin}" --ignored --exact --nocapture \
+          the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
     - name: Upload cargo timings
       if: always()
       uses: actions/upload-artifact@v4
@@ -145,18 +157,13 @@ runs:
       with:
         path: ${{ steps.downloads.outputs.tools-path }}
         key: ${{ steps.downloads.outputs.tools-key }}
-    # The Rust cache this job saves is written after the run, so every
-    # earlier generation under the job's prefix can go now; without this the
-    # generations accumulate past the repository's cache quota and evict the
-    # hot one. Only main's own generations retire: pull-request caches share
-    # the prefix and a later push of their PR still restores them.
-    - name: Retire superseded Rust caches
-      if: github.ref == 'refs/heads/main'
+    - name: Report stow cache stats
+      if: always()
       shell: bash
-      run: |
-        prefix="v0-rust-${{ github.job }}-"
-        gh api --paginate "repos/${{ github.repository }}/actions/caches?key=${prefix}" \
-          -q ".actions_caches[] | select(.key | startswith(\"${prefix}\")) | select(.ref == \"refs/heads/main\") | .id" \
-          | while read -r id; do
-              gh api -X DELETE "repos/${{ github.repository }}/actions/caches/${id}" || true
-            done
+      run: stow stats || true
+    - uses: ./.github/actions/save-stow-cache
+      if: success()
+      with:
+        cache-prefix: ${{ steps.stow.outputs.cache-prefix }}
+        cache-key: ${{ steps.stow.outputs.cache-key }}
+        cache-hit: ${{ steps.stow.outputs.cache-hit }}

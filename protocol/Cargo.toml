@@ -1,0 +1,71 @@
+[package]
+name = "may-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "May's foundational wire types and leaf utilities"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[features]
+default = []
+# The `serve_api` test server and the global-executor installer shared by
+# the workspace's `#[cfg(test)]` code; a crate's `[dev-dependencies]` enable
+# it for test builds.
+testing = [
+    "dep:executor-core",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tokio",
+]
+
+[dependencies]
+aither-agent = { version = "0.31.0" }
+aither-core = { version = "0.31.0" }
+aither-sandbox = { version = "0.31.0" }
+arc-swap = { version = "1", features = ["weak"] }
+askama = "0.16"
+async-channel = "2"
+async-fs = "2.1"
+brush-parser = { version = "0.3.0", default-features = false }
+fastrand = { version = "2.4.1" }
+futures-lite = "2.6"
+futures-util = "0.3"
+humantime = { version = "2.4", default-features = false }
+jiff = { version = "0.2", features = ["serde"] }
+may-patch = { path = "../patch" }
+may-tasks = { path = "../tasks" }
+petname = "2"
+regex = "1.12"
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+skyzen = { version = "0.5.1" }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+zenwave = "0.7"
+
+# `testing`
+executor-core = { version = "0.7", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["server", "client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+[dev-dependencies]
+futures-lite = "2.6"
+mime = "0.3"
+tempfile = "3.24.0"
+tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
+tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

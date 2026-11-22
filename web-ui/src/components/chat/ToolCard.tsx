@@ -44,7 +44,6 @@ interface ToolCardProps {
 const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
   terminal: Play,
   terminal_input: Wrench,
-  terminal_kill: Wrench,
   terminal_read: Wrench,
   browser: MousePointer,
   web_search: Search,
@@ -59,7 +58,6 @@ const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
 const VARIANT_LABEL_KEY: Record<ToolVariant, MessageKey> = {
   terminal: 'tools.terminal',
   terminal_input: 'tools.terminalInput',
-  terminal_kill: 'tools.terminalKill',
   terminal_read: 'tools.terminalRead',
   browser: 'tools.browser',
   web_search: 'tools.webSearch',
@@ -80,8 +78,7 @@ function isTerminalVariant(variant: ToolVariant): boolean {
   return (
     variant === 'terminal' ||
     variant === 'terminal_input' ||
-    variant === 'terminal_read' ||
-    variant === 'terminal_kill'
+    variant === 'terminal_read'
   );
 }
 
@@ -94,8 +91,7 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
   switch (tool.variant) {
     case 'terminal':
     case 'terminal_input':
-    case 'terminal_read':
-    case 'terminal_kill': {
+    case 'terminal_read': {
       if (s.description) return s.description;
       if (s.script) return firstLine(s.script);
       return fallback;
@@ -351,7 +347,6 @@ function selectDetails(tool: TurnToolState, primary: string) {
     case 'terminal':
     case 'terminal_input':
     case 'terminal_read':
-    case 'terminal_kill':
       return <TerminalDetails tool={tool} primary={primary} />;
     default:
       return <GenericDetails tool={tool} />;
