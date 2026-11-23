@@ -25,7 +25,7 @@ use super::cli::{
 use super::command_set::{AnyCommandSet, CommandSet};
 use super::payload::{
     CallImageStore, CommandEnvelope, HandlerOutput, RecordedCallImage, ReservedForMain,
-    ToolUsageError, UnknownCommand, answer_recording_images, tool_usage_error,
+    ReservedForSubagent, ToolUsageError, UnknownCommand, answer_recording_images, tool_usage_error,
 };
 
 /// Which side of the authority boundary a launch is on: the main agent's, or
@@ -153,6 +153,15 @@ enum SubagentSide {
     Absent,
 }
 
+/// What the main role has of a command.
+#[derive(Clone, Copy)]
+enum MainSide {
+    /// Its handler.
+    Serves,
+    /// Reserved: the main agent's call gets the refusal naming it so.
+    Reserved,
+}
+
 #[derive(Clone)]
 struct Entry {
     help: String,
@@ -161,6 +170,7 @@ struct Entry {
     schema: Option<Value>,
     stdin_arg: Option<String>,
     main: Factory,
+    main_side: MainSide,
     subagent: SubagentSide,
     modes: Modes,
 }
@@ -173,9 +183,13 @@ impl Entry {
 
     fn factory(&self, role: Role) -> Option<&Factory> {
         match (role, &self.subagent) {
-            (Role::Main, _) | (Role::Subagent, SubagentSide::Same) => Some(&self.main),
             (Role::Subagent, SubagentSide::Serves(factory)) => Some(factory),
             (Role::Subagent, SubagentSide::Reserved | SubagentSide::Absent) => None,
+            (Role::Subagent, SubagentSide::Same) => Some(&self.main),
+            (Role::Main, _) => match self.main_side {
+                MainSide::Serves => Some(&self.main),
+                MainSide::Reserved => None,
+            },
         }
     }
 }
@@ -362,6 +376,7 @@ where
             schema: Some(schema),
             stdin_arg,
             main: Arc::new(move |_| handler.clone()),
+            main_side: MainSide::Serves,
             subagent: SubagentSide::Same,
             modes: Modes::Every,
         },
@@ -387,6 +402,7 @@ where
             schema: Some(schema),
             stdin_arg,
             main: Arc::new(move |_| handler.clone()),
+            main_side: MainSide::Serves,
             subagent: SubagentSide::Same,
             modes: Modes::Every,
         },
@@ -424,6 +440,7 @@ fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, E
             schema: Some(schema),
             stdin_arg,
             main: Arc::new(move |_| handler.clone()),
+            main_side: MainSide::Serves,
             subagent: SubagentSide::Same,
             modes: Modes::Every,
         },
@@ -439,7 +456,7 @@ fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, E
 pub struct CommandRegistryBuilder {
     entries: HashMap<String, Entry>,
     sets: Vec<AnyCommandSet>,
-    set_policies: Vec<(SubagentSide, Modes)>,
+    set_policies: Vec<(SubagentSide, MainSide, Modes)>,
     observer: Option<AnyCommandObserver>,
     kept: HashSet<String>,
     call_images: CallImageStore,
@@ -579,6 +596,7 @@ impl CommandRegistryBuilder {
                 schema: Some(entry_schema),
                 stdin_arg,
                 main: factory,
+                main_side: MainSide::Serves,
                 subagent: SubagentSide::Same,
                 modes: Modes::Every,
             },
@@ -612,6 +630,7 @@ impl CommandRegistryBuilder {
                 schema: None,
                 stdin_arg: None,
                 main: Arc::new(move |_| handler.clone()),
+                main_side: MainSide::Serves,
                 subagent: SubagentSide::Same,
                 modes: Modes::Every,
             },
@@ -653,7 +672,8 @@ impl CommandRegistryBuilder {
     /// stays with that command.
     pub fn command_set(&mut self, set: impl CommandSet) {
         self.sets.push(AnyCommandSet::new(set));
-        self.set_policies.push((SubagentSide::Same, Modes::Every));
+        self.set_policies
+            .push((SubagentSide::Same, MainSide::Serves, Modes::Every));
     }
 
     /// Reserves for the main agent every command `configure` registers: a
@@ -662,7 +682,7 @@ impl CommandRegistryBuilder {
         self.restrict(
             configure,
             |entry| entry.subagent = SubagentSide::Reserved,
-            |subagent, _| *subagent = SubagentSide::Reserved,
+            |subagent, _, _| *subagent = SubagentSide::Reserved,
         );
     }
 
@@ -672,7 +692,17 @@ impl CommandRegistryBuilder {
         self.restrict(
             configure,
             |entry| entry.subagent = SubagentSide::Absent,
-            |subagent, _| *subagent = SubagentSide::Absent,
+            |subagent, _, _| *subagent = SubagentSide::Absent,
+        );
+    }
+
+    /// Reserves for subagents every command `configure` registers: the main
+    /// agent's call is refused with a message naming the command.
+    pub fn subagent_only(&mut self, configure: impl FnOnce(&mut Self)) {
+        self.restrict(
+            configure,
+            |entry| entry.main_side = MainSide::Reserved,
+            |_, main_side, _| *main_side = MainSide::Reserved,
         );
     }
 
@@ -681,7 +711,7 @@ impl CommandRegistryBuilder {
         self.restrict(
             configure,
             |entry| entry.modes = Modes::Sandboxed,
-            |_, modes| *modes = Modes::Sandboxed,
+            |_, _, modes| *modes = Modes::Sandboxed,
         );
     }
 
@@ -706,7 +736,7 @@ impl CommandRegistryBuilder {
         &mut self,
         configure: impl FnOnce(&mut Self),
         apply_entry: impl Fn(&mut Entry),
-        apply_set: impl Fn(&mut SubagentSide, &mut Modes),
+        apply_set: impl Fn(&mut SubagentSide, &mut MainSide, &mut Modes),
     ) {
         let mut scoped = Self::new();
         configure(&mut scoped);
@@ -715,10 +745,12 @@ impl CommandRegistryBuilder {
             apply_entry(&mut entry);
             self.entries.insert(name, entry);
         }
-        for (set, (mut subagent, mut modes)) in scoped.sets.into_iter().zip(scoped.set_policies) {
-            apply_set(&mut subagent, &mut modes);
+        for (set, (mut subagent, mut main_side, mut modes)) in
+            scoped.sets.into_iter().zip(scoped.set_policies)
+        {
+            apply_set(&mut subagent, &mut main_side, &mut modes);
             self.sets.push(set);
-            self.set_policies.push((subagent, modes));
+            self.set_policies.push((subagent, main_side, modes));
         }
     }
 
@@ -750,7 +782,7 @@ impl CommandRegistryBuilder {
 pub struct CommandRegistry {
     entries: Arc<HashMap<String, Entry>>,
     sets: Arc<[AnyCommandSet]>,
-    set_policies: Arc<[(SubagentSide, Modes)]>,
+    set_policies: Arc<[(SubagentSide, MainSide, Modes)]>,
     observer: Option<AnyCommandObserver>,
     kept: Arc<HashSet<String>>,
     kept_tx: Sender<ToolCallId>,
@@ -792,10 +824,8 @@ impl CommandRegistry {
         if self.entries.contains_key(name) {
             return None;
         }
-        self.sets
-            .iter()
-            .zip(self.set_policies.iter())
-            .find_map(|(set, (subagent, modes))| {
+        self.sets.iter().zip(self.set_policies.iter()).find_map(
+            |(set, (subagent, main_side, modes))| {
                 let definition = set
                     .definitions()
                     .into_iter()
@@ -826,14 +856,16 @@ impl CommandRegistry {
                 });
                 let mut entry = definition_entry(&definition, raw).1;
                 entry.subagent = subagent.clone();
+                entry.main_side = *main_side;
                 entry.modes = *modes;
                 Some(entry)
-            })
+            },
+        )
     }
 
     fn set_names(&self, role: Role, mode: SandboxMode) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for (set, (subagent, modes)) in self.sets.iter().zip(self.set_policies.iter()) {
+        for (set, (subagent, _, modes)) in self.sets.iter().zip(self.set_policies.iter()) {
             let admitted = modes.admits(mode)
                 && !(role == Role::Subagent && matches!(subagent, SubagentSide::Absent));
             if !admitted {
@@ -961,16 +993,21 @@ impl CommandRegistry {
             .or_else(|| self.set_entry(name))
             .filter(|entry| entry.exists(role, mode));
         let handler = match resolved {
-            Some(entry) => match entry.factory(role) {
-                Some(factory) => factory(&binding),
-                None => {
-                    return CommandEnvelope::failure(
-                        ReservedForMain { name }
+            Some(entry) => {
+                if let Some(factory) = entry.factory(role) {
+                    factory(&binding)
+                } else {
+                    let refusal = match role {
+                        Role::Subagent => ReservedForMain { name }
                             .render()
                             .expect("the reserved-for-main template renders typed input"),
-                    );
+                        Role::Main => ReservedForSubagent { name }
+                            .render()
+                            .expect("the reserved-for-subagent template renders typed input"),
+                    };
+                    return CommandEnvelope::failure(refusal);
                 }
-            },
+            }
             None => {
                 return CommandEnvelope::failure(
                     UnknownCommand { name }

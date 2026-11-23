@@ -734,3 +734,48 @@ fn sessions_differing_only_in_session_values_share_the_prompt_up_to_the_session_
             .all(|slot| session_tier.contains(slot))
     );
 }
+
+/// A subagent's instruction blocks carry the parent contract — `send_message`
+/// mid-task, the last turn response as the report — and none of the
+/// user-facing directives the main agent's sections hold.
+#[test]
+fn subagent_instructions_report_to_the_parent_and_never_the_user() {
+    let blocks = super::build_subagent_instructions(
+        &AgentEnvironment::Local,
+        Vec::new(),
+        false,
+        vec!["API_KEY"],
+        None,
+        &Parameters::default(),
+    );
+    let text = blocks.join("\n");
+    assert!(
+        text.contains("`send_message`")
+            && text.contains("your last response is delivered to your parent as your report"),
+        "the parent contract is stated:\n{text}"
+    );
+    for user_facing in [
+        "ask_user",
+        "request_workspace",
+        "the user's timezone",
+        "probably in",
+        "Each user message",
+        "A user message that begins",
+        "artifacts/",
+        "files/",
+        "<session>",
+        "the session directory",
+    ] {
+        assert!(
+            !text.contains(user_facing),
+            "`{user_facing}` has no place in a subagent's prompt:\n{text}"
+        );
+    }
+    // It still states the mechanisms it shares: the sandbox escalation is
+    // its parent's decision, and secrets stay secret.
+    assert!(
+        text.contains("the agent that launched you approves")
+            && text.contains("Stored secrets: API_KEY"),
+        "{text}"
+    );
+}

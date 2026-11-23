@@ -572,6 +572,7 @@ where
             agent_messaging: None,
             languages: None,
             acp: None,
+            session_prompts: None,
             git: may_agent::host_git::HostGit::inherit(),
             timeout_cap: budgets.limits().timeout_cap,
             tasks_line_limit: may_agent::tasks_md::schema::LineLimit::new(

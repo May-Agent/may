@@ -1,0 +1,1 @@
+Delivered to the agent that launched you: it reads the message at its next turn boundary, or is woken with it when idle. Keep working; your last turn response, once the task is done and no background job runs, is your report.
