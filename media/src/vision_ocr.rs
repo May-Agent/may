@@ -1010,6 +1010,7 @@ mod tests {
                 },
                 stderr: None,
                 outcome: CommandOutcome::Exited { code: 0 },
+                retained_pid: None,
                 interruptions: Vec::new(),
             })),
         )

@@ -365,6 +365,45 @@ async fn publish_piece(
                     },
                 );
             }
+            let (pipe_upserts, pipe_removed) = diff(
+                &published.background.pipelines,
+                &snapshot.pipelines,
+                |pipe| &pipe.launch_id,
+            );
+            for launch_id in pipe_removed {
+                #[derive(Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct PipelineRemoved<'a> {
+                    session_id: &'a str,
+                    launch_id: u64,
+                }
+                publish(
+                    state,
+                    session_id,
+                    "pipeline.removed",
+                    &PipelineRemoved {
+                        session_id,
+                        launch_id: *launch_id,
+                    },
+                );
+            }
+            for pipeline in pipe_upserts {
+                #[derive(Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct PipelineUpserted<'a> {
+                    session_id: &'a str,
+                    pipeline: &'a crate::client::background::WirePipeline,
+                }
+                publish(
+                    state,
+                    session_id,
+                    "pipeline.upserted",
+                    &PipelineUpserted {
+                        session_id,
+                        pipeline,
+                    },
+                );
+            }
             published.background = snapshot;
         }
         SessionChange::Artifacts => {

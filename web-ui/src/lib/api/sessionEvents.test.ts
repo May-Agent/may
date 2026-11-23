@@ -96,6 +96,26 @@ describe('background deltas', () => {
     applyBackgroundDelta(state, 'subagent.removed', { sessionId: 's', runId: 3 });
     expect(state.subagents).toHaveLength(0);
   });
+
+  test('a pipeline upserted then removed updates by launchId', () => {
+    const state: BackgroundState = { jobs: [], subagents: [], pipelines: [] };
+    const pipe = {
+      pid: 48210,
+      launchId: 11,
+      jobStatus: { state: 'running' as const },
+      elapsedMs: 3100,
+      activeStep: 0,
+      stages: [],
+    };
+    expect(applyBackgroundDelta(state, 'pipeline.upserted', { sessionId: 's', pipeline: pipe })).toBe(
+      true,
+    );
+    expect(state.pipelines?.map((p) => p.launchId)).toEqual([11]);
+    expect(applyBackgroundDelta(state, 'pipeline.removed', { sessionId: 's', launchId: 11 })).toBe(
+      true,
+    );
+    expect(state.pipelines).toEqual([]);
+  });
 });
 
 describe('artifact deltas', () => {

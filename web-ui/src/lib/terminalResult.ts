@@ -25,6 +25,8 @@ export interface OutputStream {
 
 export interface TerminalResult {
   exitCode: number | null;
+  runningPid: number | null;
+  retainedPid: number | null;
   stdout: OutputStream | null;
   stderr: OutputStream | null;
 }
@@ -66,6 +68,11 @@ export function extractTerminalResult(result: unknown): TerminalResult | null {
       outcome && outcome.status === 'exited' && typeof outcome.code === 'number'
         ? outcome.code
         : null,
+    runningPid:
+      outcome && outcome.status === 'running' && typeof outcome.pid === 'number'
+        ? outcome.pid
+        : null,
+    retainedPid: typeof r.retained_pid === 'number' ? r.retained_pid : null,
     stdout: extractOutputStream(r.stdout),
     stderr: extractOutputStream(r.stderr),
   };

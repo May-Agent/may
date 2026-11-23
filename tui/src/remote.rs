@@ -445,8 +445,13 @@ struct StreamState {
 impl StreamState {
     /// The `AppEvent` the background state now yields.
     fn background_event(&self) -> AppEvent {
+        let pipelines = self.background.pipelines.clone();
         let (jobs, subagents) = self.background.clone().into_parts();
-        AppEvent::BackgroundLoaded { jobs, subagents }
+        AppEvent::BackgroundLoaded {
+            jobs,
+            subagents,
+            pipelines,
+        }
     }
 
     /// The `AppEvent` the issue list now yields.
@@ -512,6 +517,27 @@ fn stream_app_event(kind: &str, data: &str, state: &mut StreamState) -> Option<A
                         .background
                         .subagents
                         .retain(|run| run.run_id != frame.run_id);
+                    state.background_event()
+                })
+        }
+        "pipeline.upserted" => {
+            serde_json::from_str::<may_client::client::PipelineUpsertedFrame>(data)
+                .ok()
+                .map(|frame| {
+                    upsert(&mut state.background.pipelines, frame.pipeline, |pipe| {
+                        pipe.launch_id
+                    });
+                    state.background_event()
+                })
+        }
+        "pipeline.removed" => {
+            serde_json::from_str::<may_client::client::PipelineRemovedFrame>(data)
+                .ok()
+                .map(|frame| {
+                    state
+                        .background
+                        .pipelines
+                        .retain(|pipe| pipe.launch_id != frame.launch_id);
                     state.background_event()
                 })
         }

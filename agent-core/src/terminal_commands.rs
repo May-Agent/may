@@ -255,6 +255,9 @@ pub struct SharedTerminalCommands {
     /// Receives the main agent's shell, which the read-only forks answering
     /// side requests launch theirs from.
     pub fork_launcher: crate::agent_link::ForkLauncher,
+    /// Earlier shells' job handles kept across main-agent rebuilds while
+    /// retained pipeline stages remain within their retention window.
+    pub prior_jobs: crate::agent::pipe_tool::PriorJobs,
 }
 
 /// Why the shared terminal commands could not be registered.
@@ -644,6 +647,19 @@ where
         builder.main_only(|reserved| reserved.configure_tool(task));
     }
 
+    let prior_jobs = crate::agent::pipe_tool::PriorJobs::default();
+    describe_arguments::<crate::agent::pipe_tool::PipeArgs>(&mut descriptions, "pipe");
+    {
+        let prior_jobs = prior_jobs.clone();
+        builder.configure_bound_tool("pipe", move |binding| {
+            crate::agent::pipe_tool::PipeTool::new(
+                binding.shell.cloned(),
+                binding.role(),
+                prior_jobs.clone(),
+            )
+        });
+    }
+
     describe_arguments::<crate::agent::serve_tool::ServeArgs>(&mut descriptions, "serve");
     {
         // A service's alerts land on the session's main agent: a subagent
@@ -833,6 +849,7 @@ where
         usages,
         fork_source,
         fork_launcher,
+        prior_jobs,
     })
 }
 

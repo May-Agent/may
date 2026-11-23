@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use aither_sandbox::{
     Delivery, Interpreter, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, SandboxMode,
-    TimeoutKill,
+    StageStatus, TimeoutKill,
 };
 use serde::{Deserialize, Serialize};
 
@@ -374,6 +374,89 @@ impl From<WireSubagentRun> for SubagentRunSnapshot {
     }
 }
 
+/// Execution state of one pipeline stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WireStageStatus {
+    /// Stage has not reported start yet.
+    Pending,
+    /// Stage is currently running.
+    Running,
+    /// Stage exited with `code`.
+    Exited {
+        /// Process exit code of this stage.
+        code: i32,
+    },
+}
+
+impl From<StageStatus> for WireStageStatus {
+    fn from(status: StageStatus) -> Self {
+        match status {
+            StageStatus::Pending => Self::Pending,
+            StageStatus::Running => Self::Running,
+            StageStatus::Exited { code } => Self::Exited { code },
+        }
+    }
+}
+
+impl From<WireStageStatus> for StageStatus {
+    fn from(status: WireStageStatus) -> Self {
+        match status {
+            WireStageStatus::Pending => Self::Pending,
+            WireStageStatus::Running => Self::Running,
+            WireStageStatus::Exited { code } => Self::Exited { code },
+        }
+    }
+}
+
+/// Metadata for one `0`-indexed stage of a running or retained pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePipelineStage {
+    /// Zero-based stage index within the pipeline.
+    pub step: usize,
+    /// Stage command text.
+    pub command: String,
+    /// Current lifecycle state of this stage.
+    pub status: WireStageStatus,
+    /// Measured own active duration in milliseconds once the stage has exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_duration_ms: Option<u64>,
+    /// Whether this stage's output is currently readable (live or retained).
+    pub retained: bool,
+    /// Combined UI byte count buffered for this stage.
+    pub ui_bytes: usize,
+    /// Newline count across this stage's output.
+    pub total_lines: usize,
+}
+
+/// A running (`>= 3s` foreground or any background) or retained (`15m` window)
+/// multi-stage shell pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePipeline {
+    /// Process ID inside the execution environment.
+    pub pid: u32,
+    /// Monotonic launch generation key disambiguating OS PID reuse.
+    pub launch_id: u64,
+    /// Script text of the command, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub script: String,
+    /// Overall job status.
+    pub job_status: WireJobStatus,
+    /// Milliseconds elapsed while the pipeline ran.
+    pub elapsed_ms: u64,
+    /// RFC 3339 wall-clock instant when retained intermediate stages expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub expires_at: Option<jiff::Timestamp>,
+    /// Earliest stage still pending or running (`None` once all stages exited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_step: Option<usize>,
+    /// Ordered stages of the pipeline.
+    pub stages: Vec<WirePipelineStage>,
+}
+
 /// A session's background work: the `session_background` event payload and
 /// the answer of `GET /api/sessions/{id}/background`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
@@ -386,6 +469,9 @@ pub struct SessionBackgroundSnapshot {
     pub jobs: Vec<WireJob>,
     /// Its subagent runs in flight.
     pub subagents: Vec<WireSubagentRun>,
+    /// Its active (`>= 3s` foreground or background) and retained pipelines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipelines: Vec<WirePipeline>,
     /// Whether the daemon holds a background wake for the session: a
     /// finished command whose result starts a turn of its own, or that turn
     /// still running.
@@ -443,6 +529,12 @@ pub struct WireTerminalDelta {
     pub bytes: Vec<u8>,
     /// The job's state at the read.
     pub status: WireJobStatus,
+    /// Total UI bytes buffered for the read stream, when reading a pipeline stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<usize>,
+    /// Lifecycle state of the pipeline stage, when reading a pipeline stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_status: Option<WireStageStatus>,
 }
 
 mod base64_opt {
@@ -508,9 +600,18 @@ impl RemoteBackground {
     pub async fn snapshot(
         &self,
     ) -> Result<(Vec<JobInfo>, Vec<SubagentRunSnapshot>), super::DaemonClientError> {
-        let snapshot: SessionBackgroundSnapshot =
-            self.client.get(&self.path("/background")).await?;
+        let snapshot = self.full_snapshot().await?;
         Ok(snapshot.into_parts())
+    }
+
+    /// Full background snapshot including active and retained pipelines.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn full_snapshot(
+        &self,
+    ) -> Result<SessionBackgroundSnapshot, super::DaemonClientError> {
+        self.client.get(&self.path("/background")).await
     }
 
     /// Whether the session will start another turn on its own.
@@ -560,6 +661,32 @@ impl RemoteBackground {
             .append_pair("pid", &pid.to_string())
             .append_pair("cursor", &cursor.to_string())
             .finish();
+        self.client
+            .get(&self.path(&format!("/jobs/read?{query}")))
+            .await
+    }
+
+    /// Colored UI output of pipeline stage `step` on `pid` since `cursor`.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or the stage is unknown/expired.
+    pub async fn read_stage(
+        &self,
+        pid: u32,
+        launch_id: Option<u64>,
+        step: usize,
+        cursor: usize,
+    ) -> Result<WireTerminalDelta, super::DaemonClientError> {
+        let query = {
+            let mut ser = url::form_urlencoded::Serializer::new(String::new());
+            ser.append_pair("pid", &pid.to_string())
+                .append_pair("step", &step.to_string())
+                .append_pair("cursor", &cursor.to_string());
+            if let Some(launch_id) = launch_id {
+                ser.append_pair("launchId", &launch_id.to_string());
+            }
+            ser.finish()
+        };
         self.client
             .get(&self.path(&format!("/jobs/read?{query}")))
             .await
@@ -681,6 +808,8 @@ mod tests {
             cursor: 3,
             bytes: vec![0xff, b'a', 0],
             status: WireJobStatus::Running,
+            total_bytes: None,
+            stage_status: None,
         };
         let text = serde_json::to_string(&delta).expect("serializes");
         assert!(text.contains("\"/2EA\""), "{text}");

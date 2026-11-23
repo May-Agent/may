@@ -99,6 +99,8 @@ pub struct ToolOutput {
     /// Why the command failed — a non-zero exit or a killed run; `None`
     /// when the call succeeded.
     pub failure: Option<String>,
+    /// Process ID retained for pipeline inspection or detached execution.
+    pub pid: Option<u32>,
 }
 
 /// Frontend-agnostic end event for a tool call.
@@ -275,6 +277,7 @@ pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
             text: output,
             image: Some(image),
             failure: None,
+            pid: None,
         });
     }
 
@@ -286,6 +289,7 @@ pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
         text: output,
         image: None,
         failure: None,
+        pid: None,
     })
 }
 
@@ -322,11 +326,16 @@ fn extract_tool_output(result: &CommandResult) -> ToolOutput {
         CommandOutcome::Killed { notice, .. } => Some(notice.clone()),
         CommandOutcome::Exited { .. } | CommandOutcome::Running { .. } => None,
     };
+    let pid = result.retained_pid.or(match &result.outcome {
+        CommandOutcome::Running { pid, .. } => Some(*pid),
+        CommandOutcome::Exited { .. } | CommandOutcome::Killed { .. } => None,
+    });
     let mut output = match &result.stdout {
         CommandStream::Inline { text } => ToolOutput {
             text: text.clone(),
             image: None,
             failure: None,
+            pid,
         },
         CommandStream::Image { file, .. } => ToolOutput {
             text: format!("[image] {}", file.path),
@@ -335,16 +344,19 @@ fn extract_tool_output(result: &CommandResult) -> ToolOutput {
                 path: file.path.clone(),
             }),
             failure: None,
+            pid,
         },
         CommandStream::Stored { file, preview, .. } if preview.is_empty() => ToolOutput {
             text: format!("[stored: {}]", file.url),
             image: None,
             failure: None,
+            pid,
         },
         CommandStream::Stored { preview, .. } => ToolOutput {
             text: preview.clone(),
             image: None,
             failure: None,
+            pid,
         },
     };
     output.failure = failure;
@@ -653,6 +665,7 @@ mod tests {
             stdout,
             stderr: None,
             outcome: CommandOutcome::Exited { code: 0 },
+            retained_pid: None,
             interruptions: Vec::new(),
         }))
     }
@@ -755,6 +768,7 @@ mod tests {
                 },
                 stderr: None,
                 outcome,
+                retained_pid: None,
                 interruptions: Vec::new(),
             }));
             match parse_tool_end(&result) {

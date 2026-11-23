@@ -2092,6 +2092,15 @@ pub struct ShellSettings {
     pub media_high: u32,
     /// Characters of a job's script shown in the job list.
     pub job_preview_bytes: usize,
+    /// Minimum own active duration a pipeline stage must reach to retain its
+    /// output after exit (and after which a foreground pipeline surfaces live
+    /// stage progress).
+    #[serde(with = "duration_text")]
+    pub pipeline_record_after: Duration,
+    /// How long retained pipeline stage outputs remain readable after a command
+    /// finishes before intermediate buffers are deleted.
+    #[serde(with = "duration_text")]
+    pub pipeline_retention: Duration,
 }
 
 impl Default for ShellSettings {
@@ -2113,6 +2122,8 @@ impl Default for ShellSettings {
             media_medium: 1024,
             media_high: 2048,
             job_preview_bytes: 50,
+            pipeline_record_after: Duration::from_secs(3),
+            pipeline_retention: Duration::from_mins(15),
         }
     }
 }

@@ -763,6 +763,7 @@ mod tests {
                 text: stderr.to_string(),
             }),
             outcome: CommandOutcome::Exited { code },
+            retained_pid: None,
             interruptions: Vec::new(),
         }))
     }

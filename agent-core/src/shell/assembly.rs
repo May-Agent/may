@@ -14,8 +14,8 @@ use aither_sandbox::{
 use heel::HeelBinary;
 
 use super::{
-    FileReadsAreVerbatim, HostSession, MayShellWording, SessionEnvironmentError, ShellBudgets,
-    approval::ServerApproval, shell_tool_settings,
+    FileReadsAreVerbatim, HostSession, MayPipelinePlanner, MayShellWording,
+    SessionEnvironmentError, ShellBudgets, approval::ServerApproval, shell_tool_settings,
 };
 use crate::agent::command_env::CommandEnv;
 use crate::agent::subagent_spaces::SessionSubagentSpaces;
@@ -138,6 +138,7 @@ where
             .output(self.budgets.output())
             .wording(MayShellWording)
             .treat_output(FileReadsAreVerbatim)
+            .plan_pipelines(MayPipelinePlanner)
             .tools(shell_tool_settings(&self.budgets))
             .policy(ServerApproval::new(sessions.clone()))
             .ipc(CommandBridge::new(commands, self.slot.clone()));

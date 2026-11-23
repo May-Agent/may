@@ -430,6 +430,9 @@ pub struct MayAgent {
     /// The facts the session's shells raise about their jobs, which the idle
     /// agent waits on.
     job_events: super::job_events::SessionJobBridge,
+    /// Earlier shells' job registries kept for `pipe` while retained stages
+    /// remain within their retention window.
+    prior_jobs: super::pipe_tool::PriorJobs,
     tools: ToolEnvironments,
     environment: AgentEnvironment,
     /// Where a fact of a main-agent job is told to the clients that show it.
@@ -1198,6 +1201,7 @@ impl MayAgent {
 
         // The command table, the capabilities and the efficiency rules are
         // rendered from the commands registered above.
+        let prior_jobs = shared_terminal_commands.prior_jobs.clone();
         let command_descriptions = shared_terminal_commands.descriptions.clone();
         let core_commands = shared_terminal_commands.usages.clone();
         let capabilities = build_capabilities(
@@ -1438,6 +1442,7 @@ impl MayAgent {
             inner: agent,
             sandbox_dir: shell.working_dir().clone(),
             job_events: job_bridge,
+            prior_jobs,
             tools,
             environment: config.environment,
             job_facts_tx,
@@ -1815,10 +1820,12 @@ impl MayAgent {
     pub fn attach_session_job_hooks(
         &mut self,
         prior_events: Vec<ShellEvents>,
+        prior_jobs: Vec<aither_sandbox::Jobs>,
         hooks: super::job_events::SessionJobHooks,
         restored_alerts: Vec<String>,
     ) {
         self.job_events.configure(prior_events, hooks);
+        self.prior_jobs.set(prior_jobs);
         for alert in restored_alerts {
             self.inner
                 .context_mut()

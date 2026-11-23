@@ -1059,7 +1059,7 @@ mod tests {
     use crate::cloud_home::follow_peer_bridge;
     use crate::cloud_sessions::Endpoint;
     use crate::config::MayConfig;
-    use crate::db::{PromptCacheRequest, RunFence};
+    use crate::db::PromptCacheRequest;
     use crate::server::{DaemonMode, build_router};
 
     struct TestNode {
@@ -1290,19 +1290,10 @@ mod tests {
             .expect("warm remote send");
         assert_eq!(recipient, "Backend");
 
-        let claimed = mini
-            .state
-            .runtime_service
-            .db()
-            .claim_next_pending_message(
-                &RunFence {
-                    session_id: "badger".to_string(),
-                    run_id: "r1".to_string(),
-                },
-                "badger",
-            )
-            .await
-            .unwrap()
+        let summary = mini.state.runtime_service.get("badger").await.unwrap();
+        let claimed = summary
+            .pending_immediate
+            .or_else(|| summary.queued_messages.into_iter().next())
             .expect("remote message queued");
         let xml = claimed.hidden_context_xml.unwrap().into_inner();
         assert!(
@@ -1392,19 +1383,10 @@ mod tests {
             .expect("cloud-to-host send");
         assert_eq!(delivered_to, "Host Lead");
 
-        let claimed = host_node
-            .state
-            .runtime_service
-            .db()
-            .claim_next_pending_message(
-                &RunFence {
-                    session_id: "otter".to_string(),
-                    run_id: "r-host".to_string(),
-                },
-                "otter",
-            )
-            .await
-            .unwrap()
+        let summary = host_node.state.runtime_service.get("otter").await.unwrap();
+        let claimed = summary
+            .pending_immediate
+            .or_else(|| summary.queued_messages.into_iter().next())
             .expect("host message queued");
         let xml = claimed.hidden_context_xml.unwrap().into_inner();
         assert!(xml.contains("agent send cloud:lynx"), "{xml}");

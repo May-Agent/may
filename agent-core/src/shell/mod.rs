@@ -7,6 +7,7 @@ mod assembly;
 mod budgets;
 mod environment;
 mod output_treatment;
+mod pipeline_plan;
 mod python_shim;
 mod settings;
 mod tools;
@@ -18,6 +19,7 @@ pub use assembly::{ShellAssembly, ShellAssemblyError};
 pub use budgets::ShellBudgets;
 pub use environment::{HostSession, SessionEnvironmentError};
 pub use output_treatment::FileReadsAreVerbatim;
+pub use pipeline_plan::MayPipelinePlanner;
 pub use settings::{
     INPUT_TOOL, MONITOR_TOOL, READ_TOOL, SHELL_TOOL, monitor_settings, shell_tool_settings,
 };
