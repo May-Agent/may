@@ -1,0 +1,3 @@
+<system-reminder>
+The conversation was rewound to an earlier prompt. Files in the workspace and session directory (including tasks.md), git commits and branches, pull requests, and issues were not reverted and remain in their current state — inspect them before relying on earlier memory, and undo landed changes with a revert PR rather than rewriting history.{% if !prs.is_empty() %} Session pull requests: {% for pr in prs %}{% if !loop.first %}, {% endif %}{{ pr.sigil }}{{ pr.number }} {{ pr.title }} ({{ pr.state }}){% endfor %}.{% endif %}
+</system-reminder>

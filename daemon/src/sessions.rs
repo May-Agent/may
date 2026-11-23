@@ -98,32 +98,82 @@ pub async fn rewind_inner(
     id: &str,
     req: &RewindRequest,
 ) -> SkyResult<Json<i64>> {
+    let guard = state
+        .runtime_service
+        .runs()
+        .acquire(id)
+        .await
+        .map_err(super::chat::acquire_refusal)?;
     let db = state.db();
-    let rows = db.get_messages(id).await.map_err(internal_error)?;
-    let index = {
+    let _ = state.pending_transcripts.flush_session(&db, id).await;
+
+    let rows = match db.get_messages(id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let _ = guard.finish_idle(crate::session::RunOutcome::Failed).await;
+            return Err(internal_error(error));
+        }
+    };
+    let resolved = async {
         let history = crate::session::load_history_from_db(&db, id)
             .await
             .map_err(internal_error)?;
         let entries = super::transcript::build_entries(history.messages());
-        super::transcript::entry_cut_index(&rows, &entries, &req.entry_id)?
+        let cut_index = super::transcript::entry_cut_index(&rows, &entries, &req.entry_id)?;
+        let user_message_id = req
+            .entry_id
+            .parse::<i64>()
+            .map_err(|_| bad_request_error("unknown `entryId`"))?;
+        let Some(row) = rows.get(cut_index) else {
+            return Err(bad_request_error("rewind index out of range"));
+        };
+        Ok((i64::from(row.id), user_message_id))
+    }
+    .await;
+    let (cut_id, user_message_id) = match resolved {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = guard.finish_idle(crate::session::RunOutcome::Failed).await;
+            return Err(error);
+        }
     };
-    let Some(row) = rows.get(index) else {
-        return Err(bad_request_error("rewind index out of range"));
-    };
-    let cut_id = i64::from(row.id);
-    db.delete_messages_from(id, cut_id)
+
+    state.parked_agents.evict_and_wait(id).await;
+    super::chat::suggest::cancel(state, id);
+    super::chat::recap::unarm(state, id);
+    state.session_background.rewind(id, user_message_id).await;
+
+    if let Err(error) = db
+        .rewind_session_from(guard.fence(), cut_id, user_message_id)
         .await
-        .map_err(internal_error)?;
+    {
+        let _ = guard.finish_idle(crate::session::RunOutcome::Failed).await;
+        return Err(internal_error(error));
+    }
+
     // The audit log is append-only: every PR this session opened keeps a
     // `rewound` event so its history records that the conversation was
     // cut back while the proposal itself still stands.
+    let mut touched_prs = false;
     if let Ok(prs) = db.list_session_prs(id).await {
         let detail = format!("history rewound to message {cut_id}");
         for pr in prs {
+            touched_prs = true;
             let _ = db
                 .add_pr_event(pr.id, "rewound", id, "user", None, Some(&detail))
                 .await;
         }
+    }
+
+    let _ = guard
+        .finish_idle(crate::session::RunOutcome::Completed)
+        .await;
+    state.session_background.record_now().await;
+    state.turn_hub.reset(id);
+    state.publish_session_change(id, super::session_events::SessionChange::Runtime);
+    state.publish_session_change(id, super::session_events::SessionChange::Background);
+    if touched_prs {
+        state.publish_session_change(id, super::session_events::SessionChange::Prs);
     }
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(cut_id))

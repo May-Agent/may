@@ -16,9 +16,10 @@ path = "src/bin/may/main.rs"
 dist = true
 
 [workspace]
-members = [".", "agent-core", "daemon", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
-# `cargo build` also builds the `tasks`, `apply_patch` and `aither-sed` binaries.
-default-members = [".", "agent-core", "daemon", "tasks", "patch", "sed", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
+members = [".", "agent-core", "daemon", "tasks", "patch", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
+# `cargo build` also builds the `tasks` and `apply_patch` binaries (`may-sed`
+# lives in its own `sed/` workspace so main-workspace edits never compile it).
+default-members = [".", "agent-core", "daemon", "tasks", "patch", "container-image", "protocol", "tool-dist", "config", "command-policy", "media", "harness", "db", "providers", "client", "tui", "repo-search", "git-forge"]
 
 [features]
 default = ["vision-ocr"]

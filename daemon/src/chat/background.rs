@@ -9,15 +9,15 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use aither_sandbox::{Job, JobInfo, JobRead, JobStatus, Jobs};
+use aither_sandbox::{Job, JobInfo, JobRead, JobStatus, Jobs, ShellEvent};
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
-use crate::agent::SubagentTracker;
+use crate::agent::{DeliveredJobCompletion, SessionJobHooks, SubagentTracker, render_job_ended};
 use crate::client::background::{
     SessionBackgroundSnapshot, WireJob, WireJobDetail, WireSubagentRun, WireTerminalDelta,
 };
@@ -38,6 +38,17 @@ struct SessionBackground {
     /// Background wakes being served: received from the idle agent and not
     /// yet settled by the turn they start.
     resuming: Arc<std::sync::atomic::AtomicUsize>,
+    /// Monotonic start instant of each user prompt row persisted in this
+    /// daemon process.
+    prompt_starts: Vec<(i64, Instant)>,
+    /// Jobs terminated by a conversation rewind, keyed by `(pid, started_at)`
+    /// so later OS PID reuse never hides a new job.
+    abandoned_jobs: Arc<Mutex<Vec<(u32, Instant)>>>,
+    /// Completions read by an agent during turns that may later be rewound.
+    delivered_completions: Arc<Mutex<Vec<DeliveredJobCompletion>>>,
+    /// Pre-rewind job completions restored across a rewind, injected on the
+    /// next built agent.
+    rewound_alerts: Vec<String>,
 }
 
 /// A background wake of a session being served; the session reads as
@@ -77,13 +88,24 @@ impl Drop for ResumePending {
 type RecordRequest = async_channel::Sender<()>;
 
 /// Background work of every session the daemon ran.
-#[derive(Default)]
 pub struct SessionBackgrounds {
     sessions: Mutex<HashMap<String, SessionBackground>>,
     next_registry: std::sync::atomic::AtomicU64,
+    started_at: Instant,
     /// Where the watcher, the record's one writer, takes requests to bring
     /// it up to date; set once the watcher runs.
     record: std::sync::OnceLock<async_channel::Sender<RecordRequest>>,
+}
+
+impl Default for SessionBackgrounds {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            next_registry: std::sync::atomic::AtomicU64::new(0),
+            started_at: Instant::now(),
+            record: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionBackgrounds {
@@ -118,6 +140,210 @@ impl SessionBackgrounds {
             .or_default()
             .jobs
             .push((id, jobs));
+    }
+
+    /// Records when user prompt `message_id` began in this daemon process so
+    /// rewinding to it distinguishes earlier jobs from jobs launched by the
+    /// rewound timeline.
+    pub fn record_prompt_start(&self, session_id: &str, message_id: i64, at: Instant) {
+        let mut sessions = self.sessions();
+        let entry = sessions.entry(session_id.to_string()).or_default();
+        entry.prompt_starts.retain(|(id, _)| *id != message_id);
+        entry.prompt_starts.push((message_id, at));
+        drop(sessions);
+    }
+
+    /// Registers `agent`'s shell jobs, forwards surviving earlier shells'
+    /// event queues into `agent`, and injects any pre-cut completions restored
+    /// across a rewind.
+    pub async fn attach_agent_jobs(&self, session_id: &str, agent: &mut crate::MayAgent) {
+        let (older_registries, abandoned, delivered, restored_alerts) = {
+            let mut sessions = self.sessions();
+            let entry = sessions.entry(session_id.to_string()).or_default();
+            let tuple = (
+                entry.jobs.clone(),
+                entry.abandoned_jobs.clone(),
+                entry.delivered_completions.clone(),
+                std::mem::take(&mut entry.rewound_alerts),
+            );
+            drop(sessions);
+            tuple
+        };
+        let abandoned_snapshot = abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut prior_events = Vec::new();
+        for (_, registry) in older_registries {
+            let has_surviving = registry.list().await.into_iter().any(|job| {
+                !abandoned_snapshot.contains(&(job.pid, job.started_at))
+                    && (job.status == JobStatus::Running || job.status.completion_pending())
+            });
+            if has_surviving {
+                prior_events.push(registry.events());
+            }
+        }
+        self.add_jobs(session_id, agent.jobs());
+        let hooks = SessionJobHooks::new(
+            move |pid, started_at| {
+                let guard = abandoned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                started_at.map_or_else(
+                    || guard.iter().any(|(abandoned_pid, _)| *abandoned_pid == pid),
+                    |at| guard.contains(&(pid, at)),
+                )
+            },
+            move |completion| {
+                delivered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(completion);
+            },
+        );
+        agent.attach_session_job_hooks(prior_events, hooks, restored_alerts);
+    }
+
+    /// Rewinds `session_id`'s background work to before `user_message_id`:
+    /// kills terminal jobs and cancels subagent runs started at or after the
+    /// cut, settles their pending completions silently, and preserves jobs
+    /// started before the cut along with any completions they delivered during
+    /// the rewound turns.
+    pub async fn rewind(&self, session_id: &str, user_message_id: i64) {
+        let (cut_at, registries, subagents, abandoned_arc, delivered_arc) = {
+            let mut sessions = self.sessions();
+            let Some(entry) = sessions.get_mut(session_id) else {
+                return;
+            };
+            let cut_at = entry
+                .prompt_starts
+                .iter()
+                .find(|(id, _)| *id == user_message_id)
+                .map(|(_, at)| *at)
+                .or_else(|| {
+                    entry
+                        .prompt_starts
+                        .iter()
+                        .filter(|(id, _)| *id > user_message_id)
+                        .map(|(_, at)| *at)
+                        .min()
+                        .filter(|_| {
+                            entry
+                                .prompt_starts
+                                .iter()
+                                .any(|(id, _)| *id < user_message_id)
+                        })
+                })
+                .unwrap_or(self.started_at);
+            entry.prompt_starts.retain(|(id, _)| *id < user_message_id);
+            let tuple = (
+                cut_at,
+                entry.jobs.clone(),
+                entry.subagents.clone(),
+                entry.abandoned_jobs.clone(),
+                entry.delivered_completions.clone(),
+            );
+            drop(sessions);
+            tuple
+        };
+
+        let mut newly_abandoned = Vec::new();
+        let mut to_settle = Vec::new();
+        let mut restored_alerts = Vec::new();
+
+        for (_, registry) in &registries {
+            let list = registry.list().await;
+            for job in &list {
+                if job.started_at >= cut_at {
+                    newly_abandoned.push((job.pid, job.started_at));
+                    if job.status == JobStatus::Running {
+                        let _ = registry.kill(&job.task_id).await;
+                    }
+                }
+            }
+        }
+
+        if !newly_abandoned.is_empty() {
+            let mut guard = abandoned_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for item in &newly_abandoned {
+                if !guard.contains(item) {
+                    guard.push(*item);
+                }
+            }
+        }
+
+        let abandoned_all = abandoned_arc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        for (_, registry) in &registries {
+            let events = registry.events();
+            while let Some(event) = events.try_recv() {
+                if !event.agent().is_main() {
+                    continue;
+                }
+                if let ShellEvent::JobEnded(ended) = event {
+                    let pid = ended.info().pid;
+                    let started_at = ended.info().started_at;
+                    if started_at >= cut_at || abandoned_all.contains(&(pid, started_at)) {
+                        let (_, _, _, pending) = (*ended).into_parts();
+                        to_settle.extend(pending);
+                    } else {
+                        restored_alerts.push(render_job_ended(&ended));
+                        let (_, _, _, pending) = (*ended).into_parts();
+                        to_settle.extend(pending);
+                    }
+                }
+            }
+        }
+
+        futures_util::future::join_all(
+            to_settle
+                .into_iter()
+                .map(aither_sandbox::PendingCompletion::take),
+        )
+        .await;
+
+        for run in subagents.running() {
+            if run.started_at >= cut_at {
+                let _ = subagents.runs().cancel(run.run_id);
+            }
+        }
+
+        let reclaimed_from_delivered = {
+            let mut delivered = delivered_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut kept = Vec::with_capacity(delivered.len());
+            let mut reclaimed = Vec::new();
+            for item in delivered.drain(..) {
+                if item.started_at >= cut_at {
+                    continue;
+                }
+                if item.delivered_at >= cut_at {
+                    reclaimed.push(item.alert);
+                } else {
+                    kept.push(item);
+                }
+            }
+            *delivered = kept;
+            reclaimed
+        };
+
+        let mut all_restored = reclaimed_from_delivered;
+        all_restored.extend(restored_alerts);
+        if !all_restored.is_empty()
+            && let Some(entry) = self.sessions().get_mut(session_id)
+        {
+            for alert in all_restored {
+                if !entry.rewound_alerts.contains(&alert) {
+                    entry.rewound_alerts.push(alert);
+                }
+            }
+        }
     }
 
     /// Marks `session_id` as resuming until the guard drops, which holds the
@@ -162,7 +388,20 @@ impl SessionBackgrounds {
     /// earlier agents that still run or whose completion their agent has
     /// not taken. Earlier registries with neither are dropped.
     async fn jobs(&self, session_id: &str) -> Vec<JobInfo> {
-        let registries = self.registries(session_id);
+        let (registries, abandoned) = {
+            let sessions = self.sessions();
+            let Some(session) = sessions.get(session_id) else {
+                return Vec::new();
+            };
+            let abandoned = session
+                .abandoned_jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let tuple = (session.jobs.clone(), abandoned);
+            drop(sessions);
+            tuple
+        };
         let Some(((_, newest), older)) = registries.split_last() else {
             return Vec::new();
         };
@@ -173,14 +412,23 @@ impl SessionBackgrounds {
                 .list()
                 .await
                 .into_iter()
-                .filter(|job| job.status == JobStatus::Running || job.status.completion_pending())
+                .filter(|job| {
+                    !abandoned.contains(&(job.pid, job.started_at))
+                        && (job.status == JobStatus::Running || job.status.completion_pending())
+                })
                 .collect();
             if live.is_empty() {
                 idle.push(*id);
             }
             jobs.extend(live);
         }
-        jobs.extend(newest.list().await);
+        jobs.extend(
+            newest
+                .list()
+                .await
+                .into_iter()
+                .filter(|job| !abandoned.contains(&(job.pid, job.started_at))),
+        );
         if !idle.is_empty()
             && let Some(session) = self.sessions().get_mut(session_id)
         {
@@ -631,5 +879,85 @@ mod tests {
 
         take_completion(&shell).await;
         assert!(!backgrounds.snapshot("s").await.will_resume());
+    }
+
+    #[tokio::test]
+    async fn rewind_kills_post_cut_jobs_and_preserves_pre_cut_jobs_and_completions() {
+        crate::test_support::install_global_executor();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backgrounds = SessionBackgrounds::default();
+
+        backgrounds.record_prompt_start("s", 1, Instant::now());
+        let (pre_shell, _pre_job, pre_pid) = shell_with_job(&dir.path().join("pre")).await;
+        backgrounds.add_jobs("s", pre_shell.shell().jobs());
+
+        let (done_shell, done_job, done_pid) = shell_with_job(&dir.path().join("done")).await;
+        backgrounds.add_jobs("s", done_shell.shell().jobs());
+
+        let cut_at = Instant::now();
+        backgrounds.record_prompt_start("s", 2, cut_at);
+
+        // Simulate a pre-cut job whose completion was read during the rewound turn.
+        assert!(done_job.kill().await);
+        take_completion(&done_shell).await;
+        {
+            let delivered = backgrounds
+                .sessions()
+                .get("s")
+                .expect("session entry")
+                .delivered_completions
+                .clone();
+            delivered
+                .lock()
+                .expect("lock")
+                .push(DeliveredJobCompletion {
+                    pid: done_pid,
+                    started_at: cut_at.checked_sub(Duration::from_millis(50)).unwrap(),
+                    delivered_at: Instant::now(),
+                    alert: format!("Background job {done_pid} finished"),
+                });
+        }
+
+        let (post_shell, _post_job, post_pid) = shell_with_job(&dir.path().join("post")).await;
+        backgrounds.add_jobs("s", post_shell.shell().jobs());
+
+        assert_eq!(
+            backgrounds
+                .snapshot("s")
+                .await
+                .jobs
+                .iter()
+                .map(|j| j.pid)
+                .collect::<Vec<_>>(),
+            vec![pre_pid, post_pid]
+        );
+
+        backgrounds.rewind("s", 2).await;
+
+        let after = backgrounds.snapshot("s").await;
+        assert_eq!(
+            after.jobs.iter().map(|j| j.pid).collect::<Vec<_>>(),
+            vec![pre_pid],
+            "post-cut job is killed and removed while pre-cut job keeps running"
+        );
+        assert!(
+            !after.resuming,
+            "abandoned job completion never leaves the session resuming"
+        );
+        {
+            let alerts = backgrounds
+                .sessions()
+                .get("s")
+                .expect("session entry")
+                .rewound_alerts
+                .clone();
+            assert_eq!(
+                alerts,
+                vec![format!("Background job {done_pid} finished")],
+                "pre-cut completion read during rewound turn is restored for the next agent"
+            );
+        }
+
+        backgrounds.stop_all("s").await;
     }
 }
