@@ -1,0 +1,1 @@
+Posted {{ board_epoch }}:{{ seq }} to the swarm board{% if !woken.is_empty() %}; woke {{ woken.join(", ") }}{% endif %}{% if !queued_capped.is_empty() %}; queued for {{ queued_capped.join(", ") }} (automatic @mention wake limit reached){% endif %}.

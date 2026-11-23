@@ -1,0 +1,14 @@
+{%- match action -%}
+{%- when PrSwarmAction::Opened -%}
+{{ actor }} [id {{ actor_id }}] opened PR {{ sigil }}{{ number }} ({{ title }}) at {{ head_sha }}.
+{%- when PrSwarmAction::Queued -%}
+{{ actor }} [id {{ actor_id }}] queued PR {{ sigil }}{{ number }} ({{ title }}) for merge — the base branch will move once checks pass.
+{%- when PrSwarmAction::Merged { sha } -%}
+{{ actor }} [id {{ actor_id }}] merged PR {{ sigil }}{{ number }} ({{ title }}) at {{ sha }} — rebase overlapping session clones onto the updated base.
+{%- when PrSwarmAction::Cancelled { reason } -%}
+PR {{ sigil }}{{ number }} ({{ title }}) from {{ actor }} [id {{ actor_id }}] will not land ({{ reason }}).
+{%- when PrSwarmAction::Timeline { event } -%}
+PR {{ sigil }}{{ number }} ({{ title }}) from {{ actor }} [id {{ actor_id }}]: {{ event }}.
+{%- endmatch -%}
+{%- if !files.is_empty() %}
+Touched files: {{ files.join(", ") }}{% if extra_files > 0 %} (+{{ extra_files }} more){% endif %}{% endif %}

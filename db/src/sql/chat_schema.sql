@@ -143,3 +143,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_tasks_word ON scheduled_tasks(se
 CREATE TABLE IF NOT EXISTS pr_check_state (pr_id INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, rollup TEXT NOT NULL, unreadable BOOLEAN NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS pr_check_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, pr_id INTEGER NOT NULL, text TEXT NOT NULL, alerted BOOLEAN NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_pr_check_alerts_session ON pr_check_alerts(session_id, alerted);
+CREATE TABLE IF NOT EXISTS swarm_epochs (workdir TEXT PRIMARY KEY, last_epoch INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS swarm_boards (workdir TEXT PRIMARY KEY, board_epoch INTEGER NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS swarm_messages (workdir TEXT NOT NULL, board_epoch INTEGER NOT NULL, seq INTEGER NOT NULL, session_id TEXT, sender TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (workdir, seq));
+CREATE TABLE IF NOT EXISTS swarm_cursors (workdir TEXT NOT NULL, session_id TEXT NOT NULL, last_seq INTEGER NOT NULL, PRIMARY KEY (workdir, session_id));
+CREATE TABLE IF NOT EXISTS swarm_session_state (session_id TEXT PRIMARY KEY, told_workdir TEXT, told_epoch INTEGER NOT NULL DEFAULT 0, consecutive_mention_wakes INTEGER NOT NULL DEFAULT 0);

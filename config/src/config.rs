@@ -1420,13 +1420,42 @@ pub struct MayConfig {
     pub experimental: ExperimentalConfig,
 }
 
+const fn default_swarm_mention_wake_limit() -> u32 {
+    6
+}
+
+const fn default_swarm_read_limit() -> usize {
+    50
+}
+
 /// `[experimental]` section: features that are opt-in and may change shape.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Hashline search and editing: `search`/`edit` binaries on PATH,
     /// `apply_patch` absent, and semantic search answered by `rag`.
     pub hashline: bool,
+    /// Per-worktree coordination board, `@mention` wakeups and PR notifications
+    /// when more than one working session shares a checkout.
+    pub swarm: bool,
+    /// Consecutive unattended `@mention` wakeups permitted on one session before
+    /// automatic waking pauses until the next user prompt.
+    #[serde(default = "default_swarm_mention_wake_limit")]
+    pub swarm_mention_wake_limit: u32,
+    /// Default page size for `board` / `board read`.
+    #[serde(default = "default_swarm_read_limit")]
+    pub swarm_read_limit: usize,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            hashline: false,
+            swarm: false,
+            swarm_mention_wake_limit: default_swarm_mention_wake_limit(),
+            swarm_read_limit: default_swarm_read_limit(),
+        }
+    }
 }
 
 /// What publishing one kind of text asks of the user.

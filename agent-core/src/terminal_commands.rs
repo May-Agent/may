@@ -181,6 +181,8 @@ pub struct SharedServices {
     /// working copy and signer is granted here, and `sign-commit` checks
     /// a subagent's working directory against the same set.
     pub signer_roots: crate::commit_signing::SignerRoots,
+    /// Optional daemon-hosted swarm coordination service.
+    swarm: Arc<arc_swap::ArcSwapOption<crate::swarm::SwarmService>>,
 }
 
 impl SharedServices {
@@ -195,6 +197,7 @@ impl SharedServices {
             ),
             forge_auth: crate::forge::LiveForgeAuth::default(),
             signer_roots: crate::commit_signing::SignerRoots::default(),
+            swarm: Arc::new(arc_swap::ArcSwapOption::empty()),
         }
     }
 
@@ -207,6 +210,17 @@ impl SharedServices {
             forge_auth,
             ..self
         }
+    }
+
+    /// Installs the daemon's live [`crate::swarm::SwarmService`].
+    pub fn set_swarm(&self, swarm: crate::swarm::SwarmService) {
+        self.swarm.store(Some(Arc::new(swarm)));
+    }
+
+    /// Returns the installed [`crate::swarm::SwarmService`], when hosted by the daemon.
+    #[must_use]
+    pub fn swarm(&self) -> Option<crate::swarm::SwarmService> {
+        self.swarm.load_full().map(|arc| (*arc).clone())
     }
 }
 
@@ -470,6 +484,9 @@ where
     if let Some(guard) = &config.languages {
         pr_command = pr_command.with_languages(guard.clone());
     }
+    if let Some(swarm) = config.services.swarm() {
+        pr_command = pr_command.with_swarm(swarm);
+    }
     describe_arguments::<PrArgs>(&mut descriptions, "pr");
     // Built per terminal: git inside a session clone and the project checks
     // run on that terminal's sandbox.
@@ -577,6 +594,22 @@ where
             usage: tool_usage(&agent),
         });
         builder.main_only(|reserved| reserved.configure_tool(agent));
+
+        if let Some(swarm) = config.services.swarm() {
+            let mut board = crate::swarm::tool_for_session(
+                swarm,
+                config.session_id.clone(),
+                config.sandbox_dir.clone(),
+                matches!(config.task_runtime, TaskRuntimeKind::Container).then(|| {
+                    crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone())
+                }),
+            );
+            if let Some(guard) = &config.languages {
+                board = board.with_languages(guard.clone());
+            }
+            let set = crate::swarm::BoardCommandSet::new(board);
+            builder.main_only(|reserved| reserved.command_set(set));
+        }
     }
 
     if let Some(imagine) = config.imagine {
