@@ -922,7 +922,34 @@ impl RuntimeDeps {
             ))
             .into());
         };
-        let point = app.session_manager.rewind_to_prompt(history_index).await?;
+        // Stop the current stream follower before the daemon broadcasts
+        // `reset` so this client preserves its rewound composer and notice
+        // while other attached clients reload the truncated transcript.
+        *worker = None;
+        let point = match app.session_manager.rewind_to_prompt(history_index).await {
+            Ok(point) => point,
+            Err(error) => {
+                if let Some(session) = app.session_manager.current() {
+                    let session_id = session.id.clone();
+                    let sandbox_dir = session.sandbox_dir.clone();
+                    if let Ok(selected_model) =
+                        SelectedModel::resolve(&app.config, session.model.as_deref())
+                        && let Ok(rebuilt) = self.begin_worker_build(
+                            app,
+                            sandbox_dir,
+                            session_id,
+                            selected_model,
+                            None,
+                            None,
+                        )
+                        && let Ok(restored_worker) = rebuilt.task.await
+                    {
+                        *worker = Some(restored_worker);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
 
         let session = app
             .session_manager
@@ -937,27 +964,10 @@ impl RuntimeDeps {
         }
 
         app.chat.truncate_prompt_at(history_index);
+        app.queue = crate::queue::MessageQueue::new();
         app.input = content;
         app.cursor = app.input.len();
         app.attachments = attachments;
-        // The next send carries a one-shot notice: the conversation rolled
-        // back while the world — open and merged PRs — stands. The audit
-        // log already recorded a `rewound` event per session PR.
-        let mut notice =
-            "The conversation was rewound to an earlier point. Nothing outside the conversation changed — repository state, open and merged pull requests, and issues still stand as recorded. Undo landed code through a revert PR, never by rewriting history.".to_string();
-        let prs = &app.sidebar.prs;
-        if !prs.is_empty() {
-            let list = prs
-                .iter()
-                .map(|pr| format!("#{} {} ({})", pr.number, pr.title, pr.state))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = std::fmt::Write::write_fmt(
-                &mut notice,
-                format_args!(" Session pull requests: {list}."),
-            );
-        }
-        app.rewind_notice = may_protocol::xml::XmlBlock::parse(notice).ok();
         app.chat.push_notice(&format!(
             "⏪ rewound to before this prompt{}",
             if restore_code {
@@ -968,7 +978,6 @@ impl RuntimeDeps {
         ));
         app.scroll = usize::MAX;
 
-        *worker = None;
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
         self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }

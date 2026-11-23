@@ -152,6 +152,13 @@ impl ParkedAgents {
         }
     }
 
+    /// Evicts `session_id`'s idle agent and waits until its worker loop has
+    /// stopped, so no background wait or idle compaction races with state
+    /// truncation.
+    pub async fn evict_and_wait(&self, session_id: &str) {
+        let _ = self.take(session_id).await;
+    }
+
     /// Takes `session_id`'s idle agent for a turn.
     pub async fn take(&self, session_id: &str) -> Option<MayAgent> {
         let worker = self.workers().remove(session_id)?;
@@ -428,16 +435,4 @@ pub async fn btw_inner(
         }
     }
     Ok(Json(BtwResponse { answer }))
-}
-
-/// `DELETE /api/sessions/{id}/agent`: drops the session's idle agent, for a
-/// client that changed the conversation outside a turn (a rewind); the next
-/// turn rebuilds it from history.
-pub async fn release_agent(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<crate::types::ApiHealth>> {
-    let session_id = session_id_param(&params)?;
-    state.parked_agents.evict(&session_id);
-    Ok(Json(crate::types::API_OK))
 }

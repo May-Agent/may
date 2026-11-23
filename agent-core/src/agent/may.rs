@@ -427,9 +427,9 @@ pub struct MayAgent {
     inner: MayAgentInner,
     /// The session's shell: its jobs, events and grants.
     shell: Arc<SessionShell>,
-    /// The facts the shell raises about its jobs, which the idle agent waits
-    /// on.
-    job_events: ShellEvents,
+    /// The facts the session's shells raise about their jobs, which the idle
+    /// agent waits on.
+    job_events: super::job_events::SessionJobBridge,
     tools: ToolEnvironments,
     environment: AgentEnvironment,
     /// Where a fact of a main-agent job is told to the clients that show it.
@@ -1309,6 +1309,7 @@ impl MayAgent {
             config.model_context_window,
         ));
         let watch_valve = valve.clone();
+        let job_bridge = super::job_events::SessionJobBridge::new(shell.jobs().events());
         let mut builder = AgentBuilder::new(llm)
             .hooks(hooks)
             .system_layout(tag::layout())
@@ -1333,7 +1334,7 @@ impl MayAgent {
                 config.services.checkouts.clone(),
                 config.session_id.as_str(),
             ))
-            .context_source(JobReports::new(shell.jobs().events(), job_facts_tx.clone()));
+            .context_source(JobReports::new(job_bridge.clone(), job_facts_tx.clone()));
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }
@@ -1406,7 +1407,7 @@ impl MayAgent {
         Ok(Self {
             inner: agent,
             sandbox_dir: shell.working_dir().clone(),
-            job_events: shell.jobs().events(),
+            job_events: job_bridge,
             tools,
             environment: config.environment,
             job_facts_tx,
@@ -1744,26 +1745,58 @@ impl MayAgent {
     /// host continues with [`Self::resume`]. Cancel-safe: nothing is taken
     /// until the wait completes.
     pub async fn wait_background(&mut self) -> BackgroundWake {
-        let first = self.job_events.recv().await;
-        let mut report = JobReport::default();
-        report.take(first, &self.job_facts_tx);
-        while let Some(event) = self.job_events.try_recv() {
-            report.take(event, &self.job_facts_tx);
+        loop {
+            let first = self.job_events.recv().await;
+            let hooks = self.job_events.hooks();
+            let mut report = JobReport::default();
+            report.take(first, &self.job_facts_tx, &hooks);
+            while let Some(event) = self.job_events.try_recv() {
+                report.take(event, &self.job_facts_tx, &hooks);
+            }
+            for completion in report.discarded {
+                completion.take().await;
+            }
+            if report.alerts.is_empty() && report.pending.is_empty() && !report.needs_model {
+                continue;
+            }
+            for alert in report.alerts {
+                self.inner
+                    .context_mut()
+                    .push_block_alert(&aither_agent::Block::new("system-reminder", alert));
+            }
+            let decision =
+                crate::agent::wake::decide(crate::agent::wake::WakeCause::BackgroundCompletion {
+                    needs_model: report.needs_model,
+                    interrupted: self.interrupted,
+                });
+            return BackgroundWake {
+                pending: report.pending,
+                starts_run: decision == crate::agent::wake::WakeDecision::Start,
+            };
         }
-        for alert in report.alerts {
+    }
+
+    /// Connects surviving pre-rewind shell queues, rewound-job filtering, and
+    /// any pre-rewind completions restored across a conversation rewind.
+    pub fn attach_session_job_hooks(
+        &mut self,
+        prior_events: Vec<ShellEvents>,
+        hooks: super::job_events::SessionJobHooks,
+        restored_alerts: Vec<String>,
+    ) {
+        self.job_events.configure(prior_events, hooks);
+        for alert in restored_alerts {
             self.inner
                 .context_mut()
                 .push_block_alert(&aither_agent::Block::new("system-reminder", alert));
         }
-        let decision =
-            crate::agent::wake::decide(crate::agent::wake::WakeCause::BackgroundCompletion {
-                needs_model: report.needs_model,
-                interrupted: self.interrupted,
-            });
-        BackgroundWake {
-            pending: report.pending,
-            starts_run: decision == crate::agent::wake::WakeDecision::Start,
-        }
+    }
+
+    /// Transcript `seq` the next item pushed into this agent's context will
+    /// receive.
+    #[must_use]
+    pub fn next_transcript_seq(&self) -> i64 {
+        i64::try_from(self.inner.context().checkpoint().fork_point()).unwrap_or(i64::MAX)
     }
 
     /// The user stopped the run: what the session's jobs report from now on
