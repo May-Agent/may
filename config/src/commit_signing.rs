@@ -121,11 +121,24 @@ impl From<HostGitError> for SigningError {
     }
 }
 
-/// `key` from the host's configuration, which signing as the user needs.
-fn required(host: &HostGit, key: &'static str) -> Result<String, SigningError> {
-    host.config_value(key)?
-        .filter(|value| !value.is_empty())
-        .ok_or(SigningError::MissingConfig(key))
+/// All host git config keys `sandbox_git_config` and `HostSigner` inspect.
+const SANDBOX_CONFIG_PATTERN: &str =
+    r"^(user\.(name|email|signingkey)|commit\.gpgsign|gpg\.(format|ssh\.program))$";
+
+/// Reads a single host git config key from a prefetched map.
+fn map_value(
+    entries: &std::collections::HashMap<String, String>,
+    key: &'static str,
+) -> Option<String> {
+    entries.get(key).filter(|value| !value.is_empty()).cloned()
+}
+
+/// `key` from a prefetched host configuration map, or `MissingConfig`.
+fn required_from_map(
+    entries: &std::collections::HashMap<String, String>,
+    key: &'static str,
+) -> Result<String, SigningError> {
+    map_value(entries, key).ok_or(SigningError::MissingConfig(key))
 }
 
 /// Who the user is to git.
@@ -136,10 +149,10 @@ struct Identity {
 }
 
 impl Identity {
-    fn read(host: &HostGit) -> Result<Self, SigningError> {
+    fn from_map(entries: &std::collections::HashMap<String, String>) -> Result<Self, SigningError> {
         Ok(Self {
-            name: required(host, "user.name")?,
-            email: required(host, "user.email")?,
+            name: required_from_map(entries, "user.name")?,
+            email: required_from_map(entries, "user.email")?,
         })
     }
 }
@@ -157,6 +170,27 @@ enum SigningPolicy {
 }
 
 impl SigningPolicy {
+    fn from_map(
+        host: &HostGit,
+        entries: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, SigningError> {
+        let gpgsign = match entries.get("commit.gpgsign") {
+            Some(raw) => match crate::host_git::parse_git_bool(raw) {
+                Some(enabled) => enabled,
+                None => host.config_bool("commit.gpgsign")?.unwrap_or(false),
+            },
+            None => false,
+        };
+        if !gpgsign {
+            return Ok(Self::Off);
+        }
+        match entries.get("gpg.format").map(String::as_str) {
+            Some("ssh") => Ok(Self::Ssh),
+            Some(other) if !other.is_empty() => Ok(Self::Unsupported(other.to_string())),
+            _ => Ok(Self::Unsupported("openpgp".to_string())),
+        }
+    }
+
     fn read(host: &HostGit) -> Result<Self, SigningError> {
         if !host.config_bool("commit.gpgsign")?.unwrap_or(false) {
             return Ok(Self::Off);
@@ -257,13 +291,12 @@ struct HostSigner {
 
 impl HostSigner {
     fn read(host: &HostGit) -> Result<Self, SigningError> {
+        let entries = host.config_regexp(SANDBOX_CONFIG_PATTERN)?;
         Ok(Self {
-            identity: Identity::read(host)?,
-            program: host
-                .config_value("gpg.ssh.program")?
-                .filter(|program| !program.is_empty())
+            identity: Identity::from_map(&entries)?,
+            program: map_value(&entries, "gpg.ssh.program")
                 .unwrap_or_else(|| "ssh-keygen".to_string()),
-            key: SigningKey::parse(&required(host, "user.signingkey")?)?,
+            key: SigningKey::parse(&required_from_map(&entries, "user.signingkey")?)?,
         })
     }
 
@@ -695,15 +728,16 @@ impl CommitSigning {
         let host = self.host.clone();
         let program = program.to_string();
         let (identity, signing) = blocking::unblock(move || {
-            let identity = Identity::read(&host)
+            let entries = host.config_regexp(SANDBOX_CONFIG_PATTERN)?;
+            let identity = Identity::from_map(&entries)
                 .inspect_err(|error| tracing::warn!(%error, "no git identity on the host"))
                 .ok();
-            let signing = match SigningPolicy::read(&host)? {
+            let signing = match SigningPolicy::from_map(&host, &entries)? {
                 SigningPolicy::Off => None,
                 // An unsupported format still gets the signer, which refuses
                 // the commit naming the format.
                 SigningPolicy::Ssh | SigningPolicy::Unsupported(_) => {
-                    let key = required(&host, "user.signingkey")
+                    let key = required_from_map(&entries, "user.signingkey")
                         .and_then(|value| SigningKey::parse(&value)?.public())
                         .map_or_else(
                             |error| {

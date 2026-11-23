@@ -18,7 +18,6 @@ export type ApiErrorCode =
   | 'location_unavailable'
   | 'github_unauthenticated'
   | 'cloud_account_unusable'
-  | 'repo_declined'
   | 'loop_stopped'
   | 'session_suspended';
 

@@ -882,7 +882,6 @@ async fn forward_turn_error(data: &str, current: &mut Option<ForwardedTurn>) {
         .get("code")
         .and_then(|code| serde_json::from_value::<ApiErrorCode>(code.clone()).ok());
     let event = match code {
-        Some(ApiErrorCode::RepoDeclined) => TuiEvent::Declined(message),
         Some(ApiErrorCode::LoopStopped) => TuiEvent::LoopStopped(message),
         _ => TuiEvent::Error(message),
     };
@@ -1295,14 +1294,13 @@ mod tests {
     #[tokio::test]
     async fn a_loop_stop_reaches_the_turn_as_a_stop_with_its_reason() {
         const NOTICE: &str = "The turn was ended because the agent was looping: it made the same call 10 times in a row. Send a message to continue.";
-        for code in ["loop_stopped", "repo_declined", "internal_error"] {
+        for code in ["loop_stopped", "internal_error"] {
             let (events, rx) = unbounded();
             let mut current = Some(ForwardedTurn::new(events, true));
             forward_turn_error(&turn_error(code, NOTICE), &mut current).await;
             let seen: Vec<TuiEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
             match (code, seen.as_slice()) {
                 ("loop_stopped", [TuiEvent::LoopStopped(message)])
-                | ("repo_declined", [TuiEvent::Declined(message)])
                 | ("internal_error", [TuiEvent::Error(message)]) => assert_eq!(message, NOTICE),
                 (_, other) => panic!("{code}: {other:?}"),
             }

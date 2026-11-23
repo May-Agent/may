@@ -3711,8 +3711,6 @@ pub enum UiChatPreparationError {
     PersistContextDebugSnapshot(#[source] crate::db::ChatDbError),
     #[error("failed to bind the session to its repository: {0}")]
     RepoGate(#[source] crate::repo_gate::GateError),
-    #[error("the session did not start: it was not allowed to work in this repository")]
-    RepoGateDeclined,
 }
 
 impl UiChatPreparationError {
@@ -3737,35 +3735,7 @@ impl UiChatPreparationError {
     }
 }
 
-/// Puts the session gate's questions to the user through the session's
-/// `ask_user` channel, so every attached client shows them.
-struct SessionAsker {
-    broker: ask_user::AskUserBroker,
-    session_id: String,
-}
-
-impl crate::repo_gate::Asker for SessionAsker {
-    async fn ask(
-        &self,
-        question: ask_user::Question,
-    ) -> Result<Vec<ask_user::QuestionAnswer>, crate::repo_gate::GateError> {
-        self.broker
-            .request(ask_user::AskUserRequestPayload {
-                session_id: self.session_id.clone(),
-                request: ask_user::AskUserArgs {
-                    question: None,
-                    option: Vec::new(),
-                    multi_select: false,
-                    questions: vec![question],
-                },
-            })
-            .await
-            .map_err(|error| crate::repo_gate::GateError::Ask(error.to_string()))
-    }
-}
-
-/// Binds the session to its repository and runs the checkout preflight
-/// before its first turn builds an agent.
+/// Binds the session to its repository before its first turn builds an agent.
 async fn gate_session_repo(
     state: &Arc<DaemonState>,
     session_id: &str,
@@ -3784,36 +3754,21 @@ async fn gate_session_repo(
     let sandbox =
         SessionStore::new(home.clone()).sandbox_dir(session_id.as_str(), row.profile_id.as_deref());
     let config_path = crate::session::SessionPaths::new(sandbox.clone()).workspace_config();
-    let staging = home.repo_staging_dir();
-    let asker = SessionAsker {
-        broker: spawn_ask_user_forwarder(state, session_id),
-        session_id: session_id.as_str().to_string(),
-    };
-    let host = crate::host_git::HostGit::inherit();
     let may_config = state.config_snapshot();
     let probe = crate::trust::ForgeProbes::new(
         crate::pr::PrContext::default_github_api(state.forge_auth.clone()),
         state.forge_auth.clone(),
     );
-    let verdict = crate::repo_gate::RepoGate {
+    crate::repo_gate::RepoGate {
         db: &db,
-        host: &host,
-        asker: &asker,
         probe: &probe,
-        forge_auth: &state.forge_auth,
         config_path: &config_path,
         may_config: &may_config,
         session_root: &sandbox,
-        staging: &staging,
-        remote: "origin",
     }
     .run(session_id.as_str())
     .await
-    .map_err(UiChatPreparationError::RepoGate)?;
-    match verdict {
-        crate::repo_gate::Verdict::Proceed => Ok(()),
-        crate::repo_gate::Verdict::Exit => Err(UiChatPreparationError::RepoGateDeclined),
-    }
+    .map_err(UiChatPreparationError::RepoGate)
 }
 
 impl UiChatPreparationError {
@@ -3833,7 +3788,6 @@ impl UiChatPreparationError {
             Self::EnsureContainerImage(_) => ApiErrorCode::ContainerPullFailed,
             Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
             Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
-            Self::RepoGateDeclined => ApiErrorCode::RepoDeclined,
             Self::LoadSession(_)
             | Self::LoadHistory(_)
             | Self::LoadProfile(_)
@@ -8014,136 +7968,6 @@ mod tests {
         assert!(
             stopped_recorded,
             "client disconnect must persist ToolEventRecord::Stopped for active terminal calls"
-        );
-    }
-
-    #[tokio::test]
-    async fn stopping_a_run_blocked_in_repo_gate_ask_user_settles_and_withdraws() {
-        let provider = stub_provider(vec![sse_text("ok")]).await;
-        let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), &provider, &provider).await;
-        // A GitHub-bound session launched in a GitHub checkout whose remote
-        // cannot be reached: the gate's checkout preflight asks the user.
-        // `origin` names github.com so the checkout counts as GitHub, and a
-        // dead loopback proxy fails `ls-remote` at once, without the network.
-        let checkout_dir = cwd.path().join("checkout");
-        let repo = git2::Repository::init(&checkout_dir).expect("git init");
-        repo.remote("origin", "https://github.com/acme/app.git")
-            .expect("origin");
-        repo.config()
-            .expect("git config")
-            .set_str("http.proxy", "http://127.0.0.1:9")
-            .expect("dead proxy");
-        let checkout = checkout_dir.canonicalize().expect("canonical checkout");
-        let config_path =
-            crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
-        crate::trust::persist(
-            &config_path,
-            &checkout,
-            Some(&crate::trust::RepoKind::Forge {
-                repo: crate::forge::ForgeRepo::parse_binding("github:acme/app")
-                    .expect("github binding"),
-            }),
-            crate::trust::TrustLevel::Full,
-        )
-        .expect("persist trust");
-        state
-            .db()
-            .set_session_repo("session", Some("github:acme/app"))
-            .await
-            .expect("bind repo");
-        state
-            .db()
-            .set_session_cwd("session", &checkout.to_string_lossy())
-            .await
-            .expect("session cwd");
-
-        let mut sink = TestSink::default();
-        let req = ChatRequest {
-            session_id: "session".to_string(),
-            content: "hello".to_string(),
-            attachments: Vec::new(),
-            hidden_context_xml: None,
-            delivery_mode: crate::session::PendingUserMessageMode::Steer,
-            pending_entry_id: None,
-        };
-        let guard = state
-            .runtime_service
-            .runs()
-            .acquire("session")
-            .await
-            .expect("acquire");
-
-        let run_and_release = async {
-            let result = super::run_agent_loop(
-                &state,
-                &req,
-                &mut sink,
-                &guard,
-                true,
-                false,
-                &super::TurnKind::Prompt,
-            )
-            .await;
-            guard
-                .finish_idle(crate::session::RunOutcome::Cancelled)
-                .await
-                .expect("finish idle");
-            result
-        };
-
-        let stop_future = async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if state
-                        .runtime_service
-                        .get("session")
-                        .await
-                        .expect("runtime")
-                        .waiting_ask_user
-                        .is_some()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("repo gate should register blocking ask_user");
-
-            let runtime = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                super::stop_session(&state, "session", crate::session::CancelReason::User),
-            )
-            .await
-            .expect("stop_session must not hang while repo gate waits")
-            .expect("stop_session succeeds");
-            assert_eq!(runtime.state, crate::session::SessionRuntimeState::Idle);
-        };
-
-        let (result, ()) = tokio::join!(run_and_release, stop_future);
-        assert!(matches!(
-            result,
-            Err(super::AgentLoopError::Cancelled(reason)) if reason == super::USER_CANCELLED
-        ));
-        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
-
-        let runtime = state
-            .runtime_service
-            .get("session")
-            .await
-            .expect("runtime after stop");
-        assert_eq!(runtime.state, crate::session::SessionRuntimeState::Idle);
-        assert!(runtime.waiting_ask_user.is_none());
-
-        let history = crate::session::load_history_from_db(&state.db(), "session")
-            .await
-            .expect("history");
-        assert!(
-            history.messages().is_empty(),
-            "ask_user_request written during cancelled preparation must be removed: {:?}",
-            history.messages()
         );
     }
 

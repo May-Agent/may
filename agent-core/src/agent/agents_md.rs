@@ -109,7 +109,22 @@ fn discover_sync(workdir: &Path) -> AgentsIndex {
         // Deterministic order keeps the rendered block stable across
         // agent rebuilds.
         .sort_by_file_name(std::cmp::Ord::cmp)
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != OsStr::new(".git"))
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_name() == OsStr::new(".git") {
+                return false;
+            }
+            // Linked worktrees and nested repositories carry their own `.git`
+            // (file or directory) and can hold gigabytes of parallel builds.
+            if entry.file_type().is_some_and(|kind| kind.is_dir())
+                && entry.path().join(".git").exists()
+            {
+                return false;
+            }
+            true
+        })
         .build();
     for entry in walker {
         let entry = match entry {
@@ -345,5 +360,30 @@ mod tests {
             load_referenced("[x](sub/AGENTS.md)", None).await,
             [] as [HandoffAgentDoc; 0]
         );
+    }
+
+    #[tokio::test]
+    async fn discover_skips_nested_git_checkouts_and_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "AGENTS.md", "root rules");
+        write(dir.path(), "crates/foo/AGENTS.md", "foo rules");
+        // Nested repository (`.git` directory) and linked worktree (`.git` file).
+        write(
+            dir.path(),
+            ".worktrees/topic/.git",
+            "gitdir: ../.git/worktrees/topic",
+        );
+        write(dir.path(), ".worktrees/topic/AGENTS.md", "worktree rules");
+        write(
+            dir.path(),
+            ".worktrees/topic/sub/AGENTS.md",
+            "nested worktree rules",
+        );
+        std::fs::create_dir_all(dir.path().join("vendor-repo/.git")).unwrap();
+        write(dir.path(), "vendor-repo/AGENTS.md", "nested repo rules");
+
+        let index = discover(dir.path()).await;
+
+        assert_eq!(index.nested, vec!["crates/foo/AGENTS.md".to_string()]);
     }
 }

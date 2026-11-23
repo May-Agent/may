@@ -553,11 +553,11 @@ impl SessionRepos {
         }
         Ok(Some(match source {
             CloneSource::Remote { url, repo } => {
-                self.create_remote_clone(&url, &repo.cache_key(), staging, None)
+                self.create_remote_clone(&url, &repo.cache_key(), staging)
                     .await?
             }
             CloneSource::Local { identity } => {
-                self.create_local_clone(checkout, &identity, staging, false)
+                self.create_local_clone(checkout, &identity, staging)
                     .await?
             }
         }))
@@ -599,7 +599,7 @@ impl SessionRepos {
                     return Ok(Some(reusable));
                 }
                 Ok(Some(
-                    self.create_remote_clone(&url, &repository.cache_key(), staging, None)
+                    self.create_remote_clone(&url, &repository.cache_key(), staging)
                         .await?,
                 ))
             }
@@ -830,23 +830,15 @@ impl SessionRepos {
         }
     }
 
-    /// Run `git clone <args> <staged>` in a fresh directory under `staging`,
-    /// then move the finished clone to `repos/<dir>`. The clone is never
-    /// agent-writable while host git works on it, so nothing the agent writes
-    /// into it runs on the host. `host` carries any credentials the source
-    /// needs.
-    ///
-    /// With `wip_of`, the checkout's uncommitted and untracked files become
-    /// one commit on top of the clone's HEAD, whose id is returned.
+    /// Stages a clone from `args` via `host`, installs it into the session,
+    /// and returns `Ok(())`.
     async fn clone_staged(
         &self,
         args: Vec<String>,
         staging: &Path,
         dir: &CloneDir,
-        wip_of: Option<&Path>,
         host: HostGit,
-    ) -> Result<Option<String>, RepoCloneError> {
-        let wip_of = wip_of.map(Path::to_path_buf);
+    ) -> Result<(), RepoCloneError> {
         let staging = staging.to_path_buf();
         let session_root = self.session_root.clone();
         let dir = dir.clone();
@@ -861,15 +853,9 @@ impl SessionRepos {
             let staged_arg = staged.to_string_lossy();
             command.push(&staged_arg);
             host.output(None, &command)?;
-            // The clone is still host-owned here, so nothing the agent
-            // writes can run on the host.
-            let base = wip_of
-                .map(|checkout| wip::commit_onto(&host, &checkout, &staged))
-                .transpose()?
-                .flatten();
             std::fs::create_dir_all(&session_root)?;
             confined::install_clone(&session_root, &staged, &dir)?;
-            Ok(base)
+            Ok(())
         })
         .await
     }
@@ -914,24 +900,7 @@ impl SessionRepos {
         repo_key: &Path,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
-        self.local_clone(checkout, repo_key, staging, false).await
-    }
-
-    /// Like [`Self::ensure_local_clone`], for a session that works on top of
-    /// the checkout as it stands: the checkout's uncommitted changes and
-    /// untracked files become one base commit in the clone, recorded as the
-    /// clone's base, and the session's work stacks on it.
-    ///
-    /// # Errors
-    /// Fails as [`Self::ensure_local_clone`] does, or when the base commit
-    /// cannot be made.
-    pub async fn ensure_wip_clone(
-        &self,
-        checkout: &Path,
-        repo_key: &Path,
-        staging: &Path,
-    ) -> Result<PathBuf, RepoCloneError> {
-        self.local_clone(checkout, repo_key, staging, true).await
+        self.local_clone(checkout, repo_key, staging).await
     }
 
     async fn create_local_clone(
@@ -939,30 +908,27 @@ impl SessionRepos {
         checkout: &Path,
         repo_key: &Path,
         staging: &Path,
-        with_wip: bool,
     ) -> Result<PathBuf, RepoCloneError> {
         let key = repo_key.to_string_lossy().into_owned();
         let clone_dir = self.next_clone_dir(&key).await?;
         let dir = self.path(&clone_dir);
-        let base = self
-            .clone_staged(
-                vec![
-                    "--local".to_string(),
-                    "--no-hardlinks".to_string(),
-                    checkout.to_string_lossy().into_owned(),
-                ],
-                staging,
-                &clone_dir,
-                with_wip.then_some(checkout),
-                self.host.clone(),
-            )
-            .await?;
+        self.clone_staged(
+            vec![
+                "--local".to_string(),
+                "--no-hardlinks".to_string(),
+                checkout.to_string_lossy().into_owned(),
+            ],
+            staging,
+            &clone_dir,
+            self.host.clone(),
+        )
+        .await?;
         self.register(
             key,
             &clone_dir,
             checkout.to_string_lossy().into_owned(),
             true,
-            base,
+            None,
         )
         .await?;
         Ok(dir)
@@ -973,7 +939,6 @@ impl SessionRepos {
         checkout: &Path,
         repo_key: &Path,
         staging: &Path,
-        with_wip: bool,
     ) -> Result<PathBuf, RepoCloneError> {
         let key = repo_key.to_string_lossy().into_owned();
         if let Some(dir) = self.clone_for(&key).await? {
@@ -996,25 +961,23 @@ impl SessionRepos {
         }
         // Objects are copied: the sandbox runs as the user's uid, so a
         // hardlinked object made writable would change the source's inode.
-        let base = self
-            .clone_staged(
-                vec![
-                    "--local".to_string(),
-                    "--no-hardlinks".to_string(),
-                    checkout.to_string_lossy().into_owned(),
-                ],
-                staging,
-                &clone_dir,
-                with_wip.then_some(checkout),
-                self.host.clone(),
-            )
-            .await?;
+        self.clone_staged(
+            vec![
+                "--local".to_string(),
+                "--no-hardlinks".to_string(),
+                checkout.to_string_lossy().into_owned(),
+            ],
+            staging,
+            &clone_dir,
+            self.host.clone(),
+        )
+        .await?;
         self.register(
             key,
             &clone_dir,
             checkout.to_string_lossy().into_owned(),
             true,
-            base,
+            None,
         )
         .await?;
         Ok(dir)
@@ -1032,27 +995,7 @@ impl SessionRepos {
         repo_key: &str,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
-        self.remote_clone(url, repo_key, staging, None).await
-    }
-
-    /// Like [`Self::ensure_remote_clone`], for a session that works on top of
-    /// `checkout` as it stands: the checkout's uncommitted changes and
-    /// untracked files become one base commit on the remote's HEAD, recorded
-    /// as the clone's base. The clone stays remote-sourced, so the session
-    /// keeps its GitHub binding.
-    ///
-    /// # Errors
-    /// Fails as [`Self::ensure_remote_clone`] does, or when the base commit
-    /// cannot be made.
-    pub async fn ensure_remote_wip_clone(
-        &self,
-        url: &str,
-        repo_key: &str,
-        staging: &Path,
-        checkout: &Path,
-    ) -> Result<PathBuf, RepoCloneError> {
-        self.remote_clone(url, repo_key, staging, Some(checkout))
-            .await
+        self.remote_clone(url, repo_key, staging).await
     }
 
     async fn create_remote_clone(
@@ -1060,19 +1003,17 @@ impl SessionRepos {
         url: &str,
         repo_key: &str,
         staging: &Path,
-        wip_of: Option<&Path>,
     ) -> Result<PathBuf, RepoCloneError> {
         let clone_dir = self.next_clone_dir(repo_key).await?;
         let dir = self.path(&clone_dir);
-        let base = self
-            .remote_clone_into_dir(url, repo_key, staging, &clone_dir, wip_of)
+        self.remote_clone_into_dir(url, repo_key, staging, &clone_dir)
             .await?;
         self.register(
             repo_key.to_string(),
             &clone_dir,
             url.to_string(),
             false,
-            base,
+            None,
         )
         .await?;
         Ok(dir)
@@ -1084,8 +1025,7 @@ impl SessionRepos {
         repo_key: &str,
         staging: &Path,
         clone_dir: &CloneDir,
-        wip_of: Option<&Path>,
-    ) -> Result<Option<String>, RepoCloneError> {
+    ) -> Result<(), RepoCloneError> {
         if let Some(checkouts) = &self.checkouts {
             let staging_buf = staging.to_path_buf();
             let scratch = blocking::unblock(move || {
@@ -1097,18 +1037,12 @@ impl SessionRepos {
             .await?;
             let staged = scratch.path().join("repo");
             checkouts.derive_workspace(repo_key, url, &staged).await?;
-            let wip_of_buf = wip_of.map(Path::to_path_buf);
             let session_root = self.session_root.clone();
             let dir_owned = clone_dir.clone();
-            let host = self.host.clone();
             return blocking::unblock(move || {
-                let base = wip_of_buf
-                    .map(|checkout| wip::commit_onto(&host, &checkout, &staged))
-                    .transpose()?
-                    .flatten();
                 std::fs::create_dir_all(&session_root)?;
                 confined::install_clone(&session_root, &staged, &dir_owned)?;
-                Ok(base)
+                Ok(())
             })
             .await;
         }
@@ -1121,7 +1055,6 @@ impl SessionRepos {
             ],
             staging,
             clone_dir,
-            wip_of,
             host,
         )
         .await
@@ -1132,7 +1065,6 @@ impl SessionRepos {
         url: &str,
         repo_key: &str,
         staging: &Path,
-        wip_of: Option<&Path>,
     ) -> Result<PathBuf, RepoCloneError> {
         if let Some(dir) = self.clone_for(repo_key).await? {
             return Ok(dir);
@@ -1150,15 +1082,14 @@ impl SessionRepos {
             .await?;
             return Ok(dir);
         }
-        let base = self
-            .remote_clone_into_dir(url, repo_key, staging, &clone_dir, wip_of)
+        self.remote_clone_into_dir(url, repo_key, staging, &clone_dir)
             .await?;
         self.register(
             repo_key.to_string(),
             &clone_dir,
             url.to_string(),
             false,
-            base,
+            None,
         )
         .await?;
         Ok(dir)
@@ -1271,8 +1202,6 @@ fn real_dir_exists(path: &Path) -> Result<bool, RepoCloneError> {
 /// is host-owned but everything in it is agent-writable, so each step runs
 /// relative to an open handle and never follows a symlink: a `repos` or
 /// clone directory swapped for a link is refused or unlinked, never entered.
-mod wip;
-
 mod confined {
     use std::ffi::CStr;
     use std::io;
@@ -1945,7 +1874,7 @@ mod tests {
         assert!(repos.clones().await.unwrap().is_empty());
 
         let ws1 = repos
-            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()), None)
+            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()))
             .await
             .unwrap();
         assert_eq!(git(Some(&ws1), &["rev-parse", "HEAD"]).unwrap().trim(), c2);
@@ -1954,7 +1883,7 @@ mod tests {
         // Derive a second independent workspace on the same repo.
         std::fs::write(ws1.join("ws1_only.txt"), "one\n").unwrap();
         let ws2 = repos
-            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()), None)
+            .create_remote_clone(&remote_url, "o/r", &staging(tmp.path()))
             .await
             .unwrap();
         assert_ne!(ws1, ws2);
