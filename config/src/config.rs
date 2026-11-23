@@ -1177,6 +1177,21 @@ pub struct RemoteAccessConfig {
     /// a larger delivery is refused with 413 before it is buffered.
     #[serde(default = "default_webhook_max_body_bytes")]
     pub webhook_max_body_bytes: u64,
+    /// Optional explicit short machine name advertised in `<machine>:<session-id>`
+    /// peer agent addresses; defaults to the first `MagicDNS` label or hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_name: Option<String>,
+    /// Optional explicit peer base URLs keyed by machine name (e.g.
+    /// `mac-mini = "https://mac-mini.tail1234.ts.net"`), overriding or
+    /// supplementing same-owner `tailscale status --json` discovery.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub peer_endpoints: std::collections::BTreeMap<String, String>,
+    /// Per-peer timeout in milliseconds for cross-machine `agent list` and `agent send`.
+    #[serde(default = "default_peer_discovery_timeout_ms")]
+    pub peer_discovery_timeout_ms: u64,
+    /// Per-peer timeout in seconds for cross-machine `btw` side-question forks.
+    #[serde(default = "default_peer_btw_timeout_secs")]
+    pub peer_btw_timeout_secs: u64,
 }
 
 /// Default for `[remote_access] webhook_max_body_bytes`: 25 MiB, which holds
@@ -1194,6 +1209,18 @@ const fn default_tailscale_https_port() -> u16 {
     443
 }
 
+/// Default for `[remote_access] peer_discovery_timeout_ms`: 5 seconds per peer.
+#[must_use]
+pub const fn default_peer_discovery_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Default for `[remote_access] peer_btw_timeout_secs`: 120 seconds per fork query.
+#[must_use]
+pub const fn default_peer_btw_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for RemoteAccessConfig {
     fn default() -> Self {
         Self {
@@ -1205,6 +1232,10 @@ impl Default for RemoteAccessConfig {
             funnel: false,
             funnel_port: default_tailscale_https_port(),
             webhook_max_body_bytes: default_webhook_max_body_bytes(),
+            machine_name: None,
+            peer_endpoints: std::collections::BTreeMap::new(),
+            peer_discovery_timeout_ms: default_peer_discovery_timeout_ms(),
+            peer_btw_timeout_secs: default_peer_btw_timeout_secs(),
         }
     }
 }

@@ -178,7 +178,7 @@ impl Endpoint {
 
     /// `method path` with an optional JSON body, answering with the status
     /// and the body's bytes.
-    async fn exchange(
+    pub async fn exchange(
         &self,
         method: hyper::Method,
         path: &str,
@@ -366,9 +366,15 @@ impl CloudHost {
         }
     }
 
+    /// Stored cloud session record.
+    #[must_use]
+    pub fn row(&self) -> &CloudSessionRow {
+        &self.row
+    }
+
     /// The codespace daemon's endpoint once it serves the session; with
     /// `wake`, a suspended codespace is started first.
-    async fn endpoint(&self, wake: bool) -> Result<Endpoint, CloudSessionError> {
+    pub async fn endpoint(&self, wake: bool) -> Result<Endpoint, CloudSessionError> {
         let (reply, answer) = async_channel::bounded(1);
         self.requests
             .send(HostRequest::Endpoint { wake, reply })
@@ -388,6 +394,7 @@ pub struct CloudSessions<B: CloudBackend = GitHubCloud> {
     /// This daemon's live configuration, whose providers are pushed.
     config: Arc<ArcSwap<MayConfig>>,
     mirror: Mirror,
+    peer_bridge: Arc<arc_swap::ArcSwapOption<super::cloud_home::BridgeDispatcher>>,
     hosts: Arc<DashMap<String, CloudHost>>,
     events: broadcast::Sender<CloudSessionEvent>,
 }
@@ -430,6 +437,7 @@ impl<B: CloudBackend> CloudSessions<B> {
                 bus,
                 runtimes: Arc::default(),
             },
+            peer_bridge: Arc::new(arc_swap::ArcSwapOption::empty()),
             hosts,
             events,
         };
@@ -447,6 +455,24 @@ impl<B: CloudBackend> CloudSessions<B> {
     /// The host of `session_id`, when it is a cloud session.
     pub fn host(&self, session_id: &str) -> Option<CloudHost> {
         self.hosts.get(session_id).map(|host| host.clone())
+    }
+
+    /// Whether `session_id` is fronted on a cloud home rather than hosted locally.
+    pub fn is_cloud_session(&self, session_id: &str) -> bool {
+        self.hosts.contains_key(session_id)
+    }
+
+    /// Snapshot of every fronted cloud session and its [`CloudHost`].
+    pub fn hosts_snapshot(&self) -> Vec<(Arc<CloudSessionRow>, CloudHost)> {
+        self.hosts
+            .iter()
+            .map(|entry| (entry.value().row.clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Installs the dispatcher servicing reverse peer RPCs from connected cloud homes.
+    pub fn set_peer_bridge(&self, dispatcher: super::cloud_home::BridgeDispatcher) {
+        self.peer_bridge.store(Some(Arc::new(dispatcher)));
     }
 
     /// The runtime state the codespace daemon reports for `session_id`,
@@ -483,6 +509,7 @@ impl<B: CloudBackend> CloudSessions<B> {
             db: self.db.clone(),
             config: self.config.clone(),
             mirror: self.mirror.clone(),
+            peer_bridge: self.peer_bridge.clone(),
             publisher: Publisher {
                 session_id: row.session_id.clone(),
                 events: self.events.clone(),
@@ -492,6 +519,7 @@ impl<B: CloudBackend> CloudSessions<B> {
             own: host.requests.downgrade(),
             forward: None,
             follower: None,
+            bridge_follower: None,
             suspended: false,
             running: false,
             refresh_at: None,
@@ -657,6 +685,7 @@ struct Host<B: CloudBackend> {
     db: ChatDb,
     config: Arc<ArcSwap<MayConfig>>,
     mirror: Mirror,
+    peer_bridge: Arc<arc_swap::ArcSwapOption<super::cloud_home::BridgeDispatcher>>,
     publisher: Publisher,
     row: Arc<CloudSessionRow>,
     /// This host's own requests, for its timer and its event follower.
@@ -665,6 +694,8 @@ struct Host<B: CloudBackend> {
     /// Follows the codespace daemon's events while the forward stands; a
     /// new forward replaces it, dropping the old one.
     follower: Option<executor_core::AnyExecutorTask<()>>,
+    /// Services reverse peer-agent calls while the forward stands.
+    bridge_follower: Option<executor_core::AnyExecutorTask<()>>,
     /// Only a message starts a suspended codespace, so once it is seen
     /// suspended every other request is answered so without asking GitHub
     /// again, however often a client retries.
@@ -729,6 +760,12 @@ impl<B: CloudBackend> Host<B> {
                         self.own.clone(),
                     ));
                     self.follower = Some(following);
+                    let bridging = executor_core::spawn(super::cloud_home::follow_peer_bridge(
+                        served.endpoint.clone(),
+                        self.row.session_id.clone(),
+                        self.peer_bridge.clone(),
+                    ));
+                    self.bridge_follower = Some(bridging);
                 }
                 if wake || served.fresh {
                     self.push(&served.endpoint).await.map(|()| served.endpoint)

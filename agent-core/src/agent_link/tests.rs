@@ -438,3 +438,155 @@ async fn resolve_prompt_path_blocks_container_and_local_symlink_escapes() {
         std::fs::canonicalize(sandbox.join("real.md")).expect("canonical")
     );
 }
+
+struct FakePeerFabric {
+    local_machine: String,
+    shadows: std::collections::HashSet<String>,
+    remote: Vec<super::RemoteAgentEntry>,
+    issues: Vec<super::PeerNodeIssue>,
+    sent: std::sync::Mutex<Vec<(String, String, super::PeerSendRequest)>>,
+}
+
+impl super::PeerFabric for Arc<FakePeerFabric> {
+    fn local_machine(&self) -> String {
+        self.local_machine.clone()
+    }
+
+    fn is_cloud_shadow(&self, session_id: &str) -> bool {
+        self.shadows.contains(session_id)
+    }
+
+    fn list_remote(
+        &self,
+        _caller_session_id: &str,
+    ) -> impl std::future::Future<Output = super::RemoteListing> + Send {
+        std::future::ready(super::RemoteListing {
+            local_machine: self.local_machine.clone(),
+            agents: self.remote.clone(),
+            issues: self.issues.clone(),
+        })
+    }
+
+    fn send_remote(
+        &self,
+        machine: &str,
+        target_session_id: &str,
+        request: super::PeerSendRequest,
+    ) -> impl std::future::Future<Output = Result<String, AgentLinkError>> + Send {
+        self.sent.lock().expect("mutex").push((
+            machine.to_string(),
+            target_session_id.to_string(),
+            request,
+        ));
+        std::future::ready(Ok(format!("{machine}:{target_session_id}")))
+    }
+
+    fn btw_remote(
+        &self,
+        machine: &str,
+        target_session_id: &str,
+        _request: super::PeerBtwRequest,
+    ) -> impl std::future::Future<Output = Result<super::BtwAnswer, AgentLinkError>> + Send {
+        std::future::ready(Ok(super::BtwAnswer {
+            recipient: "remote-peer".to_string(),
+            recipient_id: format!("{machine}:{target_session_id}"),
+            answer: "from remote fork".to_string(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn cross_machine_addressing_disambiguates_titles_hides_shadows_and_refuses_suspended_cloud() {
+    use aither_core::llm::{Tool as _, ToolContext};
+
+    let mut host = Host::new().await;
+    host.session("otter", "Shared Title").await;
+    // Shadow row for a cloud session must not appear as a duplicate local session.
+    host.session("lynx", "Cloud Worker").await;
+
+    let fabric = Arc::new(FakePeerFabric {
+        local_machine: "macbook".to_string(),
+        shadows: std::iter::once("lynx".to_string()).collect(),
+        remote: vec![
+            super::RemoteAgentEntry {
+                machine: "mac-mini".to_string(),
+                status: super::AgentStatus {
+                    session_id: "badger".to_string(),
+                    name: "Shared Title".to_string(),
+                    cwd: PathBuf::from("/Users/lexo/may"),
+                    activity: Activity::Running,
+                    roots: vec!["May-Agent/may#1316".to_string()],
+                },
+                suspended: false,
+                repo: Some("github:May-Agent/may".to_string()),
+            },
+            super::RemoteAgentEntry {
+                machine: "cloud".to_string(),
+                status: super::AgentStatus {
+                    session_id: "lynx".to_string(),
+                    name: "Cloud Worker".to_string(),
+                    cwd: PathBuf::from("/workspaces/may"),
+                    activity: Activity::Idle,
+                    roots: Vec::new(),
+                },
+                suspended: true,
+                repo: Some("github:May-Agent/may".to_string()),
+            },
+        ],
+        issues: vec![super::PeerNodeIssue {
+            target: "studio".to_string(),
+            state: super::PeerNodeState::Offline,
+            detail: Some("connection refused".to_string()),
+        }],
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    host.messaging.directory = host.messaging.directory.with_peers(fabric.clone());
+
+    let local_live = host.messaging.directory.live().await.expect("live");
+    assert_eq!(local_live.len(), 1, "cloud shadow row excluded locally");
+    assert_eq!(local_live[0].session_id, "otter");
+
+    // `agent list` shows local, tailnet, suspended cloud, and offline peer without blocking.
+    let sandbox = host.session_dir("otter");
+    std::fs::create_dir_all(&sandbox).expect("sandbox");
+    let tool = super::AgentTool::new(host.messaging.clone(), "otter".to_string(), sandbox, None);
+    let result = tool
+        .call(super::AgentArgs::List, ToolContext::new())
+        .await
+        .expect("agent list");
+    let listed = result.as_text().expect("text");
+    assert!(listed.contains("[id mac-mini:badger]: running"), "{listed}");
+    assert!(listed.contains("[id cloud:lynx]: suspended"), "{listed}");
+    assert!(listed.contains("[peer studio]: offline"), "{listed}");
+
+    // Colliding title across machines fails with AmbiguousAgent listing `<machine>:<id>`.
+    let ambig = host
+        .messaging
+        .send("otter", "Shared Title", "hello")
+        .await
+        .expect_err("colliding title across machines");
+    let ambig_msg = ambig.to_string();
+    assert!(matches!(ambig, AgentLinkError::AmbiguousAgent(_)));
+    assert!(ambig_msg.contains("macbook:otter"), "{ambig_msg}");
+    assert!(ambig_msg.contains("mac-mini:badger"), "{ambig_msg}");
+
+    // Suspended cloud home is refused as ColdRecipient without invoking `send_remote`.
+    let cold_cloud = host
+        .messaging
+        .send("otter", "cloud:lynx", "wake?")
+        .await
+        .expect_err("suspended codespace refused");
+    assert!(matches!(cold_cloud, AgentLinkError::ColdRecipient(_)));
+    assert_eq!(fabric.sent.lock().expect("mutex").len(), 0);
+
+    // Qualified `<machine>:<id>` and unique bare id deliver with `<local_machine>:<sender>` reply address.
+    host.messaging
+        .send("otter", "mac-mini:badger", "日本語 / 한국어 / 中文 status?")
+        .await
+        .expect("qualified send");
+    let sent = fabric.sent.lock().expect("mutex");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "mac-mini");
+    assert_eq!(sent[0].1, "badger");
+    assert_eq!(sent[0].2.sender_address, "macbook:otter");
+}

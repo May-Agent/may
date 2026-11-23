@@ -460,6 +460,8 @@ pub struct DaemonState {
     /// The cloud sessions this daemon fronts: their codespaces, hosts and
     /// the steps of bringing them up.
     pub cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
+    /// Reverse peer-agent RPC queue when this daemon runs inside a fronted cloud home.
+    pub cloud_home_bridge: super::cloud_home::CloudHomeBridge,
     /// On a cloud home, the providers the fronting daemon pushed: kept
     /// apart from `config`, so no configuration write carries them.
     pub pushed_providers: crate::cloud::access::PushedProviders,
@@ -1501,6 +1503,7 @@ impl DaemonState {
                 .await?,
             ),
             pushed_providers: crate::cloud::access::PushedProviders::default(),
+            cloud_home_bridge: super::cloud_home::CloudHomeBridge::default(),
             notification_service,
             memory_processor: None,
             local_url_port_mapper: std::sync::Arc::new(

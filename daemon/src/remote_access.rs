@@ -641,7 +641,7 @@ fn public_url(host: &str, https_port: u16) -> String {
 }
 
 /// The configured `tailscale` binary, or the default when none is set.
-fn tailscale_binary(config: &RemoteAccessConfig) -> String {
+pub fn tailscale_binary(config: &RemoteAccessConfig) -> String {
     let binary = config.tailscale_binary.trim();
     if binary.is_empty() {
         crate::config::DEFAULT_TAILSCALE_BINARY.to_string()
@@ -678,18 +678,134 @@ struct TailscaleStatus {
     backend_state: String,
     #[serde(rename = "Self")]
     self_node: Option<TailscaleNode>,
+    #[serde(rename = "Peer", default)]
+    peer: std::collections::BTreeMap<String, TailscalePeerNode>,
     #[serde(rename = "User", default)]
     user: std::collections::BTreeMap<u64, TailscaleUser>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TailscaleNode {
+    #[serde(rename = "HostName", default)]
+    host_name: String,
     #[serde(rename = "DNSName", default)]
     dns_name: String,
     #[serde(rename = "UserID", default)]
     user_id: u64,
     #[serde(rename = "TailscaleIPs", default)]
     tailscale_ips: Vec<IpAddr>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscalePeerNode {
+    #[serde(rename = "HostName", default)]
+    host_name: String,
+    #[serde(rename = "DNSName", default)]
+    dns_name: String,
+    #[serde(rename = "UserID", default)]
+    user_id: u64,
+    #[serde(rename = "Online", default)]
+    online: bool,
+    #[serde(rename = "Tags", default)]
+    tags: Vec<String>,
+    #[serde(rename = "TailscaleIPs", default)]
+    tailscale_ips: Vec<IpAddr>,
+}
+
+/// Online same-owner Tailscale peer discovered from `tailscale status --json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredTailnetPeer {
+    /// Short machine name (`mac-mini`, etc.).
+    pub machine: String,
+    /// HTTPS (or direct) base URL reaching the peer's remote listener.
+    pub base_url: String,
+}
+
+/// Local node identity and same-owner online peers parsed from `tailscale status --json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TailnetTopology {
+    /// Normalized short name of this node.
+    pub local_machine: Option<String>,
+    /// Login name owning this node (`Self.UserID`).
+    pub owner_login: Option<String>,
+    /// Online non-tagged peers owned by the exact same `UserID` (`allowed_logins`
+    /// users on other accounts are excluded).
+    pub peers: Vec<DiscoveredTailnetPeer>,
+}
+
+/// Parses same-owner online peers from `tailscale status --json` output.
+pub fn parse_tailnet_topology(output: &str, https_port: u16) -> Result<TailnetTopology, String> {
+    let status: TailscaleStatus = serde_json::from_str(output)
+        .map_err(|error| format!("unexpected `tailscale status` output: {error}"))?;
+    if status.backend_state != "Running" {
+        return Err(format!(
+            "Tailscale is not connected (state: {})",
+            status.backend_state
+        ));
+    }
+    let self_node = status
+        .self_node
+        .ok_or_else(|| "`tailscale status` reports no Self node".to_string())?;
+    let local_raw = if self_node.dns_name.trim_end_matches('.').is_empty() {
+        &self_node.host_name
+    } else {
+        self_node.dns_name.trim_end_matches('.')
+    };
+    let local_machine =
+        (!local_raw.is_empty()).then(|| crate::agent_link::sanitize_machine_name(local_raw));
+    let owner_login = (self_node.user_id != 0)
+        .then(|| status.user.get(&self_node.user_id))
+        .flatten()
+        .map(|u| u.login_name.clone())
+        .filter(|login| !login.is_empty());
+
+    let mut peers = Vec::new();
+    if self_node.user_id != 0 {
+        for peer in status.peer.values() {
+            if !peer.online || !peer.tags.is_empty() || peer.user_id != self_node.user_id {
+                continue;
+            }
+            let dns = peer.dns_name.trim_end_matches('.');
+            let raw_name = if dns.is_empty() {
+                peer.host_name.as_str()
+            } else {
+                dns
+            };
+            if raw_name.is_empty() {
+                continue;
+            }
+            let machine = crate::agent_link::sanitize_machine_name(raw_name);
+            if local_machine.as_deref() == Some(machine.as_str()) {
+                continue;
+            }
+            let base_url = if !dns.is_empty() {
+                public_url(dns, https_port)
+            } else if let Some(ip) = peer.tailscale_ips.first() {
+                let host = match ip {
+                    IpAddr::V4(v4) => v4.to_string(),
+                    IpAddr::V6(v6) => format!("[{v6}]"),
+                };
+                public_url(&host, https_port)
+            } else {
+                continue;
+            };
+            peers.push(DiscoveredTailnetPeer { machine, base_url });
+        }
+    }
+    peers.sort_by(|a, b| a.machine.cmp(&b.machine));
+    peers.dedup_by(|a, b| a.machine == b.machine);
+    Ok(TailnetTopology {
+        local_machine,
+        owner_login,
+        peers,
+    })
+}
+
+/// Queries `tailscale status --json` using the configured binary and parses [`TailnetTopology`].
+pub async fn read_tailnet_topology(config: &RemoteAccessConfig) -> Result<TailnetTopology, String> {
+    let binary = tailscale_binary(config);
+    let output = tailscale(&binary, vec!["status".into(), "--json".into()]).await?;
+    parse_tailnet_topology(&output, config.https_port)
 }
 
 /// `tailscale whois --json`: the node a tailnet address belongs to and the
@@ -812,10 +928,9 @@ async fn refresh_allow_list(
     identity: &super::auth::TailscaleServeIdentitySource,
     config: &RemoteAccessConfig,
 ) -> AcceptedLogins {
-    let accepted = accepted_logins(
-        node_owner_login(&tailscale_binary(config)).await,
-        &config.allowed_logins,
-    );
+    let owner = node_owner_login(&tailscale_binary(config)).await;
+    identity.set_owner(owner.as_ref().ok().cloned());
+    let accepted = accepted_logins(owner, &config.allowed_logins);
     identity.set_allowed(accepted.allow_list());
     accepted
 }
@@ -838,7 +953,7 @@ fn accepted_logins(owner: Result<String, String>, listed: &[String]) -> Accepted
 
 /// The login that owns this node: `tailscale status --json`'s `Self.UserID`
 /// looked up in the `User` map.
-async fn node_owner_login(binary: &str) -> Result<String, String> {
+pub async fn node_owner_login(binary: &str) -> Result<String, String> {
     let output = tailscale(binary, vec!["status".into(), "--json".into()]).await?;
     let status: TailscaleStatus = serde_json::from_str(&output)
         .map_err(|error| format!("unexpected `tailscale status` output: {error}"))?;
@@ -1133,5 +1248,60 @@ mod tests {
         let other_target = r#"{"Web":{"mac.ts.net:8443":{"Handlers":{"/api/tasks/webhook":{"Proxy":"http://127.0.0.1:1"}}}},"AllowFunnel":{"mac.ts.net:8443":true}}"#;
         assert!(!funnels(other_target, &spec, target));
         assert!(!funnels("{}", &spec, target));
+    }
+
+    #[test]
+    fn topology_discovers_only_online_same_owner_untagged_peers() {
+        let json = r#"{
+            "BackendState": "Running",
+            "Self": {
+                "HostName": "lexolius-macbook-pro",
+                "DNSName": "macbook.tail1234.ts.net.",
+                "UserID": 7,
+                "TailscaleIPs": ["100.64.0.1"]
+            },
+            "User": {
+                "7": { "LoginName": "me@example.com" },
+                "9": { "LoginName": "guest@example.com" }
+            },
+            "Peer": {
+                "k1": {
+                    "HostName": "mac-mini",
+                    "DNSName": "mac-mini.tail1234.ts.net.",
+                    "UserID": 7,
+                    "Online": true,
+                    "TailscaleIPs": ["100.64.0.2"]
+                },
+                "k2_offline": {
+                    "HostName": "ipad",
+                    "DNSName": "ipad.tail1234.ts.net.",
+                    "UserID": 7,
+                    "Online": false
+                },
+                "k3_other_user": {
+                    "HostName": "guest-box",
+                    "DNSName": "guest-box.tail1234.ts.net.",
+                    "UserID": 9,
+                    "Online": true
+                },
+                "k4_tagged": {
+                    "HostName": "ci-runner",
+                    "DNSName": "ci-runner.tail1234.ts.net.",
+                    "UserID": 7,
+                    "Online": true,
+                    "Tags": ["tag:ci"]
+                }
+            }
+        }"#;
+        let topology = parse_tailnet_topology(json, 8443).expect("parses");
+        assert_eq!(topology.local_machine.as_deref(), Some("macbook"));
+        assert_eq!(topology.owner_login.as_deref(), Some("me@example.com"));
+        assert_eq!(
+            topology.peers,
+            vec![DiscoveredTailnetPeer {
+                machine: "mac-mini".to_string(),
+                base_url: "https://mac-mini.tail1234.ts.net:8443".to_string(),
+            }]
+        );
     }
 }
