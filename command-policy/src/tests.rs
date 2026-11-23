@@ -25,6 +25,7 @@ fn check_with<'a>(
 fn unchanged_reads() -> UnchangedFileReads {
     UnchangedFileReads {
         refused: RefusedReads::default(),
+        read_epochs: FileReadEpochs::default(),
     }
 }
 
@@ -690,5 +691,110 @@ async fn whitespace_that_carries_meaning_is_not_formatting() {
         .await,
         ScriptDecision::Pass,
         "a file that cannot be read is not judged"
+    );
+}
+
+#[tokio::test]
+async fn bumping_read_epoch_allows_post_compaction_recall_without_clearing_other_agents() {
+    use aither_core::llm::tool::{AgentIdentity, SubagentIdentity};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("lib.rs");
+    std::fs::write(&file, "pub fn answer() -> u32 { 42 }\n").expect("write");
+
+    let epochs = FileReadEpochs::default();
+    let policy = UnchangedFileReads {
+        refused: RefusedReads::default(),
+        read_epochs: epochs.clone(),
+    };
+    let main_state = FileReads::default();
+    let child_state = FileReads::default();
+    let start = ScriptDir::Host(dir.path().to_path_buf());
+    let script = "cat lib.rs";
+    let parsed_shell = ShellScript::parse(script);
+
+    let main_call = CallIdentity::new(ToolCallId::new("c1"), AgentIdentity::Main);
+    let child_call = CallIdentity::new(
+        ToolCallId::new("c2"),
+        AgentIdentity::Subagent(SubagentIdentity::new("explore", Some(main_call.clone()))),
+    );
+    let child_path = AgentPath::of(child_call.agent());
+
+    // Initial reads succeed on both main and child, then identical repeats are refused.
+    for (call, state) in [(&main_call, &main_state), (&child_call, &child_state)] {
+        let launch = aither_sandbox::LaunchLease::fresh().id();
+        let mut check = check_with(
+            launch,
+            script,
+            Some(parsed_shell.as_ref()),
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        check.call = Some(call);
+        assert_eq!(policy.check(&check, state).await, ScriptDecision::Pass);
+        policy.ended(&ended(launch, 0, &start), state).await;
+
+        let mut repeat = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            script,
+            Some(parsed_shell.as_ref()),
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        repeat.call = Some(call);
+        assert!(refusal(&policy.check(&repeat, state).await).is_some());
+    }
+
+    // Main compacts: main's post-compaction recall passes again while child's
+    // unchanged-read guard stays intact.
+    epochs.bump(&AgentPath::main());
+
+    let mut child_repeat = check_with(
+        aither_sandbox::LaunchLease::fresh().id(),
+        script,
+        Some(parsed_shell.as_ref()),
+        ScriptOrigin::Foreground,
+        &start,
+    );
+    child_repeat.call = Some(&child_call);
+    assert!(
+        refusal(&policy.check(&child_repeat, &child_state).await).is_some(),
+        "child did not compact, so its unchanged read stays refused"
+    );
+
+    let main_recall = aither_sandbox::LaunchLease::fresh().id();
+    let mut main_check = check_with(
+        main_recall,
+        script,
+        Some(parsed_shell.as_ref()),
+        ScriptOrigin::Foreground,
+        &start,
+    );
+    main_check.call = Some(&main_call);
+    assert_eq!(
+        policy.check(&main_check, &main_state).await,
+        ScriptDecision::Pass,
+        "post-compaction recall read on main must pass"
+    );
+    policy
+        .ended(&ended(main_recall, 0, &start), &main_state)
+        .await;
+
+    // Once recalled in the new epoch, an immediate duplicate read is refused again.
+    let mut main_dup = check_with(
+        aither_sandbox::LaunchLease::fresh().id(),
+        script,
+        Some(parsed_shell.as_ref()),
+        ScriptOrigin::Foreground,
+        &start,
+    );
+    main_dup.call = Some(&main_call);
+    assert!(refusal(&policy.check(&main_dup, &main_state).await).is_some());
+
+    // Bumping the child's path likewise re-enables the child's recall read.
+    epochs.bump(&child_path);
+    assert_eq!(
+        policy.check(&child_repeat, &child_state).await,
+        ScriptDecision::Pass
     );
 }

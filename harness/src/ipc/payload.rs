@@ -269,10 +269,7 @@ async fn tool_output_to_payload_collecting(
     command_name: Option<&str>,
     images: &mut Vec<RecordedCallImage>,
 ) -> Result<Option<CommandPayload>, String> {
-    let text = match output
-        .into_tool_result()
-        .map_err(|error| format!("failed to convert tool result: {error}"))?
-    {
+    let text = match output.into_tool_result() {
         ToolResult::Done => return Ok(None),
         ToolResult::Error { message } => return Err(message),
         ToolResult::Binary { mime, content } => {

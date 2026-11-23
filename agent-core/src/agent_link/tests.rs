@@ -270,7 +270,7 @@ async fn request_made(host: &Host, session_id: &str, ago: std::time::Duration) {
             at,
             usage: &usage,
             prefix: aither_agent::context::PromptPrefix {
-                chain: aither_agent::context::PrefixChain::of(&[], &[]),
+                chain: aither_agent::context::PrefixChain::of(&[], &[], false),
                 rewrites: aither_agent::context::PrefixRewrites::default(),
                 first_request: true,
             },
