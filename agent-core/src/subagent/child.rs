@@ -39,8 +39,6 @@ use crate::vision_ocr::{VisionOcr, augment_tool_outcome};
 pub struct ChildHooks {
     valve: Option<Arc<CompactSignal>>,
     requested: Arc<AtomicBool>,
-    /// Refuses every tool call with this reason when set.
-    deny: Option<String>,
     vision_ocr: VisionOcr,
     call_images: Option<CallImageStore>,
     outputs_dir: Option<PathBuf>,
@@ -55,21 +53,6 @@ impl ChildHooks {
         Self {
             valve,
             requested,
-            deny: None,
-            vision_ocr: VisionOcr::new(),
-            call_images: None,
-            outputs_dir: None,
-            redactor: crate::secrets::SecretRedactor::new(std::path::Path::new("")),
-        }
-    }
-
-    /// Hooks that refuse every tool call with `reason`.
-    #[must_use]
-    pub fn denying(reason: String) -> Self {
-        Self {
-            valve: None,
-            requested: Arc::default(),
-            deny: Some(reason),
             vision_ocr: VisionOcr::new(),
             call_images: None,
             outputs_dir: None,
@@ -101,13 +84,6 @@ impl ChildHooks {
 }
 
 impl Hooks for ChildHooks {
-    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
-    async fn before_tool(&self, _call: &ToolInvocation<'_>) -> ToolDecision {
-        self.deny
-            .clone()
-            .map_or(ToolDecision::Allow, ToolDecision::Deny)
-    }
-
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
         if let Some(valve) = &self.valve
             && outcome.name != COMPACT_TOOL_NAME

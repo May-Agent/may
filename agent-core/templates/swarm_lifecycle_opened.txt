@@ -1,0 +1,1 @@
+Swarm board opened (epoch {{ board_epoch }}) for {{ workdir }} with {{ member_count }} members: {{ names.join(", ") }}.

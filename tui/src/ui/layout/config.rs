@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::super::super::app::App;
-use super::super::super::state::{ConfigEditMode, ConfigSection};
+use super::super::super::state::{ConfigEditMode, ConfigSection, ConfigTextTarget};
 use super::super::band::panel;
 use super::{centered_rect, display_width_prefix};
 
@@ -314,15 +314,25 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
 
     // If in text edit mode, show edit overlay
     if let Some((input, cursor)) = state.edit_text() {
-        let display = masked(input);
-        items[state.selected] = ListItem::new(format!("  API Key: {display}"))
+        // The cache lifetime row edits a duration, not a secret: show the
+        // text under its own label instead of masking it as an API key.
+        let (label, display, caret_width) = match state.text_target {
+            ConfigTextTarget::CacheLifetime => (
+                "Cache lifetime",
+                input.to_string(),
+                unicode_width::UnicodeWidthStr::width(&input[..cursor]),
+            ),
+            ConfigTextTarget::Primary => {
+                ("API Key", masked(input), masked_width_before(input, cursor))
+            }
+        };
+        items[state.selected] = ListItem::new(format!("  {label}: {display}"))
             .style(Style::default().fg(Color::Yellow));
 
         // IME anchor at the caret inside the selected row.
         let row = area.y + 1 + u16::try_from(state.selected).unwrap_or(u16::MAX);
         if row < area.bottom().saturating_sub(1) {
-            let caret_x =
-                area.x + 12 + u16::try_from(masked_width_before(input, cursor)).unwrap_or(u16::MAX);
+            let caret_x = area.x + 12 + u16::try_from(caret_width).unwrap_or(u16::MAX);
             frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), row));
         }
     }

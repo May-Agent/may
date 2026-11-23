@@ -1757,6 +1757,9 @@ pub async fn post_turn(
         .map_err(super::error::bad_request_error)?
         .to_string();
     wake_on_user_message(&state).await?;
+    if let Err(error) = state.db.reset_swarm_mention_wakes(&session_id).await {
+        tracing::warn!(%session_id, %error, "failed to reset swarm mention wake counter");
+    }
     let chat = ChatRequest {
         session_id: session_id.clone(),
         content: req.content,
@@ -4615,7 +4618,7 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
 
 /// Agent-to-agent messaging as the daemon's sessions see it: `send` stores
 /// in the shared queue and `wake` dispatches a follow-up run in-process.
-fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessaging {
+pub fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessaging {
     crate::agent_link::AgentMessaging {
         directory: crate::agent_link::AgentDirectory::new(
             state.runtime_service.clone(),
@@ -4906,6 +4909,7 @@ fn build_session_agent<'a>(
                 .restore_checkpoint(snapshot.checkpoint.clone())
                 .map_err(UiChatPreparationError::RestoreCheckpoint)?;
             agent.mark_restored_sleep_seen().await;
+            agent.mark_restored_swarm_seen().await;
             for (_, message) in ctx
                 .transcript
                 .iter()

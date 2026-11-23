@@ -113,6 +113,7 @@ pub enum PrArgs {
 pub struct PrCommand {
     context: PrContext,
     languages: Option<crate::harness::language::LanguageGuard>,
+    swarm: Option<crate::swarm::SwarmService>,
     timeout_cap: aither_sandbox::LiveDuration,
 }
 
@@ -124,6 +125,7 @@ impl PrCommand {
         Self {
             context,
             languages: None,
+            swarm: None,
             timeout_cap,
         }
     }
@@ -132,6 +134,13 @@ impl PrCommand {
     #[must_use]
     pub fn with_languages(mut self, guard: crate::harness::language::LanguageGuard) -> Self {
         self.languages = Some(guard);
+        self
+    }
+
+    /// Announce PR and merge-queue events onto the session's active swarm board.
+    #[must_use]
+    pub fn with_swarm(mut self, swarm: crate::swarm::SwarmService) -> Self {
+        self.swarm = Some(swarm);
         self
     }
 
@@ -145,11 +154,15 @@ impl PrCommand {
     /// shell's sandbox.
     pub fn for_terminal(&self, binding: &Binding<'_>) -> PrTool {
         let shell = binding.shell.expect("`pr` runs in a session's shell");
+        let mut store = PrStore::new(
+            self.context.clone(),
+            CloneSandbox::new(shell.clone(), self.timeout_cap.get()),
+        );
+        if let Some(swarm) = &self.swarm {
+            store = store.with_swarm(swarm.clone());
+        }
         PrTool {
-            store: PrStore::new(
-                self.context.clone(),
-                CloneSandbox::new(shell.clone(), self.timeout_cap.get()),
-            ),
+            store,
             languages: self.languages.clone(),
             role: binding.role(),
         }

@@ -1979,7 +1979,7 @@ mod tests {
 
     /// Audit and history tables that name a session but outlive it, and the
     /// search outbox, whose triggers queue index removals for deleted messages.
-    const RETAINED_ON_DELETE: [&str; 11] = [
+    const RETAINED_ON_DELETE: [&str; 12] = [
         "search_outbox",
         "prs",
         "pr_events",
@@ -1991,6 +1991,7 @@ mod tests {
         "notification_mailbox",
         "scheduled_tasks",
         "scheduled_task_runs",
+        "swarm_messages",
     ];
 
     #[derive(Debug, serde::Deserialize, skyzen::FromRow)]

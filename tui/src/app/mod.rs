@@ -353,6 +353,10 @@ pub struct App {
     pub image_regions: Vec<ImageRegion>,
     /// Image rect inside the zoom overlay — a click outside it closes the view
     pub image_view_area: Option<ratatui::layout::Rect>,
+    /// `ChatLayout::scan_version` the last image-key scan ran on; `u64::MAX`
+    /// forces the first scan. Markdown anchors are rescanned only when the
+    /// laid-out set changed — on updates, never on an idle tick.
+    pub last_image_scan_version: u64,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
     /// Where the pointer last was inside the chat column (screen cell);
@@ -778,6 +782,7 @@ impl App {
             image_failed: ahash::AHashSet::new(),
             image_regions: Vec::new(),
             image_view_area: None,
+            last_image_scan_version: u64::MAX,
             selection: None,
             hover: None,
             link_opener: std::sync::Arc::new(super::ui::links::SystemOpener),
@@ -1074,11 +1079,23 @@ impl App {
         }
     }
 
+    /// Persist `self.config`. Connected to the daemon, the write goes
+    /// through `PUT /api/config` — read, overlaid with the sections the TUI
+    /// manages, written back — so the daemon stays authoritative and its
+    /// own untouched sections survive the save. Without a daemon the TUI
+    /// writes the config file itself.
     pub(crate) fn persist_config_background(&self) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
+        let client = self
+            .btw_daemon
+            .clone()
+            .or_else(|| self.session_manager.daemon_handle().ok());
         spawn(async move {
-            let result = config.save().await.map_err(TuiError::from);
+            let result = match client {
+                Some(client) => config::persist_config_via_daemon(&client, &config).await,
+                None => config.save().await.map_err(TuiError::from),
+            };
             let _ = tx.send(AppEvent::ConfigSaved(result)).await;
         })
         .detach();
@@ -1813,11 +1830,14 @@ impl App {
         self.image_fetching.insert(key.clone());
         let picker = support.picker().clone();
         let tx = self.event_tx.clone();
+        let policy = self.config.preferences.network_policy.clone();
         tracing::debug!("Starting image fetch: {} (targets: {:?})", key, targets);
         spawn(async move {
             let mut data = None;
             for target in &targets {
-                if let Some(bytes) = super::ui::image::fetch_image(target).await {
+                if let Some(bytes) =
+                    Box::pin(super::ui::image::fetch_image_with_policy(target, &policy)).await
+                {
                     data = Some(bytes);
                     break;
                 }
@@ -1879,6 +1899,29 @@ impl App {
         } else {
             tracing::debug!("Image fetch/decode failed for {}", key);
             self.image_failed.insert(key);
+        }
+    }
+
+    /// Restore an iTerm2/Sixel/halfblocks protocol that finished its
+    /// `resize_encode` off the draw path. A stale encode — the entry was
+    /// re-fetched or the session changed meanwhile — is dropped.
+    pub(super) fn handle_image_encoded(
+        &mut self,
+        key: String,
+        proto: super::ui::image::EncodedProtocol,
+    ) {
+        let proto = proto.0;
+        match self.image_cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if matches!(entry.get().proto, super::ui::image::ImageProtocol::Encoding) {
+                    entry.get_mut().proto = super::ui::image::ImageProtocol::Other(proto);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(super::ui::image::ImageState {
+                    proto: super::ui::image::ImageProtocol::Other(proto),
+                });
+            }
         }
     }
 
@@ -2749,6 +2792,10 @@ impl App {
     }
 
     /// Handle a key event.
+    ///
+    /// `AppResult` is this handler family's contract — callers and tests
+    /// match on it, and failing paths reappear whenever a key gains one.
+    #[allow(clippy::unnecessary_wraps)]
     pub(super) fn handle_key(
         &mut self,
         code: KeyCode,
@@ -2781,9 +2828,8 @@ impl App {
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
                 KeyCode::Char('c') => {
-                    if self.copy_selection_to_clipboard()? {
+                    if self.copy_selection_to_clipboard() {
                         self.quit_pending = false;
-                        self.set_status("Copied selection");
                         return Ok(None);
                     }
 
@@ -3556,6 +3602,7 @@ impl App {
             .max(1)
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         const SCROLL_STEP_LINES: usize = 3;
 
@@ -3734,9 +3781,7 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard()? => {
-                self.set_status("Copied selection");
-            }
+            MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard() => {}
             _ => {}
         }
 
@@ -3816,25 +3861,28 @@ impl App {
         if out.is_empty() { None } else { Some(out) }
     }
 
-    fn copy_selection_to_clipboard(&self) -> AppResult<bool> {
+    /// Copy the selection on a blocking worker — arboard's clipboard write
+    /// can stall the event loop. `true` when a selection existed and the
+    /// copy was queued; the result arrives as `AppEvent::ClipboardCopied`.
+    fn copy_selection_to_clipboard(&self) -> bool {
         let Some(text) = self.selected_text() else {
-            return Ok(false);
+            return false;
         };
-
-        // Try terminal clipboard first, but do not fail hard if OSC52 is unsupported.
-        let osc52_ok = super::clipboard::copy_via_osc52(&text).is_ok();
-
-        // Also try rich+plain system clipboard copy.
-        let html = super::clipboard::markdown_to_basic_html(&text);
-        let arboard_ok = set_clipboard_html(&html, &text)
-            .or_else(|_| set_clipboard_text(&text))
-            .is_ok();
-
-        if !osc52_ok && !arboard_ok {
-            return Err(TuiError::ClipboardCopyFailed);
-        }
-
-        Ok(true)
+        let tx = self.event_tx.clone();
+        // arboard's write is blocking I/O — a plain thread needs no
+        // executor, which tests of the key path do not install.
+        std::thread::spawn(move || {
+            let osc52_ok = super::clipboard::copy_via_osc52(&text).is_ok();
+            let html = super::clipboard::markdown_to_basic_html(&text);
+            let arboard_ok = set_clipboard_html(&html, &text)
+                .or_else(|_| set_clipboard_text(&text))
+                .is_ok();
+            let result = (osc52_ok || arboard_ok)
+                .then_some(())
+                .ok_or(TuiError::ClipboardCopyFailed);
+            let _ = tx.try_send(AppEvent::ClipboardCopied(result));
+        });
+        true
     }
 
     /// Whether `/sandbox` is available for the current session: an active
@@ -4320,6 +4368,23 @@ impl App {
 
     /// Prepare a message for sending, returning the action.
     fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> Option<SendAction> {
+        // Without a configured model a message can never reach an agent —
+        // keep the TUI (and the draft) alive and point at `/config` instead
+        // of letting the send fail downstream. Slash commands and bash mode
+        // need no model and always go through.
+        let text = self.input.trim();
+        if !self.is_configured()
+            && !text.is_empty()
+            && !text.starts_with('/')
+            && !text.starts_with('!')
+        {
+            self.chat.push_error(
+                "No model is configured — open /config to add a provider and pick a model.",
+            );
+            self.set_status("Configure a model with /config");
+            return None;
+        }
+
         // Add to history before clearing (only if non-empty and not just whitespace)
         if !self.input.trim().is_empty() {
             self.history.push(self.input.clone());
@@ -5558,7 +5623,24 @@ mod tests {
             .as_str()
             .to_string();
         let (tx, _rx) = async_channel::unbounded();
-        let app = App::with_parts(MayConfig::default(), sessions, tx, None, None);
+        // A send needs a configured provider and model — tests exercise
+        // the send path, so the fixture carries one.
+        let mut config = MayConfig::default();
+        config.provider.insert(
+            "anthropic".to_string(),
+            may_config::config::ProviderInstance {
+                api_key: Some("test-key".to_string()),
+                ..may_config::config::ProviderInstance::default()
+            },
+        );
+        config
+            .models
+            .advanced
+            .push(may_protocol::model_selector::ModelSelector::new(
+                "anthropic",
+                "claude-test",
+            ));
+        let app = App::with_parts(config, sessions, tx, None, None);
         (app, id)
     }
 
@@ -5993,6 +6075,48 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
         app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    /// Sending without a configured model must not reach the send path —
+    /// the TUI stays alive, keeps the draft and points at `/config`
+    /// (#558 regression).
+    #[tokio::test]
+    async fn a_send_without_a_configured_model_stays_alive() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut sessions = SessionManager::at(dir.path().to_path_buf())
+            .await
+            .expect("session manager");
+        sessions
+            .create_session_in_profile(
+                may_protocol::session_summary::SessionId::from_string("amber-river"),
+                None,
+                None,
+            )
+            .expect("session");
+        let (tx, _rx) = async_channel::unbounded();
+        // Deliberately unconfigured: no provider, no model.
+        let mut app = App::with_parts(MayConfig::default(), sessions, tx, None, None);
+        app.input = "hello".to_string();
+        app.cursor = app.input.len();
+
+        assert!(
+            press(&mut app, KeyCode::Enter).is_none(),
+            "an unconfigured send must not produce a SendAction"
+        );
+        assert_eq!(app.input, "hello", "the draft is kept");
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.text.as_str()),
+            Some("Configure a model with /config"),
+            "the hint tells the user where to fix it"
+        );
+
+        // Slash commands still work — `/config` is how the user escapes.
+        app.input = "/config".to_string();
+        app.cursor = app.input.len();
+        assert!(
+            press(&mut app, KeyCode::Enter).is_some(),
+            "slash commands send without a model"
+        );
     }
 
     /// A withdrawn turn restores its prompt text only to the client that sent

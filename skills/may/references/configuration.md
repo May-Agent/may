@@ -64,6 +64,7 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 - `[computer] signing_identity`: codesign identity for the macOS desktop helper.
 - `[daemon]`: `port` (default 8787) and `listen` (extra addresses, applied live). `[remote_access]`: see `remote-access.md`.
 - `[appearance]`: `font` (default Inter) and `theme` (default `system`), used by the web UI.
+- `[experimental]`: `hashline` (default `false`; replaces `apply_patch` with `search`/`edit` hashline binaries and renames indexed search to `rag`) and `swarm` (default `false`; opens a per-worktree coordination board once `> 1` working sessions share a checkout and destroys it at `<= 1`, with `swarm_mention_wake_limit` defaulting to `6` and `swarm_read_limit` defaulting to `50`). Applied live.
 
 ## Screens
 

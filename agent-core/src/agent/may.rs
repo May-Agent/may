@@ -443,6 +443,10 @@ pub struct MayAgent {
     sleep: Option<Arc<crate::sleep::SleepState>>,
     /// Sleep epoch last observed by the model in this context window (`0` = awake).
     sleep_seen_epoch: Arc<AtomicU64>,
+    /// Shared swarm service, when hosted by a daemon.
+    swarm: Option<crate::swarm::SwarmService>,
+    /// Swarm `(workdir, board_epoch)` last delivered to this warm context.
+    swarm_seen: crate::swarm::SwarmSeenState,
     /// The live grants of the session's sandbox: an approved workspace
     /// request reaches the shell through them.
     grants: Grants,
@@ -1165,6 +1169,7 @@ impl MayAgent {
                     keep_alive,
                     instructions: subagent_instructions,
                     vision_ocr: crate::vision_ocr::VisionOcr::new(),
+                    permissions: permissions.clone(),
                 },
                 issue_store: issue_store.clone(),
                 task_events: task_events.clone(),
@@ -1241,6 +1246,11 @@ impl MayAgent {
                 shared_terminal_commands.fork_launcher.clone(),
                 toolkit.clone(),
                 config.languages,
+                permissions.for_read_only_subagent(),
+                crate::secrets::SecretRedactor::for_session(
+                    &config.may_dir,
+                    config.session_id.as_str(),
+                ),
             )
         });
 
@@ -1393,6 +1403,15 @@ impl MayAgent {
                 sleep_seen_epoch.clone(),
             ));
         }
+        let swarm_service = config.services.swarm();
+        let swarm_seen = crate::swarm::SwarmSeenState::new();
+        if let Some(swarm) = swarm_service.clone() {
+            builder = builder.context_source(crate::swarm::SwarmConditions::new(
+                swarm,
+                config.session_id.as_str(),
+                swarm_seen.clone(),
+            ));
+        }
         builder = builder.context_source(document);
         if let Some(compaction) = config.compaction_llm.clone() {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);
@@ -1426,6 +1445,8 @@ impl MayAgent {
             interrupted: false,
             sleep: config.sleep,
             sleep_seen_epoch,
+            swarm: swarm_service,
+            swarm_seen,
             shell,
             grants,
             readonly_checkouts,
@@ -2309,8 +2330,32 @@ impl MayAgent {
         }
     }
 
+    /// Synchronizes the swarm protocol alert state after restoring a warm checkpoint.
+    ///
+    /// Ensures an already-delivered `board_epoch` alert is not repeated until
+    /// compaction or board recreation.
+    pub async fn mark_restored_swarm_seen(&self) {
+        let Some(swarm) = &self.swarm else {
+            return;
+        };
+        if let Ok(state) = swarm
+            .db()
+            .get_swarm_session_state(self.session_id.as_str())
+            .await
+            && state.told_epoch > 0
+        {
+            self.swarm_seen
+                .restore(state.told_workdir, state.told_epoch);
+        }
+    }
+
     /// Synchronizes runtime-generated system context into the agent's context.
     pub async fn sync_runtime_context(&mut self) {
+        if let Some(swarm) = &self.swarm
+            && let Err(error) = swarm.reconcile().await
+        {
+            tracing::warn!(session_id = %self.session_id, %error, "failed to reconcile swarm before syncing runtime context");
+        }
         self.runtime_system_context
             .sync_memory_content(self.inner.context_mut())
             .await;

@@ -355,11 +355,13 @@ impl AgentMessaging {
 
 /// Tag names that frame text for the recipient; text from another agent must
 /// not be able to open or close them.
-const FRAMING_TAGS: [&str; 4] = [
+const FRAMING_TAGS: [&str; 6] = [
     "system-reminder",
     "agent-message",
     "agent-btw",
     "task-message",
+    "board-message",
+    "board-notice",
 ];
 
 /// Text written by another agent, escaped for display.

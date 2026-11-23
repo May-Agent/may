@@ -72,25 +72,36 @@ pub fn spawn_remote_worker(
     let (foreign_tx, foreign_rx) = unbounded::<ForeignTurn>();
     let shared = Arc::new(Shared::default());
     let background = RemoteBackground::new(client.clone(), session_id.clone());
-    tokio::spawn(follow_session_globals(
-        client.clone(),
-        session_id.clone(),
-        shared.clone(),
-        app_events.clone(),
-    ));
-    tokio::spawn(follow_session(
-        client.clone(),
-        session_id.clone(),
-        shared.clone(),
-        Forwarding {
-            foreign_tx,
-            command_tx: command_tx.clone(),
-            app_events,
-        },
-        events_cursor,
-        owns_turns,
-    ));
-    tokio::spawn(run_commands(client, session_id, shared, command_rx));
+    // The command task owns the followers' handles: when it ends — the
+    // worker shutting down or the command channel closing — dropping them
+    // cancels the SSE loops instead of leaving them attached. A dropped
+    // follower's ownsTurn subscription closing is what the daemon reads as
+    // "the owner went away"; a follower left running past its worker would
+    // reopen that subscription and steal the next worker's run.
+    let followers = vec![
+        executor_core::spawn(follow_session_globals(
+            client.clone(),
+            session_id.clone(),
+            shared.clone(),
+            app_events.clone(),
+        )),
+        executor_core::spawn(follow_session(
+            client.clone(),
+            session_id.clone(),
+            shared.clone(),
+            Forwarding {
+                foreign_tx,
+                command_tx: command_tx.clone(),
+                app_events,
+            },
+            events_cursor,
+            owns_turns,
+        )),
+    ];
+    executor_core::spawn(run_commands(
+        client, session_id, shared, command_rx, followers,
+    ))
+    .detach();
     AgentWorker::remote(command_tx, foreign_rx, background)
 }
 
@@ -192,15 +203,20 @@ pub fn spawn_build_watch(
     build: may_client::daemon::lifecycle::ClientBuild,
     app_events: EventSender,
 ) {
-    tokio::spawn(async move {
+    executor_core::spawn(async move {
         loop {
-            tokio::time::sleep(BUILD_RECHECK).await;
+            async_io::Timer::after(BUILD_RECHECK).await;
+            // The TUI left: nothing consumes the answer.
+            if app_events.is_closed() {
+                return;
+            }
             if build.superseded_by(&client).await {
                 let _ = app_events.send(AppEvent::DaemonSuperseded).await;
                 return;
             }
         }
-    });
+    })
+    .detach();
 }
 
 /// Follow worktree index coverage for `cwd` for as long as the TUI runs.
@@ -211,7 +227,7 @@ pub fn spawn_index_coverage(
     cwd: std::path::PathBuf,
     app_events: EventSender,
 ) {
-    tokio::spawn(follow_index(client, cwd, app_events));
+    executor_core::spawn(follow_index(client, cwd, app_events)).detach();
 }
 
 async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events: EventSender) {
@@ -223,11 +239,15 @@ async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events:
         query.finish()
     };
     loop {
+        // The TUI left: nothing consumes the stream.
+        if app_events.is_closed() {
+            return;
+        }
         let mut stream = match client.events(&query).await {
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%error, "index event stream unavailable");
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                async_io::Timer::after(RECONNECT_DELAY).await;
                 continue;
             }
         };
@@ -238,9 +258,15 @@ async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events:
             let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data) else {
                 continue;
             };
-            let _ = app_events.send(AppEvent::IndexCoverage(snapshot)).await;
+            if app_events
+                .send(AppEvent::IndexCoverage(snapshot))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        async_io::Timer::after(RECONNECT_DELAY).await;
     }
 }
 
@@ -249,6 +275,20 @@ async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events:
 #[serde(rename_all = "camelCase")]
 struct ProfileSessionsFrame {
     profile_sessions: may_protocol::profile::ProfileSessions,
+}
+
+/// The `config` event payload: the parts of the daemon's config response
+/// the TUI keeps a local copy of (`UiConfigResponse` is serialize-only on
+/// the daemon side, so the frame is re-declared here).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigFrame {
+    full_config: may_client::daemon::types::UiFullConfig,
+    ssh_servers: Vec<may_config::config::SshServerConfig>,
+    max_iterations: usize,
+    ui_font: String,
+    ui_theme: String,
+    timezone: String,
 }
 
 /// Follow the session lists of `profile_id` while the task lives: the
@@ -267,6 +307,9 @@ pub async fn follow_profile_sessions(
         query.finish()
     };
     loop {
+        if app_events.is_closed() {
+            return;
+        }
         match client.events(&query).await {
             Ok(mut stream) => {
                 while let Ok(Some(event)) = stream.next().await {
@@ -288,18 +331,19 @@ pub async fn follow_profile_sessions(
             }
             Err(error) => tracing::debug!(%error, "profile sessions stream unavailable"),
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        async_io::Timer::after(RECONNECT_DELAY).await;
     }
 }
 
 /// The session's `/api/events` query: only the topics that did not move to
-/// the session stream.
+/// the session stream. `config` rides along so a config change pushed from
+/// another client (the web UI, another TUI) reaches this one too.
 fn globals_query(session_id: &str) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query
         .append_pair(
             "topics",
-            "sleep,user_notification,session_index,cloud_session,prs",
+            "config,sleep,user_notification,session_index,cloud_session,prs",
         )
         .append_pair("sessionId", session_id);
     query.finish()
@@ -320,7 +364,7 @@ async fn follow_session_globals(
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%error, "session event stream unavailable");
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                async_io::Timer::after(RECONNECT_DELAY).await;
                 continue;
             }
         };
@@ -329,6 +373,25 @@ async fn follow_session_globals(
                 return;
             }
             match event.kind.as_str() {
+                "config" => {
+                    if let Ok(frame) = serde_json::from_str::<ConfigFrame>(&event.data)
+                        && app_events
+                            .send(AppEvent::ConfigPushed(Box::new(
+                                crate::event::PushedConfig {
+                                    full: frame.full_config,
+                                    ssh_servers: frame.ssh_servers,
+                                    max_iterations: frame.max_iterations,
+                                    ui_font: frame.ui_font,
+                                    ui_theme: frame.ui_theme,
+                                    timezone: frame.timezone,
+                                },
+                            )))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
                 "user_notification" => {
                     if let Ok(notification) = serde_json::from_str::<
                         may_protocol::notification::UserNotification,
@@ -367,7 +430,7 @@ async fn follow_session_globals(
                 _ => {}
             }
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        async_io::Timer::after(RECONNECT_DELAY).await;
     }
 }
 
@@ -534,7 +597,7 @@ async fn follow_session(
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%error, "session event stream unavailable");
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                async_io::Timer::after(RECONNECT_DELAY).await;
                 continue;
             }
         };
@@ -628,7 +691,7 @@ async fn follow_session(
         // The turn in progress keeps its handle: the reopened stream
         // continues it from the frame after the last one received.
         shared.attached.store(false, Ordering::Release);
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        async_io::Timer::after(RECONNECT_DELAY).await;
     }
 }
 
@@ -801,12 +864,12 @@ async fn forward_turn_error(data: &str, current: &mut Option<ForwardedTurn>) {
 }
 
 async fn wait_attached(shared: &Shared) -> bool {
-    let deadline = tokio::time::Instant::now() + ATTACH_TIMEOUT;
+    let deadline = std::time::Instant::now() + ATTACH_TIMEOUT;
     while !shared.attached.load(Ordering::Acquire) {
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        async_io::Timer::after(Duration::from_millis(25)).await;
     }
     true
 }
@@ -821,6 +884,8 @@ async fn run_commands(
     session_id: String,
     shared: Arc<Shared>,
     command_rx: Receiver<WorkerCommand>,
+    // Held so the followers' SSE loops end when this task does.
+    _followers: Vec<executor_core::AnyExecutorTask<()>>,
 ) {
     while let Ok(command) = command_rx.recv().await {
         match command {
@@ -1037,7 +1102,7 @@ mod tests {
         let query = globals_query("s 1");
         assert!(query.contains("sessionId=s+1"), "{query}");
         assert!(
-            query.contains("sleep%2Cuser_notification%2Csession_index"),
+            query.contains("config%2Csleep%2Cuser_notification%2Csession_index"),
             "{query}"
         );
         assert!(!query.contains("after="), "{query}");

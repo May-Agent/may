@@ -41,6 +41,9 @@ pub struct Completion {
     selected: usize,
     /// File search engine.
     file_matcher: Option<Nucleo<PathBuf>>,
+    /// The matcher still has work queued — the walk is streaming entries
+    /// in or a reparse is unprocessed — so the snapshot may grow.
+    file_matcher_dirty: bool,
     /// Working directory (higher priority).
     workdir: PathBuf,
     /// Sandbox directory (lower priority).
@@ -68,6 +71,7 @@ impl Completion {
             items: Vec::new(),
             selected: 0,
             file_matcher: None,
+            file_matcher_dirty: false,
             workdir: PathBuf::new(),
             sandbox: PathBuf::new(),
             sandbox_available: true,
@@ -165,6 +169,7 @@ impl Completion {
         self.items.clear();
         self.selected = 0;
         self.file_matcher = None;
+        self.file_matcher_dirty = false;
     }
 
     /// Move selection up.
@@ -212,28 +217,36 @@ impl Completion {
         self.items.iter().map(|item| item.label.as_str()).collect()
     }
 
-    /// Initialize file matcher with files from directories.
+    /// Initialize file matcher; the directory walk runs off the UI loop on
+    /// a blocking worker and pushes entries into the matcher's injector as
+    /// it finds them.
     fn init_file_matcher(&mut self) {
         let config = Config::DEFAULT.match_paths();
         let matcher: Nucleo<PathBuf> = Nucleo::new(config, std::sync::Arc::new(|| {}), None, 1);
+        let injector = matcher.injector();
+        let workdir = self.workdir.clone();
+        let sandbox = self.sandbox.clone();
+        blocking::unblock(move || {
+            // Add files from workdir (higher priority - add first)
+            if workdir.exists() {
+                Self::add_files_to_matcher(&injector, &workdir);
+            }
 
-        // Add files from workdir (higher priority - add first)
-        if self.workdir.exists() {
-            Self::add_files_to_matcher(&matcher, &self.workdir, true);
-        }
-
-        // Add files from sandbox
-        if self.sandbox.exists() && self.sandbox != self.workdir {
-            Self::add_files_to_matcher(&matcher, &self.sandbox, false);
-        }
+            // Add files from sandbox
+            if sandbox.exists() && sandbox != workdir {
+                Self::add_files_to_matcher(&injector, &sandbox);
+            }
+        })
+        .detach();
 
         self.file_matcher = Some(matcher);
+        // The matcher starts empty; the first refresh fills it as the walk
+        // streams entries in.
+        self.file_matcher_dirty = true;
     }
 
     /// Add files from a directory to the matcher.
-    fn add_files_to_matcher(matcher: &Nucleo<PathBuf>, dir: &Path, _is_workdir: bool) {
-        let injector = matcher.injector();
-
+    fn add_files_to_matcher(injector: &nucleo::Injector<PathBuf>, dir: &Path) {
         let walker = WalkBuilder::new(dir)
             .hidden(true) // Skip hidden files/directories (including .git)
             .ignore(true) // Respect .ignore files
@@ -266,7 +279,26 @@ impl Completion {
         }
     }
 
-    /// Update file items based on query.
+    /// Re-sync the file matcher without blocking: the worker thread does
+    /// the matching and the directory walk feeds it asynchronously, so a
+    /// `tick(0)` only picks up results that are ready. The event loop's
+    /// ticks keep this current while matches stream in.
+    pub fn refresh_file_matches(&mut self) {
+        if self.mode != CompletionMode::File {
+            return;
+        }
+        let Some(ref mut matcher) = self.file_matcher else {
+            return;
+        };
+        let status = matcher.tick(0);
+        if status.changed || self.file_matcher_dirty {
+            self.file_matcher_dirty = status.running;
+            self.rebuild_file_items();
+        }
+    }
+
+    /// Update file items based on query: re-parse the pattern, take a
+    /// non-blocking snapshot and rebuild the visible items from it.
     fn update_file_items(&mut self) {
         let Some(ref mut matcher) = self.file_matcher else {
             return;
@@ -280,9 +312,16 @@ impl Completion {
             nucleo::pattern::Normalization::Smart,
             false,
         );
+        let status = matcher.tick(0);
+        self.file_matcher_dirty = status.running;
+        self.rebuild_file_items();
+    }
 
-        // Tick to process
-        matcher.tick(100);
+    /// Rebuild `self.items` from the matcher's current snapshot.
+    fn rebuild_file_items(&mut self) {
+        let Some(ref matcher) = self.file_matcher else {
+            return;
+        };
 
         // Get snapshot
         let snapshot = matcher.snapshot();

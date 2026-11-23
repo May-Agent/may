@@ -166,32 +166,60 @@ function reduceLifecycle(
   }
 }
 
-export const useRuntimeStore = create<RuntimeState>((set, get) => ({
-  connected: false,
-  activeProfileId: null,
-  browser: null,
-  browserLifecycle: EMPTY_LIFECYCLE,
-  cloudSessions: {},
-  runtimes: {},
-  profileSessions: null,
-  mailbox: [],
-  networkAccess: null,
-  requestLogs: null,
-  remoteAccess: null,
-  sleep: null,
-  sleepReminders: 0,
-  prs: [],
-  orphanedPrs: [],
-  abort: null,
+export const useRuntimeStore = create<RuntimeState>((set, get) => {
+  /** Monotonic connect generation: a stale stream or abort must not clear
+   * the state of the connection that replaced it. */
+  let generation = 0;
+  /** Reconnect timer after a dropped stream; cleared on disconnect. */
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Backoff, reset on a clean connect. */
+  let backoffMs = 1000;
 
-  async connect(profileId = null) {
-    if (get().abort) return;
-    const handle = await openUiEventStream(SUBSCRIBED_TOPICS, { profileId });
-    set({ abort: handle.abort, connected: true, activeProfileId: profileId ?? null });
+  const scheduleReconnect = (gen: number, profileId: string | null) => {
+    const delay = backoffMs;
+    backoffMs = Math.min(backoffMs * 2, 30_000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      // Only the still-current generation may reopen the stream.
+      if (gen === generation && get().abort === null && !get().connected) {
+        void get().connect(profileId);
+      }
+    }, delay);
+  };
 
-    (async () => {
-      try {
-        for await (const evt of handle.events as AsyncGenerator<UiEvent>) {
+  return {
+    connected: false,
+    activeProfileId: null,
+    browser: null,
+    browserLifecycle: EMPTY_LIFECYCLE,
+    cloudSessions: {},
+    runtimes: {},
+    profileSessions: null,
+    mailbox: [],
+    networkAccess: null,
+    requestLogs: null,
+    remoteAccess: null,
+    sleep: null,
+    sleepReminders: 0,
+    prs: [],
+    orphanedPrs: [],
+    abort: null,
+
+    async connect(profileId = null) {
+      if (get().abort) return;
+      const gen = ++generation;
+      const handle = await openUiEventStream(SUBSCRIBED_TOPICS, { profileId });
+      // A newer connect or a disconnect arrived while the stream opened.
+      if (gen !== generation) {
+        handle.abort();
+        return;
+      }
+      backoffMs = 1000;
+      set({ abort: handle.abort, connected: true, activeProfileId: profileId ?? null });
+
+      (async () => {
+        try {
+          for await (const evt of handle.events as AsyncGenerator<UiEvent>) {
           switch (evt.kind) {
             case 'heartbeat':
               break;
@@ -297,12 +325,23 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
       } catch {
         // stream aborted or network dropped
       } finally {
-        set({ connected: false, abort: null });
+        // A superseded connection does not touch the live state and
+        // never schedules a reconnect — `gen !== generation` means either
+        // a newer connect or an explicit disconnect arrived first.
+        if (gen === generation) {
+          set({ connected: false, abort: null });
+          scheduleReconnect(gen, profileId ?? null);
+        }
       }
     })();
   },
 
   disconnect() {
+    generation += 1;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
     get().abort?.();
     set({ abort: null, connected: false });
   },
@@ -310,6 +349,13 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   async reconnectForProfile(profileId) {
     const { activeProfileId, abort } = get();
     if (activeProfileId === profileId && abort) return;
+    // Bump the generation before aborting so the dropped stream's
+    // finally cannot clear this new state or schedule a reconnect.
+    generation += 1;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
     abort?.();
     set({
       abort: null,
@@ -325,4 +371,5 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
     if (get().profileSessions) return;
     set({ profileSessions: payload });
   },
-}));
+  };
+});
