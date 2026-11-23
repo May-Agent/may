@@ -908,8 +908,6 @@ pub fn verify_prepared_specs(
     python: Option<&PythonRuntime>,
     destination: &Path,
 ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
-    let destination = std::fs::canonicalize(destination)
-        .map_err(|error| cache_entry_error(destination, error))?;
     let bin_dir = destination.join("bin");
     for binary in binaries {
         let path = bin_dir.join(binary.tool.executable_name(target));
@@ -955,6 +953,8 @@ pub fn verify_prepared_specs(
             .chain(python.map(ToolInfo::python))
             .collect(),
     };
+    let bin_dir =
+        std::fs::canonicalize(&bin_dir).map_err(|error| cache_entry_error(&bin_dir, error))?;
     Ok(PreparedTools {
         bin_dir,
         uv_dir: None,
