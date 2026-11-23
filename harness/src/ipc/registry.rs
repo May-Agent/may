@@ -700,6 +700,7 @@ impl CommandRegistryBuilder {
             "a command set cannot be kept through compaction"
         );
         self.kept.extend(registered.kept);
+        self.kept.extend(registered.entries.keys().cloned());
         self.entries.extend(registered.entries);
     }
 
