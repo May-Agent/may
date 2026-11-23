@@ -23,7 +23,6 @@ function formatRate(rate: number): string {
 
 export function AssistantTurn({
   turn,
-  reasoningEnabled = false,
   showDecodeSpeed = true,
 }: AssistantTurnProps) {
   const streaming = turn.status === 'streaming';
@@ -106,11 +105,7 @@ export function AssistantTurn({
       )}
       {streaming && !hasAnySegment && !(turn.todo && openCount(turn.todo.rows) > 0) && !turn.reasoning && !turn.hold && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          {reasoningEnabled ? (
-            <span className="shimmer-text">{t('chat.thinking')}…</span>
-          ) : (
-            <span className="shimmer-text">{t('chat.responding')}…</span>
-          )}
+          <span className="shimmer-text">{t(`chat.stages.${turn.stage}`)}…</span>
         </div>
       )}
       {turn.error && (

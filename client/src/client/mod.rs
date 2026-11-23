@@ -20,7 +20,7 @@ pub use wire::{
     PipelineRemovedFrame, PipelineUpsertedFrame, PrsChangedFrame, RecapFrame, RewindRequest,
     RunEnd, SessionAgentBody, SessionAgentFrame, SessionCompactionFrame, SessionIndexSnapshot,
     SessionIssuesFrame, SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame,
-    SubagentUpsertedFrame, SuggestionFrame, UpdateSessionRequest, WarningFrame, WirePr,
+    SubagentUpsertedFrame, SuggestionFrame, TurnStage, UpdateSessionRequest, WarningFrame, WirePr,
     WirePrCheck, WirePrChecks, WirePrEvent, WireSession, WireTranscriptEntry, WireTranscriptPage,
 };
 

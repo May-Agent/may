@@ -5816,9 +5816,15 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
 
     // Read the start and a few chunks, then drop the stream mid-turn.
+    // Preparation stages can arrive before and after the start frame; the
+    // cursor this test exercises is about turn frames, so they are skipped.
     let mut seen = Vec::new();
-    for _ in 0..3 {
-        seen.push(next_turn_frame(&mut first).await);
+    while seen.len() < 3 {
+        let frame = next_turn_frame(&mut first).await;
+        if frame.data.contains("\"stage\"") {
+            continue;
+        }
+        seen.push(frame);
     }
     assert!(seen[0].data.contains("\"start\""), "{:?}", seen[0]);
     let last_seen = frame_cursor(seen.last().expect("frames were read"));

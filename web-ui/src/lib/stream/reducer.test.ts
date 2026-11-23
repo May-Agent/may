@@ -449,4 +449,15 @@ describe('reducer', () => {
     ]);
     expect(t.hold).toEqual({ reason: 'network', message: 'offline' });
   });
+
+  test('stage events track real preparation and model-wait phases', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'stage', seq: 2, turnId: 't1', stage: 'checking_repo' },
+      { kind: 'stage', seq: 3, turnId: 't1', stage: 'preparing_agent' },
+      { kind: 'stage', seq: 4, turnId: 't1', stage: 'waiting_for_model' },
+    ]);
+    expect(t.stage).toBe('waiting_for_model');
+    expect(t.reasoning).toBe('');
+  });
 });

@@ -339,6 +339,21 @@ export interface ChatRequestPayload {
 
 // ── Turn events: `session_turn` frames on the session stream ─
 
+export type TurnStage =
+  | 'preparing'
+  | 'checking_repo'
+  | 'loading_context'
+  | 'starting_container'
+  | 'preparing_agent'
+  | 'waiting_for_model';
+
+export interface SseStage {
+  kind: 'stage';
+  seq: number;
+  turnId: string;
+  stage: TurnStage;
+}
+
 export interface SseStart {
   kind: 'start';
   seq: number;
@@ -582,6 +597,7 @@ export interface SseWithdrawn {
 }
 
 export type ChatStreamEvent =
+  | SseStage
   | SseStart
   | SseText
   | SseReasoning

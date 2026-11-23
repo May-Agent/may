@@ -120,6 +120,10 @@ fn persist_stopped_terminal_calls(
 ///
 /// [`HubSink`] publishes them to every client of the session.
 trait ChatSink {
+    /// The run entered a preparation or model-wait stage.
+    fn on_stage(&mut self, _stage: crate::client::TurnStage) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     /// The run is prepared; `user_message_id` is the row of the user
     /// message it answers, when it stored one.
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
@@ -307,6 +311,15 @@ impl HubSink {
     }
 }
 
+/// `session_turn` frame carrying the run's current preparation or model-wait stage.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseStageEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    stage: crate::client::TurnStage,
+}
+
 /// `session_turn` frame carrying the display translation of the reply the
 /// turn just streamed; the streamed text stays its original.
 #[derive(Serialize)]
@@ -374,6 +387,20 @@ struct SessionTurnFrame<'a, T> {
 // that write to a socket.
 #[allow(clippy::unused_async_trait_impl)]
 impl ChatSink for HubSink {
+    async fn on_stage(&mut self, stage: crate::client::TurnStage) -> bool {
+        let seq = self.next_seq();
+        self.publish_turn(
+            "stage",
+            &SseStageEvent {
+                seq,
+                turn_id: &self.turn_id,
+                stage,
+            },
+        );
+        self.publish_agent(crate::client::SessionAgentBody::Stage { stage });
+        true
+    }
+
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool {
         self.turn_id.clear();
         self.turn_id.push_str(assistant_id);
@@ -2428,43 +2455,54 @@ fn run_agent_loop_attempts<'a>(
                 "chat stream start sent"
             );
 
-            let prepared = tokio::select! {
-                biased;
-                cancel = guard.cancellation().recv() => {
-                    return finish_cancelled_preparation(
-                        state,
-                        req,
-                        &mut *sink,
-                        guard,
-                        kind,
-                        turn_boundary,
-                        continue_from_transcript,
-                        turn_consumed_alerts,
-                        cancellation_reason_of(&cancel),
-                    )
-                    .await;
-                }
-                result = prepare_agent_for_request(
-                    state,
-                    req,
-                    guard.fence(),
-                    persist_user_message && attempt == 0 && !kind.is_resume(),
-                    use_persisted_context_snapshot,
-                    TurnAttempt {
-                        provider_attempt: candidate,
-                        // A resubmitting retry rebuilds context only up to the
-                        // turn boundary; a resume retry replays the committed
-                        // transcript in full.
-                        turn_boundary: if continue_from_transcript {
-                            None
-                        } else {
-                            Some(turn_boundary)
-                        },
-                        retained_agent: retained_agent.take(),
+            let (stage_tx, stage_rx) = async_channel::unbounded();
+            let mut prep_fut = std::pin::pin!(prepare_agent_for_request_with_stages(
+                state,
+                req,
+                guard.fence(),
+                persist_user_message && attempt == 0 && !kind.is_resume(),
+                use_persisted_context_snapshot,
+                TurnAttempt {
+                    provider_attempt: candidate,
+                    // A resubmitting retry rebuilds context only up to the
+                    // turn boundary; a resume retry replays the committed
+                    // transcript in full.
+                    turn_boundary: if continue_from_transcript {
+                        None
+                    } else {
+                        Some(turn_boundary)
                     },
-                    kind,
-                ) => result,
+                    retained_agent: retained_agent.take(),
+                },
+                kind,
+                Some(stage_tx),
+            ));
+            let prepared = loop {
+                tokio::select! {
+                    biased;
+                    cancel = guard.cancellation().recv() => {
+                        return finish_cancelled_preparation(
+                            state,
+                            req,
+                            &mut *sink,
+                            guard,
+                            kind,
+                            turn_boundary,
+                            continue_from_transcript,
+                            turn_consumed_alerts,
+                            cancellation_reason_of(&cancel),
+                        )
+                        .await;
+                    }
+                    Ok(turn_stage) = stage_rx.recv() => {
+                        let _ = sink.on_stage(turn_stage).await;
+                    }
+                    result = &mut prep_fut => break result,
+                }
             };
+            while let Ok(turn_stage) = stage_rx.try_recv() {
+                let _ = sink.on_stage(turn_stage).await;
+            }
             let PreparedAgent {
                 session_id,
                 mut agent,
@@ -2585,6 +2623,9 @@ fn run_agent_loop_attempts<'a>(
             }
             turn_consumed_alerts.merge(consumed_alerts);
             sink.on_prepared(turn_user_message_id);
+            let _ = sink
+                .on_stage(crate::client::TurnStage::WaitingForModel)
+                .await;
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
@@ -3738,6 +3779,8 @@ async fn gate_session_repo(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<(), UiChatPreparationError> {
+    let gate_lock = state.repo_gate_lock(session_id);
+    let _gate_guard = gate_lock.lock().await;
     let session_id = SessionId::from_string(session_id.to_string());
     let session_id = &session_id;
     let db = state.db();
@@ -4741,8 +4784,41 @@ fn prepare_agent_for_request<'a>(
     attempt: TurnAttempt,
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
+    prepare_agent_for_request_with_stages(
+        state,
+        req,
+        fence,
+        persist_user_message,
+        use_persisted_context_snapshot,
+        attempt,
+        kind,
+        None,
+    )
+}
+
+fn emit_turn_stage(
+    stages: Option<&async_channel::Sender<crate::client::TurnStage>>,
+    stage: crate::client::TurnStage,
+) {
+    if let Some(tx) = stages {
+        let _ = tx.try_send(stage);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_agent_for_request_with_stages<'a>(
+    state: &'a Arc<DaemonState>,
+    req: &'a ChatRequest,
+    fence: &'a RunFence,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
+    attempt: TurnAttempt,
+    kind: &'a TurnKind,
+    stages: Option<async_channel::Sender<crate::client::TurnStage>>,
+) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
         let take_prewarm = attempt.retained_agent.is_none() && attempt.provider_attempt == 0;
+        let stage_ref = stages.as_ref();
         let (prewarmed_agent, ctx_res) = futures_util::join!(
             async {
                 if take_prewarm {
@@ -4753,8 +4829,10 @@ fn prepare_agent_for_request<'a>(
             },
             async {
                 if !kind.is_resume() {
+                    emit_turn_stage(stage_ref, crate::client::TurnStage::CheckingRepo);
                     gate_session_repo(state, &req.session_id).await?;
                 }
+                emit_turn_stage(stage_ref, crate::client::TurnStage::LoadingContext);
                 Box::pin(resolve_session_context(
                     state,
                     req,
@@ -4792,16 +4870,19 @@ fn prepare_agent_for_request<'a>(
         });
         let mut agent = match reused {
             Some(mut agent) => {
-                let ssh_servers = crate::profile::resolve_attached_ssh_servers(
-                    &state.db(),
-                    ctx.profile_id.as_deref(),
-                    &config.ssh_servers,
-                )
-                .await
-                .map_err(UiChatPreparationError::LoadProfile)?;
-                let location = resolve_profile_location(state, &ctx).await?;
-                let model_context_window =
-                    resolve_model_context_window(state, &ctx.current_model).await;
+                emit_turn_stage(stage_ref, crate::client::TurnStage::PreparingAgent);
+                let db = state.db();
+                let (ssh_servers_res, location_res, model_context_window) = futures_util::join!(
+                    crate::profile::resolve_attached_ssh_servers(
+                        &db,
+                        ctx.profile_id.as_deref(),
+                        &config.ssh_servers,
+                    ),
+                    resolve_profile_location(state, &ctx),
+                    resolve_model_context_window(state, &ctx.current_model),
+                );
+                let ssh_servers = ssh_servers_res.map_err(UiChatPreparationError::LoadProfile)?;
+                let location = location_res?;
                 agent
                     .sync_for_turn(crate::agent::TurnSyncInput {
                         may_config: &config,
@@ -4825,14 +4906,22 @@ fn prepare_agent_for_request<'a>(
             }
             None if kind.is_resume() => return Err(UiChatPreparationError::NothingToResume),
             None => {
-                Box::pin(build_session_agent(
+                let turn_stage = if wants_container {
+                    crate::client::TurnStage::StartingContainer
+                } else {
+                    crate::client::TurnStage::PreparingAgent
+                };
+                emit_turn_stage(stage_ref, turn_stage);
+                let agent = Box::pin(build_session_agent(
                     state,
                     &config,
                     &ctx,
                     fence,
                     attempt.provider_attempt,
                 ))
-                .await?
+                .await?;
+                emit_turn_stage(stage_ref, crate::client::TurnStage::PreparingAgent);
+                agent
             }
         };
 
@@ -4919,9 +5008,12 @@ fn build_session_agent<'a>(
     provider_attempt: usize,
 ) -> Pin<Box<impl Future<Output = Result<MayAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
-        let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
+        let (env_and_location, model_context_window) = futures_util::join!(
+            setup_agent_environment(state, ctx),
+            resolve_model_context_window(state, &ctx.current_model),
+        );
+        let (environment, location) = env_and_location?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
-        let model_context_window = resolve_model_context_window(state, &ctx.current_model).await;
 
         let subagents = state.session_background.subagents(ctx.session_id.as_str());
         cards::forward_updates(state, ctx.session_id.as_str(), subagents.cards());

@@ -260,6 +260,25 @@ impl<T: Clone + Send + Sync> RefreshableCache<T> {
         self.inner.load_full().map(|cached| cached.value.clone())
     }
 
+    /// Runs `update` under the refresh lock against the current cached value
+    /// (at any age) and stores the returned value.
+    pub async fn update_with<F, Fut, R>(&self, update: F) -> R
+    where
+        F: FnOnce(Option<T>) -> Fut + Send,
+        Fut: Future<Output = (Option<T>, R)> + Send,
+    {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let current = self.latest();
+        let (next, output) = update(current).await;
+        if let Some(value) = next {
+            self.inner.store(Some(Arc::new(CachedValue {
+                updated_at: TokioInstant::now(),
+                value,
+            })));
+        }
+        output
+    }
+
     pub async fn get_or_refresh<F, Fut>(&self, refresh: F) -> T
     where
         F: FnOnce() -> Fut + Send,
@@ -516,6 +535,10 @@ pub struct DaemonState {
     pub parked_agents: super::chat::ParkedAgents,
     /// In-flight session pre-warm tasks spawned on session creation.
     pub session_prewarms: super::chat::SessionPrewarms,
+    /// Serializes concurrent `repo_gate` runs for the same session so pre-warm
+    /// and the first turn never duplicate forge API lookups.
+    pub repo_gate_locks:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<async_lock::Mutex<()>>>>,
     /// Each session agent's fork source and model, working or idle, for
     /// `btw` questions from other agents.
     pub agent_forks: crate::agent_link::ForkHosts,
@@ -562,30 +585,59 @@ impl DaemonState {
 
     /// The context window of `selector`: what its provider reports in the
     /// fetched model list, else the `aither_models` table. The list is read
-    /// from the cache at any age; when the cache holds no list and the static
-    /// table cannot answer, only the selector's own provider is queried so
+    /// from the cache at any age; when the cache holds no list for that
+    /// provider and the static table cannot answer, only the selector's own
+    /// provider is queried (coalesced and persisted back into the cache) so
     /// unrelated slow providers never stall turn startup.
     pub async fn model_context_window(&self, selector: &crate::ModelSelector) -> Option<u32> {
-        let resolve = |fetched: &[crate::models::FetchedModel]| {
-            crate::models::resolve_context_window(
-                fetched,
-                selector.provider_id(),
-                selector.model_id(),
-            )
-        };
-        let cached = self.fetched_models_cache.latest().unwrap_or_default();
-        if !cached.is_empty() {
-            return resolve(&cached);
+        let provider_id = selector.provider_id().to_string();
+        let model_id = selector.model_id().to_string();
+        if let Some(cached) = self.fetched_models_cache.latest()
+            && cached.iter().any(|model| model.provider_id == provider_id)
+        {
+            return crate::models::resolve_context_window(&cached, &provider_id, &model_id);
         }
-        if let Some(window) = resolve(&[]) {
+        if let Some(window) = crate::models::resolve_context_window(&[], &provider_id, &model_id) {
             return Some(window);
         }
         let config = self.config_snapshot();
-        let instance = config.provider.get(selector.provider_id()).cloned()?;
-        let result =
-            crate::models::fetch_models_for_configured_provider(selector.provider_id(), &instance)
-                .await;
-        resolve(&result.models)
+        let instance = config.provider.get(&provider_id).cloned()?;
+        self.fetched_models_cache
+            .update_with(|current| async move {
+                if let Some(cached) = current.as_ref()
+                    && cached.iter().any(|model| model.provider_id == provider_id)
+                {
+                    return (
+                        None,
+                        crate::models::resolve_context_window(cached, &provider_id, &model_id),
+                    );
+                }
+                let result =
+                    crate::models::fetch_models_for_configured_provider(&provider_id, &instance)
+                        .await;
+                let window =
+                    crate::models::resolve_context_window(&result.models, &provider_id, &model_id);
+                if result.models.is_empty() {
+                    return (None, window);
+                }
+                let mut merged = current.unwrap_or_default();
+                merged.retain(|model| model.provider_id != provider_id);
+                merged.extend(result.models);
+                (Some(merged), window)
+            })
+            .await
+    }
+
+    pub fn repo_gate_lock(&self, session_id: &str) -> Arc<async_lock::Mutex<()>> {
+        let mut locks = self
+            .repo_gate_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(async_lock::Mutex::new(()))),
+        )
     }
 
     pub fn config_snapshot(&self) -> Arc<MayConfig> {
@@ -1549,6 +1601,7 @@ impl DaemonState {
             turn_hub: std::sync::Arc::new(super::chat::TurnHub::default()),
             parked_agents: super::chat::ParkedAgents::default(),
             session_prewarms: super::chat::SessionPrewarms::default(),
+            repo_gate_locks: std::sync::Mutex::default(),
             agent_forks: crate::agent_link::ForkHosts::default(),
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),

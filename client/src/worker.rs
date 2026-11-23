@@ -18,6 +18,8 @@ pub const ERR_SEND_IN_PROCESS: &str = "this agent runs in-process; turns go thro
 /// Events sent from the agent background task to the TUI.
 #[derive(Debug)]
 pub enum TuiEvent<S = ()> {
+    /// Turn entered a preparation or model-wait stage.
+    Stage(crate::client::TurnStage),
     /// Agent produced a streaming event.
     Agent(Result<TimedEvent, aither_agent::AgentError>),
     /// Compaction request finished.

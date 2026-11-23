@@ -1037,6 +1037,9 @@ where
                     }
                 }
                 match tui_event {
+                    TuiEvent::Stage(stage) => {
+                        app.activity_phase = may_agent::tui::ui::chat::ActivityPhase::Stage(stage);
+                    }
                     TuiEvent::Agent(result) => {
                         // The wait that followed a failure is over.
                         app.clear_persistent_status();

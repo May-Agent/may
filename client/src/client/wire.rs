@@ -154,10 +154,48 @@ pub enum HoldReason {
     Network,
 }
 
+/// Real lifecycle stage of a turn before or between model responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStage {
+    /// Initial turn preparation before a more specific stage is reported.
+    Preparing,
+    /// Checking the session's repository binding and trust.
+    CheckingRepo,
+    /// Loading the session transcript, profile, and context snapshot.
+    LoadingContext,
+    /// Ensuring the session's container runtime and workspace are running.
+    StartingContainer,
+    /// Building or synchronizing the agent and its tools.
+    PreparingAgent,
+    /// Waiting for the model API to begin streaming.
+    WaitingForModel,
+}
+
+impl TurnStage {
+    /// Human-readable label shown in live status lines.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing",
+            Self::CheckingRepo => "Checking repository",
+            Self::LoadingContext => "Loading context",
+            Self::StartingContainer => "Starting container",
+            Self::PreparingAgent => "Preparing agent",
+            Self::WaitingForModel => "Waiting for model",
+        }
+    }
+}
+
 /// What a `session_agent` frame reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionAgentBody {
+    /// The turn entered a lifecycle stage.
+    Stage {
+        /// The active stage.
+        stage: TurnStage,
+    },
     /// A run started.
     Start {
         /// The user message the run answers, when it has one.
