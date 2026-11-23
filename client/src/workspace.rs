@@ -304,6 +304,10 @@ impl WorkspaceConfig {
     ///
     /// Returns [`WorkspaceConfigError::Read`] when the file exists but cannot
     /// be read, and [`WorkspaceConfigError`] when its TOML fails to parse.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous workspace config load; async callers wrap in blocking::unblock"
+    )]
     pub fn load(config_path: &Path) -> Result<Self, WorkspaceConfigError> {
         match fs::read_to_string(config_path) {
             Ok(content) => {
@@ -382,6 +386,10 @@ impl WorkspaceConfig {
     ///
     /// Returns [`WorkspaceConfigError`] when serializing or writing the file
     /// fails.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous workspace config save; async callers wrap in blocking::unblock"
+    )]
     pub fn save(&self, config_path: &Path) -> Result<(), WorkspaceConfigError> {
         let content = toml::to_string_pretty(self)?;
         fs::write(config_path, content)?;

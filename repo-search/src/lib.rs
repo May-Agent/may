@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! repo-search: the daemon behind code, session and issue search.
 //!
 //! May runs repo-search as a host program — a pinned, hash-verified binary
@@ -213,6 +214,10 @@ fn boot_out_relocated(
 /// Fails when the launchd state cannot be read, or a service is still
 /// registered [`BOOTOUT_SETTLE`] after its bootout.
 #[cfg(target_os = "macos")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous launchd bootout polling runs inside blocking::unblock"
+)]
 fn await_bootouts(
     launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
     booted_out: &[String],

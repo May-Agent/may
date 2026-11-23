@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous transcript importers; async callers wrap in blocking::unblock"
+)]
 //! Import foreign agent transcripts (Codex, Claude Code) into May sessions.
 //!
 //! Parsers are pure and offline: they read a transcript file and produce the

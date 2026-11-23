@@ -69,6 +69,10 @@ pub use user_wait::{UserAsk, UserWait};
 ///
 /// # Errors
 /// Returns an I/O error when directory creation or permission tightening fails.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "explicitly synchronous counterpart of ensure_private_dir_async"
+)]
 pub fn ensure_private_dir_sync(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

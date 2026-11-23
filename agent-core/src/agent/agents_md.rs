@@ -75,6 +75,10 @@ pub async fn load_global(path: &Path) -> Option<RulesDocument> {
 
 /// `path` capped to [`ROOT_DOCUMENT_CAP`]; `None` when absent or blank. A
 /// read error other than absence is logged and treated as absent.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous read runs inside blocking::unblock"
+)]
 fn read_document(path: &Path) -> Option<RulesDocument> {
     match std::fs::read_to_string(path) {
         Ok(content) if !content.trim().is_empty() => {
@@ -187,6 +191,10 @@ pub async fn load_referenced(handoff_markdown: &str, base: Option<&Path>) -> Vec
             if !seen.insert(path.clone()) {
                 continue;
             }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "synchronous read runs inside blocking::unblock"
+            )]
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };

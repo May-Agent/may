@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous git/PR helpers; async methods wrap work in blocking::unblock"
+)]
 //! `pr` — the session's landing object.
 //!
 //! A session's PR is a numbered, archived record of work landing from its

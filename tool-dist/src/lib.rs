@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! The pinned tool distribution every May execution backend prepares.
 
 use std::path::Path;

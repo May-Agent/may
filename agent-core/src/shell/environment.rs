@@ -57,19 +57,29 @@ impl HostSession {
     ) -> Result<Self, SessionEnvironmentError> {
         write_git_shim(tools).await?;
         python_shim::install(&tools.shim_dir()).await?;
-        let environment = environment(working_dir, tools).await?;
-        let mut grants = tool_grants(tools)?;
-        grants.extend(path_directory_grants(&environment)?);
-        Ok(Self {
-            grants,
-            environment,
-            write_denylist: write_denylist(working_dir, tools),
+        let env_values = environment(working_dir, tools).await?;
+        let working_dir = working_dir.to_path_buf();
+        let tools = tools.clone();
+        blocking::unblock(move || {
+            let mut grants = tool_grants(&tools)?;
+            grants.extend(path_directory_grants(&env_values)?);
+            let write_denylist = write_denylist(&working_dir, &tools);
+            Ok(Self {
+                grants,
+                environment: env_values,
+                write_denylist,
+            })
         })
+        .await
     }
 }
 
 /// The object `path` names, in the spelling a resolved grant checks: a
 /// symlinked component or an 8.3 alias would not name the same object.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous canonicalization runs inside blocking::unblock in HostSession::prepare"
+)]
 fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
     ResolvedPath::new(dunce::simplified(
         &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
@@ -93,6 +103,10 @@ fn path_value(name: &'static str, path: &Path) -> Result<String, SessionEnvironm
 /// wrappers inside the remapped-`HOME` sandbox reach the host `stow` daemon
 /// and `build-dir`. Only directories that exist yield, so a toolchain absent
 /// from the host is never granted.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous stow daemon setup runs inside blocking::unblock in environment()"
+)]
 fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
     let home = std::env::home_dir;
     let stow_cache = std::env::var_os("STOW_CACHE_DIR")
@@ -218,6 +232,10 @@ fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<Vec<G
 /// dependencies; the session directory `working_dir`, where `git clone` and
 /// `git init` make the session's own repositories; and the prepared
 /// runtime's `uv` cache, whose buckets `uv` marks with a `.git` entry.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous canonicalization runs inside blocking::unblock in HostSession::prepare"
+)]
 fn write_denylist(working_dir: &Path, tools: &PreparedTools<PathBuf>) -> heel::WriteDenylist {
     let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let denylist = heel::WriteDenylist::persistence().except(resolved(working_dir));
@@ -301,7 +319,8 @@ async fn environment(
     // Point cargo and rustup at the same host homes the grants cover, so the
     // remapped HOME does not strand them under the working dir.
     let mut has_stow_cache = false;
-    for (name, home) in host_toolchain_homes() {
+    let homes: Vec<_> = blocking::unblock(|| host_toolchain_homes().collect()).await;
+    for (name, home) in homes {
         if name == "STOW_CACHE_DIR" {
             has_stow_cache = true;
         }

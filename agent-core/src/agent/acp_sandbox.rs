@@ -178,56 +178,61 @@ impl AcpSandbox {
         // writes: a run's sandbox only reads the session's.
         let tmp = self.sandbox.working_dir().join("tmp");
         async_fs::create_dir_all(&tmp).await?;
-        let tmp = os_text("TMPDIR", canonical(&tmp)?.into_os_string())?;
+        let (tmp, program, agent_grants, agent_env) = {
+            let process_is_agent = match process {
+                Process::Agent { state } => Some((
+                    state.clone(),
+                    spec.program.clone(),
+                    spec.args.clone(),
+                    cwd.to_path_buf(),
+                )),
+                Process::Terminal => None,
+            };
+            let terminal_program = spec.program.clone();
+            blocking::unblock(move || -> io::Result<_> {
+                let tmp = os_text("TMPDIR", canonical(&tmp)?.into_os_string())?;
+                if let Some((state, spec_program, spec_args, cwd)) = process_is_agent {
+                    let search_path = std::env::var_os("PATH").unwrap_or_default();
+                    let program = resolve_program(&spec_program, &search_path, &cwd)?;
+                    let target = canonical(&program)?;
+                    let named = spec_args
+                        .iter()
+                        .map(|arg| cwd.join(arg))
+                        .filter(|path| path.is_file());
+                    let links = link_dirs(&program)?;
+                    let host_grants = std::iter::once((target, Access::EXEC))
+                        .chain(links.into_iter().map(|path| (path, Access::READ)))
+                        .chain(named.map(|path| (path, Access::READ)))
+                        .chain(
+                            state
+                                .into_iter()
+                                .map(|path| (path, Access::WRITE | Access::EXEC)),
+                        );
+                    let mut grants = Vec::new();
+                    for (path, access) in host_grants {
+                        grants.push(SpawnGrant::Host(Grant::new(resolved(&path)?, access)));
+                    }
+                    let env = vec![
+                        ("PATH".to_string(), os_text("PATH", search_path)?),
+                        (
+                            "HOME".to_string(),
+                            os_text("HOME", canonical(&real_home()?)?.into_os_string())?,
+                        ),
+                    ];
+                    let program = os_text("the program path", program.into_os_string())?;
+                    Ok((tmp, program, grants, env))
+                } else {
+                    Ok((tmp, terminal_program, Vec::new(), Vec::new()))
+                }
+            })
+            .await?
+        };
         let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
             .into_iter()
             .map(|name| (name.to_string(), tmp.clone()))
             .collect();
-        let mut grants: Vec<SpawnGrant> = Vec::new();
-        let program = match process {
-            Process::Agent { state } => {
-                // The agent runs on the host's tools and finds its own config
-                // and login through the user's real home; its commands keep
-                // the session's.
-                let search_path = std::env::var_os("PATH").unwrap_or_default();
-                let program = resolve_program(&spec.program, &search_path, cwd)?;
-                // The program starts by the path `PATH` gives, so a link
-                // starts under its own name (`cargo` is a link to `rustup`,
-                // which dispatches on it). A grant never names a link, so
-                // its target is what the sandbox may execute.
-                let target = canonical(&program)?;
-                // The files the agent's own command line names (an
-                // interpreter's script), which it reads: that command is the
-                // user's configuration.
-                let named = spec
-                    .args
-                    .iter()
-                    .map(|arg| cwd.join(arg))
-                    .filter(|path| path.is_file());
-                // The directories holding the links the program starts
-                // through, which the sandbox reads to follow them.
-                let links = link_dirs(&program)?;
-                let host_grants = std::iter::once((target, Access::EXEC))
-                    .chain(links.into_iter().map(|path| (path, Access::READ)))
-                    .chain(named.map(|path| (path, Access::READ)))
-                    .chain(
-                        state
-                            .iter()
-                            .cloned()
-                            .map(|path| (path, Access::WRITE | Access::EXEC)),
-                    );
-                for (path, access) in host_grants {
-                    grants.push(SpawnGrant::Host(Grant::new(resolved(&path)?, access)));
-                }
-                env.push(("PATH".to_string(), os_text("PATH", search_path)?));
-                env.push((
-                    "HOME".to_string(),
-                    os_text("HOME", canonical(&real_home()?)?.into_os_string())?,
-                ));
-                os_text("the program path", program.into_os_string())?
-            }
-            Process::Terminal => spec.program.clone(),
-        };
+        env.extend(agent_env);
+        let mut grants: Vec<SpawnGrant> = agent_grants;
         // A command the agent runs draws its jobs from the machine-wide
         // pool through a fifo of its own; the agent itself starts none.
         let job_fifo = match (&self.jobs, process) {
@@ -279,6 +284,10 @@ fn os_text(what: &str, value: OsString) -> io::Result<String> {
 
 /// The resolved directory of every link on the way from `program` to the
 /// file it names. `program` resolves, so the chain ends.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous symlink chain traversal runs inside blocking::unblock"
+)]
 fn link_dirs(program: &Path) -> io::Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     let mut path = program.to_path_buf();
@@ -318,6 +327,10 @@ fn toolchain_homes() -> Vec<(&'static str, PathBuf)> {
 
 /// `path` with every link resolved; a path that cannot be resolved is an
 /// error naming it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous canonicalization runs inside blocking::unblock"
+)]
 fn canonical(path: &Path) -> io::Result<PathBuf> {
     std::fs::canonicalize(path).map_err(|error| {
         io::Error::new(

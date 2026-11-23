@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! End-to-end tests for the `apply_patch` executable: real process invocations
 //! with the patch on stdin, exactly as a shell heredoc delivers it.
 

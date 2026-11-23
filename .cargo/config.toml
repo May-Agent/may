@@ -1,2 +1,3 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "12.3", force = false }
+CLIPPY_CONF_DIR = { value = ".", relative = true, force = false }

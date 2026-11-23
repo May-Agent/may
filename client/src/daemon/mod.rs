@@ -80,6 +80,10 @@ impl DaemonPaths {
 ///
 /// # Errors
 /// Fails when the file's metadata cannot be read.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous stat of local executable binary"
+)]
 pub fn build_id_of(path: &Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt as _;
 

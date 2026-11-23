@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! End-to-end tests for May's terminal-first execution and REST/SSE contracts.
 
 use std::convert::Infallible;

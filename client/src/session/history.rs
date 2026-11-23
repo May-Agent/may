@@ -334,6 +334,10 @@ fn attachment_local_path(
 /// represents: pasted text becomes its XML block, file references their
 /// marker line, and binary attachments become typed LLM attachments —
 /// mirroring what the frontends sent at send time.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous attachment text replay helper"
+)]
 fn replay_user_message(
     message: &ChatMessage,
 ) -> Result<aither_core::llm::Message, HistoryReplayError> {

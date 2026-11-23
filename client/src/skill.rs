@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous filesystem operations run inside blocking::unblock"
+)]
 //! Skill management for May.
 //!
 //! Skills are Markdown-based capability definitions stored in `~/.may/skills/`.

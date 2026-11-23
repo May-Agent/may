@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous git commit signing helpers; async callers use blocking::unblock"
+)]
 //! Signing of the commits an agent makes in its session sandbox.
 //!
 //! The sandbox's `HOME` is the session directory, so git there sees none of

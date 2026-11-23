@@ -10,8 +10,9 @@ use url::Url;
 use zenwave::Client;
 
 use super::runtime::{
-    DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool, PythonPin,
-    PythonRuntime, ToolBinary, ToolBundle, ToolRuntimeError, ToolTarget, check_python, digest,
+    DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool,
+    PreparedBinarySpec, PreparedTools, PythonPin, PythonRuntime, ToolBinary, ToolBundle,
+    ToolRuntimeError, ToolTarget, check_python, digest, ensure_uv_dir, verify_prepared_specs,
 };
 
 /// A kind of program a manifest artifact can provide.
@@ -383,14 +384,80 @@ impl ToolDistribution {
                 let cache_root = cache_root.to_path_buf();
                 let token = token.clone();
                 async move {
-                    let bytes = load_artifact(&artifact, &cache_root, token.as_ref()).await?;
-                    ToolBinary::verify(artifact.tool, &artifact.version, &digest(&bytes), bytes)
+                    let (bytes, sha256) =
+                        load_artifact_and_digest(&artifact, &cache_root, token.as_ref()).await?;
+                    ToolBinary::from_verified_digest(
+                        artifact.tool,
+                        &artifact.version,
+                        sha256,
+                        bytes,
+                    )
                 }
             })
             .buffer_unordered(ManagedTool::ALL.len())
             .try_collect::<Vec<_>>()
             .await?;
         ToolBundle::new(target.clone(), binaries, self.select_python(target)?)
+    }
+
+    /// Prepares the host's local runtime directory under `cache_root/runtimes`,
+    /// reusing an already-verified runtime directory without re-reading or
+    /// decompressing cached archives when its manifest index matches and every
+    /// executable on disk passes verification.
+    ///
+    /// # Errors
+    /// Fails on unsupported targets, missing/tampered artifacts, or I/O errors.
+    pub(crate) async fn prepare_local_bundle(
+        &self,
+        target: &ToolTarget,
+        cache_root: &Path,
+        hashline: bool,
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
+        let mut selected = self.select_artifacts(target)?;
+        if hashline {
+            selected.retain(|artifact| artifact.tool != ManagedTool::ApplyPatch);
+        }
+        selected.sort_by_key(|artifact| artifact.tool);
+        let python = self.select_python(target)?;
+        let manifest_key = manifest_runtime_key(target, &selected, python.as_ref())?;
+        let runtimes_root = cache_root.join("runtimes");
+        let manifest_path = runtimes_root.join(format!(".manifest-{manifest_key}.json"));
+
+        if let Some(prepared) = try_verify_manifest_runtime(
+            target,
+            &selected,
+            python.as_ref(),
+            &runtimes_root,
+            &manifest_path,
+        )
+        .await?
+        {
+            return Ok(prepared);
+        }
+
+        let artifacts = cache_root.join("artifacts");
+        let bundle = self.load(target, &artifacts).await?;
+        let bundle = if hashline {
+            bundle.without(ManagedTool::ApplyPatch)
+        } else {
+            bundle
+        };
+        let prepared = bundle.prepare_local(&runtimes_root).await?;
+        let specs = bundle.specs();
+        let bundle_key = bundle.cache_key()?;
+        blocking::unblock(move || {
+            let record = CachedRuntimeManifest {
+                bundle_key,
+                tools: specs,
+            };
+            let json = serde_json::to_vec(&record)?;
+            let mut stage = tempfile::NamedTempFile::new_in(&runtimes_root)?;
+            std::io::Write::write_all(&mut stage, &json)?;
+            let _ = stage.persist(&manifest_path);
+            Ok::<(), ToolRuntimeError>(())
+        })
+        .await?;
+        Ok(prepared)
     }
 
     /// The bytes of the `uv` pinned for the machine running this build, which
@@ -542,6 +609,97 @@ fn validate_artifact<P: Distributed>(artifact: &PinnedArtifact<P>) -> Result<(),
 }
 
 /// Stores every artifact's verified executable beside a relocatable manifest.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedRuntimeManifest {
+    bundle_key: String,
+    tools: Vec<PreparedBinarySpec>,
+}
+
+fn manifest_runtime_key(
+    target: &ToolTarget,
+    selected: &[ToolArtifact],
+    python: Option<&PythonRuntime>,
+) -> Result<String, ToolRuntimeError> {
+    #[derive(Serialize)]
+    struct ManifestIdentity<'a> {
+        target: &'a ToolTarget,
+        tools: Vec<(ManagedTool, &'a str, &'a str, u64)>,
+        python: Option<(&'a semver::Version, &'a [u8; 32])>,
+    }
+    let identity = ManifestIdentity {
+        target,
+        tools: selected
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.tool,
+                    artifact.version.as_str(),
+                    artifact.sha256.as_str(),
+                    artifact.size,
+                )
+            })
+            .collect(),
+        python: python.map(|p| (p.version(), p.interpreter_sha256())),
+    };
+    Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "all filesystem reads and verification run inside blocking::unblock"
+)]
+async fn try_verify_manifest_runtime(
+    target: &ToolTarget,
+    selected: &[ToolArtifact],
+    python: Option<&PythonRuntime>,
+    runtimes_root: &Path,
+    manifest_path: &Path,
+) -> Result<Option<PreparedTools<PathBuf>>, ToolRuntimeError> {
+    let expected_tools: Vec<(ManagedTool, semver::Version)> = selected
+        .iter()
+        .map(|artifact| Ok((artifact.tool, semver::Version::parse(&artifact.version)?)))
+        .collect::<Result<_, ToolRuntimeError>>()?;
+    let target = target.clone();
+    let python = python.cloned();
+    let runtimes_root = runtimes_root.to_path_buf();
+    let manifest_path = manifest_path.to_path_buf();
+    blocking::unblock(move || {
+        let Ok(bytes) = std::fs::read(&manifest_path) else {
+            return Ok(None);
+        };
+        let Ok(record) = serde_json::from_slice::<CachedRuntimeManifest>(&bytes) else {
+            return Ok(None);
+        };
+        let record_pairs: Vec<(ManagedTool, semver::Version)> = record
+            .tools
+            .iter()
+            .map(|spec| (spec.tool, spec.version.clone()))
+            .collect();
+        if record_pairs != expected_tools {
+            return Ok(None);
+        }
+        let destination = runtimes_root.join(&record.bundle_key);
+        if !destination.try_exists()? {
+            return Ok(None);
+        }
+        match verify_prepared_specs(&target, &record.tools, python.as_ref(), &destination) {
+            Ok(mut prepared) => {
+                if python.is_some() {
+                    ensure_uv_dir(&runtimes_root, &mut prepared)?;
+                }
+                Ok(Some(prepared))
+            }
+            Err(
+                ToolRuntimeError::InvalidCache(_)
+                | ToolRuntimeError::Integrity { .. }
+                | ToolRuntimeError::PythonIntegrity,
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
+    })
+    .await
+}
+
 async fn package_artifacts<P: Distributed>(
     artifacts: &[PinnedArtifact<P>],
     directory: &Path,
@@ -553,11 +711,16 @@ async fn package_artifacts<P: Distributed>(
             let directory = directory.to_path_buf();
             async move {
                 let tool = artifact.tool.into();
-                let bytes = load_artifact(&artifact, &directory.join("artifacts"), token).await?;
-                let sha256 = digest(&bytes);
+                let (bytes, sha256) =
+                    load_artifact_and_digest(&artifact, &directory.join("artifacts"), token)
+                        .await?;
                 let size = bytes.len() as u64;
                 let name = hex::encode(sha256);
                 let path = directory.join(&name);
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "reads happen synchronously inside blocking::unblock"
+                )]
                 blocking::unblock(move || {
                     use std::io::Write;
                     if path.try_exists()? {
@@ -600,39 +763,58 @@ async fn load_artifact<P: Distributed>(
     cache_root: &Path,
     token: Option<&GithubToken>,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
+    let (bytes, _) = load_artifact_and_digest(artifact, cache_root, token).await?;
+    Ok(bytes)
+}
+
+/// Fetches an artifact through the cache, verifies the archive SHA-256 once,
+/// extracts the executable, and computes the executable SHA-256 once — all
+/// CPU/sync work inside `blocking::unblock`.
+async fn load_artifact_and_digest<P: Distributed>(
+    artifact: &PinnedArtifact<P>,
+    cache_root: &Path,
+    token: Option<&GithubToken>,
+) -> Result<(Vec<u8>, [u8; 32]), ToolRuntimeError> {
     let tool = artifact.tool.into();
     let mut expected = [0; 32];
     hex::decode_to_slice(&artifact.sha256, &mut expected)?;
     let path = cache_root.join(hex::encode(expected));
-    let encoded = match read_artifact_file(&path, tool, artifact.size).await {
-        Ok(encoded) => encoded,
+    let encoding = artifact.encoding.clone();
+    match read_artifact_file(&path, tool, artifact.size).await {
+        Ok(encoded) => {
+            blocking::unblock(move || {
+                if digest(&encoded) != expected {
+                    return Err(ToolRuntimeError::Integrity { tool });
+                }
+                let extracted = extract_executable(&encoding, &encoded)?;
+                let sha256 = digest(&extracted);
+                Ok((extracted, sha256))
+            })
+            .await
+        }
         Err(ToolRuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             let encoded = download_artifact(tool, &artifact.url, artifact.size, token).await?;
-            if digest(&encoded) != expected {
-                return Err(ToolRuntimeError::Integrity { tool });
-            }
-            let destination = path.clone();
             let root = cache_root.to_path_buf();
             blocking::unblock(move || {
                 use std::io::Write;
+                if digest(&encoded) != expected {
+                    return Err(ToolRuntimeError::Integrity { tool });
+                }
                 let mut stage = tempfile::NamedTempFile::new_in(root)?;
                 stage.write_all(&encoded)?;
-                match stage.persist_noclobber(destination) {
-                    Ok(_) => Ok::<(), ToolRuntimeError>(()),
-                    Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                    Err(error) => Err(error.error.into()),
+                match stage.persist_noclobber(&path) {
+                    Ok(_) => {}
+                    Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.error.into()),
                 }
+                let extracted = extract_executable(&encoding, &encoded)?;
+                let sha256 = digest(&extracted);
+                Ok((extracted, sha256))
             })
-            .await?;
-            read_artifact_file(&path, tool, artifact.size).await?
+            .await
         }
-        Err(error) => return Err(error),
-    };
-    if digest(&encoded) != expected {
-        return Err(ToolRuntimeError::Integrity { tool });
+        Err(error) => Err(error),
     }
-    let encoding = artifact.encoding.clone();
-    blocking::unblock(move || extract_executable(&encoding, &encoded)).await
 }
 
 /// Reads a file the manifest pins at `size` bytes, rejecting any other length
@@ -1373,6 +1555,56 @@ pub mod tests {
                 .await,
             Err(ToolRuntimeError::Integrity { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn prepare_local_bundle_reuses_verified_runtime_manifest_without_artifacts() {
+        let files = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
+        let target = ToolTarget::native().unwrap();
+        let distribution = script_distribution(&target, "1.0.0", files.path(), file_artifact);
+
+        let first = distribution
+            .prepare_local_bundle(&target, cache.path(), false)
+            .await
+            .unwrap();
+        assert!(first.bin_dir().is_dir());
+
+        // Remove the downloaded artifact cache and source files: the second run
+        // must reuse the verified runtime via its manifest without touching archives.
+        std::fs::remove_dir_all(cache.path().join("artifacts")).unwrap();
+        for entry in std::fs::read_dir(files.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let second = distribution
+            .prepare_local_bundle(&target, cache.path(), false)
+            .await
+            .unwrap();
+        assert_eq!(second.bin_dir(), first.bin_dir());
+
+        // A tampered prepared binary must fail manifest verification and fall back
+        // to the archive path instead of trusting the stale manifest.
+        let tool_bin = first
+            .bin_dir()
+            .join(ManagedTool::Ripgrep.executable_name(&target));
+        let mut perms = std::fs::metadata(&tool_bin).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            perms.set_mode(0o644);
+        }
+        std::fs::set_permissions(&tool_bin, perms).unwrap();
+        std::fs::write(&tool_bin, b"tampered").unwrap();
+
+        assert!(
+            distribution
+                .prepare_local_bundle(&target, cache.path(), false)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

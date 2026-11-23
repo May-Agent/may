@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous transcript parser; async callers wrap in blocking::unblock"
+)]
 //! Claude Code transcript (`~/.claude/projects/<dir>/<id>.jsonl`) →
 //! [`ImportedTranscript`].
 //!

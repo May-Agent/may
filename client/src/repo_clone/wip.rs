@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous WIP snapshot helpers; async callers wrap in blocking::unblock"
+)]
 //! A checkout's work in progress as one commit.
 //!
 //! The session works on top of the checkout as it stands: every uncommitted

@@ -123,6 +123,10 @@ fn bin_dir(paths: &DaemonPaths) -> PathBuf {
 ///
 /// # Errors
 /// Fails when the directory or the link cannot be written.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous symlink management runs during CLI startup or daemon setup"
+)]
 pub fn ensure_tasks_link(paths: &DaemonPaths) -> std::io::Result<()> {
     let directory = bin_dir(paths);
     std::fs::create_dir_all(&directory)?;
@@ -146,6 +150,10 @@ const HASHLINE_COMMANDS: [&str; 2] = ["search", "edit"];
 ///
 /// # Errors
 /// Fails when the directory or a link cannot be written or removed.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous symlink management runs during CLI startup or daemon setup"
+)]
 pub fn ensure_hashline_links(paths: &DaemonPaths, enabled: bool) -> std::io::Result<()> {
     let directory = bin_dir(paths);
     if enabled {
@@ -261,26 +269,24 @@ pub fn installed() -> bool {
     path.is_ok_and(|path| path.exists())
 }
 
-/// Runs `command` off the executor and returns its stdout.
+/// Runs `command` asynchronously and returns its stdout.
 async fn run_output(command: &str, args: &[&str]) -> Result<String, LifecycleError> {
-    let command = command.to_owned();
-    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-    blocking::unblock(move || {
-        let output = std::process::Command::new(&command).args(&args).output()?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-        }
-        let mut line = command;
-        for arg in &args {
-            line.push(' ');
-            line.push_str(arg);
-        }
-        Err(LifecycleError::ServiceManager {
-            command: line,
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+    let output = async_process::Command::new(command)
+        .args(args)
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let mut line = command.to_owned();
+    for arg in args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    Err(LifecycleError::ServiceManager {
+        command: line,
+        detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     })
-    .await
 }
 
 async fn run(command: &str, args: &[&str]) -> Result<(), LifecycleError> {
@@ -348,10 +354,10 @@ where
 pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
     let program = current_exe()?;
     let program = program.display().to_string();
-    std::fs::create_dir_all(paths.log().parent().unwrap_or_else(|| paths.root()))?;
+    async_fs::create_dir_all(paths.log().parent().unwrap_or_else(|| paths.root())).await?;
     if cfg!(target_os = "macos") {
         let path = launchd_plist_path()?;
-        std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/")))?;
+        async_fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/"))).await?;
         let plist = LaunchdPlist {
             label: SERVICE_LABEL,
             program: &program,
@@ -361,10 +367,10 @@ pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
         }
         .render()?;
         let domain = format!("gui/{}", uid().await?);
-        if path.exists() {
+        if async_fs::metadata(&path).await.is_ok() {
             boot_out(&domain, SERVICE_LABEL, &path).await?;
         }
-        write_private(&path, &plist)?;
+        write_private_async(&path, &plist).await?;
         run(
             "launchctl",
             &["bootstrap", &domain, &path.display().to_string()],
@@ -373,8 +379,8 @@ pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
         Ok(path)
     } else {
         let path = systemd_unit_path()?;
-        std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/")))?;
-        std::fs::write(&path, SystemdUnit { program: &program }.render()?)?;
+        async_fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/"))).await?;
+        async_fs::write(&path, SystemdUnit { program: &program }.render()?).await?;
         run("systemctl", &["--user", "daemon-reload"]).await?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT]).await?;
         Ok(path)
@@ -389,20 +395,20 @@ pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
 pub async fn uninstall() -> Result<Option<PathBuf>, LifecycleError> {
     if cfg!(target_os = "macos") {
         let path = launchd_plist_path()?;
-        if !path.exists() {
+        if async_fs::metadata(&path).await.is_err() {
             return Ok(None);
         }
         let domain = format!("gui/{}", uid().await?);
         boot_out(&domain, SERVICE_LABEL, &path).await?;
-        std::fs::remove_file(&path)?;
+        async_fs::remove_file(&path).await?;
         Ok(Some(path))
     } else {
         let path = systemd_unit_path()?;
-        if !path.exists() {
+        if async_fs::metadata(&path).await.is_err() {
             return Ok(None);
         }
         let _ = run("systemctl", &["--user", "disable", "--now", SYSTEMD_UNIT]).await;
-        std::fs::remove_file(&path)?;
+        async_fs::remove_file(&path).await?;
         let _ = run("systemctl", &["--user", "daemon-reload"]).await;
         Ok(Some(path))
     }
@@ -436,6 +442,10 @@ pub fn spawn_restart(paths: &DaemonPaths, executable: &Path) -> Result<(), Lifec
 }
 
 /// Runs `executable` with `args` detached, logging to the daemon log.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "pre_exec setsid requires std::process::Command and runs before exec"
+)]
 fn spawn_detached(
     paths: &DaemonPaths,
     executable: &Path,
@@ -525,6 +535,10 @@ fn require_gui_domain(domain_exists: bool) -> Result<(), LifecycleError> {
 /// Writes `contents` to `path`, readable by the owner alone: the plist holds
 /// the client's environment. `mode` only applies when the file is created, so
 /// an existing file is restricted before anything is written to it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous mode-0600 file creation runs inside write_private_async via blocking::unblock"
+)]
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -538,6 +552,12 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.set_len(0)?;
     file.write_all(contents.as_bytes())
+}
+
+async fn write_private_async(path: &Path, contents: &str) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    let contents = contents.to_owned();
+    blocking::unblock(move || write_private(&path, &contents)).await
 }
 
 fn on_demand_plist_path(paths: &DaemonPaths) -> PathBuf {
@@ -627,10 +647,10 @@ async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
     require_gui_domain(run("launchctl", &["print", &domain]).await.is_ok())?;
     let log = paths.log();
     if let Some(parent) = log.parent() {
-        std::fs::create_dir_all(parent)?;
+        async_fs::create_dir_all(parent).await?;
     }
-    std::fs::create_dir_all(paths.root())?;
-    let label = on_demand_label(&std::fs::canonicalize(paths.root())?);
+    async_fs::create_dir_all(paths.root()).await?;
+    let label = on_demand_label(&async_fs::canonicalize(paths.root()).await?);
     // Jobs of deleted homes go first, so a start never leaves them behind.
     #[cfg(target_os = "macos")]
     {
@@ -647,7 +667,7 @@ async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
         }
     }
     let plist = on_demand_plist_path(paths);
-    write_private(
+    write_private_async(
         &plist,
         &on_demand_plist(
             &label,
@@ -655,7 +675,8 @@ async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
             &log.display().to_string(),
             &environment(paths)?,
         )?,
-    )?;
+    )
+    .await?;
     // A job left from an earlier start of this home (a stopped or replaced
     // daemon) is still loaded and would refuse the new bootstrap.
     boot_out(&domain, &label, &plist).await?;
@@ -671,12 +692,17 @@ async fn start(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
     if cfg!(target_os = "macos") {
         start_job(paths).await
     } else {
-        spawn(paths).map(Started::Child)
+        let paths = paths.clone();
+        blocking::unblock(move || spawn(&paths).map(Started::Child)).await
     }
 }
 
 /// Why the daemon's last run failed, from its log: anyhow's `Error:` line
 /// and the first cause under it, or the log's last line.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous helper also exercised directly by unit tests; async caller uses blocking::unblock"
+)]
 fn last_error_line(log: &Path) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let lines: Vec<&str> = text
@@ -838,9 +864,11 @@ pub async fn ensure_running(
             None => None,
         };
         if let Some(status) = exited {
+            let log = paths.log();
+            let reason = blocking::unblock(move || last_error_line(&log)).await;
             return Err(LifecycleError::StartFailed {
                 status,
-                reason: last_error_line(&paths.log()),
+                reason,
                 log: paths.log(),
             });
         }

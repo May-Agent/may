@@ -444,6 +444,10 @@ pub fn pasted_image_path_candidate(pasted: &str) -> Option<PathBuf> {
 /// # Errors
 ///
 /// Returns [`ImageError::Io`] when the file cannot be stat'ed or read.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous image file read; async callers wrap in blocking::unblock"
+)]
 pub fn read_pasted_image_file(path: &Path) -> Result<Option<ClipboardImage>, ImageError> {
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
     let meta = std::fs::metadata(path)?;

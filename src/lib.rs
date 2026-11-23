@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May - A warm, boundaried AI assistant.
 //!
 //! `may-agent` is the assembly layer: the whole library surface lives in

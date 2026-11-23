@@ -86,6 +86,10 @@ impl CloudHome {
     ///
     /// # Errors
     /// Fails when the file exists but cannot be read or parsed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous startup load of cloud home marker"
+    )]
     pub fn load(may_dir: &Path) -> Result<Option<Self>, CloudHomeError> {
         let path = Self::path(may_dir);
         let text = match std::fs::read_to_string(&path) {

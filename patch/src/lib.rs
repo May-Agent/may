@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Engine behind the `apply_patch` sandbox executable.
 //!
 //! The crate applies the compact contextual patch format (`*** Begin Patch` …

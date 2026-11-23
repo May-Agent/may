@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The patch an agent produced against abs-lang/abs `evaluator/evaluator.go`
 //! (commit cb1b3b671d0e, MIT; see the origin comment in the fixture) that the
 //! previous matcher rejected: every hunk matches the file contiguously.

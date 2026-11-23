@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test fixture module sets up temporary directories synchronously"
+)]
 //! Idle compaction and the compaction model, from a saved [`MayConfig`]
 //! through May's own agent construction ([`MayAgent::session_config`] and
 //! [`MayAgent::new`]) to aither, against stub model servers.

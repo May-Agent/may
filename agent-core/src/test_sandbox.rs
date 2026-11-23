@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods, reason = "test fixture sandbox setup")]
 //! A session shell as May builds one, for `#[cfg(test)]` code: a
 //! sandboxed terminal with the baseline tool distribution, plus helpers
 //! for hostile repository configurations.

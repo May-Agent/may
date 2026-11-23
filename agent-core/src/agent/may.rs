@@ -539,7 +539,7 @@ async fn session_tools(
     let tools_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir();
     let (tools, outcome) = match config
         .tool_environments
-        .acquire(&config.session_id, backend)
+        .acquire(&config.session_id, backend, config.hashline)
         .await?
     {
         Acquired::Ready(tools) => (*tools, "adopted"),
@@ -923,8 +923,27 @@ impl MayAgent {
             .and_then(|row| row.repo)
             .map(|stored| crate::session::RepoBinding::parse(&stored))
             .transpose()?;
-        let worktree = crate::repo_search::worktree_root(&config.cwd);
-        let forge_target = match (&binding, &worktree) {
+        let worktree = {
+            let cwd = config.cwd.clone();
+            blocking::unblock(move || crate::repo_search::worktree_root(&cwd)).await
+        };
+        let clone_source = if binding.is_none() {
+            if let Some(worktree) = worktree.clone() {
+                let ws_cfg = workspace.config.clone();
+                let may_cfg = may_config.clone();
+                Some(
+                    blocking::unblock(move || {
+                        crate::repo_clone::CloneSource::of(&worktree, &ws_cfg, &may_cfg)
+                    })
+                    .await,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let forge_target = match (&binding, &clone_source) {
             (Some(crate::session::RepoBinding::Forge(repo)), _) => {
                 let cfg = workspace.config.clone();
                 let (repo, may_cfg) = (repo.clone(), may_config.clone());
@@ -937,23 +956,18 @@ impl MayAgent {
                 .publishes_to_forge();
                 publishes.then_some((key, url))
             }
-            (None, Some(worktree)) => {
-                match crate::repo_clone::CloneSource::of(worktree, &workspace.config, &may_config) {
-                    Ok(Some(crate::repo_clone::CloneSource::Remote { url, repo })) => {
-                        Some((repo.cache_key(), url))
-                    }
-                    Ok(_) => None,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to resolve repository clone source");
-                        None
-                    }
-                }
+            (None, Some(Ok(Some(crate::repo_clone::CloneSource::Remote { url, repo })))) => {
+                Some((repo.cache_key(), url.clone()))
             }
-            (Some(crate::session::RepoBinding::Local(_)), _) | (None, None) => None,
+            (None, Some(Ok(_)) | None) | (Some(crate::session::RepoBinding::Local(_)), _) => None,
+            (None, Some(Err(error))) => {
+                tracing::warn!(%error, "failed to resolve repository clone source");
+                None
+            }
         };
         let mut readonly_checkouts = Vec::new();
         let mut readonly_checkout = None;
-        let mut clones_work = match (&binding, &worktree) {
+        let mut clones_work = match (&binding, &clone_source) {
             (Some(crate::session::RepoBinding::Local(id)), _) => {
                 let cfg = workspace.config.clone();
                 let id = id.clone();
@@ -975,11 +989,8 @@ impl MayAgent {
                     .clones_work()
             }
             (Some(crate::session::RepoBinding::Forge(_)), _) => forge_target.is_some(),
-            (None, Some(worktree)) => matches!(
-                crate::repo_clone::CloneSource::of(worktree, &workspace.config, &may_config),
-                Ok(Some(_))
-            ),
-            (None, None) => false,
+            (None, Some(Ok(Some(_)))) => true,
+            (None, _) => false,
         };
         if let Some((repo_key, remote_url)) = forge_target {
             clones_work = true;
@@ -1024,15 +1035,10 @@ impl MayAgent {
         // The remote forge repository the session is bound to or launched
         // in, so the system prompt names it even in prs-only mode, which
         // tracks issues in may and holds no clone yet.
-        let remote_repo = match (&binding, &worktree) {
+        let remote_repo = match (&binding, &clone_source) {
             (Some(crate::session::RepoBinding::Forge(repo)), _) => Some(repo.host_and_path()),
-            (None, Some(worktree)) => {
-                match crate::repo_clone::CloneSource::of(worktree, &workspace.config, &may_config) {
-                    Ok(Some(crate::repo_clone::CloneSource::Remote { repo, .. })) => {
-                        Some(repo.host_and_path())
-                    }
-                    _ => None,
-                }
+            (None, Some(Ok(Some(crate::repo_clone::CloneSource::Remote { repo, .. })))) => {
+                Some(repo.host_and_path())
             }
             _ => None,
         };
@@ -1561,11 +1567,13 @@ impl MayAgent {
             .ok_or_else(|| {
                 MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
             })?;
-        let secrets = crate::secrets::Secrets::load_for_session(
-            &crate::secrets::SecretStore::new(&may_dir),
-            may_config,
-            session_id.as_str(),
-        )?;
+        let secrets = {
+            let store = crate::secrets::SecretStore::new(&may_dir);
+            let cfg = may_config.clone();
+            let sid = session_id.as_str().to_string();
+            blocking::unblock(move || crate::secrets::Secrets::load_for_session(&store, &cfg, &sid))
+                .await?
+        };
         let subagent_models = {
             let may_config = Arc::new(may_config.clone());
             let pushed_providers = pushed_providers.clone();
@@ -2420,11 +2428,13 @@ impl MayAgent {
             .compile()
             .map_err(|error| MayAgentError::Sandbox(error.to_string()))?;
         self.permissions.set_network_policy(network_policy.clone());
-        let secrets = crate::secrets::Secrets::load_for_session(
-            &crate::secrets::SecretStore::new(&self.may_dir),
-            input.may_config,
-            self.session_id.as_str(),
-        )?;
+        let secrets = {
+            let store = crate::secrets::SecretStore::new(&self.may_dir);
+            let cfg = input.may_config.clone();
+            let sid = self.session_id.as_str().to_string();
+            blocking::unblock(move || crate::secrets::Secrets::load_for_session(&store, &cfg, &sid))
+                .await?
+        };
         self.runtime_system_context.set_instruction_opt(
             tag::PERMISSIONS,
             Some(build_permissions(

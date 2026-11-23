@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous git tree tracker driven from a dedicated worker thread"
+)]
 //! Per-session file-change tracking backed by detached git trees.
 //!
 //! For every writable root the tracker keeps a shadow repository: `GIT_DIR`

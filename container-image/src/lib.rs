@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The container image references CI needs before anything compiles.
 //!
 //! `may-agent`'s build script bakes `MAY_BASE_IMAGE` and

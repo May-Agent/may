@@ -69,6 +69,10 @@ pub async fn run_in_own_session() -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt as _;
     use tokio::signal::unix::{SignalKind, signal};
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "pre_exec setsid requires std::process::Command before wrapping in async_process::Command"
+    )]
     let mut command = std::process::Command::new(
         std::env::current_exe().context("the daemon's executable has no path")?,
     );
@@ -119,6 +123,10 @@ pub async fn run_in_own_session() -> anyhow::Result<()> {
 /// # Errors
 /// Returns the OS error of reading the process table or of a signal, or an
 /// error naming the members that survived every round of `SIGKILL`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "explicitly documented synchronous process-session teardown"
+)]
 pub fn end_exited_session(session: u32) -> std::io::Result<usize> {
     let session = Pid::from_raw(session.cast_signed()).ok_or_else(|| {
         std::io::Error::new(

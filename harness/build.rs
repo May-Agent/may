@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Emits `MAY_GIT_SHA`, the commit `update` reports a build as coming from.
 
 use std::process::Command;

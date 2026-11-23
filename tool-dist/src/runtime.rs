@@ -417,6 +417,34 @@ impl ToolBinary {
             bytes,
         })
     }
+
+    /// Constructs a [`ToolBinary`] from executable bytes whose SHA-256 was
+    /// already computed once during extraction.
+    ///
+    /// # Errors
+    /// Rejects an invalid semantic version.
+    pub(crate) fn from_verified_digest(
+        tool: ManagedTool,
+        version: &str,
+        sha256: [u8; 32],
+        bytes: Vec<u8>,
+    ) -> Result<Self, ToolRuntimeError> {
+        let version = semver::Version::parse(version)?;
+        Ok(Self {
+            tool,
+            version,
+            sha256,
+            bytes: bytes.into(),
+        })
+    }
+}
+
+/// Verified identity of one staged executable without keeping its bytes in RAM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedBinarySpec {
+    pub tool: ManagedTool,
+    pub version: semver::Version,
+    pub sha256: [u8; 32],
 }
 
 /// Checks the version and digest every distributed executable must satisfy.
@@ -461,6 +489,10 @@ impl HostProgramPath {
     /// Writes `bytes` to `<root>/<sha256>/<command>`, read-only, replacing
     /// whatever is there. The directory holds nothing else and is not shared
     /// with any sandbox `PATH` directory.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous file lock and staged write execute inside blocking::unblock"
+    )]
     pub(crate) fn write(
         root: &Path,
         program: HostProgram,
@@ -498,6 +530,10 @@ impl HostProgramPath {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem checks execute inside blocking::unblock"
+    )]
     fn location(
         root: &Path,
         program: HostProgram,
@@ -510,7 +546,10 @@ impl HostProgramPath {
             .join(program.executable_name(target)))
     }
 
-    /// Whether `path` is a regular read-only executable with the trusted digest.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous metadata and digest read execute inside blocking::unblock"
+    )]
     fn is_prepared(path: &Path, sha256: &[u8; 32]) -> Result<bool, ToolRuntimeError> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -671,10 +710,7 @@ impl ToolBundle {
             let key = bundle.cache_key()?;
             let mut prepared = bundle.prepare_local_sync(&root, &key, None)?;
             if bundle.python.is_some() {
-                let uv_dir = std::fs::canonicalize(&root)?.join(UV_STATE_DIRECTORY);
-                std::fs::create_dir_all(&uv_dir)?;
-                set_private(&uv_dir)?;
-                prepared.uv_dir = Some(uv_dir);
+                ensure_uv_dir(&root, &mut prepared)?;
             }
             Ok(prepared)
         })
@@ -690,6 +726,10 @@ impl ToolBundle {
     ///
     /// `installer` is the `uv` that installs the interpreter when this bundle's
     /// own cannot run on the building machine (an image for another platform).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous staging and lock operations execute inside blocking::unblock"
+    )]
     pub(crate) fn prepare_local_sync(
         &self,
         root: &Path,
@@ -783,6 +823,10 @@ impl ToolBundle {
     ///
     /// The managed interpreter is installed last, and the finished tree is
     /// read-only.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous staging runs inside prepare_local_sync under blocking::unblock"
+    )]
     fn stage_scratch(
         &self,
         root: &Path,
@@ -828,57 +872,110 @@ impl ToolBundle {
         Ok(stage)
     }
 
+    pub(crate) fn specs(&self) -> Vec<PreparedBinarySpec> {
+        self.binaries
+            .iter()
+            .map(|binary| PreparedBinarySpec {
+                tool: binary.tool,
+                version: binary.version.clone(),
+                sha256: binary.sha256,
+            })
+            .collect()
+    }
+
     /// Checks that every executable under `destination` is a regular, read-only
     /// executable file with the trusted digest.
     fn verify_prepared(
         &self,
         destination: &Path,
     ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
-        let bin_dir = destination.join("bin");
-        for binary in self.binaries.iter() {
-            let path = bin_dir.join(binary.tool.executable_name(&self.target));
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|error| cache_entry_error(&path, error))?;
-            if !metadata.file_type().is_file() {
-                return Err(ToolRuntimeError::InvalidCache(path));
-            }
-            let bytes = std::fs::read(&path).map_err(|error| cache_entry_error(&path, error))?;
-            if digest(&bytes) != binary.sha256 {
-                return Err(ToolRuntimeError::Integrity {
-                    tool: binary.tool.into(),
-                });
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = metadata.permissions().mode();
-                if mode & 0o222 != 0 || mode & 0o111 == 0 {
-                    return Err(ToolRuntimeError::InvalidCache(path));
-                }
-            }
-            #[cfg(not(unix))]
-            if !metadata.permissions().readonly() {
-                return Err(ToolRuntimeError::InvalidCache(path));
-            }
-            for alias in binary.tool.aliases() {
-                let alias = bin_dir.join(alias);
-                let target =
-                    std::fs::read_link(&alias).map_err(|error| alias_entry_error(&alias, error))?;
-                if target != Path::new(binary.tool.command()) {
-                    return Err(ToolRuntimeError::InvalidCache(alias));
-                }
-            }
-        }
-        if let Some(python) = &self.python {
-            python.verify(&self.target, &bin_dir)?;
-        }
-        Ok(PreparedTools {
-            bin_dir,
-            uv_dir: None,
-            heel: None,
-            catalog: self.catalog(),
-        })
+        verify_prepared_specs(
+            &self.target,
+            &self.specs(),
+            self.python.as_ref(),
+            destination,
+        )
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous cache verification runs inside blocking::unblock"
+)]
+pub fn verify_prepared_specs(
+    target: &ToolTarget,
+    binaries: &[PreparedBinarySpec],
+    python: Option<&PythonRuntime>,
+    destination: &Path,
+) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
+    let destination = std::fs::canonicalize(destination)
+        .map_err(|error| cache_entry_error(destination, error))?;
+    let bin_dir = destination.join("bin");
+    for binary in binaries {
+        let path = bin_dir.join(binary.tool.executable_name(target));
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| cache_entry_error(&path, error))?;
+        if !metadata.file_type().is_file() {
+            return Err(ToolRuntimeError::InvalidCache(path));
+        }
+        let bytes = std::fs::read(&path).map_err(|error| cache_entry_error(&path, error))?;
+        if digest(&bytes) != binary.sha256 {
+            return Err(ToolRuntimeError::Integrity {
+                tool: binary.tool.into(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            if mode & 0o222 != 0 || mode & 0o111 == 0 {
+                return Err(ToolRuntimeError::InvalidCache(path));
+            }
+        }
+        #[cfg(not(unix))]
+        if !metadata.permissions().readonly() {
+            return Err(ToolRuntimeError::InvalidCache(path));
+        }
+        for alias in binary.tool.aliases() {
+            let alias = bin_dir.join(alias);
+            let link_target =
+                std::fs::read_link(&alias).map_err(|error| alias_entry_error(&alias, error))?;
+            if link_target != Path::new(binary.tool.command()) {
+                return Err(ToolRuntimeError::InvalidCache(alias));
+            }
+        }
+    }
+    if let Some(python) = python {
+        python.verify(target, &bin_dir)?;
+    }
+    let catalog = ToolCatalog {
+        tools: binaries
+            .iter()
+            .map(|binary| ToolInfo::tool(binary.tool, binary.version.clone()))
+            .chain(python.map(ToolInfo::python))
+            .collect(),
+    };
+    Ok(PreparedTools {
+        bin_dir,
+        uv_dir: None,
+        heel: None,
+        catalog,
+    })
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous directory setup runs inside blocking::unblock"
+)]
+pub fn ensure_uv_dir(
+    root: &Path,
+    prepared: &mut PreparedTools<PathBuf>,
+) -> Result<(), ToolRuntimeError> {
+    let uv_dir = std::fs::canonicalize(root)?.join(UV_STATE_DIRECTORY);
+    std::fs::create_dir_all(&uv_dir)?;
+    set_private(&uv_dir)?;
+    prepared.uv_dir = Some(uv_dir);
+    Ok(())
 }
 
 /// Name of the shared, writable directory for `uv`'s cache and project
@@ -1061,10 +1158,18 @@ const BUSY_BACKOFF: [std::time::Duration; 6] = [
 /// the write descriptor until it execs, and executing the file meanwhile fails
 /// with `ETXTBSY`. That failure is retried with a short bounded backoff; any
 /// other error, or a file still busy afterwards, is returned unchanged.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous process retry and permissions helpers run inside blocking::unblock"
+)]
 pub fn run_installed(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     retry_busy(|| command.output())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous backoff runs inside blocking::unblock"
+)]
 fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     for delay in BUSY_BACKOFF {
         match attempt() {
@@ -1080,6 +1185,10 @@ fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Re
 /// Fails unless every alias of `tool` is a command its executable at `path`
 /// reports in `--list`, so the managed directory never shadows a command the
 /// pinned binary lacks.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous alias check runs inside blocking::unblock"
+)]
 fn ensure_aliases_provided(tool: ManagedTool, path: &Path) -> Result<(), ToolRuntimeError> {
     let output = run_installed(std::process::Command::new(path).arg("--list"))?;
     if !output.status.success() {
@@ -1101,6 +1210,10 @@ fn ensure_aliases_provided(tool: ManagedTool, path: &Path) -> Result<(), ToolRun
 }
 
 /// Makes `path` accessible to its owner only.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous permission setup runs inside blocking::unblock"
+)]
 fn set_private(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
@@ -1114,6 +1227,10 @@ fn set_private(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous permission setup runs inside blocking::unblock"
+)]
 fn set_executable_readonly(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {

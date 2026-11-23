@@ -554,8 +554,9 @@ impl DaemonState {
 
     /// The context window of `selector`: what its provider reports in the
     /// fetched model list, else the `aither_models` table. The list is read
-    /// from the cache at any age; the network is touched only when the cache
-    /// holds no list and the table cannot answer.
+    /// from the cache at any age; when the cache holds no list and the static
+    /// table cannot answer, only the selector's own provider is queried so
+    /// unrelated slow providers never stall turn startup.
     pub async fn model_context_window(&self, selector: &crate::ModelSelector) -> Option<u32> {
         let resolve = |fetched: &[crate::models::FetchedModel]| {
             crate::models::resolve_context_window(
@@ -571,12 +572,12 @@ impl DaemonState {
         if let Some(window) = resolve(&[]) {
             return Some(window);
         }
-        let config = (*self.config_snapshot()).clone();
-        let fetched = self
-            .fetched_models_cache
-            .get_or_refresh(move || async move { crate::models::fetch_all_models(&config).await })
-            .await;
-        resolve(&fetched)
+        let config = self.config_snapshot();
+        let instance = config.provider.get(selector.provider_id()).cloned()?;
+        let result =
+            crate::models::fetch_models_for_configured_provider(selector.provider_id(), &instance)
+                .await;
+        resolve(&result.models)
     }
 
     pub fn config_snapshot(&self) -> Arc<MayConfig> {

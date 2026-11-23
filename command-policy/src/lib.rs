@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's rules on what a terminal script may run, as aither script policies.
 //!
 //! Every script of a shell built with a [`PolicySet`] is put to them before it
@@ -1142,17 +1143,17 @@ pub struct CheckoutFileReads {
     tracker: CheckoutReadTracker,
 }
 
-fn resolve_checkout_read(
+async fn resolve_checkout_read(
     checkouts: &AnyCheckoutRegistry,
     start: &Path,
     path: &str,
 ) -> Option<(String, String)> {
     let candidate = start.join(path);
-    CheckoutRegistry::identify_path(checkouts, &candidate).or_else(|| {
-        std::fs::canonicalize(&candidate)
-            .ok()
-            .and_then(|c| CheckoutRegistry::identify_path(checkouts, &c))
-    })
+    if let Some(hit) = CheckoutRegistry::identify_path(checkouts, &candidate) {
+        return Some(hit);
+    }
+    let canonical = async_fs::canonicalize(&candidate).await.ok()?;
+    CheckoutRegistry::identify_path(checkouts, &canonical)
 }
 
 impl ScriptPolicy for CheckoutFileReads {
@@ -1172,7 +1173,7 @@ impl ScriptPolicy for CheckoutFileReads {
         for step in &reading.steps {
             if let Intent::Read { path, .. } = &step.intent
                 && let Some((repo_key, rel_path)) =
-                    resolve_checkout_read(&self.tracker.checkouts, start, path)
+                    resolve_checkout_read(&self.tracker.checkouts, start, path).await
             {
                 let entry = reads_by_repo.entry(repo_key).or_default();
                 if !entry.contains(&rel_path) {

@@ -118,6 +118,10 @@ fn edit(action: &Action, dir: Option<&Path>) -> FileEdit {
             new_path,
             hunks,
         } => {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "synchronous patch-hunk annotation helper"
+            )]
             let file = dir.and_then(|dir| std::fs::read_to_string(dir.join(path)).ok());
             let starts = file.map(|content| {
                 let lines: Vec<String> = content.lines().map(String::from).collect();

@@ -654,6 +654,10 @@ fn tailscale_binary(config: &RemoteAccessConfig) -> String {
 /// failed.
 async fn tailscale(binary: &str, args: Vec<String>) -> Result<String, String> {
     let binary = binary.to_string();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous command execution runs inside blocking::unblock"
+    )]
     let output = blocking::unblock({
         let binary = binary.clone();
         move || std::process::Command::new(binary).args(args).output()

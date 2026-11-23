@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's foundational types: the ids, wire shapes and leaf utilities every
 //! crate above it shares, with no dependency on `may-agent` itself.
 //!

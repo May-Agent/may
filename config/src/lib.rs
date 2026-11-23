@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's configuration layer: `~/.may/config.toml` and everything it
 //! touches.
 //!

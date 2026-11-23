@@ -37,8 +37,8 @@ impl CodespaceShell {
     /// The command running `script` by `sh` on the codespace, whatever its
     /// login shell: `gh codespace ssh` passes what follows `--` to `ssh`,
     /// whose first non-option word is the remote command.
-    fn command(&self, script: &str) -> std::process::Command {
-        let mut command = std::process::Command::new(GH);
+    fn command(&self, script: &str) -> async_process::Command {
+        let mut command = async_process::Command::new(GH);
         command
             .args([
                 "codespace",
@@ -69,12 +69,11 @@ impl RemoteShell for CodespaceShell {
 /// Runs `command` with `input` on its standard input and returns its
 /// standard output, within `deadline`.
 async fn run_command(
-    command: std::process::Command,
+    mut command: async_process::Command,
     step: &'static str,
     input: Option<Vec<u8>>,
     deadline: Duration,
 ) -> Result<String, CloudError> {
-    let mut command = async_process::Command::from(command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -231,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_sees_the_end_of_its_input_once_it_is_written() {
-        let mut command = std::process::Command::new("sh");
+        let mut command = async_process::Command::new("sh");
         command.args(["-c", "cat"]);
         let input = "日本語 한국어 中文".as_bytes().to_vec();
 

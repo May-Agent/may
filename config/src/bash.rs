@@ -63,6 +63,10 @@ fn cap_stream(bytes: &[u8]) -> String {
 /// Run a bash-mode (`!`) command in may's environment: `cwd` plus
 /// keychain secrets injected as environment variables. Output is masked
 /// before it returns.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous user shell helper; async callers wrap in blocking::unblock"
+)]
 #[must_use]
 pub fn run_bash_command(
     command: &str,

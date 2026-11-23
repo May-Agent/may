@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! The May daemon: one resident process that runs every agent loop.
 //!
 //! The daemon owns the sessions' agents, the task scheduler and the search
@@ -252,6 +253,10 @@ struct SingleInstance {
     _lock: fd_lock::RwLock<std::fs::File>,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous flock acquisition runs once at daemon startup"
+)]
 fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance> {
     use std::io::Write as _;
 
@@ -280,6 +285,10 @@ fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance
     Ok(SingleInstance { _lock: lock })
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous Unix listener bind runs once at daemon startup"
+)]
 fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -720,7 +729,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         }
         Err(error) => tracing::warn!(%error, "could not boot out the repo-search agents"),
     }
-    let _ = std::fs::remove_file(paths.socket());
+    let _ = async_fs::remove_file(paths.socket()).await;
     Ok(())
 }
 

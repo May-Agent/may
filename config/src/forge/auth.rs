@@ -746,6 +746,10 @@ async fn cli_token(
         program,
         message,
     };
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous CLI execution runs inside blocking::unblock"
+    )]
     let output =
         blocking::unblock(move || std::process::Command::new(program).args(&args).output())
             .await

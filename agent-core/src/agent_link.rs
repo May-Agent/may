@@ -595,6 +595,10 @@ fn symlink_target_escapes_lexically(target: &Path) -> bool {
 ///
 /// # Errors
 /// Fails when the path cannot be resolved inside the sandbox.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous sandbox path resolution; async callers wrap in blocking::unblock"
+)]
 pub fn resolve_prompt_path(
     sandbox_dir: &Path,
     mount: Option<&aither_sandbox::MountRoot>,

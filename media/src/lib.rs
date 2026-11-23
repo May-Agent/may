@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's media layer: the encoded video pipeline, the per-session virtual
 //! desktop (`computer`), and on-device OCR for the images tool calls return.
 //!

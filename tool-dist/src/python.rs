@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "every function in this module is synchronous and runs inside blocking::unblock"
+)]
 //! The `CPython` that the pinned `uv` installs into a prepared tool tree.
 //!
 //! A prepared tree carries the interpreter beside the tools, under

@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's agent core: the `MayAgent` wrapper, the terminal-command surface,
 //! containers, cloud machines, PRs, profiles, memory and the runtimes the
 //! daemon and binary assemble into the application.

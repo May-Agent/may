@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous transcript parser; async callers wrap in blocking::unblock"
+)]
 //! Codex rollout transcript (`rollout-*.jsonl`) → [`ImportedTranscript`].
 //!
 //! The file is an append-only log of `{timestamp, type, payload}` records. The

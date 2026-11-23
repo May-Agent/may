@@ -59,6 +59,10 @@ static DUMPED: AtomicBool = AtomicBool::new(false);
 /// # Errors
 ///
 /// When the directory cannot be created or an action cannot be installed.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "process startup crash handler installation before async tasks"
+)]
 pub fn install(log_ring: LogRingHandle, bugs_dir: PathBuf) -> io::Result<()> {
     std::fs::create_dir_all(&bugs_dir)?;
     let bugs_dir_c = CString::new(bugs_dir.into_os_string().into_vec())

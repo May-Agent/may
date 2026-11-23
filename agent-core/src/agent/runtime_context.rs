@@ -356,6 +356,10 @@ impl RuntimeSystemContext {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous memory directory scan runs inside blocking::unblock"
+)]
 fn scan_memories_dir(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

@@ -2381,7 +2381,8 @@ impl App {
         match &self.mode {
             AppMode::PermissionConfirm(_) | AppMode::WorkspaceConfirm(_) => true,
             AppMode::AskUser(state) => {
-                state.request.is_some()
+                state.blocking
+                    || state.request.is_some()
                     || self
                         .session_runtime
                         .waiting_ask_user
@@ -2392,17 +2393,74 @@ impl App {
         }
     }
 
+    /// Close a blocking dialog once its request is no longer the one the
+    /// session waits on: another client answered it, or it was withdrawn.
+    pub fn close_resolved_prompts(&mut self) {
+        match &self.mode {
+            AppMode::PermissionConfirm(state)
+                if self
+                    .session_runtime
+                    .waiting_permission
+                    .as_ref()
+                    .is_none_or(|request| request.id != state.request_id) =>
+            {
+                self.mode = AppMode::Chat;
+            }
+            AppMode::WorkspaceConfirm(state)
+                if state.request.is_none()
+                    && self
+                        .session_runtime
+                        .waiting_workspace
+                        .as_ref()
+                        .is_none_or(|request| request.id != state.request_id) =>
+            {
+                self.mode = AppMode::Chat;
+            }
+            AppMode::AskUser(state)
+                if state.blocking
+                    && state.request.is_none()
+                    && self
+                        .session_runtime
+                        .waiting_ask_user
+                        .as_ref()
+                        .is_none_or(|request| request.id != state.request_id) =>
+            {
+                self.mode = AppMode::Chat;
+            }
+            _ => {}
+        }
+    }
+
     /// Close the permission dialog once its request is no longer the one the
     /// session waits on: another client answered it, or it was withdrawn.
     pub fn close_resolved_permission(&mut self) {
-        if let AppMode::PermissionConfirm(state) = &self.mode
-            && self
-                .session_runtime
-                .waiting_permission
-                .as_ref()
-                .is_none_or(|request| request.id != state.request_id)
-        {
-            self.mode = AppMode::Chat;
+        self.close_resolved_prompts();
+    }
+
+    /// Reconcile the open-question docked panel with `session_runtime.open_questions`.
+    ///
+    /// Returns `true` when a fresh open question arrived (`0 -> N`) so the caller
+    /// can ring the terminal bell.
+    pub fn reconcile_open_questions(&mut self) -> bool {
+        let open = self.session_runtime.open_questions.clone();
+        let had_none = self.open_question_count == 0;
+        self.open_question_count = open.len();
+        if had_none && let Some(first) = open.into_iter().next() {
+            self.offer_open_question(AskUserState::for_open_question(first));
+            true
+        } else {
+            if self.open_question_count == 0
+                && matches!(
+                    self.mode,
+                    AppMode::AskUser(ref state) if !state.blocking
+                )
+            {
+                // Every open question went away (answered or withdrawn elsewhere):
+                // the docked panel closes on its own; a blocking prompt is not
+                // touched.
+                self.mode = AppMode::Chat;
+            }
+            false
         }
     }
 
@@ -5317,8 +5375,11 @@ pub enum SendAction {
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
         request_id: String,
-        /// The prompt a run is blocked on, or `None` for an open question.
+        /// In-process response channel when the turn runs locally, or `None`
+        /// for daemon-held prompts and open questions.
         request: Option<may_harness::harness::ask_user::AskUserRequest>,
+        /// Whether a run is blocked waiting on this response.
+        blocking: bool,
         /// The user's answers, one entry per question.
         answers: Vec<may_protocol::ask_user::QuestionAnswer>,
     },
@@ -5553,6 +5614,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> may_client::daemon::ty
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous OS file manager launch runs inside blocking::unblock"
+)]
 fn open_sandbox_dir(dir: &std::path::Path) -> Result<(), String> {
     if !dir.exists() {
         return Err(format!(
@@ -7065,8 +7130,13 @@ mod tests {
             };
             app.session_runtime.waiting_ask_user = Some(request.clone());
             app.show_blocking_prompt(crate::AppMode::AskUser(
-                crate::AskUserState::for_open_question(request),
+                crate::AskUserState::for_blocking_prompt(request),
             ));
+            assert!(!app.reconcile_open_questions());
+            assert!(
+                matches!(app.mode, crate::AppMode::AskUser(_)),
+                "empty open_questions must not close a daemon-held blocking prompt"
+            );
             let action = app
                 .handle_key(shortcut, KeyModifiers::CONTROL)
                 .expect("key");
@@ -7079,12 +7149,44 @@ mod tests {
             assert!(
                 matches!(
                     answer,
-                    Some(SendAction::RespondAskUser { ref request_id, .. })
+                    Some(SendAction::RespondAskUser { ref request_id, blocking: true, .. })
                         if request_id == "q1"
                 ),
                 "{shortcut:?}: the question is answered"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_blocking_question_survives_empty_open_questions_and_closes_when_resolved() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        let request = may_protocol::session_runtime::PersistedAskUserRequest {
+            id: "gate-1".to_string(),
+            questions: vec![may_protocol::session_runtime::PersistedAskUserQuestion {
+                section: "checkout-state".to_string(),
+                question: "How should the session start?".to_string(),
+                option: vec!["remote".to_string(), "checkout".to_string()],
+                multi_select: false,
+                secret: None,
+            }],
+        };
+        app.session_runtime.waiting_ask_user = Some(request.clone());
+        app.show_blocking_prompt(crate::AppMode::AskUser(
+            crate::AskUserState::for_blocking_prompt(request),
+        ));
+        assert!(!app.reconcile_open_questions());
+        assert!(matches!(app.mode, crate::AppMode::AskUser(_)));
+        assert!(app.holds_pending_request());
+
+        app.handle_event(AppEvent::SessionRuntime(Box::new(
+            may_client::client::SessionRuntimeEvent {
+                session_id: "test".to_string(),
+                runtime: may_client::client::SessionRuntimeSnapshot::default(),
+            },
+        )))
+        .expect("resolved runtime snapshot");
+        assert!(matches!(app.mode, crate::AppMode::Chat));
     }
 
     #[tokio::test]

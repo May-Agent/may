@@ -84,16 +84,12 @@ impl ToolEnvironments {
         hashline: bool,
     ) -> Result<Self, ToolRuntimeError> {
         let target = ToolTarget::native()?;
-        ensure_command_line_tools(&LocalToolTransport, &target).await?;
-        let artifacts = cache_root.join("artifacts");
-        let (bundle, heel) = futures::try_join!(
-            distribution.load(&target, &artifacts),
+        let ((), tools, heel) = futures::try_join!(
+            ensure_command_line_tools(&LocalToolTransport, &target),
+            distribution.prepare_local_bundle(&target, cache_root, hashline),
             distribution.prepare_host_program(HostProgram::Heel, &target, cache_root),
         )?;
-        let tools = strip_for_hashline(bundle, hashline)
-            .prepare_local(&cache_root.join("runtimes"))
-            .await?
-            .with_heel(heel);
+        let tools = tools.with_heel(heel);
         Ok(Self::new(
             PreparedHome::Local(tools),
             distribution,

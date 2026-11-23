@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May TUI - Terminal interface for May agent.
 //!
 //! Architecture:
@@ -153,6 +154,10 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
 
 /// Points this process's stderr at `path`, appending, so panics and the
 /// error `main` returns land there too.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "runs synchronously in main() before starting the async runtime"
+)]
 fn redirect_stderr(path: &std::path::Path) -> anyhow::Result<()> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -406,6 +411,10 @@ struct LoopExit {
 /// Replaces this process with the executable `build` started from, which an
 /// update replaced: in the session it left, else with its own arguments. The
 /// terminal is already restored. Returns only when starting it failed.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "replaces the current process via exec() after async runtime exit"
+)]
 fn relaunch(
     build: &may_agent::daemon::lifecycle::ClientBuild,
     summary: Option<&ExitSummary>,
@@ -801,7 +810,7 @@ where
                 && shown_prompts.insert(request.id.clone())
             {
                 app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(
-                    may_agent::tui::AskUserState::for_open_question(request),
+                    may_agent::tui::AskUserState::for_blocking_prompt(request),
                 ));
             } else if let Some(request) = &app.session_runtime.waiting_workspace
                 && shown_prompts.insert(request.id.clone())
@@ -825,24 +834,10 @@ where
         // docked panel itself, notifies, and rings the terminal bell so the
         // dock icon bounces. Later additions only update the count.
         let step_start = std::time::Instant::now();
-        let open = app.session_runtime.open_questions.clone();
-        let had_none = app.open_question_count == 0;
-        app.open_question_count = open.len();
-        if had_none && let Some(first) = open.into_iter().next() {
+        if app.reconcile_open_questions() {
             let _ = io::stdout()
                 .write_all(b"\x07")
                 .and_then(|()| io::stdout().flush());
-            app.offer_open_question(may_agent::tui::AskUserState::for_open_question(first));
-        } else if app.open_question_count == 0
-            && matches!(
-                app.mode,
-                may_agent::tui::AppMode::AskUser(ref state) if state.request.is_none()
-            )
-        {
-            // Every open question went away (answered or withdrawn elsewhere):
-            // the docked panel closes on its own; a blocking prompt is not
-            // touched.
-            app.mode = may_agent::tui::AppMode::Chat;
         }
 
         phases.step("questions+listeners", step_start.elapsed());
@@ -1472,9 +1467,10 @@ where
                     Some(SendAction::RespondAskUser {
                         request_id,
                         request,
+                        blocking,
                         answers,
                     }) => {
-                        if let Some(request) = request {
+                        if blocking {
                             let session_id = app
                                 .session_manager
                                 .current()
@@ -1482,30 +1478,55 @@ where
                                 .ok_or_else(|| anyhow::anyhow!("No active session"))?;
                             match runtime_deps
                                 .resolve_ask_user_response(&session_id, &request_id, &answers)
-                                .await?
+                                .await
                             {
-                                ResponseCommit::Committed => {
-                                    request.respond(answers).unwrap_or_else(|_| {
-                                        panic!(
-                                            "{}",
-                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
-                                        )
-                                    });
+                                Ok(ResponseCommit::Committed) => {
+                                    if let Some(request) = request {
+                                        request.respond(answers).unwrap_or_else(|_| {
+                                            panic!(
+                                                "{}",
+                                                may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                            )
+                                        });
+                                    }
                                 }
-                                ResponseCommit::Lost(committed) => {
-                                    request.respond(committed).unwrap_or_else(|_| {
-                                        panic!(
-                                            "{}",
-                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
-                                        )
-                                    });
+                                Ok(ResponseCommit::Lost(committed)) => {
+                                    if let Some(request) = request {
+                                        request.respond(committed).unwrap_or_else(|_| {
+                                            panic!(
+                                                "{}",
+                                                may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                            )
+                                        });
+                                    }
                                     app.chat.push_notice(
                                         "That prompt was already answered elsewhere; the run continues with that answer, not yours",
                                     );
                                 }
-                                ResponseCommit::Withdrawn => app.chat.push_notice(
+                                Ok(ResponseCommit::Withdrawn) => app.chat.push_notice(
                                     "That prompt was withdrawn; your answer was not sent",
                                 ),
+                                Err(error) => {
+                                    if request.is_none()
+                                        && let Some(waiting) = app
+                                            .session_runtime
+                                            .waiting_ask_user
+                                            .as_ref()
+                                            .filter(|waiting| waiting.id == request_id)
+                                            .cloned()
+                                    {
+                                        app.chat.push_notice(&format!(
+                                            "Your answer was not sent and the prompt is still waiting: {error}"
+                                        ));
+                                        app.mode = may_agent::tui::AppMode::AskUser(
+                                            may_agent::tui::AskUserState::for_blocking_prompt(
+                                                waiting,
+                                            ),
+                                        );
+                                    } else {
+                                        return Err(error.into());
+                                    }
+                                }
                             }
                         } else {
                             match runtime_deps
