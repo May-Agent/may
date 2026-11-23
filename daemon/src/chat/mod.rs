@@ -4616,8 +4616,87 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
     }
 }
 
+/// Local-only agent messaging used by incoming `/api/peers/*` handlers so remote
+/// peer queries inspect this daemon's hosted sessions without re-fanning out.
+pub fn local_agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessaging {
+    let state_for_shadow = state.clone();
+    crate::agent_link::AgentMessaging {
+        directory: crate::agent_link::AgentDirectory::new(
+            state.runtime_service.clone(),
+            state.may_dir.clone(),
+            {
+                let state = state.clone();
+                move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
+            },
+        )
+        .with_peers(LocalShadowFilter(state_for_shadow)),
+        runtime_service: state.runtime_service.clone(),
+        cache_lifetime: {
+            let state = state.clone();
+            crate::agent_link::CacheLifetimes::new(move |provider_id: &str| {
+                state
+                    .config
+                    .load()
+                    .provider
+                    .get(provider_id)
+                    .map_or_default(|instance| instance.cache_lifetime)
+            })
+        },
+        forks: state.agent_forks.clone(),
+    }
+}
+
+struct LocalShadowFilter(Arc<DaemonState>);
+
+impl crate::agent_link::PeerFabric for LocalShadowFilter {
+    fn local_machine(&self) -> String {
+        crate::peers::DaemonPeerFabric::new(self.0.clone()).local_machine()
+    }
+
+    fn is_cloud_shadow(&self, session_id: &str) -> bool {
+        self.0.cloud_sessions.is_cloud_session(session_id)
+    }
+
+    fn list_remote(
+        &self,
+        _caller_session_id: &str,
+    ) -> impl std::future::Future<Output = crate::agent_link::RemoteListing> + Send {
+        std::future::ready(crate::agent_link::RemoteListing {
+            local_machine: self.local_machine(),
+            agents: Vec::new(),
+            issues: Vec::new(),
+        })
+    }
+
+    fn send_remote(
+        &self,
+        machine: &str,
+        target_session_id: &str,
+        _request: crate::agent_link::PeerSendRequest,
+    ) -> impl std::future::Future<Output = Result<String, crate::agent_link::AgentLinkError>> + Send
+    {
+        std::future::ready(Err(crate::agent_link::AgentLinkError::NoSuchAgent(
+            format!("{machine}:{target_session_id}"),
+        )))
+    }
+
+    fn btw_remote(
+        &self,
+        machine: &str,
+        target_session_id: &str,
+        _request: crate::agent_link::PeerBtwRequest,
+    ) -> impl std::future::Future<
+        Output = Result<crate::agent_link::BtwAnswer, crate::agent_link::AgentLinkError>,
+    > + Send {
+        std::future::ready(Err(crate::agent_link::AgentLinkError::NoSuchAgent(
+            format!("{machine}:{target_session_id}"),
+        )))
+    }
+}
+
 /// Agent-to-agent messaging as the daemon's sessions see it: `send` stores
-/// in the shared queue and `wake` dispatches a follow-up run in-process.
+/// in the shared queue and `wake` dispatches a follow-up run in-process, while
+/// cross-machine addresses route over [`crate::peers::DaemonPeerFabric`].
 pub fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessaging {
     crate::agent_link::AgentMessaging {
         directory: crate::agent_link::AgentDirectory::new(
@@ -4627,7 +4706,8 @@ pub fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMess
                 let state = state.clone();
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
             },
-        ),
+        )
+        .with_peers(crate::peers::DaemonPeerFabric::new(state.clone())),
         runtime_service: state.runtime_service.clone(),
         cache_lifetime: {
             let state = state.clone();

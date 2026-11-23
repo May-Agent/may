@@ -303,6 +303,10 @@ pub async fn start(
         tokio::runtime::Handle::current(),
     ));
 
+    let cloud_home = crate::cloud::home::CloudHome::load(&may_dir)
+        .context("failed to read the cloud home record")?;
+    let cloud_home_bridge = super::cloud_home::CloudHomeBridge::new(cloud_home.is_some());
+
     let state = Arc::new(DaemonState {
         acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
@@ -330,6 +334,7 @@ pub async fn start(
         remote_access_manager,
         tcp_listeners: super::TcpListeners::new(),
         cloud_sessions,
+        cloud_home_bridge,
         pushed_providers,
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
@@ -417,8 +422,7 @@ pub async fn start(
     // The tailscale-serve listener trusts Serve's identity header; a direct
     // non-loopback bind trusts only the peer's `WhoIs`-resolved login. On a
     // cloud home it also admits the fronting daemon's bearer token.
-    let cloud_home = crate::cloud::home::CloudHome::load(&state.may_dir)
-        .context("failed to read the cloud home record")?;
+    super::peers::DaemonPeerFabric::install_cloud_bridge(&state);
     let mut remote_sources: Vec<Box<dyn super::auth::IdentitySource>> =
         vec![Box::new(state.remote_access_manager.tailscale_identity())];
     if let Some(home) = &cloud_home {
@@ -537,8 +541,17 @@ fn api_routes() -> Route {
                 "/{id}/close".post(close_pr),
             ))),
             "/session-names".post(super::sessions::issue_session_name),
-            "/cloud-home/providers/{id}".put(super::cloud_home::push_provider),
-            "/cloud-home/tiers".put(super::cloud_home::push_tiers),
+            "/cloud-home".route(Route::new((
+                "/providers/{id}".put(super::cloud_home::push_provider),
+                "/tiers".put(super::cloud_home::push_tiers),
+                "/peer-rpc".at(super::cloud_home::poll_peer_rpc),
+                "/peer-rpc/{id}".post(super::cloud_home::reply_peer_rpc),
+            ))),
+            "/peers".route(Route::new((
+                "/agents".at(super::peers::get_peer_agents),
+                "/agents/{id}/messages".post(super::peers::post_peer_message),
+                "/agents/{id}/btw".post(super::peers::post_peer_btw),
+            ))),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
                 "".post(create_session),

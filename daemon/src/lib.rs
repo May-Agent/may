@@ -65,6 +65,7 @@ mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
 mod notifications;
+mod peers;
 mod pr_checks;
 mod process_session;
 mod profiles;
