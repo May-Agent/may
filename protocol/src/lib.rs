@@ -102,8 +102,7 @@ pub mod subagent_snapshot;
 pub mod task_rows;
 /// The lifecycle states of a scheduled task's run.
 pub mod task_run;
-/// The tool-result wire shape transcripts persist.
-pub mod tool_result_wire;
+
 /// The persisted trust level of one repository.
 pub mod trust;
 /// Wall-clock accounting of a turn's phases.

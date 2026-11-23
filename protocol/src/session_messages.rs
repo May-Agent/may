@@ -69,8 +69,7 @@ pub enum ToolEventRecord {
         id: String,
         /// Tool name.
         name: String,
-        /// Tool result, stored in its wire form.
-        #[serde(with = "super::tool_result_wire")]
+        /// Tool result, stored in aither's serde wire form.
         result: aither_core::llm::ToolResult,
         /// The call ended in a refusal, not a failure — an unchanged
         /// re-read the policy rejected; the task it read stays running.
@@ -449,5 +448,33 @@ impl ChatMessage {
             card: None,
             thinking: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_core::llm::{CommandOutcome, CommandResult, CommandStream, ToolResult};
+
+    /// The persisted `result` stays in aither's wire form: one `"kind"` tag
+    /// and typed fields the web API and transcripts read directly.
+    #[test]
+    fn a_tool_result_persists_in_the_wire_shape() {
+        let result = ToolResult::Command(Box::new(CommandResult {
+            stdout: CommandStream::Inline {
+                text: "out".to_string(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 3 },
+            retained_pid: None,
+            interruptions: Vec::new(),
+        }));
+        assert_eq!(
+            serde_json::to_value(&result).expect("the result serializes"),
+            serde_json::json!({
+                "kind": "command",
+                "stdout": {"kind": "inline", "text": "out"},
+                "outcome": {"status": "exited", "code": 3},
+            })
+        );
     }
 }

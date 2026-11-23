@@ -8,7 +8,7 @@ use aither_agent::{
     Agent, AgentBuilder, AgentError, AgentPath, AnyClock, CompactResult, PromptCache,
 };
 use aither_core::llm::{
-    Attachment as LlmAttachment, Message as LlmMessage, ToolCallId,
+    Attachment as LlmAttachment, Message as LlmMessage,
     model::{Parameters, ReasoningEffort},
 };
 use aither_sandbox::{
@@ -50,9 +50,7 @@ use crate::harness::working_document::file::DocumentFile;
 use crate::harness::working_document::{
     AnyBlockerResolver, AnyWorkTracker, WorkEvents, WorkingDocument,
 };
-use crate::ipc::{
-    CommandRegistry, CommandRegistryBuilder, KeptExchangeReceiver, SessionShell, ShellSlot,
-};
+use crate::ipc::{CommandRegistry, CommandRegistryBuilder, SessionShell, ShellSlot};
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
@@ -495,11 +493,6 @@ pub struct MayAgent {
     agent_path: AgentPath,
     /// Shared per-agent unchanged-read epoch table.
     read_epochs: FileReadEpochs,
-    /// Where the calls whose exchanges a compaction keeps are reported.
-    kept_exchanges: KeptExchangeReceiver,
-    /// The calls reported since the last compaction, whose exchanges the
-    /// next one carries into the compacted context.
-    kept_calls: Vec<ToolCallId>,
     /// This agent's entry among the daemon's btw fork hosts, while it is the
     /// session's agent.
     _fork_registration: Option<crate::agent_link::ForkRegistration>,
@@ -1281,6 +1274,7 @@ impl MayAgent {
             vision_ocr,
             call_images: registry.call_images(),
             outputs_dir: shell.output_store().dir().to_path_buf(),
+            kept: super::hooks::KeptCalls::new(registry.kept_receiver()),
         };
         let effective_max_iterations = if config.max_iterations == 0 {
             usize::MAX
@@ -1341,6 +1335,7 @@ impl MayAgent {
                 config.session_id.as_str(),
                 config.prompt_cache_epoch,
             ))
+            .claude_cache_ttl(crate::cache_lifetime::claude_cache_ttl(cache_lifetime))
             .cache_lifetime(cache_lifetime)
             .context_policy(config.context_policy)
             .max_iterations(effective_max_iterations)
@@ -1437,7 +1432,6 @@ impl MayAgent {
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
-        let kept_exchanges = registry.kept_receiver();
         Ok(Self {
             inner: agent,
             sandbox_dir: shell.working_dir().clone(),
@@ -1479,8 +1473,6 @@ impl MayAgent {
             watch,
             agent_path,
             read_epochs,
-            kept_exchanges,
-            kept_calls: Vec::new(),
             _fork_registration: fork_registration,
         })
     }
@@ -1881,49 +1873,6 @@ impl MayAgent {
         compacted
     }
 
-    /// Takes the exchanges of the calls the registry reported as kept out of
-    /// the conversation, in order.
-    fn kept_exchanges(&mut self) -> Vec<LlmMessage> {
-        self.kept_calls.extend(self.kept_exchanges.take_pending());
-        if self.kept_calls.is_empty() {
-            return Vec::new();
-        }
-        let kept = |id: &str| self.kept_calls.iter().any(|call| call.as_str() == id);
-        let mut exchanges = Vec::new();
-        for message in self.inner.context().conversation_messages() {
-            match message {
-                LlmMessage::Assistant { tool_calls, .. } => {
-                    let calls: Vec<_> = tool_calls
-                        .into_iter()
-                        .filter(|call| kept(&call.id))
-                        .collect();
-                    if !calls.is_empty() {
-                        exchanges.push(LlmMessage::assistant_with_tool_calls("", calls));
-                    }
-                }
-                LlmMessage::Tool {
-                    ref tool_call_id, ..
-                } if kept(tool_call_id) => exchanges.push(message),
-                _ => {}
-            }
-        }
-        exchanges
-    }
-
-    /// Puts the kept `exchanges` back into the compacted context, their
-    /// results marked to survive the next compaction too.
-    fn restore_kept_exchanges(&mut self, exchanges: Vec<LlmMessage>) {
-        self.kept_calls.clear();
-        let context = self.inner.context_mut();
-        for message in exchanges {
-            if matches!(message, LlmMessage::Tool { .. }) {
-                context.push_kept(message);
-            } else {
-                context.push(message);
-            }
-        }
-    }
-
     /// One-shot query.
     ///
     /// # Errors
@@ -2167,6 +2116,19 @@ impl MayAgent {
         self.inner.cache_warmth()
     }
 
+    /// How long the provider's prompt-cache entry for this agent stays warm
+    /// without a hit.
+    #[must_use]
+    pub const fn cache_lifetime(&self) -> aither_agent::context::CacheLifetime {
+        self.inner.cache_lifetime()
+    }
+
+    /// The Claude breakpoint retention this agent's requests ask for.
+    #[must_use]
+    pub const fn claude_cache_ttl(&self) -> aither_core::llm::model::ClaudePromptCacheTtl {
+        self.inner.claude_cache_ttl()
+    }
+
     /// The agent's model, which counts streamed text in tokens
     /// ([`LanguageModel::count_text`]) while a run holds the agent.
     #[must_use]
@@ -2252,9 +2214,8 @@ impl MayAgent {
         &mut self,
         reporter: &CompactionReporter,
     ) -> Result<Option<CompactResult>, AgentError> {
-        let exchanges = self.kept_exchanges();
         let compacted = reporter.drive(self.inner.compact_when_idle()).await;
-        self.compaction_landed(&compacted, exchanges);
+        self.compaction_landed(&compacted);
         compacted
     }
 
@@ -2267,25 +2228,16 @@ impl MayAgent {
         focus: Option<&str>,
         reporter: &CompactionReporter,
     ) -> Result<Option<CompactResult>, AgentError> {
-        let exchanges = self.kept_exchanges();
         let compacted = reporter.drive(self.inner.compact(focus)).await;
-        self.compaction_landed(&compacted, exchanges);
+        self.compaction_landed(&compacted);
         compacted
     }
 
-    /// What follows a compaction, whether it applied or not: the kept
-    /// exchanges go back into the context it left, and the valve and the
-    /// warning learn its size.
-    fn compaction_landed(
-        &mut self,
-        compacted: &Result<Option<CompactResult>, AgentError>,
-        exchanges: Vec<LlmMessage>,
-    ) {
-        let applied = matches!(compacted, Ok(Some(_)));
-        if applied {
-            self.restore_kept_exchanges(exchanges);
-        }
-        self.watch.ended(applied);
+    /// What follows a compaction, whether it applied or not: the valve and
+    /// the warning learn its size. Exchanges marked kept were retained in
+    /// place by the compaction itself.
+    fn compaction_landed(&self, compacted: &Result<Option<CompactResult>, AgentError>) {
+        self.watch.ended(matches!(compacted, Ok(Some(_))));
     }
 
     #[cfg(test)]
@@ -2456,6 +2408,24 @@ impl MayAgent {
         }
         if *self.inner.parameters() != request_parameters {
             self.inner.set_parameters(request_parameters.clone());
+        }
+
+        // The provider's advertised retention follows the resolved instance
+        // live: a changed or swapped provider's lifetime and breakpoint TTL
+        // update the running agent's cache bookkeeping here, not only the
+        // next rebuild.
+        if let Some(advertised) = providers
+            .get(&self.provider_id)
+            .map(|provider| provider.instance.cache_lifetime)
+        {
+            let lifetime: aither_agent::context::CacheLifetime = advertised.into();
+            if self.inner.cache_lifetime() != lifetime {
+                self.inner.set_cache_lifetime(lifetime);
+            }
+            let ttl = advertised.claude_ttl();
+            if self.inner.claude_cache_ttl() != ttl {
+                self.inner.set_claude_cache_ttl(ttl);
+            }
         }
 
         let skills_dir = profile_skills_dir(&self.may_dir, input.profile_id);

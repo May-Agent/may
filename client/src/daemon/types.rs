@@ -215,7 +215,6 @@ pub struct SseToolEndEvent<'a> {
     pub arguments: Option<&'a str>,
     /// The call's result.
     #[schema(value_type = serde_json::Value)]
-    #[serde(serialize_with = "crate::session::tool_result_wire::serialize")]
     pub result: &'a ToolResult,
     /// True when the call ended in a refusal — an unchanged re-read the
     /// policy rejected — not a failure; the task it read stays running.

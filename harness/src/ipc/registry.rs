@@ -244,6 +244,14 @@ pub struct KeptExchangeReceiver {
 }
 
 impl KeptExchangeReceiver {
+    /// A receiver nothing reports to.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            rx: async_channel::unbounded().1,
+        }
+    }
+
     /// Takes the pending call ids without blocking.
     #[must_use]
     pub fn take_pending(&self) -> Vec<ToolCallId> {

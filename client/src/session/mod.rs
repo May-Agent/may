@@ -24,7 +24,6 @@ pub use may_protocol::session_runtime as runtime;
 /// The daemon-side session service the client talks to.
 pub mod runtime_service;
 pub mod store;
-pub use may_protocol::tool_result_wire;
 pub mod user_wait;
 
 pub use binding::{BindingError, RepoBinding, group_sessions, project_label};

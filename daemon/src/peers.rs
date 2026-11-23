@@ -1283,12 +1283,21 @@ mod tests {
             .expect_err("unstarted fork refused");
         assert!(matches!(no_ctx_btw, AgentLinkError::NoForkContext(_)));
 
+        // Delivery wakes the recipient: mini's daemon spawns a follow-up
+        // dispatcher that races this test to claim the queued message.
+        // Park it at the run claim so the row stays `pending`.
+        let dispatch_parked = mini.state.runtime_service.db().run_gates.claim.arm();
+
         // Warm remote session receives message framed with `macbook:otter` reply address.
         let recipient = mb_msg
             .send("otter", "Backend", "API ready — テスト / 테스트 / 测试")
             .await
             .expect("warm remote send");
         assert_eq!(recipient, "Backend");
+        with_timeout(Duration::from_secs(10), dispatch_parked.recv())
+            .await
+            .expect("recipient wake reached the run claim")
+            .expect("run claim gate stays open");
 
         let summary = mini.state.runtime_service.get("badger").await.unwrap();
         let claimed = summary
@@ -1377,11 +1386,20 @@ mod tests {
             "cloud home discovers fronting daemon's session: {listing:?}"
         );
 
+        // Delivery wakes the recipient: the host daemon spawns a follow-up
+        // dispatcher that races this test to claim the queued message.
+        // Park it at the run claim so the row stays `pending`.
+        let dispatch_parked = host_node.state.runtime_service.db().run_gates.claim.arm();
+
         let delivered_to = cloud_msg
             .send("lynx", "macbook:otter", "Built inside codespace!")
             .await
             .expect("cloud-to-host send");
         assert_eq!(delivered_to, "Host Lead");
+        with_timeout(Duration::from_secs(10), dispatch_parked.recv())
+            .await
+            .expect("recipient wake reached the run claim")
+            .expect("run claim gate stays open");
 
         let summary = host_node.state.runtime_service.get("otter").await.unwrap();
         let claimed = summary

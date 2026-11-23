@@ -30,7 +30,7 @@ use aither_sandbox::{Interpreter, JobStatus, Jobs, Refused, UnchangedRead};
 use super::loop_watch::LoopWatch;
 use crate::command_policy::RefusedReads;
 use crate::harness::compact_tool::{COMPACT_TOOL_NAME, CompactSignal};
-use crate::ipc::CallImageStore;
+use crate::ipc::{CallImageStore, KeptExchangeReceiver};
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionRuntimeService};
 use crate::vision_ocr::VisionOcr;
@@ -70,6 +70,43 @@ impl CallInterpreters {
     }
 }
 
+/// The `terminal` calls a registry marked `kept_through_compaction`, whose
+/// exchanges `after_tool` retains in place.
+///
+/// The registry reports each kept call as its command finishes; `after_tool`
+/// matches the report to the call's outcome and wraps the decision kept, so
+/// the exchange is retained verbatim at its own sequence number through
+/// compactions, tombstoning and recovery spills — including compactions
+/// inside a run, which no caller-side extract/re-append ever saw.
+#[derive(Debug, Clone)]
+pub struct KeptCalls {
+    /// The calls the registry reported since the last drain.
+    pending: KeptExchangeReceiver,
+    /// Reports drained so far; a call and its reports need not arrive in the
+    /// same order concurrent calls finish.
+    drained:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<aither_core::llm::ToolCallId>>>,
+}
+
+impl KeptCalls {
+    /// A kept-call tracker draining `receiver`.
+    #[must_use]
+    pub fn new(receiver: KeptExchangeReceiver) -> Self {
+        Self {
+            pending: receiver,
+            drained: std::sync::Arc::default(),
+        }
+    }
+
+    /// Whether `call` was reported kept; drains what the registry reported
+    /// so far first.
+    fn take(&self, call: &aither_core::llm::ToolCallId) -> bool {
+        let mut drained = self.drained.lock().expect("the kept record locks");
+        drained.extend(self.pending.take_pending());
+        drained.remove(call)
+    }
+}
+
 /// What a May agent decides at the loop's control points.
 #[derive(Debug, Clone)]
 pub struct MayHooks {
@@ -94,6 +131,8 @@ pub struct MayHooks {
     pub(super) call_images: CallImageStore,
     /// Session output directory where downscaled image files are persisted.
     pub(super) outputs_dir: PathBuf,
+    /// The calls whose exchanges compaction keeps in place.
+    pub(super) kept: KeptCalls,
 }
 
 impl MayHooks {
@@ -166,6 +205,7 @@ impl Hooks for MayHooks {
         let mut result = shown.clone();
         redactions.redact_tool_result(&mut result);
         let redacted = result != shown;
+        let kept = self.kept.take(outcome.call.call());
         if let Some((mut augmented, attachments)) = crate::vision_ocr::augment_tool_outcome(
             &self.vision_ocr,
             Some(&self.call_images),
@@ -180,12 +220,13 @@ impl Hooks for MayHooks {
             return AfterTool::ReplaceWithAttachments {
                 result: augmented,
                 attachments,
-            };
+            }
+            .with_kept(kept);
         }
         if redacted {
-            AfterTool::Replace(result)
+            AfterTool::Replace(result).with_kept(kept)
         } else {
-            AfterTool::Keep
+            AfterTool::Keep.with_kept(kept)
         }
     }
 
@@ -367,6 +408,7 @@ mod tests {
             vision_ocr: VisionOcr::new(),
             call_images: call_images.clone(),
             outputs_dir: dir.path().join("outputs"),
+            kept: KeptCalls::new(crate::ipc::KeptExchangeReceiver::none()),
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let llm = ScriptedModel {
