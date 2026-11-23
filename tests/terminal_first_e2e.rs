@@ -1807,7 +1807,7 @@ async fn share_tool_cache(home_paths: &MayHomePaths) {
     #[cfg(windows)]
     tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
         .await
-        .unwrap_or_else(http_response_or_panic);
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 /// Points the test home's host-program cache at the shared repo-search binary.
@@ -1829,7 +1829,7 @@ async fn share_host_program_cache(home_paths: &MayHomePaths) {
     #[cfg(windows)]
     tokio::fs::symlink_dir(&shared, &cache)
         .await
-        .unwrap_or_else(http_response_or_panic);
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 /// Prepares the shared cache exactly once per run, behind a lock file in it:
@@ -4691,12 +4691,12 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
     for priority in [CommandPriority::Normal, CommandPriority::Low] {
         let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
             .await
-            .unwrap_or_else(http_response_or_panic);
+            .unwrap_or_else(|error| panic!("harness config should load: {error}"));
         config.sandbox.command_priority = priority;
         config
             .save_to(&harness.may_dir.join("config.toml"))
             .await
-            .unwrap_or_else(http_response_or_panic);
+            .unwrap_or_else(|error| panic!("harness config should save: {error}"));
 
         let home = harness.home_path().to_path_buf();
         let binary = binary.clone();
