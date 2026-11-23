@@ -32,9 +32,8 @@ const SLOW_DOWN_EXTRA: Duration = Duration::from_secs(5);
 /// The device-flow grant type, shared by GitHub and GitLab.
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// OAuth application `client_id` May registered for `github.com`; not
-/// registered yet.
-const GITHUB_COM_CLIENT_ID: Option<&str> = None;
+/// OAuth application `client_id` May registered for `github.com`.
+const GITHUB_COM_CLIENT_ID: Option<&str> = Some("Ov23licUOVNrI5j5Duxb");
 /// OAuth application `client_id` May registered for `gitlab.com`; not
 /// registered yet.
 const GITLAB_COM_CLIENT_ID: Option<&str> = None;
