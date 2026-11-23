@@ -33,6 +33,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
+use zenwave::Client as _;
 
 const TEST_PROVIDER_ID: &str = "mock";
 const TEST_MODEL: &str = "test-model";
@@ -257,7 +258,7 @@ impl MockOpenAiServer {
     async fn spawn_gated(scenario: MockChatScenario, gate: Option<Arc<RequestGate>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("mock OpenAI listener should bind");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let addr = listener
             .local_addr()
             .expect("mock OpenAI listener should expose local addr");
@@ -1059,7 +1060,7 @@ const TASKS_TURN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Collects a turn's events, failing with the turn and the server log when it
 /// does not finish within [`TASKS_TURN_TIMEOUT`].
 async fn collect_turn_events(
-    response: reqwest::Response,
+    response: zenwave::Response,
     turn: &str,
     log: &ServerLog,
 ) -> Vec<(String, Value)> {
@@ -1248,7 +1249,7 @@ async fn handle_mock_openai_request(
         .into_body()
         .collect()
         .await
-        .expect("mock request body should collect")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
         .to_bytes();
     let payload: Value =
         serde_json::from_slice(&body).expect("mock OpenAI request should be valid JSON");
@@ -1316,7 +1317,7 @@ async fn write_request_transcript(path: &Path, requests: &Arc<tokio::sync::Mutex
     };
     async_fs::write(path, transcript)
         .await
-        .expect("model request transcript should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 fn json_response(
@@ -1447,7 +1448,7 @@ impl TestHarness {
         let may_dir = home_path.join(".may");
         tokio::fs::create_dir_all(&may_dir)
             .await
-            .expect("test may dir should be created");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
         let mut config = MayConfig::default();
         // Aux generation would fire an unscripted request per completed
@@ -1487,7 +1488,7 @@ impl TestHarness {
         config
             .save_to(&may_dir.join("config.toml"))
             .await
-            .expect("test config should be written");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
         // A typical user: an identity and no commit signing.
         std::fs::write(
@@ -1531,17 +1532,17 @@ impl TestHarness {
     async fn create_session_in_profile(&self, profile_slug: &str) -> TestSession {
         let (store, db, _default_profile_id) = initialize_session_persistence(&self.may_dir)
             .await
-            .expect("session persistence should initialize");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let profile_id = db
             .get_profile_by_slug(profile_slug)
             .await
-            .expect("profile lookup should succeed")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .unwrap_or_else(|| panic!("default profile `{profile_slug}` should exist"))
             .id;
         let session_id = db
             .issue_session_name()
             .await
-            .expect("a session name")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .to_string();
         store
             .create_session_dirs(
@@ -1550,7 +1551,7 @@ impl TestHarness {
                 SandboxResourceLayout::Symlinked,
             )
             .await
-            .expect("session directory layout should be created");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         db.create_session_in_profile(
             &session_id,
             None,
@@ -1558,7 +1559,7 @@ impl TestHarness {
             Some(profile_id.as_str()),
         )
         .await
-        .expect("session row should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let sandbox_dir = store.sandbox_dir(&session_id, Some(profile_id.as_str()));
         TestSession {
             id: session_id,
@@ -1661,7 +1662,7 @@ impl RunningDaemon {
     }
 
     async fn wait_until_healthy(&mut self, timeout_duration: Duration) {
-        let client = reqwest::Client::new();
+        let mut client = zenwave::client();
         let url = format!("{}/api/health", self.base_url);
         let deadline = Instant::now() + timeout_duration;
         loop {
@@ -1673,7 +1674,7 @@ impl RunningDaemon {
             }
             let healthy = client
                 .get(&url)
-                .send()
+                .expect("request builds")
                 .await
                 .is_ok_and(|response| response.status().is_success());
             if healthy {
@@ -1704,10 +1705,11 @@ impl RunningDaemon {
     /// When the daemon ignores the shutdown: it is then killed and the test
     /// fails.
     async fn stop(mut self) {
-        let requested = reqwest::Client::new()
+        let requested = zenwave::client()
             .post(format!("{}/api/daemon/shutdown", self.base_url))
-            .json(&serde_json::json!({}))
-            .send()
+            .expect("request builds")
+            .json_body(&serde_json::json!({}))
+            .expect("JSON body serializes")
             .await
             .is_ok_and(|response| response.status().is_success());
         let exited = requested
@@ -1734,7 +1736,7 @@ async fn warm_may_binary(home: &Path) {
         .env("HOME", home)
         .output()
         .await
-        .expect("may --help should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         output.status.success(),
         "may --help should succeed: {}",
@@ -1797,15 +1799,15 @@ async fn share_tool_cache(home_paths: &MayHomePaths) {
     let shared = shared_download_root().join("may-tools");
     tokio::fs::create_dir_all(&shared)
         .await
-        .expect("shared tool cache dir should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(unix)]
     tokio::fs::symlink(&shared, home_paths.tools_dir())
         .await
-        .expect("test home tool cache should link to the shared cache");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(windows)]
     tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
         .await
-        .expect("test home tool cache should link to the shared cache");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 /// Points the test home's host-program cache at the shared repo-search binary.
@@ -1815,19 +1817,19 @@ async fn share_host_program_cache(home_paths: &MayHomePaths) {
         .join("host-programs");
     tokio::fs::create_dir_all(&shared)
         .await
-        .expect("shared host-program cache dir should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let cache = home_paths.host_programs_dir();
     tokio::fs::create_dir_all(cache.parent().expect("host-program cache has a parent"))
         .await
-        .expect("test home cache dir should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(unix)]
     tokio::fs::symlink(&shared, &cache)
         .await
-        .expect("test home host-program cache should link to the shared cache");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(windows)]
     tokio::fs::symlink_dir(&shared, &cache)
         .await
-        .expect("test home host-program cache should link to the shared cache");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 /// Prepares the shared cache exactly once per run, behind a lock file in it:
@@ -1865,7 +1867,7 @@ async fn ensure_shared_tools_prepared(home_paths: &MayHomePaths) {
     bundle
         .prepare_local(&home_paths.tool_runtimes_dir())
         .await
-        .expect("baseline tools should prepare");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     distribution
         .prepare_host_program(
             HostProgram::RepoSearch,
@@ -1873,7 +1875,7 @@ async fn ensure_shared_tools_prepared(home_paths: &MayHomePaths) {
             &home_paths.host_programs_dir(),
         )
         .await
-        .expect("the repo-search host program should download and verify");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     std::fs::write(&ready, []).expect("ready marker should be written");
 }
 
@@ -1907,43 +1909,30 @@ impl Drop for RunningDaemon {
 }
 
 struct SseReader {
-    response: reqwest::Response,
-    buffer: String,
+    stream: zenwave::sse::SseStream,
 }
 
 impl SseReader {
-    const fn new(response: reqwest::Response) -> Self {
+    fn new(response: zenwave::Response) -> Self {
         Self {
-            response,
-            buffer: String::new(),
+            stream: response.into_body().into_sse(),
         }
     }
 
     async fn next_event(&mut self) -> Option<TestSseEvent> {
+        use futures_lite::StreamExt as _;
         loop {
-            if let Some((event, remainder)) = split_sse_block(&self.buffer) {
-                self.buffer = remainder;
-                if event.event.is_empty() && event.data.is_empty() {
-                    continue;
-                }
-                return Some(event);
+            let event = self.stream.next().await?.expect("SSE frame parses");
+            if event.event().is_none() && event.data::<Value>().is_err() {
+                continue;
             }
-
-            let chunk = self
-                .response
-                .chunk()
-                .await
-                .expect("SSE response chunk should be readable");
-            if let Some(bytes) = chunk {
-                self.buffer.push_str(&String::from_utf8_lossy(&bytes));
-            } else {
-                if self.buffer.trim().is_empty() {
-                    return None;
-                }
-                let event = parse_sse_block(self.buffer.as_str());
-                self.buffer.clear();
-                return Some(event);
-            }
+            return Some(TestSseEvent {
+                event: event.event().unwrap_or_default().to_string(),
+                data: event
+                    .data::<Value>()
+                    .map_or_else(|_| String::new(), |data| data.to_string()),
+                id: event.id().map(str::to_string),
+            });
         }
     }
 }
@@ -1955,27 +1944,47 @@ struct TestSseEvent {
     id: Option<String>,
 }
 
+/// zenwave's transports error on 4xx/5xx where reqwest returned the
+/// response; recover it so status assertions keep working. Real
+/// transport failures still panic.
+fn http_response_or_panic(error: zenwave::Error) -> zenwave::Response {
+    match error {
+        zenwave::Error::Http { response, .. } => response.response,
+        error => panic!("request failed: {error}"),
+    }
+}
+
+/// The response's body decoded as JSON.
+async fn response_json(response: zenwave::Response) -> Value {
+    serde_json::from_slice(
+        &response
+            .into_body()
+            .into_bytes()
+            .await
+            .unwrap_or_else(|error| panic!("operation failed: {error}")),
+    )
+    .expect("response body is JSON")
+}
+
 /// Starts a turn the way every client does: subscribes to the session's
 /// `session_turn` frames on `/api/sessions/{id}/events`, then `POST`s the
 /// message. Returns the event stream, or the refused `POST`'s response.
 async fn send_turn(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     base_url: &str,
     body: &Value,
-) -> reqwest::Result<reqwest::Response> {
+) -> Result<zenwave::Response, zenwave::Error> {
     let session_id = body
         .get("sessionId")
         .and_then(Value::as_str)
         .expect("turn body names its session")
         .to_string();
     let events = client
-        .get(format!("{base_url}/api/sessions/{session_id}/events"))
-        .send()
+        .get(format!("{base_url}/api/sessions/{session_id}/events"))?
         .await?;
     let sent = client
-        .post(format!("{base_url}/api/sessions/{session_id}/turns"))
-        .json(body)
-        .send()
+        .post(format!("{base_url}/api/sessions/{session_id}/turns"))?
+        .json_body(body)?
         .await?;
     if sent.status().is_success() {
         Ok(events)
@@ -1987,7 +1996,7 @@ async fn send_turn(
 /// Drain a session's `session_turn` frames into `(event kind, parsed data)`
 /// pairs until the turn finishes (`done`/`paused`/`error`/`end`) or the
 /// server closes the stream.
-async fn collect_sse_events(response: reqwest::Response) -> Vec<(String, Value)> {
+async fn collect_sse_events(response: zenwave::Response) -> Vec<(String, Value)> {
     let mut reader = SseReader::new(response);
     let mut events = Vec::new();
     while let Some(event) = reader.next_event().await {
@@ -2008,39 +2017,6 @@ async fn collect_sse_events(response: reqwest::Response) -> Vec<(String, Value)>
         }
     }
     events
-}
-
-fn split_sse_block(buffer: &str) -> Option<(TestSseEvent, String)> {
-    let delimiter = if let Some(position) = buffer.find("\n\n") {
-        (position, 2)
-    } else {
-        let position = buffer.find("\r\n\r\n")?;
-        (position, 4)
-    };
-    let (position, width) = delimiter;
-    let event = parse_sse_block(&buffer[..position]);
-    Some((event, buffer[position + width..].to_string()))
-}
-
-fn parse_sse_block(block: &str) -> TestSseEvent {
-    let mut event = String::new();
-    let mut id = None;
-    let mut data_lines = Vec::new();
-    for line in block.lines() {
-        // Per the SSE spec, a single space after the field colon is optional.
-        if let Some(value) = line.strip_prefix("event:") {
-            event = value.strip_prefix(' ').unwrap_or(value).to_string();
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.strip_prefix(' ').unwrap_or(value).to_string());
-        } else if let Some(value) = line.strip_prefix("id:") {
-            id = Some(value.strip_prefix(' ').unwrap_or(value).to_string());
-        }
-    }
-    TestSseEvent {
-        event,
-        data: data_lines.join("\n"),
-        id,
-    }
 }
 
 fn reserve_tcp_port() -> u16 {
@@ -2064,7 +2040,7 @@ fn runtime_is_idle(runtime: &Value) -> bool {
 }
 
 async fn wait_for_runtime_state_clear(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     session_id: &str,
     timeout_duration: Duration,
@@ -2087,7 +2063,7 @@ async fn wait_for_runtime_state_clear(
 }
 
 async fn wait_for_runtime_condition<F>(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     session_id: &str,
     timeout_duration: Duration,
@@ -2171,20 +2147,19 @@ fn terminal_output_file_from_latest_tool_output(request: &Value) -> Option<Strin
 /// and the server's logs, which carry the cause of a redacted 5xx body.
 async fn expect_status(
     log: &ServerLog,
-    response: reqwest::Response,
+    response: zenwave::Response,
     expected: StatusCode,
-) -> reqwest::Response {
+) -> zenwave::Response {
     let status = response.status();
     if status == expected {
         return response;
     }
-    let url = response.url().clone();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+    let body = response.into_body().into_string().await.map_or_else(
+        |error| format!("<failed to read body: {error}>"),
+        |body| body.to_string(),
+    );
     panic!(
-        "{url} returned {status}, expected {expected}; body: {body}; server logs:\n{}",
+        "request returned {status}, expected {expected}; body: {body}; server logs:\n{}",
         log.contents().await
     );
 }
@@ -2219,7 +2194,7 @@ impl ChatEnvironment {
     async fn prepare(
         self,
         harness: &TestHarness,
-        client: &reqwest::Client,
+        client: &mut zenwave::DefaultClient,
         server: &RunningDaemon,
     ) -> PreparedEnvironment {
         match self {
@@ -2247,7 +2222,7 @@ impl ChatEnvironment {
                             "{}/api/profiles/{profile_id}/sessions",
                             server.base_url
                         ))
-                        .send(),
+                        .expect("request builds"),
                 )
                 .await
                 else {
@@ -2331,7 +2306,7 @@ impl PreparedEnvironment {
                     .sandbox_dir(session_id, Some(profile_id));
                 tokio::fs::canonicalize(&sandbox)
                     .await
-                    .expect("session sandbox directory should canonicalize")
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"))
                     .display()
                     .to_string()
             }
@@ -2351,11 +2326,11 @@ impl PreparedEnvironment {
                 let (_store, db, _default_profile_id) =
                     initialize_session_persistence(&harness.may_dir)
                         .await
-                        .expect("session persistence should initialize");
+                        .unwrap_or_else(|error| panic!("operation failed: {error}"));
                 let profile = db
                     .get_profile(&profile_id)
                     .await
-                    .expect("profile lookup should succeed")
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"))
                     .expect("container profile should exist");
                 let name = may_agent::container::profile::container_name_for_profile_session(
                     &profile,
@@ -2364,12 +2339,12 @@ impl PreparedEnvironment {
                 let container_id = manager
                     .resolve_container_id_by_name(&name)
                     .await
-                    .expect("session container lookup should succeed")
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"))
                     .unwrap_or_else(|| panic!("session container {name} should exist"));
                 manager
                     .remove(&container_id)
                     .await
-                    .expect("session container should be removed");
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"));
             }
         }
     }
@@ -2389,21 +2364,19 @@ fn system_text(request: &Value) -> String {
 }
 
 async fn create_session_via_api(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     profile_id: &str,
 ) -> String {
     let response = client
         .post(format!("{}/api/sessions", server.base_url))
-        .json(&serde_json::json!({ "profileId": profile_id }))
-        .send()
+        .expect("request builds")
+        .json_body(&serde_json::json!({ "profileId": profile_id }))
+        .expect("JSON body serializes")
         .await
-        .expect("create session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let value: Value = response
-        .json()
-        .await
-        .expect("create session response should be valid JSON");
+    let value: Value = response_json(response).await;
     value
         .get("id")
         .and_then(Value::as_str)
@@ -2422,7 +2395,7 @@ async fn create_container_profile(harness: &TestHarness) -> String {
 
     let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
         .await
-        .expect("session persistence should initialize");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let key = format!(
         "e2e-{}-{}",
         std::process::id(),
@@ -2431,7 +2404,7 @@ async fn create_container_profile(harness: &TestHarness) -> String {
     if let Some(existing) = db
         .get_profile(&key)
         .await
-        .expect("profile lookup should succeed")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
     {
         return existing.id;
     }
@@ -2446,25 +2419,22 @@ async fn create_container_profile(harness: &TestHarness) -> String {
         location_aware: false,
     })
     .await
-    .expect("container profile should be created")
+    .unwrap_or_else(|error| panic!("operation failed: {error}"))
     .id
 }
 
 async fn profile_id_via_api(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     slug: &str,
 ) -> String {
     let response = client
         .get(format!("{}/api/profiles", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("list profiles request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let profiles: Value = response
-        .json()
-        .await
-        .expect("profiles response should be valid JSON");
+    let profiles: Value = response_json(response).await;
     profiles
         .as_array()
         .expect("profiles response should be an array")
@@ -2475,20 +2445,21 @@ async fn profile_id_via_api(
         .to_string()
 }
 
-async fn get_runtime(client: &reqwest::Client, server: &RunningDaemon, session_id: &str) -> Value {
+async fn get_runtime(
+    client: &mut zenwave::DefaultClient,
+    server: &RunningDaemon,
+    session_id: &str,
+) -> Value {
     let response = client
         .get(format!(
             "{}/api/sessions/{session_id}/runtime",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("runtime request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    response
-        .json()
-        .await
-        .expect("runtime response should be valid JSON")
+    response_json(response).await
 }
 
 fn extract_assistant_messages(transcript: &Value) -> Vec<String> {
@@ -2524,7 +2495,7 @@ async fn the_harness_config_never_lets_a_daemon_update_itself() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
         .await
-        .expect("the harness config should load");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(!config.update.auto);
 }
 
@@ -2551,7 +2522,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec pwd should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         pwd_output.status.success(),
         "pwd command failed: {}",
@@ -2559,7 +2530,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
     );
     let expected_workdir = tokio::fs::canonicalize(&session.sandbox_dir)
         .await
-        .expect("session sandbox directory should canonicalize");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert_eq!(
         String::from_utf8_lossy(&pwd_output.stdout).trim(),
         expected_workdir.display().to_string()
@@ -2579,7 +2550,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec layout/help probe should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         layout_output.status.success(),
         "layout/help probe failed: {}",
@@ -2611,7 +2582,7 @@ async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec commit should run")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
 }
 
 #[tokio::test]
@@ -2683,21 +2654,21 @@ async fn a_terminal_command_runs_and_writes_in_the_session_directory_when_home_i
     std::os::unix::fs::symlink(harness.home_path(), &linked_home)
         .expect("home symlink should be created");
     let server = RunningDaemon::spawn(&linked_home, &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "run the probe" }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the symlinked-home turn", &server.log).await;
     assert!(
@@ -2763,20 +2734,20 @@ async fn a_tool_an_mcp_server_adds_mid_session_runs_and_is_announced_once() {
     )
     .expect("mcp.json should be written");
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     for content in ["add the tool", "greet", "anything new?"] {
         let response = send_turn(
-            &client,
+            &mut client,
             &server.base_url,
             &serde_json::json!({ "sessionId": session_id, "content": content }),
         )
         .await
-        .expect("chat stream request should succeed");
+        .unwrap_or_else(http_response_or_panic);
         let response = expect_status(&server.log, response, StatusCode::OK).await;
         let events = collect_turn_events(response, content, &server.log).await;
         assert!(
@@ -2785,7 +2756,7 @@ async fn a_tool_an_mcp_server_adds_mid_session_runs_and_is_announced_once() {
             server.log.contents().await
         );
         wait_for_runtime_condition(
-            &client,
+            &mut client,
             &server,
             &session_id,
             Duration::from_secs(10),
@@ -2868,7 +2839,7 @@ async fn exec_script(
         .env("PATH", path)
         .output()
         .await
-        .expect("may exec should run")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
 }
 
 #[tokio::test]
@@ -2890,7 +2861,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
         format!("#!/bin/sh\ntouch '{}'\necho gh-ran\n", gh_marker.display()),
     )
     .await
-    .expect("fake gh");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     std::fs::set_permissions(
         &fake_gh,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2900,7 +2871,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     tokio::fs::create_dir_all(&gh_config).await.expect("gh dir");
     tokio::fs::write(gh_config.join("hosts.yml"), "oauth_token: SECRET-TOKEN\n")
         .await
-        .expect("gh credentials");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let created = exec_script(
         &harness,
@@ -3024,7 +2995,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec large output probe should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     assert!(
         output.status.success(),
@@ -3046,7 +3017,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
     );
     let stored_contents = tokio::fs::read_to_string(&stored_path)
         .await
-        .expect("stored output file should be readable");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert_eq!(stored_contents.len(), 60000);
     assert!(stored_contents.chars().all(|ch| ch == 'x'));
 }
@@ -3055,19 +3026,17 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
 async fn ui_session_crud_round_trip_matches_api_contract() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
 
     let create_response = client
         .post(format!("{}/api/sessions", server.base_url))
-        .json(&serde_json::json!({}))
-        .send()
+        .expect("request builds")
+        .json_body(&serde_json::json!({}))
+        .expect("JSON body serializes")
         .await
-        .expect("create session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let create_response = expect_status(&server.log, create_response, StatusCode::OK).await;
-    let created: Value = create_response
-        .json()
-        .await
-        .expect("create session response should be valid JSON");
+    let created: Value = response_json(create_response).await;
     let session_id = created
         .get("id")
         .and_then(Value::as_str)
@@ -3080,14 +3049,11 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
 
     let list_response = client
         .get(format!("{}/api/sessions", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("list sessions request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let list_response = expect_status(&server.log, list_response, StatusCode::OK).await;
-    let listed: Value = list_response
-        .json()
-        .await
-        .expect("list sessions response should be valid JSON");
+    let listed: Value = response_json(list_response).await;
     let contains = listed
         .as_array()
         .expect("list sessions response should be an array")
@@ -3097,19 +3063,20 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
     assert!(contains);
 
     let update_response = client
-        .patch(format!("{}/api/sessions/{session_id}", server.base_url))
-        .json(&serde_json::json!({
+        .method(
+            zenwave::Method::PATCH,
+            format!("{}/api/sessions/{session_id}", server.base_url),
+        )
+        .expect("request builds")
+        .json_body(&serde_json::json!({
             "title": "Terminal first test",
             "model": TEST_SELECTOR
         }))
-        .send()
+        .expect("JSON body serializes")
         .await
-        .expect("update session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let update_response = expect_status(&server.log, update_response, StatusCode::OK).await;
-    let updated: Value = update_response
-        .json()
-        .await
-        .expect("update session response should be valid JSON");
+    let updated: Value = response_json(update_response).await;
     assert_eq!(
         updated.get("title").and_then(Value::as_str),
         Some("Terminal first test")
@@ -3117,14 +3084,11 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
 
     let get_response = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("get session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let get_response = expect_status(&server.log, get_response, StatusCode::OK).await;
-    let fetched: Value = get_response
-        .json()
-        .await
-        .expect("get session response should be valid JSON");
+    let fetched: Value = response_json(get_response).await;
     assert_eq!(
         fetched.get("title").and_then(Value::as_str),
         Some("Terminal first test")
@@ -3140,16 +3104,16 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
 
     let delete_response = client
         .delete(format!("{}/api/sessions/{session_id}", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("delete session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, delete_response, StatusCode::OK).await;
 
     let missing_response = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("missing session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, missing_response, StatusCode::NOT_FOUND).await;
 
     server.stop().await;
@@ -3167,16 +3131,16 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::WritesTasksFile).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -3184,7 +3148,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the first tasks turn", &server.log).await;
     assert!(
@@ -3226,14 +3190,11 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     let tasks_url = format!("{}/api/sessions/{session_id}/tasks", server.base_url);
     let response = client
         .get(&tasks_url)
-        .send()
+        .expect("request builds")
         .await
-        .expect("get tasks request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let payload: Value = response
-        .json()
-        .await
-        .expect("tasks payload should be valid JSON");
+    let payload: Value = response_json(response).await;
     assert_eq!(
         payload.get("content").and_then(Value::as_str),
         Some(MODEL_WRITTEN)
@@ -3242,15 +3203,13 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     // PUT lands on disk, where the next model request's injection reads it.
     let response = client
         .put(&tasks_url)
-        .json(&serde_json::json!({ "content": REWRITTEN, "planState": "disabled" }))
-        .send()
+        .expect("request builds")
+        .json_body(&serde_json::json!({ "content": REWRITTEN, "planState": "disabled" }))
+        .expect("JSON body serializes")
         .await
-        .expect("put tasks request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let payload: Value = response
-        .json()
-        .await
-        .expect("put tasks response should be valid JSON");
+    let payload: Value = response_json(response).await;
     assert_eq!(
         payload.get("content").and_then(Value::as_str),
         Some(REWRITTEN)
@@ -3261,13 +3220,13 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     );
     let on_disk = tokio::fs::read_to_string(sandbox_dir.join("tasks.md"))
         .await
-        .expect("PUT should have written the canonical tasks.md");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert_eq!(on_disk, REWRITTEN);
 
     // A follow-up turn proves the injection reads the file: the rewritten
     // content shows up in the next model request.
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -3275,7 +3234,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         }),
     )
     .await
-    .expect("second chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the follow-up tasks turn", &server.log).await;
     assert!(
@@ -3357,16 +3316,16 @@ async fn run_probe_turn_on(
         None => TestHarness::new(&mock.base_url()).await,
     };
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -3374,7 +3333,7 @@ async fn run_probe_turn_on(
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the subagent probe turn", &server.log).await;
     assert!(
@@ -3880,8 +3839,8 @@ async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listin
 async fn daemon_error_logs_its_cause() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
-    let profile_id = profile_id_via_api(&client, &server, "build").await;
+    let mut client = zenwave::client();
+    let profile_id = profile_id_via_api(&mut client, &server, "build").await;
 
     // A regular file where the profile's sessions directory belongs makes
     // session directory creation fail with an I/O error.
@@ -3890,27 +3849,25 @@ async fn daemon_error_logs_its_cause() {
         .sessions_dir();
     if tokio::fs::try_exists(&sessions_dir)
         .await
-        .expect("sessions dir existence should be checkable")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
     {
         tokio::fs::remove_dir_all(&sessions_dir)
             .await
-            .expect("existing sessions dir should be removable");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
     }
     tokio::fs::write(&sessions_dir, b"not a directory")
         .await
-        .expect("sessions dir placeholder file should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let response = client
         .post(format!("{}/api/sessions", server.base_url))
-        .json(&serde_json::json!({ "profileId": profile_id }))
-        .send()
+        .expect("request builds")
+        .json_body(&serde_json::json!({ "profileId": profile_id }))
+        .expect("JSON body serializes")
         .await
-        .expect("create session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::INTERNAL_SERVER_ERROR).await;
-    let body: Value = response
-        .json()
-        .await
-        .expect("error response should be valid JSON");
+    let body: Value = response_json(response).await;
     assert_eq!(
         body,
         serde_json::json!({ "error": "Internal server error" })
@@ -3955,18 +3912,18 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
-    let environment = environment.prepare(&harness, &client, &server).await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let mut client = zenwave::client();
+    let environment = environment.prepare(&harness, &mut client, &server).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let chat_task = tokio::spawn({
-        let client = client.clone();
+        let mut client = zenwave::client();
         let base_url = server.base_url.clone();
         let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
             let response = send_turn(
-                &client,
+                &mut client,
                 &base_url,
                 &serde_json::json!({
                     "sessionId": session_id,
@@ -3974,7 +3931,7 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
                 }),
             )
             .await
-            .expect("chat stream request should succeed");
+            .unwrap_or_else(http_response_or_panic);
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -4002,14 +3959,14 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
             "{}/api/sessions/{}/turns/current",
             server.base_url, session_id
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("stop session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, stop_response, StatusCode::OK).await;
 
     let events = tokio::time::timeout(Duration::from_secs(15), chat_task)
         .await
-        .expect("cancelled chat stream should terminate promptly")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
         .expect("chat task should join");
     assert!(
         events.iter().any(|(kind, _)| kind == "text"),
@@ -4017,21 +3974,18 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
         server.log.contents().await
     );
 
-    wait_for_runtime_state_clear(&client, &server, &session_id, Duration::from_secs(10)).await;
+    wait_for_runtime_state_clear(&mut client, &server, &session_id, Duration::from_secs(10)).await;
 
     let transcript_response = client
         .get(format!(
             "{}/api/sessions/{}/transcript",
             server.base_url, session_id
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("get transcript after cancel should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let transcript_response = expect_status(&server.log, transcript_response, StatusCode::OK).await;
-    let transcript: Value = transcript_response
-        .json()
-        .await
-        .expect("transcript after cancel should be valid JSON");
+    let transcript: Value = response_json(transcript_response).await;
     let assistant_messages = extract_assistant_messages(&transcript);
     assert!(
         assistant_messages
@@ -4063,18 +4017,18 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TerminalRoundTrip).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
-    let environment = environment.prepare(&harness, &client, &server).await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let mut client = zenwave::client();
+    let environment = environment.prepare(&harness, &mut client, &server).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let chat_task = tokio::spawn({
-        let client = client.clone();
+        let mut client = zenwave::client();
         let base_url = server.base_url.clone();
         let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
             let response = send_turn(
-                &client,
+                &mut client,
                 &base_url,
                 &serde_json::json!({
                     "sessionId": session_id,
@@ -4082,14 +4036,14 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
                 }),
             )
             .await
-            .expect("chat stream request should succeed");
+            .unwrap_or_else(http_response_or_panic);
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
 
     let runtime_during_background = wait_for_runtime_condition(
-        &client,
+        &mut client,
         &server,
         &session_id,
         // The first terminal dispatch competes with the rest of the parallel
@@ -4129,7 +4083,7 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         chat_task,
     )
     .await
-    .expect("chat stream should finish before timeout")
+    .unwrap_or_else(|error| panic!("operation failed: {error}"))
     .expect("chat task should join");
     let server_logs = server.log.contents().await;
     assert!(
@@ -4159,7 +4113,7 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
     );
 
     wait_for_runtime_condition(
-        &client,
+        &mut client,
         &server,
         &session_id,
         Duration::from_secs(10),
@@ -4214,20 +4168,20 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
     let config_path = harness.may_dir.join("config.toml");
     let mut config = MayConfig::load_from(&config_path)
         .await
-        .expect("harness config should load");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     config
         .set_provider_cache_lifetime(TEST_PROVIDER_ID, "2s")
         .expect("the lifetime parses");
     config
         .save_to(&config_path)
         .await
-        .expect("harness config should save");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     for (turn, content) in ["First turn.", "Second turn.", "After the lifetime."]
         .into_iter()
@@ -4237,23 +4191,23 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
             sleep(LIFETIME + Duration::from_millis(500)).await;
         }
         let response = send_turn(
-            &client,
+            &mut client,
             &server.base_url,
             &serde_json::json!({ "sessionId": session_id, "content": content }),
         )
         .await
-        .expect("chat stream request should succeed");
+        .unwrap_or_else(http_response_or_panic);
         let response = expect_status(&server.log, response, StatusCode::OK).await;
         let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
             .await
-            .expect("chat stream should finish before timeout");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         assert!(
             events.iter().any(|(kind, _)| kind == "done"),
             "{content:?} should complete; events: {events:?}; server logs:\n{}",
             server.log.contents().await
         );
         wait_for_runtime_condition(
-            &client,
+            &mut client,
             &server,
             &session_id,
             Duration::from_secs(10),
@@ -4268,14 +4222,11 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
             "{}/api/sessions/{session_id}/usage",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("usage request should succeed");
-    let usage: Value = expect_status(&server.log, response, StatusCode::OK)
-        .await
-        .json()
-        .await
-        .expect("usage should be JSON");
+        .unwrap_or_else(http_response_or_panic);
+    let usage: Value =
+        response_json(expect_status(&server.log, response, StatusCode::OK).await).await;
     assert_eq!(
         usage["cacheMissCauses"],
         // The mock reports no writes, so the second request is credited with
@@ -4308,9 +4259,9 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("turn answered".to_string())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
-    let environment = environment.prepare(&harness, &client, &server).await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let mut client = zenwave::client();
+    let environment = environment.prepare(&harness, &mut client, &server).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     for (content, turn_timeout) in [
         (
@@ -4320,7 +4271,7 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         ("Second turn.", Duration::from_secs(60)),
     ] {
         let response = send_turn(
-            &client,
+            &mut client,
             &server.base_url,
             &serde_json::json!({
                 "sessionId": session_id,
@@ -4328,27 +4279,28 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
             }),
         )
         .await
-        .expect("chat stream request should succeed");
+        .unwrap_or_else(http_response_or_panic);
         let status = response.status();
         assert!(
             status == StatusCode::OK,
             "{content:?} was refused with {status}: {}; server logs:\n{}",
             response
-                .text()
+                .into_body()
+                .into_string()
                 .await
-                .expect("refusal body should be readable"),
+                .unwrap_or_else(|error| panic!("operation failed: {error}")),
             server.log.contents().await
         );
         let events = tokio::time::timeout(turn_timeout, collect_sse_events(response))
             .await
-            .expect("chat stream should finish before timeout");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         assert!(
             events.iter().any(|(kind, _)| kind == "done"),
             "turn should complete with a done event; events: {events:?}; server logs:\n{}",
             server.log.contents().await
         );
         wait_for_runtime_condition(
-            &client,
+            &mut client,
             &server,
             &session_id,
             Duration::from_secs(10),
@@ -4394,14 +4346,14 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -4409,11 +4361,11 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = tokio::time::timeout(Duration::from_secs(90), collect_sse_events(response))
         .await
-        .expect("the turn should finish after its retries");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
@@ -4432,14 +4384,11 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
             "{}/api/sessions/{session_id}/transcript",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("get transcript request should succeed");
-    let transcript: Value = expect_status(&server.log, transcript, StatusCode::OK)
-        .await
-        .json()
-        .await
-        .expect("transcript should be valid JSON");
+        .unwrap_or_else(http_response_or_panic);
+    let transcript: Value =
+        response_json(expect_status(&server.log, transcript, StatusCode::OK).await).await;
     assert_eq!(
         extract_assistant_messages(&transcript),
         vec!["recovered answer".to_string()],
@@ -4486,7 +4435,7 @@ async fn priority_probe_command() -> String {
     let probe_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("priority-probe");
     async_fs::create_dir_all(&probe_dir)
         .await
-        .expect("probe directory should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let probe_binary = probe_dir.join("priority-probe");
     let rustc_output = probe_binary.clone();
     let compile = blocking::unblock(move || {
@@ -4500,7 +4449,7 @@ async fn priority_probe_command() -> String {
             .output()
     })
     .await
-    .expect("rustc should run");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         compile.status.success(),
         "probe compile failed: {}",
@@ -4555,7 +4504,7 @@ async fn exec_applies_local_command_priority() {
             .output()
     })
     .await
-    .expect("host probe should run");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         baseline_output.status.success(),
         "host probe failed: {}",
@@ -4595,12 +4544,12 @@ async fn exec_applies_local_command_priority() {
 
         let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should load");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         config.sandbox.command_priority = priority;
         config
             .save_to(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should save");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
         let session = harness.create_session().await;
 
@@ -4622,7 +4571,7 @@ async fn exec_applies_local_command_priority() {
                 .output()
         })
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
         assert!(
             output.status.success(),
             "may exec at {priority:?} failed: stdout={} stderr={}",
@@ -4694,7 +4643,7 @@ async fn the_baseline_tools_pass_their_acceptance_script_in_the_sandbox() {
             .output()
     })
     .await
-    .expect("may exec should run");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -4731,23 +4680,23 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("unused".to_string())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Container
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
     let binary = may_binary_path();
 
     let mut observed = Vec::new();
     for priority in [CommandPriority::Normal, CommandPriority::Low] {
         let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should load");
+            .unwrap_or_else(|error| panic!("harness config should load: {error}"));
         config.sandbox.command_priority = priority;
         config
             .save_to(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should save");
+            .unwrap_or_else(|error| panic!("harness config should save: {error}"));
 
         let home = harness.home_path().to_path_buf();
         let binary = binary.clone();
@@ -4769,7 +4718,7 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
                 .output()
         })
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("may exec should run: {error}"));
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         println!("container script output at {priority:?}:\n{stdout}");
         assert!(
@@ -4806,14 +4755,14 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
 async fn ui_chat_reports_unreachable_provider_error() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let mut server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -4821,7 +4770,7 @@ async fn ui_chat_reports_unreachable_provider_error() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -4830,7 +4779,7 @@ async fn ui_chat_reports_unreachable_provider_error() {
     );
     let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
         .await
-        .expect("chat stream should finish before timeout");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let exit = server
         .child
@@ -4873,9 +4822,9 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("unused".to_string())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Container
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
 
     let script = r#"cat "$MAY_TASK_TRIGGER_FILE""#;
@@ -4886,7 +4835,7 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
             let path = script_dir.path().join("trigger-reader.sh");
             tokio::fs::write(&path, script)
                 .await
-                .expect("script file should be written");
+                .unwrap_or_else(|error| panic!("operation failed: {error}"));
             serde_json::json!({ "scriptPath": path.display().to_string() })
         }
     };
@@ -4907,12 +4856,13 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
 
     let response = client
         .post(format!("{}/api/tasks", server.base_url))
-        .json(&body)
-        .send()
+        .expect("request builds")
+        .json_body(&body)
+        .expect("JSON body serializes")
         .await
-        .expect("create task request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let created: Value = response.json().await.expect("task response should be JSON");
+    let created: Value = response_json(response).await;
     let task_id = created
         .get("id")
         .and_then(Value::as_str)
@@ -4921,20 +4871,20 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
 
     let response = client
         .post(format!("{}/api/tasks/{task_id}/run", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("run task request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, response, StatusCode::OK).await;
 
     let deadline = Instant::now() + CONTAINER_TASK_RUN_TIMEOUT;
     let task = loop {
         let response = client
             .get(format!("{}/api/tasks/{task_id}", server.base_url))
-            .send()
+            .expect("request builds")
             .await
-            .expect("get task request should succeed");
+            .unwrap_or_else(http_response_or_panic);
         let response = expect_status(&server.log, response, StatusCode::OK).await;
-        let task: Value = response.json().await.expect("task response should be JSON");
+        let task: Value = response_json(response).await;
         let status = task.get("lastRunStatus").and_then(Value::as_str);
         if matches!(status, Some("success" | "failed")) {
             break task;
@@ -4970,22 +4920,22 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
     {
         let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
             .await
-            .expect("session persistence should initialize");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let profile = db
             .get_profile(&profile_id)
             .await
-            .expect("profile lookup should succeed")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("container profile should exist");
         let name = format!("may-{}", profile.slug.as_deref().unwrap_or(&profile.id));
         let container_id = manager
             .resolve_container_id_by_name(&name)
             .await
-            .expect("task container lookup should succeed")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .unwrap_or_else(|| panic!("task container {name} should exist"));
         manager
             .remove(&container_id)
             .await
-            .expect("task container should be removed");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
     }
 }
 
@@ -5003,23 +4953,24 @@ async fn container_profile_script_file_task_reads_its_trigger_file() {
 
 /// Answers `request_id` through the API with `value` selected.
 async fn answer_open_question(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     request_id: &str,
     value: &str,
 ) {
     let response = client
         .post(format!("{}/api/interactions/{request_id}", server.base_url))
-        .json(&serde_json::json!({
+        .expect("request builds")
+        .json_body(&serde_json::json!({
             "kind": "askUser",
             "answers": [{
                 "section": "",
                 "answer": { "kind": "selected", "values": [value] }
             }]
         }))
-        .send()
+        .expect("JSON body serializes")
         .await
-        .expect("ask-user respond request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, response, StatusCode::OK).await;
 }
 
@@ -5045,14 +4996,14 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::AsksUser).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -5060,7 +5011,7 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the asking turn", &server.log).await;
     assert!(
@@ -5069,7 +5020,7 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         server.log.contents().await
     );
     let runtime = wait_for_runtime_condition(
-        &client,
+        &mut client,
         &server,
         &session_id,
         Duration::from_secs(10),
@@ -5086,7 +5037,7 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         "no answer exists yet"
     );
 
-    answer_open_question(&client, &server, &request_id, "PostgreSQL").await;
+    answer_open_question(&mut client, &server, &request_id, "PostgreSQL").await;
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let delivered = loop {
@@ -5108,7 +5059,7 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         "the follow-up request must name the question by its word and carry the answer: {delivered}"
     );
     wait_for_runtime_condition(
-        &client,
+        &mut client,
         &server,
         &session_id,
         Duration::from_secs(20),
@@ -5136,14 +5087,14 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
     let mock = MockOpenAiServer::spawn_gated(MockChatScenario::AsksUser, Some(gate.clone())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let response = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -5151,17 +5102,17 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
 
     tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
         .await
         .unwrap_or_else(|_| panic!("the run never sent the request after the ask_user command"));
-    let runtime = get_runtime(&client, &server, &session_id).await;
+    let runtime = get_runtime(&mut client, &server, &session_id).await;
     let request_id = only_open_question_id(&runtime);
     let held = mock.agent_requests().await.len();
 
-    answer_open_question(&client, &server, &request_id, "PostgreSQL").await;
+    answer_open_question(&mut client, &server, &request_id, "PostgreSQL").await;
     gate.release.notify_one();
 
     let events = collect_turn_events(response, "the interrupted turn", &server.log).await;
@@ -5211,7 +5162,7 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
     let mut config: toml::Table = toml::from_str(
         &tokio::fs::read_to_string(&config_path)
             .await
-            .expect("test config should be readable"),
+            .unwrap_or_else(|error| panic!("operation failed: {error}")),
     )
     .expect("test config should parse");
     let mut daemon = toml::Table::new();
@@ -5222,17 +5173,17 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
         toml::to_string(&config).expect("test config should serialize"),
     )
     .await
-    .expect("test config should be written");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     // One-shot runs use the default profile, a container one; this host may
     // have no container runtime, so the profile runs locally instead.
     let db = may_agent::db::ChatDb::open(&harness.home_path().join(".may/history.db"))
         .await
-        .expect("test database should open");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let default_profile = db
         .ensure_default_profiles()
         .await
-        .expect("default profiles should exist");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     db.update_profile(
         &default_profile,
         may_agent::db::UpdateProfileParams {
@@ -5247,7 +5198,7 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
         },
     )
     .await
-    .expect("default profile should switch to local");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     drop(db);
 }
 
@@ -5271,7 +5222,7 @@ async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
         .expect("may one-shot should spawn")
         .wait_with_output()
         .await
-        .expect("may one-shot should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
         .await
         .unwrap_or_default();
@@ -5282,7 +5233,7 @@ async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5342,14 +5293,14 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     let output = oneshot
         .wait_with_output()
         .await
-        .expect("may one-shot should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let stop = Command::new(&binary)
         .args(["daemon", "stop"])
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     assert!(
         output.status.success(),
@@ -5398,7 +5349,7 @@ async fn oneshot_run_prints_a_burst_turn_through_its_end() {
         .expect("may one-shot should spawn")
         .wait_with_output()
         .await
-        .expect("may one-shot should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
         .await
         .unwrap_or_default();
@@ -5408,7 +5359,7 @@ async fn oneshot_run_prints_a_burst_turn_through_its_end() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5491,21 +5442,21 @@ async fn install_repo_search_agents(
     let worktree = tempfile::tempdir().expect("worktree tempdir should be created");
     git2::Repository::init(worktree.path()).expect("worktree should initialise");
     let cwd = dunce::canonicalize(worktree.path()).expect("worktree should resolve");
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let events = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&[
-            ("topics", "session_index"),
-            ("cwd", cwd.to_str().expect("utf-8 path")),
-        ])
-        .send()
+        .get(format!(
+            "{}/api/events?topics=session_index&cwd={}",
+            server.base_url,
+            cwd.to_str().expect("utf-8 path"),
+        ))
+        .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let mut reader = SseReader::new(events);
     let snapshot = loop {
         let event = tokio::time::timeout(Duration::from_secs(120), reader.next_event())
             .await
-            .expect("an index snapshot should arrive")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("the stream should stay open");
         if event.event == "session_index" {
             break event.data;
@@ -5578,7 +5529,7 @@ async fn a_killed_temp_home_daemons_agents_are_swept_by_the_next_daemon_start() 
 /// The session's background work, as `GET /api/sessions/{id}/background`
 /// reports it.
 async fn background_of(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     session_id: &str,
 ) -> Value {
@@ -5587,14 +5538,10 @@ async fn background_of(
             "{}/api/sessions/{session_id}/background",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("background request should succeed");
-    expect_status(&server.log, response, StatusCode::OK)
-        .await
-        .json()
-        .await
-        .expect("background payload should be JSON")
+        .unwrap_or_else(http_response_or_panic);
+    response_json(expect_status(&server.log, response, StatusCode::OK).await).await
 }
 
 fn background_job<'a>(background: &'a Value, script: &str) -> Option<&'a Value> {
@@ -5611,20 +5558,18 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
     // The session stream replays deltas published after this cursor.
-    let session: Value = client
+    let session = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
-        .send()
+        .expect("request builds")
         .await
-        .expect("session request should succeed")
-        .json()
-        .await
-        .expect("session JSON");
+        .unwrap_or_else(http_response_or_panic);
+    let session: Value = response_json(session).await;
     let cursor = session
         .get("cursor")
         .and_then(Value::as_str)
@@ -5633,19 +5578,19 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
 
     // The turn ends with the model's reply; its job keeps running.
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
         "the turn should end while its job runs; events: {events:?}"
     );
-    let background = background_of(&client, &server, &session_id).await;
+    let background = background_of(&mut client, &server, &session_id).await;
     assert_eq!(
         background_job(&background, BACKGROUND_JOB_SCRIPT)
             .and_then(|job| job.pointer("/status/state"))
@@ -5661,14 +5606,14 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
             "{}/api/sessions/{session_id}/events?after={cursor}",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let mut reader = SseReader::new(events);
     let pid = loop {
         let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
             .await
-            .expect("a job.upserted event should arrive")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("the stream should stay open");
         if event.event != "job.upserted" {
             continue;
@@ -5690,19 +5635,16 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
             "{}/api/sessions/{session_id}/jobs/{pid}/kill",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("kill request should succeed");
-    let killed: Value = expect_status(&server.log, response, StatusCode::OK)
-        .await
-        .json()
-        .await
-        .expect("kill payload should be JSON");
+        .unwrap_or_else(http_response_or_panic);
+    let killed: Value =
+        response_json(expect_status(&server.log, response, StatusCode::OK).await).await;
     assert_eq!(killed.get("ok"), Some(&Value::Bool(true)), "{killed}");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let background = background_of(&client, &server, &session_id).await;
+        let background = background_of(&mut client, &server, &session_id).await;
         if background_job(&background, BACKGROUND_JOB_SCRIPT)
             .and_then(|job| job.pointer("/status/state"))
             .and_then(Value::as_str)
@@ -5728,19 +5670,19 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn starting the job", &server.log).await;
     assert!(
@@ -5755,20 +5697,18 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
             "{}/api/sessions/{session_id}/events",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("event stream should open");
-    let runtime: Value = client
+        .unwrap_or_else(http_response_or_panic);
+    let runtime = client
         .get(format!(
             "{}/api/sessions/{session_id}/runtime",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("runtime request should succeed")
-        .json()
-        .await
-        .expect("runtime JSON");
+        .unwrap_or_else(http_response_or_panic);
+    let runtime: Value = response_json(runtime).await;
     assert_ne!(
         runtime.get("state").and_then(Value::as_str),
         Some("running"),
@@ -5797,7 +5737,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
 /// Opens the session's events stream, continuing after the cursor `after`
 /// when given. Frames of every kind arrive; readers pick their own.
 async fn agent_frames(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     session_id: &str,
     after: Option<String>,
@@ -5808,9 +5748,9 @@ async fn agent_frames(
     }
     let response = client
         .get(url)
-        .send()
+        .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     SseReader::new(response)
 }
 
@@ -5823,7 +5763,7 @@ async fn next_turn_frame(reader: &mut SseReader) -> TestSseEvent {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(20), reader.next_event())
             .await
-            .expect("a frame should arrive")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("the stream should stay open");
         if event.event == "session_agent" || event.event == "reset" {
             return event;
@@ -5859,20 +5799,20 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
-    let mut first = agent_frames(&client, &server, &session_id, None).await;
+    let mut first = agent_frames(&mut client, &server, &session_id, None).await;
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "write slowly" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
 
     // Read the start and a few chunks, then drop the stream mid-turn.
@@ -5885,7 +5825,7 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     let last_index = frame_index(seen.last().expect("frames were read"));
     drop(first);
 
-    let mut reopened = agent_frames(&client, &server, &session_id, Some(last_seen)).await;
+    let mut reopened = agent_frames(&mut client, &server, &session_id, Some(last_seen)).await;
     let next = next_turn_frame(&mut reopened).await;
     // Indices count every frame on the session stream; the next agent
     // frame may skip the indices of the kinds this test filtered out.
@@ -5903,7 +5843,7 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
 
     // The turn ended: frames after the first one are gone for good.
     // A cursor the hub cannot continue from — a foreign epoch — gets `reset`.
-    let mut stale = agent_frames(&client, &server, &session_id, Some("1.0".to_string())).await;
+    let mut stale = agent_frames(&mut client, &server, &session_id, Some("1.0".to_string())).await;
     let resync = next_turn_frame(&mut stale).await;
     assert_eq!(resync.event, "reset", "{resync:?}");
     server.stop().await;
@@ -5961,14 +5901,14 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         TestHarness::new_with_context(&mock.base_url(), compaction_probe_context(12_000, 2_000))
             .await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -5976,7 +5916,7 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the compacting turn", &server.log).await;
     assert!(
@@ -6007,7 +5947,7 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
     server.kill().await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -6015,7 +5955,7 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         }),
     )
     .await
-    .expect("follow-up turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the restart", &server.log).await;
     assert!(
@@ -6056,15 +5996,15 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
         TestHarness::new_with_context(&mock.base_url(), compaction_probe_context(12_000, 12_000))
             .await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
-    let mut frames = agent_frames(&client, &server, &session_id, None).await;
+    let mut frames = agent_frames(&mut client, &server, &session_id, None).await;
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -6072,7 +6012,7 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
         }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
 
     let mut agent_events = Vec::new();
@@ -6128,14 +6068,14 @@ async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events(
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({
             "sessionId": session_id,
@@ -6143,7 +6083,7 @@ async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events(
         }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn to compact", &server.log).await;
     assert!(
@@ -6152,18 +6092,19 @@ async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events(
         server.log.contents().await
     );
 
-    let mut frames = agent_frames(&client, &server, &session_id, None).await;
+    let mut frames = agent_frames(&mut client, &server, &session_id, None).await;
     let compacted = client
         .post(format!(
             "{}/api/sessions/{session_id}/actions/compact",
             server.base_url
         ))
-        .json(&serde_json::json!({}))
-        .send()
+        .expect("request builds")
+        .json_body(&serde_json::json!({}))
+        .expect("JSON body serializes")
         .await
-        .expect("the compact request should be answered");
+        .unwrap_or_else(http_response_or_panic);
     let compacted = expect_status(&server.log, compacted, StatusCode::OK).await;
-    let compacted: Value = compacted.json().await.expect("compact answer JSON");
+    let compacted: Value = response_json(compacted).await;
     assert_eq!(compacted["compacted"], true, "{compacted}");
 
     let mut phases = Vec::new();
@@ -6208,7 +6149,7 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(stop.status.success(), "daemon stop failed");
     assert_eq!(
         held,
@@ -6231,32 +6172,32 @@ async fn container_and_local_commands_share_the_daemons_job_pool() {
     let harness = TestHarness::new(&mock.base_url()).await;
     set_job_pool_size(&harness, POOL).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Container
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
     let container_session =
-        create_session_via_api(&client, &server, environment.profile_id()).await;
+        create_session_via_api(&mut client, &server, environment.profile_id()).await;
     let container_sandbox = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&container_session, Some(environment.profile_id()));
     tokio::fs::create_dir_all(container_sandbox.join("tmp"))
         .await
-        .expect("container session tmp should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     tokio::fs::write(
         container_sandbox.join("tmp/job_probe.py"),
         include_str!("fixtures/job_probe.py"),
     )
     .await
-    .expect("probe should be written");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     // The turn ends with the model's reply; the probe keeps its tokens.
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": container_session, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     collect_turn_events(turn, "the container probe turn", &server.log).await;
     let report = container_sandbox.join("tmp/held");
@@ -6272,16 +6213,16 @@ async fn container_and_local_commands_share_the_daemons_job_pool() {
     assert_eq!(
         tokio::fs::read_to_string(&report)
             .await
-            .expect("container probe report should be readable")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .trim(),
         POOL.to_string(),
         "the container command drew every token of the daemon pool"
     );
 
     let local = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let local_session = create_session_via_api(&client, &server, local.profile_id()).await;
+    let local_session = create_session_via_api(&mut client, &server, local.profile_id()).await;
     let local_sandbox = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&local_session, Some(local.profile_id()));
     let held = tokens_held_by_exec_probe(&harness, &local_session, &local_sandbox).await;
@@ -6301,7 +6242,7 @@ async fn set_job_pool_size(harness: &TestHarness, size: i64) {
     let mut config: toml::Table = toml::from_str(
         &tokio::fs::read_to_string(&config_path)
             .await
-            .expect("test config should be readable"),
+            .unwrap_or_else(|error| panic!("operation failed: {error}")),
     )
     .expect("test config should parse");
     let sandbox = config
@@ -6315,7 +6256,7 @@ async fn set_job_pool_size(harness: &TestHarness, size: i64) {
         toml::to_string(&config).expect("test config should serialize"),
     )
     .await
-    .expect("test config should be written");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 /// Runs the job probe through `may exec` in the local session `session_id`
@@ -6328,11 +6269,11 @@ async fn tokens_held_by_exec_probe(
     // The sandbox reads only the session's own files.
     tokio::fs::create_dir_all(sandbox_dir.join("tmp"))
         .await
-        .expect("session tmp should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let probe = sandbox_dir.join("tmp/job_probe.py");
     tokio::fs::write(&probe, include_str!("fixtures/job_probe.py"))
         .await
-        .expect("probe should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let report = sandbox_dir.join("tmp/held");
     let output = Command::new(may_binary_path())
         .arg("exec")
@@ -6353,7 +6294,7 @@ async fn tokens_held_by_exec_probe(
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         output.status.success(),
         "exec failed: {}",
@@ -6376,7 +6317,7 @@ async fn lease_every_free_word(
     let connect_and_drain = || async {
         let ids = may_agent::client::ids::DaemonIds::connect(socket)
             .await
-            .expect("the daemon id connection")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .session(session_id);
         tokio::task::spawn_blocking(move || {
             let mut leases = Vec::new();
@@ -6386,7 +6327,7 @@ async fn lease_every_free_word(
             (ids, leases)
         })
         .await
-        .expect("leasing finishes")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
     };
     let ((first, second), (third, fourth)) = futures_lite::future::zip(
         futures_lite::future::zip(connect_and_drain(), connect_and_drain()),
@@ -6408,7 +6349,7 @@ async fn served(ids: may_agent::model_ids::SessionIds) -> may_agent::model_ids::
         ids
     })
     .await
-    .expect("the claim finishes")
+    .unwrap_or_else(|error| panic!("operation failed: {error}"))
 }
 
 /// The word `may exec` leased from the session's pool for its background job's
@@ -6496,7 +6437,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     }
     let output = running
         .await
-        .expect("exec task")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
         .expect("may exec should run");
     let exec_word = killed_exec_output_word(&session.sandbox_dir, &output);
     assert!(
@@ -6518,7 +6459,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     let ids = served(ids).await;
     let output = exec(&other.id, "while :; do sleep 0.1; done".to_string(), "1")
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let exec_word = killed_exec_output_word(&other.sandbox_dir, &output);
     assert!(
         free.contains(&exec_word),
@@ -6531,7 +6472,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(stop.status.success(), "daemon stop failed");
 }
 
@@ -6620,7 +6561,7 @@ async fn next_agent_request(mock: &MockOpenAiServer, seen: usize, log: &ServerLo
 /// Starts the session's background job with one turn and returns the job's
 /// pid once the daemon has had time to record the session's background work.
 async fn start_background_job(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     server: &RunningDaemon,
     session_id: &str,
 ) -> u32 {
@@ -6630,7 +6571,7 @@ async fn start_background_job(
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
     assert!(
@@ -6659,12 +6600,12 @@ async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_sessio
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
-    let pid = start_background_job(&client, &server, &session_id).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
+    let pid = start_background_job(&mut client, &server, &session_id).await;
     let seen = mock.agent_requests().await.len();
 
     server.kill().await;
@@ -6686,7 +6627,7 @@ async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_sessio
         "the restarted turn carries the alert: {:?}",
         message_texts(&restarted)
     );
-    wait_for_runtime_state_clear(&client, &server, &session_id, Duration::from_secs(30)).await;
+    wait_for_runtime_state_clear(&mut client, &server, &session_id, Duration::from_secs(30)).await;
     server.stop().await;
     environment.release(&harness, &session_id).await;
 }
@@ -6707,28 +6648,28 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
     let config_path = harness.may_dir.join("config.toml");
     let mut config = MayConfig::load_from(&config_path)
         .await
-        .expect("test config should load");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     config
         .set_provider_cache_lifetime(TEST_PROVIDER_ID, "2s")
         .expect("a valid cache lifetime");
     config
         .save_to(&config_path)
         .await
-        .expect("test config should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "first question" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the first turn", &server.log).await;
     assert!(
@@ -6736,12 +6677,12 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
         "events: {events:?}"
     );
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "second question" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, turn, StatusCode::OK).await;
     tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
         .await
@@ -6759,16 +6700,16 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
         "a cold session starts nothing until the user writes; server logs:\n{}",
         strip_ansi_escapes(&server.log.contents().await)
     );
-    let runtime = get_runtime(&client, &server, &session_id).await;
+    let runtime = get_runtime(&mut client, &server, &session_id).await;
     assert!(runtime_is_idle(&runtime), "{runtime}");
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "third question" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the restart", &server.log).await;
     assert!(
@@ -6815,19 +6756,19 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn starting the job", &server.log).await;
     assert!(
@@ -6839,9 +6780,9 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
             "{}/api/sessions/{session_id}/events",
             server.base_url
         ))
-        .send()
+        .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let resumed = collect_turn_events(stream, "the resumed turn", &server.log).await;
     assert!(
         resumed.iter().any(|(kind, _)| kind == "done"),
@@ -6853,12 +6794,12 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
 
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "anything new?" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the kill", &server.log).await;
     assert!(
@@ -6889,12 +6830,12 @@ async fn a_graceful_stop_does_not_alert() {
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
-    start_background_job(&client, &server, &session_id).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
+    start_background_job(&mut client, &server, &session_id).await;
     let seen = mock.agent_requests().await.len();
 
     server.stop().await;
@@ -6907,12 +6848,12 @@ async fn a_graceful_stop_does_not_alert() {
     );
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "anything new?" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the stop", &server.log).await;
     assert!(
@@ -6934,19 +6875,19 @@ async fn agent_stops_background_job_with_native_kill_by_pid() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::NativeKillByPid).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
-        .prepare(&harness, &client, &server)
+        .prepare(&harness, &mut client, &server)
         .await;
-    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let session_id = create_session_via_api(&mut client, &server, environment.profile_id()).await;
 
     let turn = send_turn(
-        &client,
+        &mut client,
         &server.base_url,
         &serde_json::json!({ "sessionId": session_id, "content": "start and stop sleeper" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "native kill by pid turn", &server.log).await;
     assert!(
@@ -6963,7 +6904,7 @@ async fn agent_stops_background_job_with_native_kill_by_pid() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let background = background_of(&client, &server, &session_id).await;
+        let background = background_of(&mut client, &server, &session_id).await;
         let running = background
             .get("jobs")
             .and_then(Value::as_array)

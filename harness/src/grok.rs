@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use zenwave::Client as _;
 
 use crate::auth_store::{delete_file, load_json, save_json};
 use crate::config::MayConfig;
@@ -54,12 +55,12 @@ pub enum GrokAuthError {
     Store(#[from] crate::auth_store::AuthStoreError),
     /// HTTP request to the xAI auth service failed.
     #[error("xAI auth request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] zenwave::Error),
     /// The auth service returned a non-success status.
     #[error("xAI auth service returned {status}: {body}")]
     Status {
         /// HTTP status code.
-        status: reqwest::StatusCode,
+        status: zenwave::StatusCode,
         /// Truncated response body.
         body: String,
     },
@@ -211,25 +212,46 @@ pub fn has_credentials() -> bool {
 /// exists, so nothing downstream bounds it.
 const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(AUTH_REQUEST_TIMEOUT)
-        .build()
-        .expect("the HTTP client builds with its default configuration")
+fn http() -> zenwave::DefaultClient {
+    zenwave::client()
 }
 
-async fn read_json_or_error<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T, GrokAuthError> {
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(GrokAuthError::Status {
+/// Fails `fut` as [`zenwave::Error::Timeout`] when it has not finished within
+/// [`AUTH_REQUEST_TIMEOUT`]: the auth calls run before the response stream
+/// exists, so nothing downstream bounds them.
+async fn bounded_request<T>(
+    fut: impl std::future::Future<Output = Result<T, zenwave::Error>>,
+) -> Result<T, zenwave::Error> {
+    futures_lite::future::race(fut, async {
+        async_io::Timer::after(AUTH_REQUEST_TIMEOUT).await;
+        Err(zenwave::Error::Timeout)
+    })
+    .await
+}
+
+fn form_request_body(pairs: &[(&str, &str)]) -> Vec<u8> {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs.iter().copied())
+        .finish()
+        .into_bytes()
+}
+
+fn json_or_status<T>(result: Result<T, zenwave::Error>) -> Result<T, GrokAuthError> {
+    result.map_err(|error| match error {
+        zenwave::Error::Http {
+            status, response, ..
+        } => GrokAuthError::Status {
             status,
-            body: body.chars().take(500).collect(),
-        });
-    }
-    Ok(response.json().await?)
+            body: response
+                .body_text
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect(),
+        },
+        other => GrokAuthError::Http(other),
+    })
 }
 
 /// Start device authorization: returns the code the user enters at
@@ -240,15 +262,24 @@ async fn read_json_or_error<T: serde::de::DeserializeOwned>(
 /// Returns [`GrokAuthError`] when the request fails or the response is
 /// missing required fields.
 pub async fn request_device_code() -> Result<GrokDeviceCode, GrokAuthError> {
-    let response: DeviceCodeResponse = read_json_or_error(
-        http()
-            .post(DEVICE_CODE_URL)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .form(&[("client_id", CLIENT_ID), ("scope", SCOPES)])
-            .send()
-            .await?,
-    )
-    .await?;
+    let mut backend = http();
+    let response: DeviceCodeResponse = json_or_status(
+        bounded_request(
+            backend
+                .post(DEVICE_CODE_URL)?
+                .header(zenwave::header::ACCEPT.as_str(), "application/json")?
+                .header(
+                    zenwave::header::CONTENT_TYPE.as_str(),
+                    "application/x-www-form-urlencoded",
+                )?
+                .bytes_body(form_request_body(&[
+                    ("client_id", CLIENT_ID),
+                    ("scope", SCOPES),
+                ]))
+                .json(),
+        )
+        .await,
+    )?;
     Ok(GrokDeviceCode {
         device_code: response.device_code,
         user_code: response.user_code,
@@ -266,14 +297,16 @@ pub async fn request_device_code() -> Result<GrokDeviceCode, GrokAuthError> {
 /// Returns [`GrokAuthError`] when discovery fails or reports an endpoint
 /// outside the xAI auth origin.
 pub async fn token_endpoint() -> Result<String, GrokAuthError> {
-    let document: DiscoveryDocument = read_json_or_error(
-        http()
-            .get(DISCOVERY_URL)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await?,
-    )
-    .await?;
+    let mut backend = http();
+    let document: DiscoveryDocument = json_or_status(
+        bounded_request(
+            backend
+                .get(DISCOVERY_URL)?
+                .header(zenwave::header::ACCEPT.as_str(), "application/json")?
+                .json(),
+        )
+        .await,
+    )?;
     let endpoint = document.token_endpoint;
     let parsed = url::Url::parse(&endpoint).map_err(|e| GrokAuthError::Protocol(e.to_string()))?;
     let host = parsed.host_str().unwrap_or_default();
@@ -316,36 +349,45 @@ pub async fn poll_device_code(
     token_endpoint: &str,
     device_code: &str,
 ) -> Result<GrokCredentials, GrokAuthError> {
-    let response = http()
-        .post(token_endpoint)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(&[
-            ("grant_type", DEVICE_GRANT),
-            ("client_id", CLIENT_ID),
-            ("device_code", device_code),
-        ])
-        .send()
-        .await?;
+    let mut backend = http();
+    let result = bounded_request(
+        backend
+            .post(token_endpoint)?
+            .header(zenwave::header::ACCEPT.as_str(), "application/json")?
+            .header(
+                zenwave::header::CONTENT_TYPE.as_str(),
+                "application/x-www-form-urlencoded",
+            )?
+            .bytes_body(form_request_body(&[
+                ("grant_type", DEVICE_GRANT),
+                ("client_id", CLIENT_ID),
+                ("device_code", device_code),
+            ]))
+            .json::<TokenResponse>(),
+    )
+    .await;
 
-    if response.status().is_success() {
-        return Ok(credentials_from(
-            response.json::<TokenResponse>().await?,
-            None,
-        ));
-    }
-
-    let error = response
-        .json::<TokenErrorResponse>()
-        .await
-        .map_err(|e| GrokAuthError::Protocol(e.to_string()))?;
-    Err(match error.error.as_str() {
-        "authorization_pending" | "slow_down" => GrokAuthError::AuthorizationPending,
-        "expired_token" => GrokAuthError::Expired,
-        "access_denied" => GrokAuthError::Denied,
-        other => {
-            GrokAuthError::Protocol(error.error_description.unwrap_or_else(|| other.to_string()))
+    let error = match result {
+        Ok(response) => {
+            return Ok(credentials_from(response, None));
         }
-    })
+        Err(error) => error,
+    };
+    if let zenwave::Error::Http { .. } = &error
+        && let Some(parsed) = error.deserialize_http_error::<TokenErrorResponse>()
+    {
+        return Err(match parsed.error.as_str() {
+            "authorization_pending" | "slow_down" => GrokAuthError::AuthorizationPending,
+            "expired_token" => GrokAuthError::Expired,
+            "access_denied" => GrokAuthError::Denied,
+            other => GrokAuthError::Protocol(
+                parsed
+                    .error_description
+                    .unwrap_or_else(|| other.to_string()),
+            ),
+        });
+    }
+    Err(json_or_status::<TokenResponse>(Err(error)).unwrap_err())
 }
 
 /// Exchange a refresh token for a rotated credential pair.
@@ -357,48 +399,43 @@ pub async fn refresh_tokens(
     token_endpoint: &str,
     refresh_token: &str,
 ) -> Result<GrokCredentials, GrokAuthError> {
-    let response = http()
-        .post(token_endpoint)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", CLIENT_ID),
-            ("refresh_token", refresh_token),
-        ])
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        return Ok(credentials_from(
-            response.json::<TokenResponse>().await?,
-            Some(refresh_token.to_string()),
-        ));
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(GrokAuthError::Status {
-        status,
-        body: body.chars().take(500).collect(),
-    })
+    let mut backend = http();
+    json_or_status(
+        bounded_request(
+            backend
+                .post(token_endpoint)?
+                .header(zenwave::header::ACCEPT.as_str(), "application/json")?
+                .header(
+                    zenwave::header::CONTENT_TYPE.as_str(),
+                    "application/x-www-form-urlencoded",
+                )?
+                .bytes_body(form_request_body(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", CLIENT_ID),
+                    ("refresh_token", refresh_token),
+                ]))
+                .json::<TokenResponse>(),
+        )
+        .await,
+    )
+    .map(|response| credentials_from(response, Some(refresh_token.to_string())))
 }
 
 /// Fetch the account email for display; failures leave it unset.
 pub async fn fetch_account_email(access_token: &str) -> Option<String> {
-    let response = http()
-        .get(USERINFO_URL)
-        .bearer_auth(access_token)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response
-        .json::<UserinfoResponse>()
-        .await
-        .ok()
-        .and_then(|u| u.email)
+    let mut backend = http();
+    bounded_request(
+        backend
+            .get(USERINFO_URL)
+            .ok()?
+            .bearer_auth(access_token)
+            .header(zenwave::header::ACCEPT.as_str(), "application/json")
+            .ok()?
+            .json::<UserinfoResponse>(),
+    )
+    .await
+    .ok()
+    .and_then(|u| u.email)
 }
 
 /// Resolve a usable `api.x.ai` bearer token.

@@ -4330,7 +4330,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -5578,7 +5577,6 @@ dependencies = [
  "open",
  "ratatui",
  "repo-search-client",
- "reqwest 0.12.28",
  "rustix 1.1.6",
  "rustls",
  "serde",
@@ -5592,6 +5590,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "zenwave",
 ]
 
 [[package]]
@@ -5660,7 +5659,6 @@ dependencies = [
  "p256",
  "pulldown-cmark",
  "regex",
- "reqwest 0.12.28",
  "rustix 1.1.6",
  "schemars",
  "serde",
@@ -5676,6 +5674,7 @@ dependencies = [
  "tokio-test",
  "toml 0.8.23",
  "tracing",
+ "url",
  "utoipa",
  "walkdir",
  "web-push",
@@ -5823,7 +5822,6 @@ dependencies = [
  "may-tasks",
  "percent-encoding",
  "regex",
- "reqwest 0.12.28",
  "rustix 1.1.6",
  "schemars",
  "serde",
@@ -6046,7 +6044,6 @@ dependencies = [
  "may-protocol",
  "may-tasks",
  "regex",
- "reqwest 0.12.28",
  "schemars",
  "semver",
  "serde",
@@ -6064,6 +6061,7 @@ dependencies = [
  "url",
  "utoipa",
  "whatlang",
+ "zenwave",
  "zip 9.5.0",
 ]
 
@@ -6182,11 +6180,11 @@ dependencies = [
  "may-config",
  "may-harness",
  "may-protocol",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+ "zenwave",
 ]
 
 [[package]]
@@ -8980,21 +8978,16 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
- "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls",
  "tower",
  "tower-http",
  "tower-service",
@@ -9002,7 +8995,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]

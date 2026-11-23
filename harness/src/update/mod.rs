@@ -134,7 +134,7 @@ pub enum UpdateError {
     InvalidChecksum,
     /// GitHub answered with an error or could not be reached.
     #[error("GitHub request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] zenwave::Error),
     /// GitHub's answer is not the documented shape.
     #[error("unreadable GitHub response: {0}")]
     Json(#[from] serde_json::Error),

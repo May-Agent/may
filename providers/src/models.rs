@@ -5,8 +5,9 @@ use aither_cloud::{
 };
 use aither_core::llm::LanguageModelProvider;
 use aither_models::{ModelMode, ModelRegistry, Provider, lookup as lookup_model_info};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
+use zenwave::Client as _;
+use zenwave::header::AUTHORIZATION;
 
 use may_config::config::{MayConfig, ProviderInstance, ProviderType};
 
@@ -18,7 +19,7 @@ pub enum ModelFetchError {
     Provider(String),
     /// HTTP error.
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] zenwave::Error),
     /// Copilot not authenticated.
     #[error("Copilot not authenticated")]
     CopilotNotAuthenticated,
@@ -297,25 +298,15 @@ async fn fetch_openai_compatible_models(
 ) -> Result<Vec<FetchedModel>, ModelFetchError> {
     let base_url = base_url.unwrap_or("https://api.openai.com/v1");
     let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut headers = HeaderMap::new();
+    let mut backend = zenwave::client();
+    let mut builder = backend.get(&endpoint)?;
     if !api_key.is_empty() {
-        let token = format!("Bearer {api_key}");
-        let value = HeaderValue::from_str(&token)
-            .expect("authorization header constructed from configured API key must be valid");
-        headers.insert(AUTHORIZATION, value);
+        builder = builder.header(AUTHORIZATION.as_str(), format!("Bearer {api_key}"))?;
     }
-
-    let response = reqwest::Client::builder()
-        .timeout(FETCH_REQUEST_TIMEOUT)
-        .build()
-        .expect("the HTTP client builds with its default configuration")
-        .get(endpoint)
-        .headers(headers)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<OpenAiModelListResponse>()
-        .await?;
+    let response: OpenAiModelListResponse = bounded(FETCH_REQUEST_TIMEOUT, builder.json(), |_| {
+        zenwave::Error::Timeout
+    })
+    .await?;
 
     let registry = ModelRegistry::bundled();
     let outdated_index = OutdatedIndex::of(registry);

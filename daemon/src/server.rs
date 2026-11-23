@@ -422,6 +422,12 @@ pub async fn start(
             .await;
         });
     }
+    // Build the shared HTTP transport — TLS engine and the platform trust
+    // store — at daemon startup, off the async worker, so the first session's
+    // LLM request never pays the one-time verifier construction.
+    state
+        .tokio_handle
+        .spawn(blocking::unblock(|| drop(zenwave::client())));
     super::archive::spawn(state.clone());
     if let Some(cm) = state.container_manager.load_full() {
         let _auto_stop = cm.spawn_auto_stop_task();

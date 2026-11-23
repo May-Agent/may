@@ -97,7 +97,7 @@ arc-swap = { version = "1", features = ["weak"] }
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
 getrandom = "0.4"
 regex = "1.12"
 walkdir = "2"

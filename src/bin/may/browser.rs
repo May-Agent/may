@@ -52,7 +52,7 @@ pub enum BrowserCliError {
     #[error("failed to fetch browser debugger metadata from {endpoint}: {source}")]
     FetchBrowserVersion {
         endpoint: String,
-        source: reqwest::Error,
+        source: zenwave::Error,
     },
     #[error("browser debugger metadata request to {endpoint} returned HTTP {status}")]
     FetchBrowserVersionStatus { endpoint: String, status: u16 },
@@ -651,35 +651,37 @@ async fn fetch_browser_targets(
 }
 
 async fn resolve_browser_websocket_endpoint(endpoint: &str) -> Result<String, BrowserCliError> {
+    use zenwave::Client as _;
+
     if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
         return Ok(endpoint.to_string());
     }
     let metadata_url = format!("{}/json/version", endpoint.trim_end_matches('/'));
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .expect("reqwest client builder must succeed")
-        .get(metadata_url)
-        .send()
-        .await
-        .map_err(|source| BrowserCliError::FetchBrowserVersion {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(BrowserCliError::FetchBrowserVersionStatus {
+    let mut backend = zenwave::client();
+    let metadata = futures_lite::future::race(
+        backend
+            .get(&metadata_url)
+            .map_err(|source| BrowserCliError::FetchBrowserVersion {
+                endpoint: endpoint.to_string(),
+                source,
+            })?
+            .json::<BrowserVersionMetadata>(),
+        async {
+            async_io::Timer::after(std::time::Duration::from_secs(5)).await;
+            Err(zenwave::Error::Timeout)
+        },
+    )
+    .await
+    .map_err(|source| match source {
+        zenwave::Error::Http { status, .. } => BrowserCliError::FetchBrowserVersionStatus {
             endpoint: endpoint.to_string(),
             status: status.as_u16(),
-        });
-    }
-    let metadata = response
-        .json::<BrowserVersionMetadata>()
-        .await
-        .map_err(|source| BrowserCliError::FetchBrowserVersion {
+        },
+        other => BrowserCliError::FetchBrowserVersion {
             endpoint: endpoint.to_string(),
-            source,
-        })?;
+            source: other,
+        },
+    })?;
     metadata.web_socket_debugger_url.ok_or_else(|| {
         BrowserCliError::MissingBrowserDebuggerWebSocket {
             endpoint: endpoint.to_string(),
