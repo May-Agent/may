@@ -1,0 +1,1 @@
+Swarm board (epoch {{ board_epoch }}) has {{ unread_count }} unread {% if unread_count == 1 %}message{% else %}messages{% endif %} ({{ board_epoch }}:{{ first_seq }}{% if first_seq != last_seq %}..{{ board_epoch }}:{{ last_seq }}{% endif %}); run `board` to read.

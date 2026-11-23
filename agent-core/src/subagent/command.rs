@@ -124,6 +124,9 @@ pub struct SubagentSettings<LLM> {
     pub fork_source: ForkSource,
     /// The tools every agent of the session registers.
     pub toolkit: ShellToolkit,
+    /// What a read-only subagent's shell escalates through: nothing its
+    /// scripts run may leave the sandbox.
+    pub read_only_permissions: crate::terminal_permission_handler::TerminalPermissionHandler,
     /// Holds prompts to the working language.
     pub languages: Option<LanguageGuard>,
     /// The connected external agents.
@@ -414,20 +417,25 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
     }
 
     /// The shell a subagent holding `grant` works in, derived from the
-    /// caller's.
+    /// caller's; a `confined` one's scripts stay inside the sandbox.
     async fn launch(
         &self,
         grant: SubagentGrant,
         caller: Option<&Path>,
         name: &str,
+        confined: bool,
     ) -> anyhow::Result<SessionShell> {
         let Some(shell) = &self.shell else {
             anyhow::bail!("a subagent needs the shell of the agent that launches it");
         };
-        shell
+        let mut shell = shell
             .subagent(grant, caller, name)
             .await
-            .map_err(|error| anyhow::anyhow!("failed to create the subagent's shell: {error}"))
+            .map_err(|error| anyhow::anyhow!("failed to create the subagent's shell: {error}"))?;
+        if confined {
+            shell = shell.with_approver(self.settings().read_only_permissions.clone());
+        }
+        Ok(shell)
     }
 
     async fn start_external(
@@ -441,7 +449,12 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         // The agent and its commands run in the space and with the grants of
         // this shell, as a native subagent's commands do.
         let shell = self
-            .launch(requested.grant(Some(working_dir)), Some(working_dir), agent)
+            .launch(
+                requested.grant(Some(working_dir)),
+                Some(working_dir),
+                agent,
+                false,
+            )
             .await?;
         let ledger = shell.commit_ledger();
         let working_copies = shell
@@ -574,8 +587,18 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                 }
             }
         };
+        let confined = matches!(
+            &source,
+            Source::Definition(definition)
+                if definition.access == SubagentAccess::ReadOnly
+        );
         let shell = self
-            .launch(grant.grant(Some(self.caller_dir(caller))), caller, &name)
+            .launch(
+                grant.grant(Some(self.caller_dir(caller))),
+                caller,
+                &name,
+                confined,
+            )
             .await?;
         Ok(Pending {
             name,

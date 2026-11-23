@@ -1,6 +1,7 @@
 //! `btw` against real session agents on a stub model server: the fork
 //! answers from the recipient's context, leaves the recipient untouched,
-//! refuses a cold recipient before any model call, and cannot write.
+//! refuses a cold recipient before any model call, reads the workspace
+//! but cannot write.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,8 +25,9 @@ const FACT: &str = "FACT-SENTINEL the release branch is rel/2026-11";
 const QUESTION: &str = "BTW-SENTINEL which branch carries the release?";
 const ANSWER: &str = "ANSWER-SENTINEL rel/2026-11";
 const WRITE_QUESTION: &str = "BTW-WRITE-SENTINEL record the branch in a file";
-/// Opening words of the refusal every command of a btw fork gets.
-const REFUSAL: &str = "A btw fork answers from its context alone";
+const READ_QUESTION: &str = "BTW-READ-SENTINEL what does the marker file say?";
+/// What a file in the asker's workspace holds, for the fork to read out.
+const MARKER: &str = "MARKER-SENTINEL the fork read this";
 
 /// The daemon's view of the asking and the answering agent.
 struct Host {
@@ -251,41 +253,55 @@ async fn a_cold_recipient_is_refused_without_a_model_call() {
     assert!(empty_or_absent(&host.spaces()), "no fork was launched");
 }
 
-/// A command the fork runs is refused before it starts, even one writing
-/// where the asking terminal may write; the fork then answers.
+/// A fork may run read-only commands — a `cat` of the asker's workspace
+/// reaches its model — while a write outside its own space is refused by
+/// the sandbox; either way the fork answers after the command's result.
 #[tokio::test]
-async fn the_fork_cannot_write() {
+async fn the_fork_reads_but_cannot_write() {
     let leak = tempfile::tempdir().expect("leak dir");
     let target = leak.path().join("leaked.txt");
-    let script = format!("echo leaked > '{}'", target.display());
+    let host = Host::new().await;
+    let marker_path = host.asker_root.path().join("marker.txt");
+    std::fs::write(&marker_path, MARKER).expect("marker is written");
+    let write_script = format!("echo leaked > '{}'", target.display());
+    let read_script = format!("cat '{}'", marker_path.display());
     let stub = StubModel::spawn_scripted(SESSION_MODEL, move |body| {
-        if !body.contains(WRITE_QUESTION) {
-            return None;
-        }
-        Some(if body.contains(REFUSAL) {
-            StubReply::Text(ANSWER.to_string())
+        let script = if last_message(body).contains(WRITE_QUESTION) {
+            write_script.clone()
+        } else if last_message(body).contains(READ_QUESTION) {
+            read_script.clone()
+        } else if body.contains(WRITE_QUESTION) || body.contains(READ_QUESTION) {
+            return Some(StubReply::Text(ANSWER.to_string()));
         } else {
-            StubReply::ToolCall {
-                name: "terminal",
-                arguments: serde_json::json!({
-                    "description": "record the branch",
-                    "script": script,
-                    "mode": "default",
-                    "timeout": 30,
-                }),
-            }
+            return None;
+        };
+        Some(StubReply::ToolCall {
+            name: "terminal",
+            arguments: serde_json::json!({
+                "description": "gather the answer",
+                "script": script,
+                "mode": "default",
+                "timeout": 30,
+            }),
         })
     })
     .await;
-    let host = Host::new().await;
     let _session = host.recipient(&stub).await;
+
+    let answer = host.ask(READ_QUESTION).await.expect("the fork answers");
+    assert_eq!(answer.answer, ANSWER);
+    assert!(
+        !requests_with(&stub, MARKER).await.is_empty(),
+        "the read's output reached the fork's model"
+    );
 
     let answer = host.ask(WRITE_QUESTION).await.expect("the fork answers");
     assert_eq!(answer.answer, ANSWER);
     assert!(!target.exists(), "the fork wrote {}", target.display());
-    assert!(
-        !requests_with(&stub, REFUSAL).await.is_empty(),
-        "the refusal reached the fork's model"
+    assert_eq!(
+        requests_with(&stub, WRITE_QUESTION).await.len(),
+        2,
+        "the sandbox refused the write and the result reached the model"
     );
     assert!(
         empty_or_absent(&host.spaces()),

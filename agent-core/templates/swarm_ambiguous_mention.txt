@@ -1,0 +1,1 @@
+`@{{ mention }}` matches more than one member on this swarm board ({{ candidates.join(", ") }}); address the intended peer by `@<session-id>`.

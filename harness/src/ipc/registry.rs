@@ -441,6 +441,7 @@ fn definition_entry(definition: &ToolDefinition, handler: Handler) -> (String, E
 pub struct CommandRegistryBuilder {
     entries: HashMap<String, Entry>,
     sets: Vec<AnyCommandSet>,
+    set_policies: Vec<(SubagentSide, Modes)>,
     observer: Option<AnyCommandObserver>,
     kept: HashSet<String>,
     call_images: CallImageStore,
@@ -648,27 +649,42 @@ impl CommandRegistryBuilder {
         self.entries.insert(name, entry);
     }
 
-    /// Registers every command `set` holds, for both roles in every mode.
-    /// A name a command registered any other way has stays with that command.
+    /// Registers every command `set` holds, for both roles in every mode
+    /// unless restricted by [`Self::main_only`], [`Self::main_exclusive`] or
+    /// [`Self::sandboxed_only`]. A name a command registered any other way has
+    /// stays with that command.
     pub fn command_set(&mut self, set: impl CommandSet) {
         self.sets.push(AnyCommandSet::new(set));
+        self.set_policies.push((SubagentSide::Same, Modes::Every));
     }
 
     /// Reserves for the main agent every command `configure` registers: a
     /// subagent's call is refused with a message naming the command.
     pub fn main_only(&mut self, configure: impl FnOnce(&mut Self)) {
-        self.restrict(configure, |entry| entry.subagent = SubagentSide::Reserved);
+        self.restrict(
+            configure,
+            |entry| entry.subagent = SubagentSide::Reserved,
+            |subagent, _| *subagent = SubagentSide::Reserved,
+        );
     }
 
     /// Registers for the main agent alone what `configure` registers: a
     /// subagent has no such command.
     pub fn main_exclusive(&mut self, configure: impl FnOnce(&mut Self)) {
-        self.restrict(configure, |entry| entry.subagent = SubagentSide::Absent);
+        self.restrict(
+            configure,
+            |entry| entry.subagent = SubagentSide::Absent,
+            |subagent, _| *subagent = SubagentSide::Absent,
+        );
     }
 
     /// Registers what `configure` registers for sandboxed scripts alone.
     pub fn sandboxed_only(&mut self, configure: impl FnOnce(&mut Self)) {
-        self.restrict(configure, |entry| entry.modes = Modes::Sandboxed);
+        self.restrict(
+            configure,
+            |entry| entry.modes = Modes::Sandboxed,
+            |_, modes| *modes = Modes::Sandboxed,
+        );
     }
 
     /// Marks every command `configure` registers as one whose exchanges are
@@ -683,21 +699,28 @@ impl CommandRegistryBuilder {
             registered.sets.is_empty(),
             "a command set cannot be kept through compaction"
         );
+        self.kept.extend(registered.kept);
         self.kept.extend(registered.entries.keys().cloned());
         self.entries.extend(registered.entries);
     }
 
-    fn restrict(&mut self, configure: impl FnOnce(&mut Self), apply: impl Fn(&mut Entry)) {
+    fn restrict(
+        &mut self,
+        configure: impl FnOnce(&mut Self),
+        apply_entry: impl Fn(&mut Entry),
+        apply_set: impl Fn(&mut SubagentSide, &mut Modes),
+    ) {
         let mut scoped = Self::new();
         configure(&mut scoped);
-        assert!(
-            scoped.sets.is_empty(),
-            "a command set serves every role and mode"
-        );
         self.kept.extend(scoped.kept);
         for (name, mut entry) in scoped.entries {
-            apply(&mut entry);
+            apply_entry(&mut entry);
             self.entries.insert(name, entry);
+        }
+        for (set, (mut subagent, mut modes)) in scoped.sets.into_iter().zip(scoped.set_policies) {
+            apply_set(&mut subagent, &mut modes);
+            self.sets.push(set);
+            self.set_policies.push((subagent, modes));
         }
     }
 
@@ -713,6 +736,7 @@ impl CommandRegistryBuilder {
         CommandRegistry {
             entries: Arc::new(self.entries),
             sets: self.sets.into(),
+            set_policies: self.set_policies.into(),
             observer: self.observer,
             kept: Arc::new(self.kept),
             kept_tx,
@@ -728,6 +752,7 @@ impl CommandRegistryBuilder {
 pub struct CommandRegistry {
     entries: Arc<HashMap<String, Entry>>,
     sets: Arc<[AnyCommandSet]>,
+    set_policies: Arc<[(SubagentSide, Modes)]>,
     observer: Option<AnyCommandObserver>,
     kept: Arc<HashSet<String>>,
     kept_tx: Sender<ToolCallId>,
@@ -769,42 +794,53 @@ impl CommandRegistry {
         if self.entries.contains_key(name) {
             return None;
         }
-        self.sets.iter().find_map(|set| {
-            let definition = set
-                .definitions()
-                .into_iter()
-                .find(|definition| definition.name() == name)?;
-            let set = set.clone();
-            let command = name.to_string();
-            let handler = Arc::new(move |call, arguments| {
+        self.sets
+            .iter()
+            .zip(self.set_policies.iter())
+            .find_map(|(set, (subagent, modes))| {
+                let definition = set
+                    .definitions()
+                    .into_iter()
+                    .find(|definition| definition.name() == name)?;
                 let set = set.clone();
-                let command = command.clone();
-                Box::pin(async move {
-                    set.call(&command, call, arguments)
-                        .await
-                        .map(HandlerOutput::from)
-                }) as HandlerFuture
-            });
-            let schema = checked_schema(definition.arguments_openai_schema());
-            let tool = name.to_string();
-            let raw: Handler = Arc::new(move |caller, args| {
-                let schema = schema.clone();
-                let tool = tool.clone();
-                let handler = handler.clone();
-                Box::pin(async move {
-                    match cli_to_json(&schema, &args) {
-                        Ok(value) => handler(caller.call, value).await,
-                        Err(error) => Err(tool_usage_error(&error.to_string(), &tool)),
-                    }
-                })
-            });
-            Some(definition_entry(&definition, raw).1)
-        })
+                let command = name.to_string();
+                let handler = Arc::new(move |call, arguments| {
+                    let set = set.clone();
+                    let command = command.clone();
+                    Box::pin(async move {
+                        set.call(&command, call, arguments)
+                            .await
+                            .map(HandlerOutput::from)
+                    }) as HandlerFuture
+                });
+                let schema = checked_schema(definition.arguments_openai_schema());
+                let tool = name.to_string();
+                let raw: Handler = Arc::new(move |caller, args| {
+                    let schema = schema.clone();
+                    let tool = tool.clone();
+                    let handler = handler.clone();
+                    Box::pin(async move {
+                        match cli_to_json(&schema, &args) {
+                            Ok(value) => handler(caller.call, value).await,
+                            Err(error) => Err(tool_usage_error(&error.to_string(), &tool)),
+                        }
+                    })
+                });
+                let mut entry = definition_entry(&definition, raw).1;
+                entry.subagent = subagent.clone();
+                entry.modes = *modes;
+                Some(entry)
+            })
     }
 
-    fn set_names(&self) -> Vec<String> {
+    fn set_names(&self, role: Role, mode: SandboxMode) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for set in self.sets.iter() {
+        for (set, (subagent, modes)) in self.sets.iter().zip(self.set_policies.iter()) {
+            let admitted = modes.admits(mode)
+                && !(role == Role::Subagent && matches!(subagent, SubagentSide::Absent));
+            if !admitted {
+                continue;
+            }
             for definition in set.definitions() {
                 let name = definition.name();
                 if !self.entries.contains_key(name) && !names.iter().any(|known| known == name) {
@@ -826,58 +862,77 @@ impl CommandRegistry {
             .filter(|(_, entry)| entry.exists(role, mode))
             .map(|(name, _)| name.clone())
             .collect();
-        names.extend(self.set_names());
+        names.extend(self.set_names(role, mode));
         names
     }
 
     /// Whether `name` is a command `launch` can call.
     #[must_use]
     pub fn is_configured(&self, launch: &LaunchInfo, name: &str) -> bool {
+        let (role, mode) = (Role::of(launch), launch.mode);
         self.entries.get(name).map_or_else(
-            || self.set_names().iter().any(|set| set == name),
-            |entry| entry.exists(Role::of(launch), launch.mode),
+            || {
+                self.set_entry(name)
+                    .is_some_and(|entry| entry.exists(role, mode))
+            },
+            |entry| entry.exists(role, mode),
         )
     }
 
     /// Whether `name` is reserved for the main agent in `launch`'s role.
     #[must_use]
     pub fn is_reserved(&self, launch: &LaunchInfo, name: &str) -> bool {
-        self.entries
-            .get(name)
-            .is_some_and(|entry| entry.factory(Role::of(launch)).is_none())
+        let role = Role::of(launch);
+        self.entries.get(name).map_or_else(
+            || {
+                self.set_entry(name)
+                    .is_some_and(|entry| entry.factory(role).is_none())
+            },
+            |entry| entry.factory(role).is_none(),
+        )
     }
 
     /// The help text of `name` as `launch` sees it.
     #[must_use]
     pub fn help(&self, launch: &LaunchInfo, name: &str) -> Option<String> {
+        let (role, mode) = (Role::of(launch), launch.mode);
         self.entries.get(name).map_or_else(
-            || self.set_entry(name).map(|entry| entry.help),
-            |entry| {
-                entry
-                    .exists(Role::of(launch), launch.mode)
-                    .then(|| entry.help.clone())
+            || {
+                self.set_entry(name)
+                    .filter(|entry| entry.exists(role, mode))
+                    .map(|entry| entry.help)
             },
+            |entry| entry.exists(role, mode).then(|| entry.help.clone()),
         )
     }
 
     /// Whether `args` ask for the usage of `name` as `launch` sees it.
     #[must_use]
     pub fn requests_help(&self, launch: &LaunchInfo, name: &str, args: &[String]) -> bool {
+        let (role, mode) = (Role::of(launch), launch.mode);
         let asks = |entry: &Entry| requests_help(entry.schema.as_ref(), args);
         self.entries.get(name).map_or_else(
-            || self.set_entry(name).is_some_and(|entry| asks(&entry)),
-            |entry| entry.exists(Role::of(launch), launch.mode) && asks(entry),
+            || {
+                self.set_entry(name)
+                    .is_some_and(|entry| entry.exists(role, mode) && asks(&entry))
+            },
+            |entry| entry.exists(role, mode) && asks(entry),
         )
     }
 
     /// The stdin argument of `name` as `launch` sees it.
     #[must_use]
     pub fn stdin_arg(&self, launch: &LaunchInfo, name: &str) -> Option<String> {
+        let (role, mode) = (Role::of(launch), launch.mode);
         self.entries.get(name).map_or_else(
-            || self.set_entry(name).and_then(|entry| entry.stdin_arg),
+            || {
+                self.set_entry(name)
+                    .filter(|entry| entry.exists(role, mode))
+                    .and_then(|entry| entry.stdin_arg)
+            },
             |entry| {
                 entry
-                    .exists(Role::of(launch), launch.mode)
+                    .exists(role, mode)
                     .then(|| entry.stdin_arg.clone())
                     .flatten()
             },
@@ -901,11 +956,13 @@ impl CommandRegistry {
     ) -> CommandEnvelope {
         let (role, mode) = (Role::of(launch), launch.mode);
         let binding = Binding { launch, shell };
-        let handler = match self
+        let resolved = self
             .entries
             .get(name)
-            .filter(|entry| entry.exists(role, mode))
-        {
+            .cloned()
+            .or_else(|| self.set_entry(name))
+            .filter(|entry| entry.exists(role, mode));
+        let handler = match resolved {
             Some(entry) => match entry.factory(role) {
                 Some(factory) => factory(&binding),
                 None => {
@@ -916,16 +973,13 @@ impl CommandRegistry {
                     );
                 }
             },
-            None => match self.set_entry(name) {
-                Some(entry) => (entry.main)(&binding),
-                None => {
-                    return CommandEnvelope::failure(
-                        UnknownCommand { name }
-                            .render()
-                            .expect("the unknown-command template renders typed input"),
-                    );
-                }
-            },
+            None => {
+                return CommandEnvelope::failure(
+                    UnknownCommand { name }
+                        .render()
+                        .expect("the unknown-command template renders typed input"),
+                );
+            }
         };
         let caller = Caller {
             call: launch.call.clone(),
