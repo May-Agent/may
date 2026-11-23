@@ -258,7 +258,7 @@ impl MockOpenAiServer {
     async fn spawn_gated(scenario: MockChatScenario, gate: Option<Arc<RequestGate>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("mock OpenAI listener should bind");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let addr = listener
             .local_addr()
             .expect("mock OpenAI listener should expose local addr");
@@ -1249,7 +1249,7 @@ async fn handle_mock_openai_request(
         .into_body()
         .collect()
         .await
-        .expect("mock request body should collect")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
         .to_bytes();
     let payload: Value =
         serde_json::from_slice(&body).expect("mock OpenAI request should be valid JSON");
@@ -1317,7 +1317,7 @@ async fn write_request_transcript(path: &Path, requests: &Arc<tokio::sync::Mutex
     };
     async_fs::write(path, transcript)
         .await
-        .expect("model request transcript should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 fn json_response(
@@ -1448,7 +1448,7 @@ impl TestHarness {
         let may_dir = home_path.join(".may");
         tokio::fs::create_dir_all(&may_dir)
             .await
-            .expect("test may dir should be created");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
         let mut config = MayConfig::default();
         // Aux generation would fire an unscripted request per completed
@@ -1488,7 +1488,7 @@ impl TestHarness {
         config
             .save_to(&may_dir.join("config.toml"))
             .await
-            .expect("test config should be written");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
         // A typical user: an identity and no commit signing.
         std::fs::write(
@@ -1532,17 +1532,17 @@ impl TestHarness {
     async fn create_session_in_profile(&self, profile_slug: &str) -> TestSession {
         let (store, db, _default_profile_id) = initialize_session_persistence(&self.may_dir)
             .await
-            .expect("session persistence should initialize");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let profile_id = db
             .get_profile_by_slug(profile_slug)
             .await
-            .expect("profile lookup should succeed")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .unwrap_or_else(|| panic!("default profile `{profile_slug}` should exist"))
             .id;
         let session_id = db
             .issue_session_name()
             .await
-            .expect("a session name")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .to_string();
         store
             .create_session_dirs(
@@ -1551,7 +1551,7 @@ impl TestHarness {
                 SandboxResourceLayout::Symlinked,
             )
             .await
-            .expect("session directory layout should be created");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         db.create_session_in_profile(
             &session_id,
             None,
@@ -1559,7 +1559,7 @@ impl TestHarness {
             Some(profile_id.as_str()),
         )
         .await
-        .expect("session row should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let sandbox_dir = store.sandbox_dir(&session_id, Some(profile_id.as_str()));
         TestSession {
             id: session_id,
@@ -1736,7 +1736,7 @@ async fn warm_may_binary(home: &Path) {
         .env("HOME", home)
         .output()
         .await
-        .expect("may --help should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         output.status.success(),
         "may --help should succeed: {}",
@@ -1799,15 +1799,15 @@ async fn share_tool_cache(home_paths: &MayHomePaths) {
     let shared = shared_download_root().join("may-tools");
     tokio::fs::create_dir_all(&shared)
         .await
-        .expect("shared tool cache dir should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(unix)]
     tokio::fs::symlink(&shared, home_paths.tools_dir())
         .await
-        .expect("test home tool cache should link to the shared cache");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(windows)]
     tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
         .await
-        .expect("test home tool cache should link to the shared cache");
+        .unwrap_or_else(http_response_or_panic);
 }
 
 /// Points the test home's host-program cache at the shared repo-search binary.
@@ -1817,19 +1817,19 @@ async fn share_host_program_cache(home_paths: &MayHomePaths) {
         .join("host-programs");
     tokio::fs::create_dir_all(&shared)
         .await
-        .expect("shared host-program cache dir should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let cache = home_paths.host_programs_dir();
     tokio::fs::create_dir_all(cache.parent().expect("host-program cache has a parent"))
         .await
-        .expect("test home cache dir should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(unix)]
     tokio::fs::symlink(&shared, &cache)
         .await
-        .expect("test home host-program cache should link to the shared cache");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     #[cfg(windows)]
     tokio::fs::symlink_dir(&shared, &cache)
         .await
-        .expect("test home host-program cache should link to the shared cache");
+        .unwrap_or_else(http_response_or_panic);
 }
 
 /// Prepares the shared cache exactly once per run, behind a lock file in it:
@@ -1867,7 +1867,7 @@ async fn ensure_shared_tools_prepared(home_paths: &MayHomePaths) {
     bundle
         .prepare_local(&home_paths.tool_runtimes_dir())
         .await
-        .expect("baseline tools should prepare");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     distribution
         .prepare_host_program(
             HostProgram::RepoSearch,
@@ -1875,7 +1875,7 @@ async fn ensure_shared_tools_prepared(home_paths: &MayHomePaths) {
             &home_paths.host_programs_dir(),
         )
         .await
-        .expect("the repo-search host program should download and verify");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     std::fs::write(&ready, []).expect("ready marker should be written");
 }
 
@@ -1944,6 +1944,16 @@ struct TestSseEvent {
     id: Option<String>,
 }
 
+/// zenwave's transports error on 4xx/5xx where reqwest returned the
+/// response; recover it so status assertions keep working. Real
+/// transport failures still panic.
+fn http_response_or_panic(error: zenwave::Error) -> zenwave::Response {
+    match error {
+        zenwave::Error::Http { response, .. } => response.response,
+        error => panic!("request failed: {error}"),
+    }
+}
+
 /// The response's body decoded as JSON.
 async fn response_json(response: zenwave::Response) -> Value {
     serde_json::from_slice(
@@ -1951,7 +1961,7 @@ async fn response_json(response: zenwave::Response) -> Value {
             .into_body()
             .into_bytes()
             .await
-            .expect("response body reads"),
+            .unwrap_or_else(|error| panic!("operation failed: {error}")),
     )
     .expect("response body is JSON")
 }
@@ -2296,7 +2306,7 @@ impl PreparedEnvironment {
                     .sandbox_dir(session_id, Some(profile_id));
                 tokio::fs::canonicalize(&sandbox)
                     .await
-                    .expect("session sandbox directory should canonicalize")
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"))
                     .display()
                     .to_string()
             }
@@ -2316,11 +2326,11 @@ impl PreparedEnvironment {
                 let (_store, db, _default_profile_id) =
                     initialize_session_persistence(&harness.may_dir)
                         .await
-                        .expect("session persistence should initialize");
+                        .unwrap_or_else(|error| panic!("operation failed: {error}"));
                 let profile = db
                     .get_profile(&profile_id)
                     .await
-                    .expect("profile lookup should succeed")
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"))
                     .expect("container profile should exist");
                 let name = may_agent::container::profile::container_name_for_profile_session(
                     &profile,
@@ -2329,12 +2339,12 @@ impl PreparedEnvironment {
                 let container_id = manager
                     .resolve_container_id_by_name(&name)
                     .await
-                    .expect("session container lookup should succeed")
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"))
                     .unwrap_or_else(|| panic!("session container {name} should exist"));
                 manager
                     .remove(&container_id)
                     .await
-                    .expect("session container should be removed");
+                    .unwrap_or_else(|error| panic!("operation failed: {error}"));
             }
         }
     }
@@ -2364,7 +2374,7 @@ async fn create_session_via_api(
         .json_body(&serde_json::json!({ "profileId": profile_id }))
         .expect("JSON body serializes")
         .await
-        .expect("create session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let value: Value = response_json(response).await;
     value
@@ -2385,7 +2395,7 @@ async fn create_container_profile(harness: &TestHarness) -> String {
 
     let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
         .await
-        .expect("session persistence should initialize");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let key = format!(
         "e2e-{}-{}",
         std::process::id(),
@@ -2394,7 +2404,7 @@ async fn create_container_profile(harness: &TestHarness) -> String {
     if let Some(existing) = db
         .get_profile(&key)
         .await
-        .expect("profile lookup should succeed")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
     {
         return existing.id;
     }
@@ -2409,7 +2419,7 @@ async fn create_container_profile(harness: &TestHarness) -> String {
         location_aware: false,
     })
     .await
-    .expect("container profile should be created")
+    .unwrap_or_else(|error| panic!("operation failed: {error}"))
     .id
 }
 
@@ -2422,7 +2432,7 @@ async fn profile_id_via_api(
         .get(format!("{}/api/profiles", server.base_url))
         .expect("request builds")
         .await
-        .expect("list profiles request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let profiles: Value = response_json(response).await;
     profiles
@@ -2447,7 +2457,7 @@ async fn get_runtime(
         ))
         .expect("request builds")
         .await
-        .expect("runtime request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     response_json(response).await
 }
@@ -2485,7 +2495,7 @@ async fn the_harness_config_never_lets_a_daemon_update_itself() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
         .await
-        .expect("the harness config should load");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(!config.update.auto);
 }
 
@@ -2512,7 +2522,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec pwd should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         pwd_output.status.success(),
         "pwd command failed: {}",
@@ -2520,7 +2530,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
     );
     let expected_workdir = tokio::fs::canonicalize(&session.sandbox_dir)
         .await
-        .expect("session sandbox directory should canonicalize");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert_eq!(
         String::from_utf8_lossy(&pwd_output.stdout).trim(),
         expected_workdir.display().to_string()
@@ -2540,7 +2550,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec layout/help probe should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         layout_output.status.success(),
         "layout/help probe failed: {}",
@@ -2572,7 +2582,7 @@ async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec commit should run")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
 }
 
 #[tokio::test]
@@ -2658,7 +2668,7 @@ async fn a_terminal_command_runs_and_writes_in_the_session_directory_when_home_i
         &serde_json::json!({ "sessionId": session_id, "content": "run the probe" }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the symlinked-home turn", &server.log).await;
     assert!(
@@ -2737,7 +2747,7 @@ async fn a_tool_an_mcp_server_adds_mid_session_runs_and_is_announced_once() {
             &serde_json::json!({ "sessionId": session_id, "content": content }),
         )
         .await
-        .expect("chat stream request should succeed");
+        .unwrap_or_else(http_response_or_panic);
         let response = expect_status(&server.log, response, StatusCode::OK).await;
         let events = collect_turn_events(response, content, &server.log).await;
         assert!(
@@ -2829,7 +2839,7 @@ async fn exec_script(
         .env("PATH", path)
         .output()
         .await
-        .expect("may exec should run")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
 }
 
 #[tokio::test]
@@ -2851,7 +2861,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
         format!("#!/bin/sh\ntouch '{}'\necho gh-ran\n", gh_marker.display()),
     )
     .await
-    .expect("fake gh");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     std::fs::set_permissions(
         &fake_gh,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2861,7 +2871,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     tokio::fs::create_dir_all(&gh_config).await.expect("gh dir");
     tokio::fs::write(gh_config.join("hosts.yml"), "oauth_token: SECRET-TOKEN\n")
         .await
-        .expect("gh credentials");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let created = exec_script(
         &harness,
@@ -2985,7 +2995,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may exec large output probe should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     assert!(
         output.status.success(),
@@ -3007,7 +3017,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
     );
     let stored_contents = tokio::fs::read_to_string(&stored_path)
         .await
-        .expect("stored output file should be readable");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert_eq!(stored_contents.len(), 60000);
     assert!(stored_contents.chars().all(|ch| ch == 'x'));
 }
@@ -3024,7 +3034,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .json_body(&serde_json::json!({}))
         .expect("JSON body serializes")
         .await
-        .expect("create session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let create_response = expect_status(&server.log, create_response, StatusCode::OK).await;
     let created: Value = response_json(create_response).await;
     let session_id = created
@@ -3041,7 +3051,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .get(format!("{}/api/sessions", server.base_url))
         .expect("request builds")
         .await
-        .expect("list sessions request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let list_response = expect_status(&server.log, list_response, StatusCode::OK).await;
     let listed: Value = response_json(list_response).await;
     let contains = listed
@@ -3064,7 +3074,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         }))
         .expect("JSON body serializes")
         .await
-        .expect("update session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let update_response = expect_status(&server.log, update_response, StatusCode::OK).await;
     let updated: Value = response_json(update_response).await;
     assert_eq!(
@@ -3076,7 +3086,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
         .expect("request builds")
         .await
-        .expect("get session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let get_response = expect_status(&server.log, get_response, StatusCode::OK).await;
     let fetched: Value = response_json(get_response).await;
     assert_eq!(
@@ -3096,14 +3106,14 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .delete(format!("{}/api/sessions/{session_id}", server.base_url))
         .expect("request builds")
         .await
-        .expect("delete session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, delete_response, StatusCode::OK).await;
 
     let missing_response = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
         .expect("request builds")
         .await
-        .expect("missing session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, missing_response, StatusCode::NOT_FOUND).await;
 
     server.stop().await;
@@ -3138,7 +3148,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the first tasks turn", &server.log).await;
     assert!(
@@ -3182,7 +3192,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         .get(&tasks_url)
         .expect("request builds")
         .await
-        .expect("get tasks request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let payload: Value = response_json(response).await;
     assert_eq!(
@@ -3197,7 +3207,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         .json_body(&serde_json::json!({ "content": REWRITTEN, "planState": "disabled" }))
         .expect("JSON body serializes")
         .await
-        .expect("put tasks request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let payload: Value = response_json(response).await;
     assert_eq!(
@@ -3210,7 +3220,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     );
     let on_disk = tokio::fs::read_to_string(sandbox_dir.join("tasks.md"))
         .await
-        .expect("PUT should have written the canonical tasks.md");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert_eq!(on_disk, REWRITTEN);
 
     // A follow-up turn proves the injection reads the file: the rewritten
@@ -3224,7 +3234,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         }),
     )
     .await
-    .expect("second chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the follow-up tasks turn", &server.log).await;
     assert!(
@@ -3323,7 +3333,7 @@ async fn run_probe_turn_on(
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the subagent probe turn", &server.log).await;
     assert!(
@@ -3839,15 +3849,15 @@ async fn daemon_error_logs_its_cause() {
         .sessions_dir();
     if tokio::fs::try_exists(&sessions_dir)
         .await
-        .expect("sessions dir existence should be checkable")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
     {
         tokio::fs::remove_dir_all(&sessions_dir)
             .await
-            .expect("existing sessions dir should be removable");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
     }
     tokio::fs::write(&sessions_dir, b"not a directory")
         .await
-        .expect("sessions dir placeholder file should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let response = client
         .post(format!("{}/api/sessions", server.base_url))
@@ -3855,7 +3865,7 @@ async fn daemon_error_logs_its_cause() {
         .json_body(&serde_json::json!({ "profileId": profile_id }))
         .expect("JSON body serializes")
         .await
-        .expect("create session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::INTERNAL_SERVER_ERROR).await;
     let body: Value = response_json(response).await;
     assert_eq!(
@@ -3921,7 +3931,7 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
                 }),
             )
             .await
-            .expect("chat stream request should succeed");
+            .unwrap_or_else(http_response_or_panic);
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -3951,12 +3961,12 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
         ))
         .expect("request builds")
         .await
-        .expect("stop session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, stop_response, StatusCode::OK).await;
 
     let events = tokio::time::timeout(Duration::from_secs(15), chat_task)
         .await
-        .expect("cancelled chat stream should terminate promptly")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
         .expect("chat task should join");
     assert!(
         events.iter().any(|(kind, _)| kind == "text"),
@@ -3973,7 +3983,7 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
         ))
         .expect("request builds")
         .await
-        .expect("get transcript after cancel should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let transcript_response = expect_status(&server.log, transcript_response, StatusCode::OK).await;
     let transcript: Value = response_json(transcript_response).await;
     let assistant_messages = extract_assistant_messages(&transcript);
@@ -4026,7 +4036,7 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
                 }),
             )
             .await
-            .expect("chat stream request should succeed");
+            .unwrap_or_else(http_response_or_panic);
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -4073,7 +4083,7 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         chat_task,
     )
     .await
-    .expect("chat stream should finish before timeout")
+    .unwrap_or_else(|error| panic!("operation failed: {error}"))
     .expect("chat task should join");
     let server_logs = server.log.contents().await;
     assert!(
@@ -4158,14 +4168,14 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
     let config_path = harness.may_dir.join("config.toml");
     let mut config = MayConfig::load_from(&config_path)
         .await
-        .expect("harness config should load");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     config
         .set_provider_cache_lifetime(TEST_PROVIDER_ID, "2s")
         .expect("the lifetime parses");
     config
         .save_to(&config_path)
         .await
-        .expect("harness config should save");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
@@ -4186,11 +4196,11 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
             &serde_json::json!({ "sessionId": session_id, "content": content }),
         )
         .await
-        .expect("chat stream request should succeed");
+        .unwrap_or_else(http_response_or_panic);
         let response = expect_status(&server.log, response, StatusCode::OK).await;
         let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
             .await
-            .expect("chat stream should finish before timeout");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         assert!(
             events.iter().any(|(kind, _)| kind == "done"),
             "{content:?} should complete; events: {events:?}; server logs:\n{}",
@@ -4214,7 +4224,7 @@ async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
         ))
         .expect("request builds")
         .await
-        .expect("usage request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let usage: Value =
         response_json(expect_status(&server.log, response, StatusCode::OK).await).await;
     assert_eq!(
@@ -4269,7 +4279,7 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
             }),
         )
         .await
-        .expect("chat stream request should succeed");
+        .unwrap_or_else(http_response_or_panic);
         let status = response.status();
         assert!(
             status == StatusCode::OK,
@@ -4278,12 +4288,12 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
                 .into_body()
                 .into_string()
                 .await
-                .expect("refusal body should be readable"),
+                .unwrap_or_else(|error| panic!("operation failed: {error}")),
             server.log.contents().await
         );
         let events = tokio::time::timeout(turn_timeout, collect_sse_events(response))
             .await
-            .expect("chat stream should finish before timeout");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         assert!(
             events.iter().any(|(kind, _)| kind == "done"),
             "turn should complete with a done event; events: {events:?}; server logs:\n{}",
@@ -4351,11 +4361,11 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = tokio::time::timeout(Duration::from_secs(90), collect_sse_events(response))
         .await
-        .expect("the turn should finish after its retries");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
@@ -4376,7 +4386,7 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
         ))
         .expect("request builds")
         .await
-        .expect("get transcript request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let transcript: Value =
         response_json(expect_status(&server.log, transcript, StatusCode::OK).await).await;
     assert_eq!(
@@ -4425,7 +4435,7 @@ async fn priority_probe_command() -> String {
     let probe_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("priority-probe");
     async_fs::create_dir_all(&probe_dir)
         .await
-        .expect("probe directory should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let probe_binary = probe_dir.join("priority-probe");
     let rustc_output = probe_binary.clone();
     let compile = blocking::unblock(move || {
@@ -4439,7 +4449,7 @@ async fn priority_probe_command() -> String {
             .output()
     })
     .await
-    .expect("rustc should run");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         compile.status.success(),
         "probe compile failed: {}",
@@ -4494,7 +4504,7 @@ async fn exec_applies_local_command_priority() {
             .output()
     })
     .await
-    .expect("host probe should run");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         baseline_output.status.success(),
         "host probe failed: {}",
@@ -4534,12 +4544,12 @@ async fn exec_applies_local_command_priority() {
 
         let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should load");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         config.sandbox.command_priority = priority;
         config
             .save_to(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should save");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
         let session = harness.create_session().await;
 
@@ -4561,7 +4571,7 @@ async fn exec_applies_local_command_priority() {
                 .output()
         })
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
         assert!(
             output.status.success(),
             "may exec at {priority:?} failed: stdout={} stderr={}",
@@ -4633,7 +4643,7 @@ async fn the_baseline_tools_pass_their_acceptance_script_in_the_sandbox() {
             .output()
     })
     .await
-    .expect("may exec should run");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -4681,12 +4691,12 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
     for priority in [CommandPriority::Normal, CommandPriority::Low] {
         let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should load");
+            .unwrap_or_else(http_response_or_panic);
         config.sandbox.command_priority = priority;
         config
             .save_to(&harness.may_dir.join("config.toml"))
             .await
-            .expect("harness config should save");
+            .unwrap_or_else(http_response_or_panic);
 
         let home = harness.home_path().to_path_buf();
         let binary = binary.clone();
@@ -4708,7 +4718,7 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
                 .output()
         })
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(http_response_or_panic);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         println!("container script output at {priority:?}:\n{stdout}");
         assert!(
@@ -4760,7 +4770,7 @@ async fn ui_chat_reports_unreachable_provider_error() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -4769,7 +4779,7 @@ async fn ui_chat_reports_unreachable_provider_error() {
     );
     let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
         .await
-        .expect("chat stream should finish before timeout");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let exit = server
         .child
@@ -4825,7 +4835,7 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
             let path = script_dir.path().join("trigger-reader.sh");
             tokio::fs::write(&path, script)
                 .await
-                .expect("script file should be written");
+                .unwrap_or_else(|error| panic!("operation failed: {error}"));
             serde_json::json!({ "scriptPath": path.display().to_string() })
         }
     };
@@ -4850,7 +4860,7 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
         .json_body(&body)
         .expect("JSON body serializes")
         .await
-        .expect("create task request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let created: Value = response_json(response).await;
     let task_id = created
@@ -4863,7 +4873,7 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
         .post(format!("{}/api/tasks/{task_id}/run", server.base_url))
         .expect("request builds")
         .await
-        .expect("run task request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, response, StatusCode::OK).await;
 
     let deadline = Instant::now() + CONTAINER_TASK_RUN_TIMEOUT;
@@ -4872,7 +4882,7 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
             .get(format!("{}/api/tasks/{task_id}", server.base_url))
             .expect("request builds")
             .await
-            .expect("get task request should succeed");
+            .unwrap_or_else(http_response_or_panic);
         let response = expect_status(&server.log, response, StatusCode::OK).await;
         let task: Value = response_json(response).await;
         let status = task.get("lastRunStatus").and_then(Value::as_str);
@@ -4910,22 +4920,22 @@ async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
     {
         let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
             .await
-            .expect("session persistence should initialize");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
         let profile = db
             .get_profile(&profile_id)
             .await
-            .expect("profile lookup should succeed")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("container profile should exist");
         let name = format!("may-{}", profile.slug.as_deref().unwrap_or(&profile.id));
         let container_id = manager
             .resolve_container_id_by_name(&name)
             .await
-            .expect("task container lookup should succeed")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .unwrap_or_else(|| panic!("task container {name} should exist"));
         manager
             .remove(&container_id)
             .await
-            .expect("task container should be removed");
+            .unwrap_or_else(|error| panic!("operation failed: {error}"));
     }
 }
 
@@ -4960,7 +4970,7 @@ async fn answer_open_question(
         }))
         .expect("JSON body serializes")
         .await
-        .expect("ask-user respond request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, response, StatusCode::OK).await;
 }
 
@@ -5001,7 +5011,7 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the asking turn", &server.log).await;
     assert!(
@@ -5092,7 +5102,7 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
         }),
     )
     .await
-    .expect("chat stream request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let response = expect_status(&server.log, response, StatusCode::OK).await;
 
     tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
@@ -5152,7 +5162,7 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
     let mut config: toml::Table = toml::from_str(
         &tokio::fs::read_to_string(&config_path)
             .await
-            .expect("test config should be readable"),
+            .unwrap_or_else(|error| panic!("operation failed: {error}")),
     )
     .expect("test config should parse");
     let mut daemon = toml::Table::new();
@@ -5163,17 +5173,17 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
         toml::to_string(&config).expect("test config should serialize"),
     )
     .await
-    .expect("test config should be written");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     // One-shot runs use the default profile, a container one; this host may
     // have no container runtime, so the profile runs locally instead.
     let db = may_agent::db::ChatDb::open(&harness.home_path().join(".may/history.db"))
         .await
-        .expect("test database should open");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let default_profile = db
         .ensure_default_profiles()
         .await
-        .expect("default profiles should exist");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     db.update_profile(
         &default_profile,
         may_agent::db::UpdateProfileParams {
@@ -5188,7 +5198,7 @@ async fn prepare_oneshot_home(harness: &TestHarness) {
         },
     )
     .await
-    .expect("default profile should switch to local");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
     drop(db);
 }
 
@@ -5212,7 +5222,7 @@ async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
         .expect("may one-shot should spawn")
         .wait_with_output()
         .await
-        .expect("may one-shot should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
         .await
         .unwrap_or_default();
@@ -5223,7 +5233,7 @@ async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5283,14 +5293,14 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     let output = oneshot
         .wait_with_output()
         .await
-        .expect("may one-shot should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let stop = Command::new(&binary)
         .args(["daemon", "stop"])
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     assert!(
         output.status.success(),
@@ -5339,7 +5349,7 @@ async fn oneshot_run_prints_a_burst_turn_through_its_end() {
         .expect("may one-shot should spawn")
         .wait_with_output()
         .await
-        .expect("may one-shot should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
         .await
         .unwrap_or_default();
@@ -5349,7 +5359,7 @@ async fn oneshot_run_prints_a_burst_turn_through_its_end() {
         .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5441,12 +5451,12 @@ async fn install_repo_search_agents(
         ))
         .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let mut reader = SseReader::new(events);
     let snapshot = loop {
         let event = tokio::time::timeout(Duration::from_secs(120), reader.next_event())
             .await
-            .expect("an index snapshot should arrive")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("the stream should stay open");
         if event.event == "session_index" {
             break event.data;
@@ -5530,7 +5540,7 @@ async fn background_of(
         ))
         .expect("request builds")
         .await
-        .expect("background request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     response_json(expect_status(&server.log, response, StatusCode::OK).await).await
 }
 
@@ -5558,7 +5568,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
         .expect("request builds")
         .await
-        .expect("session request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let session: Value = response_json(session).await;
     let cursor = session
         .get("cursor")
@@ -5573,7 +5583,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
     assert!(
@@ -5598,12 +5608,12 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         ))
         .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let mut reader = SseReader::new(events);
     let pid = loop {
         let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
             .await
-            .expect("a job.upserted event should arrive")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("the stream should stay open");
         if event.event != "job.upserted" {
             continue;
@@ -5627,7 +5637,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         ))
         .expect("request builds")
         .await
-        .expect("kill request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let killed: Value =
         response_json(expect_status(&server.log, response, StatusCode::OK).await).await;
     assert_eq!(killed.get("ok"), Some(&Value::Bool(true)), "{killed}");
@@ -5672,7 +5682,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn starting the job", &server.log).await;
     assert!(
@@ -5689,7 +5699,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         ))
         .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let runtime = client
         .get(format!(
             "{}/api/sessions/{session_id}/runtime",
@@ -5697,7 +5707,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         ))
         .expect("request builds")
         .await
-        .expect("runtime request should succeed");
+        .unwrap_or_else(http_response_or_panic);
     let runtime: Value = response_json(runtime).await;
     assert_ne!(
         runtime.get("state").and_then(Value::as_str),
@@ -5740,7 +5750,7 @@ async fn agent_frames(
         .get(url)
         .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     SseReader::new(response)
 }
 
@@ -5753,7 +5763,7 @@ async fn next_turn_frame(reader: &mut SseReader) -> TestSseEvent {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(20), reader.next_event())
             .await
-            .expect("a frame should arrive")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .expect("the stream should stay open");
         if event.event == "session_agent" || event.event == "reset" {
             return event;
@@ -5802,7 +5812,7 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
         &serde_json::json!({ "sessionId": session_id, "content": "write slowly" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
 
     // Read the start and a few chunks, then drop the stream mid-turn.
@@ -5906,7 +5916,7 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the compacting turn", &server.log).await;
     assert!(
@@ -5945,7 +5955,7 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         }),
     )
     .await
-    .expect("follow-up turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the restart", &server.log).await;
     assert!(
@@ -6002,7 +6012,7 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
         }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
 
     let mut agent_events = Vec::new();
@@ -6073,7 +6083,7 @@ async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events(
         }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn to compact", &server.log).await;
     assert!(
@@ -6092,7 +6102,7 @@ async fn an_explicit_compact_reports_its_start_and_finish_on_the_session_events(
         .json_body(&serde_json::json!({}))
         .expect("JSON body serializes")
         .await
-        .expect("the compact request should be answered");
+        .unwrap_or_else(http_response_or_panic);
     let compacted = expect_status(&server.log, compacted, StatusCode::OK).await;
     let compacted: Value = response_json(compacted).await;
     assert_eq!(compacted["compacted"], true, "{compacted}");
@@ -6139,7 +6149,7 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(stop.status.success(), "daemon stop failed");
     assert_eq!(
         held,
@@ -6172,13 +6182,13 @@ async fn container_and_local_commands_share_the_daemons_job_pool() {
         .sandbox_dir(&container_session, Some(environment.profile_id()));
     tokio::fs::create_dir_all(container_sandbox.join("tmp"))
         .await
-        .expect("container session tmp should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     tokio::fs::write(
         container_sandbox.join("tmp/job_probe.py"),
         include_str!("fixtures/job_probe.py"),
     )
     .await
-    .expect("probe should be written");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
 
     // The turn ends with the model's reply; the probe keeps its tokens.
     let turn = send_turn(
@@ -6187,7 +6197,7 @@ async fn container_and_local_commands_share_the_daemons_job_pool() {
         &serde_json::json!({ "sessionId": container_session, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     collect_turn_events(turn, "the container probe turn", &server.log).await;
     let report = container_sandbox.join("tmp/held");
@@ -6203,7 +6213,7 @@ async fn container_and_local_commands_share_the_daemons_job_pool() {
     assert_eq!(
         tokio::fs::read_to_string(&report)
             .await
-            .expect("container probe report should be readable")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .trim(),
         POOL.to_string(),
         "the container command drew every token of the daemon pool"
@@ -6232,7 +6242,7 @@ async fn set_job_pool_size(harness: &TestHarness, size: i64) {
     let mut config: toml::Table = toml::from_str(
         &tokio::fs::read_to_string(&config_path)
             .await
-            .expect("test config should be readable"),
+            .unwrap_or_else(|error| panic!("operation failed: {error}")),
     )
     .expect("test config should parse");
     let sandbox = config
@@ -6246,7 +6256,7 @@ async fn set_job_pool_size(harness: &TestHarness, size: i64) {
         toml::to_string(&config).expect("test config should serialize"),
     )
     .await
-    .expect("test config should be written");
+    .unwrap_or_else(|error| panic!("operation failed: {error}"));
 }
 
 /// Runs the job probe through `may exec` in the local session `session_id`
@@ -6259,11 +6269,11 @@ async fn tokens_held_by_exec_probe(
     // The sandbox reads only the session's own files.
     tokio::fs::create_dir_all(sandbox_dir.join("tmp"))
         .await
-        .expect("session tmp should be created");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let probe = sandbox_dir.join("tmp/job_probe.py");
     tokio::fs::write(&probe, include_str!("fixtures/job_probe.py"))
         .await
-        .expect("probe should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let report = sandbox_dir.join("tmp/held");
     let output = Command::new(may_binary_path())
         .arg("exec")
@@ -6284,7 +6294,7 @@ async fn tokens_held_by_exec_probe(
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(
         output.status.success(),
         "exec failed: {}",
@@ -6307,7 +6317,7 @@ async fn lease_every_free_word(
     let connect_and_drain = || async {
         let ids = may_agent::client::ids::DaemonIds::connect(socket)
             .await
-            .expect("the daemon id connection")
+            .unwrap_or_else(|error| panic!("operation failed: {error}"))
             .session(session_id);
         tokio::task::spawn_blocking(move || {
             let mut leases = Vec::new();
@@ -6317,7 +6327,7 @@ async fn lease_every_free_word(
             (ids, leases)
         })
         .await
-        .expect("leasing finishes")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
     };
     let ((first, second), (third, fourth)) = futures_lite::future::zip(
         futures_lite::future::zip(connect_and_drain(), connect_and_drain()),
@@ -6339,7 +6349,7 @@ async fn served(ids: may_agent::model_ids::SessionIds) -> may_agent::model_ids::
         ids
     })
     .await
-    .expect("the claim finishes")
+    .unwrap_or_else(|error| panic!("operation failed: {error}"))
 }
 
 /// The word `may exec` leased from the session's pool for its background job's
@@ -6427,7 +6437,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     }
     let output = running
         .await
-        .expect("exec task")
+        .unwrap_or_else(|error| panic!("operation failed: {error}"))
         .expect("may exec should run");
     let exec_word = killed_exec_output_word(&session.sandbox_dir, &output);
     assert!(
@@ -6449,7 +6459,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
     let ids = served(ids).await;
     let output = exec(&other.id, "while :; do sleep 0.1; done".to_string(), "1")
         .await
-        .expect("may exec should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let exec_word = killed_exec_output_word(&other.sandbox_dir, &output);
     assert!(
         free.contains(&exec_word),
@@ -6462,7 +6472,7 @@ async fn exec_and_the_daemon_never_lease_one_word_of_a_session() {
         .env("HOME", harness.home_path())
         .output()
         .await
-        .expect("may daemon stop should run");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     assert!(stop.status.success(), "daemon stop failed");
 }
 
@@ -6561,7 +6571,7 @@ async fn start_background_job(
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
     assert!(
@@ -6638,14 +6648,14 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
     let config_path = harness.may_dir.join("config.toml");
     let mut config = MayConfig::load_from(&config_path)
         .await
-        .expect("test config should load");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     config
         .set_provider_cache_lifetime(TEST_PROVIDER_ID, "2s")
         .expect("a valid cache lifetime");
     config
         .save_to(&config_path)
         .await
-        .expect("test config should be written");
+        .unwrap_or_else(|error| panic!("operation failed: {error}"));
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let mut client = zenwave::client();
     let environment = ChatEnvironment::Local
@@ -6659,7 +6669,7 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
         &serde_json::json!({ "sessionId": session_id, "content": "first question" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the first turn", &server.log).await;
     assert!(
@@ -6672,7 +6682,7 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
         &serde_json::json!({ "sessionId": session_id, "content": "second question" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     expect_status(&server.log, turn, StatusCode::OK).await;
     tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
         .await
@@ -6699,7 +6709,7 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
         &serde_json::json!({ "sessionId": session_id, "content": "third question" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the restart", &server.log).await;
     assert!(
@@ -6758,7 +6768,7 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
         &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn starting the job", &server.log).await;
     assert!(
@@ -6772,7 +6782,7 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
         ))
         .expect("request builds")
         .await
-        .expect("event stream should open");
+        .unwrap_or_else(http_response_or_panic);
     let resumed = collect_turn_events(stream, "the resumed turn", &server.log).await;
     assert!(
         resumed.iter().any(|(kind, _)| kind == "done"),
@@ -6789,7 +6799,7 @@ async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session(
         &serde_json::json!({ "sessionId": session_id, "content": "anything new?" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the kill", &server.log).await;
     assert!(
@@ -6843,7 +6853,7 @@ async fn a_graceful_stop_does_not_alert() {
         &serde_json::json!({ "sessionId": session_id, "content": "anything new?" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "the turn after the stop", &server.log).await;
     assert!(
@@ -6877,7 +6887,7 @@ async fn agent_stops_background_job_with_native_kill_by_pid() {
         &serde_json::json!({ "sessionId": session_id, "content": "start and stop sleeper" }),
     )
     .await
-    .expect("turn request should succeed");
+    .unwrap_or_else(http_response_or_panic);
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
     let events = collect_turn_events(turn, "native kill by pid turn", &server.log).await;
     assert!(
