@@ -1099,6 +1099,7 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
             "monitor",
             "terminal",
             "terminal_input",
+            "terminal_kill",
             "terminal_read",
         ]
     {
