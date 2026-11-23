@@ -193,16 +193,16 @@ pub enum ManagedBrowserStartupError {
     #[error("managed browser debugger metadata at {url} did not include webSocketDebuggerUrl")]
     MissingWebSocketDebuggerUrl {
         /// Metadata endpoint that was queried.
-        url: reqwest::Url,
+        url: url::Url,
     },
     /// The debugger metadata endpoint did not return decodable JSON.
     #[error("failed to decode managed browser debugger metadata from {url}")]
     DecodeDebuggerMetadata {
         /// Metadata endpoint that was queried.
-        url: reqwest::Url,
+        url: url::Url,
         /// HTTP/JSON decoding error.
         #[source]
-        source: reqwest::Error,
+        source: serde_json::Error,
     },
     /// The debugger websocket endpoint did not appear before the deadline.
     #[error(
@@ -1659,9 +1659,9 @@ fn managed_browser_start_timeout_error(
     )
 }
 
-fn managed_browser_debugger_metadata_url(port: u16) -> reqwest::Url {
+fn managed_browser_debugger_metadata_url(port: u16) -> url::Url {
     let mut url =
-        reqwest::Url::parse("http://127.0.0.1").expect("static managed browser URL must parse");
+        url::Url::parse("http://127.0.0.1").expect("static managed browser URL must parse");
     url.set_port(Some(port))
         .expect("managed browser port must be valid");
     url.set_path("/json/version");
@@ -1703,28 +1703,42 @@ async fn wait_for_local_browser_websocket_endpoint(
     port: u16,
     timeout: Duration,
 ) -> Result<String, BrowserError> {
+    use zenwave::Client as _;
+
     let metadata_url = managed_browser_debugger_metadata_url(port);
-    let client = reqwest::Client::new();
+    let mut backend = zenwave::client();
     let start = Instant::now();
 
     loop {
-        match client.get(metadata_url.clone()).send().await {
-            Ok(response) if response.status().is_success() => {
-                let metadata: BrowserVersionMetadata = response.json().await.map_err(|source| {
-                    ManagedBrowserStartupError::DecodeDebuggerMetadata {
-                        url: metadata_url.clone(),
-                        source,
-                    }
-                })?;
-                return metadata.web_socket_debugger_url.ok_or_else(|| {
-                    ManagedBrowserStartupError::MissingWebSocketDebuggerUrl {
-                        url: metadata_url.clone(),
-                    }
-                    .into()
-                });
-            }
-            Ok(_) => {}
-            Err(error) if error.is_connect() || error.is_timeout() => {}
+        match backend.get(metadata_url.as_str()) {
+            Ok(request) => match request.bytes().await {
+                Ok(bytes) => {
+                    let metadata: BrowserVersionMetadata =
+                        serde_json::from_slice(&bytes).map_err(|source| {
+                            ManagedBrowserStartupError::DecodeDebuggerMetadata {
+                                url: metadata_url.clone(),
+                                source,
+                            }
+                        })?;
+                    return metadata.web_socket_debugger_url.ok_or_else(|| {
+                        ManagedBrowserStartupError::MissingWebSocketDebuggerUrl {
+                            url: metadata_url.clone(),
+                        }
+                        .into()
+                    });
+                }
+                Err(
+                    zenwave::Error::Http { .. }
+                    | zenwave::Error::Transport(..)
+                    | zenwave::Error::Timeout,
+                ) => {}
+                Err(error) => {
+                    return Err(BrowserError::browser_operation(
+                        "fetch managed browser debugger metadata",
+                        error,
+                    ));
+                }
+            },
             Err(error) => {
                 return Err(BrowserError::browser_operation(
                     "fetch managed browser debugger metadata",

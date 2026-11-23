@@ -155,14 +155,14 @@ impl GitHub {
         runs_url: &str,
         name: &str,
     ) -> Result<Option<Found>, UpdateError> {
-        let runs = parse_runs(&self.get(runs_url).await?.bytes().await?)?;
+        let runs = parse_runs(&self.get(runs_url).await?)?;
         for run in runs {
             let url = format!(
                 "{}/repos/{REPOSITORY}/actions/runs/{}/artifacts?name={name}",
                 self.api_base(),
                 run.id
             );
-            if let Some(artifact) = parse_artifact(&self.get(&url).await?.bytes().await?)? {
+            if let Some(artifact) = parse_artifact(&self.get(&url).await?)? {
                 return Ok(Some(Found {
                     head_sha: run.head_sha,
                     artifact,
@@ -179,12 +179,13 @@ impl GitHub {
         artifact: &Artifact,
         progress: &mut impl FnMut(u64, Option<u64>),
     ) -> Result<Vec<u8>, UpdateError> {
-        let bytes = super::github::body_bytes(
-            self.get(&artifact.archive_download_url).await?,
-            Some(artifact.size_in_bytes),
-            progress,
-        )
-        .await?;
+        let bytes = self
+            .get_bytes(
+                &artifact.archive_download_url,
+                Some(artifact.size_in_bytes),
+                progress,
+            )
+            .await?;
         if let Some(expected) = artifact
             .digest
             .as_deref()

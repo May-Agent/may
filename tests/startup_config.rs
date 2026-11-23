@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep, timeout};
+use zenwave::Client as _;
 
 /// Longest a refusal or an exiting entry point may take.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -243,7 +244,7 @@ async fn assert_rest_answers(home: &Path, context: &str) {
         .spawn()
         .expect("`may rest` should spawn");
     let url = format!("http://127.0.0.1:{port}/api/health");
-    let client = reqwest::Client::new();
+    let mut client = zenwave::client();
     let deadline = Instant::now() + STARTED_TIMEOUT;
     let outcome = loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -251,7 +252,7 @@ async fn assert_rest_answers(home: &Path, context: &str) {
         }
         if client
             .get(&url)
-            .send()
+            .expect("request builds")
             .await
             .is_ok_and(|response| response.status().is_success())
         {

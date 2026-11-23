@@ -3717,7 +3717,7 @@ impl UiChatPreparationError {
     /// as the failure a request would have produced. `None` when the turn
     /// failed for a reason a resubmit cannot fix: configuration, storage,
     /// or a refusal.
-    fn provider_failure(&self) -> Option<Failure> {
+    const fn provider_failure(&self) -> Option<Failure> {
         match self {
             Self::BuildAgent(crate::agent::MayAgentError::ProviderTimeout { .. }) => {
                 Some(Failure::transient())
@@ -3726,8 +3726,8 @@ impl UiChatPreparationError {
                 crate::grok::GrokAuthError::Http(error),
             )) if error.is_timeout() => Some(Failure::transient()),
             Self::BuildAgent(crate::agent::MayAgentError::GrokAuth(
-                crate::grok::GrokAuthError::Http(error),
-            )) if error.is_connect() => Some(Failure::network()),
+                crate::grok::GrokAuthError::Http(zenwave::Error::Transport(..)),
+            )) => Some(Failure::network()),
             _ => None,
         }
     }

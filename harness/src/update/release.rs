@@ -164,7 +164,7 @@ impl GitHub {
             "{}/repos/{REPOSITORY}/releases?per_page={RELEASES_SCANNED}",
             self.api_base()
         );
-        parse_latest(&self.get(&url).await?.bytes().await?, platform)
+        parse_latest(&self.get(&url).await?, platform)
     }
 
     /// The release's archive, checked against the checksum the release
@@ -175,10 +175,8 @@ impl GitHub {
         latest: &Latest,
         progress: &mut impl FnMut(u64, Option<u64>),
     ) -> Result<Vec<u8>, UpdateError> {
-        let checksum = self.get_public(&latest.checksum_url).await?.bytes().await?;
-        let archive =
-            super::github::body_bytes(self.get_public(&latest.archive_url).await?, None, progress)
-                .await?;
+        let checksum = self.get_public(&latest.checksum_url).await?;
+        let archive = self.get_public_bytes(&latest.archive_url, progress).await?;
         let checksum = String::from_utf8_lossy(&checksum);
         verify_sha256(&archive, parse_checksum(&checksum)?)?;
         Ok(archive.into())

@@ -20,7 +20,7 @@ aither-core = { version = "0.31.0" }
 aither-models = { version = "0.31.0" }
 futures-lite = "2"
 async-io = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+zenwave = "0.7"
 futures-util = { version = "0.3", default-features = false }
 aither-codex = "0.31.0"
 serde = { version = "1.0", features = ["derive"] }

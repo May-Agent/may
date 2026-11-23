@@ -15,6 +15,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use zenwave::Client as _;
 
 /// Authorization page the user completes in a browser.
 const AUTHORIZE_URL: &str = "https://openrouter.ai/auth";
@@ -42,12 +43,12 @@ const CALLBACK_BUF: usize = 8192;
 pub enum OpenrouterAuthError {
     /// HTTP request to `OpenRouter` failed.
     #[error("OpenRouter request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] zenwave::Error),
     /// The exchange/validation endpoint returned a non-success status.
     #[error("OpenRouter returned {status}: {body}")]
     Status {
         /// HTTP status code.
-        status: reqwest::StatusCode,
+        status: zenwave::StatusCode,
         /// Truncated response body.
         body: String,
     },
@@ -150,11 +151,38 @@ pub fn is_api_key(input: &str) -> bool {
 /// Longest one `OpenRouter` auth call may take; nothing downstream bounds it.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .expect("the HTTP client builds with its default configuration")
+fn http() -> zenwave::DefaultClient {
+    zenwave::client()
+}
+
+/// Fails `fut` as [`zenwave::Error::Timeout`] when it has not finished within
+/// [`REQUEST_TIMEOUT`]: nothing downstream bounds an `OpenRouter` auth call.
+async fn bounded_request<T>(
+    fut: impl std::future::Future<Output = Result<T, zenwave::Error>>,
+) -> Result<T, zenwave::Error> {
+    futures_lite::future::race(fut, async {
+        async_io::Timer::after(REQUEST_TIMEOUT).await;
+        Err(zenwave::Error::Timeout)
+    })
+    .await
+}
+
+fn status_or_transport<T>(result: Result<T, zenwave::Error>) -> Result<T, OpenrouterAuthError> {
+    result.map_err(|error| match error {
+        zenwave::Error::Http {
+            status, response, ..
+        } => OpenrouterAuthError::Status {
+            status,
+            body: response
+                .body_text
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect(),
+        },
+        other => OpenrouterAuthError::Http(other),
+    })
 }
 
 /// Validate an `sk-or-` API key against the introspection endpoint.
@@ -164,21 +192,18 @@ fn http() -> reqwest::Client {
 /// Returns [`OpenrouterAuthError`] when the request fails or the key is
 /// rejected.
 pub async fn validate_api_key(api_key: &str) -> Result<(), OpenrouterAuthError> {
-    let response = http()
-        .get(KEY_CHECK_URL)
-        .bearer_auth(api_key)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await?;
-    if response.status().is_success() {
-        return Ok(());
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(OpenrouterAuthError::Status {
-        status,
-        body: body.chars().take(500).collect(),
-    })
+    let mut backend = http();
+    status_or_transport(
+        bounded_request(
+            backend
+                .get(KEY_CHECK_URL)?
+                .bearer_auth(api_key)
+                .header(zenwave::header::ACCEPT.as_str(), "application/json")?
+                .string(),
+        )
+        .await,
+    )?;
+    Ok(())
 }
 
 /// Exchange an authorization code + PKCE verifier for the durable API key.
@@ -188,25 +213,21 @@ pub async fn validate_api_key(api_key: &str) -> Result<(), OpenrouterAuthError> 
 /// Returns [`OpenrouterAuthError`] on transport errors, rejection by the keys
 /// endpoint, or a response missing the `key` field.
 pub async fn exchange_code(code: &str, verifier: &str) -> Result<String, OpenrouterAuthError> {
-    let response = http()
-        .post(KEYS_URL)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&serde_json::json!({
-            "code": code,
-            "code_verifier": verifier,
-            "code_challenge_method": "S256",
-        }))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(OpenrouterAuthError::Status {
-            status,
-            body: body.chars().take(500).collect(),
-        });
-    }
-    let body: KeyExchangeResponse = response.json().await?;
+    let mut backend = http();
+    let body: KeyExchangeResponse = status_or_transport(
+        bounded_request(
+            backend
+                .post(KEYS_URL)?
+                .header(zenwave::header::ACCEPT.as_str(), "application/json")?
+                .json_body(&serde_json::json!({
+                    "code": code,
+                    "code_verifier": verifier,
+                    "code_challenge_method": "S256",
+                }))?
+                .json(),
+        )
+        .await,
+    )?;
     if body.key.is_empty() {
         return Err(OpenrouterAuthError::Protocol("empty key".into()));
     }
