@@ -1,0 +1,14 @@
+{%- if messages.is_empty() -%}
+No {% if unread_only %}unread {% endif %}messages on swarm board (epoch {{ board_epoch }}, latest seq {{ max_seq }}).
+{%- else -%}
+Swarm board (epoch {{ board_epoch }}):
+{% for msg in messages -%}
+[{{ msg.board_epoch }}:{{ msg.seq }}] ({{ msg.kind }}) {{ msg.sender }}{% match msg.session_id %}{% when Some with (id) %} [id {{ id }}]{% when None %}{% endmatch %}:
+{{ msg.body }}
+{% endfor -%}
+{%- match next_seq -%}
+{%- when Some with (next) -%}
+More messages remain starting at {{ board_epoch }}:{{ next }}; run `board` (or `board read --since {{ next }}`) to continue.
+{%- when None -%}
+{%- endmatch -%}
+{%- endif -%}

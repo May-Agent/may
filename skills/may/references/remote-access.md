@@ -22,4 +22,4 @@ Remote access refuses to start while any local-environment profile exists, and t
 
 ## Settings
 
-`[remote_access]`: `enabled` (false), `tailscale_binary` (`tailscale`), `https_port` (443), `allow_local_environment` (false), `allowed_logins` (empty), `funnel` (false), `funnel_port` (443), `webhook_max_body_bytes` (26214400). Changes apply live.
+`[remote_access]`: `enabled` (false), `tailscale_binary` (`tailscale`), `https_port` (443), `allow_local_environment` (false), `allowed_logins` (empty), `funnel` (false), `funnel_port` (443), `webhook_max_body_bytes` (26214400), `machine_name` (unset: first MagicDNS label or hostname), `peer_endpoints` (empty map of `<machine> = "<base-url>"` overrides), `peer_discovery_timeout_ms` (5000), `peer_btw_timeout_secs` (120). Cross-machine `agent` and `btw` routes (`/api/peers/*`) admit only the node's Tailscale owner (`Peer.UserID == Self.UserID` / owner login) or the fronting daemon, never non-owner `allowed_logins` accounts; cloud homes reach the fronting daemon and sibling peers over `/api/cloud-home/peer-rpc` while forwarded. Changes apply live.

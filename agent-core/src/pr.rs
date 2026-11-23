@@ -256,6 +256,7 @@ pub struct PrStore {
     context: PrContext,
     repos: Option<SessionRepos>,
     sandbox: CloneSandbox,
+    swarm: Option<crate::swarm::SwarmService>,
 }
 
 impl std::fmt::Debug for PrStore {
@@ -283,7 +284,15 @@ impl PrStore {
             context,
             repos,
             sandbox,
+            swarm: None,
         }
+    }
+
+    /// Announces PR lifecycle transitions onto the session's active swarm board.
+    #[must_use]
+    pub fn with_swarm(mut self, swarm: crate::swarm::SwarmService) -> Self {
+        self.swarm = Some(swarm);
+        self
     }
 
     fn repos(&self) -> Result<&SessionRepos, PrError> {
@@ -1981,7 +1990,7 @@ impl PrStore {
     }
 
     async fn event(&self, pr: &crate::db::PrRow, kind: &str, detail: Option<&str>) {
-        if let Some(db) = self.context.db.as_ref() {
+        let repo_key_opt = if let Some(db) = self.context.db.as_ref() {
             let message_id = db
                 .max_message_id(&self.context.session_id)
                 .await
@@ -1997,8 +2006,70 @@ impl PrStore {
                     detail,
                 )
                 .await;
-        }
+            db.repo_key_of_project(pr.project_id).await.ok().flatten()
+        } else {
+            None
+        };
         self.notify_prs(&pr.session_id);
+
+        if let (Some(swarm), Some(repo_key)) = (&self.swarm, repo_key_opt.as_deref()) {
+            let changed_files = self.pr_changed_files(pr, repo_key).await;
+            swarm
+                .announce_pr_event(crate::swarm::SwarmPrAnnouncement {
+                    actor_session_id: &self.context.session_id,
+                    repo_key,
+                    workspace_config: &self.context.workspace_config,
+                    pr,
+                    kind,
+                    detail,
+                    changed_files,
+                })
+                .await;
+        }
+    }
+
+    async fn pr_changed_files(&self, pr: &crate::db::PrRow, repo_key: &str) -> Vec<String> {
+        let Some(head_sha) = pr.head_sha.as_deref() else {
+            return Vec::new();
+        };
+        if let Some(checkouts) = &self.context.checkouts
+            && let Ok(files) = checkouts.diff_files(repo_key, &pr.base_sha, head_sha).await
+            && !files.is_empty()
+        {
+            return files;
+        }
+        if let Some(db) = self.context.db.as_ref() {
+            if let Ok(clones) = db.list_repo_clones(&pr.session_id).await {
+                for clone in clones.into_iter().filter(|c| c.repo_key == repo_key) {
+                    let clone_path = self.context.session_root.join("repos").join(&clone.dir);
+                    let files = git_diff_names(
+                        self.context.signing.host().clone(),
+                        clone_path,
+                        pr.base_sha.clone(),
+                        head_sha.to_string(),
+                    )
+                    .await;
+                    if !files.is_empty() {
+                        return files;
+                    }
+                }
+            }
+            if let Ok(checkout) =
+                resolve_host_checkout(db, &self.context.workspace_config, repo_key).await
+            {
+                let files = git_diff_names(
+                    self.context.signing.host().clone(),
+                    checkout,
+                    pr.base_sha.clone(),
+                    head_sha.to_string(),
+                )
+                .await;
+                if !files.is_empty() {
+                    return files;
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// The `[ci]` thresholds as they are now. `None` when the session keeps
@@ -2528,6 +2599,36 @@ async fn close_linked_may_issue(
             )
             .await;
     }
+}
+
+async fn git_diff_names(
+    host: crate::host_git::HostGit,
+    repo_dir: PathBuf,
+    base_sha: String,
+    head_sha: String,
+) -> Vec<String> {
+    blocking::unblock(move || {
+        let range = format!("{base_sha}..{head_sha}");
+        let output = host
+            .command()
+            .current_dir(&repo_dir)
+            .args(["diff", "--name-only", &range])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 async fn record_user_event(

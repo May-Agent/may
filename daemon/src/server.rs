@@ -303,6 +303,10 @@ pub async fn start(
         tokio::runtime::Handle::current(),
     ));
 
+    let cloud_home = crate::cloud::home::CloudHome::load(&may_dir)
+        .context("failed to read the cloud home record")?;
+    let cloud_home_bridge = super::cloud_home::CloudHomeBridge::new(cloud_home.is_some());
+
     let state = Arc::new(DaemonState {
         acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
@@ -330,6 +334,7 @@ pub async fn start(
         remote_access_manager,
         tcp_listeners: super::TcpListeners::new(),
         cloud_sessions,
+        cloud_home_bridge,
         pushed_providers,
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
@@ -379,6 +384,16 @@ pub async fn start(
     });
 
     state.ensure_session_publisher();
+    let swarm = crate::swarm::SwarmService::new(
+        super::chat::agent_messaging(&state),
+        state.may_dir.clone(),
+        state.config.clone(),
+    );
+    state.services.set_swarm(swarm.clone());
+    if let Err(error) = swarm.reconcile().await {
+        tracing::warn!(%error, "failed initial swarm board reconciliation");
+    }
+    spawn_swarm_reconciler(&state, swarm);
 
     super::chat::restart_interrupted_sessions(&state)
         .await
@@ -407,8 +422,7 @@ pub async fn start(
     // The tailscale-serve listener trusts Serve's identity header; a direct
     // non-loopback bind trusts only the peer's `WhoIs`-resolved login. On a
     // cloud home it also admits the fronting daemon's bearer token.
-    let cloud_home = crate::cloud::home::CloudHome::load(&state.may_dir)
-        .context("failed to read the cloud home record")?;
+    super::peers::DaemonPeerFabric::install_cloud_bridge(&state);
     let mut remote_sources: Vec<Box<dyn super::auth::IdentitySource>> =
         vec![Box::new(state.remote_access_manager.tailscale_identity())];
     if let Some(home) = &cloud_home {
@@ -527,8 +541,17 @@ fn api_routes() -> Route {
                 "/{id}/close".post(close_pr),
             ))),
             "/session-names".post(super::sessions::issue_session_name),
-            "/cloud-home/providers/{id}".put(super::cloud_home::push_provider),
-            "/cloud-home/tiers".put(super::cloud_home::push_tiers),
+            "/cloud-home".route(Route::new((
+                "/providers/{id}".put(super::cloud_home::push_provider),
+                "/tiers".put(super::cloud_home::push_tiers),
+                "/peer-rpc".at(super::cloud_home::poll_peer_rpc),
+                "/peer-rpc/{id}".post(super::cloud_home::reply_peer_rpc),
+            ))),
+            "/peers".route(Route::new((
+                "/agents".at(super::peers::get_peer_agents),
+                "/agents/{id}/messages".post(super::peers::post_peer_message),
+                "/agents/{id}/btw".post(super::peers::post_peer_btw),
+            ))),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
                 "".post(create_session),
@@ -1100,6 +1123,36 @@ async fn recover_persisted_runs_after_restart(
     task_runs.context("failed to reconcile persisted scheduled-task runs after restart")?;
     cards.context("failed to settle the subagent cards a stopped daemon left running")?;
     Ok(())
+}
+
+fn spawn_swarm_reconciler(state: &DaemonState, swarm: crate::swarm::SwarmService) {
+    use crate::ui_event_bus::UiEventTopics;
+    let mut rx = state.ui_event_bus.subscribe();
+    let shutdown = state.daemon_shutdown.clone();
+    tokio::spawn(async move {
+        let relevant = UiEventTopics::PROFILE_SESSIONS
+            | UiEventTopics::SESSION_RUNTIMES
+            | UiEventTopics::CONFIG;
+        loop {
+            tokio::select! {
+                () = shutdown.notified() => break,
+                received = rx.recv() => match received {
+                    Ok(topics) if topics.intersects(relevant) => {
+                        if let Err(error) = swarm.reconcile().await {
+                            tracing::warn!(%error, "swarm reconciliation failed");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Err(error) = swarm.reconcile().await {
+                            tracing::warn!(%error, "swarm reconciliation after lag failed");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

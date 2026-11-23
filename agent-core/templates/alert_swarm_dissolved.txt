@@ -1,0 +1,1 @@
+The swarm board for {{ workdir }} has dissolved because no other working session remains in this checkout; the `board` command is no longer active.

@@ -6,6 +6,8 @@
 pub mod agent;
 /// Main agents on one machine discover each other and exchange messages.
 pub mod agent_link;
+/// Experimental per-worktree coordination board, `@mention` wakeups and PR alerts.
+pub mod swarm;
 /// Persistent storage for OAuth credentials.
 pub use may_config::auth_store;
 
