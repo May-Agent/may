@@ -78,40 +78,55 @@ const settledPipeline: BackgroundPipeline = {
 };
 
 describe('PipelineStagesView', () => {
-  test('highlights the active running stage with session-sweep', () => {
+  test('renders normal full command and sweeps only the active stage substring', () => {
     const html = renderToStaticMarkup(
-      <PipelineStagesView sessionId="s1" pipeline={runningPipeline} settledText={null} />,
+      <PipelineStagesView
+        sessionId="s1"
+        pipeline={runningPipeline}
+        script={runningPipeline.script}
+        settledText={null}
+      />,
     );
     expect(html).toContain('data-testid="pipeline-stage-0"');
     expect(html).toContain('data-active="true"');
     expect(html).toContain('session-sweep');
     expect(html).toContain('cargo clippy --workspace');
+    expect(html).toContain('rg error');
+    expect(html).toContain('tail -n 50');
+    expect(html).not.toContain('[0]');
+    expect(html).not.toContain('[1]');
+    expect(html).not.toContain('4.1s');
   });
 
-  test('settles onto final output on completion while keeping >=3s stage clickable', () => {
+  test('settles onto final colored output without leaking stage timings', () => {
     const html = renderToStaticMarkup(
       <PipelineStagesView
         sessionId="s1"
         pipeline={settledPipeline}
+        script={settledPipeline.script}
         settledText={'\x1b[32m检查完成 完了 완료\x1b[0m\n'}
       />,
     );
-    expect(html).toContain('5.8s');
-    expect(html).toContain('&lt;1s');
+    expect(html).not.toContain('5.8s');
+    expect(html).not.toContain('&lt;1s');
+    expect(html).not.toContain('[0]');
+    expect(html).toContain('data-clickable="true"');
     expect(html).toContain('检查完成 完了 완료');
     expect(html).toContain('#16a34a');
   });
 
-  test('marks retained intermediate stages expired once retention elapses', () => {
+  test('marks retained intermediate stages expired on hover hint once retention elapses', () => {
     const html = renderToStaticMarkup(
       <PipelineStagesView
         sessionId="s1"
         pipeline={settledPipeline}
+        script={settledPipeline.script}
         settledText="final result"
         expired
       />,
     );
-    expect(html).toContain('5.8s · expired');
+    expect(html).toContain('cargo clippy --workspace (expired)');
+    expect(html).not.toContain('5.8s');
     expect(html).toContain('final result');
   });
 });

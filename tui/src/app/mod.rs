@@ -3901,27 +3901,26 @@ impl App {
                         self.last_click = self
                             .mouse_to_selection_point(mouse)
                             .map(|point| (Instant::now(), point));
-                        if let Some(point) = self.mouse_to_selection_point(mouse)
+                        if let Some(hit) = self.stage_at_screen(mouse.column, mouse.row) {
+                            if hit.target.clickable
+                                && let Some(req) = self
+                                    .chat
+                                    .select_pipeline_step(&hit.target.tool_id, hit.target.step)
+                            {
+                                self.fetch_pipeline_stage(req);
+                            }
+                        } else if let Some(point) = self.mouse_to_selection_point(mouse)
                             && let Some(region) = self
                                 .chat_layout
                                 .collapse_regions()
                                 .into_iter()
                                 .filter(|r| point.line >= r.start && point.line < r.end)
                                 // The innermost span wins: a click inside an
-                                // expanded "Worked for" member or pipeline stage
-                                // row targets that inner region.
+                                // expanded "Worked for" member targets that
+                                // inner region.
                                 .min_by_key(|r| r.end - r.start)
                         {
-                            if let Some((tool_id, step)) =
-                                super::ui::chat::parse_pipe_step_click(&region.element_id)
-                            {
-                                let call_id = tool_id.to_string();
-                                if let Some(req) = self.chat.select_pipeline_step(&call_id, step) {
-                                    self.fetch_pipeline_stage(req);
-                                }
-                            } else {
-                                self.chat.toggle_expanded(&region.element_id);
-                            }
+                            self.chat.toggle_expanded(&region.element_id);
                         }
                     }
                 }
@@ -3946,6 +3945,21 @@ impl App {
     pub(super) fn hovered_link(&self) -> Option<super::ui::links::LinkHit> {
         let (col, row) = self.hover?;
         self.link_at_screen(col, row)
+    }
+
+    /// The pipeline stage drawn at screen cell `(col, row)`.
+    fn stage_at_screen(&self, col: u16, row: u16) -> Option<super::ui::chat::StageHit> {
+        let x = col.checked_sub(self.chat_area.x)?;
+        let y = row.checked_sub(self.chat_area.y)?;
+        let doc = (self.effective_scroll() + usize::from(y))
+            .checked_sub(self.chat_layout.top_padding())?;
+        self.chat_layout.stage_at(doc, x)
+    }
+
+    /// The pipeline stage under the pointer, if it is inside the chat column.
+    pub(super) fn hovered_stage(&self) -> Option<super::ui::chat::StageHit> {
+        let (col, row) = self.hover?;
+        self.stage_at_screen(col, row)
     }
 
     fn mouse_to_selection_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {
@@ -7975,6 +7989,206 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("does-not-exist")),
             "async sandbox open error should render in chat stream: {rows:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hovering_and_clicking_pipeline_stages_never_folds_command() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use may_client::client::background::{
+            WireDelivery, WireJobStatus, WirePipeline, WirePipelineStage, WireStageStatus,
+        };
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.chat.push_tool(
+            "call:pipe".to_string(),
+            crate::ui::chat::ToolDisplay::Terminal {
+                description: "检查命令 Check ビルド 검사".to_string(),
+                command: "issue list 2>&1 | head -40\npr list 2>&1 | head -40".to_string(),
+                mode: aither_sandbox::SandboxMode::Sandboxed,
+                location: None,
+                interpreter: aither_sandbox::Interpreter::Shell,
+                reading: None,
+                card: None,
+                status: crate::ui::chat::ToolStatus::Done,
+                output: Some(
+                    crate::ui::chat::TerminalCallInfo::new(
+                        "issue list 2>&1 | head -40\npr list 2>&1 | head -40".to_string(),
+                    )
+                    .with_output("no issues\n".to_string()),
+                ),
+                diffs: Vec::new(),
+                pinned: Some(true),
+            },
+        );
+        app.chat.set_tool_pid("call:pipe", 5001);
+        app.chat.sync_pipelines(&[WirePipeline {
+            pid: 5001,
+            launch_id: 11,
+            script: "issue list 2>&1 | head -40\npr list 2>&1 | head -40".to_string(),
+            job_status: WireJobStatus::Completed {
+                exit_code: 0,
+                delivery: WireDelivery::Taken,
+            },
+            elapsed_ms: 21000,
+            expires_at: None,
+            active_step: None,
+            stages: vec![
+                WirePipelineStage {
+                    step: 0,
+                    command: "issue list 2>&1".to_string(),
+                    status: WireStageStatus::Exited { code: 0 },
+                    own_duration_ms: Some(17000),
+                    retained: true,
+                    ui_bytes: 32,
+                    total_lines: 1,
+                },
+                WirePipelineStage {
+                    step: 1,
+                    command: "head -40".to_string(),
+                    status: WireStageStatus::Exited { code: 0 },
+                    own_duration_ms: Some(10),
+                    retained: false,
+                    ui_bytes: 0,
+                    total_lines: 0,
+                },
+                WirePipelineStage {
+                    step: 2,
+                    command: "pr list 2>&1".to_string(),
+                    status: WireStageStatus::Exited { code: 0 },
+                    own_duration_ms: Some(4000),
+                    retained: true,
+                    ui_bytes: 32,
+                    total_lines: 1,
+                },
+                WirePipelineStage {
+                    step: 3,
+                    command: "head -40".to_string(),
+                    status: WireStageStatus::Exited { code: 0 },
+                    own_duration_ms: Some(10),
+                    retained: false,
+                    ui_bytes: 10,
+                    total_lines: 1,
+                },
+            ],
+        }]);
+        app.chat.append_pipeline_stage_output(
+            "call:pipe",
+            11,
+            0,
+            24,
+            "\x1b[32mopen issue #1\x1b[0m\n",
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("term");
+        let rows = draw_rows(&mut terminal, &mut app);
+        let joined = rows.join("\n");
+        assert!(joined.contains("$ issue list 2>&1 | head -40"), "{joined}");
+        assert!(joined.contains("│ pr list 2>&1 | head -40"), "{joined}");
+        assert!(
+            !joined.contains("[0]") && !joined.contains("17s") && !joined.contains("<1s"),
+            "{joined}"
+        );
+
+        let find_cell = |rows: &[String], needle: &str| -> (u16, u16) {
+            let y = rows
+                .iter()
+                .position(|r| r.contains(needle))
+                .expect("row containing needle");
+            let byte_col = rows[y].find(needle).expect("col");
+            let col = unicode_width::UnicodeWidthStr::width(&rows[y][..byte_col]);
+            (
+                u16::try_from(col).expect("col"),
+                u16::try_from(y).expect("y"),
+            )
+        };
+
+        // Hovering stage 0 highlights its cells with UNDERLINED and sets status hint.
+        let (stage0_col, stage0_row) = find_cell(&rows, "issue list");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: stage0_col,
+            row: stage0_row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("hover");
+        let hovered_buf = draw_buffer(&mut app, 100, 24);
+        assert!(
+            hovered_buf[(stage0_col, stage0_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "hovered stage cell must be underlined"
+        );
+        assert!(
+            app.hovered_stage()
+                .is_some_and(|h| h.target.step == 0 && h.target.command == "issue list 2>&1")
+        );
+
+        // Clicking stage 0 selects it and shows its command + output without folding.
+        let click = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            stage0_col,
+            stage0_row,
+        ))
+        .expect("down");
+        app.handle_mouse(click(
+            MouseEventKind::Up(MouseButton::Left),
+            stage0_col,
+            stage0_row,
+        ))
+        .expect("up");
+        let after_stage0_rows = draw_rows(&mut terminal, &mut app);
+        let after_stage0 = after_stage0_rows.join("\n");
+        assert!(after_stage0.contains("▸ issue list 2>&1"), "{after_stage0}");
+        assert!(after_stage0.contains("open issue #1"), "{after_stage0}");
+        assert!(
+            after_stage0.contains("$ issue list 2>&1 | head -40"),
+            "command must remain expanded: {after_stage0}"
+        );
+
+        // Clicking an unretained stage (`head -40` on the first command line) must NOT fold!
+        let (col1, row_cmd1) = find_cell(&after_stage0_rows, "head -40");
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            col1,
+            row_cmd1,
+        ))
+        .expect("down");
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left), col1, row_cmd1))
+            .expect("up");
+        let after_stage1_rows = draw_rows(&mut terminal, &mut app);
+        let after_stage1 = after_stage1_rows.join("\n");
+        assert!(
+            after_stage1.contains("$ issue list 2>&1 | head -40"),
+            "unretained stage click must not fold: {after_stage1}"
+        );
+
+        // Clicking the header row folds the tool call as expected.
+        let (hdr_col, hdr_row) = find_cell(&after_stage1_rows, "Check");
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            hdr_col,
+            hdr_row,
+        ))
+        .expect("down");
+        app.handle_mouse(click(
+            MouseEventKind::Up(MouseButton::Left),
+            hdr_col,
+            hdr_row,
+        ))
+        .expect("up");
+        let folded = draw_rows(&mut terminal, &mut app).join("\n");
+        assert!(
+            !folded.contains("$ issue list 2>&1 | head -40"),
+            "header click should fold: {folded}"
         );
     }
 }

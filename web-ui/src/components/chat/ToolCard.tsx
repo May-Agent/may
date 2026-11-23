@@ -294,6 +294,8 @@ function TerminalDetails({
         <PipelineStagesView
           sessionId={sessionId}
           pipeline={pipeline}
+          script={script}
+          interpreter={tool.summary?.interpreter ?? projectField(tool.argumentsRaw, 'interpreter')}
           settledText={terminal?.stdout?.text ?? null}
           expired={pipelineExpired}
         />

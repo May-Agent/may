@@ -72,8 +72,64 @@ impl ToolCallImage {
     }
 }
 
-/// Prefix on `ClickRegion::element_id` for a clickable pipeline stage row.
-pub const PIPE_STEP_PREFIX: &str = "pipe-step:";
+/// One pipeline stage segment exposed for cell-exact hover and click hit testing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageTarget {
+    /// Tool call owning this pipeline stage.
+    pub tool_id: String,
+    /// Zero-based stage index.
+    pub step: usize,
+    /// Stage command text.
+    pub command: String,
+    /// Whether clicking switches output to this stage.
+    pub clickable: bool,
+    /// Whether this stage's buffer is retained/live.
+    pub retained: bool,
+    /// Whether the 15-minute retention window has elapsed.
+    pub expired: bool,
+}
+
+/// Hover/click hit on a pipeline stage at a screen cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageHit {
+    /// Laid-out entry index in `ChatLayout`.
+    pub entry: usize,
+    /// Target metadata.
+    pub target: StageTarget,
+}
+
+impl StageHit {
+    /// Status-line hint shown while the pointer hovers this stage.
+    #[must_use]
+    pub fn status_hint(&self) -> String {
+        if self.target.clickable {
+            format!("View stage: {}", self.target.command)
+        } else if self.target.expired {
+            format!("{} (expired)", self.target.command)
+        } else {
+            format!("{} (not retained)", self.target.command)
+        }
+    }
+}
+
+/// A pipeline stage cell run located on screen for hover painting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenStageRun {
+    /// Screen column of the first cell.
+    pub x: u16,
+    /// Screen row.
+    pub y: u16,
+    /// Cells covered.
+    pub width: u16,
+    /// Symbols the run must still show to be painted.
+    pub text: String,
+    /// Laid-out entry index.
+    pub entry: usize,
+    /// Stage step index.
+    pub step: usize,
+    /// Whether clicking switches to this stage.
+    pub clickable: bool,
+}
 
 /// Request parameters to read one pipeline stage from the daemon.
 #[derive(Debug, Clone)]
@@ -90,14 +146,70 @@ pub struct StageFetchRequest {
     pub cursor: usize,
 }
 
-type StageRegions<'a> = (&'a str, &'a mut Vec<(String, usize, usize)>);
+#[derive(Default)]
+pub(super) struct StageMarks<'a> {
+    pub tool_id: &'a str,
+    pub lines: Vec<(usize, Line<'static>)>,
+    pub targets: Vec<StageTarget>,
+}
 
-/// Extracts `(tool_id, step)` from a pipeline stage click region identifier.
+/// Scratch marker colour for stage `index`.
 #[must_use]
-pub fn parse_pipe_step_click(region_id: &str) -> Option<(&str, usize)> {
-    let rest = region_id.strip_prefix(PIPE_STEP_PREFIX)?;
-    let (tool_id, step_raw) = rest.rsplit_once(':')?;
-    Some((tool_id, step_raw.parse().ok()?))
+pub(super) const fn stage_marker(index: u32) -> Color {
+    let [_, r, g, b] = index.to_be_bytes();
+    Color::Rgb(r, g, b)
+}
+
+/// Stage target index encoded in a scratch cell's `underline_color`.
+#[must_use]
+pub(super) const fn stage_marker_index(color: Color) -> Option<u32> {
+    match color {
+        Color::Rgb(r, g, b) => Some(u32::from_be_bytes([0, r, g, b])),
+        _ => None,
+    }
+}
+
+/// Paint hover feedback onto the pipeline stage under the pointer.
+pub fn paint_hovered_stage(
+    buf: &mut ratatui::buffer::Buffer,
+    runs: &[ScreenStageRun],
+    hovered: Option<(usize, usize)>,
+) {
+    use unicode_width::UnicodeWidthStr as _;
+    let Some(hovered) = hovered else {
+        return;
+    };
+    let area = buf.area;
+    for run in runs {
+        if (run.entry, run.step) != hovered {
+            continue;
+        }
+        if run.y >= area.bottom() || run.x + run.width > area.right() {
+            continue;
+        }
+        let mut cell_text = String::new();
+        let mut at = run.x;
+        while at < run.x + run.width {
+            let symbol = buf[(at, run.y)].symbol();
+            cell_text.push_str(symbol);
+            at += u16::try_from(symbol.width().max(1)).unwrap_or(1);
+        }
+        if cell_text != run.text {
+            continue;
+        }
+        for x in run.x..run.x + run.width {
+            let cell = &mut buf[(x, run.y)];
+            cell.modifier.insert(Modifier::UNDERLINED);
+            if run.clickable {
+                cell.modifier.insert(Modifier::BOLD);
+                if cell.bg == Color::Reset {
+                    cell.bg = Color::Rgb(50, 66, 84);
+                }
+            } else {
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
 }
 
 /// Live or retained multi-stage pipeline state attached to a terminal call.
@@ -1835,9 +1947,7 @@ impl ChatStream {
                     if !stage.retained && !final_has_output {
                         return Some((false, None));
                     }
-                    let next = if card.selected_step == Some(step)
-                        || (!card.is_running() && step == last)
-                    {
+                    let next = if card.selected_step == Some(step) {
                         None
                     } else {
                         Some(step)
@@ -1884,36 +1994,49 @@ impl ChatStream {
     /// Running pipeline stage reads to poll on tick.
     #[must_use]
     pub fn active_pipeline_reads(&self) -> Vec<StageFetchRequest> {
+        fn collect(elem: &ChatElement, out: &mut Vec<StageFetchRequest>) {
+            match elem {
+                ChatElement::ToolCall {
+                    id,
+                    display:
+                        ToolDisplay::Terminal {
+                            output: Some(info), ..
+                        },
+                } => {
+                    if let Some(card) = info.pipeline.as_deref()
+                        && !card.expired
+                        && card.is_running()
+                    {
+                        let step = card.effective_step();
+                        if card
+                            .snapshot
+                            .stages
+                            .iter()
+                            .any(|s| s.step == step && s.retained)
+                        {
+                            let cursor = card.stage_buffers.get(&step).map_or(0, |(cur, _)| *cur);
+                            out.push(StageFetchRequest {
+                                call_id: id.clone(),
+                                pid: card.snapshot.pid,
+                                launch_id: card.snapshot.launch_id,
+                                step,
+                                cursor,
+                            });
+                        }
+                    }
+                }
+                ChatElement::WorkedFor { elements, .. } => {
+                    for child in elements {
+                        collect(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut out = Vec::new();
         for elem in &self.elements {
-            if let ChatElement::ToolCall {
-                id,
-                display:
-                    ToolDisplay::Terminal {
-                        output: Some(info), ..
-                    },
-            } = elem
-                && let Some(card) = info.pipeline.as_deref()
-                && !card.expired
-                && card.is_running()
-            {
-                let step = card.effective_step();
-                if card
-                    .snapshot
-                    .stages
-                    .iter()
-                    .any(|s| s.step == step && s.retained)
-                {
-                    let cursor = card.stage_buffers.get(&step).map_or(0, |(cur, _)| *cur);
-                    out.push(StageFetchRequest {
-                        call_id: id.clone(),
-                        pid: card.snapshot.pid,
-                        launch_id: card.snapshot.launch_id,
-                        step,
-                        cursor,
-                    });
-                }
-            }
+            collect(elem, &mut out);
         }
         out
     }
@@ -2891,6 +3014,10 @@ pub(super) struct ElementLines {
     /// (sub-)element these lines contain — a click on those rows toggles
     /// that element, not the one owning the lines around it.
     pub regions: Vec<(String, usize, usize)>,
+    /// Scratch-tagged command lines carrying pipeline stage `underline_color` markers.
+    pub stage_lines: Vec<(usize, Line<'static>)>,
+    /// Stage metadata indexed by the markers in `stage_lines`.
+    pub stage_targets: Vec<StageTarget>,
 }
 
 /// `52s`, `1m27s` — the worked-for row's compact duration.
@@ -3271,7 +3398,11 @@ pub(super) fn element_lines(
         ChatElement::ToolCall { id, display } => {
             let start = lines.len();
             let mut tool_lines = Vec::new();
-            let mut stage_regions = Vec::new();
+            let mut stage_marks = StageMarks {
+                tool_id: id.as_str(),
+                lines: Vec::new(),
+                targets: Vec::new(),
+            };
             render_tool_inline_at(
                 &mut tool_lines,
                 display,
@@ -3281,15 +3412,38 @@ pub(super) fn element_lines(
                 state.open,
                 state.spinner_frame,
                 &assets.highlighting,
-                Some((id.as_str(), &mut stage_regions)),
+                Some(&mut stage_marks),
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
-            for (region_id, rel_start, rel_end) in stage_regions {
-                regions.push((region_id, start + rel_start, start + rel_end));
-            }
+            let has_pipeline = matches!(
+                display,
+                ToolDisplay::Terminal {
+                    output: Some(info), ..
+                } if info.pipeline.is_some()
+            );
             if display.expandable() {
-                regions.push((id.clone(), start, lines.len()));
+                let region_end = if state.open && has_pipeline {
+                    // When a pipeline command is open, only its header row
+                    // toggles collapse so inspecting stages in the body never
+                    // folds the command.
+                    (start + 1).min(lines.len())
+                } else {
+                    lines.len()
+                };
+                regions.push((id.clone(), start, region_end));
             }
+            let stage_lines = stage_marks
+                .lines
+                .into_iter()
+                .map(|(rel_idx, line)| (start + rel_idx, line))
+                .collect();
+            return ElementLines {
+                lines,
+                images,
+                regions,
+                stage_lines,
+                stage_targets: stage_marks.targets,
+            };
         }
 
         ChatElement::TodoBlock { .. } if state.hide_todos => {}
@@ -3478,6 +3632,8 @@ pub(super) fn element_lines(
             expanded,
             ..
         } => {
+            let mut stage_lines: Vec<(usize, Line<'static>)> = Vec::new();
+            let mut stage_targets: Vec<StageTarget> = Vec::new();
             let arrow = if *expanded { " ▾" } else { " ▸" };
             lines.push(Line::from(Span::styled(
                 format!("✦ Worked for {}{arrow}", compact_seconds(*seconds)),
@@ -3491,6 +3647,7 @@ pub(super) fn element_lines(
                         ElementState::of(inner, None, state.hide_todos, state.spinner_frame);
                     let sub = element_lines(inner, inner_state, images_supported, assets, width);
                     let offset = lines.len();
+                    let target_base = u32::try_from(stage_targets.len()).unwrap_or(0);
                     lines.extend(sub.lines);
                     regions.extend(
                         sub.regions
@@ -3502,15 +3659,40 @@ pub(super) fn element_lines(
                             .into_iter()
                             .map(|(url, row, mime)| (url, offset + row, mime)),
                     );
+                    if !sub.stage_targets.is_empty() {
+                        stage_targets.extend(sub.stage_targets);
+                        for (rel_idx, mut line) in sub.stage_lines {
+                            if target_base > 0 {
+                                for span in &mut line.spans {
+                                    if let Some(idx) =
+                                        span.style.underline_color.and_then(stage_marker_index)
+                                    {
+                                        span.style.underline_color =
+                                            Some(stage_marker(target_base + idx));
+                                    }
+                                }
+                            }
+                            stage_lines.push((offset + rel_idx, line));
+                        }
+                    }
                 }
             }
             lines.push(Line::from(""));
+            return ElementLines {
+                lines,
+                images,
+                regions,
+                stage_lines,
+                stage_targets,
+            };
         }
     }
     ElementLines {
         lines,
         images,
         regions,
+        stage_lines: Vec::new(),
+        stage_targets: Vec::new(),
     }
 }
 
@@ -4674,7 +4856,7 @@ fn render_tool_inline_at<'a>(
     open: bool,
     spinner_frame: usize,
     highlighting: &super::highlight::Highlighting,
-    stage_regions: Option<StageRegions<'_>>,
+    stage_marks: Option<&mut StageMarks<'_>>,
 ) {
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
@@ -4733,12 +4915,18 @@ fn render_tool_inline_at<'a>(
             {
                 render_pipeline_inline(
                     lines,
-                    pipe,
-                    &info.output,
-                    status,
-                    selection_style,
-                    spinner_frame,
-                    stage_regions,
+                    &PipelineRenderCtx {
+                        command,
+                        mode_prefix: &mode_prefix,
+                        interpreter: *interpreter,
+                        pipe,
+                        settled_output: &info.output,
+                        status,
+                        selection_style,
+                        spinner_frame,
+                        highlighting,
+                    },
+                    stage_marks,
                 );
                 push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
                 return;
@@ -4862,137 +5050,334 @@ fn render_tool_inline_at<'a>(
 /// full-screen view still carries the whole script.
 const EDIT_PREVIEW_ROWS: usize = 40;
 
-fn format_stage_duration_ms(ms: u64) -> String {
-    if ms >= 60_000 {
-        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1_000)
-    } else if ms >= 10_000 {
-        format!("{}s", ms / 1_000)
-    } else if ms >= 1_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        "<1s".to_string()
-    }
-}
-
-fn pipeline_stage_badge(
-    stage: &may_client::client::background::WirePipelineStage,
-    expired: bool,
-) -> Option<(String, Color)> {
-    use may_client::client::background::WireStageStatus;
-    match stage.status {
-        WireStageStatus::Pending => None,
-        WireStageStatus::Running => Some(("running".to_string(), Color::Yellow)),
-        WireStageStatus::Exited { code } => {
-            let dur = stage.own_duration_ms.map(format_stage_duration_ms);
-            if expired && stage.retained {
-                let label = dur.map_or_else(|| "expired".to_string(), |d| format!("{d} · expired"));
-                Some((label, Color::DarkGray))
-            } else if !stage.retained {
-                Some((dur.unwrap_or_else(|| "<3s".to_string()), Color::DarkGray))
-            } else if code != 0 {
-                let label =
-                    dur.map_or_else(|| format!("exit {code}"), |d| format!("exit {code} · {d}"));
-                Some((label, Color::Red))
-            } else {
-                dur.map(|d| (d, Color::DarkGray))
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_pipeline_inline(
-    lines: &mut Vec<Line<'_>>,
-    pipe: &PipelineCardState,
-    settled_output: &str,
-    status: &ToolStatus,
+struct PipelineRenderCtx<'a> {
+    command: &'a str,
+    mode_prefix: &'a str,
+    interpreter: Interpreter,
+    pipe: &'a PipelineCardState,
+    settled_output: &'a str,
+    status: &'a ToolStatus,
     selection_style: Style,
     spinner_frame: usize,
-    mut stage_regions: Option<StageRegions<'_>>,
-) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let is_running = pipe.is_running();
-    let effective = pipe.effective_step();
-    let last_step = pipe.last_step();
+    highlighting: &'a super::highlight::Highlighting,
+}
 
-    for (idx, stage) in pipe.snapshot.stages.iter().enumerate() {
-        let row_idx = lines.len();
-        let active = is_running && pipe.snapshot.active_step == Some(stage.step);
-        let selected = effective == stage.step;
+struct StageSpanMeta {
+    start: usize,
+    end: usize,
+    total_graphemes: usize,
+    target_idx: usize,
+    active: bool,
+    selected: bool,
+}
+
+fn resolve_stage_byte_ranges(
+    script: &str,
+    stages: &[may_client::client::background::WirePipelineStage],
+) -> Vec<Option<(usize, usize)>> {
+    let mut cursor = 0usize;
+    stages
+        .iter()
+        .map(|stage| {
+            let needle = stage.command.trim();
+            if needle.is_empty() {
+                return None;
+            }
+            let rel = script.get(cursor..)?.find(needle)?;
+            let start = cursor + rel;
+            let end = start + needle.len();
+            cursor = end;
+            Some((start, end))
+        })
+        .collect()
+}
+
+fn line_byte_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            let end = if text.get(start..idx).is_some_and(|s| s.ends_with('\r')) {
+                idx - 1
+            } else {
+                idx
+            };
+            out.push((start, end));
+            start = idx + 1;
+        }
+    }
+    if start < text.len() {
+        let end = if text.get(start..).is_some_and(|s| s.ends_with('\r')) {
+            text.len() - 1
+        } else {
+            text.len()
+        };
+        out.push((start, end));
+    }
+    out
+}
+
+fn split_line_spans_by_stages<'a>(
+    spans: Vec<Span<'static>>,
+    line_start: usize,
+    stages: &'a [StageSpanMeta],
+) -> Vec<(Vec<Span<'static>>, Option<&'a StageSpanMeta>)> {
+    let mut chunks: Vec<(Vec<Span<'static>>, Option<&StageSpanMeta>)> = Vec::new();
+    let mut cursor = line_start;
+    for span in spans {
+        let text = span.content.into_owned();
+        let span_start = cursor;
+        let span_end = span_start + text.len();
+        cursor = span_end;
+        let mut local_at = 0usize;
+        while local_at < text.len() {
+            let abs_at = span_start + local_at;
+            let hit = stages.iter().find(|s| s.start <= abs_at && abs_at < s.end);
+            let (take_end, stage_ref) = hit.map_or_else(
+                || {
+                    let next_start = stages
+                        .iter()
+                        .filter(|s| s.start > abs_at && s.start < span_end)
+                        .map(|s| s.start - span_start)
+                        .min()
+                        .unwrap_or(text.len());
+                    (next_start, None)
+                },
+                |stage| ((stage.end - span_start).min(text.len()), Some(stage)),
+            );
+            if take_end > local_at
+                && let Some(piece) = text.get(local_at..take_end)
+            {
+                let part = Span::styled(piece.to_string(), span.style);
+                let same_stage = chunks.last().is_some_and(|(_, prev)| {
+                    prev.map(|s| s.target_idx) == stage_ref.map(|s| s.target_idx)
+                });
+                if same_stage && let Some((last_spans, _)) = chunks.last_mut() {
+                    last_spans.push(part);
+                } else {
+                    chunks.push((vec![part], stage_ref));
+                }
+            }
+            local_at = take_end.max(local_at + 1);
+        }
+    }
+    chunks
+}
+
+fn render_pipeline_inline(
+    lines: &mut Vec<Line<'_>>,
+    ctx: &PipelineRenderCtx<'_>,
+    mut stage_marks: Option<&mut StageMarks<'_>>,
+) {
+    use unicode_segmentation::UnicodeSegmentation as _;
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let is_running = ctx.pipe.is_running();
+    let effective = ctx.pipe.effective_step();
+    let last_step = ctx.pipe.last_step();
+
+    let fallback_cmd;
+    let cmd_text = if !ctx.command.trim().is_empty() {
+        ctx.command
+    } else if !ctx.pipe.snapshot.script.trim().is_empty() {
+        ctx.pipe.snapshot.script.as_str()
+    } else {
+        fallback_cmd = ctx
+            .pipe
+            .snapshot
+            .stages
+            .iter()
+            .map(|s| s.command.trim())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        fallback_cmd.as_str()
+    };
+
+    let ranges = resolve_stage_byte_ranges(cmd_text, &ctx.pipe.snapshot.stages);
+    let mut stage_metas: Vec<StageSpanMeta> = Vec::new();
+    for (stage, range) in ctx.pipe.snapshot.stages.iter().zip(ranges) {
+        let Some((start, end)) = range else {
+            continue;
+        };
         let is_final = stage.step == last_step;
         let clickable =
-            !pipe.expired && (stage.retained || (is_final && !settled_output.is_empty()));
-
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let lead = if idx == 0 { "  " } else { "| " };
-        spans.push(Span::styled(lead, dim.patch(selection_style)));
-        let pointer = if selected { "▸ " } else { "  " };
-        let pointer_style = if selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .bold()
-                .patch(selection_style)
-        } else {
-            dim.patch(selection_style)
-        };
-        spans.push(Span::styled(pointer, pointer_style));
-        spans.push(Span::styled(
-            format!("[{}] ", stage.step),
-            dim.patch(selection_style),
-        ));
-
-        let cmd_line = stage.command.lines().next().unwrap_or_default();
-        if active {
-            spans.extend(super::sweep::sweep_spans(
-                cmd_line,
-                spinner_frame,
-                Style::default().fg(Color::Gray).patch(selection_style),
-                Style::default()
-                    .fg(Color::White)
-                    .bold()
-                    .patch(selection_style),
-            ));
-        } else {
-            let cmd_style = if selected {
-                Style::default().fg(Color::Cyan).patch(selection_style)
-            } else if clickable {
-                Style::default().fg(Color::Gray).patch(selection_style)
-            } else {
-                dim.patch(selection_style)
-            };
-            spans.push(Span::styled(cmd_line.to_string(), cmd_style));
-        }
-
-        if let Some((badge, color)) = pipeline_stage_badge(stage, pipe.expired && !is_final) {
-            spans.push(Span::styled(
-                format!("  ({badge})"),
-                Style::default().fg(color).patch(selection_style),
-            ));
-        }
-        lines.push(Line::from(spans));
-
-        if clickable && let Some((tool_id, ref mut regs)) = stage_regions {
-            regs.push((
-                format!("{PIPE_STEP_PREFIX}{tool_id}:{}", stage.step),
-                row_idx,
-                row_idx + 1,
-            ));
+            !ctx.pipe.expired && (stage.retained || (is_final && !ctx.settled_output.is_empty()));
+        let active = is_running && ctx.pipe.snapshot.active_step == Some(stage.step);
+        let selected = ctx.pipe.selected_step == Some(stage.step);
+        let target_idx = stage_metas.len();
+        let total_graphemes = cmd_text
+            .get(start..end)
+            .map_or(0, |s| s.graphemes(true).count());
+        stage_metas.push(StageSpanMeta {
+            start,
+            end,
+            total_graphemes,
+            target_idx,
+            active,
+            selected,
+        });
+        if let Some(marks) = stage_marks.as_deref_mut() {
+            marks.targets.push(StageTarget {
+                tool_id: marks.tool_id.to_string(),
+                step: stage.step,
+                command: stage.command.clone(),
+                clickable,
+                retained: stage.retained,
+                expired: ctx.pipe.expired && !is_final,
+            });
         }
     }
 
-    if let Some(status_text) = body_status_text(status) {
+    let syntax_rows = ctx
+        .highlighting
+        .spans(interpreter_syntax(ctx.interpreter), cmd_text);
+    let line_ranges = line_byte_ranges(cmd_text);
+    let sweep_hi = Style::default()
+        .fg(Color::White)
+        .bold()
+        .patch(ctx.selection_style);
+    let selected_stage_bg = Style::default()
+        .bg(Color::Rgb(38, 56, 72))
+        .add_modifier(Modifier::UNDERLINED);
+
+    for (line_idx, (line_start, line_end)) in line_ranges.into_iter().enumerate() {
+        let row_idx = lines.len();
+        let raw_spans = syntax_rows.get(line_idx).cloned().unwrap_or_else(|| {
+            let slice = cmd_text.get(line_start..line_end).unwrap_or_default();
+            vec![Span::raw(slice.to_string())]
+        });
+        let prefix_spans = if line_idx == 0 {
+            vec![
+                Span::styled(
+                    ctx.mode_prefix.to_string(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .bold()
+                        .patch(ctx.selection_style),
+                ),
+                Span::styled("$ ", dim.patch(ctx.selection_style)),
+            ]
+        } else {
+            vec![Span::styled("│ ", dim.patch(ctx.selection_style))]
+        };
+
+        let mut visible_spans = prefix_spans.clone();
+        let mut tagged_spans = prefix_spans;
+        let mut has_stage_on_line = false;
+
+        let chunks = split_line_spans_by_stages(raw_spans, line_start, &stage_metas);
+        let mut chunk_abs_start = line_start;
+        for (chunk_spans, stage_opt) in chunks {
+            let chunk_bytes: usize = chunk_spans.iter().map(|s| s.content.len()).sum();
+            let this_abs_start = chunk_abs_start;
+            chunk_abs_start += chunk_bytes;
+
+            let Some(stage) = stage_opt else {
+                for span in chunk_spans {
+                    let styled = Span::styled(span.content, span.style.patch(ctx.selection_style));
+                    visible_spans.push(styled.clone());
+                    tagged_spans.push(styled);
+                }
+                continue;
+            };
+
+            has_stage_on_line = true;
+            let marker_color = stage_marker(u32::try_from(stage.target_idx).unwrap_or(0));
+            for span in &chunk_spans {
+                let mut tag_style = span.style.patch(ctx.selection_style);
+                tag_style.underline_color = Some(marker_color);
+                tagged_spans.push(Span::styled(span.content.clone(), tag_style));
+            }
+
+            if stage.active {
+                let base_chunk: Vec<Span<'static>> = chunk_spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content, s.style.patch(ctx.selection_style)))
+                    .collect();
+                let grapheme_offset = cmd_text
+                    .get(stage.start..this_abs_start)
+                    .map_or(0, |prefix| prefix.graphemes(true).count());
+                let (swept, _) = super::sweep::sweep_styled_slice(
+                    &base_chunk,
+                    grapheme_offset,
+                    stage.total_graphemes,
+                    ctx.spinner_frame,
+                    sweep_hi,
+                );
+                visible_spans.extend(swept);
+            } else if stage.selected {
+                for span in chunk_spans {
+                    visible_spans.push(Span::styled(
+                        span.content,
+                        span.style
+                            .patch(selected_stage_bg)
+                            .patch(ctx.selection_style),
+                    ));
+                }
+            } else {
+                for span in chunk_spans {
+                    visible_spans.push(Span::styled(
+                        span.content,
+                        span.style.patch(ctx.selection_style),
+                    ));
+                }
+            }
+        }
+
+        lines.push(Line::from(visible_spans));
+        if has_stage_on_line && let Some(marks) = stage_marks.as_deref_mut() {
+            marks.lines.push((row_idx, Line::from(tagged_spans)));
+        }
+    }
+
+    if let Some(status_text) = body_status_text(ctx.status) {
         lines.push(Line::from(vec![
-            Span::styled("↳ ", dim.patch(selection_style)),
-            Span::styled(status_text, dim.patch(selection_style)),
+            Span::styled("↳ ", dim.patch(ctx.selection_style)),
+            Span::styled(status_text, dim.patch(ctx.selection_style)),
         ]));
     }
 
-    let buffered = pipe
+    if let Some(sel_step) = ctx.pipe.selected_step
+        && !ctx.pipe.expired
+        && let Some(sel_stage) = ctx.pipe.snapshot.stages.iter().find(|s| s.step == sel_step)
+    {
+        let mut sel_spans = vec![Span::styled(
+            "▸ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .bold()
+                .patch(ctx.selection_style),
+        )];
+        if let Some(first_row) = ctx
+            .highlighting
+            .spans(
+                interpreter_syntax(ctx.interpreter),
+                sel_stage.command.trim(),
+            )
+            .into_iter()
+            .next()
+        {
+            sel_spans.extend(
+                first_row
+                    .into_iter()
+                    .map(|span| Span::styled(span.content, span.style.patch(ctx.selection_style))),
+            );
+        } else {
+            sel_spans.push(Span::styled(
+                sel_stage.command.trim().to_string(),
+                Style::default().fg(Color::Cyan).patch(ctx.selection_style),
+            ));
+        }
+        lines.push(Line::from(sel_spans));
+    }
+
+    let buffered = ctx
+        .pipe
         .stage_buffers
         .get(&effective)
         .map_or("", |(_, text)| text.as_str());
     let shown = if !is_running && effective == last_step && buffered.is_empty() {
-        settled_output
+        ctx.settled_output
     } else {
         buffered
     };
@@ -5003,7 +5388,7 @@ fn render_pipeline_inline(
             "│ ",
             dim,
             Style::default().fg(Color::Gray),
-            selection_style,
+            ctx.selection_style,
         );
         let total = parsed.len();
         let skip = if is_running {
@@ -5017,7 +5402,7 @@ fn render_pipeline_inline(
         if !is_running && total > DIFF_PREVIEW_LINES {
             lines.push(Line::from(Span::styled(
                 format!("│ … {} more lines", total - DIFF_PREVIEW_LINES),
-                dim.italic().patch(selection_style),
+                dim.italic().patch(ctx.selection_style),
             )));
         }
     }
@@ -8840,9 +9225,20 @@ mod tests {
             .map(|y| row_text(&frame_settled.buf, y))
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(
+            screen_settled.contains("$ cargo clippy | tail -n 5"),
+            "{screen_settled}"
+        );
+        assert!(
+            !screen_settled.contains("[0]")
+                && !screen_settled.contains("[1]")
+                && !screen_settled.contains("4.9s")
+                && !screen_settled.contains("<1s"),
+            "must not leak internal step numbers or timings: {screen_settled}"
+        );
         assert!(screen_settled.contains("settled tail"), "{screen_settled}");
 
-        // Clicking retained stage 0 switches inline display to stage 0's colored buffer.
+        // Clicking retained stage 0 switches inline display to stage 0's command and colored buffer.
         let fetch = chat
             .select_pipeline_step("call:1", 0)
             .expect("retained stage 0 returns fetch request");
@@ -8862,6 +9258,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(plain_stage0.contains("▸ cargo clippy"), "{plain_stage0}");
         assert!(
             plain_stage0.contains("编译中 ビルド중 빌드"),
             "{plain_stage0}"
@@ -8875,7 +9272,14 @@ mod tests {
             .map(|y| row_text(&frame_expired.buf, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(screen_expired.contains("expired"), "{screen_expired}");
         assert!(screen_expired.contains("settled tail"), "{screen_expired}");
+
+        let mut layout = crate::ui::chat_layout::ChatLayout::default();
+        layout.sync(&chat, 80, false, false, None, 0);
+        let hit = (0..layout.element_rows())
+            .find_map(|row| (0..80u16).find_map(|col| layout.stage_at(row, col)))
+            .expect("stage 0 hit in layout");
+        assert!(hit.target.expired);
+        assert!(hit.status_hint().contains("expired"), "{hit:?}");
     }
 }
