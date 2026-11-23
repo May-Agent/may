@@ -418,18 +418,20 @@ where
 
     type Arguments = IssueArgs;
     type Res = ToolResult;
+    type Error = IssueError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         if arguments.writes() {
             let refusal = IssueReserved {
                 subcommand: arguments.subcommand(),
             }
-            .render()?;
-            return Err(IssueError::Reserved(refusal).into());
+            .render()
+            .expect("issue reserved template renders");
+            return Err(IssueError::Reserved(refusal));
         }
         execute_in_target(
             &self.store,
@@ -444,7 +446,6 @@ where
             arguments,
         )
         .await
-        .map_err(Into::into)
     }
 }
 
@@ -553,17 +554,20 @@ where
 
     type Arguments = IssueArgs;
     type Res = ToolResult;
+    type Error = IssueError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         if let Some(guard) = &self.languages {
             for text in arguments.published_texts() {
                 guard
                     .check_working(text, crate::harness::language::WorkingText::Public)
-                    .map_err(super::notices::language_refused)?;
+                    .map_err(|refusal| {
+                        IssueError::Invalid(super::notices::language_refused(refusal).to_string())
+                    })?;
             }
         }
         if let Some(review) = &self.publish_review
@@ -629,7 +633,7 @@ where
         if writes && let Some(changes) = &self.changes {
             changes.notify();
         }
-        result.map_err(Into::into)
+        result
     }
 }
 

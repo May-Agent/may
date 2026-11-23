@@ -207,13 +207,14 @@ impl Tool for CompactTool {
 
     type Arguments = CompactArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn call(
         &self,
         _args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let request = self.signal.request();
         let text = request.wording();
         // A refusal is a typed tool error, so an embedder tells it from a

@@ -224,8 +224,8 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
     );
     assert_eq!(
         roles_mentioning(&requests[1], CONSTRAINT),
-        ["system", "user"],
-        "the second request sees the constraint through the first handoff and the user's own message, which a compaction keeps verbatim"
+        ["system"],
+        "the second request sees the constraint inside the first handoff (both summary and folded verbatim user messages)"
     );
 
     let checkpoint = agent
@@ -285,9 +285,21 @@ async fn context_messages_after_a_compaction_carry_the_handoff_not_the_replaced_
     assert!(
         after
             .iter()
-            .filter(|m| m.role() != aither_core::llm::Role::User)
+            .all(|m| !m.content().contains("Starting with the token definitions")),
+        "the replaced assistant turn is gone from the context"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|m| m.role() == aither_core::llm::Role::System && m.content().contains(REPLACED)),
+        "the user's verbatim words are folded inside the system <handoff>"
+    );
+    assert!(
+        after
+            .iter()
+            .filter(|m| m.role() == aither_core::llm::Role::User)
             .all(|m| !m.content().contains(REPLACED)),
-        "the replaced turns are not in the context, but for the user's own words a compaction keeps verbatim"
+        "old user turns are not emitted as bare Role::User messages after <handoff>"
     );
     let again = agent.context_messages().await.expect("context reads");
     let texts = |messages: &[aither_core::llm::Message]| {

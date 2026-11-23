@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 # The command reading every shell policy is checked against.
 may-protocol = { path = "../protocol" }
+aither-agent = { version = "0.31.0" }
 aither-core = { version = "0.31.0" }
 aither-sandbox = { version = "0.31.0" }
 askama = "0.16"

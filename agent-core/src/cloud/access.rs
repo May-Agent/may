@@ -339,7 +339,8 @@ pub async fn local_access(provider_type: ProviderType) -> Result<Option<AccessTo
                 .await?
                 .ok_or(AccessError::NotSignedIn("ChatGPT"))?;
             if credentials.is_expired(CHATGPT_EXPIRY_MARGIN) {
-                credentials = aither_codex::auth::refresh_tokens(&credentials.refresh_token)
+                let refresh_token = credentials.refresh_token.as_deref().unwrap_or_default();
+                credentials = aither_codex::auth::refresh_tokens(refresh_token)
                     .await
                     .map_err(crate::chatgpt::ChatgptAuthError::Codex)?;
                 crate::chatgpt::save_credentials(&credentials).await?;

@@ -16,6 +16,7 @@ use aither_agent::{
 };
 use askama::Template;
 
+use crate::command_policy::FileReadEpochs;
 use crate::harness::compact_tool::CompactSignal;
 
 const TAG: &str = "precompaction_alert";
@@ -155,12 +156,13 @@ pub struct RunWatch {
     gauge: Arc<WindowGauge>,
     valve: Arc<CompactSignal>,
     floor: usize,
+    read_epochs: FileReadEpochs,
 }
 
 impl RunWatch {
     /// The watch of the agent `own`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         own: AgentPath,
         gauge: Arc<WindowGauge>,
         valve: Arc<CompactSignal>,
@@ -171,7 +173,16 @@ impl RunWatch {
             gauge,
             valve,
             floor,
+            read_epochs: FileReadEpochs::default(),
         }
+    }
+
+    /// Invalidates `own`'s unchanged-file-read stamps in `read_epochs` whenever
+    /// a compaction applies.
+    #[must_use]
+    pub fn with_read_epochs(mut self, read_epochs: FileReadEpochs) -> Self {
+        self.read_epochs = read_epochs;
+        self
     }
 
     /// Updates the watched model context window size in place.
@@ -198,9 +209,11 @@ impl RunWatch {
     }
 
     /// Records that a compaction ended. One that applied left the context as
-    /// the handoff, and the valve refuses another until the agent acts.
+    /// the handoff, resets unchanged-read stamps so post-compaction recall runs
+    /// unobstructed, and has the valve refuse another until the agent acts.
     pub fn ended(&self, applied: bool) {
         if applied {
+            self.read_epochs.bump(&self.own);
             self.measured(0);
             self.valve.landed();
         } else {

@@ -87,12 +87,13 @@ impl Tool for ModelsTool {
 
     type Arguments = ModelsArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let registry = aither_models::ModelRegistry::bundled();
         let index = crate::models::OutdatedIndex::of(registry);
         let outdated =

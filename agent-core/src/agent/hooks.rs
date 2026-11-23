@@ -125,10 +125,11 @@ impl MayHooks {
             .iter()
             .map(|outcome| {
                 let refused = self.refused.take(outcome.call.call());
-                let polled =
-                    outcome.result.as_ref().err().is_some_and(|error| {
-                        error.downcast_ref::<Refused<UnchangedRead>>().is_some()
-                    });
+                let polled = outcome.result.as_ref().err().is_some_and(|error| {
+                    std::error::Error::source(error)
+                        .and_then(|source| source.downcast_ref::<Refused<UnchangedRead>>())
+                        .is_some()
+                });
                 refused || polled
             })
             .fold(!outcomes.is_empty(), |all, unchanged| all && unchanged)
@@ -317,12 +318,13 @@ mod tests {
 
         type Arguments = NoArgs;
         type Res = ToolResult;
+        type Error = core::convert::Infallible;
 
         fn call(
             &self,
             _args: Self::Arguments,
             cx: ToolContext,
-        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        ) -> impl std::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
             if let Some(call) = cx.identity() {
                 self.call_images
                     .record(call.call(), vec![self.image.clone()]);

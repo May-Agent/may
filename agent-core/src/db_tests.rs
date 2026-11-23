@@ -79,7 +79,7 @@ mod cache_misses_tests {
                     at: jiff::Timestamp::from_millisecond(self.at_ms).expect("in range"),
                     usage: &usage,
                     prefix: PromptPrefix {
-                        chain: PrefixChain::of(&self.tools, &messages),
+                        chain: PrefixChain::of(&self.tools, &messages, true),
                         rewrites: std::mem::take(&mut self.rewrites),
                         first_request: std::mem::replace(&mut self.first_request, false),
                     },
@@ -170,7 +170,7 @@ mod cache_misses_tests {
                 at: jiff::Timestamp::from_millisecond(at_ms).expect("in range"),
                 usage: &usage,
                 prefix: PromptPrefix {
-                    chain: PrefixChain::of(&[], &[Message::system("you are may")]),
+                    chain: PrefixChain::of(&[], &[Message::system("you are may")], false),
                     rewrites: PrefixRewrites::default(),
                     first_request: false,
                 },

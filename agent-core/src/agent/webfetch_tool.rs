@@ -31,8 +31,9 @@ impl Tool for MayWebFetch {
 
     type Arguments = WebFetchArgs;
     type Res = ToolResult;
+    type Error = <WebFetchTool as Tool>::Error;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         self.0.call(args, cx).await
     }
 }
