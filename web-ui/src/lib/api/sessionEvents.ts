@@ -2,7 +2,7 @@ import { ApiError, apiSseUrl } from './client';
 import { parseNamedSseStream } from '../stream/sse';
 import { markAuthRequired } from '../stores/authGate';
 import type { ChatStreamEvent } from '../types';
-import type { SessionBackground } from './background';
+import type { BackgroundPipeline, SessionBackground } from './background';
 
 const RECONNECT_DELAY_MS = 1000;
 
@@ -32,13 +32,14 @@ export type SessionEventHandler = (
   id: string | null,
 ) => void;
 
-/** The background snapshot a watcher's `job.*`/`subagent.*` deltas apply to. */
+/** The background snapshot a watcher's `job.*`/`subagent.*`/`pipeline.*` deltas apply to. */
 export interface BackgroundState {
   jobs: SessionBackground['jobs'];
   subagents: SessionBackground['subagents'];
+  pipelines?: BackgroundPipeline[];
 }
 
-/** Apply one `job.*`/`subagent.*` frame to `state`; whether it handled `kind`. */
+/** Apply one `job.*`/`subagent.*`/`pipeline.*` frame to `state`; whether it handled `kind`. */
 export function applyBackgroundDelta(
   state: BackgroundState,
   kind: string,
@@ -67,6 +68,20 @@ export function applyBackgroundDelta(
     case 'subagent.removed': {
       const { runId } = data as { runId: number };
       state.subagents = state.subagents.filter((run) => run.runId !== runId);
+      return true;
+    }
+    case 'pipeline.upserted': {
+      const pipeline = (data as { pipeline: BackgroundPipeline }).pipeline;
+      const list = state.pipelines ? [...state.pipelines] : [];
+      const index = list.findIndex((old) => old.launchId === pipeline.launchId);
+      if (index >= 0) list[index] = pipeline;
+      else list.push(pipeline);
+      state.pipelines = list;
+      return true;
+    }
+    case 'pipeline.removed': {
+      const { launchId } = data as { launchId: number };
+      state.pipelines = (state.pipelines ?? []).filter((pipe) => pipe.launchId !== launchId);
       return true;
     }
     default:

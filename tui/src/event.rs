@@ -160,12 +160,14 @@ pub enum AppEvent {
     },
 
     // ─── Background jobs ─────────────────────────────────────────────
-    /// The session's jobs and subagent runs, as the daemon reported them.
+    /// The session's jobs, subagent runs, and active/retained pipelines.
     BackgroundLoaded {
         /// Terminal jobs.
         jobs: Vec<aither_sandbox::JobInfo>,
         /// Subagent runs in flight.
         subagents: Vec<may_client::subagent_tracker::SubagentRunSnapshot>,
+        /// Active (`>= 3s` foreground or detached) and retained pipelines.
+        pipelines: Vec<may_client::client::background::WirePipeline>,
     },
     /// A background request finished with a message for the status line.
     Status(String),
@@ -269,6 +271,8 @@ pub enum AppEvent {
     },
     /// Incremental terminal-output poll for running tool calls.
     TerminalOutputs(Vec<TerminalOutputDelta>),
+    /// Incremental colored output poll for active or selected pipeline stages.
+    PipelineStageOutputs(Vec<PipelineStageOutputDelta>),
 
     // ─── /btw side question ─────────────────────────────────────────
     /// An answer chunk arrived for the `/btw` overlay.
@@ -354,6 +358,7 @@ impl AppEvent {
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",
+            Self::PipelineStageOutputs(_) => "pipeline_stage_outputs",
             Self::BtwDelta(_) => "btw_delta",
             Self::BtwFinished => "btw_finished",
             Self::BtwFailed(_) => "btw_failed",
@@ -380,6 +385,21 @@ pub struct TerminalOutputDelta {
     pub bytes: Vec<u8>,
     /// Job status at read time — a finished job unbinds the call.
     pub status: aither_sandbox::JobStatus,
+}
+
+/// One incremental UI-colored output read for a pipeline stage.
+#[derive(Debug)]
+pub struct PipelineStageOutputDelta {
+    /// Tool call owning the pipeline card.
+    pub call_id: String,
+    /// Monotonic launch generation key of the pipeline.
+    pub launch_id: u64,
+    /// Zero-based stage index.
+    pub step: usize,
+    /// Updated cursor after this read.
+    pub cursor: usize,
+    /// Colored UTF-8/ANSI bytes appended since the previous cursor.
+    pub bytes: Vec<u8>,
 }
 
 /// Sender type for sending events back to the main loop.

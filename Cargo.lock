@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "async-channel",
  "async-process",
@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-attachments",
  "aither-connectivity",
@@ -198,7 +198,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -211,7 +211,7 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "askama 0.16.1",
@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -244,7 +244,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -263,7 +263,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -287,7 +287,7 @@ dependencies = [
 [[package]]
 name = "aither-connectivity"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -333,7 +333,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-derive",
  "askama 0.16.1",
@@ -361,7 +361,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -398,7 +398,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "arc-swap",
@@ -422,7 +422,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "serde",
@@ -432,7 +432,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -457,7 +457,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -508,7 +508,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -520,7 +520,7 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#db5edf3f823df8c871dcf30ea1bd478032caec7f"
+source = "git+https://github.com/May-Agent/aither?branch=main#45719c87a8342f1960513817718cd3f315f6944c"
 dependencies = [
  "aither-core",
  "askama 0.16.1",

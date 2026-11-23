@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aither_sandbox::{Job, JobInfo, JobRead, JobStatus, Jobs, ShellEvent};
+use aither_sandbox::{
+    Job, JobInfo, JobRead, JobStatus, Jobs, LaunchId, PipelineSnapshot, ShellEvent,
+};
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::routing::Params;
@@ -19,7 +21,8 @@ use skyzen::utils::{Json, State};
 
 use crate::agent::{DeliveredJobCompletion, SessionJobHooks, SubagentTracker, render_job_ended};
 use crate::client::background::{
-    SessionBackgroundSnapshot, WireJob, WireJobDetail, WireSubagentRun, WireTerminalDelta,
+    SessionBackgroundSnapshot, WireJob, WireJobDetail, WirePipeline, WirePipelineStage,
+    WireSubagentRun, WireTerminalDelta,
 };
 use crate::error::bad_request_error;
 use crate::state::DaemonState;
@@ -27,6 +30,8 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 /// How often running background work is checked for changes.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// Faster tick while a session has an actively running pipeline stage.
+const PIPELINE_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 /// Largest terminal read one request returns.
 const MAX_READ_BYTES: usize = 64 * 1024;
 
@@ -35,6 +40,10 @@ struct SessionBackground {
     subagents: SubagentTracker,
     /// Jobs of the session's agents' shells, numbered, newest last.
     jobs: Vec<(u64, Jobs)>,
+    /// Cached script text per pipeline `launch_id`, preserved after foreground exit.
+    pipeline_scripts: HashMap<u64, String>,
+    /// Stable wall-clock expiry timestamp per finished pipeline `launch_id`.
+    pipeline_expires: HashMap<u64, jiff::Timestamp>,
     /// Background wakes being served: received from the idle agent and not
     /// yet settled by the turn they start.
     resuming: Arc<std::sync::atomic::AtomicUsize>,
@@ -174,6 +183,7 @@ impl SessionBackgrounds {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let mut prior_events = Vec::new();
+        let mut prior_jobs = Vec::new();
         for (_, registry) in older_registries {
             let has_surviving = registry.list().await.into_iter().any(|job| {
                 !abandoned_snapshot.contains(&(job.pid, job.started_at))
@@ -181,6 +191,10 @@ impl SessionBackgrounds {
             });
             if has_surviving {
                 prior_events.push(registry.events());
+            }
+            let has_pipelines = !registry.pipelines().await.is_empty();
+            if has_surviving || has_pipelines {
+                prior_jobs.push(registry);
             }
         }
         self.add_jobs(session_id, agent.jobs());
@@ -201,7 +215,7 @@ impl SessionBackgrounds {
                     .push(completion);
             },
         );
-        agent.attach_session_job_hooks(prior_events, hooks, restored_alerts);
+        agent.attach_session_job_hooks(prior_events, prior_jobs, hooks, restored_alerts);
     }
 
     /// Rewinds `session_id`'s background work to before `user_message_id`:
@@ -259,6 +273,11 @@ impl SessionBackgrounds {
                     if job.status == JobStatus::Running {
                         let _ = registry.kill(job.pid).await;
                     }
+                }
+            }
+            for pipe in registry.pipelines().await {
+                if pipe.started_at >= cut_at {
+                    newly_abandoned.push((pipe.pid, pipe.started_at));
                 }
             }
         }
@@ -417,7 +436,7 @@ impl SessionBackgrounds {
                         && (job.status == JobStatus::Running || job.status.completion_pending())
                 })
                 .collect();
-            if live.is_empty() {
+            if live.is_empty() && registry.pipelines().await.is_empty() {
                 idle.push(*id);
             }
             jobs.extend(live);
@@ -450,9 +469,151 @@ impl SessionBackgrounds {
         None
     }
 
+    /// Active and retained pipelines of `session_id`.
+    async fn pipelines(&self, session_id: &str, jobs: &[JobInfo]) -> Vec<WirePipeline> {
+        let Some((registries, abandoned)) = self.sessions().get(session_id).map(|session| {
+            let abandoned = session
+                .abandoned_jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            (session.jobs.clone(), abandoned)
+        }) else {
+            return Vec::new();
+        };
+        let mut raw_pipelines: Vec<PipelineSnapshot> = Vec::new();
+        for (_, registry) in &registries {
+            for pipe in registry.pipelines().await {
+                if !abandoned.contains(&(pipe.pid, pipe.started_at)) {
+                    raw_pipelines.push(pipe);
+                }
+            }
+        }
+        let now_mono = Instant::now();
+        let now_wall = jiff::Timestamp::now();
+        let active_launches: std::collections::HashSet<u64> =
+            raw_pipelines.iter().map(|p| p.launch.raw()).collect();
+        let mut sessions = self.sessions();
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Vec::new();
+        };
+        session
+            .pipeline_scripts
+            .retain(|launch, _| active_launches.contains(launch));
+        session
+            .pipeline_expires
+            .retain(|launch, _| active_launches.contains(launch));
+
+        let mut out = Vec::with_capacity(raw_pipelines.len());
+        for pipe in &raw_pipelines {
+            let launch_id = pipe.launch.raw();
+            let script = session
+                .pipeline_scripts
+                .entry(launch_id)
+                .or_insert_with(|| {
+                    jobs.iter()
+                        .find(|job| job.pid == pipe.pid && job.started_at == pipe.started_at)
+                        .or_else(|| jobs.iter().rfind(|job| job.pid == pipe.pid))
+                        .map_or_default(|job| job.script.clone())
+                })
+                .clone();
+            let expires_at = pipe.expires_at.map(|exp| {
+                *session
+                    .pipeline_expires
+                    .entry(launch_id)
+                    .or_insert_with(|| {
+                        let rem = exp.saturating_duration_since(now_mono);
+                        let secs = i64::try_from(rem.as_secs()).unwrap_or(i64::MAX);
+                        now_wall
+                            .checked_add(jiff::Span::new().seconds(secs))
+                            .unwrap_or(now_wall)
+                    })
+            });
+            out.push((script, expires_at));
+        }
+        drop(sessions);
+
+        raw_pipelines
+            .into_iter()
+            .zip(out)
+            .map(|(pipe, (script, expires_at))| {
+                let launch_id = pipe.launch.raw();
+                let elapsed_dur = pipe.finished_at.map_or_else(
+                    || pipe.started_at.elapsed(),
+                    |fin| fin.saturating_duration_since(pipe.started_at),
+                );
+                let elapsed_ms = u64::try_from(elapsed_dur.as_millis()).unwrap_or(u64::MAX);
+                let stages = pipe
+                    .stages
+                    .into_iter()
+                    .map(|stage| WirePipelineStage {
+                        step: stage.step,
+                        command: stage.command,
+                        status: stage.status.into(),
+                        own_duration_ms: stage
+                            .own_duration
+                            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                        retained: stage.retained,
+                        ui_bytes: stage.ui_bytes,
+                        total_lines: stage.total_lines,
+                    })
+                    .collect();
+                WirePipeline {
+                    pid: pipe.pid,
+                    launch_id,
+                    script,
+                    job_status: (&pipe.job_status).into(),
+                    elapsed_ms,
+                    expires_at,
+                    active_step: pipe.active_step,
+                    stages,
+                }
+            })
+            .collect()
+    }
+
+    /// Reads colored UI bytes from pipeline stage `step` of `pid` (optionally
+    /// pinned to `launch_id`).
+    async fn read_pipeline_stage_ui(
+        &self,
+        session_id: &str,
+        pid: u32,
+        launch_id: Option<u64>,
+        step: usize,
+        cursor: usize,
+    ) -> Result<WireTerminalDelta, aither_sandbox::PipelineReadError> {
+        let launch = launch_id.map(LaunchId::from_raw);
+        let mut best_error = None;
+        for (_, jobs) in self.registries(session_id).into_iter().rev() {
+            match jobs
+                .read_pipeline_stage_ui(pid, launch, step, cursor, MAX_READ_BYTES)
+                .await
+            {
+                Ok(delta) => {
+                    return Ok(WireTerminalDelta {
+                        cursor: delta.cursor,
+                        bytes: delta.bytes,
+                        status: (&delta.job_status).into(),
+                        total_bytes: Some(delta.total_bytes),
+                        stage_status: Some(delta.stage_status.into()),
+                    });
+                }
+                Err(err) => {
+                    if best_error.as_ref().is_none_or(|prev| {
+                        matches!(prev, aither_sandbox::PipelineReadError::UnknownJob { .. })
+                    }) {
+                        best_error = Some(err);
+                    }
+                }
+            }
+        }
+        Err(best_error.unwrap_or(aither_sandbox::PipelineReadError::UnknownJob { pid }))
+    }
+
     /// The snapshot clients render.
     pub async fn snapshot(&self, session_id: &str) -> SessionBackgroundSnapshot {
         let jobs = self.jobs(session_id).await;
+        let pipelines = self.pipelines(session_id, &jobs).await;
         let subagents = self
             .subagents_of(session_id)
             .map_or_default(|tracker| tracker.running());
@@ -463,6 +624,7 @@ impl SessionBackgrounds {
             session_id: session_id.to_string(),
             jobs: jobs.iter().map(WireJob::from).collect(),
             subagents: subagents.iter().map(WireSubagentRun::from).collect(),
+            pipelines,
             resuming: owed_turn || self.resuming(session_id),
         }
     }
@@ -553,6 +715,12 @@ fn shape(snapshot: &SessionBackgroundSnapshot) -> Vec<(u64, String)> {
                 .iter()
                 .map(|run| (run.run_id, "subagent".to_string())),
         )
+        .chain(snapshot.pipelines.iter().map(|pipe| {
+            (
+                pipe.launch_id,
+                format!("pipeline:{:?}:{:?}", pipe.job_status, pipe.active_step),
+            )
+        }))
         .collect()
 }
 
@@ -603,21 +771,30 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
                 }
                 let mut changed = std::collections::BTreeSet::new();
                 let mut busy = std::collections::BTreeSet::new();
+                let mut any_running_pipeline = false;
                 for session_id in state.session_background.session_ids() {
                     let snapshot = state.session_background.snapshot(&session_id).await;
                     let shape = shape(&snapshot);
                     if snapshot.will_resume() {
                         busy.insert(session_id.clone());
                     }
-                    let running =
-                        snapshot.jobs.iter().any(|job| {
+                    let running_pipe = snapshot.pipelines.iter().any(|pipe| {
+                        pipe.job_status == crate::client::background::WireJobStatus::Running
+                    });
+                    any_running_pipeline |= running_pipe;
+                    let running = running_pipe
+                        || snapshot.jobs.iter().any(|job| {
                             job.status == crate::client::background::WireJobStatus::Running
-                        }) || !snapshot.subagents.is_empty();
-                    // Running work changes every second (elapsed time, tokens).
+                        })
+                        || !snapshot.subagents.is_empty();
+                    // Running work changes every tick (elapsed time, active stage, tokens).
                     if running || last.get(&session_id) != Some(&shape) {
                         changed.insert(session_id.clone());
                     }
                     last.insert(session_id, shape);
+                }
+                if any_running_pipeline {
+                    next_tick = std::time::Instant::now() + PIPELINE_WATCH_INTERVAL;
                 }
                 if !changed.is_empty() {
                     for session_id in changed {
@@ -721,6 +898,12 @@ pub async fn kill_job(
 pub struct ReadJobQuery {
     /// Process ID of the job.
     pub pid: u32,
+    /// Optional monotonic launch generation key for retained pipeline stages.
+    #[serde(default)]
+    pub launch_id: Option<u64>,
+    /// Optional zero-based pipeline stage index to read UI-colored bytes from.
+    #[serde(default)]
+    pub step: Option<usize>,
     /// Cursor from the previous read.
     #[serde(default)]
     pub cursor: usize,
@@ -733,6 +916,14 @@ pub async fn read_job(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<WireTerminalDelta>> {
     let session_id = session_id_param(&params)?;
+    if let Some(step) = query.step {
+        let delta = state
+            .session_background
+            .read_pipeline_stage_ui(&session_id, query.pid, query.launch_id, step, query.cursor)
+            .await
+            .map_err(bad_request_error)?;
+        return Ok(Json(delta));
+    }
     let (job, _) = state
         .session_background
         .job_with(&session_id, query.pid)
@@ -747,6 +938,8 @@ pub async fn read_job(
             cursor: delta.cursor,
             bytes: delta.bytes,
             status: (&delta.status).into(),
+            total_bytes: None,
+            stage_status: None,
         })),
         // A client that polls reads what its last read did; the answer is
         // the job's state with nothing new.
@@ -754,6 +947,8 @@ pub async fn read_job(
             cursor: query.cursor,
             bytes: Vec::new(),
             status: (&job.info().await.status).into(),
+            total_bytes: None,
+            stage_status: None,
         })),
     }
 }

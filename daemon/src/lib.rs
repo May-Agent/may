@@ -82,6 +82,7 @@ mod session_events_tests;
 mod session_ids;
 mod sessions;
 mod state;
+mod swarm_peers;
 mod tasks;
 mod terminal_parsing;
 mod title_generation;

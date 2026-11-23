@@ -462,6 +462,10 @@ pub struct DaemonState {
     pub cloud_sessions: Arc<super::cloud_sessions::CloudSessions>,
     /// Reverse peer-agent RPC queue when this daemon runs inside a fronted cloud home.
     pub cloud_home_bridge: super::cloud_home::CloudHomeBridge,
+    /// Live `/api/events?topics=swarm` SSE mirror state across reachable tailnet peers.
+    pub swarm_mirrors: super::swarm_peers::SwarmMirrorState,
+    /// Buffered routine PR/lifecycle swarm notices waiting for `Suspended` codespaces.
+    pub buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices,
     /// On a cloud home, the providers the fronting daemon pushed: kept
     /// apart from `config`, so no configuration write carries them.
     pub pushed_providers: crate::cloud::access::PushedProviders,
@@ -1504,6 +1508,8 @@ impl DaemonState {
             ),
             pushed_providers: crate::cloud::access::PushedProviders::default(),
             cloud_home_bridge: super::cloud_home::CloudHomeBridge::default(),
+            swarm_mirrors: super::swarm_peers::SwarmMirrorState::default(),
+            buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::default(),
             notification_service,
             memory_processor: None,
             local_url_port_mapper: std::sync::Arc::new(

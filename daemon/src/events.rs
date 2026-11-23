@@ -56,6 +56,7 @@ struct EventSignatures {
     remote_access: String,
     sleep: String,
     prs: String,
+    swarm: String,
     session_index: String,
 }
 
@@ -313,6 +314,11 @@ async fn emit_topics_if_changed(
     }
     if topics.contains(UiEventTopics::PRS)
         && !emit_prs_if_changed(state, sender, &mut signatures.prs).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::SWARM)
+        && !emit_swarm_if_changed(state, sender, &mut signatures.swarm).await
     {
         return false;
     }
@@ -713,6 +719,31 @@ async fn emit_prs_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "prs", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_swarm_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let host_machine = crate::peers::DaemonPeerFabric::new(state.clone()).local_machine_name();
+    let boards = state
+        .services
+        .swarm()
+        .map_or_default(|s| s.hosted_board_summaries());
+    let payload = crate::swarm::SwarmBoardsSsePayload {
+        host_machine,
+        boards,
+    };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "swarm", &payload).await {
             return false;
         }
         *last_sig = sig;

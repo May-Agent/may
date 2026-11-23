@@ -17,11 +17,11 @@ pub use sse::{ServerEvent, SseParser};
 pub use wire::{
     CompactionPhase, CreateSessionRequest, HoldReason, IndexCoverage, IssueRemovedFrame,
     IssueUpsertedFrame, IssuedSessionName, JobRemovedFrame, JobUpsertedFrame, PermissionPollItem,
-    PrsChangedFrame, RecapFrame, RewindRequest, RunEnd, SessionAgentBody, SessionAgentFrame,
-    SessionCompactionFrame, SessionIndexSnapshot, SessionIssuesFrame, SessionRuntimeEvent,
-    SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame, SuggestionFrame,
-    UpdateSessionRequest, WarningFrame, WirePr, WirePrCheck, WirePrChecks, WirePrEvent,
-    WireSession, WireTranscriptEntry, WireTranscriptPage,
+    PipelineRemovedFrame, PipelineUpsertedFrame, PrsChangedFrame, RecapFrame, RewindRequest,
+    RunEnd, SessionAgentBody, SessionAgentFrame, SessionCompactionFrame, SessionIndexSnapshot,
+    SessionIssuesFrame, SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame,
+    SubagentUpsertedFrame, SuggestionFrame, UpdateSessionRequest, WarningFrame, WirePr,
+    WirePrCheck, WirePrChecks, WirePrEvent, WireSession, WireTranscriptEntry, WireTranscriptPage,
 };
 
 use std::path::PathBuf;

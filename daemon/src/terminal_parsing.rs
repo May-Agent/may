@@ -123,6 +123,7 @@ mod tests {
             },
             stderr: None,
             outcome,
+            retained_pid: None,
             interruptions: Vec::new(),
         }))
     }

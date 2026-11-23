@@ -1,1 +1,1 @@
-Read the new output of a background terminal job by its PID.
+Read the new output of a background terminal job, or a retained pipeline stage (`step`), by its PID.
