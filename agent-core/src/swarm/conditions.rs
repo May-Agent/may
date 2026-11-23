@@ -2,17 +2,18 @@
 //!
 //! Injects the swarm rules once on entry, re-injects after context compaction
 //! while the board remains active, and appends unread message hints without
-//! waking idle sessions.
+//! waking idle sessions. When federated peer transport is attached, evaluation
+//! reads the in-memory SSE-mirrored board snapshot plus local SQLite cursor
+//! state with zero cross-machine RTT.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 use askama::Template;
 
+use super::federation::{SwarmMember, display_group_key};
 use super::{ActiveBoard, SwarmService};
-use crate::agent_link::AgentStatus;
 
 const SOURCE_ID: &str = "swarm";
 
@@ -70,7 +71,7 @@ impl SwarmSeenState {
 struct SwarmAlertTemplate<'a> {
     workdir: &'a str,
     board_epoch: u64,
-    peers: &'a [AgentStatus],
+    peers: &'a [SwarmMember],
 }
 
 #[derive(Template)]
@@ -108,14 +109,14 @@ impl SwarmConditions {
         }
     }
 
-    fn render_protocol_alert(&self, board: &ActiveBoard) -> ContextBlock {
-        let peers: Vec<AgentStatus> = board
+    fn render_protocol_alert(&self, board: &ActiveBoard, local_machine: &str) -> ContextBlock {
+        let peers: Vec<SwarmMember> = board
             .members
             .iter()
-            .filter(|m| m.session_id != self.session_id)
+            .filter(|m| !(m.machine == local_machine && m.session_id == self.session_id))
             .cloned()
             .collect();
-        let display_dir = crate::fs_utils::display_path(Path::new(&board.workdir));
+        let display_dir = display_group_key(&board.workdir);
         let text = SwarmAlertTemplate {
             workdir: &display_dir,
             board_epoch: board.board_epoch,
@@ -129,7 +130,14 @@ impl SwarmConditions {
     }
 
     async fn evaluate(&self, reassembled: bool, commit: bool) -> Vec<ContextBlock> {
-        if commit && let Err(error) = self.swarm.reconcile().await {
+        // Only run inline SQLite reconciliation when no cross-machine transport is
+        // attached. With peer transport enabled, background reconciliation and
+        // `/api/events?topics=swarm` SSE mirrors maintain the snapshot so model
+        // requests pay zero network RTT.
+        if commit
+            && !self.swarm.has_transport()
+            && let Err(error) = self.swarm.reconcile().await
+        {
             tracing::warn!(session_id = %self.session_id, %error, "failed to reconcile swarm on request");
         }
 
@@ -140,14 +148,34 @@ impl SwarmConditions {
         };
 
         let mut blocks = Vec::new();
+        let local_machine = self.swarm.local_machine();
 
         if let Some(board) = self.swarm.active_board_for(&self.session_id) {
             let target_epoch = board.board_epoch.max(1);
-            let needs_protocol = prior.epoch != target_epoch
+            let epoch_advanced = prior.epoch != target_epoch
                 || prior.workdir.as_deref() != Some(board.workdir.as_str());
-            if needs_protocol {
-                blocks.push(self.render_protocol_alert(&board));
+            if epoch_advanced {
+                blocks.push(self.render_protocol_alert(&board, &local_machine));
                 if commit {
+                    // If this daemon mirrors a remote Board Host and `board_epoch` bumped
+                    // (e.g. after Board Host failover or recreation), reset the local read
+                    // cursor when the persisted told_epoch differs so new `#1..` entries
+                    // are not masked by an earlier epoch's cursor.
+                    if !board.is_local_host
+                        && let Ok(persisted) = self
+                            .swarm
+                            .db()
+                            .get_swarm_session_state(&self.session_id)
+                            .await
+                        && (persisted.told_epoch != target_epoch
+                            || persisted.told_workdir.as_deref() != Some(board.workdir.as_str()))
+                    {
+                        let _ = self
+                            .swarm
+                            .db()
+                            .set_swarm_cursor(&board.workdir, &self.session_id, 0)
+                            .await;
+                    }
                     self.seen.set(Some(board.workdir.clone()), target_epoch);
                     if let Err(error) = self
                         .swarm
@@ -160,34 +188,43 @@ impl SwarmConditions {
                 }
             }
 
-            match self
-                .swarm
-                .db()
-                .swarm_unread_status(&board.workdir, &self.session_id)
-                .await
+            let unread_opt = if board.is_local_host {
+                let reader_key = self.swarm.local_cursor_key(&self.session_id);
+                self.swarm
+                    .db()
+                    .swarm_unread_status(&board.workdir, &reader_key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|st| (st.board_epoch, st.cursor, st.max_seq))
+            } else {
+                self.swarm
+                    .db()
+                    .get_swarm_cursor(&board.workdir, &self.session_id)
+                    .await
+                    .ok()
+                    .map(|cursor| (board.board_epoch, cursor, board.max_seq))
+            };
+
+            if let Some((board_epoch, cursor, max_seq)) = unread_opt
+                && max_seq > cursor
             {
-                Ok(Some(status)) if status.max_seq > status.cursor => {
-                    let unread_count = status.max_seq - status.cursor;
-                    let text = SwarmUnreadTemplate {
-                        board_epoch: status.board_epoch,
-                        unread_count,
-                        first_seq: status.cursor + 1,
-                        last_seq: status.max_seq,
-                    }
-                    .render()
-                    .unwrap_or_default()
-                    .trim_end()
-                    .to_string();
-                    blocks.push(ContextBlock::tail("system-reminder", text));
+                let unread_count = max_seq - cursor;
+                let text = SwarmUnreadTemplate {
+                    board_epoch,
+                    unread_count,
+                    first_seq: cursor + 1,
+                    last_seq: max_seq,
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(session_id = %self.session_id, %error, "failed to read swarm unread status");
-                }
+                .render()
+                .unwrap_or_default()
+                .trim_end()
+                .to_string();
+                blocks.push(ContextBlock::tail("system-reminder", text));
             }
         } else if !reassembled && prior.epoch != 0 {
             let raw_dir = prior.workdir.as_deref().unwrap_or(".");
-            let display_dir = crate::fs_utils::display_path(Path::new(raw_dir));
+            let display_dir = display_group_key(raw_dir);
             let text = SwarmDissolvedTemplate {
                 workdir: &display_dir,
             }

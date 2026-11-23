@@ -1,9 +1,15 @@
-//! Experimental per-worktree agent swarm coordination.
+//! Experimental repository-first and cross-machine agent swarm coordination.
 //!
-//! Manages shared boards, pull-by-default message history, `@mention` wakeups
-//! with loop breaking, and PR/merge-queue notifications.
+//! Coordinates working sessions sharing a canonical `ForgeRepo` across git
+//! worktrees, same-owner Tailscale peers, and Codespaces cloud homes (falling
+//! back to `<machine>:<worktree_root>` for local-only checkouts). Elects a
+//! single-writer Board Host per active swarm while mirroring lightweight
+//! `(board_epoch, max_seq, members)` summaries over `/api/events` SSE so
+//! request-time `SwarmConditions` and dynamic `board` `CommandSet` checks run
+//! with zero cross-machine RTT.
 
 mod conditions;
+pub mod federation;
 mod tool;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +23,7 @@ use may_protocol::session_runtime::PendingMessageState;
 use may_protocol::xml::XmlBlock;
 
 use crate::agent_link::{
-    AgentLinkError, AgentMessaging, AgentStatus, AttributeText, UntrustedText,
+    AgentLinkError, AgentMessaging, AttributeText, UntrustedText, split_qualified_target,
 };
 use crate::config::MayConfig;
 use crate::db::{
@@ -29,6 +35,14 @@ use crate::ui_event_bus::UiEventTopics;
 use crate::workspace::WorkspaceConfig;
 
 pub use conditions::{SwarmConditions, SwarmSeenState};
+pub use federation::{
+    AnySwarmTransport, PeerSwarmDeliverRequest, PeerSwarmDeliverResponse, PeerSwarmErrorBody,
+    PeerSwarmPostRequest, PeerSwarmPostResponse, PeerSwarmPrRequest, PeerSwarmReadRequest,
+    PeerSwarmReadResponse, PeerSwarmStateResponse, PeerSwarmWorld, RemoteWorkingSession,
+    SwarmBoardSummary, SwarmBoardsSsePayload, SwarmMember, SwarmTransport, WireSwarmMessage,
+    WireSwarmReadMode, display_group_key, elect_board_host, group_matches_pr_repo,
+    is_forge_group_key, resolve_session_group_key,
+};
 pub use tool::{BoardArgs, BoardCommandSet, BoardTool};
 
 /// Convenience constructor for [`BoardTool`].
@@ -63,15 +77,22 @@ pub struct SwarmPrAnnouncement<'a> {
     /// Changed file paths between `base_sha` and `head_sha`.
     pub changed_files: Vec<String>,
 }
-/// Active board snapshot for one normalized worktree root.
+
+/// Active board snapshot for one repository or local worktree group.
 #[derive(Debug, Clone)]
 pub struct ActiveBoard {
-    /// Normalized worktree root path.
+    /// Canonical group key (`github:owner/repo` or `<machine>:<worktree_root>`).
     pub workdir: String,
+    /// Elected authoritative Board Host machine (`""` when local-only without transport).
+    pub host_machine: String,
+    /// True when this daemon's SQLite owns the authoritative single-writer board.
+    pub is_local_host: bool,
     /// Monotonic generation of this board.
     pub board_epoch: u64,
-    /// Working sessions currently attached to this board.
-    pub members: Vec<AgentStatus>,
+    /// Highest message sequence number known on this board (`0` when empty).
+    pub max_seq: u64,
+    /// Working sessions currently attached to this board across participating machines.
+    pub members: Vec<SwarmMember>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,17 +117,20 @@ pub enum SwarmError {
     /// Agent directory lookup or delivery failed.
     #[error(transparent)]
     AgentLink(#[from] AgentLinkError),
-    /// `board` was called when the session's checkout has no active swarm.
+    /// `board` was called when the session's repository/checkout has no active swarm.
     #[error(
-        "no active swarm board in this checkout (`[experimental] swarm` requires > 1 working session in the same worktree)"
+        "no active swarm board for this repository (`[experimental] swarm` requires > 1 working session)"
     )]
     NoActiveBoard,
     /// Message file was empty.
     #[error("refusing to post an empty board message from {0}")]
     EmptyMessage(PathBuf),
-    /// `@mention` matched multiple members with the same title.
+    /// `@mention` matched multiple members with the same title or bare id.
     #[error("{0}")]
     AmbiguousMention(String),
+    /// Remote Board Host RPC failed.
+    #[error("remote swarm board host error: {0}")]
+    Remote(String),
     /// Template rendering failed.
     #[error(transparent)]
     Template(#[from] askama::Error),
@@ -118,6 +142,7 @@ pub struct SwarmService {
     messaging: AgentMessaging,
     may_dir: PathBuf,
     config: Arc<ArcSwap<MayConfig>>,
+    transport: Option<AnySwarmTransport>,
     snapshot: Arc<ArcSwap<ActiveSwarmSnapshot>>,
     reconcile_lock: Arc<async_lock::Mutex<()>>,
 }
@@ -168,8 +193,9 @@ struct SwarmMembersTemplate<'a> {
 
 struct RenderedMember<'a> {
     name: &'a str,
-    session_id: &'a str,
+    address: &'a str,
     activity: crate::agent_link::Activity,
+    suspended: bool,
     roots: &'a [String],
     is_self: bool,
 }
@@ -235,6 +261,13 @@ struct SwarmPrEntryTemplate<'a> {
     extra_files: usize,
 }
 
+#[derive(Debug, Clone)]
+struct CandidateMember {
+    member: SwarmMember,
+    voter_machine: String,
+    is_local: bool,
+}
+
 impl SwarmService {
     /// Builds the swarm coordination service backed by `messaging` and live `config`.
     #[must_use]
@@ -247,8 +280,49 @@ impl SwarmService {
             messaging,
             may_dir,
             config,
+            transport: None,
             snapshot: Arc::new(ArcSwap::from_pointee(ActiveSwarmSnapshot::default())),
             reconcile_lock: Arc::new(async_lock::Mutex::new(())),
+        }
+    }
+
+    /// Attaches a cross-machine [`SwarmTransport`] enabling multi-host Board Host
+    /// election, SSE summary mirroring, and remote board RPCs.
+    #[must_use]
+    pub fn with_transport(mut self, transport: impl SwarmTransport) -> Self {
+        self.transport = Some(AnySwarmTransport::new(transport));
+        self
+    }
+
+    /// Attaches an already-wrapped [`AnySwarmTransport`].
+    #[must_use]
+    pub fn with_any_transport(mut self, transport: AnySwarmTransport) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Whether cross-machine peer transport is attached.
+    #[must_use]
+    pub const fn has_transport(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    /// Normalized machine name of this daemon (`""` when no transport is attached).
+    #[must_use]
+    pub fn local_machine(&self) -> String {
+        self.transport
+            .as_ref()
+            .map_or_else(String::new, AnySwarmTransport::local_machine)
+    }
+
+    /// Cursor key used for a local session on locally hosted boards.
+    #[must_use]
+    pub fn local_cursor_key(&self, session_id: &str) -> String {
+        let machine = self.local_machine();
+        if machine.is_empty() {
+            session_id.to_string()
+        } else {
+            format!("{machine}:{session_id}")
         }
     }
 
@@ -264,13 +338,150 @@ impl SwarmService {
         self.config.load().experimental.swarm
     }
 
-    /// Active board for `session_id` from the latest reconciled in-memory snapshot.
+    /// Active board for `session_id` from the latest reconciled or SSE-mirrored
+    /// in-memory snapshot (zero network RTT).
     #[must_use]
     pub fn active_board_for(&self, session_id: &str) -> Option<ActiveBoard> {
         if !self.is_enabled() {
             return None;
         }
         self.snapshot.load().board_for_session(session_id).cloned()
+    }
+
+    /// Authoritative board summaries currently hosted on this daemon, emitted on
+    /// `/api/events?topics=swarm` and `GET /api/peers/swarm/state`.
+    #[must_use]
+    pub fn hosted_board_summaries(&self) -> Vec<SwarmBoardSummary> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        let local_machine = self.local_machine();
+        let snap = self.snapshot.load();
+        snap.boards
+            .values()
+            .filter(|b| b.is_local_host)
+            .map(|b| SwarmBoardSummary {
+                group_key: b.workdir.clone(),
+                host_machine: if b.host_machine.is_empty() {
+                    local_machine.clone()
+                } else {
+                    b.host_machine.clone()
+                },
+                board_epoch: b.board_epoch,
+                max_seq: b.max_seq,
+                members: b.members.clone(),
+            })
+            .collect()
+    }
+
+    /// Returns local non-archived working sessions formatted for `GET /api/peers/swarm/state`.
+    ///
+    /// # Errors
+    /// Returns [`SwarmError`] on storage or `tasks.md` read failure.
+    pub async fn local_working_sessions(
+        &self,
+        local_machine: &str,
+    ) -> Result<Vec<RemoteWorkingSession>, SwarmError> {
+        if !self.is_enabled() {
+            return Ok(Vec::new());
+        }
+        let db = self.db();
+        let ((live_agents, working_ids), session_rows) = futures_lite::future::zip(
+            futures_lite::future::zip(self.messaging.directory.live(), db.working_session_ids()),
+            db.list_sessions(),
+        )
+        .await;
+        let live_agents = live_agents?;
+        let working_ids = working_ids?;
+        let session_rows = session_rows?;
+        let rows_by_id: BTreeMap<&str, &crate::db::entity::sessions::Model> = session_rows
+            .iter()
+            .map(|row| (row.id.as_str(), row))
+            .collect();
+
+        let mut out = Vec::new();
+        for agent in live_agents {
+            if !working_ids.contains(&agent.session_id) {
+                continue;
+            }
+            let Some(row) = rows_by_id.get(agent.session_id.as_str()) else {
+                continue;
+            };
+            let Some(group_key) =
+                resolve_session_group_key(row, &self.may_dir, Some(local_machine))
+            else {
+                continue;
+            };
+            out.push(RemoteWorkingSession {
+                machine: local_machine.to_string(),
+                voter_machine: local_machine.to_string(),
+                session_id: agent.session_id,
+                name: agent.name,
+                activity: agent.activity,
+                suspended: false,
+                roots: agent.roots,
+                group_key,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Applies an SSE `"swarm"` frame pushed from `host_machine` directly into the
+    /// local zero-RTT snapshot so `SwarmConditions` and `BoardCommandSet` see new
+    /// `max_seq` / `board_epoch` values immediately without polling.
+    pub async fn apply_mirrored_boards(&self, host_machine: &str, boards: Vec<SwarmBoardSummary>) {
+        if !self.is_enabled() {
+            return;
+        }
+        let local_machine = self.local_machine();
+        if host_machine == local_machine {
+            return;
+        }
+        for summary in &boards {
+            let _ = self
+                .db()
+                .observe_swarm_epoch(&summary.group_key, summary.board_epoch)
+                .await;
+        }
+        let _guard = self.reconcile_lock.lock().await;
+        let current = (**self.snapshot.load()).clone();
+        let mut next = ActiveSwarmSnapshot {
+            boards: current
+                .boards
+                .into_iter()
+                .filter(|(_, b)| b.is_local_host || b.host_machine != host_machine)
+                .collect(),
+            session_to_workdir: BTreeMap::new(),
+        };
+        for summary in boards {
+            if next
+                .boards
+                .get(&summary.group_key)
+                .is_some_and(|existing| existing.is_local_host)
+            {
+                continue;
+            }
+            next.boards.insert(
+                summary.group_key.clone(),
+                ActiveBoard {
+                    workdir: summary.group_key,
+                    host_machine: summary.host_machine,
+                    is_local_host: false,
+                    board_epoch: summary.board_epoch,
+                    max_seq: summary.max_seq,
+                    members: summary.members,
+                },
+            );
+        }
+        for (group_key, board) in &next.boards {
+            for member in &board.members {
+                if member.machine == local_machine {
+                    next.session_to_workdir
+                        .insert(member.session_id.clone(), group_key.clone());
+                }
+            }
+        }
+        self.snapshot.store(Arc::new(next));
     }
 
     /// Normalizes a session checkout path to its git worktree root when inside
@@ -285,8 +496,8 @@ impl SwarmService {
             .into_owned()
     }
 
-    /// Reconciles active swarm boards against live working sessions and the
-    /// `[experimental] swarm` switch. Safe to call concurrently and idempotently.
+    /// Reconciles active swarm boards against live local and remote working sessions,
+    /// deterministic Board Host election, and the `[experimental] swarm` switch.
     ///
     /// # Errors
     /// Returns [`SwarmError`] when reading sessions or updating board rows fails.
@@ -294,14 +505,20 @@ impl SwarmService {
         let _guard = self.reconcile_lock.lock().await;
         let db = self.db();
 
+        let prev_hosted = self.hosted_board_summaries();
+
         if !self.is_enabled() {
             let existing = db.list_swarm_boards().await?;
             let mut touched_any = false;
             for board in existing {
-                if let Some((_, touched)) = self.destroy_board_and_steers(&board.workdir).await?
-                    && !touched.is_empty()
+                if let Some((epoch, touched)) =
+                    self.destroy_board_and_steers(&board.workdir).await?
                 {
-                    touched_any = true;
+                    if !touched.is_empty() {
+                        touched_any = true;
+                    }
+                    self.broadcast_dissolved_to_peers(&board.workdir, epoch, &prev_hosted)
+                        .await;
                 }
             }
             self.snapshot
@@ -312,8 +529,23 @@ impl SwarmService {
                     .ui_events()
                     .publish(UiEventTopics::SESSION_RUNTIMES);
             }
+            if !prev_hosted.is_empty()
+                && let Some(transport) = &self.transport
+            {
+                transport.notify_hosted_boards_changed();
+            }
             return Ok(());
         }
+
+        let peer_world = if let Some(transport) = &self.transport {
+            Some(transport.poll_world().await)
+        } else {
+            None
+        };
+        let local_machine = peer_world
+            .as_ref()
+            .map_or_else(String::new, |w| w.local_machine.clone());
+        let local_machine_opt = (!local_machine.is_empty()).then_some(local_machine.as_str());
 
         let ((live_agents, working_ids), (session_rows, existing_boards)) =
             futures_lite::future::zip(
@@ -334,7 +566,7 @@ impl SwarmService {
             .map(|row| (row.id.as_str(), row))
             .collect();
 
-        let mut grouped: BTreeMap<String, Vec<AgentStatus>> = BTreeMap::new();
+        let mut grouped: BTreeMap<String, Vec<CandidateMember>> = BTreeMap::new();
         for agent in live_agents {
             if !working_ids.contains(&agent.session_id) {
                 continue;
@@ -342,66 +574,218 @@ impl SwarmService {
             let Some(row) = rows_by_id.get(agent.session_id.as_str()) else {
                 continue;
             };
-            let SessionDirectory::Checkout(checkout) = SessionDirectory::of(row, &self.may_dir)
+            let Some(group_key) = resolve_session_group_key(row, &self.may_dir, local_machine_opt)
             else {
                 continue;
             };
-            let key = Self::normalize_checkout(&checkout);
-            grouped.entry(key).or_default().push(agent);
+            let address = if local_machine.is_empty() {
+                agent.session_id.clone()
+            } else {
+                format!("{local_machine}:{}", agent.session_id)
+            };
+            grouped.entry(group_key).or_default().push(CandidateMember {
+                member: SwarmMember {
+                    machine: local_machine.clone(),
+                    session_id: agent.session_id,
+                    address,
+                    name: agent.name,
+                    activity: agent.activity,
+                    suspended: false,
+                    roots: agent.roots,
+                },
+                voter_machine: local_machine.clone(),
+                is_local: true,
+            });
         }
 
+        let mut remote_boards_by_group: BTreeMap<String, SwarmBoardSummary> = BTreeMap::new();
+        if let Some(world) = peer_world {
+            for summary in world.remote_boards {
+                let _ = db
+                    .observe_swarm_epoch(&summary.group_key, summary.board_epoch)
+                    .await;
+                remote_boards_by_group.insert(summary.group_key.clone(), summary);
+            }
+            for remote in world.remote_sessions {
+                if remote.machine == local_machine {
+                    continue;
+                }
+                let address = format!("{}:{}", remote.machine, remote.session_id);
+                grouped
+                    .entry(remote.group_key)
+                    .or_default()
+                    .push(CandidateMember {
+                        member: SwarmMember {
+                            machine: remote.machine,
+                            session_id: remote.session_id,
+                            address,
+                            name: remote.name,
+                            activity: remote.activity,
+                            suspended: remote.suspended,
+                            roots: remote.roots,
+                        },
+                        voter_machine: remote.voter_machine,
+                        is_local: false,
+                    });
+            }
+        }
+
+        // Deduplicate candidates by `(machine, session_id)` and sort deterministically.
+        for candidates in grouped.values_mut() {
+            candidates.sort_by(|a, b| {
+                a.member
+                    .machine
+                    .cmp(&b.member.machine)
+                    .then_with(|| a.member.name.cmp(&b.member.name))
+                    .then_with(|| a.member.session_id.cmp(&b.member.session_id))
+            });
+            candidates.dedup_by(|a, b| {
+                a.member.machine == b.member.machine && a.member.session_id == b.member.session_id
+            });
+            // When no cross-machine peer participates in a board and no transport is
+            // needed to disambiguate, keep bare `session_id` addresses on purely
+            // single-daemon setups without transport; with transport, keep `<machine>:<id>`
+            // whenever multiple machines participate, or bare `<id>` when all members
+            // sit on this machine alone so single-machine ergonomics stay terse.
+            let multi_machine = candidates.first().is_some_and(|first| {
+                candidates
+                    .iter()
+                    .any(|c| c.member.machine != first.member.machine)
+            });
+            if !multi_machine {
+                for c in candidates.iter_mut() {
+                    if c.is_local {
+                        c.member.address.clone_from(&c.member.session_id);
+                    }
+                }
+            }
+        }
+
+        // Destroy any locally persisted board that fell to `<= 1` members OR whose
+        // elected Board Host moved to another online machine.
         let mut touched_any = false;
         for board in &existing_boards {
-            let active_count = grouped.get(&board.workdir).map_or(0, Vec::len);
-            if active_count <= 1
-                && let Some((_, touched)) = self.destroy_board_and_steers(&board.workdir).await?
-                && !touched.is_empty()
+            let should_keep_locally = grouped.get(&board.workdir).is_some_and(|candidates| {
+                if candidates.len() <= 1 {
+                    return false;
+                }
+                if local_machine.is_empty() {
+                    return true;
+                }
+                let elected = elect_board_host(
+                    &board.workdir,
+                    candidates.iter().map(|c| c.voter_machine.as_str()),
+                );
+                elected.as_deref() == Some(local_machine.as_str())
+            });
+            if !should_keep_locally
+                && let Some((epoch, touched)) =
+                    self.destroy_board_and_steers(&board.workdir).await?
             {
-                touched_any = true;
+                if !touched.is_empty() {
+                    touched_any = true;
+                }
+                let fell_below_quorum = grouped.get(&board.workdir).is_none_or(|c| c.len() <= 1);
+                if fell_below_quorum {
+                    self.broadcast_dissolved_to_peers(&board.workdir, epoch, &prev_hosted)
+                        .await;
+                }
             }
         }
 
         let mut next_snapshot = ActiveSwarmSnapshot::default();
-        for (workdir, members) in grouped {
-            if members.len() <= 1 {
+        for (group_key, candidates) in grouped {
+            if candidates.len() <= 1 {
                 continue;
             }
-            let (board_row, created) = db.open_or_get_swarm_board(&workdir).await?;
-            if created {
-                let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
-                let display_dir = crate::fs_utils::display_path(Path::new(&workdir));
-                let summary = SwarmLifecycleOpenedTemplate {
-                    board_epoch: board_row.board_epoch,
-                    workdir: &display_dir,
-                    member_count: members.len(),
-                    names,
+            let elected_host = if local_machine.is_empty() {
+                String::new()
+            } else {
+                elect_board_host(
+                    &group_key,
+                    candidates.iter().map(|c| c.voter_machine.as_str()),
+                )
+                .unwrap_or_else(|| local_machine.clone())
+            };
+            let is_local_host = local_machine.is_empty() || elected_host == local_machine;
+            let members: Vec<SwarmMember> = candidates.iter().map(|c| c.member.clone()).collect();
+
+            if is_local_host {
+                let (board_row, created) = db.open_or_get_swarm_board(&group_key).await?;
+                if created {
+                    let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+                    let display_dir = display_group_key(&group_key);
+                    let summary = SwarmLifecycleOpenedTemplate {
+                        board_epoch: board_row.board_epoch,
+                        workdir: &display_dir,
+                        member_count: members.len(),
+                        names,
+                    }
+                    .render()?
+                    .trim_end()
+                    .to_string();
+                    let _ = db
+                        .append_swarm_message(NewSwarmMessage {
+                            workdir: &group_key,
+                            session_id: None,
+                            sender: "swarm",
+                            kind: SwarmMessageKind::Lifecycle,
+                            body: &summary,
+                        })
+                        .await?;
                 }
-                .render()?
-                .trim_end()
-                .to_string();
-                let _ = db
-                    .append_swarm_message(NewSwarmMessage {
-                        workdir: &workdir,
-                        session_id: None,
-                        sender: "swarm",
-                        kind: SwarmMessageKind::Lifecycle,
-                        body: &summary,
-                    })
-                    .await?;
+                let max_seq = db.board_max_seq(&group_key).await?;
+                for c in &candidates {
+                    if c.is_local {
+                        next_snapshot
+                            .session_to_workdir
+                            .insert(c.member.session_id.clone(), group_key.clone());
+                    }
+                }
+                next_snapshot.boards.insert(
+                    group_key.clone(),
+                    ActiveBoard {
+                        workdir: group_key,
+                        host_machine: elected_host,
+                        is_local_host: true,
+                        board_epoch: board_row.board_epoch,
+                        max_seq,
+                        members,
+                    },
+                );
+            } else {
+                let (board_epoch, max_seq, effective_members) = if let Some(mirrored) =
+                    remote_boards_by_group.get(&group_key)
+                    && mirrored.host_machine == elected_host
+                {
+                    (
+                        mirrored.board_epoch.max(1),
+                        mirrored.max_seq,
+                        mirrored.members.clone(),
+                    )
+                } else {
+                    (1, 0, members)
+                };
+                let _ = db.observe_swarm_epoch(&group_key, board_epoch).await;
+                for c in &candidates {
+                    if c.is_local {
+                        next_snapshot
+                            .session_to_workdir
+                            .insert(c.member.session_id.clone(), group_key.clone());
+                    }
+                }
+                next_snapshot.boards.insert(
+                    group_key.clone(),
+                    ActiveBoard {
+                        workdir: group_key,
+                        host_machine: elected_host,
+                        is_local_host: false,
+                        board_epoch,
+                        max_seq,
+                        members: effective_members,
+                    },
+                );
             }
-            for member in &members {
-                next_snapshot
-                    .session_to_workdir
-                    .insert(member.session_id.clone(), workdir.clone());
-            }
-            next_snapshot.boards.insert(
-                workdir.clone(),
-                ActiveBoard {
-                    workdir,
-                    board_epoch: board_row.board_epoch,
-                    members,
-                },
-            );
         }
 
         self.snapshot.store(Arc::new(next_snapshot));
@@ -411,7 +795,45 @@ impl SwarmService {
                 .ui_events()
                 .publish(UiEventTopics::SESSION_RUNTIMES);
         }
+        let next_hosted = self.hosted_board_summaries();
+        if next_hosted != prev_hosted
+            && let Some(transport) = &self.transport
+        {
+            transport.notify_hosted_boards_changed();
+        }
         Ok(())
+    }
+
+    async fn broadcast_dissolved_to_peers(
+        &self,
+        group_key: &str,
+        board_epoch: u64,
+        prev_hosted: &[SwarmBoardSummary],
+    ) {
+        let Some(transport) = &self.transport else {
+            return;
+        };
+        let local_machine = transport.local_machine();
+        let Some(summary) = prev_hosted.iter().find(|b| b.group_key == group_key) else {
+            return;
+        };
+        let mut remote_machines: BTreeSet<&str> = BTreeSet::new();
+        for m in &summary.members {
+            if !m.machine.is_empty() && m.machine != local_machine {
+                remote_machines.insert(m.machine.as_str());
+            }
+        }
+        for machine in remote_machines {
+            let _ = transport
+                .deliver_to_peer(
+                    machine,
+                    PeerSwarmDeliverRequest::Dissolved {
+                        group_key: group_key.to_string(),
+                        board_epoch,
+                    },
+                )
+                .await;
+        }
     }
 
     async fn destroy_board_and_steers(
@@ -438,7 +860,9 @@ impl SwarmService {
             .await
     }
 
-    /// Reads entries from `session_id`'s active swarm board.
+    /// Reads entries from `session_id`'s active swarm board, routing to the
+    /// remote Board Host when hosted on another machine and syncing the local
+    /// read cursor for zero-RTT unread indicators.
     ///
     /// # Errors
     /// Returns [`SwarmError`] when no board is active or the read fails.
@@ -455,11 +879,37 @@ impl SwarmService {
         let cap = limit
             .unwrap_or_else(|| self.config.load().experimental.swarm_read_limit)
             .max(1);
-        let result = self
-            .db()
-            .read_swarm_messages(&board.workdir, session_id, mode, cap)
-            .await?
-            .ok_or(SwarmError::NoActiveBoard)?;
+
+        let result = if board.is_local_host {
+            let reader_key = self.local_cursor_key(session_id);
+            self.db()
+                .read_swarm_messages(&board.workdir, &reader_key, mode, cap)
+                .await?
+                .ok_or(SwarmError::NoActiveBoard)?
+        } else {
+            let Some(transport) = &self.transport else {
+                return Err(SwarmError::NoActiveBoard);
+            };
+            let reader_key = self.local_cursor_key(session_id);
+            let resp = transport
+                .read_remote_board(
+                    &board.host_machine,
+                    PeerSwarmReadRequest {
+                        group_key: board.workdir.clone(),
+                        reader_key,
+                        mode: mode.into(),
+                        limit: cap,
+                    },
+                )
+                .await?;
+            let (read_res, cursor) = resp.into_read_result(&board.workdir);
+            let _ = self
+                .db()
+                .set_swarm_cursor(&board.workdir, session_id, cursor)
+                .await;
+            self.bump_cached_max_seq(&board.workdir, read_res.board_epoch, read_res.max_seq);
+            read_res
+        };
 
         let rendered: Vec<RenderedMessage<'_>> = result
             .messages
@@ -495,16 +945,18 @@ impl SwarmService {
         let board = self
             .active_board_for(session_id)
             .ok_or(SwarmError::NoActiveBoard)?;
-        let display_dir = crate::fs_utils::display_path(Path::new(&board.workdir));
+        let local_machine = self.local_machine();
+        let display_dir = display_group_key(&board.workdir);
         let members: Vec<RenderedMember<'_>> = board
             .members
             .iter()
             .map(|member| RenderedMember {
                 name: &member.name,
-                session_id: &member.session_id,
+                address: &member.address,
                 activity: member.activity,
+                suspended: member.suspended,
                 roots: &member.roots,
-                is_self: member.session_id == session_id,
+                is_self: member.machine == local_machine && member.session_id == session_id,
             })
             .collect();
         Ok(SwarmMembersTemplate {
@@ -517,100 +969,422 @@ impl SwarmService {
         .to_string())
     }
 
-    /// Posts `body` onto `session_id`'s active swarm board.
-    ///
-    /// Delivers framed steers to any `@mention`ed peers, waking even cold
-    /// recipients unless their unattended `@mention` wake cap has been reached.
+    /// Posts `body` onto `session_id`'s active swarm board, routing through the
+    /// authoritative Board Host so `epoch:seq` is assigned by a single writer.
     ///
     /// # Errors
     /// Returns [`SwarmError`] when no board is active, a `@mention` is
-    /// ambiguous, or storage fails.
+    /// ambiguous, or delivery fails.
     pub async fn post_message(&self, session_id: &str, body: &str) -> Result<String, SwarmError> {
         self.reconcile().await?;
         let board = self
             .active_board_for(session_id)
             .ok_or(SwarmError::NoActiveBoard)?;
-
-        let sender = board
+        let local_machine = self.local_machine();
+        let sender_name = board
             .members
             .iter()
-            .find(|m| m.session_id == session_id)
-            .map_or(session_id, |m| m.name.as_str());
+            .find(|m| m.machine == local_machine && m.session_id == session_id)
+            .map_or(session_id, |m| m.name.as_str())
+            .to_string();
 
-        let recipients = resolve_mentions(body, &board.members, session_id)?;
-
-        let row = self
-            .db()
-            .append_swarm_message(NewSwarmMessage {
-                workdir: &board.workdir,
-                session_id: Some(session_id),
-                sender,
-                kind: SwarmMessageKind::Post,
-                body,
-            })
-            .await?
-            .ok_or(SwarmError::NoActiveBoard)?;
-
-        let wake_limit = self.config.load().experimental.swarm_mention_wake_limit;
-        let mut woken = Vec::new();
-        let mut queued_capped = Vec::new();
-
-        for peer in recipients {
-            let should_wake = self
-                .db()
-                .record_swarm_mention_wake(&peer.session_id, wake_limit)
-                .await?;
-            let xml = SwarmMentionTemplate {
-                sender: AttributeText(sender),
-                sender_id: AttributeText(session_id),
-                board_epoch: row.board_epoch,
-                seq: row.seq,
-                workdir: AttributeText(&board.workdir),
-                dissolved: false,
-                wake_capped: !should_wake,
-                body: UntrustedText(body),
-            }
-            .render()?;
-            let hidden = XmlBlock::parse(xml.trim_end()).map_err(AgentLinkError::from)?;
-            let pending = PendingUserMessage {
-                id: None,
-                state: PendingMessageState::default(),
-                error: None,
-                content: String::new(),
-                attachments: Vec::new(),
-                hidden_context_xml: Some(hidden),
-                created_at: jiff::Timestamp::now().to_string(),
-                delivery_mode: PendingUserMessageMode::Steer,
+        let outcome = if board.is_local_host {
+            self.execute_host_post(&board, &local_machine, session_id, &sender_name, body)
+                .await?
+        } else {
+            let Some(transport) = &self.transport else {
+                return Err(SwarmError::NoActiveBoard);
             };
-            self.messaging
-                .runtime_service
-                .enqueue(&peer.session_id, pending, PendingUserMessageMode::Steer)
-                .await
-                .map_err(AgentLinkError::Db)?;
-
-            if should_wake {
-                self.messaging.directory.wake(&peer.session_id);
-                woken.push(format!("{} [id {}]", peer.name, peer.session_id));
-            } else {
-                queued_capped.push(format!("{} [id {}]", peer.name, peer.session_id));
+            let resp = transport
+                .post_remote_board(
+                    &board.host_machine,
+                    PeerSwarmPostRequest {
+                        group_key: board.workdir.clone(),
+                        sender_machine: local_machine,
+                        sender_session_id: session_id.to_string(),
+                        sender_name,
+                        body: body.to_string(),
+                    },
+                )
+                .await?;
+            // Author's own post advances their local cursor when contiguous.
+            if let Ok(cur) = self.db().get_swarm_cursor(&board.workdir, session_id).await
+                && cur + 1 == resp.seq
+            {
+                let _ = self
+                    .db()
+                    .set_swarm_cursor(&board.workdir, session_id, resp.seq)
+                    .await;
             }
-        }
+            self.bump_cached_max_seq(&board.workdir, resp.board_epoch, resp.seq);
+            resp
+        };
 
         Ok(SwarmPostedTemplate {
-            board_epoch: row.board_epoch,
-            seq: row.seq,
-            woken,
-            queued_capped,
+            board_epoch: outcome.board_epoch,
+            seq: outcome.seq,
+            woken: outcome.woken,
+            queued_capped: outcome.queued_capped,
         }
         .render()?
         .trim_end()
         .to_string())
     }
 
-    /// Announces a PR lifecycle event onto the actor's swarm board.
+    async fn execute_host_post(
+        &self,
+        board: &ActiveBoard,
+        sender_machine: &str,
+        sender_session_id: &str,
+        sender_name: &str,
+        body: &str,
+    ) -> Result<PeerSwarmPostResponse, SwarmError> {
+        let recipients = resolve_mentions(body, &board.members, sender_machine, sender_session_id)?;
+        let author_key = if sender_machine.is_empty() {
+            sender_session_id.to_string()
+        } else {
+            format!("{sender_machine}:{sender_session_id}")
+        };
+        let sender_display_id = board
+            .members
+            .iter()
+            .find(|m| m.machine == sender_machine && m.session_id == sender_session_id)
+            .map_or(author_key.as_str(), |m| m.address.as_str());
+
+        let row = self
+            .db()
+            .append_swarm_message(NewSwarmMessage {
+                workdir: &board.workdir,
+                session_id: Some(&author_key),
+                sender: sender_name,
+                kind: SwarmMessageKind::Post,
+                body,
+            })
+            .await?
+            .ok_or(SwarmError::NoActiveBoard)?;
+
+        self.bump_cached_max_seq(&board.workdir, row.board_epoch, row.seq);
+        if let Some(transport) = &self.transport {
+            transport.notify_hosted_boards_changed();
+        }
+
+        let local_machine = self.local_machine();
+        let wake_limit = self.config.load().experimental.swarm_mention_wake_limit;
+        let mut woken = Vec::new();
+        let mut queued_capped = Vec::new();
+
+        for peer in recipients {
+            if peer.machine == local_machine {
+                let outcome = self
+                    .deliver_local_mention(
+                        &board.workdir,
+                        row.board_epoch,
+                        row.seq,
+                        &peer.session_id,
+                        sender_name,
+                        sender_display_id,
+                        body,
+                        wake_limit,
+                    )
+                    .await?;
+                if outcome.woken {
+                    woken.push(format!("{} [id {}]", peer.name, peer.address));
+                } else {
+                    queued_capped.push(format!("{} [id {}]", peer.name, peer.address));
+                }
+            } else if let Some(transport) = &self.transport {
+                let sender_addr = if sender_machine.is_empty() {
+                    sender_session_id.to_string()
+                } else {
+                    format!("{sender_machine}:{sender_session_id}")
+                };
+                match transport
+                    .deliver_to_peer(
+                        &peer.machine,
+                        PeerSwarmDeliverRequest::Mention {
+                            group_key: board.workdir.clone(),
+                            board_epoch: row.board_epoch,
+                            seq: row.seq,
+                            target_session_id: peer.session_id.clone(),
+                            sender_name: sender_name.to_string(),
+                            sender_address: sender_addr,
+                            body: body.to_string(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(resp) if resp.woken => {
+                        woken.push(format!("{} [id {}]", peer.name, peer.address));
+                    }
+                    Ok(_) => {
+                        queued_capped.push(format!("{} [id {}]", peer.name, peer.address));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, peer = %peer.address, "failed to deliver cross-machine swarm @mention");
+                    }
+                }
+            }
+        }
+
+        Ok(PeerSwarmPostResponse {
+            board_epoch: row.board_epoch,
+            seq: row.seq,
+            woken,
+            queued_capped,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal mention helper carries distinct message coordinates and sender fields"
+    )]
+    async fn deliver_local_mention(
+        &self,
+        group_key: &str,
+        board_epoch: u64,
+        seq: u64,
+        target_session_id: &str,
+        sender_name: &str,
+        sender_id: &str,
+        body: &str,
+        wake_limit: u32,
+    ) -> Result<PeerSwarmDeliverResponse, SwarmError> {
+        let should_wake = self
+            .db()
+            .record_swarm_mention_wake(target_session_id, wake_limit)
+            .await?;
+        let xml = SwarmMentionTemplate {
+            sender: AttributeText(sender_name),
+            sender_id: AttributeText(sender_id),
+            board_epoch,
+            seq,
+            workdir: AttributeText(group_key),
+            dissolved: false,
+            wake_capped: !should_wake,
+            body: UntrustedText(body),
+        }
+        .render()?;
+        let hidden = XmlBlock::parse(xml.trim_end()).map_err(AgentLinkError::from)?;
+        let pending = PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: Some(hidden),
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: PendingUserMessageMode::Steer,
+        };
+        self.messaging
+            .runtime_service
+            .enqueue(target_session_id, pending, PendingUserMessageMode::Steer)
+            .await
+            .map_err(AgentLinkError::Db)?;
+
+        if should_wake {
+            self.messaging.directory.wake(target_session_id);
+        }
+        Ok(PeerSwarmDeliverResponse {
+            woken: should_wake,
+            capped: !should_wake,
+        })
+    }
+
+    /// Serves `POST /api/peers/swarm/read` on this Board Host.
     ///
-    /// Emits when the PR's `repo_key` matches the swarm checkout's repository,
-    /// pushing actionable transitions to warm peers.
+    /// # Errors
+    /// Returns [`SwarmError`] when the board is absent or storage fails.
+    pub async fn serve_host_read(
+        &self,
+        req: PeerSwarmReadRequest,
+    ) -> Result<PeerSwarmReadResponse, SwarmError> {
+        let mode: SwarmReadMode = req.mode.into();
+        let res = self
+            .db()
+            .read_swarm_messages(&req.group_key, &req.reader_key, mode, req.limit.max(1))
+            .await?
+            .ok_or(SwarmError::NoActiveBoard)?;
+        let cursor = self
+            .db()
+            .get_swarm_cursor(&req.group_key, &req.reader_key)
+            .await?;
+        Ok(PeerSwarmReadResponse {
+            board_epoch: res.board_epoch,
+            messages: res
+                .messages
+                .into_iter()
+                .map(WireSwarmMessage::from_row)
+                .collect(),
+            next_seq: res.next_seq,
+            max_seq: res.max_seq,
+            cursor,
+        })
+    }
+
+    /// Serves `POST /api/peers/swarm/post` on this Board Host.
+    ///
+    /// # Errors
+    /// Returns [`SwarmError`] when the board is absent, a `@mention` is ambiguous,
+    /// or storage fails.
+    pub async fn serve_host_post(
+        &self,
+        req: PeerSwarmPostRequest,
+    ) -> Result<PeerSwarmPostResponse, SwarmError> {
+        self.reconcile().await?;
+        let board = self
+            .snapshot
+            .load()
+            .boards
+            .get(&req.group_key)
+            .filter(|b| b.is_local_host)
+            .cloned()
+            .ok_or(SwarmError::NoActiveBoard)?;
+        self.execute_host_post(
+            &board,
+            &req.sender_machine,
+            &req.sender_session_id,
+            &req.sender_name,
+            &req.body,
+        )
+        .await
+    }
+
+    /// Serves `POST /api/peers/swarm/pr` on this Board Host.
+    ///
+    /// # Errors
+    /// Returns [`SwarmError`] on storage failure.
+    pub async fn serve_host_pr(&self, req: PeerSwarmPrRequest) -> Result<(), SwarmError> {
+        self.reconcile().await?;
+        let Some(board) = self
+            .snapshot
+            .load()
+            .boards
+            .get(&req.group_key)
+            .filter(|b| b.is_local_host)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.append_and_fan_out_pr(
+            &board,
+            &req.actor_machine,
+            &req.actor_session_id,
+            &req.actor_name,
+            &req.backend,
+            req.number,
+            &req.title,
+            req.head_sha.as_deref(),
+            req.merge_commit_sha.as_deref(),
+            &req.kind,
+            req.detail.as_deref(),
+            &req.changed_files,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Serves `POST /api/peers/swarm/deliver` on a member's local daemon.
+    ///
+    /// # Errors
+    /// Returns [`SwarmError`] on storage or XML framing failure.
+    pub async fn receive_peer_delivery(
+        &self,
+        req: PeerSwarmDeliverRequest,
+    ) -> Result<PeerSwarmDeliverResponse, SwarmError> {
+        match req {
+            PeerSwarmDeliverRequest::Mention {
+                group_key,
+                board_epoch,
+                seq,
+                target_session_id,
+                sender_name,
+                sender_address,
+                body,
+            } => {
+                let wake_limit = self.config.load().experimental.swarm_mention_wake_limit;
+                self.deliver_local_mention(
+                    &group_key,
+                    board_epoch,
+                    seq,
+                    &target_session_id,
+                    &sender_name,
+                    &sender_address,
+                    &body,
+                    wake_limit,
+                )
+                .await
+            }
+            PeerSwarmDeliverRequest::Notice {
+                group_key,
+                board_epoch,
+                seq,
+                target_session_id,
+                kind,
+                body,
+            } => {
+                let woken = self
+                    .deliver_local_notice(
+                        &group_key,
+                        board_epoch,
+                        seq,
+                        &target_session_id,
+                        if kind == "PR" { "PR" } else { "notice" },
+                        &body,
+                    )
+                    .await;
+                Ok(PeerSwarmDeliverResponse {
+                    woken,
+                    capped: false,
+                })
+            }
+            PeerSwarmDeliverRequest::Dissolved {
+                group_key,
+                board_epoch: _,
+            } => {
+                let escaped_workdir = AttributeText(&group_key).to_string();
+                let target_attr = format!("workdir=\"{escaped_workdir}\"");
+                let group_owned = group_key.clone();
+                let touched = self
+                    .db()
+                    .rewrite_pending_steers(move |xml| {
+                        if !xml.contains(&target_attr) {
+                            return DissolvedSteerAction::Keep;
+                        }
+                        if xml.contains("<board-notice ") {
+                            return DissolvedSteerAction::Drop;
+                        }
+                        if xml.contains("<board-message ")
+                            && let Some(rewritten) = mark_mention_xml_dissolved(xml, &group_owned)
+                        {
+                            return DissolvedSteerAction::RewriteXml(rewritten);
+                        }
+                        DissolvedSteerAction::Keep
+                    })
+                    .await?;
+                if !touched.is_empty() {
+                    self.messaging
+                        .runtime_service
+                        .ui_events()
+                        .publish(UiEventTopics::SESSION_RUNTIMES);
+                }
+                Ok(PeerSwarmDeliverResponse::default())
+            }
+        }
+    }
+
+    fn bump_cached_max_seq(&self, group_key: &str, board_epoch: u64, seq: u64) {
+        let mut current = (**self.snapshot.load()).clone();
+        if let Some(board) = current.boards.get_mut(group_key)
+            && board.board_epoch == board_epoch
+            && seq > board.max_seq
+        {
+            board.max_seq = seq;
+            self.snapshot.store(Arc::new(current));
+        }
+    }
+
+    /// Announces a PR lifecycle event onto the actor's swarm board (routing to
+    /// the remote Board Host when needed).
     pub async fn announce_pr_event(&self, event: SwarmPrAnnouncement<'_>) {
         let SwarmPrAnnouncement {
             actor_session_id,
@@ -632,19 +1406,94 @@ impl SwarmService {
             return;
         };
 
+        let actor_checkout = self
+            .db()
+            .get_session(actor_session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| match SessionDirectory::of(&row, &self.may_dir) {
+                SessionDirectory::Checkout(path) => Some(path),
+                SessionDirectory::Sandbox(_) => None,
+            });
         let may_config = self.config.load();
-        if !checkout_matches_repo_key(
-            Path::new(&board.workdir),
+        if !group_matches_pr_repo(
+            &board.workdir,
             repo_key,
+            actor_checkout.as_deref(),
             workspace_config,
             &may_config,
         ) {
             return;
         }
 
-        let head_short = pr
-            .head_sha
-            .as_deref()
+        let local_machine = self.local_machine();
+        let actor_name = board
+            .members
+            .iter()
+            .find(|m| m.machine == local_machine && m.session_id == actor_session_id)
+            .map_or(actor_session_id, |m| m.name.as_str())
+            .to_string();
+
+        if board.is_local_host {
+            self.append_and_fan_out_pr(
+                &board,
+                &local_machine,
+                actor_session_id,
+                &actor_name,
+                &pr.backend,
+                pr.number,
+                &pr.title,
+                pr.head_sha.as_deref(),
+                pr.merge_commit_sha.as_deref(),
+                kind,
+                detail,
+                &changed_files,
+            )
+            .await;
+        } else if let Some(transport) = &self.transport {
+            let _ = transport
+                .announce_remote_pr(
+                    &board.host_machine,
+                    PeerSwarmPrRequest {
+                        group_key: board.workdir.clone(),
+                        actor_machine: local_machine,
+                        actor_session_id: actor_session_id.to_string(),
+                        actor_name,
+                        backend: pr.backend.clone(),
+                        number: pr.number,
+                        title: pr.title.clone(),
+                        head_sha: pr.head_sha.clone(),
+                        merge_commit_sha: pr.merge_commit_sha.clone(),
+                        kind: kind.to_string(),
+                        detail: detail.map(str::to_string),
+                        changed_files,
+                    },
+                )
+                .await;
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "PR fan-out helper receives normalized wire fields from local and remote callers"
+    )]
+    async fn append_and_fan_out_pr(
+        &self,
+        board: &ActiveBoard,
+        actor_machine: &str,
+        actor_session_id: &str,
+        actor_name: &str,
+        backend: &str,
+        number: i64,
+        title: &str,
+        head_sha: Option<&str>,
+        merge_commit_sha: Option<&str>,
+        kind: &str,
+        detail: Option<&str>,
+        changed_files: &[String],
+    ) {
+        let head_short = head_sha
             .and_then(|sha| {
                 sha.char_indices()
                     .nth(8)
@@ -652,10 +1501,8 @@ impl SwarmService {
                     .or(Some(sha))
             })
             .unwrap_or("HEAD");
-        let merge_short = pr
-            .merge_commit_sha
-            .as_deref()
-            .or(pr.head_sha.as_deref())
+        let merge_short = merge_commit_sha
+            .or(head_sha)
             .and_then(|sha| {
                 sha.char_indices()
                     .nth(8)
@@ -710,20 +1557,25 @@ impl SwarmService {
             _ => return,
         };
 
-        let actor_name = board
+        let actor_display_id = board
             .members
             .iter()
-            .find(|m| m.session_id == actor_session_id)
-            .map_or(actor_session_id, |m| m.name.as_str());
+            .find(|m| m.machine == actor_machine && m.session_id == actor_session_id)
+            .map_or(actor_session_id, |m| m.address.as_str());
+        let author_key = if actor_machine.is_empty() {
+            actor_session_id.to_string()
+        } else {
+            format!("{actor_machine}:{actor_session_id}")
+        };
 
         let shown_count = changed_files.len().min(MAX_INLINE_PR_FILES);
         let extra_files = changed_files.len().saturating_sub(shown_count);
         let Ok(body) = SwarmPrEntryTemplate {
             actor: actor_name,
-            actor_id: actor_session_id,
-            sigil: pr_sigil(&pr.backend),
-            number: pr.number,
-            title: &pr.title,
+            actor_id: actor_display_id,
+            sigil: pr_sigil(backend),
+            number,
+            title,
             head_sha: head_short,
             action,
             files: &changed_files[..shown_count],
@@ -738,7 +1590,7 @@ impl SwarmService {
             .db()
             .append_swarm_message(NewSwarmMessage {
                 workdir: &board.workdir,
-                session_id: Some(actor_session_id),
+                session_id: Some(&author_key),
                 sender: actor_name,
                 kind: SwarmMessageKind::Pr,
                 body: &body,
@@ -753,63 +1605,118 @@ impl SwarmService {
             }
         };
 
+        self.bump_cached_max_seq(&board.workdir, row.board_epoch, row.seq);
+        if let Some(transport) = &self.transport {
+            transport.notify_hosted_boards_changed();
+        }
+
         if !should_push {
             return;
         }
 
+        let local_machine = self.local_machine();
         for peer in &board.members {
-            if peer.session_id == actor_session_id {
+            if peer.machine == actor_machine && peer.session_id == actor_session_id {
                 continue;
             }
-            let Ok(notice_xml) = SwarmNoticeTemplate {
-                board_epoch: row.board_epoch,
-                seq: row.seq,
-                workdir: AttributeText(&board.workdir),
-                kind: "PR",
-                body: UntrustedText(&body),
+            if peer.machine == local_machine {
+                let _ = self
+                    .deliver_local_notice(
+                        &board.workdir,
+                        row.board_epoch,
+                        row.seq,
+                        &peer.session_id,
+                        "PR",
+                        &body,
+                    )
+                    .await;
+            } else if let Some(transport) = &self.transport {
+                let _ = transport
+                    .deliver_to_peer(
+                        &peer.machine,
+                        PeerSwarmDeliverRequest::Notice {
+                            group_key: board.workdir.clone(),
+                            board_epoch: row.board_epoch,
+                            seq: row.seq,
+                            target_session_id: peer.session_id.clone(),
+                            kind: "PR".to_string(),
+                            body: body.clone(),
+                        },
+                    )
+                    .await;
             }
-            .render() else {
-                continue;
-            };
-            let Ok(hidden) = XmlBlock::parse(notice_xml.trim_end()) else {
-                tracing::warn!(session_id = %peer.session_id, "failed to frame swarm PR notice XML");
-                continue;
-            };
-            let pending = PendingUserMessage {
-                id: None,
-                state: PendingMessageState::default(),
-                error: None,
-                content: String::new(),
-                attachments: Vec::new(),
-                hidden_context_xml: Some(hidden),
-                created_at: jiff::Timestamp::now().to_string(),
-                delivery_mode: PendingUserMessageMode::Steer,
-            };
-            if let Err(error) = self
-                .messaging
-                .runtime_service
-                .enqueue(&peer.session_id, pending, PendingUserMessageMode::Steer)
-                .await
-            {
-                tracing::warn!(%error, session_id = %peer.session_id, "failed to enqueue swarm PR notice");
-                continue;
+        }
+    }
+
+    async fn deliver_local_notice(
+        &self,
+        group_key: &str,
+        board_epoch: u64,
+        seq: u64,
+        target_session_id: &str,
+        kind: &'static str,
+        body: &str,
+    ) -> bool {
+        let Ok(notice_xml) = SwarmNoticeTemplate {
+            board_epoch,
+            seq,
+            workdir: AttributeText(group_key),
+            kind,
+            body: UntrustedText(body),
+        }
+        .render() else {
+            return false;
+        };
+        let Ok(hidden) = XmlBlock::parse(notice_xml.trim_end()) else {
+            tracing::warn!(session_id = %target_session_id, "failed to frame swarm PR notice XML");
+            return false;
+        };
+        let pending = PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: Some(hidden),
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: PendingUserMessageMode::Steer,
+        };
+        if let Err(error) = self
+            .messaging
+            .runtime_service
+            .enqueue(target_session_id, pending, PendingUserMessageMode::Steer)
+            .await
+        {
+            tracing::warn!(%error, session_id = %target_session_id, "failed to enqueue swarm PR notice");
+            return false;
+        }
+        let activity = self
+            .messaging
+            .directory
+            .live()
+            .await
+            .ok()
+            .and_then(|list| {
+                list.into_iter()
+                    .find(|a| a.session_id == target_session_id)
+                    .map(|a| a.activity)
+            })
+            .unwrap_or(crate::agent_link::Activity::Idle);
+        match self.messaging.is_cold(target_session_id, activity).await {
+            Ok(false) => {
+                self.messaging.directory.wake(target_session_id);
+                true
             }
-            match self
-                .messaging
-                .is_cold(&peer.session_id, peer.activity)
-                .await
-            {
-                Ok(false) => self.messaging.directory.wake(&peer.session_id),
-                Ok(true) => {}
-                Err(error) => {
-                    tracing::warn!(%error, session_id = %peer.session_id, "failed to inspect cold state for swarm PR notice");
-                }
+            Ok(true) => false,
+            Err(error) => {
+                tracing::warn!(%error, session_id = %target_session_id, "failed to inspect cold state for swarm PR notice");
+                false
             }
         }
     }
 }
 
-fn checkout_matches_repo_key(
+pub(crate) fn checkout_matches_repo_key(
     worktree: &Path,
     repo_key: &str,
     workspace_config: &WorkspaceConfig,
@@ -818,6 +1725,11 @@ fn checkout_matches_repo_key(
     if let Ok(Some(source)) =
         crate::repo_clone::CloneSource::of(worktree, workspace_config, may_config)
         && source.key() == repo_key
+    {
+        return true;
+    }
+    if let crate::trust::RepoKind::Forge { repo } = crate::trust::repo_kind(worktree)
+        && repo.cache_key().eq_ignore_ascii_case(repo_key)
     {
         return true;
     }
@@ -845,39 +1757,90 @@ fn is_mention_suffix_boundary(next: Option<char>) -> bool {
     })
 }
 
-/// Scans `body` for `@<session-id>` and `@<member-name>` (longest-prefix match
-/// on a word/punctuation boundary), ignoring self-mentions and failing fast if a
-/// title matches multiple members on the board.
+/// Scans `body` for `@<machine>:<session-id>`, `@<session-id>`, and `@<member-name>`
+/// (longest-prefix match on a word/punctuation boundary), ignoring self-mentions
+/// and failing fast if a bare id or title matches multiple members on the board.
 fn resolve_mentions<'a>(
     body: &str,
-    members: &'a [AgentStatus],
+    members: &'a [SwarmMember],
+    sender_machine: &str,
     sender_id: &str,
-) -> Result<Vec<&'a AgentStatus>, SwarmError> {
-    let mut resolved: Vec<&'a AgentStatus> = Vec::new();
-    let mut seen_ids: BTreeSet<&'a str> = BTreeSet::new();
+) -> Result<Vec<&'a SwarmMember>, SwarmError> {
+    let mut resolved: Vec<&'a SwarmMember> = Vec::new();
+    let mut seen: BTreeSet<(&'a str, &'a str)> = BTreeSet::new();
+
+    let is_self = |m: &SwarmMember| m.machine == sender_machine && m.session_id == sender_id;
 
     let mut prev_char: Option<char> = None;
     for (byte_idx, ch) in body.char_indices() {
         if ch == '@' && is_mention_prefix_boundary(prev_char) {
             let after_at = &body[byte_idx + ch.len_utf8()..];
             if !after_at.is_empty() {
-                // 1. Exact session_id match on a suffix boundary.
-                let mut id_matched = false;
+                // 1. Machine-qualified `@<machine>:<session-id>` match.
+                let mut matched = false;
                 for member in members {
-                    if let Some(rest) = after_at.strip_prefix(member.session_id.as_str())
-                        && is_mention_suffix_boundary(rest.chars().next())
-                    {
-                        if member.session_id != sender_id && seen_ids.insert(&member.session_id) {
-                            resolved.push(member);
+                    if !member.machine.is_empty() {
+                        let qualified = format!("{}:{}", member.machine, member.session_id);
+                        if let Some(rest) = after_at.strip_prefix(qualified.as_str())
+                            && is_mention_suffix_boundary(rest.chars().next())
+                        {
+                            if !is_self(member)
+                                && seen.insert((&member.machine, &member.session_id))
+                            {
+                                resolved.push(member);
+                            }
+                            matched = true;
+                            break;
                         }
-                        id_matched = true;
-                        break;
                     }
                 }
-                if !id_matched {
-                    // 2. Longest-prefix match against member names.
+                // 2. Bare `@<session-id>` match (if unambiguous across machines).
+                if !matched {
+                    let bare_matches: Vec<&'a SwarmMember> = members
+                        .iter()
+                        .filter(|member| {
+                            after_at
+                                .strip_prefix(member.session_id.as_str())
+                                .is_some_and(|rest| is_mention_suffix_boundary(rest.chars().next()))
+                        })
+                        .collect();
+                    if bare_matches.len() > 1 {
+                        let candidates = bare_matches
+                            .iter()
+                            .map(|m| format!("@{} ({})", m.address, m.name))
+                            .collect();
+                        let message = SwarmAmbiguousMentionTemplate {
+                            mention: bare_matches[0].session_id.as_str(),
+                            candidates,
+                        }
+                        .render()?
+                        .trim_end()
+                        .to_string();
+                        return Err(SwarmError::AmbiguousMention(message));
+                    }
+                    if let [member] = bare_matches.as_slice() {
+                        // Guard against `@<machine>:<id>` where `<machine>` happens to equal
+                        // another member's bare `session_id` followed by `:`.
+                        let rest = &after_at[member.session_id.len()..];
+                        let looks_qualified = rest.starts_with(':')
+                            && split_qualified_target(
+                                after_at.split_whitespace().next().unwrap_or(""),
+                            )
+                            .is_some();
+                        if !looks_qualified {
+                            if !is_self(member)
+                                && seen.insert((&member.machine, &member.session_id))
+                            {
+                                resolved.push(member);
+                            }
+                            matched = true;
+                        }
+                    }
+                }
+                // 3. Longest-prefix match against member display names.
+                if !matched {
                     let mut best_len = 0_usize;
-                    let mut best_matches: Vec<&'a AgentStatus> = Vec::new();
+                    let mut best_matches: Vec<&'a SwarmMember> = Vec::new();
                     for member in members {
                         if member.name.is_empty() {
                             continue;
@@ -899,7 +1862,7 @@ fn resolve_mentions<'a>(
                         let mention = &after_at[..best_len];
                         let candidates = best_matches
                             .iter()
-                            .map(|m| format!("@{} ({})", m.session_id, m.name))
+                            .map(|m| format!("@{} ({})", m.address, m.name))
                             .collect();
                         let message = SwarmAmbiguousMentionTemplate {
                             mention,
@@ -911,8 +1874,8 @@ fn resolve_mentions<'a>(
                         return Err(SwarmError::AmbiguousMention(message));
                     }
                     if let [member] = best_matches.as_slice()
-                        && member.session_id != sender_id
-                        && seen_ids.insert(&member.session_id)
+                        && !is_self(member)
+                        && seen.insert((&member.machine, &member.session_id))
                     {
                         resolved.push(member);
                     }

@@ -1,4 +1,4 @@
 Swarm members in {{ workdir }} (board epoch {{ board_epoch }}):
 {%- for member in members %}
-- {{ member.name }}{% if member.is_self %} (you){% endif %} [id {{ member.session_id }}]: {{ member.activity }}{% if member.roots.is_empty() %}, no roots in tasks.md{% else %}, roots: {{ member.roots.join(", ") }}{% endif %}
+- {{ member.name }}{% if member.is_self %} (you){% endif %} [id {{ member.address }}]: {% if member.suspended %}suspended{% else %}{{ member.activity }}{% endif %}{% if member.roots.is_empty() %}, no roots in tasks.md{% else %}, roots: {{ member.roots.join(", ") }}{% endif %}
 {%- endfor %}

@@ -20,6 +20,11 @@ use crate::agent_link::{
     PeerBtwRequest, PeerBtwResponse, PeerErrorBody, PeerSendRequest, RemoteListing,
 };
 use crate::cloud::access::{ProviderPush, PushedTiers};
+use crate::swarm::{
+    PeerSwarmDeliverRequest, PeerSwarmDeliverResponse, PeerSwarmErrorBody, PeerSwarmPostRequest,
+    PeerSwarmPostResponse, PeerSwarmPrRequest, PeerSwarmReadRequest, PeerSwarmReadResponse,
+    PeerSwarmWorld,
+};
 
 /// Long-poll window for `GET /api/cloud-home/peer-rpc`.
 const BRIDGE_POLL_WINDOW: Duration = Duration::from_secs(15);
@@ -52,6 +57,36 @@ pub enum BridgeRpcOp {
         /// Question payload.
         request: PeerBtwRequest,
     },
+    /// Poll cross-machine swarm world for a fronted cloud home.
+    SwarmWorld,
+    /// Forward `board read` from a cloud home to `host_machine`.
+    SwarmRead {
+        /// Elected Board Host machine name.
+        host_machine: String,
+        /// Read payload.
+        request: PeerSwarmReadRequest,
+    },
+    /// Forward `board post` from a cloud home to `host_machine`.
+    SwarmPost {
+        /// Elected Board Host machine name.
+        host_machine: String,
+        /// Post payload.
+        request: PeerSwarmPostRequest,
+    },
+    /// Forward PR event announcement from a cloud home to `host_machine`.
+    SwarmPr {
+        /// Elected Board Host machine name.
+        host_machine: String,
+        /// PR event payload.
+        request: PeerSwarmPrRequest,
+    },
+    /// Deliver a swarm steer/notice from a cloud home to `target_machine`.
+    SwarmDeliver {
+        /// Destination machine prefix.
+        target_machine: String,
+        /// Delivery payload.
+        request: PeerSwarmDeliverRequest,
+    },
 }
 
 /// Wire envelope returned by `GET /api/cloud-home/peer-rpc`.
@@ -73,6 +108,16 @@ pub enum BridgeRpcResult {
     Send(Result<String, PeerErrorBody>),
     /// `btw` outcome (`Ok(PeerBtwResponse)` or structured peer error).
     Btw(Result<PeerBtwResponse, PeerErrorBody>),
+    /// Swarm world snapshot for a cloud home.
+    SwarmWorld(PeerSwarmWorld),
+    /// Swarm read result.
+    SwarmRead(Result<PeerSwarmReadResponse, PeerSwarmErrorBody>),
+    /// Swarm post result.
+    SwarmPost(Result<PeerSwarmPostResponse, PeerSwarmErrorBody>),
+    /// Swarm PR announcement result.
+    SwarmPr(Result<(), PeerSwarmErrorBody>),
+    /// Swarm delivery result.
+    SwarmDeliver(Result<PeerSwarmDeliverResponse, PeerSwarmErrorBody>),
 }
 
 /// Cloud-home side reverse RPC queue answered by the fronting daemon while its
