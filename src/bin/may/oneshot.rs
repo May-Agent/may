@@ -517,19 +517,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             Event::Agent(TuiEvent::Withdrawn { .. }) => {
                 writeln!(output.stderr()?, "[stopped] the message was withdrawn")?;
             }
-            Event::Agent(TuiEvent::Declined(message)) => {
-                writeln!(output.stderr()?, "[stopped] {message}")?;
-                runtime_deps
-                    .finish_agent_task(
-                        &mut app,
-                        &mut None,
-                        &mut pending_title_gen,
-                        &assistant_response,
-                        RunOutcome::Cancelled,
-                    )
-                    .await;
-                return Ok(());
-            }
             // A run whose agent looped did not do what it was asked: the
             // caller of a one-shot run learns that from its exit status.
             Event::Agent(TuiEvent::LoopStopped(message)) => {

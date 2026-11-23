@@ -2,8 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { isTurnStop } from './turnStop';
 
 describe('isTurnStop', () => {
-  test('a declined repository and a loop the daemon ended are stops', () => {
-    expect(isTurnStop('repo_declined')).toBeTrue();
+  test('a loop the daemon ended is a stop', () => {
     expect(isTurnStop('loop_stopped')).toBeTrue();
   });
 

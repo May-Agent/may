@@ -53,9 +53,6 @@ pub enum ApiErrorCode {
     /// The cloud provider account `/cloud` set up cannot create machines:
     /// its login is missing, lacks a permission, or the provider refused it.
     CloudAccountUnusable,
-    /// The user declined, at the session's repository question, to work where
-    /// the session starts. The turn did not run; nothing failed.
-    RepoDeclined,
     /// The daemon ended the turn because the agent kept looping after it was
     /// alerted; the message says which loop. Nothing failed, and the session
     /// takes the next message.

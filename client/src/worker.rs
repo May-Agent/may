@@ -95,9 +95,6 @@ pub enum TuiEvent<S = ()> {
         /// Whether this client sent it and gets it back in its input.
         own: bool,
     },
-    /// The user declined, at the session's repository question, to work
-    /// where the session starts: the turn did not run, and nothing failed.
-    Declined(String),
     /// The daemon ended the turn because its agent kept looping after the
     /// alert; the message says which loop. The session takes the next
     /// message, but what the turn was asked for was not carried out.
