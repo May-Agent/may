@@ -9,8 +9,9 @@
 //! what the recipient's context holds, reads the recipient's warm prompt
 //! cache, and never touches the recipient's own agent: a running turn keeps
 //! running, and nothing the fork does reaches the recipient's context or
-//! history. The fork's hooks refuse every tool call, so it answers from its
-//! context and changes nothing.
+//! history. The fork is confined like a `read_only` subagent: it may run
+//! commands to gather what the answer needs, but its shell refuses every
+//! escalation and grants it no writes outside its own space.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,8 +27,10 @@ use super::{Activity, AgentLinkError, AgentMessaging, AttributeText, UntrustedTe
 use crate::agent::{ModelSlot, ProviderLlm};
 use crate::harness::compact_tool::CompactSignal;
 use crate::ipc::{Binding, SessionShell};
+use crate::secrets::SecretRedactor;
 use crate::shell::ShellToolkit;
 use crate::subagent::ChildHooks;
+use crate::terminal_permission_handler::TerminalPermissionHandler;
 
 /// The subagent name a btw fork's tool calls carry.
 const BTW_FORK: &str = "btw";
@@ -48,6 +51,11 @@ struct ForkHost {
     toolkit: ShellToolkit,
     /// The session's communication and working languages.
     languages: crate::harness::language::Languages,
+    /// What a fork's shell escalates through: a fork is read-only, so its
+    /// scripts stay inside the sandbox.
+    read_only_permissions: TerminalPermissionHandler,
+    /// Redacts secrets from what a fork's commands return.
+    redactor: SecretRedactor,
 }
 
 /// The shell of a session's main agent, filled when the agent's shell is
@@ -91,22 +99,23 @@ impl ForkHost {
         let shell = launcher
             .subagent(SubagentGrant::new(), None, "btw")
             .await
-            .map_err(|error| AgentLinkError::Fork(error.to_string()))?;
+            .map_err(|error| AgentLinkError::Fork(error.to_string()))?
+            // A fork answers with quick, read-only commands: its shell is
+            // confined like a `read_only` subagent's.
+            .with_approver(self.read_only_permissions.clone());
         let space = shell.working_dir().clone();
-        let refusal = ForkCommandRefused
-            .render()
-            .expect("btw refusal template must render");
+        let valve = Arc::new(CompactSignal::default());
         let builder = aither_agent::AgentBuilder::new(self.model.llm.clone())
-            .hooks(ChildHooks::denying(refusal))
+            .hooks(
+                ChildHooks::compacting(Some(valve.clone()), Arc::default())
+                    .with_redactor(self.redactor.clone()),
+            )
             .forked_from(snapshot)
             .read_only_cache()
             .identity(AgentIdentity::Subagent(SubagentIdentity::new(
                 BTW_FORK, None,
             )));
-        let mut fork = self
-            .toolkit
-            .register(builder, &shell, Some(Arc::new(CompactSignal::default())))
-            .build();
+        let mut fork = self.toolkit.register(builder, &shell, Some(valve)).build();
         let outcome = match task {
             ForkTask::Answer(prompt) => fork.query(prompt).await.map(ForkOutcome::Answer),
             ForkTask::ReadContext => {
@@ -162,6 +171,7 @@ impl ForkHosts {
     /// `session_id`'s btw questions, until the returned registration drops
     /// or a later agent of the session registers.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         session_id: &str,
@@ -170,6 +180,8 @@ impl ForkHosts {
         launcher: ForkLauncher,
         toolkit: ShellToolkit,
         languages: crate::harness::language::Languages,
+        read_only_permissions: TerminalPermissionHandler,
+        redactor: SecretRedactor,
     ) -> ForkRegistration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.hosts().insert(
@@ -181,6 +193,8 @@ impl ForkHosts {
                 launcher,
                 toolkit,
                 languages,
+                read_only_permissions,
+                redactor,
             },
         );
         ForkRegistration {
@@ -223,14 +237,16 @@ impl Drop for ForkRegistration {
 }
 
 #[derive(Template)]
-#[template(path = "agent_btw_refused.txt", escape = "none")]
-struct ForkCommandRefused;
-
-#[derive(Template)]
 #[template(path = "agent_btw_question.txt", escape = "none")]
 struct BtwQuestionText<'a> {
     sender: AttributeText<'a>,
     sender_id: AttributeText<'a>,
+    question: UntrustedText<'a>,
+}
+
+#[derive(Template)]
+#[template(path = "agent_btw_user.txt", escape = "none")]
+struct BtwUserQuestionText<'a> {
     question: UntrustedText<'a>,
 }
 
@@ -257,9 +273,9 @@ impl AgentMessaging {
     /// Answers `question` from a read-only fork of the context of the live
     /// agent addressed by `target`, made from the request it sent last,
     /// whether it is working or idle. The fork's shell comes from
-    /// `launcher`, the asking agent's, and its hooks refuse every tool call;
-    /// the fork is discarded once it answers. An idle recipient whose prompt cache is
-    /// cold is refused before any model call.
+    /// `launcher`, the asking agent's, and stays inside its sandbox; the
+    /// fork is discarded once it answers. An idle recipient whose prompt
+    /// cache is cold is refused before any model call.
     ///
     /// # Errors
     /// See [`AgentLinkError`].
@@ -318,6 +334,62 @@ impl AgentMessaging {
             recipient_id: recipient.session_id.clone(),
             answer,
         })
+    }
+
+    /// Answers a user's `/btw` side question on `session_id`'s own live
+    /// agent: a read-only fork of its last request, which may run commands
+    /// in its own sandboxed space to gather what the answer needs. `None`
+    /// when the session has no live agent that can be forked; the caller
+    /// then answers the question without one. A cold idle agent or one
+    /// about to compact is refused.
+    ///
+    /// # Errors
+    /// See [`AgentLinkError`].
+    ///
+    /// # Panics
+    /// When the compile-time question template fails to render.
+    pub async fn side_answer(
+        &self,
+        session_id: &str,
+        question: &str,
+    ) -> Result<Option<String>, AgentLinkError> {
+        let Some(host) = self.forks.get(session_id) else {
+            return Ok(None);
+        };
+        let Some(snapshot) = host.source.latest() else {
+            return Ok(None);
+        };
+        let Some(launcher) = host.launcher.0.get() else {
+            return Ok(None);
+        };
+        let name = status_name(&self.runtime_service, session_id).await?;
+        let activity = if self.runtime_service.get(session_id).await?.state.is_idle() {
+            Activity::Idle
+        } else {
+            Activity::Running
+        };
+        let recipient_cold = self.is_cold(session_id, activity).await?;
+        if crate::agent::wake::decide(crate::agent::wake::WakeCause::AgentMessage {
+            recipient_cold,
+        }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
+        {
+            return Err(AgentLinkError::ColdBtwRecipient(name));
+        }
+        if !snapshot.allows_fork() {
+            return Err(AgentLinkError::NearCompaction(name));
+        }
+        let prompt = BtwUserQuestionText {
+            question: UntrustedText(question),
+        }
+        .render()
+        .expect("btw user question template must render");
+        let ForkOutcome::Answer(answer) = host
+            .run_fork(&snapshot, launcher, ForkTask::Answer(&prompt))
+            .await?
+        else {
+            unreachable!("an answering fork gives an answer");
+        };
+        Ok(Some(answer))
     }
 
     /// The context of `session_id`'s live agent for a side request (`/btw`,

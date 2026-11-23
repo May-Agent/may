@@ -445,6 +445,7 @@ async fn build_exec_shell(
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
+        permissions.clone(),
         child_approvals.clone(),
     ))
     .await?;
@@ -481,6 +482,7 @@ async fn build_exec_shell(
     .map_err(ExecError::BuildShell)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_exec_commands<LLM>(
     context: &ExecSessionContext,
     may_config: &MayConfig,
@@ -488,6 +490,7 @@ async fn build_exec_commands<LLM>(
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
+    permissions: TerminalPermissionHandler,
     child_approvals: may_agent::subagent::ChildApprovals,
 ) -> Result<may_agent::ipc::CommandRegistry, ExecError>
 where
@@ -545,6 +548,7 @@ where
                 keep_alive: None,
                 instructions: Vec::new(),
                 vision_ocr: may_agent::vision_ocr::VisionOcr::new(),
+                permissions,
             },
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.
