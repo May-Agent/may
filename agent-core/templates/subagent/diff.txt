@@ -1,0 +1,7 @@
+{% if let Some(diffs) = diff %}
+The changes it made in its granted and cloned worktrees:
+{% for entry in diffs %}
+--- {{ entry.path.display() }} ---
+{% match entry.outcome %}{% when Ok(text) %}{% if text.is_empty() %}No changes.
+{% else %}{{ text }}{% endif %}{% when Err(error) %}The changes could not be diffed: {{ error }}
+{% endmatch %}{% endfor %}{% endif %}

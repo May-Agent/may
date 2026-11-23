@@ -141,6 +141,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Connected ACP agents, registered as subagent types; `None` outside
     /// the daemon.
     pub acp: Option<crate::agent::acp_subagent::AcpAgents>,
+    /// The session's prompt queue: a running subagent's `send_message`
+    /// reaches the main agent through it; `None` leaves the command unable
+    /// to deliver.
+    pub session_prompts: Option<crate::task_wake::SessionPrompts>,
     /// The host git whose configuration is the user's: it names the identity
     /// and key commits in the sandbox are signed with, and runs every host
     /// git `pr` needs.
@@ -785,6 +789,10 @@ where
             &config.may_dir,
             config.session_id.as_str(),
         ),
+        git: config.git.clone(),
+        global_agents: Some(
+            crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md(),
+        ),
         languages: config.languages.clone(),
         externals,
         work: config.task_events.clone(),
@@ -831,6 +839,16 @@ where
         describe_tool(&mut descriptions, &models);
         builder.main_only(|reserved| reserved.configure_tool(models));
     }
+
+    // A running subagent's line back to the main agent that launched it —
+    // the main agent itself has no parent to message, so its call is
+    // refused. Its description is the subagent prompt's, not this table's.
+    builder.subagent_only(|reserved| {
+        reserved.configure_tool(crate::subagent::SendMessageTool::new(
+            config.session_prompts.clone(),
+            config.session_id.clone(),
+        ));
+    });
 
     // An MCP server's tools are a command set: the registry reads its tool
     // list at every lookup, so a tool the server adds mid-session runs at
@@ -1085,6 +1103,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1182,6 +1201,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1255,6 +1275,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1322,6 +1343,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1384,6 +1406,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1559,6 +1582,7 @@ mod tests {
                 agent_messaging: Some(messaging),
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1692,6 +1716,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1756,6 +1781,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(
@@ -1824,6 +1850,7 @@ mod tests {
                 agent_messaging: None,
                 languages: None,
                 acp: None,
+                session_prompts: None,
                 git,
                 tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
                 timeout_cap: crate::shell::ShellBudgets::of(

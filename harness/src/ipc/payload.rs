@@ -101,6 +101,13 @@ pub(super) struct ReservedForMain<'a> {
     pub name: &'a str,
 }
 
+/// The refusal a subagent-only command answers the main agent's call with.
+#[derive(Template)]
+#[template(path = "ipc_reserved_for_subagent.txt", escape = "none")]
+pub(super) struct ReservedForSubagent<'a> {
+    pub name: &'a str,
+}
+
 /// The answer to a command no registry holds.
 #[derive(Template)]
 #[template(path = "ipc_unknown_command.txt", escape = "none")]

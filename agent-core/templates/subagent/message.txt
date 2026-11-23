@@ -1,0 +1,6 @@
+<system-reminder>
+Your subagent "{{ subagent }}" sent you a message while it keeps working.
+</system-reminder>
+<subagent-message name="{{ subagent }}">
+{{ body }}
+</subagent-message>
