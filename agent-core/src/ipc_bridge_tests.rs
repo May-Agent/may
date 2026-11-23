@@ -34,12 +34,13 @@ mod tests {
 
         type Arguments = NoteArgs;
         type Res = ToolResult;
+        type Error = core::convert::Infallible;
 
         fn call(
             &self,
             args: Self::Arguments,
             _cx: ToolContext,
-        ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+        ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
             std::future::ready(Ok(ToolResult::text(format!(
                 "ran prompt={} input={} body={}",
                 args.prompt,

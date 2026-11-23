@@ -163,7 +163,7 @@ impl PushedModel {
                 // rather than refreshing here.
                 let credentials = aither_codex::auth::CodexCredentials {
                     access_token: access_token.clone(),
-                    refresh_token: String::new(),
+                    refresh_token: None,
                     id_token: id_token.clone(),
                     account_id: account_id.clone(),
                     residency: residency.clone(),

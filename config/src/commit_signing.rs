@@ -840,6 +840,21 @@ pub fn requester(identity: Option<&CallIdentity>) -> String {
     }
 }
 
+/// A `sign_commit` call failed: no commit object on stdin, a subagent
+/// outside its granted roots, or the signing pipeline itself.
+#[derive(Debug, thiserror::Error)]
+pub enum SignCommitError {
+    /// The tool call carried no commit object on its stdin buffer.
+    #[error("no commit object on stdin")]
+    NoInput,
+    /// A subagent asked to sign where no repository root was provisioned.
+    #[error("subagent {0} may not sign commits: it was provisioned no repository")]
+    SubagentNotProvisioned(String),
+    /// The signing pipeline failed.
+    #[error(transparent)]
+    Signing(#[from] SigningError),
+}
+
 impl Tool for SignCommitTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed(SIGN_COMMAND)
@@ -847,12 +862,11 @@ impl Tool for SignCommitTool {
 
     type Arguments = SignCommitArgs;
     type Res = ToolResult;
+    type Error = SignCommitError;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         use aither_core::llm::tool::AgentIdentity;
-        let buffer = args
-            .input
-            .ok_or_else(|| anyhow::anyhow!("no commit object on stdin"))?;
+        let buffer = args.input.ok_or(SignCommitError::NoInput)?;
         if let Some(AgentIdentity::Subagent(subagent)) = cx.identity().map(CallIdentity::agent) {
             // A subagent signs only under a root the host granted its space
             // when its working copy was provisioned — state the host holds,
@@ -865,9 +879,8 @@ impl Tool for SignCommitTool {
                 None => false,
             };
             if !granted {
-                return Err(anyhow::anyhow!(
-                    "subagent {} may not sign commits: it was provisioned no repository",
-                    subagent.name()
+                return Err(SignCommitError::SubagentNotProvisioned(
+                    subagent.name().to_string(),
                 ));
             }
         }

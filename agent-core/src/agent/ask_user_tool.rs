@@ -10,10 +10,12 @@ use std::sync::Arc;
 
 use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 use aither_core::llm::{Tool, ToolContext, ToolResult};
+use aither_sandbox::Refused;
 use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::language::LanguageRefusal;
 use crate::harness::working_document::{BlockerError, BlockerResolver};
 use crate::secrets::{SecretScope, SecretStore};
 use crate::session::{
@@ -26,30 +28,45 @@ const WITHDRAW_DESCRIPTION: &str = include_str!("../texts/withdraw_ask_user_desc
 /// Tag of the open-questions block in the request tail.
 const OPEN_QUESTIONS_TAG: &str = "open_questions";
 
+/// An `ask_user` or `withdraw_ask_user` call failed before it could record or
+/// close its question.
 #[derive(Debug, thiserror::Error)]
-enum AskUserToolError {
+pub enum AskUserToolError {
+    /// `ask_user` was called without a question.
     #[error("ask_user needs a question")]
     NoQuestion,
+    /// The question was given twice, once positionally and once as a flag.
     #[error(
         "the question is given both as the positional argument and as --question; give it once"
     )]
     QuestionTwice,
+    /// A secret question lacked its name or its scope.
     #[error("a secret needs both a name and a scope (global or session)")]
     IncompleteSecret,
+    /// The secret question failed validation.
     #[error("the secret question {question:?} is refused: {source}")]
     BadSecret {
+        /// The refused question text.
         question: String,
+        /// Why it was refused.
         #[source]
         source: crate::secrets::SecretError,
     },
+    /// A secret question offered options, which secrets cannot.
     #[error("the secret question {0:?} takes only the value: it has no options")]
     SecretWithOptions(String),
+    /// The question could not be written to the session store.
     #[error("failed to persist the question: {0}")]
     Persist(#[source] crate::db::ChatDbError),
+    /// The question named for withdrawal is already closed.
     #[error("question {0} is not open: it was already answered or withdrawn")]
     NotOpen(String),
+    /// The withdrawal could not be written to the session store.
     #[error("failed to withdraw the question: {0}")]
     Withdraw(#[source] crate::db::ChatDbError),
+    /// The question or option text refused its language.
+    #[error("{0}")]
+    LanguageRefused(#[from] Refused<LanguageRefusal>),
 }
 
 #[derive(Template)]
@@ -262,11 +279,12 @@ impl Tool for AskUserTool {
 
     type Arguments = AskUserArgs;
     type Res = ToolResult;
+    type Error = AskUserToolError;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         let questions = args.into_questions()?;
         if questions.is_empty() {
-            return Err(AskUserToolError::NoQuestion.into());
+            return Err(AskUserToolError::NoQuestion);
         }
         if let Some(guard) = &self.languages {
             guard
@@ -357,12 +375,13 @@ impl Tool for WithdrawAskUserTool {
 
     type Arguments = WithdrawAskUserArgs;
     type Res = ToolResult;
+    type Error = AskUserToolError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let request_id = self
             .runtime
             .db()
@@ -378,7 +397,7 @@ impl Tool for WithdrawAskUserTool {
             None => false,
         };
         if !withdrawn {
-            return Err(AskUserToolError::NotOpen(args.request_id).into());
+            return Err(AskUserToolError::NotOpen(args.request_id));
         }
         if let Some(events) = &self.task_events {
             events.record(

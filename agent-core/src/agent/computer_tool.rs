@@ -257,12 +257,13 @@ impl Tool for ComputerTool {
 
     type Arguments = ComputerArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         match self.run(&arguments.action, &arguments.operands).await {
             Ok(result) => Ok(result),
             Err(error) => Ok(ToolResult::error(error)),

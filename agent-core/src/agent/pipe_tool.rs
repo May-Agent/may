@@ -255,14 +255,15 @@ impl Tool for PipeTool {
 
     type Arguments = PipeArgs;
     type Res = ToolResult;
+    type Error = PipeToolError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         if args.stdout && args.stderr {
-            return Err(PipeToolError::ConflictingStreams.into());
+            return Err(PipeToolError::ConflictingStreams);
         }
         if args.list || args.step.is_none() {
             let snapshot = self.lookup_snapshot(args.pid).await?;

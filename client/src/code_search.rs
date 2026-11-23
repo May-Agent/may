@@ -291,12 +291,13 @@ impl<B: SearchBackend> Tool for CodeSearchTool<B> {
 
     type Arguments = CodeSearchArgs;
     type Res = ToolResult;
+    type Error = askama::Error;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         match self.run(arguments).await {
             Ok(text) => Ok(ToolResult::text(text)),
             Err(error) => Ok(ToolResult::text(

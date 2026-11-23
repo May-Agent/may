@@ -54,14 +54,21 @@ pub type TunnelBroker = ToolRequestBroker<TunnelRequest, Result<TunnelResult, St
 /// pending tunnel requests from it.
 pub type TunnelQueue = ToolRequestQueue<TunnelRequest, Result<TunnelResult, String>>;
 
+/// A `tunnel` call failed before it could return a tool result.
 #[derive(Debug, thiserror::Error)]
-enum TunnelToolError {
+pub enum TunnelToolError {
+    /// The URL to expose was empty.
     #[error("tunnel url must not be empty")]
     EmptyUrl,
+    /// The tunnel command is not wired in this runtime.
     #[error("tunnel command is unavailable in this runtime")]
     Unavailable,
+    /// The tunnel service refused the request.
     #[error("tunnel request was rejected: {0}")]
     Rejected(String),
+    /// The request could not reach the tunnel service.
+    #[error("tunnel request failed: {0}")]
+    Request(String),
 }
 
 /// Create a paired tunnel broker and queue.
@@ -110,23 +117,25 @@ impl Tool for TunnelTool {
 
     type Arguments = TunnelArgs;
     type Res = ToolResult;
+    type Error = TunnelToolError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let broker = self.broker.as_ref().ok_or(TunnelToolError::Unavailable)?;
         let url = args.url.trim();
         if url.is_empty() {
-            return Err(TunnelToolError::EmptyUrl.into());
+            return Err(TunnelToolError::EmptyUrl);
         }
         let response = broker
             .request(TunnelRequest {
                 session_id: self.session_id.clone(),
                 url: url.to_string(),
             })
-            .await?;
+            .await
+            .map_err(|error| TunnelToolError::Request(error.to_string()))?;
         let result = response.map_err(TunnelToolError::Rejected)?;
 
         let text = TunnelOpenText {
