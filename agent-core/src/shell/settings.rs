@@ -88,8 +88,8 @@ fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
             "Start the command detached and return at once with its PID instead of waiting in the foreground. Default false: the call waits up to the foreground window and promotes a still-running command to a background job.",
         ),
         (
-            "pid",
-            "The process ID returned when the command was backgrounded.",
+            "task_id",
+            "The task ID returned when the command was backgrounded.",
         ),
         (
             "cursor",
