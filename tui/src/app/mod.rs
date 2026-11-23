@@ -392,6 +392,8 @@ pub struct App {
     /// The session's subagent runs in flight, as the daemon last reported
     /// them.
     pub subagents: Vec<may_client::subagent_tracker::SubagentRunSnapshot>,
+    /// Active and retained multi-stage pipelines reported by the daemon.
+    pub pipelines: Vec<may_client::client::background::WirePipeline>,
     /// Last live terminal-output read from the daemon.
     pub live_output_read_at: Option<std::time::Instant>,
     /// The lease of the run in flight, held from its start until the TUI has
@@ -798,6 +800,7 @@ impl App {
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
+            pipelines: Vec::new(),
             live_output_read_at: None,
             run_guard: None,
             live_reads: std::collections::HashMap::new(),
@@ -1379,10 +1382,16 @@ impl App {
         };
         let tx = self.event_tx.clone();
         spawn(async move {
-            match background.snapshot().await {
-                Ok((jobs, subagents)) => {
+            match background.full_snapshot().await {
+                Ok(snapshot) => {
+                    let pipelines = snapshot.pipelines.clone();
+                    let (jobs, subagents) = snapshot.into_parts();
                     let _ = tx
-                        .send(AppEvent::BackgroundLoaded { jobs, subagents })
+                        .send(AppEvent::BackgroundLoaded {
+                            jobs,
+                            subagents,
+                            pipelines,
+                        })
                         .await;
                 }
                 Err(error) => tracing::debug!(%error, "failed to load background jobs"),
@@ -1445,9 +1454,15 @@ impl App {
         spawn(async move {
             let ok = background.kill(pid).await.unwrap_or(false);
             let _ = tx.send(AppEvent::JobKilled { pid, ok }).await;
-            if let Ok((jobs, subagents)) = background.snapshot().await {
+            if let Ok(snapshot) = background.full_snapshot().await {
+                let pipelines = snapshot.pipelines.clone();
+                let (jobs, subagents) = snapshot.into_parts();
                 let _ = tx
-                    .send(AppEvent::BackgroundLoaded { jobs, subagents })
+                    .send(AppEvent::BackgroundLoaded {
+                        jobs,
+                        subagents,
+                        pipelines,
+                    })
                     .await;
             }
         })
@@ -1715,6 +1730,69 @@ impl App {
             }
             self.diff_preview_at = Some(std::time::Instant::now());
         }
+        self.poll_pipeline_stages();
+    }
+
+    /// Poll incremental UI-colored output for active pipeline stages.
+    pub fn poll_pipeline_stages(&self) {
+        let Some(background) = self.background.clone() else {
+            return;
+        };
+        let reads = self.chat.active_pipeline_reads();
+        if reads.is_empty() {
+            return;
+        }
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let mut deltas = Vec::with_capacity(reads.len());
+            for req in reads {
+                if let Ok(delta) = background
+                    .read_stage(req.pid, Some(req.launch_id), req.step, req.cursor)
+                    .await
+                    && (!delta.bytes.is_empty() || delta.cursor != req.cursor)
+                {
+                    deltas.push(super::event::PipelineStageOutputDelta {
+                        call_id: req.call_id,
+                        launch_id: req.launch_id,
+                        step: req.step,
+                        cursor: delta.cursor,
+                        bytes: delta.bytes,
+                    });
+                }
+            }
+            if !deltas.is_empty() {
+                let _ = tx.send(AppEvent::PipelineStageOutputs(deltas)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Fetch colored output for one clicked retained pipeline stage.
+    pub(super) fn fetch_pipeline_stage(&self, req: super::ui::chat::StageFetchRequest) {
+        let Some(background) = self.background.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            if let Ok(delta) = background
+                .read_stage(req.pid, Some(req.launch_id), req.step, req.cursor)
+                .await
+                && (!delta.bytes.is_empty() || delta.cursor != req.cursor)
+            {
+                let _ = tx
+                    .send(AppEvent::PipelineStageOutputs(vec![
+                        super::event::PipelineStageOutputDelta {
+                            call_id: req.call_id,
+                            launch_id: req.launch_id,
+                            step: req.step,
+                            cursor: delta.cursor,
+                            bytes: delta.bytes,
+                        },
+                    ]))
+                    .await;
+            }
+        })
+        .detach();
     }
 
     /// Open the detail view for one jobs-panel row.
@@ -3772,11 +3850,20 @@ impl App {
                                 .into_iter()
                                 .filter(|r| point.line >= r.start && point.line < r.end)
                                 // The innermost span wins: a click inside an
-                                // expanded "Worked for" member toggles the
-                                // member, not the group around it.
+                                // expanded "Worked for" member or pipeline stage
+                                // row targets that inner region.
                                 .min_by_key(|r| r.end - r.start)
                         {
-                            self.chat.toggle_expanded(&region.element_id);
+                            if let Some((tool_id, step)) =
+                                super::ui::chat::parse_pipe_step_click(&region.element_id)
+                            {
+                                let call_id = tool_id.to_string();
+                                if let Some(req) = self.chat.select_pipeline_step(&call_id, step) {
+                                    self.fetch_pipeline_stage(req);
+                                }
+                            } else {
+                                self.chat.toggle_expanded(&region.element_id);
+                            }
                         }
                     }
                 }
@@ -4808,6 +4895,12 @@ impl App {
                 );
                 self.chat
                     .update_tool_with_output(id, status, Some(out.text.as_str()));
+                if let Some(pid) = out.pid {
+                    self.chat.set_tool_pid(id, pid);
+                    if !self.pipelines.is_empty() {
+                        self.chat.sync_pipelines(&self.pipelines);
+                    }
+                }
                 if let Some(image) = image
                     && let Some(image) = self.install_tool_image(id, image)
                 {
@@ -7302,6 +7395,7 @@ mod tests {
         app.handle_event(AppEvent::BackgroundLoaded {
             jobs: vec![background_job(aither_sandbox::JobStatus::Running)],
             subagents: Vec::new(),
+            pipelines: Vec::new(),
         })
         .expect("background event");
         assert!(app.request_quit().is_none(), "the quit waits for an answer");
@@ -7325,6 +7419,7 @@ mod tests {
                 delivery: aither_sandbox::Delivery::Taken,
             })],
             subagents: Vec::new(),
+            pipelines: Vec::new(),
         })
         .expect("background event");
         assert!(matches!(app.request_quit(), Some(SendAction::Quit)));

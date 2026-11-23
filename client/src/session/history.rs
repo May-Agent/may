@@ -563,6 +563,7 @@ mod tests {
                 text: "warn\n".to_string(),
             }),
             outcome: CommandOutcome::Exited { code: 3 },
+            retained_pid: None,
             interruptions: Vec::new(),
         }));
         let stored = serde_json::to_string(&ToolEventRecord::End {

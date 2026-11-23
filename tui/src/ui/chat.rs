@@ -72,6 +72,79 @@ impl ToolCallImage {
     }
 }
 
+/// Prefix on `ClickRegion::element_id` for a clickable pipeline stage row.
+pub const PIPE_STEP_PREFIX: &str = "pipe-step:";
+
+/// Request parameters to read one pipeline stage from the daemon.
+#[derive(Debug, Clone)]
+pub struct StageFetchRequest {
+    /// Tool call owning the pipeline card.
+    pub call_id: String,
+    /// Process ID of the pipeline.
+    pub pid: u32,
+    /// Monotonic launch generation key.
+    pub launch_id: u64,
+    /// Zero-based stage index.
+    pub step: usize,
+    /// Current read cursor.
+    pub cursor: usize,
+}
+
+type StageRegions<'a> = (&'a str, &'a mut Vec<(String, usize, usize)>);
+
+/// Extracts `(tool_id, step)` from a pipeline stage click region identifier.
+#[must_use]
+pub fn parse_pipe_step_click(region_id: &str) -> Option<(&str, usize)> {
+    let rest = region_id.strip_prefix(PIPE_STEP_PREFIX)?;
+    let (tool_id, step_raw) = rest.rsplit_once(':')?;
+    Some((tool_id, step_raw.parse().ok()?))
+}
+
+/// Live or retained multi-stage pipeline state attached to a terminal call.
+#[derive(Debug, Clone)]
+pub struct PipelineCardState {
+    /// Latest snapshot reported by the daemon.
+    pub snapshot: may_client::client::background::WirePipeline,
+    /// True once the daemon drops the pipeline from its snapshot after completion.
+    pub expired: bool,
+    /// Stage pinned by user click (`None` follows `active_step`, then settles on final stage).
+    pub selected_step: Option<usize>,
+    /// Cached UI-colored stage text per `step`: `(cursor, text)`.
+    pub stage_buffers: std::collections::BTreeMap<usize, (usize, String)>,
+}
+
+impl PipelineCardState {
+    /// Zero-based index of the final stage in this pipeline.
+    #[must_use]
+    pub fn last_step(&self) -> usize {
+        self.snapshot.stages.last().map_or(0, |stage| stage.step)
+    }
+
+    /// Whether the pipeline job is currently running.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        matches!(
+            self.snapshot.job_status,
+            may_client::client::background::WireJobStatus::Running
+        )
+    }
+
+    /// Effective stage displayed right now.
+    #[must_use]
+    pub fn effective_step(&self) -> usize {
+        if let Some(step) = self.selected_step
+            && !self.expired
+        {
+            return step;
+        }
+        if self.is_running() {
+            self.snapshot.active_step.unwrap_or(0)
+        } else {
+            self.last_step()
+        }
+    }
+}
+
 /// Information about a terminal command execution.
 #[derive(Debug, Clone)]
 pub struct TerminalCallInfo {
@@ -83,6 +156,10 @@ pub struct TerminalCallInfo {
     pub output_file: Option<PathBuf>,
     /// Image produced by this call, if any.
     pub image: Option<ToolCallImage>,
+    /// Process ID when retained or detached.
+    pub pid: Option<u32>,
+    /// Multi-stage pipeline state when `>= 3s` foreground or detached.
+    pub pipeline: Option<Box<PipelineCardState>>,
 }
 
 impl TerminalCallInfo {
@@ -94,6 +171,8 @@ impl TerminalCallInfo {
             output: String::new(),
             output_file: None,
             image: None,
+            pid: None,
+            pipeline: None,
         }
     }
 
@@ -1269,11 +1348,22 @@ impl ChatStream {
                 let pinned = slot.pinned();
                 match &mut display {
                     ToolDisplay::Terminal {
-                        pinned: pin, diffs, ..
+                        pinned: pin,
+                        diffs,
+                        output: new_out,
+                        ..
                     } => {
                         *pin = pinned;
-                        if let ToolDisplay::Terminal { diffs: old, .. } = slot {
+                        if let ToolDisplay::Terminal {
+                            diffs: old,
+                            output: old_out,
+                            ..
+                        } = slot
+                        {
                             *diffs = std::mem::take(old);
+                            if new_out.is_none() {
+                                *new_out = old_out.take();
+                            }
                         }
                     }
                     ToolDisplay::Action { pinned: pin, .. }
@@ -1424,12 +1514,16 @@ impl ChatStream {
                     ..
                 } => {
                     *s = status;
+                    let prev_pid = out.as_ref().and_then(|info| info.pid);
+                    let prev_pipeline = out.as_mut().and_then(|info| info.pipeline.take());
                     if let Some(output_text) = output {
                         *out = Some(TerminalCallInfo {
                             command: command.clone(),
                             output: output_text.to_string(),
                             output_file: None,
                             image: None,
+                            pid: prev_pid,
+                            pipeline: prev_pipeline,
                         });
                     }
                 }
@@ -1454,6 +1548,8 @@ impl ChatStream {
                             output: output_text.to_string(),
                             output_file: None,
                             image: None,
+                            pid: None,
+                            pipeline: None,
                         });
                     }
                 }
@@ -1590,6 +1686,298 @@ impl ChatStream {
                         );
                     }
                 }
+                touched = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = touched {
+            self.touch(index);
+        }
+    }
+
+    /// Record the retained or detached PID of a terminal tool call.
+    pub fn set_tool_pid(&mut self, id: &str, pid: u32) {
+        let Some(index) = self.tool_index(id) else {
+            return;
+        };
+        if let ChatElement::ToolCall {
+            display: ToolDisplay::Terminal {
+                command, output, ..
+            },
+            ..
+        } = &mut self.elements[index]
+        {
+            let info = output.get_or_insert_with(|| TerminalCallInfo::new(command.clone()));
+            if info.pid != Some(pid) {
+                info.pid = Some(pid);
+                self.touch(index);
+            }
+        }
+    }
+
+    /// Synchronize active and retained pipelines from the daemon onto matching
+    /// terminal tool calls, and mark disappeared finished pipelines expired.
+    pub fn sync_pipelines(&mut self, pipelines: &[may_client::client::background::WirePipeline]) {
+        fn sync_elem(
+            elem: &mut ChatElement,
+            pipelines: &[may_client::client::background::WirePipeline],
+        ) -> bool {
+            match elem {
+                ChatElement::ToolCall {
+                    display:
+                        ToolDisplay::Terminal {
+                            command,
+                            status,
+                            output,
+                            ..
+                        },
+                    ..
+                } => {
+                    let known_pid = output.as_ref().and_then(|info| info.pid);
+                    let known_launch = output
+                        .as_ref()
+                        .and_then(|info| info.pipeline.as_ref().map(|p| p.snapshot.launch_id));
+                    let matched = match (known_launch, known_pid) {
+                        (Some(launch_id), _) => pipelines.iter().find(|p| p.launch_id == launch_id),
+                        (None, Some(pid)) => pipelines.iter().rfind(|p| p.pid == pid),
+                        (None, None)
+                            if matches!(status, ToolStatus::Running)
+                                && !command.trim().is_empty() =>
+                        {
+                            pipelines
+                                .iter()
+                                .rfind(|p| p.script.trim() == command.trim())
+                        }
+                        (None, None) => None,
+                    };
+
+                    if let Some(snap) = matched {
+                        let info =
+                            output.get_or_insert_with(|| TerminalCallInfo::new(command.clone()));
+                        info.pid = Some(snap.pid);
+                        if let Some(card) = &mut info.pipeline {
+                            if &card.snapshot != snap || card.expired {
+                                card.snapshot = snap.clone();
+                                card.expired = false;
+                                return true;
+                            }
+                        } else {
+                            info.pipeline = Some(Box::new(PipelineCardState {
+                                snapshot: snap.clone(),
+                                expired: false,
+                                selected_step: None,
+                                stage_buffers: std::collections::BTreeMap::new(),
+                            }));
+                            return true;
+                        }
+                    } else if !matches!(status, ToolStatus::Running)
+                        && let Some(info) = output.as_mut()
+                        && let Some(card) = info.pipeline.as_mut()
+                        && !card.expired
+                    {
+                        card.expired = true;
+                        card.selected_step = None;
+                        let last = card.last_step();
+                        card.stage_buffers.retain(|step, _| *step == last);
+                        return true;
+                    }
+                    false
+                }
+                ChatElement::WorkedFor { elements, .. } => {
+                    let mut any = false;
+                    for child in elements {
+                        any |= sync_elem(child, pipelines);
+                    }
+                    any
+                }
+                _ => false,
+            }
+        }
+
+        let mut dirty = Vec::new();
+        for (index, elem) in self.elements.iter_mut().enumerate() {
+            if sync_elem(elem, pipelines) {
+                dirty.push(index);
+            }
+        }
+        for index in dirty {
+            self.touch(index);
+        }
+    }
+
+    /// Toggle or select pipeline stage `step` on `tool_id`; returns a
+    /// [`StageFetchRequest`] when a stage read should be fetched.
+    pub fn select_pipeline_step(
+        &mut self,
+        tool_id: &str,
+        step: usize,
+    ) -> Option<StageFetchRequest> {
+        fn select_in_elem(
+            elem: &mut ChatElement,
+            tool_id: &str,
+            step: usize,
+        ) -> Option<(bool, Option<StageFetchRequest>)> {
+            match elem {
+                ChatElement::ToolCall {
+                    id,
+                    display:
+                        ToolDisplay::Terminal {
+                            output: Some(info), ..
+                        },
+                } if id == tool_id => {
+                    let card = info.pipeline.as_mut()?;
+                    if card.expired {
+                        return Some((false, None));
+                    }
+                    let stage = card.snapshot.stages.iter().find(|s| s.step == step)?;
+                    let last = card.last_step();
+                    let final_has_output = step == last && !info.output.is_empty();
+                    if !stage.retained && !final_has_output {
+                        return Some((false, None));
+                    }
+                    let next = if card.selected_step == Some(step)
+                        || (!card.is_running() && step == last)
+                    {
+                        None
+                    } else {
+                        Some(step)
+                    };
+                    card.selected_step = next;
+                    let eff = card.effective_step();
+                    let fetch = card
+                        .snapshot
+                        .stages
+                        .iter()
+                        .find(|s| s.step == eff && s.retained)
+                        .map(|_| StageFetchRequest {
+                            call_id: id.clone(),
+                            pid: card.snapshot.pid,
+                            launch_id: card.snapshot.launch_id,
+                            step: eff,
+                            cursor: card.stage_buffers.get(&eff).map_or(0, |(cur, _)| *cur),
+                        });
+                    Some((true, fetch))
+                }
+                ChatElement::WorkedFor { elements, .. } => {
+                    for child in elements {
+                        if let Some(res) = select_in_elem(child, tool_id, step) {
+                            return Some(res);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        for (index, elem) in self.elements.iter_mut().enumerate() {
+            if let Some((changed, fetch)) = select_in_elem(elem, tool_id, step) {
+                if changed {
+                    self.touch(index);
+                }
+                return fetch;
+            }
+        }
+        None
+    }
+
+    /// Running pipeline stage reads to poll on tick.
+    #[must_use]
+    pub fn active_pipeline_reads(&self) -> Vec<StageFetchRequest> {
+        let mut out = Vec::new();
+        for elem in &self.elements {
+            if let ChatElement::ToolCall {
+                id,
+                display:
+                    ToolDisplay::Terminal {
+                        output: Some(info), ..
+                    },
+            } = elem
+                && let Some(card) = info.pipeline.as_deref()
+                && !card.expired
+                && card.is_running()
+            {
+                let step = card.effective_step();
+                if card
+                    .snapshot
+                    .stages
+                    .iter()
+                    .any(|s| s.step == step && s.retained)
+                {
+                    let cursor = card.stage_buffers.get(&step).map_or(0, |(cur, _)| *cur);
+                    out.push(StageFetchRequest {
+                        call_id: id.clone(),
+                        pid: card.snapshot.pid,
+                        launch_id: card.snapshot.launch_id,
+                        step,
+                        cursor,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Append UI-colored bytes for stage `step` of `tool_id`.
+    pub fn append_pipeline_stage_output(
+        &mut self,
+        tool_id: &str,
+        launch_id: u64,
+        step: usize,
+        cursor: usize,
+        chunk: &str,
+    ) {
+        fn append_in_elem(
+            elem: &mut ChatElement,
+            tool_id: &str,
+            launch_id: u64,
+            step: usize,
+            cursor: usize,
+            chunk: &str,
+        ) -> bool {
+            match elem {
+                ChatElement::ToolCall {
+                    id,
+                    display:
+                        ToolDisplay::Terminal {
+                            output: Some(info), ..
+                        },
+                } if id == tool_id => {
+                    let Some(card) = info.pipeline.as_mut() else {
+                        return false;
+                    };
+                    if card.snapshot.launch_id != launch_id {
+                        return false;
+                    }
+                    let entry = card
+                        .stage_buffers
+                        .entry(step)
+                        .or_insert_with(|| (0, String::new()));
+                    if cursor < entry.0 {
+                        return false;
+                    }
+                    if cursor == entry.0 && chunk.is_empty() {
+                        return false;
+                    }
+                    entry.0 = cursor;
+                    entry.1.push_str(chunk);
+                    true
+                }
+                ChatElement::WorkedFor { elements, .. } => {
+                    for child in elements {
+                        if append_in_elem(child, tool_id, launch_id, step, cursor, chunk) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+
+        let mut touched = None;
+        for (index, elem) in self.elements.iter_mut().enumerate() {
+            if append_in_elem(elem, tool_id, launch_id, step, cursor, chunk) {
                 touched = Some(index);
                 break;
             }
@@ -2883,6 +3271,7 @@ pub(super) fn element_lines(
         ChatElement::ToolCall { id, display } => {
             let start = lines.len();
             let mut tool_lines = Vec::new();
+            let mut stage_regions = Vec::new();
             render_tool_inline_at(
                 &mut tool_lines,
                 display,
@@ -2892,8 +3281,12 @@ pub(super) fn element_lines(
                 state.open,
                 state.spinner_frame,
                 &assets.highlighting,
+                Some((id.as_str(), &mut stage_regions)),
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
+            for (region_id, rel_start, rel_end) in stage_regions {
+                regions.push((region_id, start + rel_start, start + rel_end));
+            }
             if display.expandable() {
                 regions.push((id.clone(), start, lines.len()));
             }
@@ -4266,6 +4659,7 @@ fn render_tool_inline<'a>(
         open,
         0,
         &super::highlight::Highlighting::default(),
+        None,
     );
 }
 
@@ -4280,6 +4674,7 @@ fn render_tool_inline_at<'a>(
     open: bool,
     spinner_frame: usize,
     highlighting: &super::highlight::Highlighting,
+    stage_regions: Option<StageRegions<'_>>,
 ) {
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
@@ -4333,6 +4728,21 @@ fn render_tool_inline_at<'a>(
                 terminal_mode_marker(*mode),
                 terminal_location_marker(location.as_deref())
             );
+            if let Some(info) = output
+                && let Some(pipe) = info.pipeline.as_deref()
+            {
+                render_pipeline_inline(
+                    lines,
+                    pipe,
+                    &info.output,
+                    status,
+                    selection_style,
+                    spinner_frame,
+                    stage_regions,
+                );
+                push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
+                return;
+            }
             // A script May recognises shows as what it does; one it does
             // not shows as the script, as before.
             let recognised = reading.as_ref().filter(|reading| reading.recognises_any());
@@ -4385,8 +4795,19 @@ fn render_tool_inline_at<'a>(
             if let Some(info) = output
                 && !info.output.is_empty()
             {
-                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
-                    lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
+                let preview = info.output_preview(OUTPUT_PREVIEW_LINES);
+                if super::ansi::has_ansi_or_cr(&preview) {
+                    lines.extend(super::ansi::parse_ansi_lines(
+                        &preview,
+                        "│ ",
+                        dim,
+                        dim,
+                        selection_style,
+                    ));
+                } else {
+                    for line in preview.lines() {
+                        lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
+                    }
                 }
             }
             push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
@@ -4440,6 +4861,167 @@ fn render_tool_inline_at<'a>(
 /// Diff rows an edit shows inline before the rest folds into a count; the
 /// full-screen view still carries the whole script.
 const EDIT_PREVIEW_ROWS: usize = 40;
+
+fn format_stage_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1_000)
+    } else if ms >= 10_000 {
+        format!("{}s", ms / 1_000)
+    } else if ms >= 1_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        "<1s".to_string()
+    }
+}
+
+fn pipeline_stage_badge(
+    stage: &may_client::client::background::WirePipelineStage,
+    expired: bool,
+) -> Option<(String, Color)> {
+    use may_client::client::background::WireStageStatus;
+    match stage.status {
+        WireStageStatus::Pending => None,
+        WireStageStatus::Running => Some(("running".to_string(), Color::Yellow)),
+        WireStageStatus::Exited { code } => {
+            let dur = stage.own_duration_ms.map(format_stage_duration_ms);
+            if expired && stage.retained {
+                let label = dur.map_or_else(|| "expired".to_string(), |d| format!("{d} · expired"));
+                Some((label, Color::DarkGray))
+            } else if !stage.retained {
+                Some((dur.unwrap_or_else(|| "<3s".to_string()), Color::DarkGray))
+            } else if code != 0 {
+                let label =
+                    dur.map_or_else(|| format!("exit {code}"), |d| format!("exit {code} · {d}"));
+                Some((label, Color::Red))
+            } else {
+                dur.map(|d| (d, Color::DarkGray))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_pipeline_inline(
+    lines: &mut Vec<Line<'_>>,
+    pipe: &PipelineCardState,
+    settled_output: &str,
+    status: &ToolStatus,
+    selection_style: Style,
+    spinner_frame: usize,
+    mut stage_regions: Option<StageRegions<'_>>,
+) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let is_running = pipe.is_running();
+    let effective = pipe.effective_step();
+    let last_step = pipe.last_step();
+
+    for (idx, stage) in pipe.snapshot.stages.iter().enumerate() {
+        let row_idx = lines.len();
+        let active = is_running && pipe.snapshot.active_step == Some(stage.step);
+        let selected = effective == stage.step;
+        let is_final = stage.step == last_step;
+        let clickable =
+            !pipe.expired && (stage.retained || (is_final && !settled_output.is_empty()));
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let lead = if idx == 0 { "  " } else { "| " };
+        spans.push(Span::styled(lead, dim.patch(selection_style)));
+        let pointer = if selected { "▸ " } else { "  " };
+        let pointer_style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .bold()
+                .patch(selection_style)
+        } else {
+            dim.patch(selection_style)
+        };
+        spans.push(Span::styled(pointer, pointer_style));
+        spans.push(Span::styled(
+            format!("[{}] ", stage.step),
+            dim.patch(selection_style),
+        ));
+
+        let cmd_line = stage.command.lines().next().unwrap_or_default();
+        if active {
+            spans.extend(super::sweep::sweep_spans(
+                cmd_line,
+                spinner_frame,
+                Style::default().fg(Color::Gray).patch(selection_style),
+                Style::default()
+                    .fg(Color::White)
+                    .bold()
+                    .patch(selection_style),
+            ));
+        } else {
+            let cmd_style = if selected {
+                Style::default().fg(Color::Cyan).patch(selection_style)
+            } else if clickable {
+                Style::default().fg(Color::Gray).patch(selection_style)
+            } else {
+                dim.patch(selection_style)
+            };
+            spans.push(Span::styled(cmd_line.to_string(), cmd_style));
+        }
+
+        if let Some((badge, color)) = pipeline_stage_badge(stage, pipe.expired && !is_final) {
+            spans.push(Span::styled(
+                format!("  ({badge})"),
+                Style::default().fg(color).patch(selection_style),
+            ));
+        }
+        lines.push(Line::from(spans));
+
+        if clickable && let Some((tool_id, ref mut regs)) = stage_regions {
+            regs.push((
+                format!("{PIPE_STEP_PREFIX}{tool_id}:{}", stage.step),
+                row_idx,
+                row_idx + 1,
+            ));
+        }
+    }
+
+    if let Some(status_text) = body_status_text(status) {
+        lines.push(Line::from(vec![
+            Span::styled("↳ ", dim.patch(selection_style)),
+            Span::styled(status_text, dim.patch(selection_style)),
+        ]));
+    }
+
+    let buffered = pipe
+        .stage_buffers
+        .get(&effective)
+        .map_or("", |(_, text)| text.as_str());
+    let shown = if !is_running && effective == last_step && buffered.is_empty() {
+        settled_output
+    } else {
+        buffered
+    };
+
+    if !shown.is_empty() {
+        let parsed = super::ansi::parse_ansi_lines(
+            shown,
+            "│ ",
+            dim,
+            Style::default().fg(Color::Gray),
+            selection_style,
+        );
+        let total = parsed.len();
+        let skip = if is_running {
+            total.saturating_sub(DIFF_PREVIEW_LINES)
+        } else {
+            0
+        };
+        for line in parsed.into_iter().skip(skip).take(DIFF_PREVIEW_LINES) {
+            lines.push(line);
+        }
+        if !is_running && total > DIFF_PREVIEW_LINES {
+            lines.push(Line::from(Span::styled(
+                format!("│ … {} more lines", total - DIFF_PREVIEW_LINES),
+                dim.italic().patch(selection_style),
+            )));
+        }
+    }
+}
 
 /// What joins a step to the one before it.
 const fn link_marker(link: Link) -> &'static str {
@@ -8151,5 +8733,149 @@ mod tests {
             );
         }
         assert_eq!(super::clamp_column_by_width("a👍🏽b", 3), 1 + 8);
+    }
+
+    #[test]
+    fn pipeline_stages_stream_settle_click_and_expire() {
+        use may_client::client::background::{
+            WireDelivery, WireJobStatus, WirePipeline, WirePipelineStage, WireStageStatus,
+        };
+        use unicode_width::UnicodeWidthStr as _;
+
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "call:1".to_string(),
+            ToolDisplay::Terminal {
+                description: "检查编译 Check ビルド 검사".to_string(),
+                command: "cargo clippy | tail -n 5".to_string(),
+                mode: SandboxMode::Sandboxed,
+                location: None,
+                interpreter: Interpreter::Shell,
+                reading: None,
+                card: None,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: Some(true),
+            },
+        );
+
+        let running = WirePipeline {
+            pid: 48210,
+            launch_id: 7,
+            script: "cargo clippy | tail -n 5".to_string(),
+            job_status: WireJobStatus::Running,
+            elapsed_ms: 3400,
+            expires_at: None,
+            active_step: Some(0),
+            stages: vec![
+                WirePipelineStage {
+                    step: 0,
+                    command: "cargo clippy".to_string(),
+                    status: WireStageStatus::Running,
+                    own_duration_ms: None,
+                    retained: true,
+                    ui_bytes: 64,
+                    total_lines: 2,
+                },
+                WirePipelineStage {
+                    step: 1,
+                    command: "tail -n 5".to_string(),
+                    status: WireStageStatus::Pending,
+                    own_duration_ms: None,
+                    retained: false,
+                    ui_bytes: 0,
+                    total_lines: 0,
+                },
+            ],
+        };
+        chat.sync_pipelines(&[running]);
+        chat.append_pipeline_stage_output(
+            "call:1",
+            7,
+            0,
+            42,
+            "\x1b[32m编译中 ビルド중 빌드\x1b[0m\n",
+        );
+        assert_eq!(chat.active_pipeline_reads().len(), 1);
+
+        let finished = WirePipeline {
+            pid: 48210,
+            launch_id: 7,
+            script: "cargo clippy | tail -n 5".to_string(),
+            job_status: WireJobStatus::Completed {
+                exit_code: 0,
+                delivery: WireDelivery::Taken,
+            },
+            elapsed_ms: 5100,
+            expires_at: None,
+            active_step: None,
+            stages: vec![
+                WirePipelineStage {
+                    step: 0,
+                    command: "cargo clippy".to_string(),
+                    status: WireStageStatus::Exited { code: 0 },
+                    own_duration_ms: Some(4900),
+                    retained: true,
+                    ui_bytes: 64,
+                    total_lines: 2,
+                },
+                WirePipelineStage {
+                    step: 1,
+                    command: "tail -n 5".to_string(),
+                    status: WireStageStatus::Exited { code: 0 },
+                    own_duration_ms: Some(120),
+                    retained: false,
+                    ui_bytes: 12,
+                    total_lines: 1,
+                },
+            ],
+        };
+        chat.update_tool_with_output("call:1", ToolStatus::Done, Some("settled tail\n"));
+        chat.set_tool_pid("call:1", 48210);
+        chat.sync_pipelines(&[finished]);
+
+        let frame_settled = draw_band(&chat, 80, 20, "", &[]);
+        let screen_settled: String = (0..20)
+            .map(|y| row_text(&frame_settled.buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen_settled.contains("settled tail"), "{screen_settled}");
+
+        // Clicking retained stage 0 switches inline display to stage 0's colored buffer.
+        let fetch = chat
+            .select_pipeline_step("call:1", 0)
+            .expect("retained stage 0 returns fetch request");
+        assert_eq!(fetch.step, 0);
+        assert_eq!(fetch.cursor, 42);
+        let frame_stage0 = draw_band(&chat, 80, 20, "", &[]);
+        let plain_stage0: String = (0..20u16)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0u16;
+                while x < 80 {
+                    let sym = frame_stage0.buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += u16::try_from(sym.width().max(1)).unwrap_or(1);
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plain_stage0.contains("编译中 ビルド중 빌드"),
+            "{plain_stage0}"
+        );
+
+        // Once daemon removes the pipeline after 15m, intermediate stages mark expired
+        // and the view settles back onto final output.
+        chat.sync_pipelines(&[]);
+        let frame_expired = draw_band(&chat, 80, 20, "", &[]);
+        let screen_expired: String = (0..20)
+            .map(|y| row_text(&frame_expired.buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen_expired.contains("expired"), "{screen_expired}");
+        assert!(screen_expired.contains("settled tail"), "{screen_expired}");
     }
 }

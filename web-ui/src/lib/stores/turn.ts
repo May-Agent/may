@@ -214,7 +214,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
   const follow = (sessionId: string) => {
     let closed = false;
     let unwatch: (() => void) | undefined;
-    const background: BackgroundState = { jobs: [], subagents: [] };
+    const background: BackgroundState = { jobs: [], subagents: [], pipelines: [] };
     // Turns whose prompt is already in the loaded history: a turn that
     // ended between the session read's cursor and its messages arriving
     // replays on the stream; showing it would duplicate the history rows.
@@ -224,6 +224,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         sessionId,
         jobs: background.jobs,
         subagents: background.subagents,
+        pipelines: background.pipelines,
       };
       useInspectorStore.getState().applyBackground(snapshot);
     };
@@ -294,6 +295,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         if (closed) return;
         background.jobs = snapshot.jobs;
         background.subagents = snapshot.subagents;
+        background.pipelines = snapshot.pipelines ?? [];
         useInspectorStore.getState().applyBackground(snapshot);
       } catch {
         // The REST read failed; deltas still apply on the empty snapshot.

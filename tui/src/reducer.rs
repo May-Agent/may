@@ -324,9 +324,16 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.request_sidebar_prs();
             Ok(None)
         }
-        AppEvent::BackgroundLoaded { jobs, subagents } => {
+        AppEvent::BackgroundLoaded {
+            jobs,
+            subagents,
+            pipelines,
+        } => {
             app.jobs = jobs;
             app.subagents = subagents;
+            app.pipelines = pipelines;
+            app.chat.sync_pipelines(&app.pipelines);
+            app.poll_pipeline_stages();
             let row_count = jobs_rows(app).len();
             if app.jobs_selected >= row_count && app.jobs_selected > 0 {
                 app.jobs_selected = row_count.saturating_sub(1);
@@ -487,6 +494,19 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                     app.chat
                         .append_tool_output(&delta.call_id, &String::from_utf8_lossy(&bytes));
                 }
+            }
+            Ok(None)
+        }
+        AppEvent::PipelineStageOutputs(deltas) => {
+            for delta in deltas {
+                let text = String::from_utf8_lossy(&delta.bytes);
+                app.chat.append_pipeline_stage_output(
+                    &delta.call_id,
+                    delta.launch_id,
+                    delta.step,
+                    delta.cursor,
+                    &text,
+                );
             }
             Ok(None)
         }

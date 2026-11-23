@@ -333,6 +333,28 @@ pub struct SubagentRemovedFrame {
     pub run_id: u64,
 }
 
+/// One `pipeline.upserted` event: a pipeline new to or changed in the
+/// session's background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineUpsertedFrame {
+    /// Session the pipeline belongs to.
+    pub session_id: String,
+    /// The pipeline as it stands now.
+    pub pipeline: super::background::WirePipeline,
+}
+
+/// One `pipeline.removed` event: a pipeline gone from the session's
+/// background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineRemovedFrame {
+    /// Session the pipeline belonged to.
+    pub session_id: String,
+    /// The removed pipeline's launch id.
+    pub launch_id: u64,
+}
+
 /// One `issue.upserted` event: a linked issue new to or changed in the
 /// session's list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

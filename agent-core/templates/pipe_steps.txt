@@ -1,0 +1,4 @@
+Pipeline PID {{ pid }} ({{ status }}{% if let Some(secs) = remaining_secs %}, expires in {{ secs }}s{% endif %}):
+{% for stage in stages -%}
+[{{ stage.step }}] {{ stage.command }} — {{ stage.state }} ({{ stage.lines }} lines, {{ stage.bytes }} bytes{% if !stage.retained %}, not retained{% endif %})
+{% endfor -%}

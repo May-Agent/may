@@ -68,6 +68,25 @@ describe('extractTerminalResult', () => {
     expect(terminal?.stdout).toBeNull();
   });
 
+  test('extracts retained_pid for completed foreground pipelines and running pid for detached jobs', () => {
+    const retained = extractTerminalResult({
+      kind: 'command',
+      stdout: { kind: 'inline', text: 'tail line\n' },
+      retained_pid: 48210,
+      outcome: { status: 'exited', code: 0 },
+    });
+    expect(retained?.retainedPid).toBe(48210);
+    expect(retained?.runningPid).toBeNull();
+
+    const running = extractTerminalResult({
+      kind: 'command',
+      stdout: { kind: 'inline', text: '' },
+      outcome: { status: 'running', pid: 51200, notice: 'detached' },
+    });
+    expect(running?.runningPid).toBe(51200);
+    expect(running?.retainedPid).toBeNull();
+  });
+
   test('other result kinds are not terminal results', () => {
     expect(extractTerminalResult({ kind: 'text', text: 'x' })).toBeNull();
     expect(extractTerminalResult(null)).toBeNull();

@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUpRight,
   Check,
@@ -25,12 +25,16 @@ import type { ToolVariant } from '@/lib/types';
 import { parsePartialJson, projectField } from '@/lib/stream/partialJson';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
+import { useInspectorStore } from '@/lib/stores/inspector';
+import type { BackgroundPipeline } from '@/lib/api/background';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, terminalLocation, type OutputStream } from '@/lib/terminalResult';
 import { recognisesAny } from '@/lib/commandReading';
+import { AnsiOutput } from './AnsiOutput';
 import { CommandCardView } from './CommandCardView';
 import { CommandReadingView } from './CommandReadingView';
 import { CompactionRow } from './CompactionRow';
+import { PipelineStagesView } from './PipelineStagesView';
 import { searchFetchLabel } from '@/lib/hostedLabel';
 import { SearchRow } from './SearchRow';
 
@@ -203,14 +207,7 @@ function OutputBlock({
           {label}
         </div>
       )}
-      <pre
-        className={cn(
-          'whitespace-pre-wrap text-xs font-mono max-h-64 overflow-auto scrollbar-thin',
-          tone === 'stderr' ? 'text-destructive/90' : 'text-foreground/80',
-        )}
-      >
-        {text}
-      </pre>
+      <AnsiOutput text={text} tone={tone} />
       {fullOutputHref && (
         <a
           href={fullOutputHref}
@@ -240,14 +237,49 @@ function TerminalDetails({
   const escalated = mode === 'unsafe';
   const location = terminalLocation(tool.argumentsRaw);
   const terminal = extractTerminalResult(tool.result);
+  const targetPid = terminal?.retainedPid ?? terminal?.runningPid ?? null;
+  const trimmedScript = script.trim();
+  const livePipeline = useInspectorStore((s) => {
+    if (!sessionId || tool.variant !== 'terminal') return null;
+    const list = s.sessions[sessionId]?.background?.pipelines;
+    if (!list || list.length === 0) return null;
+    if (targetPid !== null) {
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        if (list[i].pid === targetPid) return list[i];
+      }
+      return null;
+    }
+    if (tool.status === 'streaming' && trimmedScript.length > 0) {
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        if ((list[i].script ?? '').trim() === trimmedScript) return list[i];
+      }
+    }
+    return null;
+  });
+  const [cachedPipeline, setCachedPipeline] = useState<BackgroundPipeline | null>(null);
+  if (livePipeline !== null && livePipeline !== cachedPipeline) {
+    setCachedPipeline(livePipeline);
+  }
+  const pipeline = livePipeline ?? cachedPipeline;
+  const pipelineExpired =
+    pipeline !== null &&
+    livePipeline === null &&
+    tool.status !== 'streaming';
   const scriptRedundant = script.length > 0 && firstLine(script) === primary;
   const reading = tool.summary?.reading;
-  const readingShown = recognisesAny(reading);
-  const showScript = script.length > 0 && !scriptRedundant && !readingShown;
+  const readingShown = recognisesAny(reading) && pipeline === null;
+  const showScript = script.length > 0 && !scriptRedundant && !readingShown && pipeline === null;
   const hasOutput =
     terminal !== null &&
     (terminal.stdout !== null || terminal.stderr !== null || terminal.exitCode !== null);
-  if (!showScript && !readingShown && !escalated && location === null && !hasOutput) {
+  if (
+    pipeline === null &&
+    !showScript &&
+    !readingShown &&
+    !escalated &&
+    location === null &&
+    !hasOutput
+  ) {
     return null;
   }
   const failed =
@@ -258,6 +290,14 @@ function TerminalDetails({
 
   return (
     <div className="space-y-2">
+      {pipeline !== null && (
+        <PipelineStagesView
+          sessionId={sessionId}
+          pipeline={pipeline}
+          settledText={terminal?.stdout?.text ?? null}
+          expired={pipelineExpired}
+        />
+      )}
       {readingShown && <CommandReadingView reading={reading} />}
       {showScript && (
         <ShellBlock
@@ -277,12 +317,23 @@ function TerminalDetails({
       )}
       {hasOutput && terminal && (
         <div className="space-y-2">
-          {terminal.stdout && (
+          {pipeline === null && terminal.stdout && (
             <OutputBlock
               text={terminal.stdout.text}
               fullOutputHref={hrefFor(terminal.stdout)}
               label={terminal.stderr !== null ? 'stdout' : undefined}
             />
+          )}
+          {pipeline !== null && terminal.stdout && hrefFor(terminal.stdout) && (
+            <a
+              href={hrefFor(terminal.stdout)}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              {t('tools.viewFullOutput')}
+              <ArrowUpRight className="size-3" />
+            </a>
           )}
           {terminal.stderr && (
             <OutputBlock
