@@ -1,1 +1,0 @@
-The remote of {{ owner_repo }} cannot be reached from the checkout {{ checkout }}{% if dirty %}, which has uncommitted changes{% endif %}, so whether the checkout is current is unknown. How should the session start?

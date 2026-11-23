@@ -89,7 +89,11 @@ fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
         ),
         (
             "pid",
-            "The process ID returned when the command was backgrounded.",
+            "The process ID returned when the command was backgrounded or retained pipeline stages.",
+        ),
+        (
+            "step",
+            "Zero-based pipeline stage index to read when inspecting a specific stage of a running or retained pipeline. Omitted, reads the job's overall output.",
         ),
         (
             "cursor",

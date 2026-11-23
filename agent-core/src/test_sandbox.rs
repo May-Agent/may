@@ -125,6 +125,7 @@ impl TestTerminal {
             policies: may_command_policy::PolicySet {
                 managed_bash: may_command_policy::runs_managed_bash(false),
                 refused: may_command_policy::RefusedReads::default(),
+                read_epochs: may_command_policy::FileReadEpochs::default(),
                 checkout_reads: None,
             },
             slot: may_harness::ipc::ShellSlot::new(),

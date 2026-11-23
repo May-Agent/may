@@ -190,6 +190,8 @@ impl ShellWording for MayShellWording {
                     | CallRefusal::InterpreterNotConfigured { .. }
                     | CallRefusal::TimeoutOutOfRange { .. }
                     | CallRefusal::UnknownJob { .. }
+                    | CallRefusal::ExpiredJob { .. }
+                    | CallRefusal::InvalidPipelineStep { .. }
                     | CallRefusal::ZeroMaxBytes
                     | CallRefusal::NoStdin { .. }
             ),

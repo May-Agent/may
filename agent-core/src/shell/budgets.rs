@@ -31,6 +31,8 @@ impl ShellBudgets {
                 long_job_alert: LiveDuration::new(settings.long_job_alert),
                 subagent_import: ImportBudget::new(settings.subagent_import_bytes),
                 response_window: ResponseWindow::new(settings.response_window),
+                pipeline_record_after: LiveDuration::new(settings.pipeline_record_after),
+                pipeline_retention: LiveDuration::new(settings.pipeline_retention),
             },
             output: OutputPolicy::new(Self::output_limits(settings)),
             monitor_max_timeout: LiveDuration::new(settings.monitor_max_timeout),
@@ -65,6 +67,12 @@ impl ShellBudgets {
             .subagent_import
             .set(settings.subagent_import_bytes);
         self.limits.response_window.set(settings.response_window);
+        self.limits
+            .pipeline_record_after
+            .set(settings.pipeline_record_after);
+        self.limits
+            .pipeline_retention
+            .set(settings.pipeline_retention);
         self.output.set(Self::output_limits(settings));
         self.monitor_max_timeout.set(settings.monitor_max_timeout);
         self.monitor_default_interval
@@ -113,10 +121,14 @@ mod tests {
         let changed = ShellSettings {
             timeout_cap: Duration::from_secs(60),
             default_lines: 50,
+            pipeline_record_after: Duration::from_secs(5),
+            pipeline_retention: Duration::from_mins(20),
             ..ShellSettings::default()
         };
         budgets.apply(&changed);
         assert_eq!(held.timeout_cap.get(), Duration::from_secs(60));
+        assert_eq!(held.pipeline_record_after.get(), Duration::from_secs(5));
+        assert_eq!(held.pipeline_retention.get(), Duration::from_mins(20));
         assert_eq!(output.lines(None), 50);
     }
 }

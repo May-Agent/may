@@ -23,8 +23,6 @@ pub mod crash_signal;
 pub mod grok;
 /// MCP server configuration, connections, and management.
 pub mod mcp;
-/// The preflight checks a repository clone runs against.
-pub mod repo_preflight;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
 /// Self-update from CI artifacts (dev builds) or GitHub releases.
@@ -43,7 +41,7 @@ pub use may_protocol::id;
 pub use may_protocol::log_ring;
 pub use may_protocol::model_slot;
 
-/// The `ask_user` broker the preflight questions go through.
+/// The `ask_user` broker questions go through.
 pub use harness::ask_user;
 /// The workspace-request broker.
 pub use harness::workspace_request;

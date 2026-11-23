@@ -845,16 +845,18 @@ pub async fn probe_agent(
     let answer = tokio::time::timeout(limit, probe_with(&launch, services))
         .await
         .map_err(|_| ProbeError::TimedOut(limit))??;
-    let info = answer.agent_info.unwrap_or_default();
+    let info = answer.info;
     Ok(AgentIdentity {
-        name: info.title.unwrap_or_else(|| {
-            if info.name.is_empty() {
-                command.to_string()
-            } else {
-                info.name
-            }
-        }),
-        version: info.version,
+        name: info
+            .as_ref()
+            .and_then(|impl_info| impl_info.title.clone())
+            .or_else(|| {
+                info.as_ref()
+                    .filter(|impl_info| !impl_info.name.is_empty())
+                    .map(|impl_info| impl_info.name.clone())
+            })
+            .unwrap_or_else(|| command.to_string()),
+        version: info.map_or_default(|impl_info| impl_info.version),
     })
 }
 
@@ -897,8 +899,8 @@ mod tests {
         AcpAgentConfig {
             command: "python3".to_string(),
             args: vec![
-                fixtures_dir()
-                    .join("fake_acp_agent.py")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tests/fixtures/fake_acp_agent.py")
                     .to_string_lossy()
                     .into_owned(),
             ],
@@ -911,10 +913,7 @@ mod tests {
     }
 
     fn fixtures_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .join("tests/fixtures")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures")
     }
 
     /// A sandbox rooted in `root` that reads the fake agent's script and the

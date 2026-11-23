@@ -103,7 +103,6 @@ pub mod prompt_mentions;
 pub use may_client::repo_clone;
 pub use may_protocol::quota;
 pub mod repo_gate;
-pub use may_harness::repo_preflight;
 /// repo-search daemon: code, session and issue search.
 pub use may_repo_search as repo_search;
 /// `/import-claude` and `/import-codex`: another agent's global rules and

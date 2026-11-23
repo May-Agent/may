@@ -976,6 +976,7 @@ mod tests {
                 text: "bad hunter2-correct-horse".to_string(),
             }),
             outcome: CommandOutcome::Exited { code: 0 },
+            retained_pid: None,
             interruptions: Vec::new(),
         }));
         redactions.redact_tool_result(&mut result);

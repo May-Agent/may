@@ -74,7 +74,7 @@ pub enum ExecError {
     #[error("ssh server '{0}' is not attached to the session's profile")]
     SshServerNotAttached(String),
     #[error("terminal execution failed: {0}")]
-    TerminalCall(aither_core::Error),
+    TerminalCall(anyhow::Error),
     #[error("failed to build the shell: {0}")]
     BuildShell(may_agent::shell::ShellAssemblyError),
     #[error("failed to write stdout: {0}")]
@@ -143,7 +143,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
             background: true,
         })
         .await
-        .map_err(ExecError::TerminalCall)?;
+        .map_err(|error| ExecError::TerminalCall(anyhow::Error::msg(error)))?;
     let pid = job.pid();
     let result = job
         .wait()
@@ -468,6 +468,7 @@ async fn build_exec_shell(
                 may_agent::AgentEnvironment::Container { .. }
             )),
             refused: may_agent::command_policy::RefusedReads::default(),
+            read_epochs: may_agent::command_policy::FileReadEpochs::default(),
             checkout_reads: None,
         },
         slot: ShellSlot::new(),

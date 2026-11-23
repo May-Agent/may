@@ -151,12 +151,13 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
 
     type Arguments = AskArgs;
     type Res = ToolResult;
+    type Error = LLM::Error;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         if args.input.is_empty() {
             return Ok(ToolResult::text("No input provided. Pipe content to ask."));
         }
@@ -177,7 +178,7 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
         futures_lite::pin!(response);
         let mut result = String::new();
         while let Some(event) = response.next().await {
-            let event = event.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let event = event?;
             if let Event::Text(text) = event {
                 result.push_str(&text);
             }

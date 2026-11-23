@@ -335,6 +335,8 @@ pub async fn start(
         tcp_listeners: super::TcpListeners::new(),
         cloud_sessions,
         cloud_home_bridge,
+        swarm_mirrors: super::swarm_peers::SwarmMirrorState::default(),
+        buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::default(),
         pushed_providers,
         sleep: Arc::new(crate::sleep::SleepState::load(
             &may_dir,
@@ -388,7 +390,8 @@ pub async fn start(
         super::chat::agent_messaging(&state),
         state.may_dir.clone(),
         state.config.clone(),
-    );
+    )
+    .with_transport(super::swarm_peers::DaemonSwarmTransport::new(state.clone()));
     state.services.set_swarm(swarm.clone());
     if let Err(error) = swarm.reconcile().await {
         tracing::warn!(%error, "failed initial swarm board reconciliation");
@@ -551,6 +554,11 @@ fn api_routes() -> Route {
                 "/agents".at(super::peers::get_peer_agents),
                 "/agents/{id}/messages".post(super::peers::post_peer_message),
                 "/agents/{id}/btw".post(super::peers::post_peer_btw),
+                "/swarm/state".at(super::swarm_peers::get_peer_swarm_state),
+                "/swarm/read".post(super::swarm_peers::post_peer_swarm_read),
+                "/swarm/post".post(super::swarm_peers::post_peer_swarm_post),
+                "/swarm/pr".post(super::swarm_peers::post_peer_swarm_pr),
+                "/swarm/deliver".post(super::swarm_peers::post_peer_swarm_deliver),
             ))),
             "/sessions".route(Route::new((
                 "".at(list_sessions),
@@ -1132,10 +1140,22 @@ fn spawn_swarm_reconciler(state: &DaemonState, swarm: crate::swarm::SwarmService
     tokio::spawn(async move {
         let relevant = UiEventTopics::PROFILE_SESSIONS
             | UiEventTopics::SESSION_RUNTIMES
+            | UiEventTopics::REMOTE_ACCESS
+            | UiEventTopics::CLOUD_SESSION
             | UiEventTopics::CONFIG;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = tick.tick().await;
         loop {
             tokio::select! {
                 () = shutdown.notified() => break,
+                _ = tick.tick() => {
+                    if swarm.is_enabled()
+                        && let Err(error) = swarm.reconcile().await
+                    {
+                        tracing::warn!(%error, "periodic swarm reconciliation failed");
+                    }
+                }
                 received = rx.recv() => match received {
                     Ok(topics) if topics.intersects(relevant) => {
                         if let Err(error) = swarm.reconcile().await {

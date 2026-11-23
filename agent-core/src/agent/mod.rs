@@ -46,6 +46,7 @@ pub mod notices;
 #[cfg(test)]
 mod open_questions_tests;
 pub mod permission;
+pub mod pipe_tool;
 pub mod pr_tool;
 #[cfg(test)]
 mod prompt_layout_tests;

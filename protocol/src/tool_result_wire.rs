@@ -84,6 +84,8 @@ pub struct WireCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stderr: Option<WireStream>,
     outcome: CommandOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     interruptions: Vec<Interruption>,
 }
@@ -142,6 +144,7 @@ impl From<&ToolResult> for WireToolResult {
                 stdout: WireStream::from(&command.stdout),
                 stderr: command.stderr.as_ref().map(WireStream::from),
                 outcome: command.outcome.clone(),
+                retained_pid: command.retained_pid,
                 interruptions: command.interruptions.clone(),
             })),
             ToolResult::Parts { parts } => Self::Parts {
@@ -163,6 +166,7 @@ impl From<WireToolResult> for ToolResult {
                 stdout: command.stdout.into(),
                 stderr: command.stderr.map(Into::into),
                 outcome: command.outcome,
+                retained_pid: command.retained_pid,
                 interruptions: command.interruptions,
             })),
             WireToolResult::Parts { parts } => Self::Parts { parts },
@@ -197,6 +201,7 @@ mod tests {
             stdout,
             stderr,
             outcome: CommandOutcome::Exited { code: 3 },
+            retained_pid: None,
             interruptions: Vec::new(),
         }))
     }
@@ -257,6 +262,15 @@ mod tests {
                 },
                 None,
             ),
+            ToolResult::Command(Box::new(CommandResult {
+                stdout: CommandStream::Inline {
+                    text: "filtered\n".to_string(),
+                },
+                stderr: None,
+                outcome: CommandOutcome::Exited { code: 0 },
+                retained_pid: Some(4242),
+                interruptions: Vec::new(),
+            })),
             ToolResult::parts(vec![
                 ToolResultPart::text("shot"),
                 ToolResultPart::image(vec![9], "image/jpeg"),

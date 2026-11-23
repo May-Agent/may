@@ -153,6 +153,12 @@ impl BoardTool {
     }
 }
 
+/// A `board` call failed: the swarm service, the session db or the agent
+/// link could not complete the read or post.
+#[derive(Debug, thiserror::Error)]
+#[error("board call failed: {0}")]
+pub struct BoardCallError(String);
+
 impl Tool for BoardTool {
     fn name(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("board")
@@ -160,13 +166,14 @@ impl Tool for BoardTool {
 
     type Arguments = BoardArgs;
     type Res = ToolResult;
+    type Error = BoardCallError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
-        self.execute(args).await.map_err(aither_core::Error::msg)
+    ) -> Result<Self::Res, Self::Error> {
+        self.execute(args).await.map_err(BoardCallError)
     }
 }
 

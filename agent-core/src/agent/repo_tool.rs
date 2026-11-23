@@ -274,8 +274,9 @@ impl Tool for RepoTool {
 
     type Arguments = RepoArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         Ok(ToolResult::text(match args {
             RepoArgs::Clone { path, new } => {
                 clone_repository(
@@ -345,8 +346,9 @@ impl Tool for SubagentRepoTool {
 
     type Arguments = RepoArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         Ok(ToolResult::text(match args {
             RepoArgs::Trust { set: Some(_) } => "trust decisions are the main agent's".to_string(),
             RepoArgs::Clone { .. } => {

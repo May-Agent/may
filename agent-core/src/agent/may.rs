@@ -36,7 +36,7 @@ use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
-use crate::command_policy::PolicySet;
+use crate::command_policy::{FileReadEpochs, PolicySet};
 use crate::config::MayConfig;
 use crate::db::{ChatDb, RunFence};
 use crate::harness::compact_tool::CompactSignal;
@@ -430,6 +430,9 @@ pub struct MayAgent {
     /// The facts the session's shells raise about their jobs, which the idle
     /// agent waits on.
     job_events: super::job_events::SessionJobBridge,
+    /// Earlier shells' job registries kept for `pipe` while retained stages
+    /// remain within their retention window.
+    prior_jobs: super::pipe_tool::PriorJobs,
     tools: ToolEnvironments,
     environment: AgentEnvironment,
     /// Where a fact of a main-agent job is told to the clients that show it.
@@ -488,6 +491,10 @@ pub struct MayAgent {
     loops: LoopWatch,
     /// Hands the window's measure to the `compact` valve and the warning.
     watch: RunWatch,
+    /// Path of this agent in the run tree, for invalidating unchanged-read stamps.
+    agent_path: AgentPath,
+    /// Shared per-agent unchanged-read epoch table.
+    read_epochs: FileReadEpochs,
     /// Where the calls whose exchanges a compaction keeps are reported.
     kept_exchanges: KeptExchangeReceiver,
     /// The calls reported since the last compaction, whose exchanges the
@@ -721,6 +728,7 @@ impl MayAgent {
             .map_or_else(crate::command_policy::RefusedReads::default, |runtime| {
                 runtime.refused_reads()
             });
+        let read_epochs = FileReadEpochs::default();
         let budgets = config.limits.shell();
         let assembly = ShellAssembly {
             tools: tools.clone(),
@@ -768,6 +776,7 @@ impl MayAgent {
             policies: PolicySet {
                 managed_bash: crate::command_policy::runs_managed_bash(is_container),
                 refused: refused_reads.clone(),
+                read_epochs: read_epochs.clone(),
                 checkout_reads: Some(crate::command_policy::CheckoutReadTracker {
                     checkouts: crate::command_policy::AnyCheckoutRegistry::new(
                         config.services.checkouts.clone(),
@@ -1120,7 +1129,10 @@ impl MayAgent {
             .map_or_else(WorkEvents::new, |runtime| {
                 runtime.task_events(config.session_id.as_str())
             });
-        let toolkit = ShellToolkit::of(&budgets);
+        let skill_registry = load_skill_registry(&skills_dir).await;
+        let toolkit = ShellToolkit::of(&budgets)
+            .with_skill_registry(skill_registry)
+            .with_read_epochs(read_epochs.clone());
         let cache_lifetime: aither_agent::context::CacheLifetime = config.cache_lifetime.into();
         let keep_alive = matches!(
             config.cache_lifetime,
@@ -1195,6 +1207,7 @@ impl MayAgent {
 
         // The command table, the capabilities and the efficiency rules are
         // rendered from the commands registered above.
+        let prior_jobs = shared_terminal_commands.prior_jobs.clone();
         let command_descriptions = shared_terminal_commands.descriptions.clone();
         let core_commands = shared_terminal_commands.usages.clone();
         let capabilities = build_capabilities(
@@ -1417,12 +1430,14 @@ impl MayAgent {
         let native_tools = builder.tool_definitions();
         let mut agent = builder.build();
         runtime_system_context.reconcile(agent.context_mut());
+        let agent_path = AgentPath::of(agent.identity());
         let watch = RunWatch::new(
-            AgentPath::of(agent.identity()),
+            agent_path.clone(),
             gauge,
             watch_valve,
             config.context_policy.compaction_floor,
-        );
+        )
+        .with_read_epochs(read_epochs.clone());
 
         let named_commands = command_descriptions
             .iter()
@@ -1433,6 +1448,7 @@ impl MayAgent {
             inner: agent,
             sandbox_dir: shell.working_dir().clone(),
             job_events: job_bridge,
+            prior_jobs,
             tools,
             environment: config.environment,
             job_facts_tx,
@@ -1467,6 +1483,8 @@ impl MayAgent {
             compaction_requested,
             loops,
             watch,
+            agent_path,
+            read_epochs,
             kept_exchanges,
             kept_calls: Vec::new(),
             _fork_registration: fork_registration,
@@ -1810,10 +1828,12 @@ impl MayAgent {
     pub fn attach_session_job_hooks(
         &mut self,
         prior_events: Vec<ShellEvents>,
+        prior_jobs: Vec<aither_sandbox::Jobs>,
         hooks: super::job_events::SessionJobHooks,
         restored_alerts: Vec<String>,
     ) {
         self.job_events.configure(prior_events, hooks);
+        self.prior_jobs.set(prior_jobs);
         for alert in restored_alerts {
             self.inner
                 .context_mut()
@@ -2294,6 +2314,7 @@ impl MayAgent {
         checkpoint: aither_agent::AgentCheckpoint,
     ) -> Result<(), AgentError> {
         self.inner.restore_checkpoint(checkpoint)?;
+        self.read_epochs.bump(&self.agent_path);
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
         Ok(())
@@ -2302,6 +2323,7 @@ impl MayAgent {
     /// Clear conversation history.
     pub fn clear_history(&mut self) {
         self.inner.clear_history();
+        self.read_epochs.bump(&self.agent_path);
     }
 
     /// Synchronizes the sleep source's seen state after restoring a warm
@@ -2461,6 +2483,8 @@ impl MayAgent {
             &self.skills_dir,
             &self.readonly_checkouts,
         );
+        self.inner
+            .set_restore_roots(crate::shell::shell_restore_roots(&self.shell));
         if !matches!(self.environment, AgentEnvironment::Container { .. }) {
             self.runtime_system_context
                 .set_workdirs(build_workspace_workdirs_context(&workspace));
@@ -2677,6 +2701,25 @@ pub struct TurnSyncInput<'a> {
     pub cwd: &'a Path,
     /// The session's configured SSH servers.
     pub ssh_servers: &'a [crate::config::SshServerConfig],
+}
+
+async fn load_skill_registry(skills_dir: &Path) -> Option<Arc<aither_skills::SkillRegistry>> {
+    if async_fs::metadata(skills_dir).await.is_err() {
+        return None;
+    }
+    let loader = aither_skills::SkillLoader::new().add_path(skills_dir);
+    let mut registry = aither_skills::SkillRegistry::new();
+    match registry.load_from(&loader).await {
+        Ok(_) => Some(Arc::new(registry)),
+        Err(error) => {
+            tracing::warn!(
+                skills_dir = %skills_dir.display(),
+                %error,
+                "failed to load skill registry for post-compaction restoration"
+            );
+            None
+        }
+    }
 }
 
 fn profile_skills_dir(may_dir: &Path, profile_id: Option<&str>) -> PathBuf {

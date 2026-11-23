@@ -54,8 +54,9 @@ where
 
     type Arguments = ExploreArgs;
     type Res = ToolResult;
+    type Error = T::Error;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         let call = SubagentArgs {
             name: EXPLORE.to_string(),
             prompt_file: args.prompt_file,

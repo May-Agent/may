@@ -129,7 +129,7 @@ impl SwarmFixture {
                 at,
                 usage: &usage,
                 prefix: aither_agent::context::PromptPrefix {
-                    chain: aither_agent::context::PrefixChain::of(&[], &[]),
+                    chain: aither_agent::context::PrefixChain::of(&[], &[], false),
                     rewrites: aither_agent::context::PrefixRewrites::default(),
                     first_request: true,
                 },
@@ -541,5 +541,49 @@ async fn pr_events_filter_by_repo_key_include_files_and_clean_up_on_dissolve() {
         summary.queued_messages.is_empty(),
         "stale PR board-notice dropped on dissolve: {:?}",
         summary.queued_messages
+    );
+}
+
+#[tokio::test]
+async fn forge_bound_worktrees_group_together_while_local_paths_stay_machine_scoped() {
+    let fx = SwarmFixture::new(true).await;
+    let wt_a = fx.may_dir.join("wt-a");
+    let wt_b = fx.may_dir.join("wt-b");
+    std::fs::create_dir_all(&wt_a).unwrap();
+    std::fs::create_dir_all(&wt_b).unwrap();
+
+    fx.create_session("s1", "Worktree A", &wt_a, true).await;
+    fx.create_session("s2", "Worktree B", &wt_b, true).await;
+    fx.db
+        .set_session_repo("s1", Some("github:May-Agent/may"))
+        .await
+        .unwrap();
+    fx.db
+        .set_session_repo("s2", Some("github:May-Agent/may"))
+        .await
+        .unwrap();
+
+    fx.swarm.reconcile().await.unwrap();
+    let b1 = fx
+        .swarm
+        .active_board_for("s1")
+        .expect("forge-bound worktrees join one swarm");
+    let b2 = fx.swarm.active_board_for("s2").expect("s2 in same swarm");
+    assert_eq!(b1.workdir, "github:May-Agent/may");
+    assert_eq!(b2.workdir, "github:May-Agent/may");
+    assert_eq!(b1.members.len(), 2);
+
+    // Election prefers non-cloud daemons lexicographically and keeps `<machine>:<path>` isolated.
+    assert_eq!(
+        super::elect_board_host("github:May-Agent/may", ["cloud", "macbook", "mac-mini"]),
+        Some("mac-mini".to_string())
+    );
+    assert_eq!(
+        super::elect_board_host("github:May-Agent/may", ["cloud", "macbook"]),
+        Some("macbook".to_string())
+    );
+    assert_eq!(
+        super::elect_board_host("macbook:/tmp/demo", ["mac-mini", "macbook"]),
+        Some("macbook".to_string())
     );
 }

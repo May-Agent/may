@@ -268,6 +268,50 @@ impl HostGit {
             }),
         }
     }
+
+    /// All host configuration entries matching `pattern`, read in a single
+    /// `git config --get-regexp --null` invocation (last definition wins).
+    ///
+    /// # Errors
+    /// Fails when git cannot read its configuration.
+    pub fn config_regexp(
+        &self,
+        pattern: &str,
+    ) -> Result<std::collections::HashMap<String, String>, HostGitError> {
+        let output = self
+            .command()
+            .args(["config", "--get-regexp", "--null", pattern])
+            .output()?;
+        match output.status.code() {
+            Some(0) => {
+                let mut entries = std::collections::HashMap::new();
+                for record in output.stdout.split(|&b| b == 0) {
+                    if record.is_empty() {
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(record);
+                    let (key, value) = text.split_once('\n').unwrap_or_else(|| (text.as_ref(), ""));
+                    entries.insert(key.to_ascii_lowercase(), value.trim().to_string());
+                }
+                Ok(entries)
+            }
+            Some(1) => Ok(std::collections::HashMap::new()),
+            _ => Err(HostGitError::Failed {
+                args: format!("config --get-regexp --null {pattern}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+}
+
+/// Parses a git boolean literal (`true`/`yes`/`on`/`1` vs `false`/`no`/`off`/`0`).
+#[must_use]
+pub fn parse_git_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" | "" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +405,45 @@ mod tests {
         let rendered = format!("{auth:?}");
         assert!(rendered.contains("https://gitlab.com/"), "{rendered}");
         assert!(!rendered.contains(TOKEN), "{rendered}");
+    }
+
+    #[test]
+    fn parse_git_bool_covers_standard_literals() {
+        for truthy in ["true", "YES", "On", "1", ""] {
+            assert_eq!(parse_git_bool(truthy), Some(true), "{truthy}");
+        }
+        for falsy in ["false", "NO", "off", "0"] {
+            assert_eq!(parse_git_bool(falsy), Some(false), "{falsy}");
+        }
+        assert_eq!(parse_git_bool("maybe"), None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous temp file creation in unit test"
+    )]
+    fn config_regexp_reads_multiple_keys_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let gitconfig = dir.path().join("gitconfig");
+        std::fs::write(
+            &gitconfig,
+            "[user]\n\tname = Alice\n\temail = alice@example.com\n[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n",
+        )
+        .unwrap();
+        let git = HostGit::from_file(&gitconfig);
+        let entries = git
+            .config_regexp(r"^(user\.(name|email)|commit\.gpgsign|gpg\.format)$")
+            .unwrap();
+        assert_eq!(entries.get("user.name").map(String::as_str), Some("Alice"));
+        assert_eq!(
+            entries.get("user.email").map(String::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            entries.get("commit.gpgsign").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(entries.get("gpg.format").map(String::as_str), Some("ssh"));
     }
 }
