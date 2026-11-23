@@ -672,6 +672,9 @@ pub async fn create_session(
     let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
     session.repo = resolved_repo;
     session.location = location;
+    if req.cloud.is_none() {
+        state.session_prewarms.spawn(&state, &session.id);
+    }
     Ok(Json(session))
 }
 
@@ -823,6 +826,7 @@ pub async fn delete_session(
         .await
         .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
+    state.session_prewarms.cancel(&id);
     state.parked_agents.evict(&id);
     // After the eviction, whose dropped agent sessions start closing: the
     // host waits for those closes before it ends the rest and removes the
@@ -1122,6 +1126,7 @@ pub async fn patch_session(
         {
             if archived {
                 db.archive_session(&id).await.map_err(internal_error)?;
+                state.session_prewarms.cancel(&id);
                 state.parked_agents.evict(&id);
             } else {
                 db.unarchive_session(&id).await.map_err(internal_error)?;

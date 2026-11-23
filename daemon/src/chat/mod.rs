@@ -14,7 +14,7 @@ pub use background::{
     cancel_subagent, cancel_subagents, get_background, get_job, kill_job, read_job,
 };
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub use hosts::{ParkedAgents, context_report, usage_report};
+pub use hosts::{ParkedAgents, SessionPrewarms, context_report, usage_report};
 pub use hub::TurnHub;
 pub use may_protocol::progress::ProgressReport;
 pub use may_protocol::recap::RecapRecord;
@@ -2659,7 +2659,7 @@ fn run_agent_loop_attempts<'a>(
                 first_visible_tool_seen: false,
                 first_text_seen: false,
             };
-            agent.sync_runtime_context().await;
+            agent.sync_runtime_context_for_turn().await;
             let stopped = drive_turn(
                 &mut turn,
                 &mut agent,
@@ -3707,8 +3707,6 @@ pub enum UiChatPreparationError {
     BuildPrompt(skyzen::Error),
     #[error("failed to preview request messages: {0}")]
     PreviewRequest(#[source] aither_agent::AgentError),
-    #[error("failed to persist context debug snapshot: {0}")]
-    PersistContextDebugSnapshot(#[source] crate::db::ChatDbError),
     #[error("failed to bind the session to its repository: {0}")]
     RepoGate(#[source] crate::repo_gate::GateError),
 }
@@ -3804,7 +3802,6 @@ impl UiChatPreparationError {
             | Self::RestoreCheckpoint(_)
             | Self::BuildPrompt(_)
             | Self::PreviewRequest(_)
-            | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_)
             | Self::RepoGate(_)
             | Self::NothingToResume => ApiErrorCode::InternalError,
@@ -3890,14 +3887,41 @@ pub async fn resolve_session_context(
         .pending_transcripts
         .flush_session(&db, session_id.as_str())
         .await;
-    let session = db
-        .get_session(session_id.as_str())
-        .await
-        .map_err(UiChatPreparationError::LoadSession)?
-        .ok_or_else(|| UiChatPreparationError::SessionNotFound(session_id.clone()))?;
-    let mut history = crate::session::load_history_from_db(&db, session_id.as_str())
-        .await
-        .map_err(UiChatPreparationError::LoadHistory)?;
+    let (session_row, mut history, runtime_opt, raw_transcript, raw_snapshot) =
+        futures_util::future::try_join5(
+            async {
+                db.get_session(session_id.as_str())
+                    .await
+                    .map_err(UiChatPreparationError::LoadSession)
+            },
+            async {
+                crate::session::load_history_from_db(&db, session_id.as_str())
+                    .await
+                    .map_err(UiChatPreparationError::LoadHistory)
+            },
+            async {
+                db.get_session_runtime(session_id.as_str())
+                    .await
+                    .map_err(UiChatPreparationError::LoadRuntime)
+            },
+            async {
+                db.transcript_entries_after(session_id.as_str(), -1)
+                    .await
+                    .map_err(UiChatPreparationError::LoadContextSnapshot)
+            },
+            async {
+                if use_persisted_context_snapshot {
+                    db.get_session_context_snapshot(session_id.as_str())
+                        .await
+                        .map_err(UiChatPreparationError::LoadContextSnapshot)
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .await?;
+    let session =
+        session_row.ok_or_else(|| UiChatPreparationError::SessionNotFound(session_id.clone()))?;
     if let Some(boundary) = turn_boundary {
         // A resubmitted prompt attempt rebuilds context from before the
         // turn: its own rows were persisted by attempt 0 and the prompt
@@ -3923,12 +3947,31 @@ pub async fn resolve_session_context(
     }
     drop(cfg);
 
-    let profile_model = if let Some(profile_id) = session.profile_id.clone() {
-        db.get_profile(&profile_id)
-            .await
-            .map_err(UiChatPreparationError::LoadProfile)?
+    let runtime = runtime_opt.unwrap_or_default();
+    let memory_off = runtime.memory_off || session.non_interactive;
+
+    let (profile_model, profile_memories) = if let Some(profile_id) = session.profile_id.clone() {
+        let (profile_res, memories_res) = futures_util::future::join(
+            async {
+                db.get_profile(&profile_id)
+                    .await
+                    .map_err(UiChatPreparationError::LoadProfile)
+            },
+            async {
+                if memory_off {
+                    Ok::<_, UiChatPreparationError>(None)
+                } else {
+                    let memories = crate::memory::ProfileMemories::load(&db, &profile_id)
+                        .await
+                        .map_err(UiChatPreparationError::LoadProfileMemories)?;
+                    Ok((!memories.is_empty()).then_some(memories))
+                }
+            },
+        )
+        .await;
+        (profile_res?, memories_res?)
     } else {
-        None
+        (None, None)
     };
     let profile_persona = profile_model.as_ref().and_then(|p| p.persona.clone());
     let profile_environment = match profile_model.clone() {
@@ -3942,34 +3985,8 @@ pub async fn resolve_session_context(
         None => None,
     };
 
-    let runtime = db
-        .get_session_runtime(session_id.as_str())
-        .await
-        .map_err(UiChatPreparationError::LoadRuntime)?
-        .unwrap_or_default();
-    let memory_off = runtime.memory_off || session.non_interactive;
-
-    let profile_memories = if memory_off {
-        None
-    } else if let Some(ref profile) = profile_model {
-        let memories = crate::memory::ProfileMemories::load(&db, &profile.id)
-            .await
-            .map_err(UiChatPreparationError::LoadProfileMemories)?;
-        if memories.is_empty() {
-            None
-        } else {
-            Some(memories)
-        }
-    } else {
-        None
-    };
-
     let mut transcript = Vec::<(i64, LlmMessage)>::new();
-    for entry in db
-        .transcript_entries_after(session_id.as_str(), -1)
-        .await
-        .map_err(UiChatPreparationError::LoadContextSnapshot)?
-    {
+    for entry in raw_transcript {
         let message: LlmMessage = rmp_serde::from_slice(&entry.message_blob).map_err(|error| {
             UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(format!(
                 "failed to decode transcript entry {}: {error}",
@@ -3989,14 +4006,7 @@ pub async fn resolve_session_context(
     } else {
         Vec::new()
     };
-    let context_snapshot = if use_persisted_context_snapshot {
-        db.get_session_context_snapshot(session_id.as_str())
-            .await
-            .map_err(UiChatPreparationError::LoadContextSnapshot)?
-            .map(crate::session::parse_persisted_context_snapshot)
-    } else {
-        None
-    };
+    let context_snapshot = raw_snapshot.map(crate::session::parse_persisted_context_snapshot);
     // `history` holds the rows stored before this turn's own: a user message
     // the previous run stored but never checkpointed is among them.
     let uncheckpointed_input = match context_snapshot.as_ref() {
@@ -4689,6 +4699,36 @@ struct TurnAttempt {
     retained_agent: Option<MayAgent>,
 }
 
+/// Pre-warms `session_id`'s [`MayAgent`] in the background right after
+/// session creation so the first user turn can reuse it immediately.
+async fn prewarm_session_agent(state: &Arc<DaemonState>, session_id: &str) -> Option<MayAgent> {
+    if let Err(error) = gate_session_repo(state, session_id).await {
+        tracing::debug!(%session_id, %error, "session pre-warm repo gate skipped");
+        return None;
+    }
+    let req = ChatRequest {
+        session_id: session_id.to_string(),
+        content: String::new(),
+        attachments: Vec::new(),
+        hidden_context_xml: None,
+        delivery_mode: crate::session::PendingUserMessageMode::default(),
+        pending_entry_id: None,
+    };
+    let fence = RunFence {
+        session_id: session_id.to_string(),
+        run_id: String::new(),
+    };
+    let ctx = Box::pin(resolve_session_context(
+        state, &req, &fence, false, false, None,
+    ))
+    .await
+    .ok()?;
+    let config = state.config_snapshot();
+    Box::pin(build_session_agent(state, &config, &ctx, &fence, 0))
+        .await
+        .ok()
+}
+
 /// Resolves the session context and builds the agent for one chat turn.
 ///
 /// Built on the heap for the reason given on [`run_agent_loop`].
@@ -4702,44 +4742,54 @@ fn prepare_agent_for_request<'a>(
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
-        if !kind.is_resume() {
-            gate_session_repo(state, &req.session_id).await?;
-        }
-        let ctx = Box::pin(resolve_session_context(
-            state,
-            req,
-            fence,
-            persist_user_message,
-            use_persisted_context_snapshot,
-            attempt.turn_boundary,
-        ))
-        .await?;
+        let take_prewarm = attempt.retained_agent.is_none() && attempt.provider_attempt == 0;
+        let (prewarmed_agent, ctx_res) = futures_util::join!(
+            async {
+                if take_prewarm {
+                    state.session_prewarms.take(&req.session_id).await
+                } else {
+                    None
+                }
+            },
+            async {
+                if !kind.is_resume() {
+                    gate_session_repo(state, &req.session_id).await?;
+                }
+                Box::pin(resolve_session_context(
+                    state,
+                    req,
+                    fence,
+                    persist_user_message,
+                    use_persisted_context_snapshot,
+                    attempt.turn_boundary,
+                ))
+                .await
+            },
+        );
+        let ctx = ctx_res?;
         let config = state.config_snapshot();
         let wants_container = matches!(
             ctx.profile_environment.as_ref(),
             Some(crate::profile::ProfileEnvironment::Container { .. })
         );
-        let reused = if let Some(agent) = attempt.retained_agent {
+        let reused = if let Some(agent) = attempt.retained_agent.or(prewarmed_agent) {
             Some(agent)
         } else if attempt.provider_attempt == 0 {
-            state
-                .parked_agents
-                .take(ctx.session_id.as_str())
-                .await
-                .filter(|agent| {
-                    let is_container = matches!(
-                        agent.environment(),
-                        crate::agent::AgentEnvironment::Container { .. }
-                    );
-                    // Moving the home environment between host and container
-                    // cannot apply in place, so wait until the cache goes cold.
-                    !(!kind.is_resume()
-                        && wants_container != is_container
-                        && !agent.cache_warmth().is_warm())
-                })
+            state.parked_agents.take(ctx.session_id.as_str()).await
         } else {
             None
-        };
+        }
+        .filter(|agent| {
+            let is_container = matches!(
+                agent.environment(),
+                crate::agent::AgentEnvironment::Container { .. }
+            );
+            // Moving the home environment between host and container
+            // cannot apply in place, so wait until the cache goes cold.
+            !(!kind.is_resume()
+                && wants_container != is_container
+                && !agent.cache_warmth().is_warm())
+        });
         let mut agent = match reused {
             Some(mut agent) => {
                 let ssh_servers = crate::profile::resolve_attached_ssh_servers(
@@ -4812,20 +4862,32 @@ fn prepare_agent_for_request<'a>(
                 )
                 .await
                 .map_err(UiChatPreparationError::PreviewRequest)?;
-            if let Err(error) = persist_context_debug_snapshot(
-                state,
-                &ctx.session_id,
-                &ctx.current_model,
-                &provider_id,
-                &prompt,
-                &attachments,
-                &preview_messages,
-            )
-            .await
-                && !error.is_disk_exhausted()
-            {
-                return Err(UiChatPreparationError::PersistContextDebugSnapshot(error));
-            }
+            let bg_state = Arc::clone(state);
+            let bg_session_id = ctx.session_id.clone();
+            let bg_model = ctx.current_model.clone();
+            let bg_provider_id = provider_id.clone();
+            let bg_prompt = prompt.clone();
+            let bg_attachments = attachments.clone();
+            state.tokio_handle.spawn(async move {
+                if let Err(error) = persist_context_debug_snapshot(
+                    &bg_state,
+                    &bg_session_id,
+                    &bg_model,
+                    &bg_provider_id,
+                    &bg_prompt,
+                    &bg_attachments,
+                    &preview_messages,
+                )
+                .await
+                    && !error.is_disk_exhausted()
+                {
+                    tracing::warn!(
+                        session_id = %bg_session_id,
+                        %error,
+                        "failed to persist context debug snapshot"
+                    );
+                }
+            });
             (prompt, attachments)
         };
 
@@ -8167,6 +8229,31 @@ mod tests {
             1,
             "rewind alert must only appear once in history, not re-injected on turn 3"
         );
+    }
+
+    #[tokio::test]
+    async fn session_prewarm_coalesces_or_parks_on_create_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stub = stub_provider(vec![sse_text("hi")]).await;
+        let state = failover_state(tmp.path(), &stub, &stub).await;
+        let session_id = "prewarm-test";
+        state
+            .db()
+            .create_session(session_id, Some("prewarm"), Some("a::gpt-4o"))
+            .await
+            .expect("create session");
+
+        state.session_prewarms.spawn(&state, session_id);
+        let prewarmed = state.session_prewarms.take(session_id).await;
+        let agent = match prewarmed {
+            Some(agent) => agent,
+            None => state
+                .parked_agents
+                .take(session_id)
+                .await
+                .expect("agent either coalesced from prewarm or already parked"),
+        };
+        assert_eq!(agent.provider_id(), "a");
     }
 }
 

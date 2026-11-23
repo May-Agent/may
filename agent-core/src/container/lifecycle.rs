@@ -14,7 +14,7 @@ use bollard::query_parameters::{
     StopContainerOptionsBuilder,
 };
 use futures_lite::StreamExt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
@@ -169,17 +169,62 @@ impl ContainerManager {
             return Ok(id);
         }
 
-        // Create new container
-        let id = self
-            .create_container(spec, &host_gateway, &shared_paths, &spec_fingerprint)
-            .await?;
-
-        // Start it
-        self.runtime.client.start_container(&id, None).await?;
-        self.touch_activity(&id);
-        tracing::info!(container_id = %id, name = %spec.name, "Created and started container");
-
-        Ok(id)
+        // Create new container — or adopt the one a racing caller just
+        // registered under this deterministic name (Docker 409): a session
+        // prewarm and the first turn can resolve the environment at once.
+        // A 409 whose lookup finds nothing means the winner already removed
+        // its own container on the drift-recreate path; create again.
+        for attempt in 0..8u64 {
+            let create = self
+                .create_container(spec, &host_gateway, &shared_paths, &spec_fingerprint)
+                .await;
+            let conflict = match create {
+                Ok(id) => {
+                    self.runtime.client.start_container(&id, None).await?;
+                    self.touch_activity(&id);
+                    tracing::info!(container_id = %id, name = %spec.name, "Created and started container");
+                    return Ok(id);
+                }
+                Err(error) => error,
+            };
+            if !matches!(
+                conflict,
+                ContainerError::Docker(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                })
+            ) {
+                return Err(conflict);
+            }
+            let Some(container) = self.find_container_by_name(spec.name.as_str()).await? else {
+                // The winner's removal still holds the name while its list
+                // entry is already gone; wait it out before creating again.
+                async_io::Timer::after(Duration::from_millis(200 + 400 * attempt)).await;
+                continue;
+            };
+            let labels = container.labels.unwrap_or_default();
+            if labels.get(LABEL_MANAGED).map(String::as_str) != Some("true") {
+                let found_id = container.id.as_deref().unwrap_or("unknown");
+                return Err(ContainerError::Bootstrap(format!(
+                    "container name collision with unmanaged container: {} ({found_id})",
+                    spec.name
+                )));
+            }
+            let found = container
+                .id
+                .ok_or_else(|| ContainerError::NotFound(spec.name.clone()))?;
+            if container.state != Some(ContainerSummaryStateEnum::RUNNING) {
+                self.runtime.client.start_container(&found, None).await?;
+            }
+            self.touch_activity(&found);
+            tracing::info!(
+                container_id = %found,
+                name = %spec.name,
+                "Adopted container a racing caller created"
+            );
+            return Ok(found);
+        }
+        Err(ContainerError::NotFound(spec.name.clone()))
     }
 
     /// Resolve a managed container id by deterministic container name.

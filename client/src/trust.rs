@@ -137,6 +137,20 @@ fn level_of(project: &ProjectConfig) -> TrustLevel {
     }
 }
 
+/// Returns whether `config_path` contains any `[[projects]]` entry whose
+/// persisted trust level does not publish to a remote forge (`local` or
+/// `local-branch`), avoiding git subprocess resolution when none exist.
+///
+/// # Errors
+/// Fails when `config_path` exists but cannot be read or parsed.
+pub fn has_non_forge_project(config_path: &Path) -> Result<bool, WorkspaceConfigError> {
+    let config = WorkspaceConfig::load(config_path)?;
+    Ok(config
+        .projects
+        .iter()
+        .any(|project| !level_of(project).publishes_to_forge()))
+}
+
 /// The authenticated user's access to a forge repository, asked while
 /// resolving the repository's default trust.
 pub trait ForgeProbe {
@@ -1167,5 +1181,19 @@ mod tests {
         .await
         .expect("resolve");
         assert_eq!(level, TrustLevel::PrsOnly);
+    }
+
+    #[test]
+    fn has_non_forge_project_reflects_workspace_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = config_path(&dir);
+        assert!(!has_non_forge_project(&config_path).expect("missing config"));
+
+        persist_github(&config_path, "acme/app", TrustLevel::Full).expect("persist github");
+        assert!(!has_non_forge_project(&config_path).expect("forge only"));
+
+        persist(&config_path, dir.path(), None, TrustLevel::LocalBranch)
+            .expect("persist local-branch");
+        assert!(has_non_forge_project(&config_path).expect("has non-forge"));
     }
 }

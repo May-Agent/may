@@ -241,11 +241,26 @@ impl DaemonCheckouts {
         )
     }
 
+    /// Return the current read-only default-branch checkout snapshot if one is
+    /// already cached on disk, without hitting the network or acquiring auth.
+    ///
+    /// # Errors
+    /// Fails when inspecting the existing checkout metadata fails.
+    pub async fn current_snapshot_if_present(
+        &self,
+        repo_key: &str,
+    ) -> Result<Option<CheckoutSnapshot>, RepoCloneError> {
+        let repo_dir = self.repo_dir(repo_key);
+        let host = self.host.clone();
+        let repo_key_owned = repo_key.to_string();
+        blocking::unblock(move || read_current_snapshot(&host, &repo_dir, &repo_key_owned)).await
+    }
+
     /// Ensure a read-only default-branch checkout exists for `repo_key`.
     ///
     /// Reuses an existing valid `current` generation without hitting the network
-    /// when one is already present, so session startup never spawns an eager
-    /// clone when the checkout is warm.
+    /// or resolving forge auth when one is already present, so session startup
+    /// never spawns an eager clone or `gh auth token` when the checkout is warm.
     ///
     /// # Errors
     /// Fails when cloning the initial checkout or inspecting `HEAD` fails.
@@ -256,6 +271,18 @@ impl DaemonCheckouts {
     ) -> Result<CheckoutSnapshot, RepoCloneError> {
         let entry = self.entry_for(repo_key);
         let _guard = entry.lock.lock().await;
+        let repo_dir = self.repo_dir(repo_key);
+        let fast_host = self.host.clone();
+        let repo_key_owned = repo_key.to_string();
+        if let Some(snapshot) = blocking::unblock(move || {
+            write_repo_key_file(&repo_dir, &repo_key_owned)?;
+            read_current_snapshot(&fast_host, &repo_dir, &repo_key_owned)
+        })
+        .await?
+        {
+            return Ok(snapshot);
+        }
+
         let repo_dir = self.repo_dir(repo_key);
         let host = self.host_for_remote(remote_url).await?;
         let repo_key_owned = repo_key.to_string();
@@ -701,6 +728,26 @@ fn read_current_snapshot(
     snapshot_from_generation(host, repo_dir, repo_key, gen_num, gen_dir).map(Some)
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous git HEAD inspection runs inside blocking::unblock"
+)]
+fn read_git_head_and_branch_fast(generation_dir: &Path) -> Option<(String, String)> {
+    let git_dir = generation_dir.join(".git");
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let ref_name = head.trim().strip_prefix("ref: ")?.trim();
+    let branch = ref_name.strip_prefix("refs/heads/")?.to_string();
+    let sha = std::fs::read_to_string(git_dir.join(ref_name))
+        .ok()?
+        .trim()
+        .to_string();
+    if (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some((sha, branch))
+    } else {
+        None
+    }
+}
+
 fn snapshot_from_generation(
     host: &HostGit,
     repo_dir: &Path,
@@ -708,14 +755,20 @@ fn snapshot_from_generation(
     generation: u64,
     generation_dir: PathBuf,
 ) -> Result<CheckoutSnapshot, RepoCloneError> {
-    let head_sha = host
-        .output(Some(&generation_dir), &["rev-parse", "HEAD"])
-        .map_err(RepoCloneError::from)?
-        .trim()
-        .to_string();
-    let default_branch = host
-        .output(Some(&generation_dir), &["symbolic-ref", "--short", "HEAD"])
-        .map_or_else(|_| "main".to_string(), |s| s.trim().to_string());
+    let (head_sha, default_branch) =
+        if let Some(fast) = read_git_head_and_branch_fast(&generation_dir) {
+            fast
+        } else {
+            let head_sha = host
+                .output(Some(&generation_dir), &["rev-parse", "HEAD"])
+                .map_err(RepoCloneError::from)?
+                .trim()
+                .to_string();
+            let default_branch = host
+                .output(Some(&generation_dir), &["symbolic-ref", "--short", "HEAD"])
+                .map_or_else(|_| "main".to_string(), |s| s.trim().to_string());
+            (head_sha, default_branch)
+        };
     Ok(CheckoutSnapshot {
         repo_key: repo_key.to_string(),
         root_dir: repo_dir.to_path_buf(),
@@ -919,5 +972,50 @@ impl may_command_policy::CheckoutRegistry for DaemonCheckouts {
 
     async fn acquire_lease(&self, repo_key: &str) -> Option<GenerationLease> {
         Self::acquire_lease(self, repo_key).await
+    }
+}
+
+#[cfg(test)]
+mod fast_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn current_snapshot_if_present_uses_fast_head_reader_without_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkouts = DaemonCheckouts::new(dir.path());
+        let repo_key = "github_acme_app";
+        assert!(
+            checkouts
+                .current_snapshot_if_present(repo_key)
+                .await
+                .expect("inspect empty")
+                .is_none()
+        );
+
+        let repo_dir = checkouts.repo_dir(repo_key);
+        let gen_dir = repo_dir.join(GENERATIONS_DIR).join("1");
+        let refs_dir = gen_dir.join(".git").join("refs").join("heads");
+        std::fs::create_dir_all(&refs_dir).expect("create git dirs");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(gen_dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("write HEAD");
+        std::fs::write(refs_dir.join("main"), format!("{sha}\n")).expect("write branch ref");
+        create_symlink(Path::new("generations/1"), &repo_dir.join(CURRENT_LINK))
+            .expect("symlink current");
+
+        let snapshot = checkouts
+            .current_snapshot_if_present(repo_key)
+            .await
+            .expect("inspect warm")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.head_sha, sha);
+        assert_eq!(snapshot.default_branch, "main");
+        assert_eq!(snapshot.generation, 1);
+
+        let ensured = checkouts
+            .ensure_present(repo_key, "https://invalid.example.invalid/unreachable.git")
+            .await
+            .expect("warm ensure_present must not hit remote");
+        assert_eq!(ensured.head_sha, sha);
     }
 }

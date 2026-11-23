@@ -494,6 +494,9 @@ pub struct MayAgent {
     agent_path: AgentPath,
     /// Shared per-agent unchanged-read epoch table.
     read_epochs: FileReadEpochs,
+    /// Set on freshly built agents so Turn 1 skips redundant disk/tokenizer
+    /// re-sync right after `MayAgent::new`.
+    runtime_context_fresh: bool,
     /// This agent's entry among the daemon's btw fork hosts, while it is the
     /// session's agent.
     _fork_registration: Option<crate::agent_link::ForkRegistration>,
@@ -531,6 +534,35 @@ impl std::fmt::Debug for MayAgent {
             .field("model_id", &self.model_id)
             .field("model_context_window", &self.model_context_window)
             .finish_non_exhaustive()
+    }
+}
+
+/// Pre-warms the shared local host [`ToolEnvironments`] slot on daemon startup
+/// so the first session does not wait for binary verification or staging.
+pub async fn prewarm_host_tools(
+    may_dir: &Path,
+    tool_distribution: &crate::tools::ToolDistribution,
+    tool_environments: &ToolEnvironmentCache,
+    hashline: bool,
+) {
+    let session_id = SessionId::from_string("__daemon_prewarm__".to_string());
+    let tools_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).tools_dir();
+    match tool_environments
+        .acquire(&session_id, HomeBackend::Local, hashline)
+        .await
+    {
+        Ok(Acquired::Ready(_)) => {}
+        Ok(Acquired::Prepare(lease)) => {
+            match ToolEnvironments::prepare_host(tool_distribution, &tools_dir, hashline).await {
+                Ok(tools) => lease.complete(tools),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to pre-warm host tool environments");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "skipped host tool environment pre-warm");
+        }
     }
 }
 
@@ -606,13 +638,6 @@ impl MayAgent {
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
         let is_container = matches!(config.environment, AgentEnvironment::Container { .. });
 
-        let network_audit = aither_sandbox::open_network_audit_log(
-            config.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
-            crate::config::NETWORK_AUDIT_MAX_FILES,
-        )
-        .await
-        .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
-
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
         // Create workspace with permissions (only used for local environment context)
@@ -630,10 +655,95 @@ impl MayAgent {
         // the sandbox dir is the shell's own working directory, so it needs
         // no grant entry of its own.
         let grants = Grants::new();
-        // `~/.may/memories` is linked into the session's `~/.may`; it must be
-        // writable through the symlink, so it joins the grants.
         let memories_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).memories_dir();
-        async_fs::create_dir_all(&memories_dir).await.ok();
+        let memory_file = crate::session::MayHomePaths::new(config.may_dir.clone()).memory_file();
+        let global_agents_path =
+            crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md();
+        let backend = match &config.environment {
+            AgentEnvironment::Local => HomeBackend::Local,
+            AgentEnvironment::Container {
+                container_id,
+                container_ipc_route,
+                ..
+            } => HomeBackend::container(container_id, container_ipc_route),
+        };
+        let may_config = config
+            .live_config
+            .as_ref()
+            .map_or_else(crate::config::MayConfig::default, |live| {
+                (**live.load()).clone()
+            });
+        let session_repos = crate::repo_clone::SessionRepos::new(
+            session_paths.root(),
+            config.session_id.as_str(),
+            config.db.clone(),
+        )
+        .with_may_config(may_config.clone())
+        .with_forge_auth(config.services.forge_auth.clone())
+        .with_checkouts(config.services.checkouts.clone());
+
+        let (
+            (),
+            network_audit,
+            session_ids,
+            tools,
+            memory_content,
+            repo_clones_res,
+            session_row,
+            worktree,
+            global_agents,
+            agents_index,
+            skill_registry,
+        ) = futures_util::join!(
+            async {
+                let _ = async_fs::create_dir_all(&memories_dir).await;
+                let _ = async_fs::create_dir_all(&config.sandbox_dir).await;
+            },
+            async {
+                aither_sandbox::open_network_audit_log(
+                    config.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+                    crate::config::NETWORK_AUDIT_MAX_FILES,
+                )
+                .await
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))
+            },
+            async {
+                config
+                    .db
+                    .session_ids(config.session_id.as_str())
+                    .await
+                    .map_err(MayAgentError::SessionIds)
+            },
+            session_tools(&config, backend),
+            async {
+                if config.memory_off {
+                    String::new()
+                } else {
+                    async_fs::read_to_string(&memory_file)
+                        .await
+                        .unwrap_or_else(|error| {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                tracing::error!(error = %error, "failed to load global memory file");
+                            }
+                            String::new()
+                        })
+                }
+            },
+            session_repos.clones(),
+            config.db.get_session(config.session_id.as_str()),
+            async {
+                let cwd = config.cwd.clone();
+                blocking::unblock(move || crate::repo_search::worktree_root(&cwd)).await
+            },
+            agents_md::load_global(&global_agents_path),
+            agents_md::discover(&config.cwd),
+            load_skill_registry(&skills_dir),
+        );
+        let network_audit = network_audit?;
+        let session_ids = session_ids?;
+        let tools = tools?;
+        let catalog = tools.catalog().clone();
+
         sync_grants_with_workspace(
             &grants,
             &workspace,
@@ -642,28 +752,6 @@ impl MayAgent {
             &skills_dir,
             &[],
         );
-
-        // Job ids, stored outputs and subagent ids lease from the session's
-        // pool, as its questions, tunnels and tasks do.
-        let session_ids = config
-            .db
-            .session_ids(config.session_id.as_str())
-            .await
-            .map_err(MayAgentError::SessionIds)?;
-
-        let tools = session_tools(
-            &config,
-            match &config.environment {
-                AgentEnvironment::Local => HomeBackend::Local,
-                AgentEnvironment::Container {
-                    container_id,
-                    container_ipc_route,
-                    ..
-                } => HomeBackend::container(container_id, container_ipc_route),
-            },
-        )
-        .await?;
-        let catalog = tools.catalog().clone();
 
         let call_interpreters = super::hooks::CallInterpreters::default();
         // Every wait on the user holds the same pause: a command's own
@@ -805,396 +893,417 @@ impl MayAgent {
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),
         };
-        let sandbox = assembly.sandbox().await?;
-        // A connected ACP agent starts in the sandbox of its run's subagent
-        // shell, derived from this session's; a container session has no
-        // host sandbox to give it, so it offers none.
-        let acp = match config.acp.as_ref() {
-            Some(hosts) if !is_container => Some(
-                hosts.agents(
-                    config.session_id.as_str(),
-                    super::acp_sandbox::SessionServices::new(
-                        permission_approver.clone(),
-                        config
-                            .job_server
-                            .broker()
-                            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
-                    ),
-                ),
-            ),
-            Some(_) => {
-                tracing::warn!(
-                    "connected ACP agents are not offered in container sessions: they would run on the host"
-                );
-                None
-            }
-            None => None,
-        };
-
-        // Read global memory from the memories directory sessions edit via
-        // the `~/.may/memories` link/mount.
-        let memory_file = crate::session::MayHomePaths::new(config.may_dir.clone()).memory_file();
-        let memory_content = if config.memory_off {
-            String::new()
-        } else {
-            async_fs::read_to_string(&memory_file)
-                .await
-                .unwrap_or_else(|error| {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        tracing::error!(error = %error, "failed to load global memory file");
-                    }
-                    String::new()
-                })
-        };
-        let harness = build_harness();
-        let evidence = build_evidence();
-        let environment_block = build_environment(
-            &config.model_id,
-            &config.environment,
-            aither_models::lookup(config.model_id.as_str()),
-            config.ssh_servers.clone(),
-        );
-        let terminal = build_terminal(&config.environment, config.hashline);
-        let permissions_block = build_permissions(
-            &config.environment,
-            config.secrets.names(),
-            config.network_policy.as_ref(),
-        );
-        let time = build_time(
-            &config.request_parameters,
-            &config.timezone,
-            config.location.as_ref(),
-        );
-        // What every subagent's context starts with besides its definition's
-        // prompt: the parent contract, then the same mechanisms scoped to a
-        // subagent — never the user-facing sections the main agent reads.
-        let subagent_instructions = build_subagent_instructions(
-            &config.environment,
-            config.ssh_servers.clone(),
-            config.hashline,
-            config.secrets.names(),
-            config.network_policy.as_ref(),
-            &config.request_parameters,
-        );
-        let mut runtime_system_context = RuntimeSystemContext::new(memory_file, memory_content)
-            .with_memory_enabled(!config.memory_off)
-            .with_instruction(tag::IDENTITY, build_identity())
-            .with_instruction(tag::ENVIRONMENT, environment_block)
-            .with_instruction(tag::TERMINAL, terminal)
-            .with_instruction(
-                tag::PREPARED_TOOLS,
-                build_prepared_tools(&catalog, config.hashline)?,
-            )
-            .with_instruction(tag::PERMISSIONS, permissions_block)
-            .with_instruction(tag::HARNESS, harness)
-            .with_instruction(tag::EVIDENCE, evidence)
-            .with_instruction(tag::TIME, time);
-        if let Some(languages) = build_languages(&config.languages) {
-            runtime_system_context =
-                runtime_system_context.with_instruction(tag::LANGUAGES, languages);
-        }
-
-        // Session repo workspaces: writable working copies live under
-        // `<session>/repos/<dir>`, derived lazily on `repo clone` rather than
-        // eagerly at session creation. Existing workspaces from earlier turns
-        // remain listed in `<repo_clones>`, while forge repositories mount
-        // the daemon's read-only default-branch checkout.
-        let may_config = config
-            .live_config
-            .as_ref()
-            .map_or_else(crate::config::MayConfig::default, |live| {
-                (**live.load()).clone()
-            });
-        let session_repos = crate::repo_clone::SessionRepos::new(
-            session_paths.root(),
-            config.session_id.as_str(),
-            config.db.clone(),
-        )
-        .with_may_config(may_config.clone())
-        .with_forge_auth(config.services.forge_auth.clone())
-        .with_checkouts(config.services.checkouts.clone());
-        let repo_clones: Vec<RepoCloneEntry> = session_repos
-            .clones()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|record| RepoCloneEntry {
-                clone_path: session_repos.path(&record.dir),
-                source: record.source,
-            })
-            .collect();
-        let binding = config
-            .db
-            .get_session(config.session_id.as_str())
-            .await?
-            .and_then(|row| row.repo)
-            .map(|stored| crate::session::RepoBinding::parse(&stored))
-            .transpose()?;
-        let worktree = {
-            let cwd = config.cwd.clone();
-            blocking::unblock(move || crate::repo_search::worktree_root(&cwd)).await
-        };
-        let clone_source = if binding.is_none() {
-            if let Some(worktree) = worktree.clone() {
-                let ws_cfg = workspace.config.clone();
-                let may_cfg = may_config.clone();
-                Some(
-                    blocking::unblock(move || {
-                        crate::repo_clone::CloneSource::of(&worktree, &ws_cfg, &may_cfg)
-                    })
-                    .await,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let forge_target = match (&binding, &clone_source) {
-            (Some(crate::session::RepoBinding::Forge(repo)), _) => {
-                let cfg = workspace.config.clone();
-                let (repo, may_cfg) = (repo.clone(), may_config.clone());
-                let key = repo.cache_key();
-                let url = repo.https_clone_url();
-                let publishes = blocking::unblock(move || {
-                    crate::trust::effective_for_forge(&cfg, &repo, &may_cfg)
-                })
-                .await
-                .publishes_to_forge();
-                publishes.then_some((key, url))
-            }
-            (None, Some(Ok(Some(crate::repo_clone::CloneSource::Remote { url, repo })))) => {
-                Some((repo.cache_key(), url.clone()))
-            }
-            (None, Some(Ok(_)) | None) | (Some(crate::session::RepoBinding::Local(_)), _) => None,
-            (None, Some(Err(error))) => {
-                tracing::warn!(%error, "failed to resolve repository clone source");
-                None
-            }
-        };
-        let mut readonly_checkouts = Vec::new();
-        let mut readonly_checkout = None;
-        let mut clones_work = match (&binding, &clone_source) {
-            (Some(crate::session::RepoBinding::Local(id)), _) => {
-                let cfg = workspace.config.clone();
-                let id = id.clone();
-                let checkout = binding
-                    .as_ref()
-                    .and_then(crate::session::RepoBinding::checkout)
-                    .as_deref()
-                    .map(Path::to_path_buf);
-                checkout
-                    .map_or_else(
-                        || blocking::unblock(|| crate::trust::TrustLevel::LocalBranch),
-                        |_| {
-                            let cfg = cfg.clone();
-                            let id = id.clone();
-                            blocking::unblock(move || crate::trust::effective_for(&cfg, &id))
-                        },
-                    )
-                    .await
-                    .clones_work()
-            }
-            (Some(crate::session::RepoBinding::Forge(_)), _) => forge_target.is_some(),
-            (None, Some(Ok(Some(_)))) => true,
-            (None, _) => false,
-        };
-        if let Some((repo_key, remote_url)) = forge_target {
-            clones_work = true;
-            match config
-                .services
-                .checkouts
-                .ensure_present(&repo_key, &remote_url)
-                .await
-            {
-                Ok(snapshot) => {
-                    grants.add_readable(&snapshot.root_dir);
-                    readonly_checkouts.push(snapshot.root_dir);
-                    if let Err(error) = config
-                        .db
-                        .seed_seen_checkout_commit(
+        let (sandbox, shared_terminal_commands_res) = futures_util::join!(
+            assembly.sandbox(),
+            async {
+                let mut commands = CommandRegistryBuilder::new();
+                commands.with_approval_pause(approval_pause.clone());
+                let acp = match config.acp.as_ref() {
+                    Some(hosts) if !is_container => Some(
+                        hosts.agents(
                             config.session_id.as_str(),
-                            &repo_key,
-                            &snapshot.head_sha,
+                            super::acp_sandbox::SessionServices::new(
+                                permission_approver.clone(),
+                                config
+                                    .job_server
+                                    .broker()
+                                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                            ),
+                        ),
+                    ),
+                    Some(_) => {
+                        tracing::warn!(
+                            "connected ACP agents are not offered in container sessions: they would run on the host"
+                        );
+                        None
+                    }
+                    None => None,
+                };
+
+                let harness = build_harness();
+                let evidence = build_evidence();
+                let environment_block = build_environment(
+                    &config.model_id,
+                    &config.environment,
+                    aither_models::lookup(config.model_id.as_str()),
+                    config.ssh_servers.clone(),
+                );
+                let terminal = build_terminal(&config.environment, config.hashline);
+                let permissions_block = build_permissions(
+                    &config.environment,
+                    config.secrets.names(),
+                    config.network_policy.as_ref(),
+                );
+                let time = build_time(
+                    &config.request_parameters,
+                    &config.timezone,
+                    config.location.as_ref(),
+                );
+                let subagent_instructions = build_subagent_instructions(
+                    &config.environment,
+                    config.ssh_servers.clone(),
+                    config.hashline,
+                    config.secrets.names(),
+                    config.network_policy.as_ref(),
+                    &config.request_parameters,
+                );
+                let mut runtime_system_context =
+                    RuntimeSystemContext::new(memory_file, memory_content)
+                        .with_memory_enabled(!config.memory_off)
+                        .with_instruction(tag::IDENTITY, build_identity())
+                        .with_instruction(tag::ENVIRONMENT, environment_block)
+                        .with_instruction(tag::TERMINAL, terminal)
+                        .with_instruction(
+                            tag::PREPARED_TOOLS,
+                            build_prepared_tools(&catalog, config.hashline)?,
                         )
+                        .with_instruction(tag::PERMISSIONS, permissions_block)
+                        .with_instruction(tag::HARNESS, harness)
+                        .with_instruction(tag::EVIDENCE, evidence)
+                        .with_instruction(tag::TIME, time);
+                if let Some(languages) = build_languages(&config.languages) {
+                    runtime_system_context =
+                        runtime_system_context.with_instruction(tag::LANGUAGES, languages);
+                }
+
+                let repo_clones: Vec<RepoCloneEntry> = repo_clones_res
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|record| RepoCloneEntry {
+                        clone_path: session_repos.path(&record.dir),
+                        source: record.source,
+                    })
+                    .collect();
+                let binding = session_row?
+                    .and_then(|row| row.repo)
+                    .map(|stored| crate::session::RepoBinding::parse(&stored))
+                    .transpose()?;
+                let clone_source = if binding.is_none() {
+                    if let Some(worktree) = worktree.clone() {
+                        let ws_cfg = workspace.config.clone();
+                        let may_cfg = may_config.clone();
+                        Some(
+                            blocking::unblock(move || {
+                                crate::repo_clone::CloneSource::of(&worktree, &ws_cfg, &may_cfg)
+                            })
+                            .await,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let forge_target = match (&binding, &clone_source) {
+                    (Some(crate::session::RepoBinding::Forge(repo)), _) => {
+                        let cfg = workspace.config.clone();
+                        let (repo, may_cfg) = (repo.clone(), may_config.clone());
+                        let key = repo.cache_key();
+                        let url = repo.https_clone_url();
+                        let publishes = blocking::unblock(move || {
+                            crate::trust::effective_for_forge(&cfg, &repo, &may_cfg)
+                        })
+                        .await
+                        .publishes_to_forge();
+                        publishes.then_some((key, url))
+                    }
+                    (
+                        None,
+                        Some(Ok(Some(crate::repo_clone::CloneSource::Remote { url, repo }))),
+                    ) => Some((repo.cache_key(), url.clone())),
+                    (None, Some(Ok(_)) | None)
+                    | (Some(crate::session::RepoBinding::Local(_)), _) => None,
+                    (None, Some(Err(error))) => {
+                        tracing::warn!(%error, "failed to resolve repository clone source");
+                        None
+                    }
+                };
+                let mut readonly_checkouts = Vec::new();
+                let mut readonly_checkout = None;
+                let mut clones_work = match (&binding, &clone_source) {
+                    (Some(crate::session::RepoBinding::Local(id)), _) => {
+                        let cfg = workspace.config.clone();
+                        let id = id.clone();
+                        let checkout = binding
+                            .as_ref()
+                            .and_then(crate::session::RepoBinding::checkout)
+                            .as_deref()
+                            .map(Path::to_path_buf);
+                        checkout
+                            .map_or_else(
+                                || blocking::unblock(|| crate::trust::TrustLevel::LocalBranch),
+                                |_| {
+                                    let cfg = cfg.clone();
+                                    let id = id.clone();
+                                    blocking::unblock(move || {
+                                        crate::trust::effective_for(&cfg, &id)
+                                    })
+                                },
+                            )
+                            .await
+                            .clones_work()
+                    }
+                    (Some(crate::session::RepoBinding::Forge(_)), _) => forge_target.is_some(),
+                    (None, Some(Ok(Some(_)))) => true,
+                    (None, _) => false,
+                };
+                if let Some((repo_key, remote_url)) = forge_target {
+                    clones_work = true;
+                    match config
+                        .services
+                        .checkouts
+                        .current_snapshot_if_present(&repo_key)
                         .await
                     {
-                        tracing::warn!(
-                            session_id = %config.session_id,
-                            repo = %repo_key,
-                            %error,
-                            "failed to record initial checkout commit"
-                        );
-                    }
-                    if !is_container {
-                        readonly_checkout = Some(snapshot.current_dir.display().to_string());
+                        Ok(Some(snapshot)) => {
+                            grants.add_readable(&snapshot.root_dir);
+                            readonly_checkouts.push(snapshot.root_dir);
+                            if let Err(error) = config
+                                .db
+                                .seed_seen_checkout_commit(
+                                    config.session_id.as_str(),
+                                    &repo_key,
+                                    &snapshot.head_sha,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    session_id = %config.session_id,
+                                    repo = %repo_key,
+                                    %error,
+                                    "failed to record initial checkout commit"
+                                );
+                            }
+                            if !is_container {
+                                readonly_checkout =
+                                    Some(snapshot.current_dir.display().to_string());
+                            }
+                        }
+                        Ok(None) => {
+                            let repo_dir = config.services.checkouts.repo_dir(&repo_key);
+                            grants.add_readable(&repo_dir);
+                            readonly_checkouts.push(repo_dir);
+                            let checkouts = config.services.checkouts.clone();
+                            let db = config.db.clone();
+                            let session_id = config.session_id.as_str().to_string();
+                            executor_core::Executor::spawn(
+                                &DefaultExecutor,
+                                async move {
+                                    match checkouts.ensure_present(&repo_key, &remote_url).await {
+                                        Ok(snapshot) => {
+                                            if let Err(error) = db
+                                                .seed_seen_checkout_commit(
+                                                    &session_id,
+                                                    &repo_key,
+                                                    &snapshot.head_sha,
+                                                )
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    %session_id,
+                                                    repo = %repo_key,
+                                                    %error,
+                                                    "failed to record background checkout commit"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                repo = %repo_key,
+                                                %error,
+                                                "failed to prepare daemon default-branch checkout in background"
+                                            );
+                                        }
+                                    }
+                                },
+                            )
+                            .detach();
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                repo = %repo_key,
+                                %error,
+                                "failed to inspect daemon default-branch checkout"
+                            );
+                        }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        repo = %repo_key,
-                        %error,
-                        "failed to prepare daemon default-branch checkout"
-                    );
+                let remote_repo = match (&binding, &clone_source) {
+                    (Some(crate::session::RepoBinding::Forge(repo)), _)
+                    | (None, Some(Ok(Some(crate::repo_clone::CloneSource::Remote { repo, .. })))) => {
+                        Some(repo.host_and_path())
+                    }
+                    _ => None,
+                };
+                let works_in_clone = !repo_clones.is_empty() || clones_work;
+                if let Some(repo_clones) =
+                    build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
+                {
+                    runtime_system_context =
+                        runtime_system_context.with_instruction(tag::REPO_CLONES, repo_clones);
                 }
-            }
-        }
-        // The remote forge repository the session is bound to or launched
-        // in, so the system prompt names it even in prs-only mode, which
-        // tracks issues in may and holds no clone yet.
-        let remote_repo = match (&binding, &clone_source) {
-            (Some(crate::session::RepoBinding::Forge(repo)), _) => Some(repo.host_and_path()),
-            (None, Some(Ok(Some(crate::repo_clone::CloneSource::Remote { repo, .. })))) => {
-                Some(repo.host_and_path())
-            }
-            _ => None,
-        };
-        let works_in_clone = !repo_clones.is_empty() || clones_work;
-        if let Some(repo_clones) =
-            build_repo_clones_context(&repo_clones, &config.environment, &session_paths)
-        {
-            runtime_system_context =
-                runtime_system_context.with_instruction(tag::REPO_CLONES, repo_clones);
-        }
 
-        // Rules: the global `~/.may/AGENTS.md` and the launch directory's
-        // AGENTS.md are loaded into the stable prefix and nested AGENTS.md
-        // files are listed, so the agent never has to find them itself.
-        let global_agents_path =
-            crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md();
-        let (global_agents, agents_index) = futures_lite::future::zip(
-            agents_md::load_global(&global_agents_path),
-            agents_md::discover(&config.cwd),
-        )
-        .await;
-        let agents_label = (!is_container).then(|| config.cwd.display().to_string());
-        runtime_system_context = runtime_system_context
-            .with_global_agents_source(global_agents_path)
-            .with_agents_source(config.cwd.clone(), agents_label.as_deref());
-        let agents_blocks = build_agents_md_blocks(
-            global_agents.as_ref(),
-            &agents_index,
-            runtime_system_context.agents_root_source(),
-            &[],
-        );
-        runtime_system_context = runtime_system_context.with_agents_md(agents_blocks);
+                let agents_label = (!is_container).then(|| config.cwd.display().to_string());
+                runtime_system_context = runtime_system_context
+                    .with_global_agents_source(global_agents_path)
+                    .with_agents_source(config.cwd.clone(), agents_label.as_deref());
+                let agents_blocks = build_agents_md_blocks(
+                    global_agents.as_ref(),
+                    &agents_index,
+                    runtime_system_context.agents_root_source(),
+                    &[],
+                );
+                runtime_system_context = runtime_system_context.with_agents_md(agents_blocks);
 
-        let llm = config.llm.clone();
+                let llm = config.llm.clone();
+                let terminal_command_llm = llm.clone();
+                let btw_llm = ModelSlot::new(llm.clone(), config.request_parameters.clone());
+                let ask_flagship = config.ask_models.flagship.clone();
+                let ask_balanced = config.ask_models.balanced.clone();
+                let ask_fast = config.ask_models.fast.clone();
 
-        // Clone LLM for terminal IPC commands before moving it into the builder.
-        let terminal_command_llm = llm.clone();
-        // `/btw` side questions run through this clone — separate from the
-        // agent's own model so a side query never joins the agent's history.
-        let btw_llm = ModelSlot::new(llm.clone(), config.request_parameters.clone());
-        // Ask-tier models arrive paired with the parameters of their own
-        // provider instances.
-        let ask_flagship = config.ask_models.flagship.clone();
-        let ask_balanced = config.ask_models.balanced.clone();
-        let ask_fast = config.ask_models.fast.clone();
+                let issue_store = crate::issue::resolve_bound_issue_store(
+                    binding.as_ref(),
+                    &config.cwd,
+                    &session_paths.workspace_config(),
+                    &may_config,
+                    &config.services.forge_auth,
+                    config.db.clone(),
+                )?;
+                let publish_gate = config
+                    .live_config
+                    .clone()
+                    .zip(permission_approver.clone())
+                    .map(|(live, approver)| {
+                        super::publish_approval::PublishGate::new(live, approver)
+                    });
+                let imagine_config = ImagineCommandConfig {
+                    generator: config.image_generator.clone(),
+                    artifacts_dir: session_paths.artifacts_dir(),
+                };
+                let agent_messaging = config.agent_messaging.clone();
+                let hook_runtime = permission_approver
+                    .as_ref()
+                    .and_then(|approver| approver.runtime_service.clone());
 
-        let issue_store = crate::issue::resolve_bound_issue_store(
-            binding.as_ref(),
-            &config.cwd,
-            &session_paths.workspace_config(),
-            &may_config,
-            &config.services.forge_auth,
-            config.db.clone(),
-        )?;
-        let publish_gate = config
-            .live_config
-            .clone()
-            .zip(permission_approver.clone())
-            .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
-        let imagine_config = ImagineCommandConfig {
-            generator: config.image_generator.clone(),
-            artifacts_dir: session_paths.artifacts_dir(),
-        };
-        let agent_messaging = config.agent_messaging.clone();
-        let hook_runtime = permission_approver
-            .as_ref()
-            .and_then(|approver| approver.runtime_service.clone());
+                let language_guard = LanguageGuard::new(config.languages);
+                let subagent_tracker = config.subagent_tracker.clone().unwrap_or_default();
+                let task_events = hook_runtime
+                    .as_ref()
+                    .map_or_else(WorkEvents::new, |runtime| {
+                        runtime.task_events(config.session_id.as_str())
+                    });
+                let toolkit = ShellToolkit::of(&budgets)
+                    .with_skill_registry(skill_registry)
+                    .with_read_epochs(read_epochs.clone());
+                let cache_lifetime: aither_agent::context::CacheLifetime =
+                    config.cache_lifetime.into();
+                let keep_alive = matches!(
+                    config.cache_lifetime,
+                    crate::cache_lifetime::CacheLifetime::Limited(_)
+                )
+                .then_some(KeepAlive {
+                    frequent_idle_threshold: FREQUENT_IDLE_THRESHOLD,
+                });
 
-        let language_guard = LanguageGuard::new(config.languages);
-        let subagent_tracker = config.subagent_tracker.clone().unwrap_or_default();
-        // The session's own inbox when the daemon keeps one, so answers
-        // committed between agent builds still reach `tasks.md`.
-        let task_events = hook_runtime
-            .as_ref()
-            .map_or_else(WorkEvents::new, |runtime| {
-                runtime.task_events(config.session_id.as_str())
-            });
-        let skill_registry = load_skill_registry(&skills_dir).await;
-        let toolkit = ShellToolkit::of(&budgets)
-            .with_skill_registry(skill_registry)
-            .with_read_epochs(read_epochs.clone());
-        let cache_lifetime: aither_agent::context::CacheLifetime = config.cache_lifetime.into();
-        let keep_alive = matches!(
-            config.cache_lifetime,
-            crate::cache_lifetime::CacheLifetime::Limited(_)
-        )
-        .then_some(KeepAlive {
-            frequent_idle_threshold: FREQUENT_IDLE_THRESHOLD,
-        });
-
-        let vision_ocr = crate::vision_ocr::VisionOcr::new();
-        let mut commands = CommandRegistryBuilder::new();
-        commands.with_approval_pause(approval_pause.clone());
-        let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
-            &mut commands,
-            SharedTerminalCommandConfig {
-                llm: terminal_command_llm,
-                subagent_tracker: subagent_tracker.clone(),
-                child_approvals: child_approvals.clone(),
-                ask_flagship,
-                ask_balanced,
-                ask_fast,
-                session_id: config.session_id.as_str().to_string(),
-                may_dir: config.may_dir.clone(),
-                sandbox_dir: config.sandbox_dir.clone(),
-                cwd: config.cwd.clone(),
-                db: config.db.clone(),
-                ask_user: hook_runtime.clone(),
-                imagine: Some(imagine_config),
-                task_runtime: match &config.environment {
-                    AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
-                    AgentEnvironment::Local => TaskRuntimeKind::Local,
-                },
-                task_broker: config.task_broker.clone(),
-                tunnel_broker: config.tunnel_broker.clone(),
-                browser_broker: config.browser_broker.clone(),
-                register_skills_broker: config.register_skills_broker.clone(),
-                request_parameters: config.request_parameters.clone(),
-                workspace_request_broker: (!is_container)
-                    .then_some(config.workspace_request_broker.clone()),
-                subagents: SubagentAssembly {
-                    toolkit: toolkit.clone(),
+                let vision_ocr = crate::vision_ocr::VisionOcr::new();
+                let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
+                    &mut commands,
+                    SharedTerminalCommandConfig {
+                        llm: terminal_command_llm,
+                        subagent_tracker: subagent_tracker.clone(),
+                        child_approvals: child_approvals.clone(),
+                        ask_flagship,
+                        ask_balanced,
+                        ask_fast,
+                        session_id: config.session_id.as_str().to_string(),
+                        may_dir: config.may_dir.clone(),
+                        sandbox_dir: config.sandbox_dir.clone(),
+                        cwd: config.cwd.clone(),
+                        db: config.db.clone(),
+                        ask_user: hook_runtime.clone(),
+                        imagine: Some(imagine_config),
+                        task_runtime: match &config.environment {
+                            AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
+                            AgentEnvironment::Local => TaskRuntimeKind::Local,
+                        },
+                        task_broker: config.task_broker.clone(),
+                        tunnel_broker: config.tunnel_broker.clone(),
+                        browser_broker: config.browser_broker.clone(),
+                        register_skills_broker: config.register_skills_broker.clone(),
+                        request_parameters: config.request_parameters.clone(),
+                        workspace_request_broker: (!is_container)
+                            .then_some(config.workspace_request_broker.clone()),
+                        subagents: SubagentAssembly {
+                            toolkit: toolkit.clone(),
+                            cache_lifetime,
+                            keep_alive,
+                            instructions: subagent_instructions,
+                            vision_ocr: crate::vision_ocr::VisionOcr::new(),
+                            permissions: permissions.clone(),
+                        },
+                        issue_store: issue_store.clone(),
+                        task_events: task_events.clone(),
+                        publish_gate,
+                        live_config: config.live_config.clone(),
+                        workspace_config: workspace.config.clone(),
+                        agent_messaging,
+                        languages: Some(language_guard.clone()),
+                        acp,
+                        session_prompts: config.session_prompts.clone(),
+                        git: crate::host_git::HostGit::inherit(),
+                        timeout_cap: budgets.limits().timeout_cap,
+                        tasks_line_limit: config.limits.tasks_lines(),
+                        #[cfg(target_os = "macos")]
+                        computer: config.computer.clone(),
+                        rules_import: config.rules_import.clone(),
+                        subagent_models: config.subagent_models.clone(),
+                        model_listing: Some(config.model_listing.clone()),
+                        services: config.services.clone(),
+                    },
+                ))
+                .await?;
+                Ok::<_, MayAgentError>((
+                    commands,
+                    shared_terminal_commands,
+                    runtime_system_context,
+                    llm,
+                    btw_llm,
+                    issue_store,
+                    hook_runtime,
+                    language_guard,
+                    subagent_tracker,
+                    task_events,
+                    toolkit,
                     cache_lifetime,
-                    keep_alive,
-                    instructions: subagent_instructions,
-                    vision_ocr: crate::vision_ocr::VisionOcr::new(),
-                    permissions: permissions.clone(),
-                },
-                issue_store: issue_store.clone(),
-                task_events: task_events.clone(),
-                publish_gate,
-                live_config: config.live_config.clone(),
-                workspace_config: workspace.config.clone(),
-                agent_messaging,
-                languages: Some(language_guard.clone()),
-                acp,
-                session_prompts: config.session_prompts.clone(),
-                git: crate::host_git::HostGit::inherit(),
-                timeout_cap: budgets.limits().timeout_cap,
-                tasks_line_limit: config.limits.tasks_lines(),
-                #[cfg(target_os = "macos")]
-                computer: config.computer.clone(),
-                rules_import: config.rules_import.clone(),
-                subagent_models: config.subagent_models.clone(),
-                model_listing: Some(config.model_listing.clone()),
-                services: config.services.clone(),
-            },
-        ))
-        .await?;
+                    vision_ocr,
+                    works_in_clone,
+                    readonly_checkouts,
+                    readonly_checkout,
+                    remote_repo,
+                ))
+            }
+        );
+        let sandbox = sandbox?;
+        let (
+            commands,
+            shared_terminal_commands,
+            mut runtime_system_context,
+            llm,
+            btw_llm,
+            issue_store,
+            hook_runtime,
+            language_guard,
+            subagent_tracker,
+            task_events,
+            toolkit,
+            cache_lifetime,
+            vision_ocr,
+            works_in_clone,
+            readonly_checkouts,
+            readonly_checkout,
+            remote_repo,
+        ) = shared_terminal_commands_res?;
         let registry = commands.build();
         let shell = assembly.build_on(sandbox, registry.clone()).await?;
         // A side request forks the agent before it has run any bound command.
@@ -1481,6 +1590,7 @@ impl MayAgent {
             watch,
             agent_path,
             read_epochs,
+            runtime_context_fresh: true,
             _fork_registration: fork_registration,
         })
     }
@@ -1556,8 +1666,33 @@ impl MayAgent {
         let providers = super::Providers::new(may_config, &pushed_providers);
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
-        let resolved_provider =
-            resolve_provider_runtime(providers, &selector, provider_attempt, &redactor).await?;
+        let (resolved_provider, ssh_servers, secrets) = futures_util::future::try_join3(
+            resolve_provider_runtime(providers, &selector, provider_attempt, &redactor),
+            async {
+                crate::profile::resolve_attached_ssh_servers(
+                    &db,
+                    profile_id.as_deref(),
+                    &may_config.ssh_servers,
+                )
+                .await
+                .map_err(|error| {
+                    MayAgentError::Sandbox(format!(
+                        "failed to load SSH attachments for profile {profile_id:?}: {error}"
+                    ))
+                })
+            },
+            async {
+                let store = crate::secrets::SecretStore::new(&may_dir);
+                let cfg = may_config.clone();
+                let sid = session_id.as_str().to_string();
+                blocking::unblock(move || {
+                    crate::secrets::Secrets::load_for_session(&store, &cfg, &sid)
+                })
+                .await
+                .map_err(MayAgentError::from)
+            },
+        )
+        .await?;
         let provider_id = resolved_provider.provider_id;
         let provider_fingerprint =
             super::provider::candidate_provider_key(providers, &selector, provider_attempt)
@@ -1568,30 +1703,19 @@ impl MayAgent {
         let request_parameters =
             super::provider::session_request_parameters(providers, &selector, reasoning_effort);
 
-        let ssh_servers = crate::profile::resolve_attached_ssh_servers(
-            &db,
-            profile_id.as_deref(),
-            &may_config.ssh_servers,
-        )
-        .await
-        .map_err(|error| {
-            MayAgentError::Sandbox(format!(
-                "failed to load SSH attachments for profile {profile_id:?}: {error}"
-            ))
-        })?;
-
-        let ask_models = super::provider::resolve_ask_tier_models(
-            providers,
-            &provider_id,
-            selector.model_id(),
-            &redactor,
-        )
-        .await?;
-        let compaction_llm = super::provider::resolve_compaction_model(
-            providers,
-            &provider_id,
-            selector.model_id(),
-            &redactor,
+        let (ask_models, compaction_llm) = futures_util::future::try_join(
+            super::provider::resolve_ask_tier_models(
+                providers,
+                &provider_id,
+                selector.model_id(),
+                &redactor,
+            ),
+            super::provider::resolve_compaction_model(
+                providers,
+                &provider_id,
+                selector.model_id(),
+                &redactor,
+            ),
         )
         .await?;
         let cache_lifetime = providers
@@ -1600,13 +1724,6 @@ impl MayAgent {
             .ok_or_else(|| {
                 MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
             })?;
-        let secrets = {
-            let store = crate::secrets::SecretStore::new(&may_dir);
-            let cfg = may_config.clone();
-            let sid = session_id.as_str().to_string();
-            blocking::unblock(move || crate::secrets::Secrets::load_for_session(&store, &cfg, &sid))
-                .await?
-        };
         let subagent_models = {
             let may_config = Arc::new(may_config.clone());
             let pushed_providers = pushed_providers.clone();
@@ -2318,8 +2435,20 @@ impl MayAgent {
         }
     }
 
+    /// Synchronizes runtime-generated system context for a turn when the agent
+    /// may have changed since it was constructed (or after prior turns); skips
+    /// redundant disk/tokenizer work on an untouched freshly built agent.
+    pub async fn sync_runtime_context_for_turn(&mut self) {
+        if self.runtime_context_fresh {
+            self.runtime_context_fresh = false;
+            return;
+        }
+        self.sync_runtime_context().await;
+    }
+
     /// Synchronizes runtime-generated system context into the agent's context.
     pub async fn sync_runtime_context(&mut self) {
+        self.runtime_context_fresh = false;
         if let Some(swarm) = &self.swarm
             && let Err(error) = swarm.reconcile().await
         {

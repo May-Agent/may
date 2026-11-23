@@ -514,6 +514,8 @@ pub struct DaemonState {
     pub turn_hub: Arc<super::chat::TurnHub>,
     /// Each session's agent between turns.
     pub parked_agents: super::chat::ParkedAgents,
+    /// In-flight session pre-warm tasks spawned on session creation.
+    pub session_prewarms: super::chat::SessionPrewarms,
     /// Each session agent's fork source and model, working or idle, for
     /// `btw` questions from other agents.
     pub agent_forks: crate::agent_link::ForkHosts,
@@ -1546,6 +1548,7 @@ impl DaemonState {
             build_id: "test".to_string(),
             turn_hub: std::sync::Arc::new(super::chat::TurnHub::default()),
             parked_agents: super::chat::ParkedAgents::default(),
+            session_prewarms: super::chat::SessionPrewarms::default(),
             agent_forks: crate::agent_link::ForkHosts::default(),
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),

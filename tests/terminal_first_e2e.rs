@@ -4364,14 +4364,12 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         .filter(|line| line.contains("session tool environments ready"))
         .filter(|line| line.contains(session_id.as_str()))
         .collect::<Vec<_>>();
-    let prepared = ready_lines
-        .iter()
-        .filter(|line| line.contains("outcome=\"prepared\""))
-        .count();
     // Later turns continue with the session's idle agent, or adopt the
-    // prepared tools when it had to be rebuilt.
+    // prepared tools when it had to be rebuilt: the readiness line is
+    // logged once whether the prewarm or the first turn produced it.
     assert_eq!(
-        prepared, 1,
+        ready_lines.len(),
+        1,
         "only the first turn should prepare tools; readiness logs: {ready_lines:#?}"
     );
 

@@ -185,6 +185,77 @@ impl ParkedAgents {
     }
 }
 
+/// In-flight session agent pre-warm tasks started when a session is created
+/// (`POST /api/sessions`), so by the time the user sends the first prompt the
+/// agent is either already parked or nearly finished and coalesced.
+#[derive(Default)]
+pub struct SessionPrewarms {
+    tasks: Mutex<HashMap<String, tokio::task::JoinHandle<Option<MayAgent>>>>,
+}
+
+impl std::fmt::Debug for SessionPrewarms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPrewarms").finish_non_exhaustive()
+    }
+}
+
+impl SessionPrewarms {
+    fn tasks(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::task::JoinHandle<Option<MayAgent>>>> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Starts pre-warming `session_id` in the background. When it finishes
+    /// before any turn takes the handle, the built agent is parked in
+    /// `state.parked_agents`.
+    pub fn spawn(&self, state: &Arc<DaemonState>, session_id: &str) {
+        let mut tasks = self.tasks();
+        if tasks.contains_key(session_id) {
+            return;
+        }
+        let handle_spawner = state.tokio_handle.clone();
+        let state = Arc::clone(state);
+        let id = session_id.to_string();
+        let handle = handle_spawner.spawn(async move {
+            let Some(agent) = super::prewarm_session_agent(&state, &id).await else {
+                state.session_prewarms.tasks().remove(&id);
+                return None;
+            };
+            let mut tasks = state.session_prewarms.tasks();
+            if tasks.remove(&id).is_some() {
+                drop(tasks);
+                state.parked_agents.park(
+                    &state,
+                    &id,
+                    agent,
+                    crate::session::RunReleased::already_released(),
+                );
+                None
+            } else {
+                Some(agent)
+            }
+        });
+        tasks.insert(session_id.to_string(), handle);
+    }
+
+    /// Claims and awaits an in-flight pre-warm task for `session_id`, if any.
+    pub async fn take(&self, session_id: &str) -> Option<MayAgent> {
+        let handle = self.tasks().remove(session_id)?;
+        handle.await.ok().flatten()
+    }
+
+    /// Aborts any in-flight pre-warm task for `session_id`.
+    pub fn cancel(&self, session_id: &str) {
+        let handle = self.tasks().remove(session_id);
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+}
+
 pub fn session_id_param(params: &Params) -> SkyResult<String> {
     Ok(params.get("id").map_err(bad_request_error)?.to_string())
 }
