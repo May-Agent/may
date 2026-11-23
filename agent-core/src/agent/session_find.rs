@@ -53,10 +53,13 @@ pub(super) struct FindRequest {
     pub offset: usize,
 }
 
+/// A `session find` scan failed: the store or the pattern.
 #[derive(Debug, thiserror::Error)]
 pub enum FindError {
+    /// The session store failed.
     #[error("database error: {0}")]
     Database(#[from] ChatDbError),
+    /// The pattern is not a valid regular expression.
     #[error("invalid pattern: {0}")]
     Pattern(#[from] regex::Error),
 }
