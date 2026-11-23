@@ -67,9 +67,9 @@ impl BuildKind {
     }
 
     /// Whether the daemon of a build of this kind updates itself in the
-    /// background. A local build never does, so a `cargo build` binary is
-    /// never overwritten behind its developer; `may update` still works on
-    /// it.
+    /// background. A local build never updates — neither automatically nor via
+    /// `may update` — so a `cargo build` binary is never overwritten behind its
+    /// developer.
     #[must_use]
     pub const fn auto_updates(self) -> bool {
         match self {
