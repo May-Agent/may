@@ -276,12 +276,19 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       }
     };
     void (async () => {
-      // The session read's cursor is the stream's resume point; a later
-      // refresh may have moved it, so the latest one wins.
+      // The stream attaches first — buffering its frames — so nothing the
+      // daemon emits between the session read's cursor and the REST
+      // background snapshot is dropped. The snapshot then seeds the state
+      // the buffered `job.*`/`subagent.*` deltas apply to.
+      let pending: [string, Record<string, unknown>][] | null = [];
       const cursor =
         useSessionsStore.getState().active?.id === sessionId
           ? useSessionsStore.getState().active?.cursor
           : undefined;
+      unwatch = watchSessionEvents(sessionId, cursor, (kind, data) => {
+        if (pending) pending.push([kind, data]);
+        else onEvent(kind, data);
+      });
       try {
         const snapshot = await getSessionBackground(sessionId);
         if (closed) return;
@@ -293,7 +300,9 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       }
       if (closed) return;
       void useInspectorStore.getState().loadPrs(sessionId);
-      unwatch = watchSessionEvents(sessionId, cursor, (kind, data) => onEvent(kind, data));
+      const buffered = pending;
+      pending = null;
+      for (const [kind, data] of buffered) onEvent(kind, data);
     })();
     return () => {
       closed = true;

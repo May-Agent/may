@@ -6,11 +6,10 @@ import {
 } from '@/components/ui/popover';
 import { getSessionContextDebug } from '@/lib/api/logs';
 import { isDraftSessionId } from '@/lib/stores/sessions';
+import { useTurnStore } from '@/lib/stores/turn';
 import { useTranslation } from '@/lib/i18n';
 import type { SessionContextDebugResponse } from '@/lib/types';
 import { cn } from '@/lib/utils';
-
-const POLL_MS = 15_000;
 
 function formatTokens(n: number | null | undefined): string {
   if (n == null) return '—';
@@ -28,6 +27,10 @@ function tone(fraction: number): { stroke: string; text: string } {
 export function ContextRing({ sessionId }: { sessionId: string }) {
   const { t } = useTranslation();
   const [data, setData] = useState<SessionContextDebugResponse | null>(null);
+  // Context shifts on turn boundaries; the SSE-driven turn store's
+  // transitions trigger the refresh instead of a fixed poll.
+  const turnActive = useTurnStore((state) => Boolean(state.turns[sessionId]?.active));
+  const turnSettled = useTurnStore((state) => state.turns[sessionId]?.last);
 
   useEffect(() => {
     if (isDraftSessionId(sessionId)) return;
@@ -41,12 +44,10 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
       }
     };
     void load();
-    const handle = window.setInterval(load, POLL_MS);
     return () => {
       cancelled = true;
-      window.clearInterval(handle);
     };
-  }, [sessionId]);
+  }, [sessionId, turnActive, turnSettled]);
 
   const metrics = data?.windowSnapshot?.metrics;
   const fraction = metrics?.usageFraction ?? 0;

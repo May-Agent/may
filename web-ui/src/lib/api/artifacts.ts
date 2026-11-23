@@ -74,7 +74,9 @@ export function artifactDownloadUrl(sessionId: string, path: string, profileId =
 /** Upload raw bytes for an attachment; returns the record to send with a message. */
 export async function uploadAttachment(sessionId: string, file: File): Promise<ApiAttachment> {
   const response = await fetch(
-    apiSseUrl(`/sessions/${sessionId}/attachments?name=${encodeURIComponent(file.name)}`),
+    apiSseUrl(
+      `/sessions/${encodeURIComponent(sessionId)}/attachments?name=${encodeURIComponent(file.name)}`,
+    ),
     { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file },
   );
   if (!response.ok) {

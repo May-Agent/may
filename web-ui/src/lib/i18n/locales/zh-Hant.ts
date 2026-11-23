@@ -123,6 +123,8 @@ export const zhHant: Messages = {
     send: '送出',
     stop: '停止',
     attach: '附加檔案',
+    attachmentUploading: '正在上傳附件…',
+    attachmentUploadFailed: '附件上傳失敗：{error}',
     queued: '排入佇列',
     queueHint: '待目前回合完成後再送出',
     immediateHint: '立即打斷目前回合送出此訊息',

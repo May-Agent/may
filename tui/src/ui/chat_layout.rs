@@ -406,6 +406,11 @@ pub struct ChatLayout {
     top_padding: usize,
     /// Elements re-laid-out by the last [`ChatLayout::sync`].
     rebuilt: usize,
+    /// Bumped whenever `sync` changed what the entries expose — new or
+    /// re-laid-out elements, refolds, width or session changes. `App`
+    /// scans markdown image anchors only when this differs from its last
+    /// scan, so the scan runs on updates, never on an idle tick.
+    scan_version: u64,
 }
 
 impl ChatLayout {
@@ -421,10 +426,11 @@ impl ChatLayout {
         selected_tool: Option<&str>,
         spinner_frame: usize,
     ) {
-        if width != self.width
+        let old_len = self.entries.len();
+        let cleared = width != self.width
             || images_supported != self.images_supported
-            || hide_todos != self.hide_todos
-        {
+            || hide_todos != self.hide_todos;
+        if cleared {
             self.entries.clear();
             self.width = width;
             self.images_supported = images_supported;
@@ -508,12 +514,23 @@ impl ChatLayout {
             row += entry.rows;
         }
         self.element_rows = row;
+        if cleared || self.rebuilt > 0 || self.entries.len() != old_len {
+            self.scan_version += 1;
+        }
     }
 
     /// Elements re-laid-out by the last sync.
     #[must_use]
     pub const fn rebuilt(&self) -> usize {
         self.rebuilt
+    }
+
+    /// Version of the laid-out set; bumped whenever `sync` re-laid-out,
+    /// added, removed or re-folded entries — the signal `App` uses to
+    /// rescan markdown image anchors on updates rather than every tick.
+    #[must_use]
+    pub const fn scan_version(&self) -> u64 {
+        self.scan_version
     }
 
     /// Wrapped rows of all elements (the tail excluded).

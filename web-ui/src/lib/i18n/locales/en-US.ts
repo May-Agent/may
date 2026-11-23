@@ -121,6 +121,8 @@ export const enUS = {
     send: 'Send',
     stop: 'Stop',
     attach: 'Attach files',
+    attachmentUploading: 'Uploading attachment…',
+    attachmentUploadFailed: 'Attachment upload failed: {error}',
     queued: 'Queue',
     queueHint: 'Queue message until current turn finishes',
     immediateHint: 'Interrupt current turn with this message',
