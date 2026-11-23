@@ -91,7 +91,9 @@ pub use compaction_report::CompactionReporter;
 pub use compaction_watch::MayRun;
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
-pub use job_events::{BackgroundWake, JobFact};
+pub use job_events::{
+    BackgroundWake, DeliveredJobCompletion, JobFact, SessionJobHooks, render_job_ended,
+};
 pub use live_limits::LiveLimits;
 pub use loop_watch::LoopLimits;
 pub use may::{

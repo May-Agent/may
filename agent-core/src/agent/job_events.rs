@@ -9,6 +9,9 @@
 //! same queue; they name their agent, and the subagent reads its own jobs, so
 //! the main agent leaves them.
 
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 use aither_sandbox::{
     CommandKilled, JobEnded, JobProcess, MonitorEnd, PendingCompletion, ShellEvent, ShellEvents,
@@ -18,6 +21,135 @@ use askama::Template;
 use async_channel::Sender;
 
 use crate::shell::MayShellWording;
+
+/// Rendered completion of a main-agent background job.
+///
+/// Kept by the session so rewinding over the turn that read it can restore the
+/// completion if the job itself predated the rewind point.
+#[derive(Debug, Clone)]
+pub struct DeliveredJobCompletion {
+    /// OS PID of the job.
+    pub pid: u32,
+    /// Monotonic instant when the job was launched.
+    pub started_at: Instant,
+    /// Monotonic instant when the completion was read by an agent.
+    pub delivered_at: Instant,
+    /// Rendered natural-language alert text.
+    pub alert: String,
+}
+
+type AbandonedJobPred = Arc<dyn Fn(u32, Option<Instant>) -> bool + Send + Sync>;
+type JobCompletionRecorder = Arc<dyn Fn(DeliveredJobCompletion) + Send + Sync>;
+
+/// Session-level hooks connecting an agent's job reader to `SessionBackgrounds`.
+#[derive(Clone, Default)]
+pub struct SessionJobHooks {
+    abandoned: Option<AbandonedJobPred>,
+    recorder: Option<JobCompletionRecorder>,
+}
+
+impl std::fmt::Debug for SessionJobHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionJobHooks").finish_non_exhaustive()
+    }
+}
+
+impl SessionJobHooks {
+    /// Builds hooks filtering abandoned post-rewind jobs and recording
+    /// delivered completions.
+    #[must_use]
+    pub fn new(
+        abandoned: impl Fn(u32, Option<Instant>) -> bool + Send + Sync + 'static,
+        recorder: impl Fn(DeliveredJobCompletion) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            abandoned: Some(Arc::new(abandoned)),
+            recorder: Some(Arc::new(recorder)),
+        }
+    }
+
+    fn is_abandoned(&self, pid: u32, started_at: Option<Instant>) -> bool {
+        self.abandoned
+            .as_ref()
+            .is_some_and(|pred| pred(pid, started_at))
+    }
+
+    fn record(&self, completion: DeliveredJobCompletion) {
+        if let Some(recorder) = &self.recorder {
+            recorder(completion);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BridgeShared {
+    prior: Vec<ShellEvents>,
+    hooks: SessionJobHooks,
+}
+
+/// Multiplexes the current shell's [`ShellEvents`] with surviving pre-rewind
+/// shells' queues and filters out jobs belonging to rewound turns.
+#[derive(Clone)]
+pub(super) struct SessionJobBridge {
+    current: ShellEvents,
+    shared: Arc<Mutex<BridgeShared>>,
+}
+
+impl SessionJobBridge {
+    pub(super) fn new(current: ShellEvents) -> Self {
+        Self {
+            current,
+            shared: Arc::new(Mutex::new(BridgeShared::default())),
+        }
+    }
+
+    pub(super) fn configure(&self, prior: Vec<ShellEvents>, hooks: SessionJobHooks) {
+        let mut guard = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.prior = prior;
+        guard.hooks = hooks;
+    }
+
+    pub(super) fn hooks(&self) -> SessionJobHooks {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hooks
+            .clone()
+    }
+
+    fn prior(&self) -> Vec<ShellEvents> {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prior
+            .clone()
+    }
+
+    pub(super) fn try_recv(&self) -> Option<ShellEvent> {
+        for events in self.prior() {
+            if let Some(event) = events.try_recv() {
+                return Some(event);
+            }
+        }
+        self.current.try_recv()
+    }
+
+    pub(super) async fn recv(&self) -> ShellEvent {
+        let prior = self.prior();
+        if prior.is_empty() {
+            return self.current.recv().await;
+        }
+        let mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = ShellEvent> + Send + '_>> =
+            Box::pin(self.current.recv());
+        for events in &prior {
+            fut = Box::pin(futures_lite::future::or(events.recv(), fut));
+        }
+        fut.await
+    }
+}
 
 /// The tag the facts' blocks carry.
 const TAG: &str = "system-reminder";
@@ -96,6 +228,8 @@ pub(super) struct JobReport {
     pub alerts: Vec<String>,
     /// The completions the facts owed; dropping them takes them.
     pub pending: Vec<PendingCompletion>,
+    /// Completions of rewound jobs to settle silently without waking.
+    pub discarded: Vec<PendingCompletion>,
     /// Whether a fact needs the model to act on it.
     pub needs_model: bool,
 }
@@ -103,12 +237,20 @@ pub(super) struct JobReport {
 impl JobReport {
     /// Reads `event` into the report and tells `facts` what clients show of
     /// it. A subagent's fact is left to the subagent.
-    pub(super) fn take(&mut self, event: ShellEvent, facts: &Sender<JobFact>) {
+    pub(super) fn take(
+        &mut self,
+        event: ShellEvent,
+        facts: &Sender<JobFact>,
+        hooks: &SessionJobHooks,
+    ) {
         if !event.agent().is_main() {
             return;
         }
         match event {
             ShellEvent::JobStarted(started) => {
+                if hooks.is_abandoned(started.pid(), None) {
+                    return;
+                }
                 let _ = facts.try_send(JobFact::Started {
                     pid: started.pid(),
                     output_preview: started.output_preview().to_string(),
@@ -117,30 +259,59 @@ impl JobReport {
             }
             ShellEvent::JobEnded(ended) => {
                 let pid = ended.info().pid;
-                self.alerts.push(render_ended(&ended));
+                let started_at = ended.info().started_at;
+                if hooks.is_abandoned(pid, Some(started_at)) {
+                    let (_, _, _, pending) = (*ended).into_parts();
+                    self.discarded.extend(pending);
+                    return;
+                }
+                let rendered = render_ended(&ended);
+                hooks.record(DeliveredJobCompletion {
+                    pid,
+                    started_at,
+                    delivered_at: Instant::now(),
+                    alert: rendered.clone(),
+                });
+                self.alerts.push(rendered);
                 let (_, _, _, pending) = (*ended).into_parts();
                 self.pending.extend(pending);
                 self.needs_model = true;
                 let _ = facts.try_send(JobFact::Ended { pid });
             }
-            ShellEvent::LongRunning(job) => self.alert(&JobAlertText::LongRunning {
-                pid: job.pid(),
-                elapsed: elapsed_text(job.after()),
-            }),
+            ShellEvent::LongRunning(job) => {
+                if hooks.is_abandoned(job.pid(), None) {
+                    return;
+                }
+                self.alert(&JobAlertText::LongRunning {
+                    pid: job.pid(),
+                    elapsed: elapsed_text(job.after()),
+                });
+            }
             ShellEvent::StdinBlocked(job) => {
+                if hooks.is_abandoned(job.pid(), None) {
+                    return;
+                }
                 self.alert(&JobAlertText::StdinBlocked { pid: job.pid() });
                 self.needs_model = true;
             }
-            ShellEvent::StdinWatchFailed(job) => self.alert(&JobAlertText::StdinWatchFailed {
-                pid: job.pid(),
-                error: job.error(),
-            }),
+            ShellEvent::StdinWatchFailed(job) => {
+                if hooks.is_abandoned(job.pid(), None) {
+                    return;
+                }
+                self.alert(&JobAlertText::StdinWatchFailed {
+                    pid: job.pid(),
+                    error: job.error(),
+                });
+            }
             ShellEvent::DescendantsKilled(killed) => {
                 self.alert(&JobAlertText::DescendantsKilled {
                     processes: killed.processes(),
                 });
             }
             ShellEvent::MonitorIncrement(increment) => {
+                if hooks.is_abandoned(increment.pid(), None) {
+                    return;
+                }
                 self.alert(&JobAlertText::MonitorIncrement {
                     pid: increment.pid(),
                     lines: increment.lines(),
@@ -148,6 +319,9 @@ impl JobReport {
                 self.needs_model = true;
             }
             ShellEvent::MonitorStalled(stalled) => {
+                if hooks.is_abandoned(stalled.pid(), None) {
+                    return;
+                }
                 self.alert(&JobAlertText::MonitorStalled {
                     pid: stalled.pid(),
                     stall_secs: stalled.stall_secs(),
@@ -155,6 +329,9 @@ impl JobReport {
                 self.needs_model = true;
             }
             ShellEvent::MonitorEnded(ended) => {
+                if hooks.is_abandoned(ended.pid(), None) {
+                    return;
+                }
                 self.alert(&JobAlertText::MonitorEnded {
                     pid: ended.pid(),
                     end: ended.end(),
@@ -245,14 +422,20 @@ fn render_ended(ended: &JobEnded) -> String {
     .expect("a job's end renders typed input")
 }
 
+/// Renders the natural-language alert text for an ended background job.
+#[must_use]
+pub fn render_job_ended(ended: &JobEnded) -> String {
+    render_ended(ended)
+}
+
 /// Puts the facts the session's jobs raised into the requests of a run.
 pub(super) struct JobReports {
-    events: ShellEvents,
+    events: SessionJobBridge,
     facts: Sender<JobFact>,
 }
 
 impl JobReports {
-    pub(super) const fn new(events: ShellEvents, facts: Sender<JobFact>) -> Self {
+    pub(super) const fn new(events: SessionJobBridge, facts: Sender<JobFact>) -> Self {
         Self { events, facts }
     }
 }
@@ -262,14 +445,17 @@ impl ContextSource for JobReports {
         SourceId::new("jobs")
     }
 
-    #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
         if !matches!(moment, Moment::Request { .. } | Moment::ToolTurnEnd) {
             return Vec::new();
         }
+        let hooks = self.events.hooks();
         let mut report = JobReport::default();
         while let Some(event) = self.events.try_recv() {
-            report.take(event, &self.facts);
+            report.take(event, &self.facts, &hooks);
+        }
+        for completion in report.discarded {
+            completion.take().await;
         }
         // The run reads these facts in its next request: the completions
         // they owed are taken as the report drops.
