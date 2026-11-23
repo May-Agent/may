@@ -14,7 +14,7 @@ use bollard::query_parameters::{
     StopContainerOptionsBuilder,
 };
 use futures_lite::StreamExt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
@@ -174,7 +174,7 @@ impl ContainerManager {
         // prewarm and the first turn can resolve the environment at once.
         // A 409 whose lookup finds nothing means the winner already removed
         // its own container on the drift-recreate path; create again.
-        for _attempt in 0..3 {
+        for attempt in 0..3u64 {
             let create = self
                 .create_container(spec, &host_gateway, &shared_paths, &spec_fingerprint)
                 .await;
@@ -197,6 +197,9 @@ impl ContainerManager {
                 return Err(conflict);
             }
             let Some(container) = self.find_container_by_name(spec.name.as_str()).await? else {
+                // The winner's removal still holds the name while its list
+                // entry is already gone; wait it out before creating again.
+                async_io::Timer::after(Duration::from_millis(150 + 250 * attempt)).await;
                 continue;
             };
             let labels = container.labels.unwrap_or_default();
