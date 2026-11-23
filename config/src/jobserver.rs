@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous fifo jobserver pool initialized and resized off async hot paths"
+)]
 //! The machine-wide jobserver token pool.
 //!
 //! The daemon owns one pool as a `fifo:` jobserver at `~/.may/jobserver/pool`.

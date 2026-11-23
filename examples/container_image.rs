@@ -18,11 +18,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Builds the `tasks` binary for the host architecture, which is the image's.
-fn build_tasks() -> Result<PathBuf, Box<dyn std::error::Error>> {
+async fn build_tasks() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = std::process::Command::new(cargo)
+    let status = async_process::Command::new(cargo)
         .args(["build", "--locked", "-p", "may-tasks", "--bin", "tasks"])
-        .status()?;
+        .status()
+        .await?;
     if !status.success() {
         return Err(format!("building the tasks binary failed: {status}").into());
     }
@@ -41,7 +42,7 @@ fn build_tasks() -> Result<PathBuf, Box<dyn std::error::Error>> {
 /// `<context>/tasks`.
 async fn stage(arch: &str, context: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::tempdir()?;
-    let tasks = build_tasks()?;
+    let tasks = build_tasks().await?;
     let staged = stage_workspace_context(arch, context, scratch.path(), &tasks).await?;
     println!("tools={}", staged.display());
     println!("heel={}", context.join("heel").display());

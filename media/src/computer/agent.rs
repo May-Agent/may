@@ -59,21 +59,26 @@ pub async fn serve(may_dir: &Path) -> Result<(), String> {
 /// [`serve`] with an explicit socket check interval.
 async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), String> {
     let sock = may_dir.join("computer-agent.sock");
-    if sock.exists() {
-        std::fs::remove_file(&sock).map_err(|e| e.to_string())?;
+    if async_fs::metadata(&sock).await.is_ok() {
+        async_fs::remove_file(&sock)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     let listener =
         UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
     // The socket carries every session's input and screenshots: owner only.
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+    async_fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        .await
         .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
     // The daemon reads this to know the helper is alive and to kill it
     // after permission grants — `open` gives no child handle.
-    let _ = std::fs::write(
+    let _ = async_fs::write(
         may_dir.join("computer-agent.pid"),
         std::process::id().to_string(),
-    );
-    let bound_inode = std::fs::metadata(&sock)
+    )
+    .await;
+    let bound_inode = async_fs::metadata(&sock)
+        .await
         .map_err(|e| format!("stat {}: {e}", sock.display()))?
         .ino();
     let state = Arc::new(AgentState {
@@ -86,7 +91,7 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
         let conn = tokio::select! {
             accepted = listener.accept() => accepted.map_err(|e| e.to_string())?.0,
             _ = watch.tick() => {
-                match std::fs::metadata(&sock) {
+                match async_fs::metadata(&sock).await {
                     Ok(meta) if meta.ino() == bound_inode => {}
                     Ok(_) => {
                         tracing::error!(socket = %sock.display(), "computer-agent socket was replaced, exiting");

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Build script: builds the web UI bundle with `bun` when the `ui` feature is
 //! enabled so its `dist/` assets can be embedded in the daemon.
 //!

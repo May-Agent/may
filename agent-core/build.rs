@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Build script: bakes the pinned `heel` library version and the
 //! content-addressed GHCR image references into the crate, as
 //! `MAY_HEEL_LIB_VERSION`, `MAY_BASE_IMAGE` and `MAY_WORKSPACE_IMAGE`.

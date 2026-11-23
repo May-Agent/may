@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test fixture distribution writes local files for tests"
+)]
 //! A tool distribution for tests that prepares offline.
 //!
 //! The embedded distribution downloads and unpacks the real pinned tools

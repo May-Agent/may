@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's git forge layer: the GitHub and GitLab clients and check views
 //! behind the `pr` and `ci` commands.
 //!

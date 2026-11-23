@@ -25,6 +25,10 @@ pub fn repo_kind(worktree: &Path) -> RepoKind {
 }
 
 /// The GitHub remote URL of a worktree, when it has one.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous git remote helper; async callers wrap in blocking::unblock"
+)]
 #[must_use]
 pub fn remote_url(worktree: &Path) -> Option<String> {
     std::process::Command::new("git")

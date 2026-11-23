@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The fatal-signal dump writes the log ring to `crash-*.log` when a signal,
 //! not a panic, ends the process. Each case re-executes this binary with an
 //! env-var child mode so the fatal signal takes down a disposable process.

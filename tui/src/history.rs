@@ -43,6 +43,10 @@ fn decode_entries(content: &str) -> Vec<String> {
 /// A history file's entries, read off the UI loop on a plain thread — the
 /// read is blocking file I/O, so a thread needs no executor the TUI's
 /// tests would have to install; the receiver delivers the entries once.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "runs on a dedicated background thread"
+)]
 fn load_from_file(path: PathBuf) -> Receiver<Vec<String>> {
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -56,6 +60,10 @@ fn load_from_file(path: PathBuf) -> Receiver<Vec<String>> {
 /// The single writer draining save requests for `path`: each request is
 /// the whole file content, so pending ones collapse to the newest before
 /// the write runs.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "runs on a dedicated writer thread"
+)]
 fn spawn_writer(path: PathBuf) -> Sender<String> {
     let (tx, rx) = async_channel::unbounded::<String>();
     std::thread::spawn(move || {

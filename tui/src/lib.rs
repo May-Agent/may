@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! TUI components for May agent.
 
 /// Adapt agent tool events into frontend-agnostic kinds.

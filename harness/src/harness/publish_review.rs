@@ -645,6 +645,10 @@ fn push_host_variants(target: &mut Vec<String>, raw: &str) {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous scutil lookup runs inside blocking::unblock"
+)]
 fn scutil_get(key: &str) -> Option<String> {
     let output = std::process::Command::new("scutil")
         .args(["--get", key])
@@ -671,6 +675,10 @@ fn system_hostname() -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous local host detection runs inside blocking::unblock"
+)]
 fn detect_local_environment(tailscale_binary: &str) -> LocalEnvironment {
     let mut env = LocalEnvironment::empty();
 

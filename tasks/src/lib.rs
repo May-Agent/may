@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! `tasks.md`: the session's working document.
 //!
 //! The document holds current state only, in up to five `##` sections:

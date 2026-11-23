@@ -146,6 +146,10 @@ impl LogRingHandle {
     ///
     /// # Errors
     /// Returns the underlying IO error when the dump cannot be written.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous dump also runs from the panic hook with no executor"
+    )]
     pub fn dump_to(&self, path: &Path, header: &str) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

@@ -212,6 +212,10 @@ impl Helper {
     /// A stale pid file, a dead pid or a pid that does not run our helper
     /// bundle all mean "not running".
     #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous helper management runs inside tokio::task::spawn_blocking"
+    )]
     fn helper_pid(&self) -> Option<libc::pid_t> {
         let pid: libc::pid_t = std::fs::read_to_string(self.may_dir.join("computer-agent.pid"))
             .ok()?
@@ -268,6 +272,10 @@ impl Helper {
     /// helper stopped, whenever the source binary or the identity differs
     /// from what the bundle was built from.
     #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous app bundle materialization runs inside tokio::task::spawn_blocking"
+    )]
     fn materialize_app(&self, identity: Option<&str>) -> Result<PathBuf, String> {
         let app = self.may_dir.join("MayComputerAgent.app");
         let stamp_path = self.may_dir.join(BUNDLE_STAMP_FILE);
@@ -300,7 +308,11 @@ impl Helper {
     }
 
     #[cfg(target_os = "macos")]
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        clippy::disallowed_methods,
+        reason = "synchronous helper launch runs inside tokio::task::spawn_blocking"
+    )]
     fn ensure_running(&self) -> Result<(), String> {
         let _launch = self
             .spawn_lock
@@ -364,6 +376,10 @@ struct BundleStamp {
 
 #[cfg(target_os = "macos")]
 impl BundleStamp {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous bundle metadata runs inside tokio::task::spawn_blocking"
+    )]
     fn of(exe: &std::path::Path, identity: Option<&str>) -> Result<Self, String> {
         let meta = std::fs::metadata(exe).map_err(|e| format!("stat {}: {e}", exe.display()))?;
         Ok(Self {
@@ -388,6 +404,10 @@ fn needs_rebuild(
 /// Sign the whole bundle so the Info.plist is bound and the designated
 /// requirement is identifier plus certificate.
 #[cfg(target_os = "macos")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous codesign runs inside tokio::task::spawn_blocking"
+)]
 fn sign_bundle(app: &std::path::Path, identity: Option<&str>) -> Result<(), String> {
     let output = std::process::Command::new("codesign")
         .args(["--force", "--sign", identity.unwrap_or("-")])

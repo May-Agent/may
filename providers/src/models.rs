@@ -76,6 +76,48 @@ const PROVIDER_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// One provider HTTP call may take at most this long.
 const FETCH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Fetch models from one configured provider with per-provider status.
+pub async fn fetch_models_for_configured_provider(
+    id: &str,
+    instance: &ProviderInstance,
+) -> ProviderModelFetchResult {
+    if !instance.is_valid(id) {
+        return ProviderModelFetchResult {
+            provider_id: id.to_string(),
+            models: Vec::new(),
+            error: Some("provider is disabled or missing required credentials".to_string()),
+        };
+    }
+
+    match bounded(
+        PROVIDER_MODELS_TIMEOUT,
+        fetch_models_for_provider(id, instance),
+        |timeout| {
+            ModelFetchError::Provider(format!("model list timed out after {}s", timeout.as_secs()))
+        },
+    )
+    .await
+    {
+        Ok(mut provider_models) => {
+            provider_models.sort_by(|a, b| a.id.cmp(&b.id));
+            provider_models.dedup_by(|a, b| a.id == b.id);
+            ProviderModelFetchResult {
+                provider_id: id.to_string(),
+                models: provider_models,
+                error: None,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch models from {id}: {e}");
+            ProviderModelFetchResult {
+                provider_id: id.to_string(),
+                models: Vec::new(),
+                error: Some(e.to_string()),
+            }
+        }
+    }
+}
+
 /// Fetch models from all configured providers with per-provider status.
 ///
 /// Providers are queried concurrently for maximum throughput.
@@ -86,48 +128,7 @@ pub async fn fetch_models_by_provider(config: &MayConfig) -> Vec<ProviderModelFe
         .map(|(id, instance)| {
             let id = id.clone();
             let instance = instance.clone();
-            async move {
-                if !instance.is_valid(&id) {
-                    return ProviderModelFetchResult {
-                        provider_id: id,
-                        models: Vec::new(),
-                        error: Some(
-                            "provider is disabled or missing required credentials".to_string(),
-                        ),
-                    };
-                }
-
-                match bounded(
-                    PROVIDER_MODELS_TIMEOUT,
-                    fetch_models_for_provider(&id, &instance),
-                    |timeout| {
-                        ModelFetchError::Provider(format!(
-                            "model list timed out after {}s",
-                            timeout.as_secs()
-                        ))
-                    },
-                )
-                .await
-                {
-                    Ok(mut provider_models) => {
-                        provider_models.sort_by(|a, b| a.id.cmp(&b.id));
-                        provider_models.dedup_by(|a, b| a.id == b.id);
-                        ProviderModelFetchResult {
-                            provider_id: id,
-                            models: provider_models,
-                            error: None,
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch models from {id}: {e}");
-                        ProviderModelFetchResult {
-                            provider_id: id,
-                            models: Vec::new(),
-                            error: Some(e.to_string()),
-                        }
-                    }
-                }
-            }
+            async move { fetch_models_for_configured_provider(&id, &instance).await }
         })
         .collect();
 

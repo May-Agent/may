@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Every entry point refuses to start on an invalid configuration file and
 //! starts when the file is absent. Each case drives the real `may` binary
 //! with an isolated home directory.

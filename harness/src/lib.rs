@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's agent harness: everything the session's agent loop and its IPC
 //! command bridge share — the command registry, working documents, host-load
 //! and language guards, the OAuth provider helpers, scheduled-task triggers

@@ -510,6 +510,10 @@ async fn stop_browser_service(
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous detached process_group(0) spawn"
+)]
 fn spawn_browser_service_process(socket_path: &std::path::Path) -> Result<(), String> {
     use std::process::Stdio;
 
@@ -691,6 +695,10 @@ async fn inspect_browser_listener_state(
         .expect("browser listener inspection task must not panic")
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous lsof/ps inspection runs inside tokio::task::spawn_blocking"
+)]
 fn inspect_browser_listener_state_blocking(
     port: u16,
 ) -> Result<BrowserListenerState, BrowserCliError> {

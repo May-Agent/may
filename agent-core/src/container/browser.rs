@@ -1163,6 +1163,10 @@ async fn seed_system_profile_if_empty(
     Ok(())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous browser profile copy runs inside blocking::unblock"
+)]
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), BrowserError> {
     for entry in WalkDir::new(src) {
         let entry =

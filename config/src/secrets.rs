@@ -134,6 +134,10 @@ impl SecretStore {
     ///
     /// Returns [`SecretError::ReadIndex`] or [`SecretError::ParseIndex`],
     /// naming the file, when it exists but cannot be read or parsed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous secret store read; async callers wrap in blocking::unblock"
+    )]
     fn index(&self) -> Result<Index, SecretError> {
         let content = match std::fs::read_to_string(&self.index_path) {
             Ok(content) => content,
@@ -153,6 +157,10 @@ impl SecretStore {
         })
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous secret store write; async callers wrap in blocking::unblock"
+    )]
     fn write_index(&self, index: &Index) -> Result<(), SecretError> {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent)?;

@@ -133,6 +133,10 @@ pub enum SessionLaunch {
 impl SessionLaunch {
     /// The directory a session started this way works in, given the client's
     /// own directory `client_cwd`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous CLI path canonicalization"
+    )]
     #[must_use]
     pub fn cwd(&self, client_cwd: &Path) -> Option<PathBuf> {
         match self {
@@ -147,6 +151,10 @@ impl SessionLaunch {
     /// The repository binding spec sent to the daemon: `owner/repo` as given,
     /// a path as the client's canonical absolute path, since the daemon
     /// resolves it from its own directory.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous CLI path canonicalization"
+    )]
     #[must_use]
     pub fn repo(&self) -> Option<String> {
         match self {

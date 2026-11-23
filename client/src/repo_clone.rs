@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous git/filesystem helpers; async callers wrap in blocking::unblock"
+)]
 //! Per-session repository clones inside the session sandbox.
 //!
 //! A session's only writable view of a repository is a private clone under

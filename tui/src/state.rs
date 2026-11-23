@@ -371,8 +371,12 @@ pub struct AskUserState {
     /// Stable persisted request identifier.
     pub request_id: String,
     /// The prompt a run is blocked on (holds the response channel); `None`
-    /// for an open question, which no run waits on.
+    /// for daemon-held prompts and open questions.
     pub request: Option<AskUserRequest>,
+    /// Whether a run is blocked waiting on this prompt (`true` for both
+    /// in-process oneshot prompts and daemon-held `waiting_ask_user` prompts;
+    /// `false` for non-blocking open questions).
+    pub blocking: bool,
     /// Normalized list of questions.
     pub questions: Vec<Question>,
     /// The secret each question collects, parallel to `questions`.
@@ -388,13 +392,28 @@ impl AskUserState {
     #[must_use]
     pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
         let secrets = questions.iter().map(|_| None).collect();
-        Self::build(request_id, Some(request), questions, secrets)
+        Self::build(request_id, Some(request), true, questions, secrets)
+    }
+
+    /// Build interaction state for a daemon-held blocking prompt.
+    #[must_use]
+    pub fn for_blocking_prompt(
+        prompt: may_protocol::session_runtime::PersistedAskUserRequest,
+    ) -> Self {
+        Self::from_persisted(prompt, true)
     }
 
     /// Build interaction state for the open question `open`.
     #[must_use]
     pub fn for_open_question(open: may_protocol::session_runtime::PersistedAskUserRequest) -> Self {
-        let (questions, secrets) = open
+        Self::from_persisted(open, false)
+    }
+
+    fn from_persisted(
+        prompt: may_protocol::session_runtime::PersistedAskUserRequest,
+        blocking: bool,
+    ) -> Self {
+        let (questions, secrets) = prompt
             .questions
             .into_iter()
             .map(|question| {
@@ -409,12 +428,13 @@ impl AskUserState {
                 )
             })
             .unzip();
-        Self::build(open.id, None, questions, secrets)
+        Self::build(prompt.id, None, blocking, questions, secrets)
     }
 
     fn build(
         request_id: String,
         request: Option<AskUserRequest>,
+        blocking: bool,
         questions: Vec<Question>,
         secrets: Vec<Option<PersistedSecretRequest>>,
     ) -> Self {
@@ -425,6 +445,7 @@ impl AskUserState {
         Self {
             request_id,
             request,
+            blocking,
             questions,
             secrets,
             current_question: 0,

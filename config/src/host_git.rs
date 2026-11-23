@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous host git wrapper; async callers run inside blocking::unblock"
+)]
 //! The one way git runs on the host.
 //!
 //! Host git works on the user's checkouts, on scratch repositories and on

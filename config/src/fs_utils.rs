@@ -39,6 +39,10 @@ pub fn display_path(path: &Path) -> String {
 /// # Errors
 ///
 /// Returns the underlying IO error.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "explicitly documented synchronous copy helper for blocking::unblock"
+)]
 pub fn copy_dir_contents_recursive(source: &Path, target: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(target)?;
 

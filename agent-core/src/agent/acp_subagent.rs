@@ -257,6 +257,10 @@ impl RunHosts {
     /// storage.
     async fn host(&self, sandbox: &aither_sandbox::Sandbox) -> Result<SandboxedHost, AcpError> {
         let storage = self.storage.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "synchronous tempdir setup runs inside blocking::unblock"
+        )]
         let storage = blocking::unblock(move || {
             std::fs::create_dir_all(&storage)?;
             tempfile::Builder::new()

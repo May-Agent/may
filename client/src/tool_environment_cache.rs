@@ -13,7 +13,7 @@
 //! for the same session queue behind the lease and are answered once it
 //! completes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use aither_sandbox::HostRoute;
 use tokio::sync::{mpsc, oneshot};
@@ -65,20 +65,20 @@ pub enum Acquired {
     Prepare(PreparationLease),
 }
 
-/// Sole right to prepare one session's environment.
+/// Sole right to prepare one tool environment slot.
 ///
 /// Completing it caches the registry and answers every queued requester.
 /// Dropping it without completing — a failed or cancelled preparation —
 /// caches nothing and lets the next queued requester prepare instead.
 #[derive(Debug)]
 pub struct PreparationLease {
-    session: SessionId,
+    slot_key: SlotKey,
     generation: u64,
     requests: Option<mpsc::UnboundedSender<Request>>,
 }
 
 impl PreparationLease {
-    /// Caches the prepared registry for the leased session.
+    /// Caches the prepared registry for the leased slot.
     ///
     /// # Panics
     ///
@@ -91,7 +91,7 @@ impl PreparationLease {
             .expect("a preparation lease completes once");
         requests
             .send(Request::Complete {
-                session: self.session.clone(),
+                slot_key: self.slot_key.clone(),
                 generation: self.generation,
                 registry: Box::new(registry),
             })
@@ -104,7 +104,7 @@ impl Drop for PreparationLease {
         if let Some(requests) = self.requests.take() {
             requests
                 .send(Request::Abandon {
-                    session: self.session.clone(),
+                    slot_key: self.slot_key.clone(),
                     generation: self.generation,
                 })
                 .expect("tool environment cache actor outlives its leases");
@@ -112,10 +112,12 @@ impl Drop for PreparationLease {
     }
 }
 
-/// Handle to the per-session prepared tool environment cache.
+/// Handle to the prepared tool environment cache.
 ///
-/// Clones share one cache. The owning actor stops once every handle and
-/// lease is dropped.
+/// Local host environments are shared across sessions with the same `hashline`
+/// setting; container environments are scoped to their owning session. Clones
+/// share one cache, and the owning actor stops once every handle and lease is
+/// dropped.
 #[derive(Debug, Clone)]
 pub struct ToolEnvironmentCache {
     requests: mpsc::UnboundedSender<Request>,
@@ -133,10 +135,10 @@ impl ToolEnvironmentCache {
         Self { requests }
     }
 
-    /// The session's cached environment when it was prepared for `key`,
+    /// The cached environment when it was prepared for `(key, hashline)`,
     /// otherwise a lease to prepare it.
     ///
-    /// Waits while another requester prepares the same session.
+    /// Waits while another requester prepares the same slot.
     ///
     /// # Errors
     /// Fails when the session is evicted while this request waits.
@@ -144,11 +146,12 @@ impl ToolEnvironmentCache {
         &self,
         session: &SessionId,
         key: HomeBackend,
+        hashline: bool,
     ) -> Result<Acquired, ToolEnvironmentCacheError> {
         let (reply, response) = oneshot::channel();
         self.send(Request::Acquire(Waiter {
             session: session.clone(),
-            key,
+            slot_key: SlotKey::of(session, key, hashline),
             reply,
         }));
         response.await.map_err(|oneshot::error::RecvError { .. }| {
@@ -156,15 +159,13 @@ impl ToolEnvironmentCache {
         })
     }
 
-    /// Forgets a deleted session's environment.
-    ///
-    /// Requesters waiting on its preparation fail, and a preparation still in
-    /// flight is not cached.
+    /// Forgets a deleted session's container environments and drops any pending
+    /// waiters belonging to that session.
     pub fn evict(&self, session: &SessionId) {
         self.send(Request::Evict(session.clone()));
     }
 
-    /// Forgets every session's environment.
+    /// Forgets every cached environment (both local and container).
     pub fn evict_all(&self) {
         self.send(Request::EvictAll);
     }
@@ -176,16 +177,50 @@ impl ToolEnvironmentCache {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotKey {
+    Local {
+        hashline: bool,
+    },
+    Container {
+        session: SessionId,
+        container_id: String,
+        route: HostRoute,
+        hashline: bool,
+    },
+}
+
+impl SlotKey {
+    fn of(session: &SessionId, backend: HomeBackend, hashline: bool) -> Self {
+        match backend {
+            HomeBackend::Local => Self::Local { hashline },
+            HomeBackend::Container {
+                container_id,
+                route,
+            } => Self::Container {
+                session: session.clone(),
+                container_id,
+                route,
+                hashline,
+            },
+        }
+    }
+
+    fn is_for_session(&self, target: &SessionId) -> bool {
+        matches!(self, Self::Container { session, .. } if session == target)
+    }
+}
+
 #[derive(Debug)]
 enum Request {
     Acquire(Waiter),
     Complete {
-        session: SessionId,
+        slot_key: SlotKey,
         generation: u64,
         registry: Box<ToolEnvironments>,
     },
     Abandon {
-        session: SessionId,
+        slot_key: SlotKey,
         generation: u64,
     },
     Evict(SessionId),
@@ -195,18 +230,16 @@ enum Request {
 #[derive(Debug)]
 struct Waiter {
     session: SessionId,
-    key: HomeBackend,
+    slot_key: SlotKey,
     reply: oneshot::Sender<Acquired>,
 }
 
 #[derive(Debug)]
 enum Slot {
     Ready {
-        key: HomeBackend,
         registry: Box<ToolEnvironments>,
     },
     Preparing {
-        key: HomeBackend,
         generation: u64,
         waiters: VecDeque<Waiter>,
     },
@@ -214,7 +247,7 @@ enum Slot {
 
 #[derive(Debug)]
 struct CacheState {
-    slots: HashMap<SessionId, Slot>,
+    slots: Vec<(SlotKey, Slot)>,
     next_generation: u64,
     /// Leases report back through this; it is weak so that the actor stops
     /// once every handle and lease is gone.
@@ -226,7 +259,7 @@ async fn run_cache_actor(
     mut requests: mpsc::UnboundedReceiver<Request>,
 ) {
     let mut state = CacheState {
-        slots: HashMap::new(),
+        slots: Vec::new(),
         next_generation: 0,
         requests: weak_requests,
     };
@@ -234,17 +267,15 @@ async fn run_cache_actor(
         match request {
             Request::Acquire(waiter) => state.serve(VecDeque::from([waiter])),
             Request::Complete {
-                session,
+                slot_key,
                 generation,
                 registry,
-            } => state.complete(session, generation, *registry),
+            } => state.complete(slot_key, generation, *registry),
             Request::Abandon {
-                session,
+                slot_key,
                 generation,
-            } => state.abandon(&session, generation),
-            Request::Evict(session) => {
-                state.slots.remove(&session);
-            }
+            } => state.abandon(&slot_key, generation),
+            Request::Evict(session) => state.evict_session(&session),
             Request::EvictAll => state.slots.clear(),
         }
     }
@@ -255,98 +286,116 @@ impl CacheState {
     /// preparation queues them, anything else starts a preparation.
     fn serve(&mut self, mut pending: VecDeque<Waiter>) {
         while let Some(waiter) = pending.pop_front() {
-            match self.slots.get_mut(&waiter.session) {
-                Some(Slot::Ready { key, registry }) if *key == waiter.key => {
-                    // A requester that stopped waiting needs no answer.
-                    let _ = waiter.reply.send(Acquired::Ready(registry.clone()));
-                }
-                Some(Slot::Preparing { waiters, .. }) => waiters.push_back(waiter),
-                Some(Slot::Ready { .. }) | None => {
-                    let Some(requests) = self.requests.upgrade() else {
-                        // Every handle is gone, so nobody can receive a lease.
+            if let Some((_, slot)) = self
+                .slots
+                .iter_mut()
+                .find(|(key, _)| *key == waiter.slot_key)
+            {
+                match slot {
+                    Slot::Ready { registry } => {
+                        // A requester that stopped waiting needs no answer.
+                        let _ = waiter.reply.send(Acquired::Ready(registry.clone()));
                         continue;
-                    };
-                    let generation = self.next_generation;
-                    self.next_generation += 1;
-                    let Waiter {
-                        session,
-                        key,
-                        reply,
-                    } = waiter;
-                    tracing::debug!(
-                        session_id = %session,
-                        generation,
-                        "tool environment preparation leased"
-                    );
-                    self.slots.insert(
-                        session.clone(),
-                        Slot::Preparing {
-                            key,
-                            generation,
-                            waiters: VecDeque::new(),
-                        },
-                    );
-                    // A requester that stopped waiting drops the lease, and
-                    // its drop abandons this preparation.
-                    let _ = reply.send(Acquired::Prepare(PreparationLease {
-                        session,
-                        generation,
-                        requests: Some(requests),
-                    }));
+                    }
+                    Slot::Preparing { waiters, .. } => {
+                        waiters.push_back(waiter);
+                        continue;
+                    }
                 }
             }
+
+            if let SlotKey::Container { session, .. } = &waiter.slot_key {
+                // Switching container/route/hashline on the same session replaces
+                // any older container slot for that session.
+                self.slots.retain(|(key, _)| !key.is_for_session(session));
+            }
+
+            let Some(requests) = self.requests.upgrade() else {
+                // Every handle is gone, so nobody can receive a lease.
+                continue;
+            };
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            let Waiter {
+                session,
+                slot_key,
+                reply,
+            } = waiter;
+            tracing::debug!(
+                session_id = %session,
+                generation,
+                "tool environment preparation leased"
+            );
+            self.slots.push((
+                slot_key.clone(),
+                Slot::Preparing {
+                    generation,
+                    waiters: VecDeque::new(),
+                },
+            ));
+            // A requester that stopped waiting drops the lease, and
+            // its drop abandons this preparation.
+            let _ = reply.send(Acquired::Prepare(PreparationLease {
+                slot_key,
+                generation,
+                requests: Some(requests),
+            }));
         }
     }
 
-    fn complete(&mut self, session: SessionId, generation: u64, registry: ToolEnvironments) {
-        let Some((key, waiters)) = self.take_preparation(&session, generation) else {
+    fn complete(&mut self, slot_key: SlotKey, generation: u64, registry: ToolEnvironments) {
+        let Some(waiters) = self.take_preparation(&slot_key, generation) else {
             tracing::debug!(
-                session_id = %session,
                 generation,
-                "discarding tool environment prepared for an evicted session"
+                "discarding tool environment prepared for an evicted slot"
             );
             return;
         };
-        self.slots.insert(
-            session,
+        self.slots.push((
+            slot_key,
             Slot::Ready {
-                key,
                 registry: Box::new(registry),
             },
-        );
+        ));
         self.serve(waiters);
     }
 
-    fn abandon(&mut self, session: &SessionId, generation: u64) {
-        if let Some((_, waiters)) = self.take_preparation(session, generation) {
-            tracing::debug!(
-                session_id = %session,
-                generation,
-                "tool environment preparation abandoned"
-            );
+    fn abandon(&mut self, slot_key: &SlotKey, generation: u64) {
+        if let Some(waiters) = self.take_preparation(slot_key, generation) {
+            tracing::debug!(generation, "tool environment preparation abandoned");
             self.serve(waiters);
         }
     }
 
-    /// Removes the session's preparation `generation` and returns its key and
-    /// queued requesters, or `None` when that preparation is no longer
-    /// current because the session was evicted.
+    fn evict_session(&mut self, session: &SessionId) {
+        self.slots.retain(|(key, _)| !key.is_for_session(session));
+        for (_, slot) in &mut self.slots {
+            if let Slot::Preparing { waiters, .. } = slot {
+                waiters.retain(|waiter| waiter.session != *session);
+            }
+        }
+    }
+
+    /// Removes the preparation `generation` for `slot_key` and returns its
+    /// queued requesters, or `None` when that preparation is no longer current
+    /// because the slot was evicted.
     fn take_preparation(
         &mut self,
-        session: &SessionId,
+        slot_key: &SlotKey,
         generation: u64,
-    ) -> Option<(HomeBackend, VecDeque<Waiter>)> {
-        match self.slots.remove(session) {
-            Some(Slot::Preparing {
-                key,
+    ) -> Option<VecDeque<Waiter>> {
+        let index = self.slots.iter().position(|(key, _)| key == slot_key)?;
+        match &self.slots[index].1 {
+            Slot::Preparing {
                 generation: current,
-                waiters,
-            }) if current == generation => Some((key, waiters)),
-            Some(slot) => {
-                self.slots.insert(session.clone(), slot);
-                None
+                ..
+            } if *current == generation => {
+                let (_, Slot::Preparing { waiters, .. }) = self.slots.swap_remove(index) else {
+                    unreachable!("checked Preparing variant");
+                };
+                Some(waiters)
             }
-            None => None,
+            _ => None,
         }
     }
 }
@@ -380,10 +429,22 @@ mod tests {
         session: &SessionId,
         key: HomeBackend,
     ) -> Acquired {
-        tokio::time::timeout(Duration::from_secs(5), cache.acquire(session, key))
-            .await
-            .expect("acquire should answer")
-            .expect("acquire should succeed")
+        acquire_with_hashline(cache, session, key, false).await
+    }
+
+    async fn acquire_with_hashline(
+        cache: &ToolEnvironmentCache,
+        session: &SessionId,
+        key: HomeBackend,
+        hashline: bool,
+    ) -> Acquired {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cache.acquire(session, key, hashline),
+        )
+        .await
+        .expect("acquire should answer")
+        .expect("acquire should succeed")
     }
 
     async fn lease(
@@ -391,7 +452,16 @@ mod tests {
         session: &SessionId,
         key: HomeBackend,
     ) -> PreparationLease {
-        match acquire(cache, session, key).await {
+        lease_with_hashline(cache, session, key, false).await
+    }
+
+    async fn lease_with_hashline(
+        cache: &ToolEnvironmentCache,
+        session: &SessionId,
+        key: HomeBackend,
+        hashline: bool,
+    ) -> PreparationLease {
+        match acquire_with_hashline(cache, session, key, hashline).await {
             Acquired::Prepare(lease) => lease,
             Acquired::Ready(_) => panic!("expected a preparation lease"),
         }
@@ -402,7 +472,16 @@ mod tests {
         session: &SessionId,
         key: HomeBackend,
     ) -> ToolEnvironments {
-        match acquire(cache, session, key).await {
+        ready_with_hashline(cache, session, key, false).await
+    }
+
+    async fn ready_with_hashline(
+        cache: &ToolEnvironmentCache,
+        session: &SessionId,
+        key: HomeBackend,
+        hashline: bool,
+    ) -> ToolEnvironments {
+        match acquire_with_hashline(cache, session, key, hashline).await {
             Acquired::Ready(registry) => *registry,
             Acquired::Prepare(_) => panic!("expected the cached registry"),
         }
@@ -532,38 +611,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_environment_is_shared_across_sessions_and_hashline_isolated() {
+        let cache = ToolEnvironmentCache::spawn();
+        let one = SessionId::from_string("one");
+        let two = SessionId::from_string("two");
+
+        lease_with_hashline(&cache, &one, HomeBackend::Local, false)
+            .await
+            .complete(registry());
+        ready_with_hashline(&cache, &two, HomeBackend::Local, false).await;
+
+        lease_with_hashline(&cache, &two, HomeBackend::Local, true)
+            .await
+            .complete(registry());
+        ready_with_hashline(&cache, &one, HomeBackend::Local, true).await;
+    }
+
+    #[tokio::test]
     async fn eviction_forgets_the_session() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
         let other = SessionId::from_string("two");
-        let key = HomeBackend::Local;
+        let one_container = HomeBackend::container("c1", &route("10.0.0.1"));
+        let two_container = HomeBackend::container("c2", &route("10.0.0.2"));
 
-        lease(&cache, &session, key.clone())
+        lease(&cache, &session, HomeBackend::Local)
             .await
             .complete(registry());
-        lease(&cache, &other, key.clone())
+        lease(&cache, &session, one_container.clone())
             .await
             .complete(registry());
+        lease(&cache, &other, two_container.clone())
+            .await
+            .complete(registry());
+
         cache.evict(&session);
-        lease(&cache, &session, key.clone()).await;
-        ready(&cache, &other, key.clone()).await;
+        // Deleting a session evicts its container slot without dropping the
+        // shared local environment or another session's container slot.
+        ready(&cache, &other, HomeBackend::Local).await;
+        lease(&cache, &session, one_container).await;
+        ready(&cache, &other, two_container.clone()).await;
 
         cache.evict_all();
-        lease(&cache, &other, key).await;
+        lease(&cache, &other, HomeBackend::Local).await;
+        lease(&cache, &other, two_container).await;
     }
 
     #[tokio::test]
     async fn eviction_fails_waiters_and_discards_inflight_preparation() {
         let cache = ToolEnvironmentCache::spawn();
         let session = SessionId::from_string("one");
-        let key = HomeBackend::Local;
+        let key = HomeBackend::container("c1", &route("10.0.0.1"));
 
         let first = lease(&cache, &session, key.clone()).await;
         let waiter = tokio::spawn({
             let cache = cache.clone();
             let session = session.clone();
             let key = key.clone();
-            async move { cache.acquire(&session, key).await }
+            async move { cache.acquire(&session, key, false).await }
         });
         let mut waiter = waiter;
         assert_pending(&mut waiter).await;

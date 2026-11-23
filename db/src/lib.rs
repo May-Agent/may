@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! Chat history database backed by SQLite.
 //!
 //! Single global database at `~/.may/history.db` containing all sessions and messages.

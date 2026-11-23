@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! May's client side: the daemon API client, the session store and the
 //! shared worker protocol the TUI and daemon exchange.
 

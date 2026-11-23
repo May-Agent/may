@@ -26,7 +26,7 @@ pub fn show_blocking_prompt(
     prompt: AppMode,
 ) {
     if let AppMode::AskUser(question) = std::mem::replace(mode, prompt)
-        && question.request.is_none()
+        && !question.blocking
     {
         *parked = Some(question);
     }
@@ -58,6 +58,7 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
             Some(SendAction::RespondAskUser {
                 request_id: state.request_id,
                 request: state.request,
+                blocking: state.blocking,
                 answers,
             })
         }

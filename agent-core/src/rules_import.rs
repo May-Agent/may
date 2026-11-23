@@ -99,6 +99,10 @@ pub async fn copy_skills(
     manager: &SkillManager,
 ) -> Result<SkillCopyReport, SkillError> {
     let dir = source_dir.to_path_buf();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous skill discovery runs inside blocking::unblock"
+    )]
     let skills = blocking::unblock(move || -> Result<Vec<PathBuf>, std::io::Error> {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -246,11 +250,17 @@ impl GlobalRulesTool {
                         .render()
                         .expect("the unanswered refusal renders"));
                 }
-                let from = crate::agent_link::resolve_prompt_path(
-                    &self.sandbox_dir,
-                    self.workspace_mount.as_ref(),
-                    &file,
-                )?;
+                let sandbox_dir = self.sandbox_dir.clone();
+                let workspace_mount = self.workspace_mount.clone();
+                let requested = file.clone();
+                let from = blocking::unblock(move || {
+                    crate::agent_link::resolve_prompt_path(
+                        &sandbox_dir,
+                        workspace_mount.as_ref(),
+                        &requested,
+                    )
+                })
+                .await?;
                 async_fs::copy(&from, destination).await.map_err(|source| {
                     GlobalRulesError::Install {
                         from: from.clone(),

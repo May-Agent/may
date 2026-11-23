@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Prints `base=<ref>` and `workspace=<ref>` for `$GITHUB_OUTPUT`: the
 //! content-addressed GHCR references of the container images, the same ones
 //! `may-agent`'s build script bakes into the binary.

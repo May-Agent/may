@@ -159,6 +159,10 @@ impl SleepState {
     ///
     /// # Panics
     /// When the file exists and cannot be read or parsed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous startup load of persisted sleep state"
+    )]
     #[must_use]
     pub fn load(may_dir: &Path, bus: UiEventBus, db: ChatDb) -> Self {
         let path = may_dir.join(STATE_FILE);

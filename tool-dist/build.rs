@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Build script: bakes the `heel` library version `Cargo.lock` pins into
 //! `MAY_HEEL_LIB_VERSION`, which a test checks the distribution's `heel`
 //! pins against.

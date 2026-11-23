@@ -182,6 +182,10 @@ mod linux {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous /proc/pressure read runs on the dedicated host_load sampler thread"
+    )]
     fn read(path: &'static str) -> Result<String, ReadError> {
         fs::read_to_string(path).map_err(|source| ReadError::Io { what: path, source })
     }

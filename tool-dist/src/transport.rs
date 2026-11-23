@@ -40,8 +40,8 @@ impl SshToolTransport {
 
     /// `ssh` in batch mode with a bounded connect time, the remote command
     /// run by `sh` whatever the login shell.
-    fn command(&self, script: &str) -> std::process::Command {
-        let mut command = std::process::Command::new("ssh");
+    fn command(&self, script: &str) -> async_process::Command {
+        let mut command = async_process::Command::new("ssh");
         command
             .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
             .arg("--")
@@ -53,8 +53,7 @@ impl SshToolTransport {
 
 impl ToolTransport for SshToolTransport {
     async fn run(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output, ToolRuntimeError> {
-        let command = async_process::Command::from(self.command(script));
-        run_command(command, input).await
+        run_command(self.command(script), input).await
     }
 }
 

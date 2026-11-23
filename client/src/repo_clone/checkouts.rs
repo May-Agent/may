@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "synchronous checkout generation work runs inside blocking::unblock"
+)]
 //! Daemon-held default-branch checkouts and copy-on-write generation management.
 //!
 //! Each GitHub repository used by any session gets a single daemon-managed
