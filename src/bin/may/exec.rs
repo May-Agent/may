@@ -16,10 +16,9 @@ use aither_sandbox::{
 use may_agent::ipc::{CommandRegistryBuilder, SessionShell, ShellSlot};
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::{
-    ChatDb, MayConfig, ProfileEnvironment, ProfileInfo, SessionId, SessionStore,
-    SharedTerminalCommandConfig, TaskRuntimeKind, TerminalPermissionHandler,
-    register_shared_terminal_commands, resolve_agent_environment_for_session,
-    resolve_provider_runtime,
+    ChatDb, MayConfig, ProfileEnvironment, SessionId, SessionStore, SharedTerminalCommandConfig,
+    TaskRuntimeKind, TerminalPermissionHandler, register_shared_terminal_commands,
+    resolve_agent_environment_for_session, resolve_provider_runtime,
 };
 
 use super::cli::ExecArgs;
@@ -116,6 +115,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
     let model = select_exec_model(&may_config);
     let sandbox = select_exec_mode(&args, &environment);
+    let child_approvals = may_agent::subagent::ChildApprovals::new();
     let shell = Box::pin(build_exec_shell(
         &context,
         &environment,
@@ -123,6 +123,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &model,
         args.ssh_server_id.as_deref(),
         tool_distribution,
+        child_approvals.clone(),
     ))
     .await?;
 
@@ -143,12 +144,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         })
         .await
         .map_err(ExecError::TerminalCall)?;
-    let task_id = job.task_id().to_owned();
+    let pid = job.pid();
     let result = job
         .wait()
         .await
         .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?;
-    render_exec_result(&task_id, &result)?;
+    render_exec_result(pid, &result)?;
     Ok(exit_code(&result.outcome))
 }
 
@@ -223,15 +224,20 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
                 source,
             })?;
             Some(
-                ProfileInfo::from_db_parts(model, preferences.clone(), attachments, cloud)
-                    .map_err(|source| ExecError::InvalidProfile {
-                        profile_id: profile_id
-                            .clone()
-                            .expect("profile id present when model exists"),
-                        source,
-                    })?
-                    .environment
-                    .into_kind(),
+                may_db::profile::profile_from_db_parts(
+                    model,
+                    preferences.clone(),
+                    attachments,
+                    cloud,
+                )
+                .map_err(|source| ExecError::InvalidProfile {
+                    profile_id: profile_id
+                        .clone()
+                        .expect("profile id present when model exists"),
+                    source,
+                })?
+                .environment
+                .into_kind(),
             )
         }
         (None, None) => None,
@@ -299,6 +305,7 @@ async fn build_exec_shell(
     model: &may_agent::ModelSelector,
     ssh_server_id: Option<&str>,
     tool_distribution: Arc<may_agent::tools::ToolDistribution>,
+    child_approvals: may_agent::subagent::ChildApprovals,
 ) -> Result<Arc<SessionShell>, ExecError> {
     // Only the targeted server is registered, so a local exec never depends
     // on the state of the profile's other attached servers.
@@ -332,7 +339,8 @@ async fn build_exec_shell(
             .profile_model
             .as_ref()
             .map(|profile| profile.id.clone()),
-    );
+    )
+    .with_child_approvals(child_approvals.clone());
     let audit_log = aither_sandbox::open_network_audit_log(
         context
             .may_dir
@@ -383,12 +391,17 @@ async fn build_exec_shell(
                         container_id,
                         &tool_distribution,
                         &tools_dir,
+                        may_config.experimental.hashline,
                     )
                     .await
                 }
                 may_agent::AgentEnvironment::Local => {
-                    may_agent::tools::ToolEnvironments::prepare_host(&tool_distribution, &tools_dir)
-                        .await
+                    may_agent::tools::ToolEnvironments::prepare_host(
+                        &tool_distribution,
+                        &tools_dir,
+                        may_config.experimental.hashline,
+                    )
+                    .await
                 }
             }
             .map_err(ExecError::InitializeBaselineTools)
@@ -433,6 +446,7 @@ async fn build_exec_shell(
         &tool_dispatchers,
         environment,
         permissions.clone(),
+        child_approvals.clone(),
     ))
     .await?;
     let grants = Grants::new();
@@ -476,6 +490,7 @@ async fn build_exec_commands<LLM>(
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
     permissions: TerminalPermissionHandler,
+    child_approvals: may_agent::subagent::ChildApprovals,
 ) -> Result<may_agent::ipc::CommandRegistry, ExecError>
 where
     LLM: aither_core::LanguageModel + Clone + Sync + 'static,
@@ -501,6 +516,7 @@ where
             rules_import: None,
             subagent_models: None,
             model_listing: None,
+            child_approvals,
             services: may_agent::SharedServices::new(&context.may_dir)
                 .with_forge_auth(forge_auth.clone()),
             llm,
@@ -614,7 +630,7 @@ const fn exit_code(outcome: &RunOutcome) -> i32 {
     }
 }
 
-fn render_exec_result(task_id: &str, result: &ScriptResult) -> Result<(), ExecError> {
+fn render_exec_result(pid: u32, result: &ScriptResult) -> Result<(), ExecError> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
@@ -644,7 +660,7 @@ fn render_exec_result(task_id: &str, result: &ScriptResult) -> Result<(), ExecEr
     match &result.outcome {
         RunOutcome::Exited { .. } => {}
         RunOutcome::Killed(_) => stderr
-            .write_all(format!("background task: {task_id} (killed)\n").as_bytes())
+            .write_all(format!("background job PID {pid} (killed)\n").as_bytes())
             .map_err(ExecError::WriteStderr)?,
     }
     stderr.flush().map_err(ExecError::WriteStderr)?;

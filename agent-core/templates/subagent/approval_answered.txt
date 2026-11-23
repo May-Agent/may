@@ -1,0 +1,1 @@
+Request {{ id }} {% if approved %}approved{% else %}denied{% endif %}; the subagent continues with your decision.

@@ -13,3 +13,6 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 [dev-dependencies]
 tempfile = "3"
 toml = "1"
+
+[lints]
+workspace = true

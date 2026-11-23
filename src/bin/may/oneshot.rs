@@ -970,7 +970,7 @@ mod tests {
             &mut output,
             r#"{"description":"serve","script":"serve"}"#,
             command(CommandOutcome::Running {
-                task_id: "t7".to_string(),
+                pid: 707,
                 output: StoredFile {
                     url: "outputs/t7.txt".to_string(),
                     path: "/sandbox/outputs/t7.txt".to_string(),
@@ -978,7 +978,7 @@ mod tests {
             }),
         );
         assert!(stderr(&output).ends_with(
-            "Tool finished: terminal: serve in 1.2s, running in background as task t7\n"
+            "Tool finished: terminal: serve in 1.2s, running in background with PID 707\n"
         ));
     }
 
@@ -989,11 +989,11 @@ mod tests {
             &mut killed,
             r#"{"description":"wait","script":"sleep 99"}"#,
             command(CommandOutcome::Killed {
-                task_id: "t9".to_string(),
+                pid: 909,
                 notice: "Killed at the time bound.".to_string(),
             }),
         );
-        assert!(stderr(&killed).ends_with("in 1.2s, killed (task t9)\n"));
+        assert!(stderr(&killed).ends_with("in 1.2s, killed (PID 909)\n"));
 
         let mut failed = output();
         terminal_call(

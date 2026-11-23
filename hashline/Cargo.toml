@@ -1,0 +1,32 @@
+[package]
+name = "may-hashline"
+version = "0.1.0"
+edition = "2024"
+authors = ["Lexo Liu <me@lexo.cool>"]
+description = "hashline: hash-anchored line search and editing for terminal-first agents"
+license = "MIT"
+repository = "https://github.com/May-Agent/may"
+publish = false
+
+[dependencies]
+thiserror = "2"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+ignore = "0.4"
+grep-regex = { version = "0.1.14", default-features = false }
+grep-searcher = { version = "0.1.17", default-features = false }
+ast-grep-core = { version = "0.51", default-features = false }
+ast-grep-language = { version = "0.51" }
+
+[[bin]]
+name = "search"
+path = "src/bin/search.rs"
+
+[[bin]]
+name = "edit"
+path = "src/bin/edit.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+
+[workspace]
