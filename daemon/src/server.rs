@@ -379,6 +379,16 @@ pub async fn start(
     });
 
     state.ensure_session_publisher();
+    let swarm = crate::swarm::SwarmService::new(
+        super::chat::agent_messaging(&state),
+        state.may_dir.clone(),
+        state.config.clone(),
+    );
+    state.services.set_swarm(swarm.clone());
+    if let Err(error) = swarm.reconcile().await {
+        tracing::warn!(%error, "failed initial swarm board reconciliation");
+    }
+    spawn_swarm_reconciler(&state, swarm);
 
     super::chat::restart_interrupted_sessions(&state)
         .await
@@ -1100,6 +1110,36 @@ async fn recover_persisted_runs_after_restart(
     task_runs.context("failed to reconcile persisted scheduled-task runs after restart")?;
     cards.context("failed to settle the subagent cards a stopped daemon left running")?;
     Ok(())
+}
+
+fn spawn_swarm_reconciler(state: &DaemonState, swarm: crate::swarm::SwarmService) {
+    use crate::ui_event_bus::UiEventTopics;
+    let mut rx = state.ui_event_bus.subscribe();
+    let shutdown = state.daemon_shutdown.clone();
+    tokio::spawn(async move {
+        let relevant = UiEventTopics::PROFILE_SESSIONS
+            | UiEventTopics::SESSION_RUNTIMES
+            | UiEventTopics::CONFIG;
+        loop {
+            tokio::select! {
+                () = shutdown.notified() => break,
+                received = rx.recv() => match received {
+                    Ok(topics) if topics.intersects(relevant) => {
+                        if let Err(error) = swarm.reconcile().await {
+                            tracing::warn!(%error, "swarm reconciliation failed");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Err(error) = swarm.reconcile().await {
+                            tracing::warn!(%error, "swarm reconciliation after lag failed");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

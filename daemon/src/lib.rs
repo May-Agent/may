@@ -140,7 +140,7 @@ use may_agent_core::{
     copilot, db, decode_meter, forge, grok, harness, host_git, id, ipc, issue, jobserver,
     live_response, location, mcp, memory, model_selector, models, network_policy, notification,
     panic_boundary, pr, profile, prompt_mentions, quota, repo_clone, repo_gate, repo_search,
-    rules_import, secrets, session, shell, skill, sleep, task_rows, task_trigger, task_wake,
+    rules_import, secrets, session, shell, skill, sleep, swarm, task_rows, task_trigger, task_wake,
     tasks_md, terminal_commands, tools, trust, ui_event_bus, update, vision_ocr, workspace,
     workspace_request,
 };
