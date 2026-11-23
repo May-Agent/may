@@ -6,6 +6,7 @@ import type {
   ToolSummary,
   ToolVariant,
   TaskRow,
+  TurnStage,
 } from '../types';
 
 export interface TurnToolState {
@@ -68,6 +69,8 @@ export interface TurnState {
   todo: { rows: TaskRow[] } | null;
   error: TurnErrorState | null;
   status: 'streaming' | 'done';
+  /** Current daemon-reported turn stage while preparing or waiting for the model. */
+  stage: TurnStage;
   /** Latest decode-rate sample reported by the backend, in tokens/second. */
   tokensPerSecond: number | null;
   /** Set while the turn waits out a quota reset or a provider retry. */
@@ -99,6 +102,7 @@ export function emptyTurn(
     todo: null,
     error: null,
     status: 'streaming',
+    stage: 'preparing',
     tokensPerSecond: null,
     hold: null,
     responseFloor: { reasoning: 0, segments: 0 },
@@ -167,6 +171,13 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
   }
 
   switch (event.kind) {
+    case 'stage':
+      return {
+        ...state,
+        stage: event.stage,
+        lastSeq: event.seq,
+      };
+
     case 'start':
       return {
         ...emptyTurn(event.turnId, event.sessionId, event.assistantId),

@@ -457,6 +457,15 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
             }
             AgentEvent::RequestStarted { prefix, .. } => {
                 self.request_prefix = Some(prefix);
+                if !self
+                    .sink
+                    .on_stage(crate::client::TurnStage::WaitingForModel)
+                    .await
+                {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                        "client disconnected before model request",
+                    )));
+                }
                 Ok(ControlFlow::Continue(()))
             }
             AgentEvent::RequestEnded { usage, outcome, .. } => {

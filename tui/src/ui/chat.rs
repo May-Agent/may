@@ -2151,18 +2151,21 @@ pub struct InputContext<'a> {
 /// status bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityPhase {
-    /// The model is reasoning or the run is waiting on its next output.
+    /// A preparation or model-wait stage before LLM reasoning/output arrives.
+    Stage(may_client::client::TurnStage),
+    /// The model is actively streaming reasoning from the LLM API.
     Thinking,
     /// The model is producing output or a tool is executing.
     Working,
 }
 
 impl ActivityPhase {
-    /// Lowercase label shown before the spinner.
+    /// Label shown before the spinner.
     const fn label(self) -> &'static str {
         match self {
-            Self::Thinking => "thinking",
-            Self::Working => "working",
+            Self::Stage(stage) => stage.label(),
+            Self::Thinking => "Thinking",
+            Self::Working => "Working",
         }
     }
 }
@@ -2170,7 +2173,7 @@ impl ActivityPhase {
 /// Live activity indicator rendered on the line above the status bar.
 #[derive(Debug, Clone, Copy)]
 pub struct ActivityContext {
-    /// `thinking` while reasoning/waiting, `working` while producing.
+    /// Active turn stage, `Thinking` during LLM reasoning, or `Working`.
     pub phase: ActivityPhase,
     /// Output tokens produced so far this turn.
     pub tokens: u64,

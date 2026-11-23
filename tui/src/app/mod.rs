@@ -748,7 +748,9 @@ impl App {
             decode_meter: may_protocol::decode_meter::DecodeMeter::default(),
             new_year: crate::new_year::NewYearState::default(),
             spinner_frame: 0,
-            activity_phase: crate::ui::chat::ActivityPhase::Thinking,
+            activity_phase: crate::ui::chat::ActivityPhase::Stage(
+                may_client::client::TurnStage::Preparing,
+            ),
             context_window: None,
             compaction: crate::state::CompactionMeter::default(),
             current_model,
@@ -4689,7 +4691,8 @@ impl App {
         self.processing = true;
         self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
-        self.activity_phase = crate::ui::chat::ActivityPhase::Thinking;
+        self.activity_phase =
+            crate::ui::chat::ActivityPhase::Stage(may_client::client::TurnStage::Preparing);
         self.decode_meter.reset();
 
         // Add user message to chat; the persisted row was appended last,
@@ -5190,18 +5193,28 @@ impl App {
                         }
                         self.show_tool_start(id, parse_tool_start(&name, &arguments));
                     }
+                    AgentEvent::RequestStarted { .. } => {
+                        self.activity_phase = crate::ui::chat::ActivityPhase::Stage(
+                            may_client::client::TurnStage::WaitingForModel,
+                        );
+                    }
                     AgentEvent::ToolCallEnded { call, result, .. } => {
                         let id = call.as_str().to_owned();
                         if let Some(tool) = self.hosted_tool_calls.remove(&id) {
-                            // The provider reports the call done; the model
-                            // call that follows is thinking again.
-                            self.activity_phase = crate::ui::chat::ActivityPhase::Thinking;
+                            // The provider reports the call done; wait on the
+                            // next model response (Thinking only starts if
+                            // reasoning arrives).
+                            self.activity_phase = crate::ui::chat::ActivityPhase::Stage(
+                                may_client::client::TurnStage::WaitingForModel,
+                            );
                             self.decode_meter.note_boundary();
                             self.chat
                                 .finish_builtin(&id, &tool, result.render_for_model());
                         } else {
                             // Back to waiting on the model for the next burst.
-                            self.activity_phase = crate::ui::chat::ActivityPhase::Thinking;
+                            self.activity_phase = crate::ui::chat::ActivityPhase::Stage(
+                                may_client::client::TurnStage::WaitingForModel,
+                            );
                             self.show_tool_end(&id, &result);
                             self.live_reads.remove(&id);
                             self.pending_tool_calls.remove(&id);

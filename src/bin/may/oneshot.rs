@@ -460,7 +460,8 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             }
             Event::Poll
             | Event::Agent(
-                TuiEvent::Compacted(_)
+                TuiEvent::Stage(_)
+                | TuiEvent::Compacted(_)
                 | TuiEvent::ContextReport(_)
                 | TuiEvent::UsageReport(_)
                 | TuiEvent::ContextDump(_)

@@ -56,6 +56,17 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
     }
+
+    fn send_pending(&self, event: TuiEvent) {
+        if let Some(sender) = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = sender.try_send(event);
+        }
+    }
 }
 
 /// An agent worker for `session_id` whose agent runs in the daemon behind
@@ -730,6 +741,12 @@ async fn forward_agent_frame(
     app_events: &EventSender,
 ) {
     match frame.body {
+        SessionAgentBody::Stage { stage } => match current.as_mut() {
+            Some(turn) => {
+                let _ = turn.events.send(TuiEvent::Stage(stage)).await;
+            }
+            None => shared.send_pending(TuiEvent::Stage(stage)),
+        },
         SessionAgentBody::Start {
             content,
             message_id,
@@ -1441,5 +1458,71 @@ mod tests {
         assert_eq!(at_end.len(), 2, "{at_end:?}");
         assert!(is_complete(&at_end[0]), "{at_end:?}");
         assert!(matches!(at_end[1], TuiEvent::Complete), "{at_end:?}");
+    }
+
+    #[tokio::test]
+    async fn stage_events_reach_pending_and_active_turns() {
+        let shared = Shared::default();
+        let (events, rx) = unbounded();
+        shared.set_pending(events);
+        let (foreign_tx, _foreign_rx) = unbounded();
+        let (commands, _command_rx) = unbounded();
+        let mut current = None;
+        let (app_events, _app_rx) = unbounded();
+
+        forward_agent_frame(
+            frame(
+                "t1",
+                SessionAgentBody::Stage {
+                    stage: may_client::client::TurnStage::CheckingRepo,
+                },
+            ),
+            &mut current,
+            &shared,
+            &foreign_tx,
+            &commands,
+            &app_events,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TuiEvent::Stage(may_client::client::TurnStage::CheckingRepo))
+        ));
+
+        forward_agent_frame(
+            frame(
+                "t1",
+                SessionAgentBody::Start {
+                    content: None,
+                    message_id: None,
+                },
+            ),
+            &mut current,
+            &shared,
+            &foreign_tx,
+            &commands,
+            &app_events,
+        )
+        .await;
+        forward_agent_frame(
+            frame(
+                "t1",
+                SessionAgentBody::Stage {
+                    stage: may_client::client::TurnStage::WaitingForModel,
+                },
+            ),
+            &mut current,
+            &shared,
+            &foreign_tx,
+            &commands,
+            &app_events,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TuiEvent::Stage(
+                may_client::client::TurnStage::WaitingForModel
+            ))
+        ));
     }
 }

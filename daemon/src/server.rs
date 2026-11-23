@@ -369,6 +369,7 @@ pub async fn start(
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
         session_prewarms: super::chat::SessionPrewarms::default(),
+        repo_gate_locks: std::sync::Mutex::default(),
         agent_forks: crate::agent_link::ForkHosts::default(),
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
@@ -428,6 +429,28 @@ pub async fn start(
     state
         .tokio_handle
         .spawn(blocking::unblock(|| drop(zenwave::client())));
+    // Pre-warm the provider model list (so custom models never wait for
+    // `/v1/models` on the first turn) and profile geolocation when enabled.
+    {
+        let warm_state = state.clone();
+        state.tokio_handle.spawn(async move {
+            let config = (*warm_state.config_snapshot()).clone();
+            let _ = warm_state
+                .fetched_models_cache
+                .get_or_refresh(move || async move { fetch_all_models(&config).await })
+                .await;
+        });
+    }
+    {
+        let warm_state = state.clone();
+        state.tokio_handle.spawn(async move {
+            if let Ok(profiles) = warm_state.db().list_profiles().await
+                && profiles.iter().any(|profile| profile.location_aware)
+            {
+                let _ = warm_state.location_provider.get().await;
+            }
+        });
+    }
     super::archive::spawn(state.clone());
     if let Some(cm) = state.container_manager.load_full() {
         let _auto_stop = cm.spawn_auto_stop_task();
