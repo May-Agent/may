@@ -33,11 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Only main saves: a PR or merge-group cache lives in a scope nothing
-      # else restores, and its size evicts main's under the cache limit.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `may-container-image` compiles only `sha2` and `serde_json`: pull them
+      # from signed prebuilts via stow instead of saving a 1.5 GB cargo-home
+      # archive that evicts test caches under the 10 GB repository quota.
+      - uses: water-rs/stow@main
       - id: refs
         run: cargo run --locked -p may-container-image --timings -- refs >> "$GITHUB_OUTPUT"
       - id: exists
@@ -151,9 +150,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - id: exists
         if: env.CAN_PUSH == 'true'
         run: |
@@ -162,6 +158,8 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+      - uses: water-rs/stow@main
+        if: steps.exists.outputs.exists != 'true'
       - uses: docker/login-action@v3
         if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
         with:

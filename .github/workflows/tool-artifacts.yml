@@ -266,14 +266,14 @@ jobs:
           "${check}/aither-sed" 'w out' </dev/null 2>/dev/null || status=$?
           [ "${status}" = 1 ]
       # The heel executable the tool distribution pins for this runner
-      # (src/tools/host-programs.json), as HEEL_BIN.
+      # (tool-dist/src/host-programs.json), as HEEL_BIN.
       - name: Install heel
         run: |
           set -euo pipefail
           pin="$(jq -c --arg os "${{ matrix.heel_os }}" --arg arch "${{ matrix.heel_arch }}" \
             '[.host_programs[] | select(.tool == "heel" and .target.os == $os and .target.arch == $arch)]
              | if length == 1 then .[0] else error("expected one heel pin") end' \
-            src/tools/host-programs.json)"
+            tool-dist/src/host-programs.json)"
           executable="${RUNNER_TEMP}/heel-runtime/heel${{ matrix.suffix }}"
           mkdir -p "${RUNNER_TEMP}/heel-runtime"
           curl -fsSL "$(jq -r .url <<<"${pin}")" -o "${executable}"

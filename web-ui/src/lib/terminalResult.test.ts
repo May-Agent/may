@@ -62,7 +62,7 @@ describe('extractTerminalResult', () => {
     const terminal = extractTerminalResult({
       kind: 'command',
       stdout: { kind: 'inline', text: '' },
-      outcome: { status: 'killed', task_id: 't', notice: 'stopped' },
+      outcome: { status: 'killed', pid: 42, notice: 'stopped' },
     });
     expect(terminal?.exitCode).toBeNull();
     expect(terminal?.stdout).toBeNull();

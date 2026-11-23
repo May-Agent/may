@@ -1,0 +1,23 @@
+Execute terminal commands.
+
+## Output Handling
+
+By default, stdout is **compressed** before being returned. Compression is semantics-preserving: the meaning is identical to the raw output, but the representation may differ. Specifically:
+
+- **JSON** outputs (arrays of objects or single objects) are automatically converted to **TSV** with dot-notation flattened column headers, but only when the TSV is smaller than the original JSON.
+- **Source code** outputs (detected via content analysis) are folded using syntax-aware block folding with line numbers. The full raw output is saved to a file whose URL is included in the result.
+- **Empty lines** and **invisible/control characters** are stripped.
+
+If you need the exact verbatim output (e.g., for checksums, binary protocols, or diffing), either set `raw: true`, pipe through further processing in the script, or redirect to a file within the script.
+
+Large outputs are automatically saved to file to manage context. When this happens, you receive the file path and can read it with `rg`, `head` and `tail`, or pipe it through `ask` for a summary.
+
+## Execution
+
+Each call starts a fresh shell; only a successful `cd` carries over to the next call. `timeout` is required: it is the job's maximum runtime in seconds — the job and its process tree are killed when it passes — and it may be at most {{ timeout_cap_minutes }} minutes.
+
+By default the call waits in the foreground for up to {{ foreground_secs }} seconds. A command still running then **promotes to a background job**: the call returns its PID and the output captured so far, and the job keeps running under its `timeout` bound. Read incremental output with `{{ read }}` and signal or stop it with `kill` (for example `kill <pid>`). Set `background: true` to detach immediately instead of waiting.
+
+A foreground command reads end of file on stdin. Only a job started with `background: true` has a stdin: send it input with `{{ input }}`.
+
+`interpreter` is `shell` by default; `python` runs `script` as Python source, without a shell wrapper.

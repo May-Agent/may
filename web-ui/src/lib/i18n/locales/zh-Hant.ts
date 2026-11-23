@@ -196,7 +196,6 @@ export const zhHant: Messages = {
   tools: {
     terminal: '正在執行任務',
     terminalInput: '傳送輸入',
-    terminalKill: '停止任務',
     terminalRead: '檢視輸出',
     browser: '操作瀏覽器',
     webSearch: '搜尋網路',

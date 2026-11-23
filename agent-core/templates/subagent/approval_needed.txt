@@ -1,0 +1,7 @@
+Your subagent "{{ subagent }}" asks to run a command outside the sandbox:
+
+{{ subject }}
+{% if let Some(reason) = reason %}
+Its reason: {{ reason }}
+{% endif %}
+Answer it with `subagent approve --id {{ id }}` or `subagent deny --id {{ id }} --reason <why>`. Its run continues in the background and reports back when it ends; an approval still goes through the session's normal permission prompt.
