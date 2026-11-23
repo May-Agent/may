@@ -84,6 +84,17 @@ impl DaemonPeerFabric {
         ));
     }
 
+    /// Returns this daemon's normalized machine prefix.
+    #[must_use]
+    pub fn local_machine_name(&self) -> String {
+        self.configured_machine_name()
+    }
+
+    /// Resolves `(local_machine, peer_endpoints)` for peer discovery and swarm federation.
+    pub(crate) async fn resolve_peer_endpoints(&self) -> (String, BTreeMap<String, String>) {
+        self.resolve_peers().await
+    }
+
     fn configured_machine_name(&self) -> String {
         let cfg = self.state.config_snapshot();
         if let Some(explicit) = cfg
@@ -304,6 +315,68 @@ impl DaemonPeerFabric {
                         answer: ans.answer,
                     })
                     .map_err(PeerErrorBody::from_link_error),
+                )
+            }
+            BridgeRpcOp::SwarmWorld => {
+                let transport = super::swarm_peers::DaemonSwarmTransport::new(state.clone());
+                let mut world = transport.poll_host_world(Some(origin_cloud_session)).await;
+                let host_machine = world.local_machine.clone();
+                if let Some(swarm) = state.services.swarm() {
+                    if let Ok(local_sessions) = swarm.local_working_sessions(&host_machine).await {
+                        world.remote_sessions.extend(local_sessions);
+                    }
+                    world.remote_boards.extend(swarm.hosted_board_summaries());
+                }
+                world.local_machine = CLOUD_MACHINE.to_string();
+                world.is_cloud_home = true;
+                BridgeRpcResult::SwarmWorld(world)
+            }
+            BridgeRpcOp::SwarmRead {
+                host_machine,
+                request,
+            } => {
+                let transport = super::swarm_peers::DaemonSwarmTransport::new(state.clone());
+                BridgeRpcResult::SwarmRead(
+                    transport
+                        .read_host_side(&host_machine, request)
+                        .await
+                        .map_err(crate::swarm::PeerSwarmErrorBody::from_swarm_error),
+                )
+            }
+            BridgeRpcOp::SwarmPost {
+                host_machine,
+                request,
+            } => {
+                let transport = super::swarm_peers::DaemonSwarmTransport::new(state.clone());
+                BridgeRpcResult::SwarmPost(
+                    transport
+                        .post_host_side(&host_machine, request)
+                        .await
+                        .map_err(crate::swarm::PeerSwarmErrorBody::from_swarm_error),
+                )
+            }
+            BridgeRpcOp::SwarmPr {
+                host_machine,
+                request,
+            } => {
+                let transport = super::swarm_peers::DaemonSwarmTransport::new(state.clone());
+                BridgeRpcResult::SwarmPr(
+                    transport
+                        .pr_host_side(&host_machine, request)
+                        .await
+                        .map_err(crate::swarm::PeerSwarmErrorBody::from_swarm_error),
+                )
+            }
+            BridgeRpcOp::SwarmDeliver {
+                target_machine,
+                request,
+            } => {
+                let transport = super::swarm_peers::DaemonSwarmTransport::new(state.clone());
+                BridgeRpcResult::SwarmDeliver(
+                    transport
+                        .deliver_host_side(&target_machine, request)
+                        .await
+                        .map_err(crate::swarm::PeerSwarmErrorBody::from_swarm_error),
                 )
             }
         }
@@ -786,7 +859,7 @@ fn decode_btw_response(
     })
 }
 
-async fn http_json(
+pub async fn http_json(
     method: zenwave::Method,
     url: &str,
     body: Option<Vec<u8>>,
@@ -818,7 +891,7 @@ async fn http_json(
     .map_err(|()| format!("request to {url} timed out"))?
 }
 
-async fn with_timeout<T>(
+pub async fn with_timeout<T>(
     duration: Duration,
     fut: impl std::future::Future<Output = T>,
 ) -> Result<T, ()> {
@@ -838,7 +911,7 @@ fn fallback_hostname() -> String {
 
 /// Verifies that a remote caller on `/api/peers/*` is the node's Tailscale owner
 /// (or local / fronting daemon), rejecting `allowed_logins` guests with `403`.
-async fn check_same_owner(state: &DaemonState, caller: &PeerCaller) -> Option<Response> {
+pub async fn check_same_owner(state: &DaemonState, caller: &PeerCaller) -> Option<Response> {
     let PeerCaller::Tailnet { login } = caller else {
         return None;
     };
@@ -883,7 +956,7 @@ fn peer_error_response(status: StatusCode, body: &PeerErrorBody) -> Response {
     response
 }
 
-fn peer_json_response<T: serde::Serialize>(payload: &T) -> Response {
+pub fn peer_json_response<T: serde::Serialize>(payload: &T) -> Response {
     let bytes = serde_json::to_vec(payload).unwrap_or_default();
     let mut response = Response::new(skyzen::Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
