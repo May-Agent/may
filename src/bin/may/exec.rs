@@ -482,6 +482,7 @@ async fn build_exec_shell(
     .map_err(ExecError::BuildShell)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_exec_commands<LLM>(
     context: &ExecSessionContext,
     may_config: &MayConfig,
