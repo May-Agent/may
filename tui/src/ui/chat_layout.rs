@@ -25,8 +25,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::chat::{
-    ChatElement, ChatStream, ClickRegion, ElementState, StreamingReply, collapsible_id,
-    element_lines,
+    ChatElement, ChatStream, ClickRegion, ElementState, ScreenStageRun, StageHit, StageTarget,
+    StreamingReply, collapsible_id, element_lines, stage_marker_index,
 };
 use super::links::{self, LinkHit, LinkId, LinkRun, ScreenRun};
 use super::streaming_markdown::IMAGE_HEIGHT;
@@ -82,6 +82,77 @@ fn scratch(lines: &[Line<'_>], width: u16, rows: usize) -> Scratch {
     Scratch { plain: out, runs }
 }
 
+/// A pipeline stage's cells on one wrapped row of a scratch render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StageCellRun {
+    row: usize,
+    col: u16,
+    width: u16,
+    target_idx: usize,
+    text: String,
+}
+
+fn scan_stage_runs(
+    stage_lines: &[(usize, Line<'static>)],
+    line_starts: &[usize],
+    width: u16,
+) -> Vec<StageCellRun> {
+    if width == 0 || stage_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    for (line_idx, tagged_line) in stage_lines {
+        let Some(&base_row) = line_starts.get(*line_idx) else {
+            continue;
+        };
+        let rows = line_rows(tagged_line, width);
+        if rows == 0 {
+            continue;
+        }
+        let height = u16::try_from(rows).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(wrap::wrap_lines(std::slice::from_ref(tagged_line), width))
+            .render(area, &mut buf);
+        for y in 0..height {
+            let mut row_runs: Vec<StageCellRun> = Vec::new();
+            let mut x = 0u16;
+            while x < width {
+                let cell = &buf[(x, y)];
+                let step = u16::try_from(cell.symbol().width().max(1)).unwrap_or(1);
+                if let Some(idx) = stage_marker_index(cell.underline_color) {
+                    let target_idx = idx as usize;
+                    match row_runs.last_mut() {
+                        Some(run) if run.target_idx == target_idx && run.col + run.width == x => {
+                            run.width += step;
+                        }
+                        _ => row_runs.push(StageCellRun {
+                            row: base_row + usize::from(y),
+                            col: x,
+                            width: step,
+                            target_idx,
+                            text: String::new(),
+                        }),
+                    }
+                }
+                x += step;
+            }
+            for run in &mut row_runs {
+                let mut text = String::new();
+                let mut at = run.col;
+                while at < run.col + run.width {
+                    let symbol = buf[(at, y)].symbol();
+                    text.push_str(symbol);
+                    at += u16::try_from(symbol.width().max(1)).unwrap_or(1);
+                }
+                run.text = text;
+            }
+            runs.extend(row_runs);
+        }
+    }
+    runs
+}
+
 /// One laid-out element.
 #[derive(Debug)]
 struct Entry {
@@ -93,12 +164,15 @@ struct Entry {
     rows: usize,
     /// `(key, row within the entry, caption)` of each reserved image block.
     images: Vec<(String, usize, String)>,
-    /// Collapsible id a click on this entry toggles.
-    collapsible: Option<String>,
+    /// Collapsible id a click on this entry toggles, with its active row span.
+    collapsible: Option<(String, usize, usize)>,
     /// `(id, first row, one past the last)` of collapsible elements folded
     /// inside this entry — an expanded "Worked for" group's members, whose
     /// rows toggle themselves rather than the group.
     sub_regions: Vec<(String, usize, usize)>,
+    /// Interactive pipeline stage targets and their wrapped cell runs.
+    stage_targets: Vec<StageTarget>,
+    stage_runs: Vec<StageCellRun>,
     /// The images are markdown references the TUI fetches itself.
     markdown_images: bool,
     /// Link targets, indexed by the markers of `marked`.
@@ -164,7 +238,20 @@ impl Entry {
             })
             .collect();
         let (marked, link_targets) = links::mark_lines(&laid.lines).unzip();
-        let collapsible = collapsible_id(elem).map(str::to_string);
+        let collapsible_key = collapsible_id(elem).map(str::to_string);
+        let region_row_span = |start: usize, end: usize| {
+            let last = end - 1;
+            let past = line_starts[last] + line_rows(&laid.lines[last], width);
+            (line_starts[start], past)
+        };
+        let collapsible = collapsible_key.as_ref().map(|id| {
+            let (start, end) = laid
+                .regions
+                .iter()
+                .find(|(reg_id, _, _)| reg_id == id)
+                .map_or((0, rows), |&(_, s, e)| region_row_span(s, e));
+            (id.clone(), start, end)
+        });
         let sub_regions = laid
             .regions
             .iter()
@@ -172,15 +259,15 @@ impl Entry {
             // entry's `collapsible` — only the ids of elements folded
             // *inside* it (an expanded "Worked for" group's members)
             // become sub-regions.
-            .filter(|(id, _, _)| collapsible.as_ref() != Some(id))
+            .filter(|(id, _, _)| collapsible_key.as_ref() != Some(id))
             // `element_lines` records a region only around lines it pushed,
             // so `start < end <= laid.lines.len()`.
             .map(|(id, start, end)| {
-                let last = end - 1;
-                let past = line_starts[last] + line_rows(&laid.lines[last], width);
-                (id.clone(), line_starts[*start], past)
+                let (s, e) = region_row_span(*start, *end);
+                (id.clone(), s, e)
             })
             .collect();
+        let stage_runs = scan_stage_runs(&laid.stage_lines, &line_starts, width);
         let entry = Self {
             revision,
             state,
@@ -190,6 +277,8 @@ impl Entry {
             images,
             collapsible,
             sub_regions,
+            stage_targets: laid.stage_targets,
+            stage_runs,
             markdown_images: matches!(
                 elem,
                 ChatElement::AssistantText { .. } | ChatElement::WorkedFor { .. }
@@ -298,8 +387,10 @@ impl Entry {
             line_starts: Vec::new(),
             rows: 0,
             images: Vec::new(),
-            collapsible: collapsible_id(elem).map(str::to_string),
+            collapsible: collapsible_id(elem).map(|id| (id.to_string(), 0, 0)),
             sub_regions: Vec::new(),
+            stage_targets: Vec::new(),
+            stage_runs: Vec::new(),
             markdown_images: true,
             link_targets: Vec::new(),
             marked: None,
@@ -752,6 +843,63 @@ impl ChatLayout {
             })
     }
 
+    /// Pipeline stage cells of the elements overlapping document rows
+    /// `[top, top + height)`, placed on screen inside `area`.
+    #[must_use]
+    pub fn stage_runs(&self, top: usize, height: usize, area: Rect) -> Vec<ScreenStageRun> {
+        let bottom = top.saturating_add(height);
+        let mut out = Vec::new();
+        if self.entries.is_empty() || top >= self.element_rows {
+            return out;
+        }
+        for (index, entry) in self.entries.iter().enumerate().skip(self.entry_at(top)) {
+            let start = self.offsets[index];
+            if start >= bottom {
+                break;
+            }
+            for run in &entry.stage_runs {
+                let row = start + run.row;
+                if row < top || row >= bottom {
+                    continue;
+                }
+                let Some(target) = entry.stage_targets.get(run.target_idx) else {
+                    continue;
+                };
+                let y = self.top_padding + row - top;
+                out.push(ScreenStageRun {
+                    x: area.x + run.col,
+                    y: area.y + u16::try_from(y).unwrap_or(u16::MAX),
+                    width: run.width,
+                    text: run.text.clone(),
+                    entry: index,
+                    step: target.step,
+                    clickable: target.clickable,
+                });
+            }
+        }
+        out
+    }
+
+    /// The pipeline stage whose cells include column `col` of document row `row`.
+    #[must_use]
+    pub fn stage_at(&self, row: usize, col: u16) -> Option<StageHit> {
+        if row >= self.element_rows {
+            return None;
+        }
+        let index = self.entry_at(row);
+        let entry = self.entries.get(index)?;
+        let local = row - self.offsets[index];
+        let run = entry
+            .stage_runs
+            .iter()
+            .find(|run| run.row == local && (run.col..run.col + run.width).contains(&col))?;
+        let target = entry.stage_targets.get(run.target_idx)?.clone();
+        Some(StageHit {
+            entry: index,
+            target,
+        })
+    }
+
     /// Row span of every collapsible element, for click hit-testing.
     /// Elements inside an expanded "Worked for" group appear as their own
     /// regions — the innermost span containing a row wins, so a click on a
@@ -760,11 +908,11 @@ impl ChatLayout {
     pub fn collapse_regions(&self) -> Vec<ClickRegion> {
         let mut out = Vec::new();
         for (entry, &offset) in self.entries.iter().zip(&self.offsets) {
-            if let Some(id) = &entry.collapsible {
+            if let Some((id, start, end)) = &entry.collapsible {
                 out.push(ClickRegion {
                     element_id: id.clone(),
-                    start: offset,
-                    end: offset + entry.rows,
+                    start: offset + start,
+                    end: offset + end,
                 });
             }
             out.extend(

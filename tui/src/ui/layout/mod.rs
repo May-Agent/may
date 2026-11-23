@@ -173,11 +173,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let scroll = app.scroll;
     let model_display = app.model_display();
-    // A notice wins; otherwise the hovered link shows its full target.
+    // A notice wins; otherwise the hovered link or pipeline stage shows its target.
     let status_message = app
         .status_text()
         .map(str::to_string)
-        .or_else(|| app.hovered_link().map(|hit| hit.display()));
+        .or_else(|| app.hovered_link().map(|hit| hit.display()))
+        .or_else(|| app.hovered_stage().map(|hit| hit.status_hint()));
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
@@ -303,9 +304,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         fireworks.paint(frame.buffer_mut(), content_area);
     }
 
-    // Last, so a popup or image drawn over a link is left alone.
+    // Last, so a popup or image drawn over a link or stage is left alone.
     if matches!(app.mode, AppMode::Chat) {
         let top = app.effective_scroll();
+        let stage_runs =
+            app.chat_layout
+                .stage_runs(top, content_area.height as usize, content_area);
+        let hovered_stage = app.hovered_stage().map(|hit| (hit.entry, hit.target.step));
+        chat::paint_hovered_stage(frame.buffer_mut(), &stage_runs, hovered_stage);
+
         let runs = app
             .chat_layout
             .link_runs(top, content_area.height as usize, content_area);

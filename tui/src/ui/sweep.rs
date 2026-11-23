@@ -9,6 +9,19 @@ const SWEEP_WIDTH: usize = 3;
 /// Animation frames the highlight rests on one position.
 const FRAMES_PER_STEP: usize = 2;
 
+/// `(start, end)` grapheme indices of the highlight window at `frame` over `len`
+/// graphemes.
+#[must_use]
+pub fn sweep_window(len: usize, frame: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let head = (frame / FRAMES_PER_STEP) % (len + SWEEP_WIDTH);
+    let start = head.saturating_sub(SWEEP_WIDTH).min(len);
+    let end = head.min(len);
+    (start, end)
+}
+
 /// `text` as spans, with a highlight moving from left to right and repeating.
 ///
 /// It enters at the left edge, leaves at the right one, then starts over.
@@ -22,9 +35,7 @@ pub fn sweep_spans(text: &str, frame: usize, base: Style, highlight: Style) -> V
     if len == 0 {
         return Vec::new();
     }
-    let head = (frame / FRAMES_PER_STEP) % (len + SWEEP_WIDTH);
-    let start = head.saturating_sub(SWEEP_WIDTH).min(len);
-    let end = head.min(len);
+    let (start, end) = sweep_window(len, frame);
     let byte = |index: usize| offsets.get(index).copied().unwrap_or(text.len());
     let (start, end) = (byte(start), byte(end));
     [
@@ -36,6 +47,53 @@ pub fn sweep_spans(text: &str, frame: usize, base: Style, highlight: Style) -> V
     .filter(|(part, _)| !part.is_empty())
     .map(|(part, style)| Span::styled(part.to_string(), style))
     .collect()
+}
+
+/// Apply the sweeping `highlight` over `spans` whose text forms a subslice of
+/// a `total_graphemes`-long stage starting at `grapheme_offset`, keeping each
+/// span's existing style outside the highlight window.
+#[must_use]
+pub fn sweep_styled_slice(
+    spans: &[Span<'static>],
+    grapheme_offset: usize,
+    total_graphemes: usize,
+    frame: usize,
+    highlight: Style,
+) -> (Vec<Span<'static>>, usize) {
+    let (win_start, win_end) = sweep_window(total_graphemes, frame);
+    let mut cursor = grapheme_offset;
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        let text = span.content.as_ref();
+        if text.is_empty() {
+            continue;
+        }
+        let offsets: Vec<usize> = text.grapheme_indices(true).map(|(at, _)| at).collect();
+        let span_len = offsets.len();
+        let span_start = cursor;
+        let span_end = cursor + span_len;
+        cursor = span_end;
+
+        let lit_start = win_start.max(span_start);
+        let lit_end = win_end.min(span_end);
+        if lit_start >= lit_end {
+            out.push(span.clone());
+            continue;
+        }
+        let byte = |local: usize| offsets.get(local).copied().unwrap_or(text.len());
+        let b_start = byte(lit_start - span_start);
+        let b_end = byte(lit_end - span_start);
+        for (part, style) in [
+            (&text[..b_start], span.style),
+            (&text[b_start..b_end], highlight),
+            (&text[b_end..], span.style),
+        ] {
+            if !part.is_empty() {
+                out.push(Span::styled(part.to_string(), style));
+            }
+        }
+    }
+    (out, cursor)
 }
 
 #[cfg(test)]
@@ -83,5 +141,27 @@ mod tests {
         assert_eq!(lit("a👍🏽e\u{301}b", 3 * FRAMES_PER_STEP), "a👍🏽e\u{301}");
         assert_eq!(lit("こんにちは", 2 * FRAMES_PER_STEP), "こん");
         assert_eq!(lit("안녕하세요", 4 * FRAMES_PER_STEP), "녕하세");
+    }
+
+    #[test]
+    fn sweep_styled_slice_preserves_syntax_style_outside_window() {
+        let base_a = Style::default().fg(Color::Cyan);
+        let base_b = Style::default().fg(Color::Green);
+        let highlight = Style::default().fg(Color::White);
+        let spans = vec![Span::styled("cargo ", base_a), Span::styled("检查", base_b)];
+        // "cargo 检查" has 8 graphemes; at frame = 7 * FRAMES_PER_STEP,
+        // head = 7 -> window is [4..7) -> "o 检".
+        let (out, end_offset) = sweep_styled_slice(&spans, 0, 8, 7 * FRAMES_PER_STEP, highlight);
+        assert_eq!(end_offset, 8);
+        let lit: String = out
+            .iter()
+            .filter(|s| s.style == highlight)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(lit, "o 检");
+        assert_eq!(out[0].style, base_a);
+        assert_eq!(out[0].content.as_ref(), "carg");
+        assert_eq!(out.last().unwrap().style, base_b);
+        assert_eq!(out.last().unwrap().content.as_ref(), "查");
     }
 }
