@@ -465,6 +465,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 3 },
+            retained_pid: None,
             interruptions: Vec::new(),
         }));
         assert_eq!(
