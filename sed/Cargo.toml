@@ -25,5 +25,34 @@ path = "src/main.rs"
 [dev-dependencies]
 tempfile = "3"
 
-[lints]
-workspace = true
+# Standalone workspace so main-workspace edits never resolve or compile may-sed
+# or its uucore dependency tree.
+[workspace]
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "warn"
+style = "warn"
+correctness = "warn"
+complexity = "warn"
+suspicious = "warn"
+perf = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+multiple_crate_versions = { level = "allow", priority = 1 }
+
+[profile.ci-check]
+inherits = "dev"
+debug = false
+incremental = false
+
+[profile.artifact]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

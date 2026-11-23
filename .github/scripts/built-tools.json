@@ -15,6 +15,7 @@
     {
       "tool": "aither-sed",
       "package": "may-sed",
+      "manifest": "sed/Cargo.toml",
       "bin": "aither-sed",
       "targets": [
         "aarch64-apple-darwin",

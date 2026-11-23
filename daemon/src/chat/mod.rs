@@ -3,18 +3,18 @@ pub mod cards;
 mod hosts;
 mod hub;
 mod progress;
-mod recap;
+pub mod recap;
 mod request_ledger;
 mod retry;
 mod sidecar;
-mod suggest;
+pub mod suggest;
 pub use background::SessionBackgrounds;
 pub use background::spawn_watcher as spawn_background_watcher;
 pub use background::{
     cancel_subagent, cancel_subagents, get_background, get_job, kill_job, read_job,
 };
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub use hosts::{ParkedAgents, context_report, release_agent, usage_report};
+pub use hosts::{ParkedAgents, context_report, usage_report};
 pub use hub::TurnHub;
 pub use may_protocol::progress::ProgressReport;
 pub use may_protocol::recap::RecapRecord;
@@ -23,6 +23,10 @@ pub use sidecar::AuxTasks;
 mod tool_dispatch;
 mod turn_events;
 mod turn_persister;
+#[cfg(test)]
+pub mod sidecar_for_test {
+    pub use super::sidecar::AuxKind;
+}
 #[cfg(test)]
 mod warm_aux_tests;
 
@@ -1105,7 +1109,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> Option<ApiMessage> {
 
 /// The response that refuses a client turn: a conflict when another run holds
 /// the session, an internal error when acquiring the run failed.
-fn acquire_refusal(error: AcquireError) -> skyzen::Error {
+pub fn acquire_refusal(error: AcquireError) -> skyzen::Error {
     match error {
         AcquireError::Busy(_) => active_session_conflict_error(),
         AcquireError::Storage(error) => internal_error(error),
@@ -1415,6 +1419,34 @@ fn daemon_exit_alert() -> String {
     DaemonExitReminder
         .render()
         .expect("daemon exit reminder must render")
+}
+
+struct RewindPr<'a> {
+    sigil: char,
+    number: i64,
+    title: &'a str,
+    state: crate::db::PrState,
+}
+
+#[derive(Template)]
+#[template(path = "reminder_rewind.txt", escape = "none")]
+struct RewindReminder<'a> {
+    prs: &'a [RewindPr<'a>],
+}
+
+fn rewind_alert(prs: &[crate::db::PrRow]) -> String {
+    let items: Vec<RewindPr<'_>> = prs
+        .iter()
+        .map(|pr| RewindPr {
+            sigil: crate::db::pr_sigil(&pr.backend),
+            number: pr.number,
+            title: pr.title.as_str(),
+            state: pr.state,
+        })
+        .collect();
+    RewindReminder { prs: &items }
+        .render()
+        .expect("rewind reminder must render")
 }
 
 /// Starts again the sessions an unexpected daemon exit interrupted whose
@@ -3506,12 +3538,15 @@ struct ConsumedAlerts {
     browser_takeover: bool,
     /// The alert that the daemon exited unexpectedly.
     daemon_exit: bool,
+    /// The alert that the conversation was rewound to an earlier prompt.
+    rewind: bool,
 }
 
 impl ConsumedAlerts {
     const fn merge(&mut self, other: Self) {
         self.browser_takeover |= other.browser_takeover;
         self.daemon_exit |= other.daemon_exit;
+        self.rewind |= other.rewind;
     }
 
     /// Owes `session_id` the consumed alerts again: the turn that carried
@@ -3529,6 +3564,9 @@ impl ConsumedAlerts {
         }
         if self.daemon_exit {
             state.db().restore_daemon_exit_alert(session_id).await?;
+        }
+        if self.rewind {
+            state.db().restore_rewind_alert(session_id).await?;
         }
         Ok(())
     }
@@ -4087,6 +4125,28 @@ pub async fn resolve_session_context(
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
+    let rewind_alert_consumed = persist_user_message
+        && db
+            .take_rewind_alert(session_id.as_str())
+            .await
+            .map_err(UiChatPreparationError::PersistHiddenContext)?;
+    if rewind_alert_consumed {
+        let prs = db
+            .list_session_prs(session_id.as_str())
+            .await
+            .unwrap_or_default();
+        push_hidden_context_part(
+            &db,
+            fence,
+            &history,
+            &mut hidden_context_parts,
+            rewind_alert(&prs),
+            persist_user_message,
+            &mut hidden_commit_entry,
+        )
+        .await
+        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+    }
 
     if let Some(hidden_context_xml) = req
         .hidden_context_xml
@@ -4175,6 +4235,11 @@ pub async fn resolve_session_context(
         };
         match append_res {
             Ok(row) => {
+                state.session_background.record_prompt_start(
+                    session_id.as_str(),
+                    i64::from(row.id),
+                    std::time::Instant::now(),
+                );
                 if session.title.is_none() {
                     // The prompt row lands first: a client reloading history on the
                     // title's `updated_at` drift already sees the message.
@@ -4246,6 +4311,7 @@ pub async fn resolve_session_context(
         consumed_alerts: ConsumedAlerts {
             browser_takeover: takeover_alert_consumed,
             daemon_exit: daemon_exit_alert_consumed,
+            rewind: rewind_alert_consumed,
         },
         session_id,
         current_model,
@@ -4684,6 +4750,15 @@ fn prepare_agent_for_request<'a>(
         };
 
         let provider_id = agent.provider_id().to_string();
+        if let Some(msg_id) = ctx.user_message_id
+            && let Err(error) = state
+                .db()
+                .record_prompt_watermark(fence, i64::from(msg_id), agent.next_transcript_seq())
+                .await
+            && !error.is_disk_exhausted()
+        {
+            return Err(UiChatPreparationError::AppendUserMessage(error));
+        }
 
         let (prompt, attachments) = if kind.is_resume() {
             (String::new(), Vec::new())
@@ -4822,9 +4897,6 @@ fn build_session_agent<'a>(
         state
             .runtime_service
             .set_terminal_grants(ctx.session_id.as_str(), agent.grants());
-        state
-            .session_background
-            .add_jobs(ctx.session_id.as_str(), agent.jobs());
 
         if let Some(snapshot) = ctx.context_snapshot.as_ref() {
             // Restore the checkpoint, then append only transcript entries
@@ -4863,6 +4935,11 @@ fn build_session_agent<'a>(
                 agent.push_message(message.clone());
             }
         }
+
+        state
+            .session_background
+            .attach_agent_jobs(ctx.session_id.as_str(), &mut agent)
+            .await;
 
         Ok(agent)
     })
@@ -7978,6 +8055,204 @@ mod tests {
             history.messages().is_empty(),
             "ask_user_request written during cancelled preparation must be removed: {:?}",
             history.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_evicts_parked_agent_truncates_model_context_and_injects_one_shot_alert() {
+        let provider_a = stub_provider(vec![
+            sse_text("first answer"),
+            sse_text("abandoned second answer"),
+            sse_text("fresh second answer"),
+            sse_text("third answer"),
+        ])
+        .await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+
+        // Turn 1
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire("session")
+                .await
+                .expect("acquire 1");
+            let req = ChatRequest {
+                session_id: "session".to_string(),
+                content: "keep first prompt".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            run_agent_loop(
+                &state,
+                &req,
+                &mut TestSink::default(),
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            )
+            .await
+            .expect("turn 1");
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish 1");
+        }
+        let _ = provider_a.bodies.recv().await.expect("body 1");
+
+        // Turn 2 (will be rewound; includes CJK text)
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire("session")
+                .await
+                .expect("acquire 2");
+            let req = ChatRequest {
+                session_id: "session".to_string(),
+                content: "丢弃提示 破棄プロンプト 폐기프롬프트".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            run_agent_loop(
+                &state,
+                &req,
+                &mut TestSink::default(),
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            )
+            .await
+            .expect("turn 2");
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish 2");
+        }
+        let _ = provider_a.bodies.recv().await.expect("body 2");
+        assert!(state.parked_agents.contains("session"));
+
+        let second_user_id = state
+            .db()
+            .get_messages("session")
+            .await
+            .expect("rows")
+            .into_iter()
+            .filter(|r| r.role == "user")
+            .nth(1)
+            .expect("second user row")
+            .id;
+
+        crate::sessions::rewind_inner(
+            &state,
+            "session",
+            &crate::types::RewindRequest {
+                entry_id: second_user_id.to_string(),
+            },
+        )
+        .await
+        .expect("rewind succeeds");
+
+        assert!(
+            !state.parked_agents.contains("session"),
+            "rewind must evict the warm parked agent"
+        );
+
+        // Replacement Turn 2 from any client (no client-side hidden_context_xml)
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire("session")
+                .await
+                .expect("acquire replacement");
+            let req = ChatRequest {
+                session_id: "session".to_string(),
+                content: "replacement second prompt".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            run_agent_loop(
+                &state,
+                &req,
+                &mut TestSink::default(),
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            )
+            .await
+            .expect("replacement turn");
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish replacement");
+        }
+        let replacement_body = provider_a.bodies.recv().await.expect("replacement body");
+        assert!(replacement_body.contains("keep first prompt"));
+        assert!(replacement_body.contains("first answer"));
+        assert!(
+            !replacement_body.contains("丢弃提示"),
+            "rewound prompt must not appear in rebuilt model context: {replacement_body}"
+        );
+        assert!(
+            !replacement_body.contains("abandoned second answer"),
+            "rewound reply must not appear in rebuilt model context: {replacement_body}"
+        );
+        assert!(
+            replacement_body.contains("The conversation was rewound to an earlier prompt."),
+            "daemon must inject one-shot rewind world-state alert: {replacement_body}"
+        );
+
+        // Turn 3 verifies the rewind alert was one-shot (not injected a second time)
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire("session")
+                .await
+                .expect("acquire 3");
+            let req = ChatRequest {
+                session_id: "session".to_string(),
+                content: "third prompt".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            let _agent = run_agent_loop(
+                &state,
+                &req,
+                &mut TestSink::default(),
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            )
+            .await
+            .expect("turn 3");
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish 3");
+        }
+        let third_body = provider_a.bodies.recv().await.expect("third body");
+        assert_eq!(
+            third_body
+                .matches("The conversation was rewound to an earlier prompt.")
+                .count(),
+            1,
+            "rewind alert must only appear once in history, not re-injected on turn 3"
         );
     }
 }

@@ -143,3 +143,5 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_tasks_word ON scheduled_tasks(se
 CREATE TABLE IF NOT EXISTS pr_check_state (pr_id INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, rollup TEXT NOT NULL, unreadable BOOLEAN NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS pr_check_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, pr_id INTEGER NOT NULL, text TEXT NOT NULL, alerted BOOLEAN NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_pr_check_alerts_session ON pr_check_alerts(session_id, alerted);
+CREATE TABLE IF NOT EXISTS session_prompt_watermarks (session_id TEXT NOT NULL, message_id INTEGER NOT NULL, transcript_seq INTEGER NOT NULL, PRIMARY KEY (session_id, message_id));
+CREATE TABLE IF NOT EXISTS session_rewind_alerts (session_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
