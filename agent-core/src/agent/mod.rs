@@ -3,7 +3,7 @@
 pub mod acp_known;
 pub mod acp_sandbox;
 pub mod acp_subagent;
-mod agents_md;
+pub(crate) mod agents_md;
 pub mod ask_user_tool;
 pub mod browser_tool;
 pub use may_protocol::cache_miss;
@@ -63,7 +63,7 @@ mod request_parameters_tests;
 mod rules_import_session_tests;
 /// Runs an agent to completion.
 pub mod runner;
-mod runtime_context;
+pub(crate) mod runtime_context;
 #[cfg(test)]
 mod secret_redaction_tests;
 pub mod serve_tool;

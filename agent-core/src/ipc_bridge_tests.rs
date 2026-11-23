@@ -129,4 +129,31 @@ mod tests {
             "{output}"
         );
     }
+
+    /// A command scoped to subagents serves their calls and answers the main
+    /// agent's with the refusal naming it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_only_command_serves_subagents_and_refuses_the_main_agent() {
+        let mut commands = CommandRegistryBuilder::new();
+        commands.subagent_only(|reserved| reserved.configure_tool(NoteTool));
+        let session = tempfile::tempdir().expect("session dir");
+        let built = crate::test_support::TestCommands::build(commands, session.path()).await;
+
+        let refused = built
+            .call(&crate::test_support::main_launch(), "note", &["hello"])
+            .await;
+        assert!(!refused.ok, "{refused:?}");
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("reserved for subagents")),
+            "{refused:?}"
+        );
+
+        let answer = built
+            .call(&crate::test_support::subagent_launch(), "note", &["hello"])
+            .await;
+        assert!(answer.ok, "{answer:?}");
+    }
 }

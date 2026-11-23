@@ -36,6 +36,8 @@ use super::report::{
 use super::tier::{Tier, TierModels};
 use crate::agent::ModelSlot;
 use crate::agent::acp_subagent::AcpSession;
+use crate::agent::agents_md;
+use crate::agent::runtime_context::{AgentsMdBlocks, agents_md_source, build_agents_md_blocks};
 use crate::agent::subagent_tracker::{RunCard, RunUsage, SubagentTracker};
 use crate::harness::compact_tool::CompactSignal;
 use crate::harness::language::{LanguageGuard, WorkingText};
@@ -153,6 +155,10 @@ pub struct SubagentSettings<LLM> {
     /// The session's secrets: tool results a subagent sees and the output it
     /// returns are redacted with it, fail closed.
     pub redactor: crate::secrets::SecretRedactor,
+    /// The host git a run's diff is taken with.
+    pub git: crate::host_git::HostGit,
+    /// Where the global `AGENTS.md` is read for a named subagent.
+    pub global_agents: Option<PathBuf>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -228,8 +234,22 @@ struct Held<LLM: LanguageModel + 'static> {
     tier: Option<Tier>,
     model: Option<String>,
     ledger: Option<CommitLedger>,
+    /// The directories its grant hands over, a run's diff covers them.
+    granted: Vec<PathBuf>,
     working_copies: Vec<PathBuf>,
     body: Body<LLM>,
+}
+
+impl<LLM: LanguageModel + 'static> Held<LLM> {
+    /// The directories a run's diff is taken of: the granted worktrees, then
+    /// the working copies the space was prepared with.
+    fn diff_roots(&self) -> Vec<PathBuf> {
+        self.granted
+            .iter()
+            .chain(&self.working_copies)
+            .cloned()
+            .collect()
+    }
 }
 
 impl<LLM: LanguageModel + 'static> Expires for Held<LLM> {
@@ -252,6 +272,11 @@ struct Pending<LLM: LanguageModel + 'static> {
     model: String,
     shell: SessionShell,
     source: Source,
+    /// The directories the grant hands over, a run's diff covers them.
+    granted: Vec<PathBuf>,
+    /// The `AGENTS.md` blocks a named call's context gets; empty for a fork,
+    /// which inherits the parent's.
+    agents: AgentsMdBlocks,
 }
 
 enum Source {
@@ -474,6 +499,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             tier: None,
             model: session.model(),
             ledger,
+            granted: requested.granted(Some(working_dir)),
             working_copies,
             body: Body::External {
                 session: Box::new(session),
@@ -592,14 +618,29 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             Source::Definition(definition)
                 if definition.access == SubagentAccess::ReadOnly
         );
+        let working_dir = self.caller_dir(caller);
+        let granted = grant.granted(Some(working_dir));
         let shell = self
-            .launch(
-                grant.grant(Some(self.caller_dir(caller))),
-                caller,
-                &name,
-                confined,
-            )
+            .launch(grant.grant(Some(working_dir)), caller, &name, confined)
             .await?;
+        // A named subagent works under the rules of where it works: its
+        // granted worktree or cloned working copy, else the directory the
+        // call ran in. A fork inherits the parent's blocks instead.
+        let agents = match &source {
+            Source::Definition(_) => {
+                let root = granted
+                    .first()
+                    .cloned()
+                    .or_else(|| {
+                        shell
+                            .prepared_space()
+                            .and_then(|space| space.working_copies().first().cloned())
+                    })
+                    .unwrap_or_else(|| working_dir.to_path_buf());
+                load_agents_md(self.settings().global_agents.as_deref(), &root).await
+            }
+            Source::Fork(_) => AgentsMdBlocks::default(),
+        };
         Ok(Pending {
             name,
             tier,
@@ -607,6 +648,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             model,
             shell,
             source,
+            granted,
+            agents,
         })
     }
 
@@ -621,6 +664,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             model,
             shell,
             source,
+            granted,
+            agents,
         } = pending;
         let floor = match &source {
             Source::Definition(_) => ContextPolicy::default().compaction_floor,
@@ -654,6 +699,15 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                     .instruction(definition.prompt.clone());
                 for block in &settings.instructions {
                     builder = builder.instruction(block.clone());
+                }
+                if let Some(rules) = agents.rules() {
+                    builder = builder.instruction(rules.to_string());
+                }
+                if let Some(global) = agents.global() {
+                    builder = builder.external_content("global_agents_md", global.clone());
+                }
+                if let Some(root) = agents.root() {
+                    builder = builder.external_content("agents_md", root.clone());
                 }
             }
             Source::Fork(snapshot) => {
@@ -697,6 +751,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             tier,
             model: Some(model),
             ledger,
+            granted,
             working_copies,
             body: Body::Agent(Box::new(session)),
         }
@@ -851,6 +906,9 @@ impl<LLM: LanguageModel + Clone + 'static> SubagentCommand<LLM> {
             Ready::Fresh(pending) => self.build(*pending, run.identity(), usage),
         };
         let settings = &service.settings;
+        // Where the granted and cloned worktrees stand before the run: the
+        // report's diff is taken against it.
+        let baseline = super::diff::baseline(&settings.git, held.diff_roots()).await;
         settings
             .work
             .record(WorkEvent::SubagentStarted(name.clone()));
@@ -896,6 +954,7 @@ impl<LLM: LanguageModel + Clone + 'static> SubagentCommand<LLM> {
             lease: lease.clone(),
             ledger,
             mark,
+            baseline,
             card_seed,
         };
         match awaited {
@@ -944,6 +1003,8 @@ struct Finish<LLM: LanguageModel + 'static> {
     lease: aither_core::IdLease,
     ledger: Option<CommitLedger>,
     mark: Option<CommitMark>,
+    /// Where the granted and cloned worktrees stood before the run.
+    baseline: Vec<super::diff::Baseline>,
     card_seed: Option<CardSeed>,
 }
 
@@ -967,8 +1028,11 @@ impl<LLM: LanguageModel + 'static> Finish<LLM> {
                 tracing::info!(subagent = %self.name, stopped, "Stopped background jobs left by a subagent");
             }
         }
-        // Whatever way the run ended, the commits it made are reported.
+        // Whatever way the run ended, the commits it made and the diff it
+        // left in its worktrees are reported.
         let commits = CommitListing::of(self.ledger.as_ref(), self.mark.as_ref()).await;
+        let diffs = super::diff::diff(&settings.git, &self.baseline).await;
+        let diff = (!diffs.is_empty()).then_some(diffs.as_slice());
         let working_copies = held.working_copies.clone();
 
         let failure = match outcome {
@@ -999,6 +1063,7 @@ impl<LLM: LanguageModel + 'static> Finish<LLM> {
                     },
                     commits: commits.as_ref(),
                     working_copies: &working_copies,
+                    diff,
                 });
                 if let Some(card) = card {
                     card.done(text.clone());
@@ -1017,6 +1082,7 @@ impl<LLM: LanguageModel + 'static> Finish<LLM> {
                     outcome: SubagentReport::Cancelled,
                     commits: commits.as_ref(),
                     working_copies: &working_copies,
+                    diff,
                 })));
             }
             RunOutcome::Failed { error } => error.to_string(),
@@ -1077,6 +1143,28 @@ impl<LLM: LanguageModel + 'static> Finish<LLM> {
     }
 }
 
+/// The `AGENTS.md` blocks a named subagent's context starts with: the
+/// global rules and the files governing the directory it works in,
+/// discovered as the main agent's runtime context discovers them.
+async fn load_agents_md(global: Option<&Path>, root: &Path) -> AgentsMdBlocks {
+    let (global, index) = futures_lite::future::zip(
+        async move {
+            match global {
+                Some(path) => agents_md::load_global(path).await,
+                None => None,
+            }
+        },
+        agents_md::discover(root),
+    )
+    .await;
+    build_agents_md_blocks(
+        global.as_ref(),
+        &index,
+        &agents_md_source(Some(&root.display().to_string())),
+        &[],
+    )
+}
+
 impl<LLM: LanguageModel + Clone + Sync + 'static> CommandUsage for SubagentCommand<LLM> {
     /// The names a call can run at the moment of the call.
     async fn usage(&self) -> String {
@@ -1086,5 +1174,51 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> CommandUsage for SubagentComma
             fork: FORK_DESCRIPTION,
             externals: self.settings().externals.described().collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A named subagent's context is built on the same blocks the main
+    /// agent's is: the global rules and the file governing where it works,
+    /// each fenced as repository instructions, and the nested files indexed
+    /// under `project_rules`.
+    #[tokio::test]
+    async fn a_named_subagent_loads_global_and_worktree_agents_md() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("AGENTS.md");
+        std::fs::write(&global, "# Global rules\nAnswer plainly.").expect("global");
+        let root = temp.path().join("worktree");
+        std::fs::create_dir_all(root.join("docs")).expect("worktree");
+        std::fs::write(root.join("AGENTS.md"), "# Project rules\nRun cargo test.")
+            .expect("root AGENTS.md");
+        std::fs::write(
+            root.join("docs/AGENTS.md"),
+            "# Docs rules\nKeep docs short.",
+        )
+        .expect("nested AGENTS.md");
+
+        let blocks = load_agents_md(Some(&global), &root).await;
+
+        let global_block = blocks.global().expect("the global block loads");
+        assert!(global_block.is_repository_instructions());
+        assert_eq!(global_block.source(), "~/.may/AGENTS.md");
+        assert!(global_block.content().contains("Answer plainly."));
+
+        let root_block = blocks.root().expect("the worktree block loads");
+        assert!(root_block.is_repository_instructions());
+        assert_eq!(
+            root_block.source(),
+            root.join("AGENTS.md").display().to_string()
+        );
+        assert!(root_block.content().contains("Run cargo test."));
+
+        let rules = blocks.rules().expect("the project rules render");
+        assert!(
+            rules.contains("<project_rules>") && rules.contains("docs/AGENTS.md"),
+            "{rules}"
+        );
     }
 }

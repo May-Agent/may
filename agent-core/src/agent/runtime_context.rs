@@ -523,8 +523,28 @@ pub struct AgentsMdBlocks {
     handoff: Option<ExternalContent>,
 }
 
+impl AgentsMdBlocks {
+    /// The `<project_rules>` instruction text; `None` when no file was found.
+    #[must_use]
+    pub fn rules(&self) -> Option<&str> {
+        self.rules.as_deref()
+    }
+
+    /// The global rules block, `~/.may/AGENTS.md`.
+    #[must_use]
+    pub const fn global(&self) -> Option<&ExternalContent> {
+        self.global.as_ref()
+    }
+
+    /// The discovery root's own `AGENTS.md` block.
+    #[must_use]
+    pub const fn root(&self) -> Option<&ExternalContent> {
+        self.root.as_ref()
+    }
+}
+
 /// The source label of the launch directory's `AGENTS.md` block.
-fn agents_md_source(launch_dir: Option<&str>) -> String {
+pub fn agents_md_source(launch_dir: Option<&str>) -> String {
     launch_dir.map_or_else(
         || "AGENTS.md of the launch directory".to_string(),
         |dir| Path::new(dir).join("AGENTS.md").display().to_string(),
@@ -1086,6 +1106,134 @@ pub fn build_time(
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render time: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/subagent/reporting.md", escape = "none")]
+struct SubagentReportingTemplate;
+
+/// The reporting section of a subagent's instructions: it answers to the
+/// agent that launched it, through `send_message` mid-task and through its
+/// last turn response as the report.
+pub fn build_subagent_reporting() -> String {
+    SubagentReportingTemplate
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render subagent reporting: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/subagent/environment.md", escape = "none")]
+struct SubagentEnvironmentTemplate {
+    home: HomeEnvironment,
+    remote: Option<RemoteHosts>,
+}
+
+/// The environment section of a subagent's instructions: its own working
+/// directory, never the session's.
+pub fn build_subagent_environment(
+    environment: &AgentEnvironment,
+    remote_hosts: Vec<SshServerConfig>,
+) -> String {
+    SubagentEnvironmentTemplate {
+        home: HomeEnvironment::of(environment),
+        remote: RemoteHosts::connected(remote_hosts),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render subagent environment: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/subagent/terminal.md", escape = "none")]
+struct SubagentTerminalTemplate {
+    managed_bash: bool,
+    hashline: bool,
+}
+
+/// The terminal section of a subagent's instructions.
+pub fn build_subagent_terminal(environment: &AgentEnvironment, hashline: bool) -> String {
+    SubagentTerminalTemplate {
+        managed_bash: crate::command_policy::runs_managed_bash(matches!(
+            environment,
+            AgentEnvironment::Container { .. }
+        )),
+        hashline,
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render subagent terminal: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/subagent/permissions.md", escape = "none")]
+struct SubagentPermissionsTemplate<'a> {
+    home: HomeEnvironment,
+    secret_names: Vec<&'a str>,
+    network: Option<NetworkRestriction>,
+}
+
+/// The permissions section of a subagent's instructions: escalation asks
+/// the agent that launched it, not the user.
+pub fn build_subagent_permissions(
+    environment: &AgentEnvironment,
+    secret_names: Vec<&str>,
+    network_policy: Option<&CompiledNetworkPolicy>,
+) -> String {
+    SubagentPermissionsTemplate {
+        home: HomeEnvironment::of(environment),
+        secret_names,
+        network: network_policy.and_then(NetworkRestriction::of),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render subagent permissions: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/subagent/evidence.md", escape = "none")]
+struct SubagentEvidenceTemplate;
+
+/// The evidence section of a subagent's instructions.
+pub fn build_subagent_evidence() -> String {
+    SubagentEvidenceTemplate
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render subagent evidence: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/subagent/time.md", escape = "none")]
+struct SubagentTimeTemplate {
+    has_hosted_web_search: bool,
+}
+
+/// The time section of a subagent's instructions: UTC, never the user's
+/// timezone.
+pub fn build_subagent_time(request_parameters: &Parameters) -> String {
+    SubagentTimeTemplate {
+        has_hosted_web_search: request_parameters.hosted_web_search(),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render subagent time: {error}"))
+}
+
+/// The instruction blocks every named subagent's context starts with, after
+/// its definition's own prompt: the parent contract first, then the same
+/// mechanisms the main agent works under, scoped to an agent that reports
+/// to its parent and never to the user.
+pub fn build_subagent_instructions(
+    environment: &AgentEnvironment,
+    remote_hosts: Vec<SshServerConfig>,
+    hashline: bool,
+    secret_names: Vec<&str>,
+    network_policy: Option<&CompiledNetworkPolicy>,
+    request_parameters: &Parameters,
+) -> Vec<String> {
+    vec![
+        build_subagent_reporting(),
+        build_harness(),
+        build_subagent_evidence(),
+        build_subagent_environment(environment, remote_hosts),
+        build_subagent_terminal(environment, hashline),
+        build_subagent_permissions(environment, secret_names, network_policy),
+        build_subagent_time(request_parameters),
+    ]
 }
 
 /// A planning phase that adds a section.

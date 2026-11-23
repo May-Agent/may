@@ -61,6 +61,9 @@ pub struct SubagentResult<'a> {
     pub commits: Option<&'a CommitListing>,
     /// The working copies its space was prepared with.
     pub working_copies: &'a [PathBuf],
+    /// The diff it left in the granted and cloned worktrees; `None` when it
+    /// had none.
+    pub diff: Option<&'a [super::diff::WorktreeDiff]>,
 }
 
 /// One message of a failed run's history.
@@ -271,6 +274,7 @@ mod tests {
             },
             commits: None,
             working_copies: &copies,
+            diff: None,
         });
         assert!(
             text.contains("Two findings.") && text.contains("amber"),

@@ -153,6 +153,13 @@ impl Requested<'_> {
             .into_iter()
             .fold(grant, SubagentGrant::with_committing_worktree)
     }
+
+    /// The granted directories, resolved as [`grant`](Self::grant) resolves
+    /// them: the plain worktrees, then the committing ones.
+    pub fn granted(&self, working_dir: Option<&Path>) -> Vec<PathBuf> {
+        let (worktrees, commit_worktrees) = self.paths(working_dir);
+        worktrees.into_iter().chain(commit_worktrees).collect()
+    }
 }
 
 impl SubagentArgs {

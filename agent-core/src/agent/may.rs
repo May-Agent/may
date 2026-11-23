@@ -30,7 +30,8 @@ use super::runtime_context::{
     build_capabilities, build_commands, build_efficiency, build_environment, build_evidence,
     build_harness, build_identity, build_languages, build_permissions, build_plan_mode_context,
     build_prepared_tools, build_profile_memories, build_profile_persona, build_repo_clones_context,
-    build_session, build_terminal, build_time, build_work, build_workspace_workdirs_context, tag,
+    build_session, build_subagent_instructions, build_terminal, build_time, build_work,
+    build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -938,14 +939,14 @@ impl MayAgent {
                     &config.timezone,
                     config.location.as_ref(),
                 );
-                let subagent_instructions = vec![
-                    harness.clone(),
-                    evidence.clone(),
-                    environment_block.clone(),
-                    terminal.clone(),
-                    permissions_block.clone(),
-                    time.clone(),
-                ];
+                let subagent_instructions = build_subagent_instructions(
+                    &config.environment,
+                    config.ssh_servers.clone(),
+                    config.hashline,
+                    config.secrets.names(),
+                    config.network_policy.as_ref(),
+                    &config.request_parameters,
+                );
                 let mut runtime_system_context =
                     RuntimeSystemContext::new(memory_file, memory_content)
                         .with_memory_enabled(!config.memory_off)
@@ -1249,6 +1250,7 @@ impl MayAgent {
                         agent_messaging,
                         languages: Some(language_guard.clone()),
                         acp,
+                        session_prompts: config.session_prompts.clone(),
                         git: crate::host_git::HostGit::inherit(),
                         timeout_cap: budgets.limits().timeout_cap,
                         tasks_line_limit: config.limits.tasks_lines(),
