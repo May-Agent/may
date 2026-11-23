@@ -585,7 +585,6 @@ fn api_routes() -> Route {
                     Route::new((
                         "/context-report".at(super::chat::context_report),
                         "/usage".at(super::chat::usage_report),
-                        "/agent".delete(super::chat::release_agent),
                     )),
                     Route::new((
                         "/background".at(super::chat::get_background),

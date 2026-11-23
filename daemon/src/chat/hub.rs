@@ -291,6 +291,33 @@ impl TurnHub {
         });
     }
 
+    /// Advances `session_id`'s replay boundary past all previously published
+    /// frames and broadcasts `reset` to live subscribers so attached clients
+    /// drop stale stream state and reload the truncated session.
+    pub fn reset(&self, session_id: &str) {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Reset<'a> {
+            session_id: &'a str,
+        }
+        let payload: Arc<str> = serde_json::to_string(&Reset { session_id })
+            .expect("reset frame serializes")
+            .into();
+        let published = self.with_session(session_id, |channel| {
+            channel.turn_open = false;
+            channel.last_index += 1;
+            channel.frames.push_back(Arc::new(TurnFrame {
+                index: channel.last_index,
+                kind: "reset",
+                data: payload,
+            }));
+            channel.cap();
+            channel.restart_replay();
+            channel.published.clone()
+        });
+        published.notify(usize::MAX);
+    }
+
     /// The index a subscriber naming it as `after` continues from to see a
     /// turn in progress from its first frame — or the newest index when no
     /// turn runs, 0 when the session has no frames yet.

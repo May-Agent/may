@@ -96,8 +96,10 @@ WEB_UI_EXTRA = frozenset(
     }
 )
 
-# `may-hashline` is a separate workspace; nothing in this graph reaches it.
+# `may-hashline` and `may-sed` are separate workspaces; nothing in the main
+# package graph reaches them (`sed/` runs its own manifest-scoped steps).
 HASHLINE_PREFIX = "hashline/"
+SED_PREFIX = "sed/"
 
 # Directories compiled into a crate's build from outside every package
 # directory: `include_dir!` embeds subagents/ and skills/, askama and
@@ -166,7 +168,7 @@ def reaches_runtime(path, owner):
         return owner not in CLIENT_ONLY_PACKAGES and not is_prose(path)
     if path.startswith(EMBEDDED_PREFIXES):
         return True
-    if path.startswith((WEB_UI_PREFIX, HASHLINE_PREFIX)):
+    if path.startswith((WEB_UI_PREFIX, HASHLINE_PREFIX, SED_PREFIX)):
         return False
     if is_prose(path):
         return False
@@ -213,13 +215,14 @@ def reverse_closure(roots, dependents):
     return seen
 
 
-def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED):
-    """Every gate on: the diff can reach anywhere."""
+def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true"):
+    """Every gate on: the diff can reach anywhere in the main workspace."""
     # `--exclude` composes with `--workspace` where `-p` cannot.
     excludes = " ".join(f"--exclude {name}" for name in sorted(linux_excluded))
     linux_scope = f"--workspace {excludes}".rstrip()
     return {
         "rust": "true",
+        "sed": sed,
         "fmt": "true",
         "clippy": "true",
         "ui-clippy": "true",
@@ -240,6 +243,7 @@ def empty_outputs(ui_args):
     """Nothing compiles: a prose-only, web-ui-agnostic or zero diff."""
     return {
         "rust": "false",
+        "sed": "false",
         "fmt": "false",
         "clippy": "false",
         "ui-clippy": "false",
@@ -265,9 +269,17 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
     owners = report["owners"]
     paths = list(owners)
     ui_args = package_args(set(ui_crates) & members)
+    sed_changed = any(
+        path.startswith(SED_PREFIX)
+        and not is_prose(path)
+        and path.rsplit("/", 1)[-1] not in METADATA_FILES
+        for path in paths
+    )
 
     if report["workspace"]:
-        return workspace_outputs(ui_args, linux_excluded)
+        return workspace_outputs(
+            ui_args, linux_excluded, sed="true" if sed_changed else "false"
+        )
 
     affected = set(report["affected"])
     # The rules file marks the root package for the embedded directories —
@@ -310,13 +322,14 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
     cargo_flags = f"{package_args(test_names)} {target_kinds}".strip()
     linux_cargo_flags = f"{package_args(test_names - linux_excluded)} {target_kinds}".strip()
 
-    rust = "true" if affected else "false"
+    has_rust_work = bool(affected) or sed_changed
     return {
-        "rust": rust,
-        "fmt": rust,
-        "clippy": rust,
+        "rust": "true" if affected else "false",
+        "sed": "true" if sed_changed else "false",
+        "fmt": "true" if has_rust_work else "false",
+        "clippy": "true" if has_rust_work else "false",
         "ui-clippy": "true" if ui_clippy else "false",
-        "test": rust,
+        "test": "true" if has_rust_work else "false",
         "e2e": "true" if e2e else "false",
         "acceptance": "true" if e2e else "false",
         "web_ui": "true" if web_ui else "false",

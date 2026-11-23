@@ -40,9 +40,6 @@ query() { jq "$@" | tr -d '\r'; }
 # The listed tools of this target, one compact JSON object per line.
 tools="$(query -c --arg target "$target" '.tools[] | select(.targets | index($target))' "$scripts/built-tools.json")"
 [ -n "$tools" ] || { echo "no tool in .github/scripts/built-tools.json is built for $target" >&2; exit 2; }
-packages=()
-while IFS= read -r package; do packages+=(-p "$package"); done < <(query -r '.package' <<<"$tools")
-metadata="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$root/Cargo.toml")"
 
 case "$abort" in
     immediate) flags=(-Zunstable-options -Cpanic=immediate-abort) ;;
@@ -62,15 +59,25 @@ esac
 export RUSTFLAGS="${flags[*]-} ${linker_flags[*]-}"
 export CARGO_TARGET_DIR="$out_dir/build"
 
-cargo +"$nightly" build "${packages[@]}" --profile artifact \
-    --target "$target" -Zbuild-std=std,panic_abort --timings \
-    --manifest-path "$root/Cargo.toml"
+# Group tools by their Cargo workspace manifest (`Cargo.toml` by default;
+# standalone tool workspaces such as `sed/Cargo.toml` carry their own lockfile).
+while IFS= read -r manifest_rel; do
+    packages=()
+    while IFS= read -r package; do
+        packages+=(-p "$package")
+    done < <(query -r --arg m "$manifest_rel" 'select((.manifest // "Cargo.toml") == $m) | .package' <<<"$tools")
+    cargo +"$nightly" build "${packages[@]}" --profile artifact \
+        --target "$target" -Zbuild-std=std,panic_abort --timings \
+        --manifest-path "$root/$manifest_rel"
+done < <(query -r '.manifest // "Cargo.toml"' <<<"$tools" | sort -u)
 
 mkdir -p "$out_dir"
 while IFS= read -r entry; do
     tool="$(query -r '.tool' <<<"$entry")"
     package="$(query -r '.package' <<<"$entry")"
+    manifest_rel="$(query -r '.manifest // "Cargo.toml"' <<<"$entry")"
     exe="$(query -r '.bin' <<<"$entry")${suffix}"
+    metadata="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$root/$manifest_rel")"
     version="$(query -r --arg package "$package" '.packages[] | select(.name == $package) | .version' <<<"$metadata")"
 
     bin="$CARGO_TARGET_DIR/$target/artifact/$exe"

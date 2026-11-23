@@ -527,3 +527,108 @@ async fn a_call_completing_after_the_page_still_shows_its_result() {
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+#[tokio::test]
+async fn rewind_refuses_concurrent_run_with_conflict_and_preserves_history() {
+    let state = state().await;
+    let row_ids = seed(&state, &sample_rows()).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
+
+    let guard = state
+        .runtime_service
+        .runs()
+        .acquire(SESSION)
+        .await
+        .expect("hold run lease");
+
+    let body = serde_json::to_string(&json!({ "entryId": row_ids[2].to_string() })).unwrap();
+    let result = router
+        .go(hyper::Request::builder()
+            .method("POST")
+            .uri(format!("/api/sessions/{SESSION}/actions/rewind"))
+            .header("content-type", "application/json")
+            .body(skyzen::Body::from(body))
+            .expect("request"))
+        .await;
+    let status = match result {
+        Ok(resp) => resp.status(),
+        Err(err) => err.status(),
+    };
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        state.db().get_messages(SESSION).await.expect("rows").len(),
+        6,
+        "concurrent run refusal leaves messages intact"
+    );
+
+    guard
+        .finish_idle(crate::session::RunOutcome::Completed)
+        .await
+        .expect("release");
+}
+
+#[tokio::test]
+async fn rewind_clears_pending_queue_cancels_aux_and_broadcasts_reset() {
+    let state = state().await;
+    let row_ids = seed(&state, &sample_rows()).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
+
+    state
+        .runtime_service
+        .enqueue(
+            SESSION,
+            may_protocol::session_runtime::PendingUserMessage {
+                id: None,
+                state: may_protocol::session_runtime::PendingMessageState::Pending,
+                error: None,
+                content: "stale queued follow-up".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                created_at: Timestamp::now().to_string(),
+                delivery_mode: may_protocol::session_runtime::PendingUserMessageMode::Queue,
+            },
+            may_protocol::session_runtime::PendingUserMessageMode::Queue,
+        )
+        .await
+        .expect("enqueue");
+
+    let handle = tokio::runtime::Handle::current();
+    let aux_id = state.aux_tasks.start(
+        SESSION,
+        super::chat::sidecar_for_test::AuxKind::Suggestion,
+        |_| async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        },
+        &handle,
+    );
+    assert!(state.aux_tasks.is_current(SESSION, aux_id));
+
+    let sub = state.turn_hub.subscribe_live(SESSION);
+
+    let body = serde_json::to_string(&json!({ "entryId": row_ids[2].to_string() })).unwrap();
+    let response = router
+        .go(hyper::Request::builder()
+            .method("POST")
+            .uri(format!("/api/sessions/{SESSION}/actions/rewind"))
+            .header("content-type", "application/json")
+            .body(skyzen::Body::from(body))
+            .expect("request"))
+        .await
+        .expect("rewind succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(!state.aux_tasks.is_current(SESSION, aux_id));
+    let runtime = state.runtime_service.get(SESSION).await.expect("runtime");
+    assert_eq!(
+        runtime.queued_messages,
+        [] as [may_client::session::PendingUserMessage; 0]
+    );
+    assert_eq!(runtime.queued_count, 0);
+    assert!(state.db().take_rewind_alert(SESSION).await.expect("alert"));
+
+    let frames = sub.take_unread().expect("subscription open");
+    assert!(
+        frames.iter().any(|frame| frame.kind == "reset"),
+        "attached clients receive reset frame: {frames:?}"
+    );
+}
