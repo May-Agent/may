@@ -289,11 +289,94 @@ impl AgentMessaging {
         question: &str,
         launcher: &SessionShell,
     ) -> Result<BtwAnswer, AgentLinkError> {
-        let live = self.directory.live().await?;
-        let recipient = super::addressed(&live, target)?;
-        if recipient.session_id == sender_session_id {
-            return Err(AgentLinkError::AskSelf);
+        let (resolved, local_machine) = self.resolve_recipient(sender_session_id, target).await?;
+        match resolved {
+            super::ResolvedRecipient::Local(recipient) => {
+                if recipient.session_id == sender_session_id {
+                    return Err(AgentLinkError::AskSelf);
+                }
+                let recipient_cold = self
+                    .is_cold(&recipient.session_id, recipient.activity)
+                    .await?;
+                if crate::agent::wake::decide(crate::agent::wake::WakeCause::AgentMessage {
+                    recipient_cold,
+                }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
+                {
+                    return Err(AgentLinkError::ColdBtwRecipient(recipient.name.clone()));
+                }
+                let host = self
+                    .forks
+                    .get(&recipient.session_id)
+                    .ok_or_else(|| AgentLinkError::NoForkContext(recipient.name.clone()))?;
+                let snapshot = host
+                    .source
+                    .latest()
+                    .ok_or_else(|| AgentLinkError::NoForkContext(recipient.name.clone()))?;
+                if !snapshot.allows_fork() {
+                    return Err(AgentLinkError::NearCompaction(recipient.name.clone()));
+                }
+                let sender = status_name(&self.runtime_service, sender_session_id).await?;
+                let prompt = BtwQuestionText {
+                    sender: AttributeText(&sender),
+                    sender_id: AttributeText(sender_session_id),
+                    question: UntrustedText(question),
+                }
+                .render()
+                .expect("btw question template must render");
+
+                let ForkOutcome::Answer(answer) = host
+                    .run_fork(&snapshot, launcher, ForkTask::Answer(&prompt))
+                    .await?
+                else {
+                    unreachable!("an answering fork gives an answer");
+                };
+                Ok(BtwAnswer {
+                    recipient: recipient.name,
+                    recipient_id: recipient.session_id,
+                    answer,
+                })
+            }
+            super::ResolvedRecipient::Remote(entry) => {
+                if entry.suspended {
+                    return Err(AgentLinkError::ColdBtwRecipient(entry.status.name));
+                }
+                let Some(peers) = self.directory.peers() else {
+                    return Err(AgentLinkError::NoSuchAgent(target.to_string()));
+                };
+                let sender_name = status_name(&self.runtime_service, sender_session_id).await?;
+                let sender_address = format!("{local_machine}:{sender_session_id}");
+                peers
+                    .btw_remote(
+                        &entry.machine,
+                        &entry.status.session_id,
+                        super::PeerBtwRequest {
+                            sender_name,
+                            sender_address,
+                            question: question.to_string(),
+                        },
+                    )
+                    .await
+            }
         }
+    }
+
+    /// Answers a cross-machine `btw` question arriving from a peer daemon using
+    /// a confined read-only fork of `target_session_id`'s own live context and
+    /// sandbox shell.
+    ///
+    /// # Errors
+    /// Returns [`AgentLinkError`] when the target is absent, cold, lacks fork
+    /// context, or is near compaction.
+    pub async fn answer_from_peer(
+        &self,
+        target_session_id: &str,
+        request: super::PeerBtwRequest,
+    ) -> Result<BtwAnswer, AgentLinkError> {
+        let live = self.directory.live().await?;
+        let recipient = live
+            .into_iter()
+            .find(|agent| agent.session_id == target_session_id)
+            .ok_or_else(|| AgentLinkError::NoSuchAgent(target_session_id.to_string()))?;
         let recipient_cold = self
             .is_cold(&recipient.session_id, recipient.activity)
             .await?;
@@ -301,7 +384,7 @@ impl AgentMessaging {
             recipient_cold,
         }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
         {
-            return Err(AgentLinkError::ColdBtwRecipient(recipient.name.clone()));
+            return Err(AgentLinkError::ColdBtwRecipient(recipient.name));
         }
         let host = self
             .forks
@@ -311,27 +394,31 @@ impl AgentMessaging {
             .source
             .latest()
             .ok_or_else(|| AgentLinkError::NoForkContext(recipient.name.clone()))?;
+        let target_launcher = host
+            .launcher
+            .0
+            .get()
+            .ok_or_else(|| AgentLinkError::NoForkContext(recipient.name.clone()))?;
         if !snapshot.allows_fork() {
-            return Err(AgentLinkError::NearCompaction(recipient.name.clone()));
+            return Err(AgentLinkError::NearCompaction(recipient.name));
         }
-        let sender = status_name(&self.runtime_service, sender_session_id).await?;
         let prompt = BtwQuestionText {
-            sender: AttributeText(&sender),
-            sender_id: AttributeText(sender_session_id),
-            question: UntrustedText(question),
+            sender: AttributeText(&request.sender_name),
+            sender_id: AttributeText(&request.sender_address),
+            question: UntrustedText(&request.question),
         }
         .render()
-        .expect("btw question template must render");
+        .map_err(|e| AgentLinkError::Fork(e.to_string()))?;
 
         let ForkOutcome::Answer(answer) = host
-            .run_fork(&snapshot, launcher, ForkTask::Answer(&prompt))
+            .run_fork(&snapshot, target_launcher, ForkTask::Answer(&prompt))
             .await?
         else {
             unreachable!("an answering fork gives an answer");
         };
         Ok(BtwAnswer {
-            recipient: recipient.name.clone(),
-            recipient_id: recipient.session_id.clone(),
+            recipient: recipient.name,
+            recipient_id: recipient.session_id,
             answer,
         })
     }

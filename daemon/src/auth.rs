@@ -284,18 +284,32 @@ impl Middleware for RequireIdentity {
 pub struct TailscaleServeIdentitySource {
     /// Swapped whole when the remote-access actor refreshes the allow-list.
     allowed: Arc<arc_swap::ArcSwap<HashSet<String>>>,
+    /// Resolved login owning this Tailscale node (`Self.UserID`), kept distinct
+    /// from shared `allowed_logins` so peer-agent routes admit only the owner.
+    owner: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 impl TailscaleServeIdentitySource {
     pub fn new(allowed: HashSet<String>) -> Self {
         Self {
             allowed: Arc::new(arc_swap::ArcSwap::from_pointee(allowed)),
+            owner: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         }
     }
 
     /// Replace the accepted logins (a changed allow-list or a resolved owner).
     pub fn set_allowed(&self, allowed: HashSet<String>) {
         self.allowed.store(Arc::new(allowed));
+    }
+
+    /// Records the resolved Tailscale owner login of this node.
+    pub fn set_owner(&self, owner: Option<String>) {
+        self.owner.store(Arc::new(owner));
+    }
+
+    /// Returns the last resolved Tailscale owner login of this node, if known.
+    pub fn owner(&self) -> Option<String> {
+        (**self.owner.load()).clone()
     }
 }
 
@@ -754,5 +768,37 @@ impl skyzen::extract::Extractor for Fronted {
                 .get::<Identity>()
                 .is_some_and(|identity| identity.source == IdentitySourceKind::FrontingDaemon),
         )))
+    }
+}
+
+/// Caller provenance extracted for `/api/peers/*` handlers so cross-machine
+/// agent operations reject shared `allowed_logins` users who do not own this node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerCaller {
+    /// Local unix-socket / loopback listener or fronting-daemon bearer token.
+    TrustedLocalOrFronting,
+    /// Authenticated Tailscale caller (`TailscaleServe` or `TailnetWhois`) whose
+    /// login must match this node's owner login.
+    Tailnet { login: String },
+}
+
+impl skyzen::extract::Extractor for PeerCaller {
+    type Error = std::convert::Infallible;
+
+    fn extract(
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
+        let caller = request.extensions().get::<Identity>().map_or(
+            Self::TrustedLocalOrFronting,
+            |identity| match identity.source {
+                IdentitySourceKind::FrontingDaemon => Self::TrustedLocalOrFronting,
+                IdentitySourceKind::TailscaleServe | IdentitySourceKind::TailnetWhois => {
+                    Self::Tailnet {
+                        login: identity.login.clone(),
+                    }
+                }
+            },
+        );
+        std::future::ready(Ok(caller))
     }
 }

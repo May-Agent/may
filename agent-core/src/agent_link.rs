@@ -75,8 +75,16 @@ pub enum AgentLinkError {
     #[error("no live agent named \"{0}\"; run `agent list`")]
     NoSuchAgent(String),
     /// Several live agents match the name.
-    #[error("several live agents are named \"{0}\"; address one by its id from `agent list`")]
+    #[error("{0}")]
     AmbiguousAgent(String),
+    /// A remote peer machine could not be reached or refused the request.
+    #[error("remote peer \"{machine}\" could not complete the agent request: {reason}")]
+    PeerUnavailable {
+        /// Target machine name.
+        machine: String,
+        /// Failure detail.
+        reason: String,
+    },
     /// The sender addressed itself.
     #[error("an agent cannot send a message to itself")]
     SendToSelf,
@@ -136,6 +144,8 @@ pub struct AgentDirectory {
     may_dir: PathBuf,
     /// Nudges the daemon to dispatch a session's stored pending work.
     wake: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Optional cross-machine peer fabric (Tailscale peers + cloud homes).
+    peers: Option<AnyPeerFabric>,
 }
 
 impl std::fmt::Debug for AgentDirectory {
@@ -157,7 +167,29 @@ impl AgentDirectory {
             runtime_service,
             may_dir,
             wake: Arc::new(wake),
+            peers: None,
         }
+    }
+
+    /// Attaches a cross-machine [`PeerFabric`] so `agent list`, `agent send`,
+    /// and `btw` span same-owner Tailscale peers and cloud homes.
+    #[must_use]
+    pub fn with_peers(mut self, peers: impl PeerFabric) -> Self {
+        self.peers = Some(AnyPeerFabric::new(peers));
+        self
+    }
+
+    /// Attaches an already-wrapped [`AnyPeerFabric`].
+    #[must_use]
+    pub fn with_any_peers(mut self, peers: AnyPeerFabric) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    /// Returns the attached cross-machine [`AnyPeerFabric`], if configured.
+    #[must_use]
+    pub const fn peers(&self) -> Option<&AnyPeerFabric> {
+        self.peers.as_ref()
     }
 
     /// Every live agent, sorted by name: every session that is not archived.
@@ -173,6 +205,27 @@ impl AgentDirectory {
             .collect())
     }
 
+    /// Local sessions formatted as [`RemoteAgentEntry`] rows for `GET /api/peers/agents`.
+    ///
+    /// # Errors
+    /// [`AgentLinkError`] on storage failure or an unreadable `tasks.md`.
+    pub async fn local_peer_entries(
+        &self,
+        machine: &str,
+    ) -> Result<Vec<RemoteAgentEntry>, AgentLinkError> {
+        Ok(self
+            .agent_tasks()
+            .await?
+            .into_iter()
+            .map(|task| RemoteAgentEntry {
+                machine: machine.to_string(),
+                status: task.status,
+                suspended: false,
+                repo: task.binding.map(|binding| binding.to_stored()),
+            })
+            .collect())
+    }
+
     /// Every live agent with the live `tasks.md` of its session, sorted like
     /// [`Self::live`].
     ///
@@ -182,6 +235,11 @@ impl AgentDirectory {
         let mut live = Vec::new();
         for session in self.runtime_service.db().list_sessions().await? {
             if session.archived {
+                continue;
+            }
+            if let Some(peers) = &self.peers
+                && peers.is_cloud_shadow(&session.id)
+            {
                 continue;
             }
             let home = MayHomePaths::new(self.may_dir.clone());
@@ -310,18 +368,27 @@ pub struct AgentMessaging {
     pub forks: ForkHosts,
 }
 
-/// The live agent `target` (name or session id) addresses in `live`.
-fn addressed<'a>(live: &'a [AgentStatus], target: &str) -> Result<&'a AgentStatus, AgentLinkError> {
-    let mut matches = live
-        .iter()
-        .filter(|agent| agent.session_id == target || agent.name == target);
-    let recipient = matches
-        .next()
-        .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
-    if matches.next().is_some() {
-        return Err(AgentLinkError::AmbiguousAgent(target.to_string()));
-    }
-    Ok(recipient)
+/// Resolved local or remote agent recipient.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedRecipient {
+    Local(AgentStatus),
+    Remote(RemoteAgentEntry),
+}
+
+#[derive(Template)]
+#[template(path = "agent_ambiguous.txt", escape = "none")]
+struct AmbiguousAgentText<'a> {
+    target: &'a str,
+    candidates: &'a [String],
+}
+
+fn ambiguous_agent_error(target: &str, candidates: &[String]) -> AgentLinkError {
+    let rendered = AmbiguousAgentText { target, candidates }
+        .render()
+        .unwrap_or_default()
+        .trim_end()
+        .to_string();
+    AgentLinkError::AmbiguousAgent(rendered)
 }
 
 impl AgentMessaging {
@@ -469,8 +536,11 @@ struct AgentSentText<'a> {
 }
 
 struct ListedAgent {
-    status: AgentStatus,
+    name: String,
+    address: String,
+    state: String,
     cwd: String,
+    roots: Vec<String>,
     is_self: bool,
 }
 
@@ -478,12 +548,121 @@ struct ListedAgent {
 #[template(path = "agent_list.txt", escape = "none")]
 struct AgentListText {
     agents: Vec<ListedAgent>,
+    issues: Vec<PeerNodeIssue>,
 }
 
 impl AgentMessaging {
-    /// Store `body` in the queue of the live agent addressed by `target` (name
-    /// or session id) and wake it; an idle recipient whose prompt cache is
-    /// cold is refused and nothing is stored. Returns the recipient's name.
+    /// Resolves `target` (`<machine>:<session-id>`, bare `<session-id>`, or
+    /// unique `<title>`) across local and reachable peer/cloud sessions.
+    pub(crate) async fn resolve_recipient(
+        &self,
+        sender_session_id: &str,
+        target: &str,
+    ) -> Result<(ResolvedRecipient, String), AgentLinkError> {
+        let Some(peers) = self.directory.peers() else {
+            let live = self.directory.live().await?;
+            let matches: Vec<&AgentStatus> = live
+                .iter()
+                .filter(|agent| agent.session_id == target || agent.name == target)
+                .collect();
+            return match matches.as_slice() {
+                [] => Err(AgentLinkError::NoSuchAgent(target.to_string())),
+                [single] => Ok((ResolvedRecipient::Local((*single).clone()), String::new())),
+                many => {
+                    let candidates: Vec<String> =
+                        many.iter().map(|a| a.session_id.clone()).collect();
+                    Err(ambiguous_agent_error(target, &candidates))
+                }
+            };
+        };
+
+        let (local_res, remote) =
+            futures_lite::future::zip(self.directory.live(), peers.list_remote(sender_session_id))
+                .await;
+        let local = local_res?;
+        let local_machine = if remote.local_machine.is_empty() {
+            peers.local_machine()
+        } else {
+            remote.local_machine
+        };
+
+        if let Some((machine, bare_id)) = split_qualified_target(target) {
+            if machine == local_machine {
+                let found = local
+                    .into_iter()
+                    .find(|agent| agent.session_id == bare_id)
+                    .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
+                return Ok((ResolvedRecipient::Local(found), local_machine));
+            }
+            if let Some(found) = remote
+                .agents
+                .into_iter()
+                .find(|entry| entry.machine == machine && entry.status.session_id == bare_id)
+            {
+                return Ok((ResolvedRecipient::Remote(found), local_machine));
+            }
+            if let Some(issue) = remote.issues.iter().find(|issue| issue.target == machine) {
+                return Err(AgentLinkError::PeerUnavailable {
+                    machine: machine.to_string(),
+                    reason: issue
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| issue.state.to_string()),
+                });
+            }
+            return Err(AgentLinkError::NoSuchAgent(target.to_string()));
+        }
+
+        // Exact bare session_id matches take precedence over display-title collisions,
+        // unless multiple machines share the same bare id.
+        let mut matches: Vec<(String, ResolvedRecipient)> = Vec::new();
+        for agent in local {
+            if agent.session_id == target || agent.name == target {
+                matches.push((
+                    format!("{local_machine}:{}", agent.session_id),
+                    ResolvedRecipient::Local(agent),
+                ));
+            }
+        }
+        for entry in remote.agents {
+            if entry.status.session_id == target || entry.status.name == target {
+                matches.push((entry.qualified_id(), ResolvedRecipient::Remote(entry)));
+            }
+        }
+
+        if matches.is_empty() {
+            return Err(AgentLinkError::NoSuchAgent(target.to_string()));
+        }
+        if matches.len() == 1 {
+            let (_, resolved) = matches.swap_remove(0);
+            return Ok((resolved, local_machine));
+        }
+
+        // If `target` uniquely matches a bare `session_id` (while another session merely has `target` as title),
+        // keep exact id semantics only when there is a single bare-id match.
+        let id_only: Vec<(String, ResolvedRecipient)> = matches
+            .iter()
+            .filter(|(_, r)| match r {
+                ResolvedRecipient::Local(a) => a.session_id == target,
+                ResolvedRecipient::Remote(e) => e.status.session_id == target,
+            })
+            .cloned()
+            .collect();
+        if id_only.len() == 1 {
+            let (_, resolved) = id_only.into_iter().next().unwrap_or_else(|| unreachable!());
+            return Ok((resolved, local_machine));
+        }
+
+        let mut candidates: Vec<String> = matches.into_iter().map(|(addr, _)| addr).collect();
+        candidates.sort();
+        candidates.dedup();
+        Err(ambiguous_agent_error(target, &candidates))
+    }
+
+    /// Store `body` in the queue of the live agent addressed by `target` (name,
+    /// session id, or `<machine>:<session-id>`) and wake it; an idle recipient
+    /// whose prompt cache is cold (or whose codespace is suspended) is refused
+    /// and nothing is stored. Returns the recipient's name.
     ///
     /// # Errors
     /// See [`AgentLinkError`].
@@ -496,11 +675,71 @@ impl AgentMessaging {
         target: &str,
         body: &str,
     ) -> Result<String, AgentLinkError> {
-        let live = self.directory.live().await?;
-        let recipient = addressed(&live, target)?;
-        if recipient.session_id == sender_session_id {
-            return Err(AgentLinkError::SendToSelf);
+        let (resolved, local_machine) = self.resolve_recipient(sender_session_id, target).await?;
+        match resolved {
+            ResolvedRecipient::Local(recipient) => {
+                if recipient.session_id == sender_session_id {
+                    return Err(AgentLinkError::SendToSelf);
+                }
+                let recipient_cold = self
+                    .is_cold(&recipient.session_id, recipient.activity)
+                    .await?;
+                if crate::agent::wake::decide(crate::agent::wake::WakeCause::AgentMessage {
+                    recipient_cold,
+                }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
+                {
+                    return Err(AgentLinkError::ColdRecipient(recipient.name.clone()));
+                }
+                let sender = status_name(&self.runtime_service, sender_session_id).await?;
+                let text = AgentMessageText {
+                    sender: AttributeText(&sender),
+                    sender_id: AttributeText(sender_session_id),
+                    body: UntrustedText(body),
+                }
+                .render()
+                .expect("agent message template must render");
+                self.directory.deliver(&recipient.session_id, text).await?;
+                Ok(recipient.name)
+            }
+            ResolvedRecipient::Remote(entry) => {
+                if entry.suspended {
+                    return Err(AgentLinkError::ColdRecipient(entry.status.name));
+                }
+                let Some(peers) = self.directory.peers() else {
+                    return Err(AgentLinkError::NoSuchAgent(target.to_string()));
+                };
+                let sender_name = status_name(&self.runtime_service, sender_session_id).await?;
+                let sender_address = format!("{local_machine}:{sender_session_id}");
+                peers
+                    .send_remote(
+                        &entry.machine,
+                        &entry.status.session_id,
+                        PeerSendRequest {
+                            sender_name,
+                            sender_address,
+                            body: body.to_string(),
+                        },
+                    )
+                    .await
+            }
         }
+    }
+
+    /// Delivers a cross-machine message arriving from a peer daemon onto local
+    /// `target_session_id`, enforcing this host's cold-cache refusal boundary.
+    ///
+    /// # Errors
+    /// Returns [`AgentLinkError`] when the target is absent, archived, or cold.
+    pub async fn deliver_from_peer(
+        &self,
+        target_session_id: &str,
+        request: PeerSendRequest,
+    ) -> Result<String, AgentLinkError> {
+        let live = self.directory.live().await?;
+        let recipient = live
+            .into_iter()
+            .find(|agent| agent.session_id == target_session_id)
+            .ok_or_else(|| AgentLinkError::NoSuchAgent(target_session_id.to_string()))?;
         let recipient_cold = self
             .is_cold(&recipient.session_id, recipient.activity)
             .await?;
@@ -508,18 +747,17 @@ impl AgentMessaging {
             recipient_cold,
         }) == crate::agent::wake::WakeDecision::RefuseColdRecipient
         {
-            return Err(AgentLinkError::ColdRecipient(recipient.name.clone()));
+            return Err(AgentLinkError::ColdRecipient(recipient.name));
         }
-        let sender = status_name(&self.runtime_service, sender_session_id).await?;
         let text = AgentMessageText {
-            sender: AttributeText(&sender),
-            sender_id: AttributeText(sender_session_id),
-            body: UntrustedText(body),
+            sender: AttributeText(&request.sender_name),
+            sender_id: AttributeText(&request.sender_address),
+            body: UntrustedText(&request.body),
         }
         .render()
-        .expect("agent message template must render");
+        .map_err(|e| AgentLinkError::Fork(e.to_string()))?;
         self.directory.deliver(&recipient.session_id, text).await?;
-        Ok(recipient.name.clone())
+        Ok(recipient.name)
     }
 }
 
@@ -814,19 +1052,57 @@ impl Tool for AgentTool {
     ) -> aither_core::Result<Self::Res> {
         let text = match args {
             AgentArgs::List => {
-                let agents = self
-                    .messaging
-                    .directory
-                    .live()
-                    .await?
+                let (local_res, remote) = if let Some(peers) = self.messaging.directory.peers() {
+                    let (local, remote) = futures_lite::future::zip(
+                        self.messaging.directory.live(),
+                        peers.list_remote(&self.session_id),
+                    )
+                    .await;
+                    (local, Some(remote))
+                } else {
+                    (self.messaging.directory.live().await, None)
+                };
+                let mut agents: Vec<ListedAgent> = local_res?
                     .into_iter()
                     .map(|status| ListedAgent {
                         cwd: crate::fs_utils::display_path(&status.cwd),
                         is_self: status.session_id == self.session_id,
-                        status,
+                        name: status.name,
+                        address: status.session_id,
+                        state: status.activity.to_string(),
+                        roots: status.roots,
                     })
                     .collect();
-                AgentListText { agents }
+                let issues = if let Some(remote) = remote {
+                    for entry in remote.agents {
+                        let address = entry.qualified_id();
+                        let location = entry.repo.as_deref().map_or_else(
+                            || crate::fs_utils::display_path(&entry.status.cwd),
+                            |repo| {
+                                format!(
+                                    "{} ({repo})",
+                                    crate::fs_utils::display_path(&entry.status.cwd)
+                                )
+                            },
+                        );
+                        agents.push(ListedAgent {
+                            name: entry.status.name,
+                            address,
+                            state: if entry.suspended {
+                                "suspended".to_string()
+                            } else {
+                                entry.status.activity.to_string()
+                            },
+                            cwd: location,
+                            roots: entry.status.roots,
+                            is_self: false,
+                        });
+                    }
+                    remote.issues
+                } else {
+                    Vec::new()
+                };
+                AgentListText { agents, issues }
                     .render()
                     .expect("agent list template must render")
             }
@@ -867,9 +1143,16 @@ impl Tool for AgentTool {
 }
 
 mod btw;
+pub mod peers;
 
 pub use btw::{
     BtwAnswer, BtwArgs, BtwCommand, BtwTool, ForkHosts, ForkLauncher, ForkRegistration, SideContext,
+};
+pub use peers::{
+    AnyPeerFabric, CLOUD_MACHINE, PeerAgentsResponse, PeerBtwRequest, PeerBtwResponse,
+    PeerErrorBody, PeerErrorKind, PeerFabric, PeerNodeIssue, PeerNodeState, PeerSendRequest,
+    PeerSendResponse, RemoteAgentEntry, RemoteListing, sanitize_machine_name,
+    split_qualified_target,
 };
 
 #[cfg(test)]
