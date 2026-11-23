@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aither_core::llm::{Tool, ToolContext, ToolResult};
+use aither_sandbox::Refused;
 use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,9 @@ pub enum AgentLinkError {
     /// The delivery text could not be wrapped as hidden context.
     #[error(transparent)]
     Context(#[from] XmlBlockError),
+    /// The question or message refused its language.
+    #[error("{0}")]
+    LanguageRefused(#[from] Refused<crate::harness::language::LanguageRefusal>),
 }
 
 /// The directory of sessions this daemon hosts: who is live, and how to
@@ -804,12 +808,13 @@ impl Tool for AgentTool {
 
     type Arguments = AgentArgs;
     type Res = ToolResult;
+    type Error = AgentLinkError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let text = match args {
             AgentArgs::List => {
                 let agents = self
@@ -842,7 +847,7 @@ impl Tool for AgentTool {
                     }
                 })?;
                 if body.trim().is_empty() {
-                    return Err(AgentLinkError::EmptyMessage(path).into());
+                    return Err(AgentLinkError::EmptyMessage(path));
                 }
                 if let Some(guard) = &self.languages {
                     guard

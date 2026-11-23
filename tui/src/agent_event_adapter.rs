@@ -143,13 +143,13 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
             interpreter: args.interpreter,
         }),
         "terminal_input" => parse(name, arguments, |args: JobInputArgs| ToolStartKind::Stdin {
-            pid: args.task_id.parse().ok(),
+            pid: Some(args.pid),
             input: args.input,
         }),
         "terminal_read" => parse(name, arguments, |args: JobReadArgs| {
             ToolStartKind::JobControl {
                 action: JobControlAction::Read,
-                pid: args.task_id.parse().ok(),
+                pid: Some(args.pid),
             }
         }),
         _ => ToolStartKind::Generic {
@@ -736,14 +736,14 @@ mod tests {
             (CommandOutcome::Exited { code: 2 }, Some("exit 2")),
             (
                 CommandOutcome::Killed {
-                    task_id: "4242".to_string(),
+                    pid: 4242,
                     notice: "killed at its timeout".to_string(),
                 },
                 Some("killed at its timeout"),
             ),
             (
                 CommandOutcome::Running {
-                    task_id: "4242".to_string(),
+                    pid: 4242,
                     output: stored("outputs/log", "/tmp/log"),
                 },
                 None,

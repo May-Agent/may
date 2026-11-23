@@ -169,8 +169,7 @@ async fn the_host_rust_toolchain_builds_and_tests_a_crate() {
         .run(
             &krate,
             &format!(
-                "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
-                 CARGO_TARGET_DIR='{}' cargo test",
+                "CARGO_TARGET_DIR='{}' cargo test",
                 krate.join("target").display()
             ),
         )

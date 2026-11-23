@@ -261,12 +261,13 @@ impl Tool for WakeTool {
 
     type Arguments = WakeArgs;
     type Res = ToolResult;
+    type Error = TaskWakeError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         self.wake(&args.prompt_file).await?;
         Ok(ToolResult::text(
             TaskWakeSentText {

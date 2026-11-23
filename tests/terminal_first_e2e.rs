@@ -1099,7 +1099,6 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
             "monitor",
             "terminal",
             "terminal_input",
-            "terminal_kill",
             "terminal_read",
         ]
     {
@@ -3450,9 +3449,7 @@ fn child_exit_code(outputs: &[String]) -> i32 {
 }
 
 /// Whether a model request is a fork's first: the main agent's context
-/// followed by the fork prompt as the last, user, message. Background-job
-/// completion notices on the main agent also quote the command that wrote the
-/// prompt file, so only a message opening with [`FORK_TASK_MARKER`] counts.
+/// followed by the fork prompt as the last, user, message.
 fn is_fork_request(request: &Value) -> bool {
     request
         .get("messages")
@@ -3463,7 +3460,7 @@ fn is_fork_request(request: &Value) -> bool {
                 && message
                     .get("content")
                     .and_then(Value::as_str)
-                    .is_some_and(|content| content.trim_start().starts_with(FORK_TASK_MARKER))
+                    .is_some_and(|content| content.contains(FORK_TASK_MARKER))
         })
 }
 

@@ -204,16 +204,17 @@ impl Tool for PrTool {
 
     type Arguments = PrArgs;
     type Res = ToolResult;
+    type Error = PrError;
 
     async fn call(
         &self,
         mut args: Self::Arguments,
         cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         if self.role == CommandRole::Subagent
             && let Some(action) = args.write_action()
         {
-            return Err(PrError::MainAgentOnly(action).into());
+            return Err(PrError::MainAgentOnly(action));
         }
         // A call made inside a session clone means that clone's repository.
         let repo = args.repo_mut();
@@ -234,7 +235,9 @@ impl Tool for PrTool {
         {
             guard
                 .check_working(title, crate::harness::language::WorkingText::Public)
-                .map_err(super::notices::language_refused)?;
+                .map_err(|refusal| {
+                    PrError::Rejected(super::notices::language_refused(refusal).to_string())
+                })?;
         }
         let result = match args {
             PrArgs::Open {

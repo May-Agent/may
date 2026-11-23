@@ -257,7 +257,7 @@ impl SessionBackgrounds {
                 if job.started_at >= cut_at {
                     newly_abandoned.push((job.pid, job.started_at));
                     if job.status == JobStatus::Running {
-                        let _ = registry.kill(&job.task_id).await;
+                        let _ = registry.kill(job.pid).await;
                     }
                 }
             }
@@ -443,7 +443,7 @@ impl SessionBackgrounds {
             let Some(info) = jobs.list().await.into_iter().find(|job| job.pid == pid) else {
                 continue;
             };
-            if let Some(job) = jobs.get(&info.task_id).await {
+            if let Some(job) = jobs.get(info.pid).await {
                 return Some((job, info));
             }
         }

@@ -7155,7 +7155,6 @@ mod tests {
     fn background_job(status: aither_sandbox::JobStatus) -> aither_sandbox::JobInfo {
         aither_sandbox::JobInfo {
             pid: 4242,
-            task_id: "4242".to_string(),
             execution_key: "key".to_string(),
             script: "sleep 300".to_string(),
             interpreter: aither_sandbox::Interpreter::Shell,

@@ -339,9 +339,7 @@ where
                 .await
                 .map_err(|error| error.to_string())?;
             let images = extract_images(&output);
-            let result = output
-                .into_tool_result()
-                .map_err(|error| format!("failed to convert tool result: {error}"))?;
+            let result = output.into_tool_result();
             Ok(HandlerOutput { result, images })
         }) as HandlerFuture
     })

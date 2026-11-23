@@ -248,3 +248,7 @@ aither-openai = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-skills = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "main" }
+# The same git source aither-sandbox declares, so the patched `heel` shares
+# one lockfile source with it and the `shim` feature unifies across both.
+heel = { git = "https://github.com/May-Agent/heel.git", branch = "main" }
+heel-shim = { git = "https://github.com/May-Agent/heel.git", branch = "main" }

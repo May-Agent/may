@@ -88,8 +88,8 @@ fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
             "Start the command detached and return at once with its PID instead of waiting in the foreground. Default false: the call waits up to the foreground window and promotes a still-running command to a background job.",
         ),
         (
-            "task_id",
-            "The task ID returned when the command was backgrounded.",
+            "pid",
+            "The process ID returned when the command was backgrounded.",
         ),
         (
             "cursor",
@@ -162,7 +162,6 @@ pub fn shell_tool_settings(budgets: &ShellBudgets) -> ShellToolSettings {
         ),
         read: identity(READ_TOOL, rendered(&ReadDescription)),
         input: identity(INPUT_TOOL, rendered(&InputDescription)),
-        kill: identity("terminal_kill", "Kills a background job by PID.".into()),
     }
 }
 

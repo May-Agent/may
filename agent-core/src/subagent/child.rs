@@ -454,7 +454,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
         for info in jobs.list().await {
             if (matches!(info.status, aither_sandbox::JobStatus::Running)
                 || info.status.completion_pending())
-                && let Some(job) = jobs.get(&info.task_id).await
+                && let Some(job) = jobs.get(info.pid).await
             {
                 waiting.push(job);
                 infos.push(info);
@@ -465,7 +465,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
         }
         self.last_idle = Some(format!(
             "waiting on background job PID {}",
-            waiting[0].task_id()
+            waiting[0].pid()
         ));
         // The keep-alive is due where the main session's refresh is: before
         // the entry the provider's cache lifetime bounds goes cold, and only
@@ -480,9 +480,11 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             _ => None,
         };
         let ended = async {
-            let (finished, _, _) = select_all(waiting.iter().map(|job| {
-                Box::pin(async move { (job.task_id().parse().unwrap_or(0), job.wait().await) })
-            }))
+            let (finished, _, _) = select_all(
+                waiting
+                    .iter()
+                    .map(|job| Box::pin(async move { (job.pid(), job.wait().await) })),
+            )
             .await;
             let (pid, result) = finished;
             let end = match result {

@@ -43,14 +43,24 @@ pub type RegisterBroker = ToolRequestBroker<RegisterRequest, Result<RegisterResu
 /// The queue the agent reads register requests from.
 pub type RegisterQueue = ToolRequestQueue<RegisterRequest, Result<RegisterResult, String>>;
 
+/// A `register` call failed before it could return a tool result.
 #[derive(Debug, thiserror::Error)]
-enum RegisterToolError {
+pub enum RegisterToolError {
+    /// The path to register was empty.
     #[error("path must not be empty")]
     EmptyPath,
+    /// The register command is not wired in this runtime.
     #[error("{tool_name} command is unavailable in this runtime")]
-    Unavailable { tool_name: &'static str },
+    Unavailable {
+        /// The tool that was unavailable.
+        tool_name: &'static str,
+    },
+    /// The register service refused the request.
     #[error("register request was rejected: {0}")]
     Rejected(String),
+    /// The request could not reach the register service.
+    #[error("register request failed: {0}")]
+    Request(String),
 }
 
 /// The broker/queue pair the `register` commands use.
@@ -96,10 +106,10 @@ impl<K: RegisterKind> RegisterTool<K> {
     }
 }
 
-fn normalize_path(args: &RegisterPathArgs) -> aither_core::Result<String> {
+fn normalize_path(args: &RegisterPathArgs) -> Result<String, RegisterToolError> {
     let path = args.path.trim();
     if path.is_empty() {
-        return Err(RegisterToolError::EmptyPath.into());
+        return Err(RegisterToolError::EmptyPath);
     }
     Ok(path.to_string())
 }
@@ -115,12 +125,13 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
 
     type Arguments = RegisterPathArgs;
     type Res = ToolResult;
+    type Error = RegisterToolError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let broker = self.broker.as_ref().ok_or(RegisterToolError::Unavailable {
             tool_name: K::TOOL_NAME,
         })?;
@@ -129,7 +140,10 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
             session_id: self.session_id.clone(),
             path,
         };
-        let response = broker.request(request).await?;
+        let response = broker
+            .request(request)
+            .await
+            .map_err(|error| RegisterToolError::Request(error.to_string()))?;
         let result = response.map_err(RegisterToolError::Rejected)?;
 
         let text = RegisterDoneText {

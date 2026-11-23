@@ -67,6 +67,11 @@ pub fn channel() -> (WorkspaceRequestBroker, WorkspaceRequestQueue) {
     tool_request_channel()
 }
 
+/// A `request_workspace` call failed: the approval broker could not answer.
+#[derive(Debug, thiserror::Error)]
+#[error("workspace request failed: {0}")]
+pub struct WorkspaceRequestError(String);
+
 /// Tool for requesting workspace access.
 #[derive(Debug, Clone)]
 pub struct RequestWorkspaceTool {
@@ -101,8 +106,9 @@ impl Tool for RequestWorkspaceTool {
 
     type Arguments = RequestWorkspaceArgs;
     type Res = ToolResult;
+    type Error = WorkspaceRequestError;
 
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
         let _pause_guard = self
             .approval_pause
             .as_ref()
@@ -113,7 +119,8 @@ impl Tool for RequestWorkspaceTool {
                 session_id: self.session_id.clone(),
                 request: args.clone(),
             })
-            .await?;
+            .await
+            .map_err(|error| WorkspaceRequestError(error.to_string()))?;
         Ok(ToolResult::text(
             WorkspaceRequestResultTemplate {
                 path: &args.path,

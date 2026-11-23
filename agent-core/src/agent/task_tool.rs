@@ -127,12 +127,18 @@ pub type TaskBroker = ToolRequestBroker<TaskCreateRequest, Result<TaskCreateResu
 /// create requests from it.
 pub type TaskQueue = ToolRequestQueue<TaskCreateRequest, Result<TaskCreateResult, String>>;
 
+/// A `task` call failed before it could return a tool result.
 #[derive(Debug, thiserror::Error)]
-enum TaskToolError {
+pub enum TaskToolError {
+    /// The task command is not wired in this runtime.
     #[error("task command is unavailable in this runtime")]
     Unavailable,
+    /// The task service refused the request.
     #[error("task request was rejected: {0}")]
     Rejected(String),
+    /// The request could not reach the task service.
+    #[error("task request failed: {0}")]
+    Request(String),
 }
 
 /// Create a paired task broker and queue for a session.
@@ -235,19 +241,23 @@ impl Tool for TaskTool {
 
     type Arguments = TaskArgs;
     type Res = ToolResult;
+    type Error = TaskToolError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let broker = self.broker.as_ref().ok_or(TaskToolError::Unavailable)?;
         let request = TaskCreateRequest {
             session_id: self.session_id.clone(),
             runtime: self.runtime,
             args,
         };
-        let response = broker.request(request).await?;
+        let response = broker
+            .request(request)
+            .await
+            .map_err(|error| TaskToolError::Request(error.to_string()))?;
         let model = response.map_err(TaskToolError::Rejected)?;
 
         let text = TaskCreatedText {

@@ -119,7 +119,7 @@ struct Agent {
     footprints: Footprints,
     guard: RunawayGuard,
     /// The jobs the agent started, by the name the test gave them.
-    jobs: Vec<(&'static str, u32, aither_sandbox::Job)>,
+    jobs: Vec<(&'static str, aither_sandbox::Job)>,
     /// The kill switches of the container jobs, by name.
     switches: Vec<(&'static str, async_channel::Receiver<()>)>,
     /// The local processes standing for remote jobs.
@@ -133,7 +133,7 @@ struct Cgroup(Arc<Mutex<CgroupState>>);
 struct CgroupState {
     limit: Option<u64>,
     pressure: &'static str,
-    jobs: HashMap<String, u64>,
+    jobs: HashMap<u32, u64>,
 }
 
 const CALM: &str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
@@ -153,12 +153,8 @@ impl Cgroup {
         self.0.lock().unwrap().pressure = pressure;
     }
 
-    fn hold(&self, task_id: &str, bytes: u64) {
-        self.0
-            .lock()
-            .unwrap()
-            .jobs
-            .insert(task_id.to_string(), bytes);
+    fn hold(&self, pid: u32, bytes: u64) {
+        self.0.lock().unwrap().jobs.insert(pid, bytes);
     }
 }
 
@@ -174,12 +170,12 @@ impl ContainerMemory for Cgroup {
 
     fn job_footprints(
         &self,
-        task_ids: &[String],
+        pids: &[u32],
     ) -> impl Future<Output = Result<Vec<u64>, FootprintError>> + Send {
         let state = self.0.lock().unwrap();
-        std::future::ready(Ok(task_ids
+        std::future::ready(Ok(pids
             .iter()
-            .map(|id| state.jobs.get(id).copied().unwrap_or(0))
+            .map(|pid| state.jobs.get(pid).copied().unwrap_or(0))
             .collect()))
     }
 }
@@ -245,26 +241,22 @@ impl Agent {
     async fn job(&mut self, name: &'static str, bytes: u64) -> u32 {
         let (job, pid) = self.terminal.sleeping_job().await;
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
-        self.jobs.push((name, pid, job));
+        self.jobs.push((name, job));
         pid
     }
 
     /// The PID the shell gave the job the test named `name`.
     fn pid_of(&self, name: &str) -> u32 {
-        self.jobs
-            .iter()
-            .find(|(job, _, _)| *job == name)
-            .expect("the test started that job")
-            .1
+        self.job_named(name).pid()
     }
 
     fn job_named(&self, name: &str) -> &aither_sandbox::Job {
         &self
             .jobs
             .iter()
-            .find(|(job, _, _)| *job == name)
+            .find(|(job, _)| *job == name)
             .expect("the test started that job")
-            .2
+            .1
     }
 
     /// Whether `pid` is the PID of the job the test named `name`.
@@ -305,19 +297,13 @@ impl Agent {
     async fn container_job(&mut self, cgroup: &Cgroup, name: &'static str, bytes: u64) -> u32 {
         let pid = self.next_pid();
         let jobs = self.shell.jobs();
-        let lease = aither_sandbox::test_ids::lease(name);
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-        jobs.place_for_test(JobPlace::Container, pid, &lease, name, Some(kill_tx))
+        jobs.place_for_test(JobPlace::Container, pid, name, Some(kill_tx))
             .await;
         self.jobs
-            .push((name, pid, jobs.get(name).await.expect("the job is held")));
+            .push((name, jobs.get(pid).await.expect("the job is held")));
         self.switches.push((name, kill_rx));
-        cgroup
-            .0
-            .lock()
-            .unwrap()
-            .jobs
-            .insert(name.to_string(), bytes);
+        cgroup.0.lock().unwrap().jobs.insert(pid, bytes);
         // The container's pid means nothing to the host: if it were read
         // there, this is what it would find.
         self.footprints
@@ -334,11 +320,9 @@ impl Agent {
         let sleeper = Sleeper::start();
         let pid = sleeper.pid();
         let jobs = self.shell.jobs();
-        let lease = aither_sandbox::test_ids::lease(name);
-        jobs.place_for_test(JobPlace::Remote, pid, &lease, name, None)
-            .await;
+        jobs.place_for_test(JobPlace::Remote, pid, name, None).await;
         self.jobs
-            .push((name, pid, jobs.get(name).await.expect("the job is held")));
+            .push((name, jobs.get(pid).await.expect("the job is held")));
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
         self.sleepers.push(sleeper);
         pid
@@ -429,7 +413,7 @@ impl Clock {
 
 /// The names the test gave the jobs `footprints` list, in their order.
 fn names<'a>(
-    started: &[(&'a str, u32, aither_sandbox::Job)],
+    started: &[(&'a str, aither_sandbox::Job)],
     footprints: &[aither_sandbox::JobFootprint],
 ) -> Vec<&'a str> {
     footprints
@@ -437,7 +421,7 @@ fn names<'a>(
         .map(|footprint| {
             started
                 .iter()
-                .find(|(_, _, job)| job.task_id() == footprint.task_id)
+                .find(|(_, job)| job.pid() == footprint.pid)
                 .expect("a job of this agent")
                 .0
         })
@@ -757,7 +741,6 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
 #[test]
 fn the_alerts_read_as_plain_text() {
     let job = |pid: u32, name: &str, gib| aither_sandbox::JobFootprint {
-        task_id: name.to_string(),
         command: format!("run {name}"),
         pid,
         footprint_bytes: gib * GIB,
@@ -968,13 +951,13 @@ async fn a_container_job_the_agent_stopped_in_time_is_not_killed() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
     let mut agent = Agent::containerized(64 * GIB, &cgroup).await;
-    agent.container_job(&cgroup, "large", 4 * GIB).await;
+    let large_pid = agent.container_job(&cgroup, "large", 4 * GIB).await;
     let normal = Some(MemoryPressure::Normal);
 
     assert_eq!(agent.guard.observe(clock.now(), normal).await.len(), 1);
     clock.advance(30);
     assert!(agent.job_named("large").kill().await);
-    cgroup.hold("large", 0);
+    cgroup.hold(large_pid, 0);
 
     clock.advance(120);
     assert!(agent.guard.observe(clock.now(), normal).await.is_empty());
@@ -1118,9 +1101,9 @@ async fn a_remote_job_in_a_container_terminal_is_still_never_judged() {
     let clock = Clock::new();
     let cgroup = Cgroup::limited(4 * GIB);
     let mut agent = Agent::containerized(10 * GIB, &cgroup).await;
-    agent.remote_job("remote", 500 * GIB).await;
+    let remote_pid = agent.remote_job("remote", 500 * GIB).await;
     // The container's cgroup knows nothing of the remote job either.
-    cgroup.hold("remote", 500 * GIB);
+    cgroup.hold(remote_pid, 500 * GIB);
     cgroup.pressure(THRASHING);
 
     let events = agent

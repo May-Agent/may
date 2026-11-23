@@ -377,7 +377,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         decided_by: &CallIdentity,
         id: &str,
         approval: Approval,
-    ) -> aither_core::Result<ToolResult> {
+    ) -> anyhow::Result<ToolResult> {
         let approved = approval.is_approved();
         let undecided = self
             .service
@@ -737,9 +737,23 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> Tool for SubagentCommand<LLM> 
 
     type Arguments = SubagentArgs;
     type Res = ToolResult;
+    type Error = SubagentCallError;
 
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> Result<Self::Res, Self::Error> {
+        self.run(args, cx)
+            .await
+            .map_err(|error| SubagentCallError(error.to_string()))
+    }
+}
+
+/// A `subagent` call failed before it could return a tool result.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SubagentCallError(String);
+
+impl<LLM: LanguageModel + Clone + 'static> SubagentCommand<LLM> {
     #[allow(clippy::too_many_lines)]
-    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+    async fn run(&self, args: SubagentArgs, cx: ToolContext) -> anyhow::Result<ToolResult> {
         let Some(started_by) = cx.identity() else {
             anyhow::bail!("the subagent command is called from an agent's tool call");
         };

@@ -13,7 +13,7 @@ fn treatment_of(script: &str, interpreter: Interpreter) -> OutputTreatment {
     let shell = (interpreter == Interpreter::Shell).then(|| ShellScript::parse(script));
     let start = ScriptDir::Host(PathBuf::from("/"));
     let check = ScriptCheck {
-        task_id: "task",
+        launch: aither_sandbox::LaunchLease::fresh().id(),
         script,
         interpreter,
         shell: shell.as_ref().map(Result::as_ref),

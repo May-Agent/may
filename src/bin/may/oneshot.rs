@@ -970,7 +970,7 @@ mod tests {
             &mut output,
             r#"{"description":"serve","script":"serve"}"#,
             command(CommandOutcome::Running {
-                task_id: "707".to_string(),
+                pid: 707,
                 output: StoredFile {
                     url: "outputs/t7.txt".to_string(),
                     path: "/sandbox/outputs/t7.txt".to_string(),
@@ -989,7 +989,7 @@ mod tests {
             &mut killed,
             r#"{"description":"wait","script":"sleep 99"}"#,
             command(CommandOutcome::Killed {
-                task_id: "909".to_string(),
+                pid: 909,
                 notice: "Killed at the time bound.".to_string(),
             }),
         );

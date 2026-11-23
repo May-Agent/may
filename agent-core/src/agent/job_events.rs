@@ -248,11 +248,11 @@ impl JobReport {
         }
         match event {
             ShellEvent::JobStarted(started) => {
-                if hooks.is_abandoned(started.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(started.pid(), None) {
                     return;
                 }
                 let _ = facts.try_send(JobFact::Started {
-                    pid: started.task_id().parse().unwrap_or(0),
+                    pid: started.pid(),
                     output_preview: started.output_preview().to_string(),
                     output_file: started.output_file().url.clone(),
                 });
@@ -279,29 +279,27 @@ impl JobReport {
                 let _ = facts.try_send(JobFact::Ended { pid });
             }
             ShellEvent::LongRunning(job) => {
-                if hooks.is_abandoned(job.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(job.pid(), None) {
                     return;
                 }
                 self.alert(&JobAlertText::LongRunning {
-                    pid: job.task_id().parse().unwrap_or(0),
+                    pid: job.pid(),
                     elapsed: elapsed_text(job.after()),
                 });
             }
             ShellEvent::StdinBlocked(job) => {
-                if hooks.is_abandoned(job.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(job.pid(), None) {
                     return;
                 }
-                self.alert(&JobAlertText::StdinBlocked {
-                    pid: job.task_id().parse().unwrap_or(0),
-                });
+                self.alert(&JobAlertText::StdinBlocked { pid: job.pid() });
                 self.needs_model = true;
             }
             ShellEvent::StdinWatchFailed(job) => {
-                if hooks.is_abandoned(job.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(job.pid(), None) {
                     return;
                 }
                 self.alert(&JobAlertText::StdinWatchFailed {
-                    pid: job.task_id().parse().unwrap_or(0),
+                    pid: job.pid(),
                     error: job.error(),
                 });
             }
@@ -311,31 +309,31 @@ impl JobReport {
                 });
             }
             ShellEvent::MonitorIncrement(increment) => {
-                if hooks.is_abandoned(increment.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(increment.pid(), None) {
                     return;
                 }
                 self.alert(&JobAlertText::MonitorIncrement {
-                    pid: increment.task_id().parse().unwrap_or(0),
+                    pid: increment.pid(),
                     lines: increment.lines(),
                 });
                 self.needs_model = true;
             }
             ShellEvent::MonitorStalled(stalled) => {
-                if hooks.is_abandoned(stalled.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(stalled.pid(), None) {
                     return;
                 }
                 self.alert(&JobAlertText::MonitorStalled {
-                    pid: stalled.task_id().parse().unwrap_or(0),
+                    pid: stalled.pid(),
                     stall_secs: stalled.stall_secs(),
                 });
                 self.needs_model = true;
             }
             ShellEvent::MonitorEnded(ended) => {
-                if hooks.is_abandoned(ended.task_id().parse().unwrap_or(0), None) {
+                if hooks.is_abandoned(ended.pid(), None) {
                     return;
                 }
                 self.alert(&JobAlertText::MonitorEnded {
-                    pid: ended.task_id().parse().unwrap_or(0),
+                    pid: ended.pid(),
                     end: ended.end(),
                 });
                 self.needs_model = true;

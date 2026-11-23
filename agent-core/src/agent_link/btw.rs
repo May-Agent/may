@@ -462,15 +462,16 @@ impl Tool for BtwTool {
 
     type Arguments = BtwArgs;
     type Res = ToolResult;
+    type Error = AgentLinkError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let question = args.question.trim();
         if question.is_empty() {
-            return Err(AgentLinkError::EmptyQuestion.into());
+            return Err(AgentLinkError::EmptyQuestion);
         }
         if let Some(guard) = &self.command.languages {
             guard

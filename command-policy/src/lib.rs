@@ -616,8 +616,8 @@ struct FileReadsInner {
     epoch: u64,
     /// Read → the stamps of its files when it last succeeded.
     recorded: HashMap<ReadIdentity, Vec<(PathBuf, Fingerprint)>>,
-    /// Task id → the epoch and read its script was admitted as, with its stamps.
-    pending: HashMap<String, PendingRead>,
+    /// Launch id → the epoch and read its script was admitted as, with its stamps.
+    pending: HashMap<aither_sandbox::LaunchId, PendingRead>,
 }
 
 impl FileReads {
@@ -706,7 +706,7 @@ impl ScriptPolicy for UnchangedFileReads {
             let same = inner.recorded.get(&identity) == Some(&stamps);
             if !same {
                 inner.pending.insert(
-                    script.task_id.to_string(),
+                    script.launch,
                     PendingRead {
                         epoch: current_epoch,
                         identity,
@@ -728,7 +728,7 @@ impl ScriptPolicy for UnchangedFileReads {
 
     fn ended(&self, end: &ScriptEnd<'_>, state: &FileReads) -> impl Future<Output = ()> + Send {
         let mut inner = state.inner();
-        let read = inner.pending.remove(end.task_id);
+        let read = inner.pending.remove(&end.launch);
         // Only a read that succeeded in the active epoch counts: a denied,
         // failed, or pre-compaction read must not block post-compaction recall.
         if let Some(PendingRead {
@@ -1206,7 +1206,7 @@ struct PendingCheckoutRead {
 /// Active checkout leases and reads keyed by launch id.
 #[derive(Debug, Default)]
 pub struct CheckoutReadState {
-    pending: Mutex<HashMap<String, PendingCheckoutRead>>,
+    pending: Mutex<HashMap<aither_sandbox::LaunchId, PendingCheckoutRead>>,
 }
 
 /// Observes terminal file reads (`cat`, `head`, `tail`, `sed -n`, `nl`) inside
@@ -1277,7 +1277,7 @@ impl ScriptPolicy for CheckoutFileReads {
             .lock()
             .expect("checkout read state is never poisoned")
             .insert(
-                script.task_id.to_string(),
+                script.launch,
                 PendingCheckoutRead {
                     leases,
                     reads_by_repo,
@@ -1291,7 +1291,7 @@ impl ScriptPolicy for CheckoutFileReads {
             .pending
             .lock()
             .expect("checkout read state is never poisoned")
-            .remove(end.task_id);
+            .remove(&end.launch);
         let Some(pending) = pending else {
             return;
         };

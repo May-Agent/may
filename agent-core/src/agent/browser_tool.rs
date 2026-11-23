@@ -33,7 +33,7 @@ pub struct BrowserCommandOutput {
 }
 
 impl IntoToolResult for BrowserCommandOutput {
-    fn into_tool_result(self) -> aither_core::Result<ToolResult> {
+    fn into_tool_result(self) -> ToolResult {
         self.output.into_tool_result()
     }
 }
@@ -102,6 +102,12 @@ impl BrowserTool {
     }
 }
 
+/// A `browser` call failed: the request broker could not reach the browser
+/// service; the tool result still carries per-request browser failures.
+#[derive(Debug, thiserror::Error)]
+#[error("browser request failed: {0}")]
+pub struct BrowserCallError(String);
+
 impl Tool for BrowserTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("browser")
@@ -109,12 +115,13 @@ impl Tool for BrowserTool {
 
     type Arguments = BrowserArgs;
     type Res = BrowserCommandOutput;
+    type Error = BrowserCallError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let Some(broker) = self.broker.as_ref() else {
             return Ok(BrowserCommandOutput {
                 output: BrowserToolOutput::from(Err(BrowserToolError::UnavailableInRuntime)),
@@ -126,7 +133,8 @@ impl Tool for BrowserTool {
                 session_id: self.session_id.clone(),
                 args,
             })
-            .await?;
+            .await
+            .map_err(|error| BrowserCallError(error.to_string()))?;
         let images = response
             .as_ref()
             .map_or_else(|_| Vec::new(), |result| self.structured_screenshots(result));

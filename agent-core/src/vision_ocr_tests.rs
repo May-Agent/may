@@ -95,12 +95,13 @@ impl Tool for CaptureTool {
 
     type Arguments = NoArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     fn call(
         &self,
         _args: Self::Arguments,
         cx: ToolContext,
-    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl std::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
         if let Some(call) = cx.identity() {
             self.store.record(call.call(), self.images.clone());
         }

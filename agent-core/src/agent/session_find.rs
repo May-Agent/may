@@ -54,7 +54,7 @@ pub(super) struct FindRequest {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum FindError {
+pub enum FindError {
     #[error("database error: {0}")]
     Database(#[from] ChatDbError),
     #[error("invalid pattern: {0}")]

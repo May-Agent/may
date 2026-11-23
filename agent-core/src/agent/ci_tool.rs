@@ -346,12 +346,13 @@ impl Tool for CiTool {
 
     type Arguments = CiArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let text = match args {
             CiArgs::Stats {} => self.stats().await,
             CiArgs::Slow { number, run } => self.slow(number, run).await,

@@ -53,22 +53,34 @@ struct ServeTunnel {
     local_url: String,
 }
 
+/// A `serve` call failed before it could return a tool result.
 #[derive(Debug, thiserror::Error)]
-enum ServeToolError {
+pub enum ServeToolError {
+    /// `serve` needs a shell to spawn the service under.
     #[error("serve needs a session shell, which this runtime has none")]
     NoShell,
+    /// `serve` was called without a command.
     #[error("serve needs a command to run")]
     NoCommand,
+    /// `--port` was neither a number nor `auto`.
     #[error("invalid --port {0:?}: a port number or `auto`")]
     BadPort(String),
+    /// `--port` needs the tunnel command to publish the port.
     #[error("--port needs the tunnel command, which this runtime has none")]
     NoTunnel,
+    /// The tunnel service refused the request.
     #[error("tunnel request was rejected: {0}")]
     Rejected(String),
+    /// The tunnel request could not reach the service.
+    #[error("tunnel request failed: {0}")]
+    Tunnel(String),
+    /// The service exited before its ready pattern matched.
     #[error("the service exited before matching --ready-regex: {0}")]
     ExitedEarly(String),
+    /// `--ready-regex` is not a valid regular expression.
     #[error("invalid --ready-regex: {0}")]
     BadRegex(#[from] regex::Error),
+    /// The service could not be spawned or read.
     #[error("service spawn failed: {0}")]
     Spawn(#[from] anyhow::Error),
 }
@@ -160,7 +172,7 @@ impl ServeTool {
             let read = job
                 .read(cursor, 1 << 20)
                 .await
-                .map_err(anyhow::Error::msg)?;
+                .map_err(|error| ServeToolError::Spawn(anyhow::Error::msg(error)))?;
             match read {
                 aither_sandbox::JobRead::Delta(delta) => {
                     cursor = delta.cursor;
@@ -192,18 +204,21 @@ impl Tool for ServeTool {
 
     type Arguments = ServeArgs;
     type Res = ToolResult;
+    type Error = ServeToolError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         if args.command.is_empty() {
-            return Err(ServeToolError::NoCommand.into());
+            return Err(ServeToolError::NoCommand);
         }
         let shell = self.shell.clone().ok_or(ServeToolError::NoShell)?;
         let port = match port(args.port.as_deref())? {
-            Some(Port::Allocate) => Some(allocate_port().map_err(anyhow::Error::from)?),
+            Some(Port::Allocate) => {
+                Some(allocate_port().map_err(|error| ServeToolError::Spawn(error.into()))?)
+            }
             Some(Port::Given(port)) => Some(port),
             None => None,
         };
@@ -223,7 +238,7 @@ impl Tool for ServeTool {
                 raw: false,
             })
             .await
-            .map_err(ServeToolError::Spawn)?;
+            .map_err(|error| ServeToolError::Spawn(anyhow::Error::msg(error)))?;
 
         let tunnel = if let Some(port) = port {
             let broker = self.tunnel.clone().ok_or(ServeToolError::NoTunnel)?;
@@ -232,7 +247,8 @@ impl Tool for ServeTool {
                     session_id: self.session_id.clone(),
                     url: format!("http://localhost:{port}"),
                 })
-                .await?
+                .await
+                .map_err(|error| ServeToolError::Tunnel(error.to_string()))?
                 .map_err(ServeToolError::Rejected)?;
             Some(ServeTunnel {
                 id: result.id,
@@ -249,7 +265,7 @@ impl Tool for ServeTool {
         };
 
         let text = ServeStarted {
-            pid: job.task_id().parse().unwrap_or(0),
+            pid: job.pid(),
             tunnel,
             ready,
         }

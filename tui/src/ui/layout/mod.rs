@@ -3012,7 +3012,6 @@ mod tests {
     fn job(status: aither_sandbox::JobStatus, age_secs: u64) -> aither_sandbox::JobInfo {
         aither_sandbox::JobInfo {
             pid: 1,
-            task_id: "1".to_string(),
             execution_key: String::new(),
             script: "true".to_string(),
             interpreter: aither_sandbox::Interpreter::Shell,

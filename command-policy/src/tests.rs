@@ -3,14 +3,14 @@ use aither_sandbox::{Carry, Interpreter, SandboxMode, ScriptDir, ShellParseError
 use super::*;
 
 fn check_with<'a>(
-    task_id: &'a str,
+    launch: aither_sandbox::LaunchId,
     script: &'a str,
     shell: Option<Result<&'a ShellScript, &'a ShellParseError>>,
     origin: ScriptOrigin,
     start: &'a ScriptDir,
 ) -> ScriptCheck<'a> {
     ScriptCheck {
-        task_id,
+        launch,
         script,
         interpreter: Interpreter::Shell,
         shell,
@@ -37,8 +37,8 @@ async fn decide<P: ScriptPolicy>(
 ) -> ScriptDecision {
     let shell = ShellScript::parse(script);
     let start = ScriptDir::Host(PathBuf::from("/"));
-    let task_id = "task";
-    let check = check_with(task_id, script, Some(shell.as_ref()), origin, &start);
+    let launch = aither_sandbox::LaunchLease::fresh().id();
+    let check = check_with(launch, script, Some(shell.as_ref()), origin, &start);
     policy.check(&check, state).await
 }
 
@@ -50,9 +50,9 @@ fn refusal(decision: &ScriptDecision) -> Option<&str> {
     }
 }
 
-fn ended<'a>(task_id: &'a str, code: i32, end: &'a ScriptDir) -> ScriptEnd<'a> {
+fn ended(launch: aither_sandbox::LaunchId, code: i32, end: &ScriptDir) -> ScriptEnd<'_> {
     ScriptEnd {
-        task_id,
+        launch,
         outcome: ScriptOutcome::Exited { code },
         end,
         carry: Carry::Unchanged,
@@ -102,7 +102,13 @@ async fn a_shell_script_that_does_not_parse_is_refused_and_python_is_not_checked
         "{decision:?}"
     );
     let start = ScriptDir::Host(PathBuf::from("/"));
-    let mut python = check_with("task", "import os", None, ScriptOrigin::Foreground, &start);
+    let mut python = check_with(
+        aither_sandbox::LaunchLease::fresh().id(),
+        "import os",
+        None,
+        ScriptOrigin::Foreground,
+        &start,
+    );
     python.interpreter = Interpreter::Python;
     assert_eq!(
         KillByName::new().check(&python, &()).await,
@@ -162,7 +168,12 @@ async fn a_reread_of_an_unchanged_file_is_refused_once_a_read_succeeded() {
             &start,
         )
     };
-    let (launch_a, launch_b, launch_c, launch_d) = ("a", "b", "c", "d");
+    let (launch_a, launch_b, launch_c, launch_d) = (
+        aither_sandbox::LaunchLease::fresh().id(),
+        aither_sandbox::LaunchLease::fresh().id(),
+        aither_sandbox::LaunchLease::fresh().id(),
+        aither_sandbox::LaunchLease::fresh().id(),
+    );
 
     assert_eq!(
         policy.check(&check(launch_a), &state).await,
@@ -212,7 +223,7 @@ async fn a_follow_or_a_missing_file_is_no_reread() {
     for script in ["tail -f log.txt", "cat missing.txt"] {
         let shell = ShellScript::parse(script).expect("parses");
         let check = check_with(
-            "task",
+            aither_sandbox::LaunchLease::fresh().id(),
             script,
             Some(Ok(&shell)),
             ScriptOrigin::Foreground,
@@ -239,16 +250,16 @@ async fn read_in(
 ) -> ScriptDecision {
     let shell = ShellScript::parse(script);
     let start = ScriptDir::Host(dir.to_path_buf());
-    let task_id = "task";
+    let launch = aither_sandbox::LaunchLease::fresh().id();
     let check = check_with(
-        task_id,
+        launch,
         script,
         Some(shell.as_ref()),
         ScriptOrigin::Foreground,
         &start,
     );
     let decision = policy.check(&check, state).await;
-    policy.ended(&ended(task_id, 0, &start), state).await;
+    policy.ended(&ended(launch, 0, &start), state).await;
     decision
 }
 
@@ -502,7 +513,7 @@ async fn patch_in(syntaxes: &Syntaxes, files: &[(&str, &str)], body: &str) -> Sc
     let shell = ShellScript::parse(&script);
     let start = ScriptDir::Host(dir.path().to_path_buf());
     let check = check_with(
-        "task",
+        aither_sandbox::LaunchLease::fresh().id(),
         &script,
         Some(shell.as_ref()),
         ScriptOrigin::Foreground,
@@ -710,12 +721,10 @@ async fn bumping_read_epoch_allows_post_compaction_recall_without_clearing_other
     let child_path = AgentPath::of(child_call.agent());
 
     // Initial reads succeed on both main and child, then identical repeats are refused.
-    for (task_id, call, state) in [
-        ("t-main-1", &main_call, &main_state),
-        ("t-child-1", &child_call, &child_state),
-    ] {
+    for (call, state) in [(&main_call, &main_state), (&child_call, &child_state)] {
+        let launch = aither_sandbox::LaunchLease::fresh().id();
         let mut check = check_with(
-            task_id,
+            launch,
             script,
             Some(parsed_shell.as_ref()),
             ScriptOrigin::Foreground,
@@ -723,10 +732,10 @@ async fn bumping_read_epoch_allows_post_compaction_recall_without_clearing_other
         );
         check.call = Some(call);
         assert_eq!(policy.check(&check, state).await, ScriptDecision::Pass);
-        policy.ended(&ended(task_id, 0, &start), state).await;
+        policy.ended(&ended(launch, 0, &start), state).await;
 
         let mut repeat = check_with(
-            "t-repeat",
+            aither_sandbox::LaunchLease::fresh().id(),
             script,
             Some(parsed_shell.as_ref()),
             ScriptOrigin::Foreground,
@@ -741,7 +750,7 @@ async fn bumping_read_epoch_allows_post_compaction_recall_without_clearing_other
     epochs.bump(&AgentPath::main());
 
     let mut child_repeat = check_with(
-        "t-child-repeat",
+        aither_sandbox::LaunchLease::fresh().id(),
         script,
         Some(parsed_shell.as_ref()),
         ScriptOrigin::Foreground,
@@ -753,26 +762,27 @@ async fn bumping_read_epoch_allows_post_compaction_recall_without_clearing_other
         "child did not compact, so its unchanged read stays refused"
     );
 
-    let mut main_recall = check_with(
-        "t-main-2",
+    let main_recall = aither_sandbox::LaunchLease::fresh().id();
+    let mut main_check = check_with(
+        main_recall,
         script,
         Some(parsed_shell.as_ref()),
         ScriptOrigin::Foreground,
         &start,
     );
-    main_recall.call = Some(&main_call);
+    main_check.call = Some(&main_call);
     assert_eq!(
-        policy.check(&main_recall, &main_state).await,
+        policy.check(&main_check, &main_state).await,
         ScriptDecision::Pass,
         "post-compaction recall read on main must pass"
     );
     policy
-        .ended(&ended("t-main-2", 0, &start), &main_state)
+        .ended(&ended(main_recall, 0, &start), &main_state)
         .await;
 
     // Once recalled in the new epoch, an immediate duplicate read is refused again.
     let mut main_dup = check_with(
-        "t-main-3",
+        aither_sandbox::LaunchLease::fresh().id(),
         script,
         Some(parsed_shell.as_ref()),
         ScriptOrigin::Foreground,

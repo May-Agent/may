@@ -53,12 +53,13 @@ impl Tool for LeakTool {
 
     type Arguments = NoArguments;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     fn call(
         &self,
         _args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl std::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
         std::future::ready(Ok(ToolResult::text(format!("token={SECRET_VALUE}"))))
     }
 }

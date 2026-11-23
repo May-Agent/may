@@ -313,7 +313,6 @@ impl From<WireJob> for JobInfo {
     fn from(job: WireJob) -> Self {
         Self {
             pid: job.pid,
-            task_id: job.pid.to_string(),
             execution_key: job.execution_key,
             script: job.script,
             interpreter: job.interpreter,
@@ -650,7 +649,6 @@ mod tests {
     fn a_job_keeps_its_age_across_the_socket() {
         let job = JobInfo {
             pid: 7,
-            task_id: "7".into(),
             execution_key: "k".into(),
             script: "sleep 30".into(),
             interpreter: Interpreter::Shell,

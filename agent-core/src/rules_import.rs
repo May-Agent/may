@@ -278,12 +278,13 @@ impl Tool for GlobalRulesTool {
 
     type Arguments = GlobalRulesArgs;
     type Res = ToolResult;
+    type Error = GlobalRulesError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         Ok(ToolResult::text(self.run(args).await?))
     }
 }

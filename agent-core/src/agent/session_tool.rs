@@ -149,42 +149,77 @@ pub struct SessionTool {
     index: Option<SessionSearchIndex>,
 }
 
+/// A `session` command failed before it could return its results.
 #[derive(Debug, thiserror::Error)]
-enum SessionToolError {
+pub enum SessionToolError {
+    /// The session store failed.
     #[error("database error: {0}")]
     Database(#[from] crate::db::ChatDbError),
+    /// A command's words could not be shell-parsed.
     #[error("session command '{command}' contains invalid shell quoting: {source}")]
     CommandWords {
+        /// The unparsable command line.
         command: String,
+        /// The parse failure.
         #[source]
         source: shell_words::ParseError,
     },
+    /// `session find` failed.
     #[error(transparent)]
     Find(#[from] FindError),
+    /// `session find` was called without a pattern.
     #[error("invalid session command: missing regular expression after 'find'")]
     MissingFindPattern,
+    /// The search index could not answer.
     #[error("session search is unavailable: {0}")]
     Index(#[from] IndexerError),
+    /// The repository search could not answer.
     #[error("session search is unavailable: {0}")]
     RepoSearch(#[from] crate::repo_search::RepoSearchError),
+    /// The session has no search index to query.
     #[error("this session has no search index")]
     NoIndex,
+    /// A command was given with no arguments.
     #[error("{command_name} command must not be empty")]
-    EmptyCommand { command_name: String },
+    EmptyCommand {
+        /// The command's name.
+        command_name: String,
+    },
+    /// A command that takes a prompt got none.
     #[error("{command_name} command must include a search prompt")]
-    MissingCommandPrompt { command_name: String },
+    MissingCommandPrompt {
+        /// The command's name.
+        command_name: String,
+    },
+    /// `session search` was called without a prompt.
     #[error("invalid session command: missing prompt after 'search'")]
     MissingSearchPrompt,
+    /// The search prompt was a wildcard rather than a description.
     #[error(
         "session search takes a description of what to find; use `session list` to list sessions by filters"
     )]
     WildcardQuery,
+    /// An action that needs a session id got none.
     #[error("session action '{action}' requires a session id")]
-    MissingActionSessionId { action: &'static str },
+    MissingActionSessionId {
+        /// The action's name.
+        action: &'static str,
+    },
+    /// The named session does not exist.
     #[error("session '{session_id}' was not found")]
-    SessionNotFound { session_id: String },
+    SessionNotFound {
+        /// The session that was asked for.
+        session_id: String,
+    },
+    /// The session exists but has no such message.
     #[error("session '{session_id}' has no message {message_id}")]
-    MessageNotFound { session_id: String, message_id: i64 },
+    MessageNotFound {
+        /// The session that was asked for.
+        session_id: String,
+        /// The message that was asked for.
+        message_id: i64,
+    },
+    /// The query matched only messages already in the context window.
     #[error(
         "every matching message is already present in the current context window; refine the query to recall older or other-session content"
     )]
@@ -321,12 +356,13 @@ impl Tool for SessionTool {
 
     type Arguments = SessionArgs;
     type Res = ToolResult;
+    type Error = SessionToolError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let plan = self.normalize_args(arguments).await?;
         execute_plan(
             self.db_path(),
@@ -335,7 +371,6 @@ impl Tool for SessionTool {
             plan,
         )
         .await
-        .map_err(Into::into)
     }
 }
 

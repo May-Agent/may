@@ -322,14 +322,12 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                             Some(CommandOutcome::Exited { code }) => {
                                 ToolOutcome::Exited { code: *code }
                             }
-                            Some(CommandOutcome::Running { task_id, .. }) => {
-                                ToolOutcome::Background {
-                                    pid: task_id.parse().unwrap_or(0),
-                                }
+                            Some(CommandOutcome::Running { pid, .. }) => {
+                                ToolOutcome::Background { pid: *pid }
                             }
-                            Some(CommandOutcome::Killed { task_id, .. }) => ToolOutcome::Killed {
-                                pid: task_id.parse().unwrap_or(0),
-                            },
+                            Some(CommandOutcome::Killed { pid, .. }) => {
+                                ToolOutcome::Killed { pid: *pid }
+                            }
                             None => ToolOutcome::Done,
                         };
                         self.write_line(

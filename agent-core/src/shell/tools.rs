@@ -8,8 +8,8 @@
 use aither_agent::{AgentBuilder, FileReferences, Hooks, context::HandoffSchema};
 use aither_core::LanguageModel;
 use aither_sandbox::{
-    AnyShellWording, JobInputTool, JobKillTool, JobReadTool, MonitorSettings, MonitorTool,
-    OutputPolicy, ShellToolSettings,
+    AnyShellWording, JobInputTool, JobReadTool, MonitorSettings, MonitorTool, OutputPolicy,
+    ShellToolSettings,
 };
 use aither_skills::SkillRegistry;
 use std::collections::HashSet;
@@ -158,12 +158,7 @@ impl ShellToolkit {
                 wording.clone(),
                 self.output.clone(),
             ))
-            .tool(JobInputTool::new(
-                self.tools.input.clone(),
-                jobs.clone(),
-                wording.clone(),
-            ))
-            .tool(JobKillTool::new(self.tools.kill.clone(), jobs, wording));
+            .tool(JobInputTool::new(self.tools.input.clone(), jobs, wording));
         if let Some(registry) = &self.skill_registry {
             builder = builder.skill_registry(registry.clone());
         }

@@ -85,12 +85,13 @@ impl Tool for ImagineTool {
 
     type Arguments = ImagineArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         match self.generate_image(arguments).await {
             Ok(artifact_path) => Ok(ToolResult::text(artifact_path)),
             Err(error) => Ok(ToolResult::error(error.to_string())),

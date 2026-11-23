@@ -74,7 +74,7 @@ pub enum ExecError {
     #[error("ssh server '{0}' is not attached to the session's profile")]
     SshServerNotAttached(String),
     #[error("terminal execution failed: {0}")]
-    TerminalCall(aither_core::Error),
+    TerminalCall(anyhow::Error),
     #[error("failed to build the shell: {0}")]
     BuildShell(may_agent::shell::ShellAssemblyError),
     #[error("failed to write stdout: {0}")]
@@ -143,8 +143,8 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
             background: true,
         })
         .await
-        .map_err(ExecError::TerminalCall)?;
-    let pid = job.task_id().parse().unwrap_or(0);
+        .map_err(|error| ExecError::TerminalCall(anyhow::Error::msg(error)))?;
+    let pid = job.pid();
     let result = job
         .wait()
         .await
