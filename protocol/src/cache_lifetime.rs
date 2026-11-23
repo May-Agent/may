@@ -56,6 +56,30 @@ impl From<CacheLifetime> for aither_agent::context::CacheLifetime {
     }
 }
 
+/// The Claude breakpoint retention whose tier covers `lifetime`: the
+/// five-minute tier for a lifetime it alone cannot cover, otherwise the
+/// one-hour tier, which is the longest Claude offers.
+#[must_use]
+pub const fn claude_cache_ttl(
+    lifetime: aither_agent::context::CacheLifetime,
+) -> aither_core::llm::model::ClaudePromptCacheTtl {
+    use aither_core::llm::model::ClaudePromptCacheTtl;
+    match lifetime {
+        aither_agent::context::CacheLifetime::Limited(lifetime) if lifetime.as_secs() <= 300 => {
+            ClaudePromptCacheTtl::FiveMinutes
+        }
+        _ => ClaudePromptCacheTtl::OneHour,
+    }
+}
+
+impl CacheLifetime {
+    /// The Claude breakpoint retention covering this lifetime.
+    #[must_use]
+    pub fn claude_ttl(&self) -> aither_core::llm::model::ClaudePromptCacheTtl {
+        claude_cache_ttl((*self).into())
+    }
+}
+
 /// A cache lifetime text that is neither `permanent` nor a duration.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid cache lifetime '{text}': expected a duration such as '1h' or 'permanent'")]
@@ -130,5 +154,37 @@ mod tests {
                 lifetime
             );
         }
+    }
+
+    #[test]
+    fn a_claude_ttl_is_the_tier_covering_the_lifetime() {
+        use aither_agent::context::CacheLifetime as AitherLifetime;
+        use aither_core::llm::model::ClaudePromptCacheTtl;
+
+        for (lifetime, ttl) in [
+            (
+                AitherLifetime::Limited(Duration::from_mins(5)),
+                ClaudePromptCacheTtl::FiveMinutes,
+            ),
+            (
+                AitherLifetime::Limited(Duration::from_secs(60)),
+                ClaudePromptCacheTtl::FiveMinutes,
+            ),
+            (
+                AitherLifetime::Limited(Duration::from_mins(30)),
+                ClaudePromptCacheTtl::OneHour,
+            ),
+            (
+                AitherLifetime::Limited(Duration::from_hours(24)),
+                ClaudePromptCacheTtl::OneHour,
+            ),
+            (AitherLifetime::Permanent, ClaudePromptCacheTtl::OneHour),
+        ] {
+            assert_eq!(claude_cache_ttl(lifetime), ttl, "{lifetime:?}");
+        }
+        assert_eq!(
+            CacheLifetime::Limited(Duration::from_mins(5)).claude_ttl(),
+            ClaudePromptCacheTtl::FiveMinutes
+        );
     }
 }

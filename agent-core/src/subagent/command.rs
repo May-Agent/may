@@ -647,6 +647,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             Source::Definition(definition) => {
                 builder = builder
                     .request_parameters(slot.parameters)
+                    .claude_cache_ttl(crate::cache_lifetime::claude_cache_ttl(
+                        settings.cache_lifetime,
+                    ))
                     .cache_lifetime(settings.cache_lifetime)
                     .instruction(definition.prompt.clone());
                 for block in &settings.instructions {

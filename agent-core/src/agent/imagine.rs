@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use aither_cloud::{CloudProvider, gemini::Gemini, openai::OpenAI};
+use aither_cloud::{CloudImageGenerator, CloudProvider, gemini::Gemini, openai::OpenAI};
 use aither_core::image::{ImageGenerator, Prompt, Size};
 use aither_core::llm::{Tool, ToolResult};
 use async_fs;
@@ -112,22 +112,9 @@ impl ImagineTool {
         let image_provider = build_image_provider(generator)?;
 
         let mut latest = None;
-        match image_provider {
-            CloudProvider::OpenAI(provider) => {
-                let mut stream = std::pin::pin!(provider.create(prompt, size));
-                while let Some(chunk) = stream.next().await {
-                    latest =
-                        Some(chunk.map_err(|error| ImagineToolError::Generate(error.to_string()))?);
-                }
-            }
-            CloudProvider::Gemini(provider) => {
-                let mut stream = std::pin::pin!(provider.create(prompt, size));
-                while let Some(chunk) = stream.next().await {
-                    latest =
-                        Some(chunk.map_err(|error| ImagineToolError::Generate(error.to_string()))?);
-                }
-            }
-            _ => return Err(ImagineToolError::UnsupportedProvider),
+        let mut stream = std::pin::pin!(image_provider.create(prompt, size));
+        while let Some(chunk) = stream.next().await {
+            latest = Some(chunk.map_err(|error| ImagineToolError::Generate(error.to_string()))?);
         }
 
         let image = latest.ok_or(ImagineToolError::EmptyResponse)?;
@@ -168,7 +155,9 @@ fn parse_imagine_size(raw: &str) -> Result<Size, ImagineToolError> {
     Ok(Size::new(width, height))
 }
 
-fn build_image_provider(config: &ImageGeneratorConfig) -> Result<CloudProvider, ImagineToolError> {
+fn build_image_provider(
+    config: &ImageGeneratorConfig,
+) -> Result<CloudImageGenerator, ImagineToolError> {
     let provider_type = config.provider.resolve_type(&config.provider_id);
     let api_key = config.provider.api_key.as_deref().unwrap_or("");
     let base_url = config.provider.effective_base_url(&config.provider_id);
@@ -194,7 +183,7 @@ fn build_image_provider(config: &ImageGeneratorConfig) -> Result<CloudProvider, 
         CloudProvider::OpenAI(client)
     };
 
-    Ok(provider)
+    CloudImageGenerator::try_from(provider).map_err(|_| ImagineToolError::UnsupportedProvider)
 }
 
 /// The image-generator config `may_config` resolves, when one is set.

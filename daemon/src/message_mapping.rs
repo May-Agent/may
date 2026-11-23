@@ -199,7 +199,7 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
             "id": id,
             "name": name,
             "variant": ToolVariant::infer(name),
-            "result": crate::session::tool_result_wire::WireToolResult::from(result),
+            "result": result,
             "seq": seq,
         }),
         ToolEventRecord::Stopped { id, name } => json!({
@@ -207,9 +207,7 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
             "id": id,
             "name": name,
             "variant": ToolVariant::infer(name),
-            "result": crate::session::tool_result_wire::WireToolResult::from(
-                &ToolEventRecord::stopped_result()
-            ),
+            "result": ToolEventRecord::stopped_result(),
             "seq": seq,
         }),
     }

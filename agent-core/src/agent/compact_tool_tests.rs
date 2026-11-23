@@ -522,3 +522,103 @@ async fn async_compaction_restores_context_folds_post_fork_and_allows_file_recal
         "UnchangedFileReads must not refuse post-compaction recall: {final_req}"
     );
 }
+
+fn ask_twice_then_work(index: usize) -> Step {
+    match index {
+        0 => terminal("ask_user --question 'FIRST-QUESTION'"),
+        1 => terminal("ask_user --question 'SECOND-QUESTION'"),
+        2 => terminal("echo PLAIN-STEP-MARKER"),
+        _ => Step::Text("done"),
+    }
+}
+
+/// Two `ask_user` exchanges stay at their own place in the window after a
+/// compaction: the first question still precedes the second, each call id
+/// appears exactly in its call and its result, and the ordinary exchange
+/// between them is summarised away.
+#[tokio::test]
+async fn kept_exchanges_stay_in_order_without_duplicate_calls() {
+    let model = ScriptedModel::spawn(ask_twice_then_work).await;
+    let mut session = Box::pin(Session::start_with_runtime(&config_for(
+        &model,
+        ContextConfig::default(),
+    )))
+    .await;
+    let _lease = lease(&session).await;
+
+    run(&mut session, 8 * 20_000, "Ask twice and work.").await;
+    session
+        .agent
+        .compact(None)
+        .await
+        .expect("the session compacts");
+    run(&mut session, 0, "Continue.").await;
+
+    let resumed = model.last_request().await;
+    assert!(resumed.contains(HANDOFF_TASK), "the compaction landed");
+    let first = resumed
+        .find("FIRST-QUESTION")
+        .expect("the first exchange is kept");
+    let second = resumed
+        .find("SECOND-QUESTION")
+        .expect("the second exchange is kept");
+    assert!(
+        first < second,
+        "the kept exchanges stay in order: {resumed}"
+    );
+    for call in ["call-0", "call-1"] {
+        assert_eq!(
+            resumed.matches(call).count(),
+            2,
+            "{call} appears in its call and its result alone: {resumed}"
+        );
+    }
+    assert!(
+        !resumed.contains("PLAIN-STEP-MARKER"),
+        "an ordinary exchange is not kept"
+    );
+}
+
+/// A compaction the run itself starts when the window reaches the ceiling
+/// — not a `compact` call May wraps — still keeps the `ask_user` exchange
+/// in place: the marking happens when the call's outcome commits, so any
+/// compaction path retains it.
+#[tokio::test]
+async fn an_in_run_compaction_keeps_the_ask_user_exchange_in_place() {
+    let model = ScriptedModel::spawn(ask_then_work).await;
+    // 38k-token start point: the turn's history crosses it inside the run.
+    let context = ContextConfig {
+        compact_ceiling: 40_000,
+        start_distance: 2_000,
+        ..ContextConfig::default()
+    };
+    let mut session = Box::pin(Session::start_with_runtime(&config_for(&model, context))).await;
+    let _lease = lease(&session).await;
+
+    run(&mut session, 0, "Ask and work.").await;
+    session
+        .agent
+        .push_message(aither_core::llm::Message::assistant("x".repeat(8 * 20_000)));
+    run(&mut session, 0, "Work on.").await;
+    assert_eq!(
+        model.traffic.lock().await.compactions,
+        1,
+        "the run compacted itself at the ceiling"
+    );
+
+    let resumed = model.last_request().await;
+    assert!(resumed.contains(HANDOFF_TASK), "the handoff landed");
+    assert!(
+        resumed.contains("ask_user --question"),
+        "the ask_user call survived the in-run compaction: {resumed}"
+    );
+    assert_eq!(
+        resumed.matches("call-0").count(),
+        2,
+        "the kept call id is not duplicated: {resumed}"
+    );
+    assert!(
+        !resumed.contains("PLAIN-STEP-MARKER"),
+        "an ordinary exchange is not kept"
+    );
+}

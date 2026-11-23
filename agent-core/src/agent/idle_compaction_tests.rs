@@ -767,3 +767,67 @@ async fn a_saved_change_reaches_the_rebuilt_session() {
         "the saved compaction model takes over from idle compaction"
     );
 }
+
+/// The provider's advertised cache lifetime reaches the agent at build and
+/// again live over `sync_for_turn`: the bookkeeping lifetime and the Claude
+/// breakpoint TTL follow the resolved instance, not the values the agent
+/// was constructed with.
+#[tokio::test]
+async fn a_providers_advertised_cache_lifetime_syncs_live() {
+    use aither_core::llm::model::ClaudePromptCacheTtl;
+
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let mut config = saved_config(&stub, None);
+    config
+        .set_provider_cache_lifetime(SESSION_PROVIDER, "5m")
+        .expect("a duration");
+    let mut session = Box::pin(Session::start(&config)).await;
+
+    assert_eq!(
+        session.agent.cache_lifetime(),
+        aither_agent::context::CacheLifetime::Limited(Duration::from_mins(5)),
+        "the build carries the advertised lifetime"
+    );
+    assert_eq!(
+        session.agent.claude_cache_ttl(),
+        ClaudePromptCacheTtl::FiveMinutes,
+        "a five-minute lifetime asks the five-minute tier"
+    );
+
+    config
+        .set_provider_cache_lifetime(SESSION_PROVIDER, "30m")
+        .expect("a duration");
+    let model = format!("{SESSION_PROVIDER}::{SESSION_MODEL}");
+    let cwd = session.temp.path().join("cwd");
+    session
+        .agent
+        .sync_for_turn(crate::agent::TurnSyncInput {
+            may_config: &config,
+            pushed_providers: &crate::cloud::access::PushedProviders::default(),
+            current_model: &model,
+            reasoning_effort: None,
+            model_context_window: None,
+            provider_attempt: 0,
+            profile_id: None,
+            profile_persona: None,
+            profile_memories: None,
+            memory_off: false,
+            plan_state: crate::session::SessionPlanState::default(),
+            location: None,
+            cwd: &cwd,
+            ssh_servers: &[],
+        })
+        .await
+        .expect("sync_for_turn");
+
+    assert_eq!(
+        session.agent.cache_lifetime(),
+        aither_agent::context::CacheLifetime::Limited(Duration::from_mins(30)),
+        "the running agent's bookkeeping tracks the changed lifetime"
+    );
+    assert_eq!(
+        session.agent.claude_cache_ttl(),
+        ClaudePromptCacheTtl::OneHour,
+        "a thirty-minute lifetime asks the one-hour tier covering it"
+    );
+}
