@@ -4718,7 +4718,7 @@ async fn a_container_command_runs_at_the_configured_nice_and_reaches_ipc() {
                 .output()
         })
         .await
-        .unwrap_or_else(http_response_or_panic);
+        .unwrap_or_else(|error| panic!("may exec should run: {error}"));
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         println!("container script output at {priority:?}:\n{stdout}");
         assert!(
