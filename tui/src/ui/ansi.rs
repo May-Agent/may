@@ -285,8 +285,7 @@ pub fn parse_ansi_lines(
                 }
                 let run = bytes
                     .get(start..i)
-                    .map(|slice| String::from_utf8_lossy(slice))
-                    .unwrap_or_default();
+                    .map_or_default(|slice| String::from_utf8_lossy(slice));
                 for g in run.graphemes(true) {
                     while row.len() < cursor {
                         row.push(Cell {
