@@ -297,6 +297,89 @@ impl ChatDb {
         ))
     }
 
+    /// Ensures `swarm_epochs.last_epoch` for `workdir` is at least `epoch` so a
+    /// subsequent Board Host failover onto this daemon opens a strictly higher
+    /// `board_epoch`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn observe_swarm_epoch(&self, workdir: &str, epoch: u64) -> Result<(), ChatDbError> {
+        if epoch == 0 {
+            return Ok(());
+        }
+        let epoch_i64 = to_i64_from_u64(epoch, "board_epoch")?;
+        query!(
+            self.db,
+            "INSERT INTO swarm_epochs (workdir, last_epoch) VALUES (?, ?)
+             ON CONFLICT(workdir) DO UPDATE SET last_epoch = MAX(swarm_epochs.last_epoch, excluded.last_epoch)",
+            workdir,
+            epoch_i64
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Highest `seq` currently stored on `workdir`'s board (`0` when empty).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn board_max_seq(&self, workdir: &str) -> Result<u64, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT COALESCE(MAX(seq), 0) AS value FROM swarm_messages WHERE workdir = ?",
+            workdir
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?;
+        u64::try_from(row.value).map_err(|e| overflow_error("swarm_messages.seq", &e))
+    }
+
+    /// Reads the locally persisted `last_seq` cursor for `(workdir, session_id)`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn get_swarm_cursor(
+        &self,
+        workdir: &str,
+        session_id: &str,
+    ) -> Result<u64, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT last_seq AS value FROM swarm_cursors WHERE workdir = ? AND session_id = ?",
+            workdir,
+            session_id
+        )
+        .fetch_optional::<I64ValueRow>()
+        .await?;
+        u64::try_from(row.map_or(0, |r| r.value))
+            .map_err(|e| overflow_error("swarm_cursors.last_seq", &e))
+    }
+
+    /// Updates the locally persisted `last_seq` cursor for `(workdir, session_id)`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn set_swarm_cursor(
+        &self,
+        workdir: &str,
+        session_id: &str,
+        last_seq: u64,
+    ) -> Result<(), ChatDbError> {
+        let seq_i64 = to_i64_from_u64(last_seq, "swarm_cursors.last_seq")?;
+        query!(
+            self.db,
+            "INSERT INTO swarm_cursors (workdir, session_id, last_seq) VALUES (?, ?, ?)
+             ON CONFLICT(workdir, session_id) DO UPDATE SET last_seq = excluded.last_seq",
+            workdir,
+            session_id,
+            seq_i64
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Active board for `workdir`, if any.
     ///
     /// # Errors
@@ -430,6 +513,81 @@ impl ChatDb {
 
         tx.commit().await?;
         Ok(Some((board.board_epoch, touched_sessions)))
+    }
+
+    /// Rewrites or drops unconsumed pending swarm steers on a member daemon when
+    /// a remote Board Host notifies it that a cross-machine board dissolved.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn rewrite_pending_steers(
+        &self,
+        inspect_pending_xml: impl Fn(&str) -> DissolvedSteerAction,
+    ) -> Result<BTreeSet<String>, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        let candidates = query!(
+            tx,
+            "SELECT id, hidden_context_xml FROM session_pending_message_entries
+             WHERE state = 'pending' AND hidden_context_xml IS NOT NULL
+               AND (hidden_context_xml LIKE '%<board-notice %' OR hidden_context_xml LIKE '%<board-message %')"
+        )
+        .fetch_all::<PendingXmlRow>()
+        .await?;
+
+        let mut touched_sessions = BTreeSet::new();
+        for row in candidates {
+            match inspect_pending_xml(&row.hidden_context_xml) {
+                DissolvedSteerAction::Keep => {}
+                DissolvedSteerAction::Drop => {
+                    if let Some(owner) = query!(
+                        tx,
+                        "SELECT session_id AS value FROM session_pending_message_entries WHERE id = ?",
+                        row.id
+                    )
+                    .fetch_optional::<StringValueRow>()
+                    .await?
+                    {
+                        touched_sessions.insert(owner.value);
+                    }
+                    query!(
+                        tx,
+                        "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+                        row.id
+                    )
+                    .execute()
+                    .await?;
+                    query!(
+                        tx,
+                        "DELETE FROM session_pending_message_entries WHERE id = ? AND state = 'pending'",
+                        row.id
+                    )
+                    .execute()
+                    .await?;
+                }
+                DissolvedSteerAction::RewriteXml(updated) => {
+                    if let Some(owner) = query!(
+                        tx,
+                        "SELECT session_id AS value FROM session_pending_message_entries WHERE id = ?",
+                        row.id
+                    )
+                    .fetch_optional::<StringValueRow>()
+                    .await?
+                    {
+                        touched_sessions.insert(owner.value);
+                    }
+                    query!(
+                        tx,
+                        "UPDATE session_pending_message_entries SET hidden_context_xml = ? WHERE id = ? AND state = 'pending'",
+                        updated.into_inner(),
+                        row.id
+                    )
+                    .execute()
+                    .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(touched_sessions)
     }
 
     /// Appends a message to `msg.workdir`'s active board with the next
