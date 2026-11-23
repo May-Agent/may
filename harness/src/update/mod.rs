@@ -16,9 +16,9 @@
 //!
 //! A binary records how it was built ([`BuildKind`]): a release build, a CI
 //! build (compiled by GitHub Actions, the build the dev channel downloads) or
-//! a local build. `may update` works on every kind; the daemon updates itself
-//! in the background only on release and CI builds, so a locally compiled
-//! binary is never overwritten behind its developer.
+//! a local build. A locally compiled binary refuses both automatic updates and
+//! `may update`, so a `cargo build` binary is never overwritten behind its
+//! developer or falsely reported as up to date.
 //!
 //! Replacing the executable does not replace a daemon that is running: the
 //! callers restart it gracefully (`daemon::lifecycle`).
@@ -82,6 +82,11 @@ pub enum Outcome {
 /// Why an update failed.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
+    /// A locally compiled binary cannot self-update.
+    #[error(
+        "this May is a local build and cannot self-update; install a release or CI build instead"
+    )]
+    LocalBuild,
     /// No build of May exists for this platform.
     #[error("no build of May exists for this platform")]
     UnsupportedPlatform,
@@ -173,10 +178,9 @@ impl Build {
         self.kind == BuildKind::Release && self.version == *latest
     }
 
-    /// Whether this is the CI build of `head_sha`: a non-release build of
-    /// that commit.
+    /// Whether this is the CI build of `head_sha`: a CI build of that commit.
     fn is_ci_build_of(&self, head_sha: &str) -> bool {
-        self.kind != BuildKind::Release && self.commit.as_deref() == Some(head_sha)
+        self.kind == BuildKind::Ci && self.commit.as_deref() == Some(head_sha)
     }
 }
 
@@ -291,6 +295,9 @@ async fn check_at(
     token: Result<String, String>,
     progress: &mut impl FnMut(Progress),
 ) -> Result<Option<Available>, UpdateError> {
+    if build.kind == BuildKind::Local {
+        return Err(UpdateError::LocalBuild);
+    }
     match channel {
         Channel::Stable => {
             let platform = ReleasePlatform::current()?;
@@ -471,12 +478,13 @@ mod tests {
     }
 
     #[test]
-    fn a_non_release_build_is_current_only_at_the_ci_head() {
-        assert!(build(BuildKind::Local, "0.1.1", Some(HEAD)).is_ci_build_of(HEAD));
-        assert!(!build(BuildKind::Local, "0.1.1", Some("0123abc")).is_ci_build_of(HEAD));
+    fn a_ci_build_is_current_only_at_the_ci_head() {
+        assert!(build(BuildKind::Ci, "0.1.1", Some(HEAD)).is_ci_build_of(HEAD));
+        assert!(!build(BuildKind::Ci, "0.1.1", Some("0123abc")).is_ci_build_of(HEAD));
         // Without its commit a build cannot be told current.
-        assert!(!build(BuildKind::Local, "0.1.1", None).is_ci_build_of(HEAD));
-        // A release build is never the dev channel's build, even of that commit.
+        assert!(!build(BuildKind::Ci, "0.1.1", None).is_ci_build_of(HEAD));
+        // Neither a local nor a release build is the dev channel's CI build.
+        assert!(!build(BuildKind::Local, "0.1.1", Some(HEAD)).is_ci_build_of(HEAD));
         assert!(!build(BuildKind::Release, "0.1.1", Some(HEAD)).is_ci_build_of(HEAD));
     }
 
@@ -524,9 +532,9 @@ mod tests {
             .expect("the check runs without a login");
         assert!(found.is_none());
 
-        // A dev build of the same version, and an older release, install.
+        // A CI build of the same version, and an older release, install.
         for build in [
-            build(BuildKind::Local, "0.1.1", Some(HEAD)),
+            build(BuildKind::Ci, "0.1.1", Some(HEAD)),
             build(BuildKind::Release, "0.1.0", None),
         ] {
             let found = check_at(&base, Channel::Stable, &build, token(), &mut ignore)
@@ -555,7 +563,7 @@ mod tests {
         let token = || Ok("test-token".to_owned());
         let mut ignore = |_: Progress| {};
 
-        let current = build(BuildKind::Local, "0.1.1", Some(HEAD));
+        let current = build(BuildKind::Ci, "0.1.1", Some(HEAD));
         let found = check_at(&base, Channel::Dev, &current, token(), &mut ignore)
             .await
             .expect("the check runs");
@@ -571,6 +579,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_build_refuses_to_check_or_update() {
+        let mut ignore = |_: Progress| {};
+        for channel in [Channel::Dev, Channel::Stable] {
+            let error = check_at(
+                "http://127.0.0.1:9",
+                channel,
+                &build(BuildKind::Local, "0.1.1", Some(HEAD)),
+                Err("no login".to_owned()),
+                &mut ignore,
+            )
+            .await
+            .expect_err("a local build refuses to update");
+            assert!(matches!(error, UpdateError::LocalBuild), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn dev_without_a_github_login_cannot_check() {
         let Ok(platform) = CiPlatform::current() else {
             return;
@@ -580,7 +605,7 @@ mod tests {
         let error = check_at(
             &base,
             Channel::Dev,
-            &build(BuildKind::Local, "0.1.1", None),
+            &build(BuildKind::Ci, "0.1.1", None),
             Err("no login".to_owned()),
             &mut ignore,
         )

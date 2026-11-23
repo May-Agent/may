@@ -3241,7 +3241,11 @@ async fn open_gui(port: Option<u16>) -> anyhow::Result<()> {
 /// `channel` switches the channel first and keeps the choice in the
 /// configuration, through the daemon when one runs, which applies it live.
 async fn run_update(channel: Option<may_agent::update::Channel>) -> anyhow::Result<()> {
-    use may_agent::update::{Outcome, running_executable, update};
+    use may_agent::update::{BuildKind, Outcome, UpdateError, running_executable, update};
+
+    if BuildKind::current() == BuildKind::Local {
+        return Err(UpdateError::LocalBuild.into());
+    }
 
     let paths = may_agent::daemon::DaemonPaths::user()?;
     let daemon = may_agent::client::DaemonClient::new(paths.socket());
