@@ -203,6 +203,10 @@ fn all_pids() -> std::io::Result<Vec<i32>> {
 /// The live members of process session `session`; exited processes not yet
 /// reaped are left out.
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous /proc scan runs inside end_exited_session"
+)]
 fn session_members(session: Pid) -> std::io::Result<Vec<Pid>> {
     let session = session.as_raw_nonzero().get();
     let mut members = Vec::new();

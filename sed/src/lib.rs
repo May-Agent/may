@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! `aither-sed`: the `sed` of sandboxed agent scripts, uutils' `sed` run in
 //! its sandbox mode so that no script writes a file.
 //!

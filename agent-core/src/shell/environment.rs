@@ -331,7 +331,7 @@ async fn environment(
         use std::os::unix::fs::PermissionsExt as _;
         let stow_run = writable.cache().join("stow").join("run");
         async_fs::create_dir_all(&stow_run).await?;
-        std::fs::set_permissions(&stow_run, std::fs::Permissions::from_mode(0o700))?;
+        async_fs::set_permissions(&stow_run, std::fs::Permissions::from_mode(0o700)).await?;
         env.push((
             "STOW_DAEMON_DIR".to_string(),
             path_value("STOW_DAEMON_DIR", &stow_run)?,

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The executable as the sandbox runs it.
 
 use std::io::Write;
