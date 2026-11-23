@@ -99,7 +99,7 @@ pub use live_limits::LiveLimits;
 pub use loop_watch::LoopLimits;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
-    generate_session_title,
+    generate_session_title, prewarm_host_tools,
 };
 pub use may::{TurnSyncInput, side_slot};
 pub use may_client::command_cards;

@@ -135,8 +135,13 @@ impl<P: ForgeProbe + Sync> RepoGate<'_, P> {
     async fn gate_bound_checkout(&self, session_id: &str, cwd: String) -> Result<(), GateError> {
         let demoted = {
             let (dir, config_path) = (cwd.clone(), self.config_path.to_path_buf());
-            blocking::unblock(move || crate::trust::persisted_level(Path::new(&dir), &config_path))
-                .await?
+            blocking::unblock(move || {
+                if !crate::trust::has_non_forge_project(&config_path)? {
+                    return Ok(None);
+                }
+                crate::trust::persisted_level(Path::new(&dir), &config_path)
+            })
+            .await?
         }
         .is_some_and(|level| !level.publishes_to_forge());
         if demoted {

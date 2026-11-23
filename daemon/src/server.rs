@@ -368,6 +368,7 @@ pub async fn start(
         build_id: crate::current_build_id().context("failed to identify the running build")?,
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
+        session_prewarms: super::chat::SessionPrewarms::default(),
         agent_forks: crate::agent_link::ForkHosts::default(),
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
@@ -406,6 +407,21 @@ pub async fn start(
         .context("failed to resume persisted pending session runs")?;
 
     // Spawn background tasks
+    {
+        let may_dir = state.may_dir.clone();
+        let tool_distribution = state.tool_distribution.clone();
+        let tool_environments = state.tool_environments.clone();
+        let hashline = state.config_snapshot().experimental.hashline;
+        state.tokio_handle.spawn(async move {
+            crate::agent::prewarm_host_tools(
+                &may_dir,
+                &tool_distribution,
+                &tool_environments,
+                hashline,
+            )
+            .await;
+        });
+    }
     super::archive::spawn(state.clone());
     if let Some(cm) = state.container_manager.load_full() {
         let _auto_stop = cm.spawn_auto_stop_task();
