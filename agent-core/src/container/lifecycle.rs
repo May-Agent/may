@@ -169,10 +169,46 @@ impl ContainerManager {
             return Ok(id);
         }
 
-        // Create new container
-        let id = self
+        // Create new container — or adopt the one a racing caller just
+        // registered under this deterministic name (Docker 409): a session
+        // prewarm and the first turn can resolve the environment at once.
+        let id = match self
             .create_container(spec, &host_gateway, &shared_paths, &spec_fingerprint)
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(ContainerError::Docker(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                ..
+            })) => {
+                let container = self
+                    .find_container_by_name(spec.name.as_str())
+                    .await?
+                    .ok_or_else(|| ContainerError::NotFound(spec.name.clone()))?;
+                let labels = container.labels.unwrap_or_default();
+                if labels.get(LABEL_MANAGED).map(String::as_str) != Some("true") {
+                    let found_id = container.id.as_deref().unwrap_or("unknown");
+                    return Err(ContainerError::Bootstrap(format!(
+                        "container name collision with unmanaged container: {} ({found_id})",
+                        spec.name
+                    )));
+                }
+                let found = container
+                    .id
+                    .ok_or_else(|| ContainerError::NotFound(spec.name.clone()))?;
+                if container.state != Some(ContainerSummaryStateEnum::RUNNING) {
+                    self.runtime.client.start_container(&found, None).await?;
+                }
+                self.touch_activity(&found);
+                tracing::info!(
+                    container_id = %found,
+                    name = %spec.name,
+                    "Adopted container a racing caller created"
+                );
+                return Ok(found);
+            }
+            Err(error) => return Err(error),
+        };
 
         // Start it
         self.runtime.client.start_container(&id, None).await?;
