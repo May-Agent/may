@@ -23,7 +23,7 @@ default-members = [".", "agent-core", "daemon", "tasks", "patch", "container-ima
 
 [features]
 default = ["vision-ocr"]
-ui = ["may-daemon/ui"]
+ui = ["may-daemon/ui", "may-tui/ui"]
 # Set by the cargo-dist release build (`dist-workspace.toml`): the binary is a
 # release, so its update channel defaults to `stable` instead of `dev`.
 release-build = ["may-config/release-build", "may-harness/release-build"]

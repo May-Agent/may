@@ -14,6 +14,7 @@ pub enum SlashCommand {
     Archive,
     New,
     Chat,
+    #[cfg(feature = "ui")]
     Gui,
     Profile,
     Model,
@@ -63,12 +64,13 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; if cfg!(feature = "ui") { 39 } else { 38 }] = [
         Self::Help,
         Self::Session,
         Self::Archive,
         Self::New,
         Self::Chat,
+        #[cfg(feature = "ui")]
         Self::Gui,
         Self::Profile,
         Self::Model,
@@ -118,6 +120,7 @@ impl SlashCommand {
                 "Start a new session, optionally on a repository",
             ),
             Self::Chat => ("/chat", "", "Start a new repo-less chat"),
+            #[cfg(feature = "ui")]
             Self::Gui => ("/gui", "", "Open this session in the web UI"),
             Self::Profile => ("/profile", "", "Switch profile (Ctrl+P)"),
             Self::Model => ("/model", "[query]", "Switch model for this session"),
@@ -304,5 +307,18 @@ mod tests {
         for command in SlashCommand::ALL {
             assert!(labels.contains(&command.name()), "{}", command.name());
         }
+    }
+
+    #[test]
+    fn gui_command_matches_ui_feature() {
+        let has_ui = cfg!(feature = "ui");
+        assert_eq!(SlashCommand::from_name("/gui").is_some(), has_ui);
+
+        let help = HelpScreen::new().render().expect("help renders");
+        assert_eq!(help.contains("/gui"), has_ui);
+
+        let mut completion = crate::completion::Completion::new();
+        completion.start_slash("gui");
+        assert_eq!(completion.labels().contains(&"/gui"), has_ui);
     }
 }
