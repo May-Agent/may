@@ -173,7 +173,7 @@ impl GitHub {
     pub(super) async fn download_release(
         &self,
         latest: &Latest,
-        progress: &mut impl FnMut(u64, Option<u64>),
+        progress: &mut (impl FnMut(u64, Option<u64>) + Send),
     ) -> Result<Vec<u8>, UpdateError> {
         let checksum = self.get_public(&latest.checksum_url).await?;
         let archive = self.get_public_bytes(&latest.archive_url, progress).await?;

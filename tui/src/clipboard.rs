@@ -550,23 +550,24 @@ pub async fn download_image(url: &Url) -> Result<ClipboardImage, ImageError> {
 /// content type did not vouch for an image, the first chunk's magic bytes
 /// must — a non-image body aborts there instead of being pulled whole.
 async fn read_image_body(body: zenwave::Body, declared_image: bool) -> Result<Vec<u8>, ImageError> {
-    use futures_lite::AsyncReadExt;
+    use futures_lite::StreamExt;
 
     const MAX_BODY: usize = 64 * 1024 * 1024;
 
-    let mut reader = body.into_reader();
+    let mut stream = body.into_data_stream();
     let mut data = Vec::new();
-    let mut chunk = vec![0u8; 16 * 1024];
     let mut first = true;
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .await
-            .map_err(|e| ImageError::Download(e.to_string()))?;
-        if n == 0 {
-            break;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ImageError::Download(e.to_string()))?;
+        if chunk.is_empty() {
+            continue;
         }
-        data.extend_from_slice(&chunk[..n]);
+        if data.len().saturating_add(chunk.len()) > MAX_BODY {
+            return Err(ImageError::Download(format!(
+                "image exceeds {MAX_BODY} bytes"
+            )));
+        }
+        data.extend_from_slice(&chunk);
         if first {
             first = false;
             if !declared_image && ImageFormat::from_magic_bytes(&data).is_none() {
@@ -574,11 +575,6 @@ async fn read_image_body(body: zenwave::Body, declared_image: bool) -> Result<Ve
                     "response body is not a supported image format".to_string(),
                 ));
             }
-        }
-        if data.len() > MAX_BODY {
-            return Err(ImageError::Download(format!(
-                "image exceeds {MAX_BODY} bytes"
-            )));
         }
     }
     Ok(data)

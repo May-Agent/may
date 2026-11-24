@@ -216,7 +216,7 @@ impl Available {
     pub async fn install(
         self,
         target: &Path,
-        progress: &mut impl FnMut(Progress),
+        progress: &mut (impl FnMut(Progress) + Send),
     ) -> Result<(), UpdateError> {
         let executable = match self.source {
             Source::Release { latest, platform } => {
@@ -338,7 +338,7 @@ async fn check_at(
 pub async fn update(
     channel: Channel,
     target: &Path,
-    mut progress: impl FnMut(Progress),
+    mut progress: impl FnMut(Progress) + Send,
 ) -> Result<Outcome, UpdateError> {
     let Some(available) = check(channel, &mut progress).await? else {
         return Ok(Outcome::UpToDate);
@@ -375,7 +375,7 @@ pub const fn built_from() -> Option<&'static str> {
 pub async fn this_build_tarball_for(
     platform: CiPlatform,
     token: String,
-    mut progress: impl FnMut(Progress),
+    mut progress: impl FnMut(Progress) + Send,
 ) -> Result<Vec<u8>, UpdateError> {
     let commit = built_from().ok_or(UpdateError::UnknownCommit)?;
     this_commit_from(GITHUB_API, platform, commit, token, &mut progress).await
@@ -386,7 +386,7 @@ async fn this_commit_from(
     platform: CiPlatform,
     commit: &str,
     token: String,
-    progress: &mut impl FnMut(Progress),
+    progress: &mut (impl FnMut(Progress) + Send),
 ) -> Result<Vec<u8>, UpdateError> {
     let name = platform.artifact();
     let github = GitHub::new(api_base, Some(token));

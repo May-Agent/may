@@ -47,7 +47,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
-zenwave = "0.7"
+zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 # `testing`
 executor-core = { version = "0.7", features = ["tokio"], optional = true }

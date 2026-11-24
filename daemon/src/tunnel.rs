@@ -12,7 +12,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt as _};
 use skyzen::Result as SkyResult;
 use skyzen::extract::Extractor;
 use skyzen::header::{
@@ -441,7 +441,12 @@ async fn proxy_http(
 
     let status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
-    let mut response = Response::new(upstream_response.into_body());
+    let mut response = Response::new(Body::from_stream(
+        upstream_response
+            .into_body()
+            .into_data_stream()
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+    ));
     *response.status_mut() = status;
     for name in upstream_headers.keys() {
         if skip_response_header(name) {
@@ -512,10 +517,10 @@ fn proxy_ws(
                 },
                 message = upstream_rx.recv() => match message {
                     Ok(Some(message)) => match message {
-                        skyzen::websocket::WebSocketMessage::Text(text) => socket.send_text(text).await?,
-                        skyzen::websocket::WebSocketMessage::Binary(bytes) => socket.send_binary(bytes).await?,
-                        skyzen::websocket::WebSocketMessage::Ping(_) | skyzen::websocket::WebSocketMessage::Pong(_) => {},
-                        skyzen::websocket::WebSocketMessage::Close => break,
+                        zenwave::websocket::WebSocketMessage::Text(text) => socket.send_text(text.as_str()).await?,
+                        zenwave::websocket::WebSocketMessage::Binary(bytes) => socket.send_binary(bytes).await?,
+                        zenwave::websocket::WebSocketMessage::Ping(_) | zenwave::websocket::WebSocketMessage::Pong(_) => {},
+                        zenwave::websocket::WebSocketMessage::Close => break,
                     },
                     Ok(None) | Err(_) => break,
                 },

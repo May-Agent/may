@@ -298,13 +298,13 @@ async fn fetch_openai_compatible_models(
 ) -> Result<Vec<FetchedModel>, ModelFetchError> {
     let base_url = base_url.unwrap_or("https://api.openai.com/v1");
     let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut backend = zenwave::client();
+    let mut backend = zenwave::client().error_for_status();
     let mut builder = backend.get(&endpoint)?;
     if !api_key.is_empty() {
         builder = builder.header(AUTHORIZATION.as_str(), format!("Bearer {api_key}"))?;
     }
     let response: OpenAiModelListResponse = bounded(FETCH_REQUEST_TIMEOUT, builder.json(), |_| {
-        zenwave::Error::Timeout
+        zenwave::Error::Timeout(zenwave::TimedOut::Request)
     })
     .await?;
 

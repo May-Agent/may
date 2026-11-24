@@ -151,8 +151,8 @@ pub fn is_api_key(input: &str) -> bool {
 /// Longest one `OpenRouter` auth call may take; nothing downstream bounds it.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn http() -> zenwave::DefaultClient {
-    zenwave::client()
+fn http() -> zenwave::endpoint::WithMiddleware<zenwave::DefaultClient, zenwave::ErrorForStatus> {
+    zenwave::client().error_for_status()
 }
 
 /// Fails `fut` as [`zenwave::Error::Timeout`] when it has not finished within
@@ -162,7 +162,7 @@ async fn bounded_request<T>(
 ) -> Result<T, zenwave::Error> {
     futures_lite::future::race(fut, async {
         async_io::Timer::after(REQUEST_TIMEOUT).await;
-        Err(zenwave::Error::Timeout)
+        Err(zenwave::Error::Timeout(zenwave::TimedOut::Request))
     })
     .await
 }
