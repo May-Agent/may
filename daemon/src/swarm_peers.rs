@@ -1006,7 +1006,33 @@ mod tests {
     use crate::config::MayConfig;
     use crate::db::{MessageMeta, PromptCacheRequest, RunFence, SwarmReadMode};
     use crate::server::{DaemonMode, build_router};
+    use crate::session::PendingUserMessage;
     use crate::swarm::{SwarmConditions, SwarmSeenState, SwarmService};
+
+    /// A delivered steer or notice is queued on the receiving daemon before
+    /// its HTTP response returns, but the pending row is only claimable once
+    /// the enqueue settles — poll the claim instead of racing the first read.
+    async fn claim_pending_with_deadline(
+        state: &DaemonState,
+        fence: &RunFence,
+        session_id: &str,
+    ) -> Option<PendingUserMessage> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match state
+                .db()
+                .claim_next_pending_message(fence, session_id)
+                .await
+            {
+                Ok(Some(message)) => return Some(message),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(None) => return None,
+                Err(error) => panic!("claim_next_pending_message failed: {error}"),
+            }
+        }
+    }
 
     struct SwarmTestDaemon {
         dir: tempfile::TempDir,
@@ -1222,19 +1248,16 @@ mod tests {
         assert!(posted.contains("1:2"), "monotonic seq on host: {posted}");
         assert!(posted.contains("mac-mini:badger"), "{posted}");
 
-        let badger_pending = mini
-            .state
-            .db()
-            .claim_next_pending_message(
-                &RunFence {
-                    session_id: "badger".to_string(),
-                    run_id: "r-badger".to_string(),
-                },
-                "badger",
-            )
-            .await
-            .unwrap()
-            .expect("cold remote peer received @mention steer");
+        let badger_pending = claim_pending_with_deadline(
+            &mini.state,
+            &RunFence {
+                session_id: "badger".to_string(),
+                run_id: "r-badger".to_string(),
+            },
+            "badger",
+        )
+        .await
+        .expect("cold remote peer received @mention steer");
         let mention_xml = badger_pending.hidden_context_xml.unwrap().into_inner();
         assert!(
             mention_xml.contains("id=\"macbook:otter\""),
@@ -1359,18 +1382,16 @@ mod tests {
             0
         );
 
-        let claimed = cloud_state
-            .db()
-            .claim_next_pending_message(
-                &RunFence {
-                    session_id: "lynx".to_string(),
-                    run_id: "r-lynx".to_string(),
-                },
-                "lynx",
-            )
-            .await
-            .unwrap()
-            .expect("flushed notice queued on codespace");
+        let claimed = claim_pending_with_deadline(
+            &cloud_state,
+            &RunFence {
+                session_id: "lynx".to_string(),
+                run_id: "r-lynx".to_string(),
+            },
+            "lynx",
+        )
+        .await
+        .expect("flushed notice queued on codespace");
         let xml = claimed.hidden_context_xml.unwrap().into_inner();
         assert!(xml.contains("PR #99 merged"), "{xml}");
     }
