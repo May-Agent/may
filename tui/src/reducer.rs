@@ -326,7 +326,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::SidebarPrs { session_id, prs } => {
-            app.sidebar.set_prs(&session_id, prs);
+            let current = app
+                .session_manager
+                .current()
+                .filter(|session| session.persisted)
+                .is_some_and(|session| session.id.as_str() == session_id);
+            if current {
+                app.sidebar.set_prs(&session_id, prs);
+            }
             Ok(None)
         }
         AppEvent::PrsInvalidated => {

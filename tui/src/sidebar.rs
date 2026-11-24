@@ -121,7 +121,7 @@ pub struct SidebarState {
     pub tasks: Option<Vec<TaskRow>>,
     /// Linked issues with their lookups, in first-mention order.
     pub issues: Vec<IssueBrief>,
-    /// The session's PRs from the daemon's `/prs` endpoint, newest first.
+    /// The session's PRs from the daemon's `/sessions/{id}/prs` endpoint, newest first.
     pub prs: Vec<may_client::client::WirePr>,
 }
 
@@ -194,9 +194,8 @@ impl SidebarState {
 
     /// Store the session's PR list from the daemon.
     pub fn set_prs(&mut self, session_id: &str, prs: Vec<may_client::client::WirePr>) {
-        if session_id.is_empty()
-            || self.session_id.is_none()
-            || self.session_id.as_deref() == Some(session_id)
+        if !session_id.is_empty()
+            && (self.session_id.is_none() || self.session_id.as_deref() == Some(session_id))
         {
             self.prs = prs;
         }
@@ -447,5 +446,42 @@ mod tests {
 
         state.reset();
         assert!(state.prs.is_empty());
+    }
+
+    #[test]
+    fn set_prs_only_accepts_non_empty_matching_session() {
+        let mut state = SidebarState::default();
+        let make_pr = |id: i64, session_id: &str| may_client::client::WirePr {
+            id,
+            repo_key: "org/repo".to_string(),
+            session_id: session_id.to_string(),
+            orphaned: false,
+            require_review: false,
+            number: id,
+            title: format!("PR {id}"),
+            state: may_db::PrState::Open,
+            backend: "may".to_string(),
+            issue_number: None,
+            auto_merge: false,
+            base_sha: String::new(),
+            head_sha: None,
+            merge_commit_sha: None,
+            checks: None,
+            checks_error: None,
+            events: Vec::new(),
+            updated_at: String::new(),
+        };
+
+        state.set_prs("", vec![make_pr(1, "other")]);
+        assert!(state.prs.is_empty());
+
+        state.set_prs("s1", vec![make_pr(2, "s1")]);
+        assert_eq!(state.prs.len(), 1);
+        assert_eq!(state.prs[0].id, 2);
+
+        state.set_tasks("s1", None);
+        state.set_prs("s2", vec![make_pr(3, "s2")]);
+        assert_eq!(state.prs.len(), 1);
+        assert_eq!(state.prs[0].id, 2);
     }
 }
