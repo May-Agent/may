@@ -4870,27 +4870,23 @@ impl App {
         }
     }
 
-    /// Fetch the session/repo/orphaned PRs for the sidebar from the daemon
-    /// (`GET /api/prs?forSession={id}` or `/api/prs?orphaned=true&state=open`);
-    /// the answer arrives as [`AppEvent::SidebarPrs`].
+    /// Fetch the current session's PRs for the sidebar from the daemon
+    /// (`GET /api/sessions/{id}/prs`); the answer arrives as
+    /// [`AppEvent::SidebarPrs`]. Unpersisted sessions have no daemon PRs.
     pub fn request_sidebar_prs(&mut self) {
-        let Some(client) = self.btw_daemon.clone() else {
-            return;
-        };
-        let session_id = self
+        let Some(session_id) = self
             .session_manager
             .current()
             .filter(|session| session.persisted)
-            .map(|session| session.id.as_str().to_string());
-        let path = session_id.as_deref().map_or_else(
-            || "/api/prs?orphaned=true&state=open".to_string(),
-            |id| {
-                let mut query = url::form_urlencoded::Serializer::new(String::new());
-                query.append_pair("forSession", id);
-                format!("/api/prs?{}", query.finish())
-            },
-        );
-        let session_id = session_id.unwrap_or_default();
+            .map(|session| session.id.as_str().to_string())
+        else {
+            self.sidebar.prs.clear();
+            return;
+        };
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let path = may_client::client::session_path(&session_id, "/prs");
         let tx = self.event_tx.clone();
         spawn(async move {
             match client.get::<Vec<may_client::client::WirePr>>(&path).await {

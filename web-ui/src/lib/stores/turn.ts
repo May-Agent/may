@@ -269,7 +269,6 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         case 'prs.changed': {
           const { prs } = data as unknown as { prs: ApiPr[] };
           useInspectorStore.getState().applyPrs(sessionId, prs);
-          void useInspectorStore.getState().loadPrs(sessionId);
           return;
         }
         default:

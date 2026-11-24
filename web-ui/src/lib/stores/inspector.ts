@@ -6,7 +6,7 @@ import {
   type SessionBackground,
 } from '../api/background';
 import { getSessionTasks } from '../api/tasks';
-import { closePr, listPrs, mergePr, type ApiPr } from '../api/prs';
+import { closePr, getSessionPrs, mergePr, type ApiPr } from '../api/prs';
 import { isDraftSessionId, useSessionsStore } from './sessions';
 import {
   NO_STOP_REQUESTS,
@@ -170,7 +170,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
     async loadPrs(sessionId) {
       if (isDraftSessionId(sessionId)) return;
       try {
-        get().applyPrs(sessionId, await listPrs({ forSession: sessionId }));
+        get().applyPrs(sessionId, await getSessionPrs(sessionId));
       } catch (err) {
         console.warn('session PRs failed to load', message(err));
       }
