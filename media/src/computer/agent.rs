@@ -70,17 +70,19 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
     async_fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .await
         .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
+    let bound_inode = async_fs::metadata(&sock)
+        .await
+        .map_err(|e| format!("stat {}: {e}", sock.display()))?
+        .ino();
     // The daemon reads this to know the helper is alive and to kill it
-    // after permission grants — `open` gives no child handle.
+    // after permission grants — `open` gives no child handle. Written last
+    // so tests watching for it only tear down the directory once setup has
+    // entered the watch loop.
     let _ = async_fs::write(
         may_dir.join("computer-agent.pid"),
         std::process::id().to_string(),
     )
     .await;
-    let bound_inode = async_fs::metadata(&sock)
-        .await
-        .map_err(|e| format!("stat {}: {e}", sock.display()))?
-        .ino();
     let state = Arc::new(AgentState {
         // The helper's one handle to the main thread and its display host.
         displays: async_lock::Mutex::new(SessionDisplays::new(MainThread::default())),
@@ -401,9 +403,10 @@ mod tests {
             let may_dir = may_dir.clone();
             async move { serve_watching(&may_dir, Duration::from_millis(20)).await }
         });
-        while !may_dir.join("computer-agent.sock").exists() {
+        while !may_dir.join("computer-agent.pid").exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
         std::fs::remove_dir_all(&may_dir).expect("remove may dir");
         let result = tokio::time::timeout(Duration::from_secs(5), server)
             .await

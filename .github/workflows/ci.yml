@@ -206,11 +206,9 @@ jobs:
       actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Test runs pay for no DWARF debug info: panic locations come from
-      # `#[track_caller]`, while line tables inflate every test executable,
-      # overflow macOS's 16 MB compact unwind table, and bloat cache archives.
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
+      # Dependencies keep Cargo's default debuginfo (`2`) so they match
+      # stow's public prebuilt cache; ./.github/actions/test disables debuginfo
+      # only on workspace packages via ${CARGO_HOME}/config.toml.
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
@@ -248,8 +246,6 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # See test-ubuntu.
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
