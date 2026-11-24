@@ -2280,15 +2280,17 @@ impl MayConfig {
 
     /// Save configuration to a specific path.
     ///
+    /// Writes to a sibling temporary file in `path`'s parent directory and
+    /// renames it into place so concurrent readers and file watchers never
+    /// observe a truncated or partially written file.
+    ///
     /// # Errors
     /// Returns [`ConfigError`] when serialization or the filesystem write fails.
     pub async fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
         let content = toml::to_string_pretty(self)?;
-        async_fs::write(path, content).await?;
+        let path = path.to_path_buf();
+        blocking::unblock(move || write_config_atomically(&path, content.as_bytes())).await?;
         Ok(())
     }
 
@@ -2564,6 +2566,22 @@ pub struct AvailableModel {
     pub provider_id: String,
     /// Suggested tier for this model
     pub tier: Option<ModelTier>,
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "isolated inside blocking::unblock by MayConfig::save_to"
+)]
+fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut temp, bytes)?;
+    temp.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3193,5 +3211,37 @@ mod tests {
             MayConfig::resolve_home(missing),
             Err(ConfigError::HomeUnresolvable { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn save_to_replaces_existing_file_atomically_without_leftover_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+
+        let first = MayConfig {
+            max_iterations: 17,
+            ..MayConfig::default()
+        };
+        first.save_to(&path).await.unwrap();
+        assert_eq!(
+            MayConfig::load_from(&path).await.unwrap().max_iterations,
+            17
+        );
+
+        let second = MayConfig {
+            max_iterations: 42,
+            ..MayConfig::default()
+        };
+        second.save_to(&path).await.unwrap();
+        assert_eq!(
+            MayConfig::load_from(&path).await.unwrap().max_iterations,
+            42
+        );
+
+        let entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("config.toml")]);
     }
 }

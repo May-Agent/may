@@ -839,16 +839,40 @@ fn configs_equal(left: &MayConfig, right: &MayConfig) -> bool {
 
 /// Reloads `<may_dir>/config.toml` from disk into `state` when valid and
 /// different from the active snapshot, broadcasting `UiEventTopics::CONFIG`.
-/// Invalid edits are logged and ignored so the daemon keeps serving.
+/// Invalid or mid-truncation empty edits are logged and ignored so the daemon
+/// keeps serving.
 pub async fn reload_config_from_disk(state: &Arc<DaemonState>) {
     let config_path = state.may_dir.join("config.toml");
-    let loaded = match MayConfig::load_from(&config_path).await {
-        Ok(loaded) => loaded,
+    let loaded = match async_fs::read_to_string(&config_path).await {
+        Ok(content) if content.trim().is_empty() => {
+            tracing::debug!(
+                path = %config_path.display(),
+                "ignoring empty config.toml during live reload; keeping previous configuration"
+            );
+            return;
+        }
+        Ok(content) => match toml::from_str::<MayConfig>(&content)
+            .map_err(crate::config::ConfigError::from)
+            .and_then(|config| {
+                config.validate()?;
+                Ok(config)
+            }) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    path = %config_path.display(),
+                    %error,
+                    "ignoring invalid config.toml edit; keeping previous configuration"
+                );
+                return;
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MayConfig::default(),
         Err(error) => {
             tracing::warn!(
                 path = %config_path.display(),
                 %error,
-                "ignoring invalid config.toml edit; keeping previous configuration"
+                "ignoring unreadable config.toml during live reload; keeping previous configuration"
             );
             return;
         }
@@ -947,6 +971,40 @@ enum WatchStep {
     QuietElapsed,
 }
 
+fn should_reload_for_config_event(event: &NotifyEvent) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    let touches_config = event
+        .paths
+        .iter()
+        .any(|path| path.file_name().is_some_and(|name| name == "config.toml"));
+    if !touches_config {
+        return false;
+    }
+    should_reload_for_event_kind(event.kind, cfg!(target_os = "linux"))
+}
+
+const fn should_reload_for_event_kind(kind: notify::EventKind, inotify_close_write: bool) -> bool {
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, ModifyKind};
+
+    match kind {
+        EventKind::Any
+        | EventKind::Create(_)
+        | EventKind::Remove(_)
+        | EventKind::Modify(ModifyKind::Name(_))
+        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        // Linux `inotify` emits `Modify(Data)` on `open(O_TRUNC)` while
+        // `config.toml` is empty or half-written and always emits
+        // `Access(Close(Write))` once the writer closes its descriptor; other
+        // backends (`FSEvents`, `kqueue`, `ReadDirectoryChangesW`) report
+        // completed writes as `Modify` without `Close(Write)`.
+        EventKind::Modify(_) => !inotify_close_write,
+        EventKind::Access(_) | EventKind::Other => false,
+    }
+}
+
 /// Watches `<may_dir>/config.toml` for external edits (including atomic editor
 /// renames and file creation/removal) and reloads configuration live without
 /// restarting the daemon.
@@ -1016,11 +1074,7 @@ pub fn spawn_config_file_watcher(state: &Arc<DaemonState>) {
             match step {
                 WatchStep::Shutdown | WatchStep::Event(None) => break,
                 WatchStep::Event(Some(Ok(event))) => {
-                    let touches_config = event
-                        .paths
-                        .iter()
-                        .any(|path| path.file_name().is_some_and(|name| name == "config.toml"));
-                    if touches_config {
+                    if should_reload_for_config_event(&event) {
                         dirty = true;
                     }
                 }
@@ -1373,16 +1427,119 @@ mod tests {
         .expect("watcher should reload config.toml and emit CONFIG without restart");
         assert!(state.config_snapshot().preferences.show_decode_speed);
 
-        // Malformed TOML must not crash the daemon or clobber the valid config.
-        async_fs::write(&config_path, "max_iterations = [unterminated")
+        // An in-place writer holding a truncated 0-byte `config.toml` before
+        // flushing its payload must not clobber the active snapshot with
+        // `MayConfig::default()`, and malformed TOML written afterwards must
+        // also leave the previous valid snapshot intact.
+        let mut truncated = async_fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&config_path)
             .await
-            .expect("write broken toml");
+            .expect("open truncated config.toml");
+        tokio::time::sleep(super::CONFIG_WATCH_DEBOUNCE * 3).await;
+        super::reload_config_from_disk(&state).await;
+        assert_eq!(
+            state.config_snapshot().max_iterations,
+            88,
+            "mid-truncate 0-byte config.toml must not reset live snapshot to default"
+        );
+
+        futures_lite::io::AsyncWriteExt::write_all(
+            &mut truncated,
+            b"max_iterations = [unterminated",
+        )
+        .await
+        .expect("write broken toml");
+        futures_lite::io::AsyncWriteExt::close(&mut truncated)
+            .await
+            .expect("close broken toml");
+        drop(truncated);
         super::reload_config_from_disk(&state).await;
         assert_eq!(
             state.config_snapshot().max_iterations,
             88,
             "invalid external config.toml edit must keep the previous valid snapshot"
         );
+
+        // Removing `config.toml` altogether resets the live snapshot to defaults.
+        async_fs::remove_file(&config_path)
+            .await
+            .expect("remove config.toml");
+        super::reload_config_from_disk(&state).await;
+        assert_eq!(state.config_snapshot().max_iterations, 0);
+    }
+
+    #[test]
+    fn config_watcher_event_filter_ignores_reads_and_mid_truncate_inotify_writes() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, Flag, MetadataKind, ModifyKind,
+            RemoveKind, RenameMode,
+        };
+        use notify::{Event, EventKind};
+        use std::path::PathBuf;
+
+        let config_event =
+            |kind: EventKind| Event::new(kind).add_path(PathBuf::from("/tmp/may/config.toml"));
+
+        // Read/open access events from `reload_config_from_disk` itself never
+        // re-dirty the watcher on any OS.
+        for read_kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Other),
+            EventKind::Other,
+        ] {
+            assert!(!super::should_reload_for_event_kind(read_kind, true));
+            assert!(!super::should_reload_for_event_kind(read_kind, false));
+            assert!(!super::should_reload_for_config_event(&config_event(
+                read_kind
+            )));
+        }
+
+        // Unrelated files in `~/.may` do not trigger reloads unless the backend
+        // requests a full directory rescan.
+        let swap_event = Event::new(EventKind::Create(CreateKind::File))
+            .add_path(PathBuf::from("/tmp/may/.config.toml.swp"));
+        assert!(!super::should_reload_for_config_event(&swap_event));
+        let rescan_event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(super::should_reload_for_config_event(&rescan_event));
+
+        // On Linux `inotify`, mid-write `Modify(Data)` / `Modify(Metadata)` wait
+        // for `Access(Close(Write))`, while atomic renames (`Modify(Name)`) and
+        // create/remove events reload immediately.
+        assert!(!super::should_reload_for_event_kind(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            true,
+        ));
+        assert!(!super::should_reload_for_event_kind(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            true,
+        ));
+        assert!(super::should_reload_for_event_kind(
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            true,
+        ));
+        assert!(super::should_reload_for_event_kind(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            true,
+        ));
+        assert!(super::should_reload_for_event_kind(
+            EventKind::Create(CreateKind::File),
+            true,
+        ));
+        assert!(super::should_reload_for_event_kind(
+            EventKind::Remove(RemoveKind::File),
+            true,
+        ));
+
+        // On backends without `Close(Write)` (`FSEvents`, `kqueue`, Windows),
+        // `Modify(Data)` triggers reload.
+        assert!(super::should_reload_for_event_kind(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            false,
+        ));
     }
 }
 
