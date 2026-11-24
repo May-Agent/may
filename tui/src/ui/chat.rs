@@ -3346,6 +3346,9 @@ pub(super) fn element_lines(
                 push_attachment_line(&mut lines, att, images_supported, Some(&mut images));
             }
 
+            // The block's own bottom shaded padding row, followed by one
+            // unshaded blank row separating the block from the next element.
+            lines.push(Line::from(""));
             lines.push(Line::from(""));
         }
 
@@ -7586,11 +7589,11 @@ mod tests {
         chat.push_user("look", vec![image_attachment()], 0);
 
         let supported = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, true);
-        assert_eq!(supported.len(), 3 + IMAGE_HEIGHT); // padding + "> look" + header + blanks + trailing ""
+        assert_eq!(supported.len(), 4 + IMAGE_HEIGHT); // padding + "> look" + header + blanks + shaded pad + separator ""
 
         let unsupported =
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert_eq!(unsupported.len(), 4); // padding + "> look" + "[image]" + trailing ""
+        assert_eq!(unsupported.len(), 5); // padding + "> look" + "[image]" + shaded pad + separator ""
         assert_eq!(unsupported[2], "[image]");
     }
 
@@ -8768,10 +8771,39 @@ mod tests {
         assert_eq!(row_text(&frame.buf, user - 1).trim(), "");
         assert!(row_has_band(&frame.buf, user - 1), "padding row above");
         assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        assert!(
+            row_has_no_band(&frame.buf, user + 2),
+            "separator row after block"
+        );
         let reply = (0..20)
             .find(|&y| row_text(&frame.buf, y).contains("first reply"))
             .expect("reply row");
         assert!(row_has_no_band(&frame.buf, reply));
+    }
+
+    #[test]
+    fn thought_and_worked_for_rows_keep_a_blank_row_after_the_user_message() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        chat.push_thinking("plan");
+        chat.fold_turn_work(1);
+        chat.push_user("next", Vec::new(), 1);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(12);
+        let frame = draw_band(&chat, 80, 30, "draft", &[]);
+        let thought = (0..30)
+            .find(|&y| row_text(&frame.buf, y).contains("Thought for"))
+            .expect("thought row");
+        assert_eq!(row_text(&frame.buf, thought - 1).trim(), "");
+        assert!(row_has_no_band(&frame.buf, thought - 1));
+        assert!(row_has_band(&frame.buf, thought - 2));
+
+        let worked = (0..30)
+            .find(|&y| row_text(&frame.buf, y).contains("Worked for"))
+            .expect("worked for row");
+        assert_eq!(row_text(&frame.buf, worked - 1).trim(), "");
+        assert!(row_has_no_band(&frame.buf, worked - 1));
+        assert!(row_has_band(&frame.buf, worked - 2));
     }
 
     /// Every context that can precede a user message leaves it one shaded

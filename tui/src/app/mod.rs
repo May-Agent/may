@@ -6084,11 +6084,12 @@ mod tests {
             .find(|&y| row_of(&buffer, y).contains("Jobs & subagents"))
             .expect("the panel title row");
         let panel_rows = title..title + 6;
+        let pad = crate::ui::band::H_PADDING;
         for y in panel_rows {
             let row = row_of(&buffer, y);
             assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
             assert!(
-                (1..99).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                (pad..100 - pad).all(|x| buffer[(x, y)].bg == BLOCK_BG),
                 "row {y} is filled: {row:?}"
             );
         }
@@ -6143,10 +6144,19 @@ mod tests {
         }
         // Inner padding: the first column of the block stays empty.
         assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
-        // The gap beside the sidebar stays unpainted on every row, including
-        // the input band at the bottom, while the input band ends right before it.
+        // The outer margins on the left, before the sidebar and at the bottom
+        // stay unpainted on every row, so the input band keeps matching padding
+        // on all three sides.
         let gap = crate::ui::band::H_PADDING;
+        let bottom_pad = crate::ui::band::V_PADDING;
         for y in 0..height {
+            for x in 0..gap {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    BLOCK_BG,
+                    "left margin column {x} on row {y} stays unpainted"
+                );
+            }
             for x in (left - gap)..left {
                 assert_ne!(
                     buffer[(x, y)].bg,
@@ -6155,11 +6165,53 @@ mod tests {
                 );
             }
         }
+        for y in (height - bottom_pad)..height {
+            for x in 0..left {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    BLOCK_BG,
+                    "bottom margin row {y} col {x} stays unpainted"
+                );
+            }
+        }
         assert_eq!(
-            buffer[(left - gap - 1, height - 1)].bg,
+            buffer[(gap, height - 1 - bottom_pad)].bg,
+            BLOCK_BG,
+            "input band starts right after the left margin"
+        );
+        assert_eq!(
+            buffer[(left - gap - 1, height - 1 - bottom_pad)].bg,
             BLOCK_BG,
             "input band reaches the left side of the sidebar gap"
         );
+    }
+
+    /// Without the sidebar, the input band keeps matching outer margins on
+    /// the left, right and bottom.
+    #[tokio::test]
+    async fn input_band_keeps_equal_outer_padding_without_sidebar() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+        let (width, height) = (80u16, 24u16);
+        assert!(!app.sidebar.visible_at(width));
+        let buffer = draw_buffer(&mut app, width, height);
+        let h_pad = crate::ui::band::H_PADDING;
+        let v_pad = crate::ui::band::V_PADDING;
+        let band_bottom = height - 1 - v_pad;
+        for x in 0..h_pad {
+            assert_ne!(buffer[(x, band_bottom)].bg, BLOCK_BG);
+        }
+        for x in (width - h_pad)..width {
+            assert_ne!(buffer[(x, band_bottom)].bg, BLOCK_BG);
+        }
+        for y in (height - v_pad)..height {
+            for x in 0..width {
+                assert_ne!(buffer[(x, y)].bg, BLOCK_BG);
+            }
+        }
+        assert_eq!(buffer[(h_pad, band_bottom)].bg, BLOCK_BG);
+        assert_eq!(buffer[(width - h_pad - 1, band_bottom)].bg, BLOCK_BG);
     }
 
     fn sidebar_screen(app: &mut App, width: u16, height: u16) -> String {

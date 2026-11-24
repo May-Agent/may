@@ -672,7 +672,8 @@ impl ChatLayout {
     }
 
     /// Doc-row ranges of the user messages overlapping `[top, top +
-    /// height)` — the rows that draw the band background.
+    /// height)` — the shaded rows that draw the band background (excluding
+    /// the trailing unshaded separator row).
     #[must_use]
     pub fn user_rows_in(&self, top: usize, height: usize) -> Vec<(usize, usize)> {
         let bottom = top.saturating_add(height);
@@ -682,7 +683,7 @@ impl ChatLayout {
                 continue;
             }
             let start = self.offsets[index];
-            let end = start + entry.rows;
+            let end = start + entry.rows.saturating_sub(1);
             if end > top && start < bottom {
                 out.push((start.max(top), end.min(bottom)));
             }
@@ -1085,11 +1086,11 @@ mod tests {
         chat.collapse_thinking();
         chat.push_thinking("second body");
         chat.fold_turn_work(4);
-        assert_eq!(rows(&chat, 60)[3], "✦ Worked for 4s ▸");
-        click(&mut chat, 3, 60);
-        let grouped = rows(&chat, 60);
-        assert_eq!(grouped[4], "◐ Thought for 0ms ▸", "{grouped:?}");
+        assert_eq!(rows(&chat, 60)[4], "✦ Worked for 4s ▸");
         click(&mut chat, 4, 60);
+        let grouped = rows(&chat, 60);
+        assert_eq!(grouped[5], "◐ Thought for 0ms ▸", "{grouped:?}");
+        click(&mut chat, 5, 60);
         let open = rows(&chat, 60);
         assert!(open.iter().any(|l| l.contains("first body")), "{open:?}");
         assert!(!open.iter().any(|l| l.contains("second body")), "{open:?}");
@@ -1106,8 +1107,8 @@ mod tests {
             !folded.iter().any(|l| l.contains("Worked for")),
             "{folded:?}"
         );
-        assert_eq!(folded[3], "◐ Thought for 0ms ▸");
-        click(&mut chat, 3, 60);
+        assert_eq!(folded[4], "◐ Thought for 0ms ▸");
+        click(&mut chat, 4, 60);
         let open = rows(&chat, 60);
         assert!(open.iter().any(|l| l.contains("only body")), "{open:?}");
     }
