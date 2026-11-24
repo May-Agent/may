@@ -4170,6 +4170,7 @@ impl App {
                     .set_launch(may_client::session::SessionLaunch::RepoLess);
                 Some(SendAction::NewSession)
             }
+            #[cfg(feature = "ui")]
             SlashCommand::Gui => {
                 if let Some(client) = self.btw_daemon.clone() {
                     let tx = self.event_tx.clone();

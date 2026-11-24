@@ -7,6 +7,10 @@ license = "MIT"
 repository = "https://github.com/May-Agent/may"
 publish = false
 
+[features]
+# Enables the `/gui` slash command when the embedded web UI is compiled in.
+ui = []
+
 [dependencies]
 # The foundational wire types the views render.
 may-protocol = { path = "../protocol" }
