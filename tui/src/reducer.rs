@@ -27,6 +27,15 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.status = None;
             app.handle_key(code, modifiers)
         }
+        AppEvent::ModifierKey { key, pressed } => {
+            app.held_modifiers.update(key, pressed);
+            Ok(None)
+        }
+        AppEvent::FocusLost => {
+            app.held_modifiers.clear();
+            app.pointer_modifiers = crossterm::event::KeyModifiers::NONE;
+            Ok(None)
+        }
         AppEvent::Tick => {
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
