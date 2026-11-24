@@ -90,6 +90,9 @@ impl LocationProvider {
     async fn fetch() -> Result<LocationInfo, LocationError> {
         let response = zenwave::get(IPINFO_URL)
             .await
+            .map_err(|error| LocationError::Fetch(Box::new(error)))?
+            .error_for_status()
+            .await
             .map_err(|error| LocationError::Fetch(Box::new(error)))?;
         let info: LocationInfo = response
             .into_json()

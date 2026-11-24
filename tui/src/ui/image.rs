@@ -625,12 +625,11 @@ async fn fetch_image_http(
     url: &str,
     policy: Option<&aither_sandbox::network_policy::CompiledNetworkPolicy>,
 ) -> Result<Vec<u8>, ImageFetchError> {
-    use futures_lite::AsyncReadExt;
-    use zenwave::{Client, client, header};
+    use zenwave::{Client, ResponseExt as _, client, header};
 
     // The body is read with a hard cap: a declared-but-unbounded body
     // (chunked, no length) cannot exhaust the TUI's memory.
-    const MAX_BODY: usize = 64 * 1024 * 1024;
+    const MAX_BODY: u64 = 64 * 1024 * 1024;
 
     let parsed =
         url::Url::parse(url).map_err(|error| ImageFetchError::Request(error.to_string()))?;
@@ -650,7 +649,7 @@ async fn fetch_image_http(
         )));
     }
 
-    let mut backend = client();
+    let mut backend = client().error_for_status();
     let response = backend
         .get(url)
         .map_err(|error| ImageFetchError::Request(error.to_string()))?
@@ -664,25 +663,11 @@ async fn fetch_image_http(
         .await
         .map_err(|error| ImageFetchError::Download(error.to_string()))?;
 
-    let mut data = Vec::new();
-    let mut reader = response.into_body().into_reader();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        let read = reader
-            .read(&mut chunk)
-            .await
-            .map_err(|error| ImageFetchError::Download(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        data.extend_from_slice(&chunk[..read]);
-        if data.len() > MAX_BODY {
-            return Err(ImageFetchError::Download(format!(
-                "image exceeds {MAX_BODY} bytes"
-            )));
-        }
-    }
-    Ok(data)
+    let data = response
+        .into_bytes_with_limit(MAX_BODY)
+        .await
+        .map_err(|error| ImageFetchError::Download(error.to_string()))?;
+    Ok(data.to_vec())
 }
 
 /// Whether `host` is a loopback or private-use address a remote image URL

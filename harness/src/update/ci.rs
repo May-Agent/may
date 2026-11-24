@@ -177,7 +177,7 @@ impl GitHub {
     pub(super) async fn download(
         &self,
         artifact: &Artifact,
-        progress: &mut impl FnMut(u64, Option<u64>),
+        progress: &mut (impl FnMut(u64, Option<u64>) + Send),
     ) -> Result<Vec<u8>, UpdateError> {
         let bytes = self
             .get_bytes(

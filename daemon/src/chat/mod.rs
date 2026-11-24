@@ -3758,7 +3758,7 @@ impl UiChatPreparationError {
     /// as the failure a request would have produced. `None` when the turn
     /// failed for a reason a resubmit cannot fix: configuration, storage,
     /// or a refusal.
-    const fn provider_failure(&self) -> Option<Failure> {
+    fn provider_failure(&self) -> Option<Failure> {
         match self {
             Self::BuildAgent(crate::agent::MayAgentError::ProviderTimeout { .. }) => {
                 Some(Failure::transient())
@@ -3767,8 +3767,8 @@ impl UiChatPreparationError {
                 crate::grok::GrokAuthError::Http(error),
             )) if error.is_timeout() => Some(Failure::transient()),
             Self::BuildAgent(crate::agent::MayAgentError::GrokAuth(
-                crate::grok::GrokAuthError::Http(zenwave::Error::Transport(..)),
-            )) => Some(Failure::network()),
+                crate::grok::GrokAuthError::Http(error),
+            )) if error.is_network_error() => Some(Failure::network()),
             _ => None,
         }
     }
@@ -3871,7 +3871,7 @@ pub enum ScheduleWaitingTurnError {
 #[derive(Debug, thiserror::Error)]
 enum AgentLoopError {
     #[error(transparent)]
-    Preparation(#[from] UiChatPreparationError),
+    Preparation(Box<UiChatPreparationError>),
     #[error("failed to persist chat state: {0}")]
     Storage(#[from] crate::db::ChatDbError),
     #[error("client disconnected before stream start")]
@@ -3888,9 +3888,15 @@ enum AgentLoopError {
     Panicked(String),
 }
 
+impl From<UiChatPreparationError> for AgentLoopError {
+    fn from(error: UiChatPreparationError) -> Self {
+        Self::Preparation(Box::new(error))
+    }
+}
+
 #[derive(Debug)]
 enum ChatCollectError {
-    Preparation(UiChatPreparationError),
+    Preparation(Box<UiChatPreparationError>),
     Sky(skyzen::Error),
 }
 

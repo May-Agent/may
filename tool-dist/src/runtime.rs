@@ -1784,7 +1784,7 @@ pub enum ToolRuntimeError {
     DownloadStatus(u16),
     /// Artifact transfer failed.
     #[error(transparent)]
-    Download(#[from] zenwave::Error),
+    Download(Box<zenwave::Error>),
     /// The GitHub release API answered with something that is not a release.
     #[error("GitHub release metadata is malformed: {0}")]
     ReleaseMetadata(serde_json::Error),
@@ -1803,6 +1803,12 @@ pub enum ToolRuntimeError {
     /// Operational prompt rendering failed.
     #[error(transparent)]
     Template(#[from] askama::Error),
+}
+
+impl From<zenwave::Error> for ToolRuntimeError {
+    fn from(error: zenwave::Error) -> Self {
+        Self::Download(Box::new(error))
+    }
 }
 
 /// The check inside [`ToolRuntimeError::InvalidImageTools`] that failed.

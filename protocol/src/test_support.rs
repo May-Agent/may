@@ -21,6 +21,8 @@ pub struct ApiRequest {
     pub path: String,
     /// The `Authorization` header, empty when absent.
     pub authorization: String,
+    /// The `Range` header, empty when absent.
+    pub range: String,
     /// The body, as text.
     pub body: String,
 }
@@ -30,10 +32,11 @@ pub struct ApiRequest {
 pub struct ApiReply {
     /// The HTTP status.
     pub status: u16,
-    /// Headers beyond `content-type: application/json`.
+    /// Headers beyond the default `content-type`.
     pub headers: Vec<(&'static str, String)>,
-    /// The body.
-    pub body: String,
+    /// The body bytes.
+    pub body: Vec<u8>,
+    content_type: &'static str,
 }
 
 impl ApiReply {
@@ -42,7 +45,18 @@ impl ApiReply {
         Self {
             status,
             headers: Vec::new(),
+            body: body.into().into_bytes(),
+            content_type: "application/json",
+        }
+    }
+
+    /// A binary `body` answered with `status`.
+    pub fn bytes(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
             body: body.into(),
+            content_type: "application/octet-stream",
         }
     }
 
@@ -104,13 +118,24 @@ pub async fn serve_api(
                                 .and_then(|value| value.to_str().ok())
                                 .unwrap_or("")
                                 .to_string(),
+                            range: parts
+                                .headers
+                                .get(hyper::header::RANGE)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_string(),
                             body: String::from_utf8_lossy(&body).into_owned(),
                         };
                         let reply = handler(&request, &base);
                         log.lock().expect("requests").push(request);
-                        let mut response = hyper::Response::builder()
-                            .status(reply.status)
-                            .header("content-type", "application/json");
+                        let has_content_type = reply
+                            .headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+                        let mut response = hyper::Response::builder().status(reply.status);
+                        if !has_content_type {
+                            response = response.header("content-type", reply.content_type);
+                        }
                         for (name, value) in reply.headers {
                             response = response.header(name, value);
                         }

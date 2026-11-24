@@ -20,14 +20,14 @@ use zenwave::Client;
 pub const MAX_LOCAL_PROXY_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 type ProxyResponseBody =
-    StreamBody<futures_util::stream::MapOk<skyzen::Body, fn(Bytes) -> Frame<Bytes>>>;
+    StreamBody<futures_util::stream::MapOk<zenwave::DataStream, fn(Bytes) -> Frame<Bytes>>>;
 
 fn into_frame(bytes: Bytes) -> Frame<Bytes> {
     Frame::data(bytes)
 }
 
-fn stream_response_body(body: skyzen::Body) -> ProxyResponseBody {
-    StreamBody::new(body.map_ok(into_frame as fn(_) -> _))
+fn stream_response_body(body: zenwave::Body) -> ProxyResponseBody {
+    StreamBody::new(body.into_data_stream().map_ok(into_frame as fn(_) -> _))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -527,7 +527,7 @@ pub fn should_skip_response_header(name: &HeaderName) -> bool {
 }
 
 fn error_response(status: StatusCode, message: &str) -> HyperResponse<ProxyResponseBody> {
-    let mut response = HyperResponse::new(stream_response_body(skyzen::Body::from(
+    let mut response = HyperResponse::new(stream_response_body(zenwave::Body::from(
         message.as_bytes().to_vec(),
     )));
     *response.status_mut() = status;

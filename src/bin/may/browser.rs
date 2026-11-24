@@ -657,7 +657,7 @@ async fn resolve_browser_websocket_endpoint(endpoint: &str) -> Result<String, Br
         return Ok(endpoint.to_string());
     }
     let metadata_url = format!("{}/json/version", endpoint.trim_end_matches('/'));
-    let mut backend = zenwave::client();
+    let mut backend = zenwave::client().error_for_status();
     let metadata = futures_lite::future::race(
         backend
             .get(&metadata_url)
@@ -668,7 +668,7 @@ async fn resolve_browser_websocket_endpoint(endpoint: &str) -> Result<String, Br
             .json::<BrowserVersionMetadata>(),
         async {
             async_io::Timer::after(std::time::Duration::from_secs(5)).await;
-            Err(zenwave::Error::Timeout)
+            Err(zenwave::Error::Timeout(zenwave::TimedOut::Request))
         },
     )
     .await

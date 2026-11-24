@@ -1015,12 +1015,21 @@ async fn read_response(
         return Err(ToolRuntimeError::DownloadStatus(response.status().as_u16()));
     }
     let mut bytes = Vec::new();
-    response
-        .into_body()
-        .into_reader()
-        .take(limit)
-        .read_to_end(&mut bytes)
-        .await?;
+    let mut stream = response.into_body().into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ToolRuntimeError::from(zenwave::Error::from(error)))?;
+        let remaining = limit.saturating_sub(bytes.len() as u64);
+        if remaining == 0 {
+            break;
+        }
+        let take = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        bytes.extend_from_slice(&chunk[..take]);
+        if (bytes.len() as u64) >= limit {
+            break;
+        }
+    }
     Ok(bytes)
 }
 
@@ -1086,7 +1095,9 @@ async fn download_once(
         },
         async {
             async_io::Timer::after(timeout).await;
-            Err(ToolRuntimeError::Download(zenwave::Error::Timeout))
+            Err(ToolRuntimeError::from(zenwave::Error::Timeout(
+                zenwave::TimedOut::Request,
+            )))
         },
     )
     .await
@@ -1105,8 +1116,10 @@ fn is_transient(error: &ToolRuntimeError) -> bool {
     match error {
         ToolRuntimeError::DownloadStatus(status) => is_transient_status(*status),
         ToolRuntimeError::Io(_) => true,
-        ToolRuntimeError::Download(error) => match error {
-            zenwave::Error::Transport(_) | zenwave::Error::Timeout => true,
+        ToolRuntimeError::Download(error) => match error.as_ref() {
+            zenwave::Error::Connect(_)
+            | zenwave::Error::Exchange(_)
+            | zenwave::Error::Timeout(_) => true,
             zenwave::Error::Http { status, .. } => is_transient_status(status.as_u16()),
             _ => false,
         },

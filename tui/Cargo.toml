@@ -88,7 +88,7 @@ unicode-width = "0.2"
 url = "2"
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 whatlang = { version = "0.18", default-features = false }
-zenwave = "0.7"
+zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = "0.3"

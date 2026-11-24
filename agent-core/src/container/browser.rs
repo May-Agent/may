@@ -1706,7 +1706,7 @@ async fn wait_for_local_browser_websocket_endpoint(
     use zenwave::Client as _;
 
     let metadata_url = managed_browser_debugger_metadata_url(port);
-    let mut backend = zenwave::client();
+    let mut backend = zenwave::client().error_for_status();
     let start = Instant::now();
 
     loop {
@@ -1729,8 +1729,9 @@ async fn wait_for_local_browser_websocket_endpoint(
                 }
                 Err(
                     zenwave::Error::Http { .. }
-                    | zenwave::Error::Transport(..)
-                    | zenwave::Error::Timeout,
+                    | zenwave::Error::Connect(..)
+                    | zenwave::Error::Exchange(..)
+                    | zenwave::Error::Timeout(..),
                 ) => {}
                 Err(error) => {
                     return Err(BrowserError::browser_operation(

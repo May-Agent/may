@@ -55,7 +55,7 @@ pub enum GrokAuthError {
     Store(#[from] crate::auth_store::AuthStoreError),
     /// HTTP request to the xAI auth service failed.
     #[error("xAI auth request failed: {0}")]
-    Http(#[from] zenwave::Error),
+    Http(#[source] Box<zenwave::Error>),
     /// The auth service returned a non-success status.
     #[error("xAI auth service returned {status}: {body}")]
     Status {
@@ -76,6 +76,12 @@ pub enum GrokAuthError {
     /// The auth service responded with an unexpected payload.
     #[error("unexpected xAI auth response: {0}")]
     Protocol(String),
+}
+
+impl From<zenwave::Error> for GrokAuthError {
+    fn from(error: zenwave::Error) -> Self {
+        Self::Http(Box::new(error))
+    }
 }
 
 /// Stored xAI OAuth credential material.
@@ -212,8 +218,8 @@ pub fn has_credentials() -> bool {
 /// exists, so nothing downstream bounds it.
 const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn http() -> zenwave::DefaultClient {
-    zenwave::client()
+fn http() -> zenwave::endpoint::WithMiddleware<zenwave::DefaultClient, zenwave::ErrorForStatus> {
+    zenwave::client().error_for_status()
 }
 
 /// Fails `fut` as [`zenwave::Error::Timeout`] when it has not finished within
@@ -224,7 +230,7 @@ async fn bounded_request<T>(
 ) -> Result<T, zenwave::Error> {
     futures_lite::future::race(fut, async {
         async_io::Timer::after(AUTH_REQUEST_TIMEOUT).await;
-        Err(zenwave::Error::Timeout)
+        Err(zenwave::Error::Timeout(zenwave::TimedOut::Request))
     })
     .await
 }
@@ -250,7 +256,7 @@ fn json_or_status<T>(result: Result<T, zenwave::Error>) -> Result<T, GrokAuthErr
                 .take(500)
                 .collect(),
         },
-        other => GrokAuthError::Http(other),
+        other => GrokAuthError::Http(Box::new(other)),
     })
 }
 

@@ -55,8 +55,9 @@ hmac = { version = "0.12", default-features = false }
 jiff = { version = "0.2", features = ["serde"] }
 libc = "0.2.191"
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
+progressor = "0.2.0"
 regex = "1.12"
-zenwave = "0.7"
+zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3", "progressor"] }
 schemars = { version = "1.0", features = ["derive"] }
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
