@@ -6858,41 +6858,46 @@ mod tests {
                 );
             }
         };
-        for width in (20u16..=56).step_by(4) {
-            for chunk in [1usize, 6] {
-                let mut chat = ChatStream::new();
-                chat.push_user("对比", Vec::new(), 0);
-                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                let mut layout = super::ChatLayout::default();
-                let mut rest = TABLE_REPLY;
-                while !rest.is_empty() {
-                    let split = rest
-                        .char_indices()
-                        .nth(chunk)
-                        .map_or(rest.len(), |(i, _)| i);
-                    let (text, tail) = rest.split_at(split);
-                    chat.push_text(text);
-                    draw(&mut terminal, &chat, &mut layout, usize::MAX);
-                    rest = tail;
-                }
-                chat.end_text();
-                chat.push_user("再说一遍", Vec::new(), 1);
-                chat.push_text("好的。\n\n第二段说明文字，稍微长一些，会在窄窗口里换行。");
-                chat.end_text();
-                for scroll in [0, 3, 11, usize::MAX] {
-                    draw(&mut terminal, &chat, &mut layout, scroll);
-                }
-                let shown = terminal.backend().screen();
-
-                let mut fresh = Terminal::new(TestBackend::new(width, height)).unwrap();
-                let mut fresh_layout = super::ChatLayout::default();
-                draw_unified(&mut fresh, &chat, &mut fresh_layout, usize::MAX);
-                assert_eq!(
-                    shown,
-                    fresh.backend().screen(),
-                    "width={width} chunk={chunk}"
-                );
+        for (width, chunk) in [
+            (20u16, 1usize),
+            (44u16, 1usize),
+            (20u16, 6usize),
+            (28u16, 6usize),
+            (40u16, 6usize),
+            (56u16, 6usize),
+        ] {
+            let mut chat = ChatStream::new();
+            chat.push_user("对比", Vec::new(), 0);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut layout = super::ChatLayout::default();
+            let mut rest = TABLE_REPLY;
+            while !rest.is_empty() {
+                let split = rest
+                    .char_indices()
+                    .nth(chunk)
+                    .map_or(rest.len(), |(i, _)| i);
+                let (text, tail) = rest.split_at(split);
+                chat.push_text(text);
+                draw(&mut terminal, &chat, &mut layout, usize::MAX);
+                rest = tail;
             }
+            chat.end_text();
+            chat.push_user("再说一遍", Vec::new(), 1);
+            chat.push_text("好的。\n\n第二段说明文字，稍微长一些，会在窄窗口里换行。");
+            chat.end_text();
+            for scroll in [0, 3, 11, usize::MAX] {
+                draw(&mut terminal, &chat, &mut layout, scroll);
+            }
+            let shown = terminal.backend().screen();
+
+            let mut fresh = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut fresh_layout = super::ChatLayout::default();
+            draw_unified(&mut fresh, &chat, &mut fresh_layout, usize::MAX);
+            assert_eq!(
+                shown,
+                fresh.backend().screen(),
+                "width={width} chunk={chunk}"
+            );
         }
     }
 

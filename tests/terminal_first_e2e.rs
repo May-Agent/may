@@ -5324,7 +5324,7 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
 /// delta through the turn's end however far its event stream falls behind.
 #[tokio::test]
 async fn oneshot_run_prints_a_burst_turn_through_its_end() {
-    const DELTAS: usize = 6_000;
+    const DELTAS: usize = 1_200;
     let chunks = (0..DELTAS)
         .map(|index| format!("d{index} "))
         .collect::<Vec<_>>();

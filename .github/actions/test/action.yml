@@ -110,6 +110,8 @@ runs:
     - name: Pack the debug may
       if: inputs.upload-may == 'true'
       shell: bash
+      env:
+        GZIP: '-1'
       run: tar -czf "${{ runner.temp }}/may-debug.tar.gz" -C target/debug may
     - name: Upload the debug may
       if: inputs.upload-may == 'true'
