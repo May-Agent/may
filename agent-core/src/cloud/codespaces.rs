@@ -1,7 +1,9 @@
 //! GitHub Codespaces as a [`CloudProvider`], over the REST API.
 //!
-//! The credential is the profile's GitHub account in the `gh` login; the
-//! account's token needs the `codespace` scope. A codespace always belongs
+//! The credential comes from `[forge."github.com"]` for the profile's GitHub
+//! account (`gh` token under `mode = "cli"`, the configured host credential
+//! otherwise); the account's token needs the `codespace` scope. A codespace
+//! always belongs
 //! to a repository: the session's GitHub repository when it has one, so the
 //! machine starts with the code and the project's devcontainer, else the
 //! private environment repository May creates in the account.
