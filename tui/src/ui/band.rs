@@ -13,9 +13,16 @@ use terminal_colorsaurus::{QueryOptions, color_palette};
 /// chat so its text lines up with the input.
 pub const H_PADDING: u16 = 2;
 
+/// Rows of bottom outer margin below the chat column, matching [`H_PADDING`]
+/// at a typical 1:2 terminal cell aspect ratio.
+pub const V_PADDING: u16 = 1;
+
 /// Narrowest column that still gets the horizontal padding; below it the
 /// content takes the whole width.
 const MIN_PADDED_WIDTH: u16 = 9;
+
+/// Shortest area that still gets the bottom outer margin.
+const MIN_PADDED_HEIGHT: u16 = 6;
 
 /// Share of the way from the terminal background to its foreground that the
 /// band sits.
@@ -34,6 +41,16 @@ pub const fn padding(width: u16) -> u16 {
     }
 }
 
+/// Bottom outer padding for an area `height` rows tall.
+#[must_use]
+pub const fn v_padding(height: u16) -> u16 {
+    if height >= MIN_PADDED_HEIGHT {
+        V_PADDING
+    } else {
+        0
+    }
+}
+
 /// `area` with its horizontal padding taken off both sides.
 #[must_use]
 pub const fn inset(area: Rect) -> Rect {
@@ -42,6 +59,20 @@ pub const fn inset(area: Rect) -> Rect {
         x: area.x + pad,
         width: area.width - 2 * pad,
         ..area
+    }
+}
+
+/// `area` with outer margin taken off the left, right and bottom so the band
+/// and sheets breathe equally on all three sides.
+#[must_use]
+pub const fn outer_inset(area: Rect) -> Rect {
+    let h_pad = padding(area.width);
+    let v_pad = v_padding(area.height);
+    Rect {
+        x: area.x + h_pad,
+        y: area.y,
+        width: area.width - 2 * h_pad,
+        height: area.height - v_pad,
     }
 }
 
@@ -142,5 +173,12 @@ mod tests {
         assert_eq!(padding(80), H_PADDING);
         assert_eq!(padding(MIN_PADDED_WIDTH), H_PADDING);
         assert_eq!(padding(MIN_PADDED_WIDTH - 1), 0);
+        assert_eq!(v_padding(24), V_PADDING);
+        assert_eq!(v_padding(MIN_PADDED_HEIGHT), V_PADDING);
+        assert_eq!(v_padding(MIN_PADDED_HEIGHT - 1), 0);
+        assert_eq!(
+            outer_inset(Rect::new(0, 0, 80, 24)),
+            Rect::new(H_PADDING, 0, 80 - 2 * H_PADDING, 24 - V_PADDING)
+        );
     }
 }

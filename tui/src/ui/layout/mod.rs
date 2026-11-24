@@ -87,14 +87,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // The right sidebar takes a column of wide terminals; the chat and its
-    // sheets live in the rest, separated by a gap matching the band padding so
-    // the input band and sheets do not fuse flush into the sidebar.
-    let (column, sidebar_area) = if app.sidebar.visible_at(area.width) {
+    // sheets sit in an inset column beside it with matching outer margin on
+    // the left, right (before the sidebar or terminal edge) and bottom.
+    let (column_outer, sidebar_area) = if app.sidebar.visible_at(area.width) {
         let width = crate::sidebar::SidebarState::width_for(area.width);
-        let gap = super::band::H_PADDING;
         (
             Rect {
-                width: area.width.saturating_sub(width + gap),
+                width: area.width.saturating_sub(width),
                 ..area
             },
             Some(Rect {
@@ -106,6 +105,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else {
         (area, None)
     };
+    let column = super::band::outer_inset(column_outer);
     // A sheet replaces the input line at the bottom of the chat column and
     // takes only the rows it needs; the chat keeps the rows above it.
     let sheet_area = sheet_height(app, column).map(|height| Rect {
@@ -3328,7 +3328,7 @@ mod tests {
         assert!(shown.iter().any(|row| row.contains(IMAGE_MARK)));
 
         // Cut by the top edge: caption only, no protocol cells.
-        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 6);
+        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 7);
         assert!(regions.is_empty());
         assert!(
             !shown.iter().any(|row| row.contains(IMAGE_MARK)),
