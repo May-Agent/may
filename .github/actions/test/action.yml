@@ -67,6 +67,18 @@ runs:
         sudo launchctl limit maxfiles 65536 200000 >/dev/null 2>&1 || true
     - uses: dtolnay/rust-toolchain@stable
     - uses: water-rs/stow@main
+    # Cargo ignores CARGO_PROFILE_*_PACKAGE_* env vars, so configure per-package
+    # debug=0 for workspace crates in $CARGO_HOME/config.toml while leaving
+    # dependencies at default debuginfo=2 to match stow's public cache.
+    - name: Disable debuginfo for workspace packages
+      if: inputs.run-workspace == 'true'
+      shell: bash
+      run: |
+        cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+        mkdir -p "${cargo_home}"
+        for pkg in may-agent may-agent-core may-client may-command-policy may-config may-container-image may-daemon may-db may-git-forge may-harness may-media may-patch may-protocol may-providers may-repo-search may-tasks may-tool-dist may-tui; do
+          printf '[profile.dev.package.%s]\ndebug = 0\n[profile.test.package.%s]\ndebug = 0\n' "$pkg" "$pkg" >> "${cargo_home}/config.toml"
+        done
     # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
       if: inputs.run-workspace == 'true'
@@ -95,6 +107,8 @@ runs:
         ulimit -n 65536 2>/dev/null || true
         if [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.downloads.outputs.tools-hit }}" = "true" ]; then
           cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
+        elif [ "${{ runner.os }}" = "macOS" ]; then
+          cargo nextest run --test-threads 6 --locked ${{ inputs.cargo-flags }} --timings
         else
           cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
         fi
