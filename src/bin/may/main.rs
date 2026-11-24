@@ -36,9 +36,9 @@ use crate::oneshot::run_oneshot;
 use async_channel::TryRecvError;
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -299,6 +299,7 @@ async fn async_main() -> anyhow::Result<()> {
             io::stdout(),
             LeaveAlternateScreen,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             PopKeyboardEnhancementFlags
         );
@@ -325,8 +326,14 @@ async fn async_main() -> anyhow::Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableFocusChange,
         EnableMouseCapture,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -352,6 +359,7 @@ async fn async_main() -> anyhow::Result<()> {
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableBracketedPaste,
+        DisableFocusChange,
         DisableMouseCapture,
         PopKeyboardEnhancementFlags
     )?;

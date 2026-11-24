@@ -316,7 +316,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let runs = app
             .chat_layout
             .link_runs(top, content_area.height as usize, content_area);
-        let hovered = app.hovered_link().map(|hit| hit.id);
+        let hovered = app
+            .hovered_link()
+            .filter(|_| app.link_open_modifier_active())
+            .map(|hit| hit.id);
         super::links::paint(frame.buffer_mut(), &runs, hovered);
     }
 

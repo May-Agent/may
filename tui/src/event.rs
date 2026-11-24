@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use blocking::unblock;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEvent};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEvent,
+};
 use executor_core::spawn;
 
 use may_client::session::import::ForeignSessionSummary;
@@ -39,6 +41,15 @@ pub struct PushedConfig {
 pub enum AppEvent {
     /// Key press
     Key(KeyCode, KeyModifiers),
+    /// Modifier key press or release (Kitty keyboard protocol)
+    ModifierKey {
+        /// Which modifier key changed state.
+        key: ModifierKeyCode,
+        /// `true` on press or repeat, `false` on release.
+        pressed: bool,
+    },
+    /// Terminal window lost focus
+    FocusLost,
     /// Tick (for polling)
     Tick,
     /// Terminal resize
@@ -309,6 +320,8 @@ impl AppEvent {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Key(..) => "key",
+            Self::ModifierKey { .. } => "modifier_key",
+            Self::FocusLost => "focus_lost",
             Self::Tick => "tick",
             Self::Resize(..) => "resize",
             Self::Paste(_) => "paste",
@@ -405,6 +418,35 @@ pub struct PipelineStageOutputDelta {
 /// Sender type for sending events back to the main loop.
 pub type EventSender = Sender<AppEvent>;
 
+fn map_terminal_event(evt: Event) -> Option<AppEvent> {
+    match evt {
+        Event::Key(key) => {
+            if let KeyCode::Modifier(modifier) = key.code {
+                let pressed = match key.kind {
+                    KeyEventKind::Press | KeyEventKind::Repeat => true,
+                    KeyEventKind::Release => false,
+                };
+                Some(AppEvent::ModifierKey {
+                    key: modifier,
+                    pressed,
+                })
+            } else {
+                match key.kind {
+                    KeyEventKind::Press | KeyEventKind::Repeat => {
+                        Some(AppEvent::Key(key.code, key.modifiers))
+                    }
+                    KeyEventKind::Release => None,
+                }
+            }
+        }
+        Event::Resize(w, h) => Some(AppEvent::Resize(w, h)),
+        Event::Paste(text) => Some(AppEvent::Paste(text)),
+        Event::Mouse(mouse) => Some(AppEvent::Mouse(mouse)),
+        Event::FocusLost => Some(AppEvent::FocusLost),
+        Event::FocusGained => None,
+    }
+}
+
 /// Event handler that polls terminal events.
 #[derive(Debug)]
 pub struct EventHandler {
@@ -434,12 +476,8 @@ impl EventHandler {
                     let evt = unblock(event::read)
                         .await
                         .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
-                    let app_event = match evt {
-                        Event::Key(key) => AppEvent::Key(key.code, key.modifiers),
-                        Event::Resize(w, h) => AppEvent::Resize(w, h),
-                        Event::Paste(text) => AppEvent::Paste(text),
-                        Event::Mouse(mouse) => AppEvent::Mouse(mouse),
-                        _ => continue,
+                    let Some(app_event) = map_terminal_event(evt) else {
+                        continue;
                     };
                     if tx_clone.send(app_event).await.is_err() {
                         break;
@@ -537,6 +575,63 @@ mod tests {
         assert!(matches!(
             handler.try_recv_input(),
             Some(AppEvent::Key(KeyCode::Esc, _))
+        ));
+    }
+
+    #[test]
+    fn map_terminal_event_tracks_modifier_press_release_and_drops_key_release() {
+        use crossterm::event::{KeyEvent, KeyEventState};
+
+        let modifier_press = Event::Key(KeyEvent::new_with_kind_and_state(
+            KeyCode::Modifier(ModifierKeyCode::LeftSuper),
+            KeyModifiers::SUPER,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        ));
+        assert!(matches!(
+            map_terminal_event(modifier_press),
+            Some(AppEvent::ModifierKey {
+                key: ModifierKeyCode::LeftSuper,
+                pressed: true,
+            })
+        ));
+
+        let modifier_release = Event::Key(KeyEvent::new_with_kind_and_state(
+            KeyCode::Modifier(ModifierKeyCode::LeftSuper),
+            KeyModifiers::SUPER,
+            KeyEventKind::Release,
+            KeyEventState::NONE,
+        ));
+        assert!(matches!(
+            map_terminal_event(modifier_release),
+            Some(AppEvent::ModifierKey {
+                key: ModifierKeyCode::LeftSuper,
+                pressed: false,
+            })
+        ));
+
+        let char_release = Event::Key(KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+            KeyEventState::NONE,
+        ));
+        assert!(map_terminal_event(char_release).is_none());
+
+        let char_repeat = Event::Key(KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+            KeyEventState::NONE,
+        ));
+        assert!(matches!(
+            map_terminal_event(char_repeat),
+            Some(AppEvent::Key(KeyCode::Char('a'), KeyModifiers::NONE))
+        ));
+
+        assert!(matches!(
+            map_terminal_event(Event::FocusLost),
+            Some(AppEvent::FocusLost)
         ));
     }
 }

@@ -10,7 +10,9 @@ use std::time::Instant;
 
 use async_channel::Receiver;
 use blocking::unblock;
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
+};
 use executor_core::spawn;
 
 use may_client::session::SessionManager;
@@ -360,8 +362,12 @@ pub struct App {
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
     /// Where the pointer last was inside the chat column (screen cell);
-    /// the link under it is underlined and its target shown.
+    /// the link under it shows its target and is underlined while Cmd or Ctrl is held.
     pub hover: Option<(u16, u16)>,
+    /// Modifier keys held down via Kitty keyboard modifier press/release events.
+    pub held_modifiers: HeldModifiers,
+    /// Open modifiers carried on the latest pointer event inside the chat column.
+    pub pointer_modifiers: KeyModifiers,
     /// Opens link targets; replaced in tests.
     pub link_opener: std::sync::Arc<dyn super::ui::links::LinkOpener>,
     /// Laid-out chat transcript: the render cache, and the plain-text
@@ -445,6 +451,56 @@ pub struct App {
     /// The open question being answered when a blocking prompt took over the
     /// screen; it comes back, draft intact, when the prompt is done.
     parked_question: Option<AskUserState>,
+}
+
+/// Tracks modifier keys reported via Kitty keyboard press/release events so
+/// `Cmd` (omitted by terminal mouse protocols) works for link hover and clicks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HeldModifiers {
+    left_super: bool,
+    right_super: bool,
+    left_control: bool,
+    right_control: bool,
+}
+
+impl HeldModifiers {
+    /// Update held state when a modifier key is pressed or released.
+    pub const fn update(&mut self, key: ModifierKeyCode, pressed: bool) {
+        match key {
+            ModifierKeyCode::LeftSuper => self.left_super = pressed,
+            ModifierKeyCode::RightSuper => self.right_super = pressed,
+            ModifierKeyCode::LeftControl => self.left_control = pressed,
+            ModifierKeyCode::RightControl => self.right_control = pressed,
+            _ => {}
+        }
+    }
+
+    /// Clear all held modifiers (e.g. when the terminal loses focus).
+    pub const fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    const fn new() -> Self {
+        Self {
+            left_super: false,
+            right_super: false,
+            left_control: false,
+            right_control: false,
+        }
+    }
+
+    /// Currently held modifiers expressed as `KeyModifiers`.
+    #[must_use]
+    pub const fn as_key_modifiers(self) -> KeyModifiers {
+        let mut out = KeyModifiers::NONE;
+        if self.left_super || self.right_super {
+            out = out.union(KeyModifiers::SUPER);
+        }
+        if self.left_control || self.right_control {
+            out = out.union(KeyModifiers::CONTROL);
+        }
+        out
+    }
 }
 
 /// A paste queued for the main loop: either text applied through the
@@ -789,6 +845,8 @@ impl App {
             last_image_scan_version: u64::MAX,
             selection: None,
             hover: None,
+            held_modifiers: HeldModifiers::default(),
+            pointer_modifiers: KeyModifiers::NONE,
             link_opener: std::sync::Arc::new(super::ui::links::SystemOpener),
             chat_layout: super::ui::chat_layout::ChatLayout::default(),
             frame_stats: super::perf::FrameStats::default(),
@@ -3745,6 +3803,7 @@ impl App {
         const SCROLL_STEP_LINES: usize = 3;
 
         self.hover = None;
+        self.pointer_modifiers = KeyModifiers::NONE;
         // Any click ends the fireworks and is spent on that.
         if self.new_year.animating() {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -3811,11 +3870,18 @@ impl App {
             return Ok(None);
         }
         self.hover = in_chat.then_some((mouse.column, mouse.row));
+        self.pointer_modifiers = if in_chat {
+            super::ui::links::open_modifiers(mouse.modifiers)
+        } else {
+            KeyModifiers::NONE
+        };
 
-        // Ctrl-click (Cmd where the terminal reports it) opens the link
-        // under the pointer instead of starting a selection.
+        // Ctrl-click or Cmd-click (with Cmd tracked via Kitty modifier events)
+        // opens the link under the pointer instead of starting a selection.
         let hit = self.link_at_screen(mouse.column, mouse.row);
-        if super::ui::links::dispatch_click(self.link_opener.as_ref(), &mouse, hit.as_ref()) {
+        let mut open_mouse = mouse;
+        open_mouse.modifiers |= self.held_modifiers.as_key_modifiers();
+        if super::ui::links::dispatch_click(self.link_opener.as_ref(), &open_mouse, hit.as_ref()) {
             self.selection = None;
             self.last_click = None;
             return Ok(None);
@@ -3947,6 +4013,14 @@ impl App {
     pub(super) fn hovered_link(&self) -> Option<super::ui::links::LinkHit> {
         let (col, row) = self.hover?;
         self.link_at_screen(col, row)
+    }
+
+    /// Whether `Cmd` or `Ctrl` is held so a hovered link should be underlined.
+    #[must_use]
+    pub(super) fn link_open_modifier_active(&self) -> bool {
+        super::ui::links::has_open_modifier(
+            self.held_modifiers.as_key_modifiers() | self.pointer_modifiers,
+        )
     }
 
     /// The pipeline stage drawn at screen cell `(col, row)`.
@@ -8203,5 +8277,106 @@ mod tests {
             !folded.contains("$ issue list 2>&1 | head -40"),
             "header click should fold: {folded}"
         );
+    }
+
+    #[tokio::test]
+    async fn cmd_hover_underlines_link_and_cmd_click_opens_it() {
+        use crossterm::event::{ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Default)]
+        struct TestOpener(Mutex<Vec<String>>);
+
+        impl crate::ui::links::LinkOpener for TestOpener {
+            fn open(&self, uri: &str) {
+                self.0.lock().unwrap().push(uri.to_string());
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let opener = Arc::new(TestOpener::default());
+        app.link_opener = opener.clone();
+        app.chat
+            .push_user("open https://example.com/docs now", Vec::new(), 0);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("term");
+        let rows = draw_rows(&mut terminal, &mut app);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("https://example.com/docs"))
+            .expect("link row");
+        let byte_col = rows[y].find("https://example.com/docs").expect("col");
+        let x = u16::try_from(unicode_width::UnicodeWidthStr::width(&rows[y][..byte_col]))
+            .expect("col");
+        let y = u16::try_from(y).expect("y");
+
+        // Hovering without Cmd or Ctrl does not underline the link.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("hover");
+        let plain_buf = draw_buffer(&mut app, 80, 20);
+        assert!(
+            !plain_buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "plain hover must not underline link"
+        );
+
+        // Pressing Cmd underlines the hovered link immediately.
+        app.handle_event(AppEvent::ModifierKey {
+            key: ModifierKeyCode::LeftSuper,
+            pressed: true,
+        })
+        .expect("cmd press");
+        let cmd_buf = draw_buffer(&mut app, 80, 20);
+        assert!(
+            cmd_buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "Cmd+hover must underline link"
+        );
+
+        // Clicking while Cmd is held opens the link even though mouse.modifiers is NONE.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("cmd click");
+        assert_eq!(
+            *opener.0.lock().unwrap(),
+            vec!["https://example.com/docs".to_string()]
+        );
+
+        // Releasing Cmd removes the underline.
+        app.handle_event(AppEvent::ModifierKey {
+            key: ModifierKeyCode::LeftSuper,
+            pressed: false,
+        })
+        .expect("cmd release");
+        let released_buf = draw_buffer(&mut app, 80, 20);
+        assert!(
+            !released_buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "releasing Cmd must clear link underline"
+        );
+
+        // FocusLost also clears held Cmd so switching windows never sticks it on.
+        app.handle_event(AppEvent::ModifierKey {
+            key: ModifierKeyCode::RightSuper,
+            pressed: true,
+        })
+        .expect("right cmd press");
+        assert!(app.link_open_modifier_active());
+        app.handle_event(AppEvent::FocusLost).expect("focus lost");
+        assert!(!app.link_open_modifier_active());
     }
 }

@@ -27,9 +27,20 @@ use url::Url;
 /// Longest hyperlink target emitted; terminals drop longer ones.
 const MAX_URI_BYTES: usize = 2000;
 
-/// Modifiers that make a click open the link under the pointer. Terminals
-/// never report Cmd in mouse events, so Ctrl is the reportable one.
+/// Modifiers that underline a hovered link and open it on click.
 const OPEN_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SUPER);
+
+/// Whether `modifiers` holds a link-opening modifier (`Cmd` or `Ctrl`).
+#[must_use]
+pub const fn has_open_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(OPEN_MODIFIERS)
+}
+
+/// The link-opening modifiers present in `modifiers`.
+#[must_use]
+pub const fn open_modifiers(modifiers: KeyModifiers) -> KeyModifiers {
+    modifiers.intersection(OPEN_MODIFIERS)
+}
 
 /// A link found in a line's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +399,7 @@ impl fmt::Display for Osc8<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "\x1b]8;id=may{}-{};{}\x1b\\{}\x1b]8;\x1b\\",
+            "\x1b]8;id=may{}-{};{}\x1b\\{}\x1b]8;;\x1b\\",
             self.id.entry, self.id.link, self.uri, self.text
         )
     }
@@ -476,8 +487,7 @@ impl LinkOpener for SystemOpener {
 /// other press, drag, release and wheel event is left to the selection
 /// and scroll handling.
 pub fn dispatch_click(opener: &dyn LinkOpener, mouse: &MouseEvent, hit: Option<&LinkHit>) -> bool {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left)
-        || !mouse.modifiers.intersects(OPEN_MODIFIERS)
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !has_open_modifier(mouse.modifiers)
     {
         return false;
     }
@@ -501,7 +511,7 @@ pub fn dispatch_enter(
     modifiers: KeyModifiers,
     hit: Option<&LinkHit>,
 ) -> bool {
-    if code != KeyCode::Enter || !modifiers.intersects(OPEN_MODIFIERS) {
+    if code != KeyCode::Enter || !has_open_modifier(modifiers) {
         return false;
     }
     if let Some(hit) = hit {
@@ -755,7 +765,7 @@ mod tests {
         paint(&mut buf, &[run], Some(hit.id));
         assert_eq!(
             buf[(3, 0)].symbol(),
-            "\x1b]8;id=may0-0;https://example.com/\x1b\\http://a.\x1b]8;\x1b\\"
+            "\x1b]8;id=may0-0;https://example.com/\x1b\\http://a.\x1b]8;;\x1b\\"
         );
         assert_eq!(
             buf[(3, 0)].diff_option,
