@@ -22,57 +22,57 @@ may-protocol = { path = "../protocol" }
 may-config = { path = "../config" }
 # The tasks.md parser `tasks_md` and `task_rows` build on.
 may-tasks = { path = "../tasks" }
-aither-agent = { version = "0.31.0" }
-aither-codex = { version = "0.31.0" }
-aither-copilot = { version = "0.31.0" }
-aither-core = { version = "0.31.0" }
-aither-mcp = { version = "0.31.0" }
-aither-sandbox = { version = "0.31.0" }
-aho-corasick = { version = "1.1.5", features = ["std", "perf-literal"] }
-anyhow = "1"
-arc-swap = { version = "1", features = ["weak"] }
-askama = "0.16"
-async-channel = "2"
-async-fs = "2.1"
-async-io = "2.6"
-async-stream = "0.3"
-base64 = "0.22"
-blocking = "1"
-bytes = "1"
-chrono = "0.4"
-cron = "0.15"
-dirs = "6"
-dunce = "1.0.5"
-event-listener = "5"
-executor-core = { version = "0.7", features = ["tokio"] }
-flate2 = "1"
+aither-agent = { version = "0.31.0", default-features = false }
+aither-codex = { version = "0.31.0", default-features = false }
+aither-copilot = { version = "0.31.0", default-features = false }
+aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
+aither-mcp = { version = "0.31.0", default-features = false, features = ["client", "http"] }
+aither-sandbox = { version = "0.31.0", default-features = false }
+aho-corasick = { version = "1.1.5", default-features = false, features = ["std", "perf-literal"] }
+anyhow = { version = "1", default-features = false, features = ["std"] }
+arc-swap = { version = "1", default-features = false, features = ["weak"] }
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+async-channel = { version = "2", default-features = false, features = ["std"] }
+async-fs = { version = "2.1", default-features = false }
+async-io = { version = "2.6", default-features = false }
+async-stream = { version = "0.3", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+blocking = { version = "1", default-features = false }
+bytes = { version = "1", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cron = { version = "0.15", default-features = false }
+dirs = { version = "6", default-features = false }
+dunce = { version = "1.0.5", default-features = false }
+event-listener = { version = "5", default-features = false, features = ["std"] }
+executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
-futures-lite = "2.6"
-getrandom = "0.4"
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+getrandom = { version = "0.4", default-features = false }
 heel = { version = "0.10.1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", default-features = false }
-jiff = { version = "0.2", features = ["serde"] }
-libc = "0.2.191"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
-progressor = "0.2.0"
-regex = "1.12"
+progressor = { version = "0.2.0", default-features = false, features = ["std"] }
+regex = { version = "1.12", default-features = false, features = ["std", "perf", "unicode"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3", "progressor"] }
-schemars = { version = "1.0", features = ["derive"] }
-semver = { version = "1.0.28", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
-similar = "3"
-skyzen = { version = "0.5.1" }
+schemars = { version = "1.0", default-features = false, features = ["derive", "std"] }
+semver = { version = "1.0.28", default-features = false, features = ["std", "serde"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+similar = { version = "3", default-features = false, features = ["std", "text"] }
+skyzen = { version = "0.5.1", default-features = false, features = ["openapi"] }
 strsim = { version = "0.11", default-features = false }
 subtle = { version = "2.6", default-features = false }
-tar = "0.4"
-tempfile = "3.24.0"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-url = "2"
+tar = { version = "0.4", default-features = false }
+tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+url = { version = "2", default-features = false, features = ["std"] }
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 whatlang = { version = "0.18", default-features = false }
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
@@ -83,8 +83,8 @@ may-protocol = { path = "../protocol", features = ["testing"] }
 # `SecretStore::in_memory` and the other test fixtures.
 may-config = { path = "../config", features = ["test-fixtures"] }
 # The test budgets and wording the payload tests build output stores with.
-aither-sandbox = { version = "0.31.0", features = ["test-util"] }
-tokio = { version = "1", features = ["full"] }
+aither-sandbox = { version = "0.31.0", default-features = false, features = ["test-util"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

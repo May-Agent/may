@@ -9,13 +9,13 @@ repository = "https://github.com/May-Agent/may"
 publish = false
 
 [dependencies]
-thiserror = "2"
-xxhash-rust = { version = "0.8", features = ["xxh32"] }
-ignore = "0.4"
+thiserror = { version = "2", default-features = false, features = ["std"] }
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh32"] }
+ignore = { version = "0.4", default-features = false }
 grep-regex = { version = "0.1.14", default-features = false }
 grep-searcher = { version = "0.1.17", default-features = false }
 ast-grep-core = { version = "0.51", default-features = false }
-ast-grep-language = { version = "0.51" }
+ast-grep-language = { version = "0.51", default-features = false }
 
 [[bin]]
 name = "search"
@@ -26,7 +26,7 @@ name = "edit"
 path = "src/bin/edit.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
 
 [workspace]

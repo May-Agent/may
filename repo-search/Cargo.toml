@@ -16,24 +16,24 @@ may-db = { path = "../db" }
 may-tool-dist = { path = "../tool-dist" }
 # The versioned wire protocol and platform launchers of the daemon.
 repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
-async-channel = "2"
-async-io = "2.6"
-async-lock = "3"
-askama = "0.16"
-blocking = "1"
-dunce = "1.0.5"
-futures-lite = "2.6"
-git2 = "0.20.3"
-jiff = { version = "0.2", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "2"
-tracing = "0.1"
+async-channel = { version = "2", default-features = false, features = ["std"] }
+async-io = { version = "2.6", default-features = false }
+async-lock = { version = "3", default-features = false, features = ["std"] }
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+blocking = { version = "1", default-features = false }
+dunce = { version = "1.0.5", default-features = false }
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+git2 = { version = "0.20.3", default-features = false }
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 
 [dev-dependencies]
-tempfile = "3.24.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

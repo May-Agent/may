@@ -21,9 +21,10 @@ use async_fs;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
 use web_push::{
-    ContentEncoding, IsahcWebPushClient, SubscriptionInfo, Urgency, VapidSignatureBuilder,
-    WebPushClient, WebPushError, WebPushMessageBuilder,
+    ContentEncoding, SubscriptionInfo, Urgency, VapidSignatureBuilder, WebPushError,
+    WebPushMessage, WebPushMessageBuilder,
 };
+use zenwave::Client as _;
 
 use crate::db::ChatDb;
 
@@ -55,8 +56,6 @@ pub struct NotificationManager {
     public_key_base64url: String,
     /// Database for subscription storage.
     db: ChatDb,
-    /// Reusable HTTP client for push delivery.
-    client: IsahcWebPushClient,
 }
 
 impl std::fmt::Debug for NotificationManager {
@@ -90,15 +89,10 @@ impl NotificationManager {
         let public_key_base64url = Self::derive_public_key_from_pem(&pem_contents)?;
         let vapid_pem: Arc<[u8]> = pem_contents.into_bytes().into();
 
-        let client = IsahcWebPushClient::new().map_err(|e| {
-            NotificationError::P256Key(format!("Failed to create push client: {e}"))
-        })?;
-
         Ok(Self {
             vapid_pem,
             public_key_base64url,
             db,
-            client,
         })
     }
 
@@ -204,11 +198,11 @@ impl NotificationManager {
                 }
             };
 
-            match self.client.send(message).await {
-                Ok(()) => {
+            match send_web_push_message(message).await {
+                Ok(PushDelivery::Sent) => {
                     sent += 1;
                 }
-                Err(WebPushError::EndpointNotValid(_) | WebPushError::EndpointNotFound(_)) => {
+                Ok(PushDelivery::StaleEndpoint) => {
                     tracing::info!(endpoint = %sub.endpoint, "Removing stale push subscription");
                     stale_endpoints.push(sub.endpoint.clone());
                 }
@@ -227,6 +221,54 @@ impl NotificationManager {
 
         Ok(sent)
     }
+}
+
+/// Result of one Web Push HTTP delivery attempt.
+enum PushDelivery {
+    /// Push service accepted the notification (`2xx`).
+    Sent,
+    /// Push service reported the subscription gone or unknown (`404`/`410`).
+    StaleEndpoint,
+}
+
+/// Deliver a built Web Push message over `zenwave` using RFC 8030/8291 headers.
+async fn send_web_push_message(message: WebPushMessage) -> Result<PushDelivery, WebPushError> {
+    let request = web_push::request_builder::build_request::<Vec<u8>>(message);
+    let url = request.uri().to_string();
+    let mut client = zenwave::client();
+    let mut builder = client.post(url).map_err(|_| WebPushError::InvalidUri)?;
+    for (name, value) in request.headers() {
+        let value = value.to_str().map_err(|_| WebPushError::InvalidCryptoKeys)?;
+        builder = builder
+            .header(name.as_str(), value)
+            .map_err(|_| WebPushError::InvalidCryptoKeys)?;
+    }
+    let body = request.into_body();
+    let response = builder
+        .bytes_body(body)
+        .await
+        .map_err(|error| WebPushError::Io(std::io::Error::other(error.to_string())))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(PushDelivery::Sent);
+    }
+    if matches!(status.as_u16(), 404 | 410) {
+        return Ok(PushDelivery::StaleEndpoint);
+    }
+    if status.as_u16() == 413 {
+        return Err(WebPushError::PayloadTooLarge);
+    }
+    let resp_bytes = response
+        .into_body()
+        .into_bytes()
+        .await
+        .map_err(|error| WebPushError::Io(std::io::Error::other(error.to_string())))?;
+    let body_text = String::from_utf8_lossy(&resp_bytes);
+    Err(WebPushError::Io(std::io::Error::other(format!(
+        "push endpoint returned HTTP {}: {}",
+        status.as_u16(),
+        body_text
+    ))))
 }
 
 /// Base64url encode without padding (RFC 4648 section 5).
