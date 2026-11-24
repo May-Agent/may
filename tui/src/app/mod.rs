@@ -3856,12 +3856,16 @@ impl App {
         }
 
         // Clicks and drags outside the chat column (the sidebar) select
-        // nothing; the wheel scrolls the chat anywhere.
+        // nothing; the wheel scrolls the chat anywhere, and an active drag
+        // continues clamping against the chat column edges.
+        let dragging_selection =
+            self.selection.is_some() && mouse.kind == MouseEventKind::Drag(MouseButton::Left);
         let in_chat = self.chat_area.is_empty()
             || self
                 .chat_area
                 .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
         if !in_chat
+            && !dragging_selection
             && !matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -4045,12 +4049,23 @@ impl App {
         }
 
         let base_scroll = self.effective_scroll();
+        let row = if self.chat_area.is_empty() {
+            usize::from(mouse.row)
+        } else {
+            usize::from(
+                mouse
+                    .row
+                    .saturating_sub(self.chat_area.y)
+                    .min(self.chat_area.height.saturating_sub(1)),
+            )
+        };
+        let col = usize::from(mouse.column.saturating_sub(self.chat_area.x));
 
-        let raw_line = base_scroll.saturating_add(mouse.row as usize);
+        let raw_line = base_scroll.saturating_add(row);
         let line = raw_line.saturating_sub(self.chat_layout.top_padding());
         let line = line.min(rows.saturating_sub(1));
         let text = self.chat_layout.plain_line(line)?;
-        let column = clamp_column_by_width(text, mouse.column as usize);
+        let column = clamp_column_by_width(text, col);
         Some(SelectionPoint { line, column })
     }
 
@@ -8430,5 +8445,100 @@ mod tests {
         assert!(app.link_open_modifier_active());
         app.handle_event(AppEvent::FocusLost).expect("focus lost");
         assert!(!app.link_open_modifier_active());
+    }
+
+    #[tokio::test]
+    async fn mouse_drag_and_double_click_align_with_rendered_cells() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.chat.push_text("alpha 你好世界 omega");
+        app.chat.end_text();
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("term");
+        let _rows = draw_rows(&mut terminal, &mut app);
+        assert!(app.chat_area.x > 0, "rendered chat must have left inset");
+
+        let buf = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            let mut text = String::new();
+            let mut x = 0u16;
+            while x < buf.area.width {
+                let sym = buf[(x, y)].symbol();
+                text.push_str(sym);
+                x += u16::try_from(unicode_width::UnicodeWidthStr::width(sym).max(1)).unwrap_or(1);
+            }
+            text
+        };
+        let row = (0..buf.area.height)
+            .find(|&y| row_text(y).contains("alpha 你好世界 omega"))
+            .expect("message row");
+        let line_text = row_text(row);
+        let cell_x = |needle: &str| -> u16 {
+            let byte_col = line_text.find(needle).expect("needle");
+            u16::try_from(unicode_width::UnicodeWidthStr::width(
+                &line_text[..byte_col],
+            ))
+            .expect("cell x")
+        };
+
+        // Drag across "alpha" from its first cell to the space after it.
+        let alpha_x = cell_x("alpha");
+        let drag_end_x = alpha_x + 5;
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), alpha_x, row))
+            .expect("down");
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_end_x,
+            row,
+        ))
+        .expect("drag");
+        assert_eq!(app.selected_text().as_deref(), Some("alpha"));
+        let sel_buf = draw_buffer(&mut app, 80, 20);
+        let sel_bg = ratatui::style::Color::Rgb(70, 90, 130);
+        for offset in 0..5 {
+            assert_eq!(sel_buf[(alpha_x + offset, row)].bg, sel_bg);
+        }
+        assert_ne!(sel_buf[(drag_end_x, row)].bg, sel_bg);
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drag_end_x,
+            row,
+        ))
+        .expect("up");
+
+        // Double-clicking on the CJK word selects "你好世界" (not shifted right).
+        let cjk_x = cell_x("你好世界");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cjk_x, row))
+            .expect("click1 down");
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cjk_x, row))
+            .expect("click1 up");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cjk_x, row))
+            .expect("click2 down");
+        assert_eq!(app.selected_text().as_deref(), Some("你好世界"));
+        let cjk_buf = draw_buffer(&mut app, 80, 20);
+        for offset in 0..8 {
+            assert_eq!(cjk_buf[(cjk_x + offset, row)].bg, sel_bg);
+        }
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cjk_x, row))
+            .expect("click2 up");
+
+        // Double-clicking on "omega" selects "omega".
+        let omega_x = cell_x("omega");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), omega_x, row))
+            .expect("click1 down");
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), omega_x, row))
+            .expect("click1 up");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), omega_x, row))
+            .expect("click2 down");
+        assert_eq!(app.selected_text().as_deref(), Some("omega"));
     }
 }
