@@ -1300,7 +1300,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = crate::secrets::SecretStore::new(dir.path());
+        let store = crate::secrets::SecretStore::in_memory(dir.path());
         store
             .set("API_TOKEN", "super-secret-value-12345")
             .expect("store secret");
@@ -1311,7 +1311,7 @@ mod tests {
             seen: seen.clone(),
             policy,
         };
-        let redacted = RedactedModel::new(inner, SecretRedactor::new(dir.path()));
+        let redacted = RedactedModel::new(inner, SecretRedactor::over(store, None));
         assert_eq!(redacted.retry_policy(), policy);
 
         let echo: Echo = redacted
