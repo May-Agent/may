@@ -11,7 +11,7 @@ publish = false
 [features]
 default = ["vision-ocr"]
 # Build and embed the `web-ui` production bundle the `gui` routes serve.
-ui = []
+ui = ["skyzen/static-files"]
 # On-device native OCR (`waterkit-vision`) and conditional downscaling for text-dense images.
 vision-ocr = ["may-media/vision-ocr", "may-agent-core/vision-ocr"]
 
