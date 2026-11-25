@@ -117,8 +117,13 @@ fn free_port() -> String {
         .to_string()
 }
 
+fn may_binary_path() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_may")
+        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_may")), PathBuf::from)
+}
+
 fn may_command(home: &Path, args: &[String]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_may"));
+    let mut command = Command::new(may_binary_path());
     command
         .args(args)
         .current_dir(home)
@@ -300,7 +305,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// alternate screen, which it only does after the startup step.
 async fn assert_tui_starts(home: &Path, context: &str) {
     const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
-    let binary = env!("CARGO_BIN_EXE_may");
+    let binary = may_binary_path();
+    let binary = binary.to_str().expect("`may` binary path is valid UTF-8");
     let mut command = Command::new("script");
     #[cfg(target_os = "macos")]
     command.args(["-q", "/dev/null", binary]);
