@@ -214,6 +214,7 @@ struct Settled {
 }
 
 impl Entry {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         elem: &ChatElement,
         revision: u64,
@@ -221,6 +222,7 @@ impl Entry {
         width: u16,
         images_supported: bool,
         assets: &super::chat::ChatAssets,
+        tilde_root: Option<&std::path::Path>,
     ) -> Self {
         let laid = element_lines(elem, state, images_supported, assets, width);
         let mut line_starts = Vec::with_capacity(laid.lines.len());
@@ -237,7 +239,7 @@ impl Entry {
                 (key, row, caption)
             })
             .collect();
-        let (marked, link_targets) = links::mark_lines(&laid.lines).unzip();
+        let (marked, link_targets) = links::mark_lines(&laid.lines, tilde_root).unzip();
         let collapsible_key = collapsible_id(elem).map(str::to_string);
         let region_row_span = |start: usize, end: usize| {
             let last = end - 1;
@@ -314,6 +316,7 @@ impl Entry {
         width: u16,
         images_supported: bool,
         assets: &super::chat::ChatAssets,
+        tilde_root: Option<&std::path::Path>,
     ) -> Self {
         let (mut entry, mut stream) = previous
             .and_then(|mut entry| entry.stream.take().map(|stream| (entry, stream)))
@@ -347,7 +350,7 @@ impl Entry {
         #[cfg(test)]
         let wrapped = fresh.len() + frame.open.len();
         for line in fresh {
-            entry.push_line(line.clone(), width, &mut mirror);
+            entry.push_line(line.clone(), width, tilde_root, &mut mirror);
         }
         for (key, index, caption) in &frame.settled_images[settled.images..] {
             entry.push_image(key.clone(), *index, caption.clone());
@@ -360,7 +363,7 @@ impl Entry {
             link_runs: mirror.runs.len(),
         };
         for line in frame.open {
-            entry.push_line(line, width, &mut mirror);
+            entry.push_line(line, width, tilde_root, &mut mirror);
         }
         for (key, index, caption) in frame.open_images {
             entry.push_image(key, index, caption);
@@ -403,11 +406,17 @@ impl Entry {
     /// Append `line`, wrapped at `width`, with its link targets.
     ///
     /// Its scratch-rendered rows go to `mirror`, the entry's scratch render.
-    fn push_line(&mut self, line: Line<'static>, width: u16, mirror: &mut Scratch) {
+    fn push_line(
+        &mut self,
+        line: Line<'static>,
+        width: u16,
+        tilde_root: Option<&std::path::Path>,
+        mirror: &mut Scratch,
+    ) {
         let rows = line_rows(&line, width);
         let first =
             u32::try_from(self.link_targets.len()).expect("link count fits the marker space");
-        let marked = links::mark_line(&line, first);
+        let marked = links::mark_line(&line, first, tilde_root);
         let drawn = scratch(
             std::slice::from_ref(marked.as_ref().map_or(&line, |(marked, _)| marked)),
             width,
@@ -481,6 +490,7 @@ pub struct ChatLayout {
     width: u16,
     images_supported: bool,
     hide_todos: bool,
+    sandbox_dir: Option<std::path::PathBuf>,
     entries: Vec<Entry>,
     /// First document row of each entry.
     offsets: Vec<usize>,
@@ -516,18 +526,22 @@ impl ChatLayout {
         hide_todos: bool,
         selected_tool: Option<&str>,
         spinner_frame: usize,
+        sandbox_dir: Option<&std::path::Path>,
     ) {
         let old_len = self.entries.len();
         let cleared = width != self.width
             || images_supported != self.images_supported
-            || hide_todos != self.hide_todos;
+            || hide_todos != self.hide_todos
+            || sandbox_dir != self.sandbox_dir.as_deref();
         if cleared {
             self.entries.clear();
             self.width = width;
             self.images_supported = images_supported;
             self.hide_todos = hide_todos;
+            self.sandbox_dir = sandbox_dir.map(std::path::Path::to_path_buf);
         }
 
+        let user_home = dirs::home_dir();
         let elements = chat.active_elements();
         let mut old = std::mem::take(&mut self.entries)
             .into_iter()
@@ -551,6 +565,11 @@ impl ChatLayout {
             });
             let entry = reused.unwrap_or_else(|| {
                 self.rebuilt += 1;
+                let tilde_root = if matches!(elem, ChatElement::UserMessage { .. }) {
+                    user_home.as_deref()
+                } else {
+                    sandbox_dir
+                };
                 // The reply streaming in the last element continues the
                 // entry it had last frame.
                 let streaming = match elem {
@@ -572,6 +591,7 @@ impl ChatLayout {
                             width,
                             images_supported,
                             chat.assets(),
+                            tilde_root,
                         )
                     },
                     |(reply, content)| {
@@ -591,6 +611,7 @@ impl ChatLayout {
                             width,
                             images_supported,
                             chat.assets(),
+                            tilde_root,
                         )
                     },
                 )
@@ -948,8 +969,16 @@ mod tests {
     const URL: &str = "https://example.com/some/long/path/segment/that/wraps?query=1";
 
     fn layout_of(chat: &ChatStream, width: u16) -> ChatLayout {
+        layout_with_sandbox(chat, width, None)
+    }
+
+    fn layout_with_sandbox(
+        chat: &ChatStream,
+        width: u16,
+        sandbox_dir: Option<&std::path::Path>,
+    ) -> ChatLayout {
         let mut layout = ChatLayout::default();
-        layout.sync(chat, width, false, false, None, 0);
+        layout.sync(chat, width, false, false, None, 0, sandbox_dir);
         layout
     }
 
@@ -1059,6 +1088,46 @@ mod tests {
         assert_eq!(hits(&layout_of(&chat, 60), 60).len(), 0);
     }
 
+    #[test]
+    fn tilde_links_resolve_to_sandbox_for_agent_and_user_home_for_user() {
+        let sandbox = std::path::Path::new("/tmp/may-session-1");
+        let mut chat = ChatStream::new();
+        chat.push_text("See ~/test.txt, [report](~/artifacts/report.md), and <~/notes.md>.");
+        chat.end_text();
+        chat.push_user("check ~/host.txt", Vec::new(), 1);
+
+        let layout = layout_with_sandbox(&chat, 120, Some(sandbox));
+        let uris: std::collections::BTreeSet<String> = hits(&layout, 120)
+            .into_iter()
+            .map(|(.., hit)| hit.uri)
+            .collect();
+        let expected_user =
+            url::Url::from_file_path(dirs::home_dir().expect("home").join("host.txt"))
+                .unwrap()
+                .to_string();
+        assert_eq!(
+            uris,
+            [
+                "file:///tmp/may-session-1/test.txt".to_string(),
+                "file:///tmp/may-session-1/artifacts/report.md".to_string(),
+                "file:///tmp/may-session-1/notes.md".to_string(),
+                expected_user,
+            ]
+            .into()
+        );
+
+        // Switching sessions re-resolves cached entries to the new sandbox_dir.
+        let mut switched = layout;
+        let next_sandbox = std::path::Path::new("/tmp/may-session-2");
+        switched.sync(&chat, 120, false, false, None, 0, Some(next_sandbox));
+        let switched_uris: std::collections::BTreeSet<String> = hits(&switched, 120)
+            .into_iter()
+            .map(|(.., hit)| hit.uri)
+            .collect();
+        assert!(switched_uris.contains("file:///tmp/may-session-2/test.txt"));
+        assert!(!switched_uris.contains("file:///tmp/may-session-1/test.txt"));
+    }
+
     /// Click the innermost collapsible region on `row`, as the mouse handler does.
     fn click(chat: &mut ChatStream, row: usize, width: u16) {
         let layout = layout_of(chat, width);
@@ -1163,6 +1232,7 @@ fn main() { println!(\"안녕\"); }\n\
             width,
             images_supported,
             chat.assets(),
+            None,
         );
         let entry = layout.entries.last().expect("the reply has an entry");
         assert!(
@@ -1196,7 +1266,7 @@ fn main() { println!(\"안녕\"); }\n\
                 let mut layout = ChatLayout::default();
                 for pair in cuts(STREAMED_REPLY, size).windows(2) {
                     chat.push_text(&STREAMED_REPLY[pair[0]..pair[1]]);
-                    layout.sync(&chat, WIDTH, images_supported, false, None, 0);
+                    layout.sync(&chat, WIDTH, images_supported, false, None, 0, None);
                     assert_matches_one_pass(&layout, &chat, WIDTH, images_supported);
                 }
                 let shown: String = layout.entries[0].plain(WIDTH).concat();
@@ -1236,7 +1306,7 @@ fn main() { println!(\"안녕\"); }\n\
         let mut last = 0;
         for (index, pair) in bounds.windows(2).enumerate() {
             chat.push_text(&reply[pair[0]..pair[1]]);
-            layout.sync(&chat, WIDTH, false, false, None, 0);
+            layout.sync(&chat, WIDTH, false, false, None, 0, None);
             frames += 1;
             let wrapped = wrapped_lines(&layout) - last;
             last = wrapped_lines(&layout);

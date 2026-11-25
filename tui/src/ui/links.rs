@@ -51,10 +51,11 @@ pub struct Detected {
     pub uri: String,
 }
 
-/// Links in `text`: `http`/`https` URLs, then absolute file paths
-/// (`/a/b`, optionally followed by `:line[:col]`) outside those URLs.
+/// Links in `text`: `http`/`https`/`file` URLs, absolute file paths
+/// (`/a/b`, optionally followed by `:line[:col]`), and `~/...` paths anchored
+/// at `tilde_root` when present, outside those URLs.
 #[must_use]
-pub fn detect(text: &str) -> Vec<Detected> {
+pub fn detect(text: &str, tilde_root: Option<&Path>) -> Vec<Detected> {
     let mut found = Vec::new();
     let mut finder = LinkFinder::new();
     finder.kinds(&[LinkKind::Url]);
@@ -63,7 +64,12 @@ pub fn detect(text: &str) -> Vec<Detected> {
         let Ok(url) = Url::parse(link.as_str()) else {
             continue;
         };
-        if !matches!(url.scheme(), "http" | "https") || url.as_str().len() > MAX_URI_BYTES {
+        let allowed = match url.scheme() {
+            "http" | "https" => true,
+            "file" => url.to_file_path().is_ok(),
+            _ => false,
+        };
+        if !allowed || url.as_str().len() > MAX_URI_BYTES {
             continue;
         }
         found.push(Detected {
@@ -73,6 +79,9 @@ pub fn detect(text: &str) -> Vec<Detected> {
     }
     let urls = found.len();
     detect_paths(text, &mut found, urls);
+    if let Some(root) = tilde_root {
+        detect_tilde_paths(text, &mut found, urls, root);
+    }
     found.sort_by_key(|link| link.range.start);
     found
 }
@@ -138,6 +147,50 @@ fn detect_paths(text: &str, found: &mut Vec<Detected>, urls: usize) {
     }
 }
 
+/// Append the `~/...` paths of `text` anchored at `tilde_root` that do not
+/// overlap the first `urls` entries of `found`.
+fn detect_tilde_paths(text: &str, found: &mut Vec<Detected>, urls: usize, tilde_root: &Path) {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while let Some(offset) = text.get(at..).and_then(|rest| rest.find("~/")) {
+        let start = at + offset;
+        at = start + 2;
+        if start > 0 && !opens_path(bytes[start - 1]) {
+            continue;
+        }
+        let rest = text.get(start..).unwrap_or_default();
+        let len = rest.find(ends_path).unwrap_or(rest.len());
+        let end = start + len;
+        at = end.max(at);
+        if found[..urls]
+            .iter()
+            .any(|url| url.range.start < end && start < url.range.end)
+        {
+            continue;
+        }
+        let token = text.get(start..end).unwrap_or_default();
+        let visible = token.trim_end_matches(is_trailing_punct);
+        let target = strip_position(visible);
+        let target = target.trim_end_matches(is_trailing_punct);
+        let Some(rel) = target.strip_prefix("~/") else {
+            continue;
+        };
+        if rel.is_empty() || rel.starts_with('/') {
+            continue;
+        }
+        let Ok(url) = Url::from_file_path(tilde_root.join(rel)) else {
+            continue;
+        };
+        if url.as_str().len() > MAX_URI_BYTES {
+            continue;
+        }
+        found.push(Detected {
+            range: start..start + visible.len(),
+            uri: url.into(),
+        });
+    }
+}
+
 const fn is_trailing_punct(c: char) -> bool {
     matches!(
         c,
@@ -184,12 +237,15 @@ pub const fn marker_index(color: Color) -> Option<u32> {
 ///
 /// Panics when an element holds more than 16 million links.
 #[must_use]
-pub fn mark_lines(lines: &[Line<'static>]) -> Option<(Vec<Line<'static>>, Vec<String>)> {
+pub fn mark_lines(
+    lines: &[Line<'static>],
+    tilde_root: Option<&Path>,
+) -> Option<(Vec<Line<'static>>, Vec<String>)> {
     let mut targets: Vec<String> = Vec::new();
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         let first = u32::try_from(targets.len()).expect("link count fits the marker space");
-        out.push(mark_line(line, first).map_or_else(
+        out.push(mark_line(line, first, tilde_root).map_or_else(
             || line.clone(),
             |(marked, found)| {
                 targets.extend(found);
@@ -205,7 +261,11 @@ pub fn mark_lines(lines: &[Line<'static>]) -> Option<(Vec<Line<'static>>, Vec<St
 /// Links are tagged by [`marker`], numbered from `first`; `None` when the
 /// line holds no link.
 #[must_use]
-pub fn mark_line(line: &Line<'static>, first: u32) -> Option<(Line<'static>, Vec<String>)> {
+pub fn mark_line(
+    line: &Line<'static>,
+    first: u32,
+    tilde_root: Option<&Path>,
+) -> Option<(Line<'static>, Vec<String>)> {
     let text: String = line
         .spans
         .iter()
@@ -214,7 +274,7 @@ pub fn mark_line(line: &Line<'static>, first: u32) -> Option<(Line<'static>, Vec
     if !text.contains('/') {
         return None;
     }
-    let found = detect(&text);
+    let found = detect(&text, tilde_root);
     if found.is_empty() {
         return None;
     }
@@ -527,7 +587,11 @@ mod tests {
     use super::*;
 
     fn links(text: &str) -> Vec<(&str, String)> {
-        detect(text)
+        links_with_tilde(text, None)
+    }
+
+    fn links_with_tilde<'a>(text: &'a str, tilde_root: Option<&Path>) -> Vec<(&'a str, String)> {
+        detect(text, tilde_root)
             .into_iter()
             .map(|link| (text.get(link.range).unwrap(), link.uri))
             .collect()
@@ -602,7 +666,7 @@ mod tests {
             Span::raw("https://exa"),
             Span::raw("mple.com/x now"),
         ])];
-        let (marked, targets) = mark_lines(&lines).unwrap();
+        let (marked, targets) = mark_lines(&lines, None).unwrap();
         assert_eq!(targets, vec!["https://example.com/x".to_string()]);
         let tagged: String = marked[0]
             .spans
@@ -613,7 +677,66 @@ mod tests {
         assert_eq!(tagged, "https://example.com/x");
         let all: String = marked[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(all, "open https://example.com/x now");
-        assert!(mark_lines(&[Line::raw("no links /here")]).is_none());
+        assert!(mark_lines(&[Line::raw("no links /here")], None).is_none());
+    }
+
+    #[test]
+    fn tilde_paths_resolve_under_tilde_root_for_bare_parenthesised_and_angle_forms() {
+        let root = Path::new("/tmp/may-session");
+        let text = "see ~/test.txt:42:7, report (~/artifacts/out.md), <~/notes.txt> and `~/笔记/説明/설명.md`";
+        let got = links_with_tilde(text, Some(root));
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "~/test.txt:42:7",
+                    "file:///tmp/may-session/test.txt".into()
+                ),
+                (
+                    "~/artifacts/out.md",
+                    "file:///tmp/may-session/artifacts/out.md".into()
+                ),
+                ("~/notes.txt", "file:///tmp/may-session/notes.txt".into()),
+                (
+                    "~/笔记/説明/설명.md",
+                    "file:///tmp/may-session/%E7%AC%94%E8%AE%B0/%E8%AA%AC%E6%98%8E/%EC%84%A4%EB%AA%85.md"
+                        .into()
+                ),
+            ]
+        );
+        assert_eq!(
+            links_with_tilde("see ~/test.txt", None),
+            [] as [(&str, std::string::String); 0]
+        );
+        assert_eq!(
+            links_with_tilde("bare ~/ and ~//bad and a~/b", Some(root)),
+            [] as [(&str, std::string::String); 0]
+        );
+    }
+
+    #[test]
+    fn tilde_inside_url_or_absolute_path_is_not_linked_twice() {
+        let root = Path::new("/tmp/may-session");
+        assert_eq!(
+            links_with_tilde("https://example.com/~/a", Some(root)),
+            vec![("https://example.com/~/a", "https://example.com/~/a".into())]
+        );
+        assert_eq!(
+            links_with_tilde("/var/~/a", Some(root)),
+            vec![("/var/~/a", "file:///var/~/a".into())]
+        );
+    }
+
+    #[test]
+    fn file_urls_in_bare_and_angle_forms_are_linked() {
+        let got = links("open <file:///tmp/a.txt> and (file:///tmp/b.txt)");
+        assert_eq!(
+            got,
+            vec![
+                ("file:///tmp/a.txt", "file:///tmp/a.txt".into()),
+                ("file:///tmp/b.txt", "file:///tmp/b.txt".into()),
+            ]
+        );
     }
 
     #[derive(Debug, Default)]

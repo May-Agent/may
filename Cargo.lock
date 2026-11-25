@@ -10542,8 +10542,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "streamdown-ansi"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b531065f2b41df7eec21d4d883613108937aacad539827730bc7a58a552b8f7"
+source = "git+https://github.com/lexoliu/streamdown-rs?branch=fix%2Fpreserve-single-tilde#7ee491fd199f543a5d4b7af142f118ced6ae4cfd"
 dependencies = [
  "crossterm 0.28.1",
  "regex",
@@ -10553,8 +10552,7 @@ dependencies = [
 [[package]]
 name = "streamdown-core"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4b0eaa964712369925867b0f17b0a27e54625df4c79bbc4d6a38390d523d863"
+source = "git+https://github.com/lexoliu/streamdown-rs?branch=fix%2Fpreserve-single-tilde#7ee491fd199f543a5d4b7af142f118ced6ae4cfd"
 dependencies = [
  "regex",
  "serde",
@@ -10564,8 +10562,7 @@ dependencies = [
 [[package]]
 name = "streamdown-parser"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e3b0878c68d83203d3bad30483ba82843889d037334a4911289e6f5c623caaf"
+source = "git+https://github.com/lexoliu/streamdown-rs?branch=fix%2Fpreserve-single-tilde#7ee491fd199f543a5d4b7af142f118ced6ae4cfd"
 dependencies = [
  "regex",
  "streamdown-ansi",

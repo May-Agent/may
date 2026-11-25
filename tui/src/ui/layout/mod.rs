@@ -241,6 +241,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             image_positions_out: Some(&mut image_positions),
             spinner_frame: app.spinner_frame,
             band_bg: app.band_bg,
+            sandbox_dir: app
+                .session_manager
+                .current()
+                .map(|session| session.sandbox_dir.as_path()),
         },
     );
     // The plain mirror is read back from the cached layout on demand.
@@ -3086,6 +3090,7 @@ mod tests {
                         image_positions_out: None,
                         spinner_frame: 0,
                         band_bg: None,
+                        sandbox_dir: None,
                     },
                 );
                 let content = super::super::band::inset(area);
@@ -3270,6 +3275,7 @@ mod tests {
                             image_positions_out: Some(&mut placements),
                             spinner_frame: 0,
                             band_bg: None,
+                            sandbox_dir: None,
                         },
                     );
                     render_inline_images(frame, area, cache, &mut regions, &placements, &[], &tx);
@@ -3468,6 +3474,7 @@ mod tests {
                         image_positions_out: Some(&mut placements),
                         spinner_frame: 0,
                         band_bg: None,
+                        sandbox_dir: None,
                     },
                 );
                 let occluder = Rect::new(0, 4, 50, 3);

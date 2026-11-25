@@ -2410,6 +2410,9 @@ pub struct UnifiedRenderContext<'a> {
     /// Background of the input band, from the terminal's own colours;
     /// `None` keeps the terminal's default background.
     pub band_bg: Option<Color>,
+    /// Current session sandbox directory; `~/` links in agent output resolve
+    /// relative to it instead of the host user's home directory.
+    pub sandbox_dir: Option<&'a std::path::Path>,
 }
 
 impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
@@ -2427,6 +2430,7 @@ impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
             image_positions_out: ctx.image_positions_out,
             spinner_frame: ctx.spinner_frame,
             band_bg: ctx.band_bg,
+            sandbox_dir: ctx.sandbox_dir,
         }
     }
 }
@@ -2464,7 +2468,7 @@ pub fn build_plain_wrapped_lines_unified(
     // left out, the rows are the ones the screen shows.
     let inner = width - 2 * band::padding(width);
     let mut layout = ChatLayout::default();
-    layout.sync(chat, inner, images_supported, false, None, 0);
+    layout.sync(chat, inner, images_supported, false, None, 0, None);
     let mut out: Vec<String> = (0..layout.element_rows())
         .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
         .collect();
@@ -2966,6 +2970,8 @@ struct RenderContext<'a> {
     spinner_frame: usize,
     /// Background of the input band; `None` keeps the terminal's own.
     band_bg: Option<Color>,
+    /// Current session sandbox directory for `~/` links in agent output.
+    sandbox_dir: Option<&'a std::path::Path>,
 }
 
 /// How one element renders this frame, beyond its own content.
@@ -3755,6 +3761,7 @@ fn render_impl(
         image_positions_out,
         spinner_frame,
         band_bg,
+        sandbox_dir,
     } = ctx;
 
     // Chat, queue and band content share the padded column; the band
@@ -3769,6 +3776,7 @@ fn render_impl(
         hide_todos,
         selected_tool,
         spinner_frame,
+        sandbox_dir,
     );
     stats.elements = layout.rebuilt();
 
@@ -6631,6 +6639,7 @@ mod tests {
                         image_positions_out: None,
                         spinner_frame: 0,
                         band_bg: None,
+                        sandbox_dir: None,
                     },
                 );
                 truth = Some(frame.buffer_mut().clone());
@@ -7056,7 +7065,7 @@ mod tests {
         chat.push_user("thanks", Vec::new(), 1);
 
         let mut layout = super::ChatLayout::default();
-        layout.sync(&chat, 60, true, false, None, 0);
+        layout.sync(&chat, 60, true, false, None, 0, None);
         let images = layout.images_in(0, 1000);
         assert_eq!(images.len(), 1);
         let block_end = images[0].row + IMAGE_HEIGHT;
@@ -8668,6 +8677,7 @@ mod tests {
                         image_positions_out: None,
                         spinner_frame: 0,
                         band_bg: Some(BAND_BG),
+                        sandbox_dir: None,
                     },
                 );
                 buf = Some(frame.buffer_mut().clone());
@@ -9319,7 +9329,7 @@ mod tests {
         assert!(screen_expired.contains("settled tail"), "{screen_expired}");
 
         let mut layout = crate::ui::chat_layout::ChatLayout::default();
-        layout.sync(&chat, 80, false, false, None, 0);
+        layout.sync(&chat, 80, false, false, None, 0, None);
         let hit = (0..layout.element_rows())
             .find_map(|row| (0..80u16).find_map(|col| layout.stage_at(row, col)))
             .expect("stage 0 hit in layout");
