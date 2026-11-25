@@ -518,7 +518,7 @@ impl StreamingMarkdown {
                 self.table_header_rows += 1;
                 self.rebuild_table();
             }
-            ParseEvent::TableSeparator => {
+            ParseEvent::TableSeparator(_) => {
                 self.end_inline_line();
                 self.table_has_separator = true;
                 self.rebuild_table();

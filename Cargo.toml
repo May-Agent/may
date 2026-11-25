@@ -252,3 +252,5 @@ aither-webfetch = { git = "https://github.com/May-Agent/aither", branch = "main"
 # one lockfile source with it and the `shim` feature unifies across both.
 heel = { git = "https://github.com/May-Agent/heel.git", branch = "main" }
 heel-shim = { git = "https://github.com/May-Agent/heel.git", branch = "main" }
+# Preserves single `~` characters in inline text (upstream PR pending).
+streamdown-parser = { git = "https://github.com/lexoliu/streamdown-rs", branch = "fix/preserve-single-tilde" }
