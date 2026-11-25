@@ -2693,7 +2693,11 @@ impl<'a> UsageCacheMisses<'a> {
                 .map(|miss| UsageMissLine {
                     at: miss.timestamp.parse::<jiff::Timestamp>().map_or_else(
                         |_| miss.timestamp.clone(),
-                        |at| at.to_zoned(zone.clone()).strftime("%H:%M").to_string(),
+                        |at| {
+                            at.to_zoned_datetime(zone.clone())
+                                .strftime("%H:%M")
+                                .to_string()
+                        },
                     ),
                     model: &miss.model,
                     cause: miss.cause,

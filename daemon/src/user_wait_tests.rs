@@ -9,7 +9,7 @@ use crate::harness::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayloa
 use crate::harness::workspace_request::RequestWorkspaceArgs;
 use aither_core::llm::{ApprovalKind, ApprovalRequest, Approver as _, Tool, ToolContext};
 use base64::Engine;
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use p256::elliptic_curve::Generate as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::{Receiver, error::TryRecvError};
 
@@ -304,11 +304,11 @@ async fn a_popup_notifies_the_subscribed_browser_and_the_attached_terminal() {
         .await
         .expect("session row");
     let (endpoint, received) = push_service().await;
-    let browser_key = p256::SecretKey::random(&mut OsRng);
+    let browser_key = p256::SecretKey::generate();
     let p256dh = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(browser_key.public_key().to_sec1_bytes());
-    let mut auth = [0_u8; 16];
-    OsRng.fill_bytes(&mut auth);
+    let auth_bytes = p256::SecretKey::generate().to_bytes();
+    let auth = &auth_bytes[..16];
     state
         .notification_service
         .subscribe(

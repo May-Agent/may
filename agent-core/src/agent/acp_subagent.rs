@@ -469,9 +469,11 @@ fn finished(reply: String, end: TurnEnd) -> Result<String, AcpError> {
         TurnEnd::NeedsPermission { request_id, title } => {
             Err(AcpError::NeedsPermission { request_id, title })
         }
-        TurnEnd::RateLimited { resume_at, reason } => {
-            Err(AcpError::RateLimited { resume_at, reason })
-        }
+        TurnEnd::RateLimited { resume_at, reason } => Err(AcpError::RateLimited {
+            resume_at: jiff::Timestamp::new(resume_at.as_second(), resume_at.subsec_nanosecond())
+                .expect("valid timestamp"),
+            reason,
+        }),
     }
 }
 
@@ -1579,7 +1581,7 @@ mod tests {
             ),
             (
                 TurnEnd::RateLimited {
-                    resume_at,
+                    resume_at: resume_at.to_string().parse().expect("valid jiff timestamp"),
                     reason: "free tier".into(),
                 },
                 "1970-01-01T00:00:00Z",

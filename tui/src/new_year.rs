@@ -37,7 +37,7 @@ pub fn user_zone(time: &may_config::config::TimeConfig) -> jiff::tz::TimeZone {
 /// Whether `now` falls on December 31 or January 1 in `zone`.
 #[must_use]
 pub fn is_new_year_day(now: jiff::Timestamp, zone: &jiff::tz::TimeZone) -> bool {
-    let date = now.to_zoned(zone.clone()).date();
+    let date = now.to_zoned_datetime(zone.clone()).date();
     matches!((date.month(), date.day()), (12, 31) | (1, 1))
 }
 
@@ -262,7 +262,7 @@ mod tests {
         let ts = date
             .parse::<jiff::civil::DateTime>()
             .expect("datetime")
-            .to_zoned(zone.clone())
+            .to_zoned_datetime(zone.clone())
             .expect("zoned")
             .timestamp();
         (ts, zone)

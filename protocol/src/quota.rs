@@ -97,7 +97,7 @@ impl QuotaPatterns {
         for format in ["%B %d, %Y %I:%M %p", "%b %d, %Y %I:%M %p"] {
             if let Ok(date_time) = DateTime::strptime(format, &date_time) {
                 return TimeZone::system()
-                    .to_ambiguous_zoned(date_time)
+                    .to_ambiguous_zoned_datetime(date_time)
                     .compatible()
                     .ok()
                     .map(|zoned| zoned.timestamp());
@@ -137,10 +137,10 @@ impl QuotaPatterns {
 /// tomorrow. Ambiguous or skipped wall times resolve by jiff's `compatible`
 /// strategy, matching how the announced boundary itself rolls over.
 fn next_wall_time(zone: &TimeZone, hour: i8, minute: i8, now: Timestamp) -> Option<Timestamp> {
-    let today = now.to_zoned(zone.clone()).date();
+    let today = now.to_zoned_datetime(zone.clone()).date();
     for date in [today, today.tomorrow().ok()?] {
         let Ok(zoned) = zone
-            .to_ambiguous_zoned(date.at(hour, minute, 0, 0))
+            .to_ambiguous_zoned_datetime(date.at(hour, minute, 0, 0))
             .compatible()
         else {
             continue;
@@ -175,7 +175,7 @@ mod tests {
                        or try again at Nov 4th, 2026 1:40 AM.";
         let parsed = reset_at(message, now()).expect("reset instant");
         let expected = TimeZone::system()
-            .to_ambiguous_zoned(
+            .to_ambiguous_zoned_datetime(
                 DateTime::strptime("%b %d, %Y %I:%M %p", "Nov 4, 2026 1:40 AM").expect("date"),
             )
             .compatible()

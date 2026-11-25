@@ -279,7 +279,8 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
             ));
         }
         self.sink.on_agent_event(&timed, self.context_window);
-        let at = timed.at;
+        let at = jiff::Timestamp::new(timed.at.as_second(), timed.at.subsec_nanosecond())
+            .expect("valid timestamp");
         let event = timed.event;
         self.last_event_at = Some(at);
         // A browser takeover reaches the turn as the cancellation

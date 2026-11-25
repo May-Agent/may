@@ -23,7 +23,7 @@ name = "aither-sed"
 path = "src/main.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
 # Standalone workspace so main-workspace edits never resolve or compile may-sed
 # or its uucore dependency tree.

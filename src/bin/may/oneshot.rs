@@ -398,6 +398,8 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 }) = result
                     && agent.is_main()
                 {
+                    let at = jiff::Timestamp::new(at.as_second(), at.subsec_nanosecond())
+                        .expect("valid timestamp");
                     assistant_response.push(text, at);
                     output.text(text)?;
                 }
@@ -484,7 +486,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     output.stderr()?,
                     "[retrying] provider error — retry {retry} at {}",
                     until
-                        .to_zoned(jiff::tz::TimeZone::system())
+                        .to_zoned_datetime(jiff::tz::TimeZone::system())
                         .strftime("%H:%M:%S")
                 )?;
             }
@@ -505,7 +507,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     output.stderr()?,
                     "[waiting] usage limit reached — continuing automatically at {}",
                     until
-                        .to_zoned(jiff::tz::TimeZone::system())
+                        .to_zoned_datetime(jiff::tz::TimeZone::system())
                         .strftime("%b %d, %Y %H:%M %Z")
                 )?;
             }

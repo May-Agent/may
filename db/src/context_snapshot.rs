@@ -507,7 +507,11 @@ mod tests {
         let committed = checkpoint
             .items()
             .iter()
-            .map(aither_agent::ContextItem::committed_at)
+            .map(|item| {
+                let at = item.committed_at();
+                jiff::Timestamp::new(at.as_second(), at.subsec_nanosecond())
+                    .expect("valid timestamp")
+            })
             .collect::<Vec<_>>();
         assert_eq!(committed.len(), 2);
         assert!(committed.iter().all(|at| before <= *at && *at <= after));
@@ -535,7 +539,11 @@ mod tests {
             .context
             .items()
             .iter()
-            .map(aither_agent::ContextItem::committed_at)
+            .map(|item| {
+                let at = item.committed_at();
+                jiff::Timestamp::new(at.as_second(), at.subsec_nanosecond())
+                    .expect("valid timestamp")
+            })
             .collect::<Vec<_>>();
         assert_eq!(restored, committed);
     }

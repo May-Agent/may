@@ -433,9 +433,6 @@ fn valid_slidev_frontmatter(lines: &[&str]) -> bool {
     };
     !mapping.is_empty()
         && mapping.keys().all(|key| {
-            let serde_yml::Value::String(key) = key else {
-                return false;
-            };
             !key.is_empty()
                 && key
                     .chars()

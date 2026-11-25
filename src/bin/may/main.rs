@@ -1065,6 +1065,8 @@ where
                         }) = result
                             && agent.is_main()
                         {
+                            let at = jiff::Timestamp::new(at.as_second(), at.subsec_nanosecond())
+                                .expect("valid timestamp");
                             assistant_response.push(text, at);
                         }
                         let ended = app.handle_agent_event(result).await;
@@ -1106,7 +1108,7 @@ where
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {
                             let at = until
-                                .to_zoned(jiff::tz::TimeZone::system())
+                                .to_zoned_datetime(jiff::tz::TimeZone::system())
                                 .strftime("%H:%M:%S")
                                 .to_string();
                             app.set_persistent_status(format!(
@@ -1115,7 +1117,7 @@ where
                         }
                         HoldReason::Quota { until } => {
                             let at = until
-                                .to_zoned(jiff::tz::TimeZone::system())
+                                .to_zoned_datetime(jiff::tz::TimeZone::system())
                                 .strftime("%b %d, %Y %H:%M %Z")
                                 .to_string();
                             app.chat.push_notice(&format!(

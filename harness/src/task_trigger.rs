@@ -179,7 +179,7 @@ impl WebhookSignature {
                 }
             }
             WebhookSignatureScheme::HmacSha256 => {
-                use hmac::{Hmac, Mac};
+                use hmac::{Hmac, KeyInit, Mac};
 
                 let digest = value.trim();
                 let digest = digest.strip_prefix(SIGNATURE_PREFIX).unwrap_or(digest);
@@ -1272,7 +1272,7 @@ mod tests {
     }
 
     fn sign(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("key");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
