@@ -38,7 +38,7 @@ pub struct ScreenBackend {
 
 fn glyph(cell: &Cell) -> (String, usize) {
     let symbol = cell.symbol();
-    if symbol.contains('\x1b') {
+    if symbol.contains('\x1b') || symbol.contains('\u{10EEEE}') {
         return (IMAGE_MARK.to_string(), 1);
     }
     (symbol.to_string(), symbol.width().max(1))

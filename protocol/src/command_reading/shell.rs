@@ -7,7 +7,7 @@ use brush_parser::ast::{
     IoHereDocument, IoRedirect, Pipeline, PipelineOperator, SeparatorOperator, SimpleCommand,
 };
 use brush_parser::word::{WordPiece, WordPieceWithSource};
-use brush_parser::{Parser, ParserOptions, SourceInfo};
+use brush_parser::{Parser, ParserOptions};
 
 use super::{CommandReading, Intent, Link, Step, patch, recognise};
 
@@ -41,12 +41,7 @@ struct Simple {
 }
 
 pub(super) fn read(script: &str, dir: Option<&Path>) -> CommandReading {
-    let parsed = Parser::new(
-        script.as_bytes(),
-        &ParserOptions::default(),
-        &SourceInfo::default(),
-    )
-    .parse_program();
+    let parsed = Parser::new(script.as_bytes(), &ParserOptions::default()).parse_program();
     let Ok(program) = parsed else {
         return CommandReading {
             steps: vec![unknown(Link::Start, script.trim().to_owned())],
@@ -246,7 +241,7 @@ fn pieces_text(
             }
             WordPiece::GettextDoubleQuotedSequence(_)
             | WordPiece::AnsiCQuotedText(_)
-            | WordPiece::TildePrefix(_)
+            | WordPiece::TildeExpansion(_)
             | WordPiece::ParameterExpansion(_)
             | WordPiece::CommandSubstitution(_)
             | WordPiece::BackquotedCommandSubstitution(_)

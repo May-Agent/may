@@ -574,6 +574,37 @@ mod tests {
     use super::*;
     use http_body_util::Full;
 
+    enum TestBody {
+        Inline(Option<Bytes>),
+        Pending(usize),
+    }
+
+    impl hyper::body::Body for TestBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            match &mut *self {
+                Self::Inline(data) => {
+                    std::task::Poll::Ready(data.take().map(|b| Ok(hyper::body::Frame::data(b))))
+                }
+                Self::Pending(_) => std::task::Poll::Pending,
+            }
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            let len = match self {
+                Self::Inline(Some(b)) => b.len(),
+                Self::Inline(None) => 0,
+                Self::Pending(len) => *len,
+            };
+            hyper::body::SizeHint::with_exact(len as u64)
+        }
+    }
+
     #[tokio::test]
     async fn local_url_mapper_enforces_loopback_policy_body_bounds_and_session_cleanup() {
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("upstream");
@@ -628,9 +659,11 @@ mod tests {
             if let Some(len) = content_len {
                 builder = builder.header("Content-Length", len.to_string());
             }
-            let req = builder
-                .body(Full::new(Bytes::from_static(b"hi")))
-                .expect("req");
+            let body = content_len.map_or_else(
+                || TestBody::Inline(Some(Bytes::from_static(b"hi"))),
+                TestBody::Pending,
+            );
+            let req = builder.body(body).expect("req");
             sender.send_request(req).await.expect("resp").status()
         };
 

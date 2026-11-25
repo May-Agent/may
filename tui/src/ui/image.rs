@@ -17,7 +17,7 @@ use base64::Engine as _;
 use ratatui_image::picker::cap_parser::Parser;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, ResizeEncodeRender, StatefulImage};
+use ratatui_image::{FontSize, Resize, ResizeEncodeRender, StatefulImage};
 
 use crate::event::{AppEvent, EventSender};
 
@@ -121,7 +121,10 @@ fn query_picker() -> std::io::Result<Option<Picker>> {
     // `from_fontsize` is the only public constructor that takes a measured
     // cell size; it also carries the tmux and iTerm2 environment hints.
     #[allow(deprecated)]
-    let mut picker = Picker::from_fontsize(cell_size);
+    let mut picker = Picker::from_fontsize(FontSize {
+        width: cell_size.0,
+        height: cell_size.1,
+    });
     if let Some(protocol) = reply.protocol {
         picker.set_protocol_type(protocol);
     }
@@ -251,7 +254,7 @@ const PLACEMENT_ID: u32 = 1;
 /// cells, so drawing fewer placeholder cells than that shows only the
 /// top-left part of the image.
 fn kitty_place(id: u32, is_tmux: bool, cols: u16, rows: u16) -> String {
-    let (start, escape, end) = Parser::escape_tmux(is_tmux);
+    let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
     format!("{start}{escape}_Gq=2,a=p,U=1,i={id},p={PLACEMENT_ID},c={cols},r={rows}{escape}\\{end}")
 }
 
@@ -263,7 +266,7 @@ fn kitty_transmit(id: u32, is_tmux: bool, bytes: &[u8]) -> String {
     const CHARS_PER_CHUNK: usize = 4096;
     const CHUNK_SIZE: usize = (CHARS_PER_CHUNK / 4) * 3;
 
-    let (start, escape, end) = Parser::escape_tmux(is_tmux);
+    let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
     let chunks = bytes.chunks(CHUNK_SIZE);
     let chunk_count = chunks.len();
     let mut data = String::with_capacity(
@@ -343,7 +346,10 @@ fn kitty_image_state(picker: &Picker, data: &[u8]) -> Option<KittyImage> {
         is_tmux,
         width,
         height,
-        font: picker.font_size(),
+        font: {
+            let font = picker.font_size();
+            (font.width, font.height)
+        },
     })
 }
 
@@ -369,7 +375,7 @@ pub fn render_image(
     match &mut state.proto {
         ImageProtocol::Kitty(kitty) => render_kitty(frame.buffer_mut(), area, kitty),
         ImageProtocol::Other(protocol) => {
-            match protocol.needs_resize(&Resize::Fit(None), area) {
+            match protocol.needs_resize(&Resize::Fit(None), area.as_size()) {
                 // The stored encoding already covers this area: the widget
                 // paints cells only — no resize, no encode.
                 None => {
@@ -411,7 +417,10 @@ impl ImageState {
     pub fn fitted(&self, area: Rect) -> Rect {
         match &self.proto {
             ImageProtocol::Kitty(kitty) => kitty.fit_rect(area),
-            ImageProtocol::Other(protocol) => protocol.size_for(Resize::Fit(None), area),
+            ImageProtocol::Other(protocol) => {
+                let size = protocol.size_for(Resize::Fit(None), area.as_size());
+                Rect::new(0, 0, size.width, size.height)
+            }
             // While the protocol encodes off-draw the slot keeps its area.
             ImageProtocol::Encoding => area,
         }

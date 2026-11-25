@@ -89,7 +89,7 @@ fn script_tool(tool: ManagedTool) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// The build's shared baseline-tool cache.

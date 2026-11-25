@@ -21,51 +21,51 @@ testing = [
 ]
 
 [dependencies]
-aither-agent = { version = "0.31.0" }
-aither-core = { version = "0.31.0" }
-aither-sandbox = { version = "0.31.0" }
-arc-swap = { version = "1", features = ["weak"] }
-askama = "0.16"
-async-channel = "2"
-async-fs = "2.1"
-brush-parser = { version = "0.3.0", default-features = false }
-fastrand = { version = "2.4.1" }
-futures-lite = "2.6"
-futures-util = "0.3"
+aither-agent = { version = "0.31.0", default-features = false }
+aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
+aither-sandbox = { version = "0.31.0", default-features = false }
+arc-swap = { version = "1", default-features = false, features = ["weak"] }
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+async-channel = { version = "2", default-features = false, features = ["std"] }
+async-fs = { version = "2.1", default-features = false }
+brush-parser = { version = "0.4.0", default-features = false }
+fastrand = { version = "2.4.1", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
 humantime = { version = "2.4", default-features = false }
-jiff = { version = "0.2", features = ["serde"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
 may-patch = { path = "../patch" }
 may-tasks = { path = "../tasks" }
-petname = "2"
-regex = "1.12"
-schemars = { version = "1.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
-skyzen = { version = "0.5.1" }
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+petname = { version = "3.2.0", default-features = false, features = ["default-rng", "default-words"] }
+regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode"] }
+schemars = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.1", default-features = false }
+skyzen = { version = "0.5.2", default-features = false, features = ["openapi"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
+utoipa = { version = "5.5", default-features = false, features = ["macros"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 # `testing`
-executor-core = { version = "0.7", features = ["tokio"], optional = true }
-http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1", features = ["server", "client", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-tokio = { version = "1", features = ["full"], optional = true }
+executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"], optional = true }
+http-body-util = { version = "0.1", default-features = false, optional = true }
+hyper = { version = "1.13.0", default-features = false, features = ["server", "client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread"], optional = true }
 
 [dev-dependencies]
-futures-lite = "2.6"
-mime = "0.3"
-tempfile = "3.24.0"
-tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
-tokio = { version = "1", features = ["full"] }
-url = "2"
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+mime = { version = "0.3", default-features = false }
+tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
+tiktoken = { version = "5.3.0", default-features = false, features = ["vocab-o200k_base"] }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

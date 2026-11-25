@@ -47,97 +47,97 @@ may-harness = { path = "../harness" }
 # The content-addressed container image references.
 may-container-image = { path = "../container-image" }
 # Aither framework
-aither-core = { version = "0.31.0" }
-aither-agent = { version = "0.31.0", features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
-aither-connectivity = { version = "0.31.0" }
-aither-sandbox = { version = "0.31.0", features = ["code-folding", "connectivity", "jobserver"] }
-aither-cloud = { version = "0.31.0" }
+aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
+aither-agent = { version = "0.31.0", default-features = false, features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
+aither-connectivity = { version = "0.31.0", default-features = false }
+aither-sandbox = { version = "0.31.0", default-features = false, features = ["code-folding", "connectivity", "jobserver"] }
+aither-cloud = { version = "0.31.0", default-features = false }
 aither-skills = { version = "0.31.0", default-features = false }
-aither-codex = { version = "0.31.0" }
-aither-models = { version = "0.31.0" }
-aither-browser = { version = "0.31.0" }
-aither-acp = { version = "0.31.0" }
+aither-codex = { version = "0.31.0", default-features = false }
+aither-models = { version = "0.31.0", default-features = false }
+aither-browser = { version = "0.31.0", default-features = false }
+aither-acp = { version = "0.31.0", default-features = false }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
 heel = { version = "0.10.1", default-features = false }
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
 acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
 # Container runtime (Docker/OrbStack/Podman)
-bollard = "0.21"
+bollard = { version = "0.21", default-features = false, features = ["http", "pipe"] }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
-futures-lite = "2.6"
-futures-util = "0.3"
-bytes = "1"
-async-stream = "0.3"
-event-listener = "5"
-executor-core = { version = "0.7", features = ["tokio"] }
-async-fs = "2.1"
-async-io = "2.6"
-async-process = "2.5"
-async-channel = "2"
-async-lock = "3"
-blocking = "1"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
+async-stream = { version = "0.3", default-features = false }
+event-listener = { version = "5", default-features = false, features = ["std"] }
+executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
+async-fs = { version = "2.1", default-features = false }
+async-io = { version = "2.6", default-features = false }
+async-process = { version = "2.5", default-features = false }
+async-channel = { version = "2", default-features = false, features = ["std"] }
+async-lock = { version = "3", default-features = false, features = ["std"] }
+blocking = { version = "1", default-features = false }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-schemars = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.8"
-dashmap = "6"
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+schemars = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "display", "serde"] }
+dashmap = { version = "6", default-features = false }
 
 # Utils
-jiff = { version = "0.2", features = ["serde"] }
-shell-escape = "0.1"
-shell-words = "1.1"
-shlex = "2"
-arc-swap = { version = "1", features = ["weak"] }
-thiserror = "2"
-tracing = "0.1"
-anyhow = "1"
-url = "2"
-getrandom = "0.4"
-regex = "1.12"
-walkdir = "2"
-ignore = "0.4"
-dunce = "1.0.5"
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+shell-escape = { version = "0.1", default-features = false }
+shell-words = { version = "1.1", default-features = false, features = ["std"] }
+shlex = { version = "2.0.1", default-features = false, features = ["std"] }
+arc-swap = { version = "1", default-features = false, features = ["weak"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+anyhow = { version = "1.0.105", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false }
+regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode"] }
+walkdir = { version = "2.5.1", default-features = false }
+ignore = { version = "0.4.35", default-features = false }
+dunce = { version = "1.0.5", default-features = false }
 which = { version = "8", default-features = false }
-tempfile = "3.24.0"
-git2 = "0.20.3"
+tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
+git2 = { version = "0.21.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 
 # Markdown parsing for structured input where one-shot correctness matters.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # Clipboard, image, and browser
-base64 = "0.22"
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # HTTP client for fetching images and streaming provider calls.
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-# Web Push notifications
-web-push = "0.11"
-p256 = "0.13"
-dirs = "6"
+hyper = { version = "1.13.0", default-features = false, features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+# Web Push notifications (delivered through zenwave, no isahc/curl-sys)
+web-push = { version = "0.11", default-features = false }
+p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdsa", "getrandom", "pem", "pkcs8", "std"] }
+dirs = { version = "7.0.0", default-features = false }
 
 # Browser automation (CDP)
-chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
-chromiumoxide_fetcher = "0.9.1"
+chromiumoxide = { version = "0.9.1", default-features = false }
+chromiumoxide_fetcher = { version = "0.9.1", default-features = false, features = ["rustls", "zip8"] }
 
 # JSON with comments and trailing commas for devcontainer.json.
 jsonc-parser = { version = "0.34", default-features = false, features = ["serde"] }
 
 # Templating
-askama = "0.16"
-skyzen = { version = "0.5.1" }
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
-mime_guess = "2"
-sha2 = "0.10"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+skyzen = { version = "0.5.2", default-features = false, features = ["openapi"] }
+utoipa = { version = "5.5", default-features = false, features = ["macros"] }
+mime_guess = { version = "2", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 [build-dependencies]
@@ -153,8 +153,8 @@ may-config = { path = "../config", features = ["test-fixtures"] }
 may-media = { path = "../media", features = ["testing"] }
 # The `tasks.md` fixtures the session and issue tests build.
 may-harness = { path = "../harness", features = ["testing"] }
-aither-sandbox = { version = "0.31.0", features = ["test-util"] }
-tokio-test = "0.4"
+aither-sandbox = { version = "0.31.0", default-features = false, features = ["test-util"] }
+tokio-test = { version = "0.4", default-features = false }
 
 [lints]
 workspace = true

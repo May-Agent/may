@@ -220,9 +220,13 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
         // Every line opens with the UTC time the agent emitted the event. A
         // run error is not an event and carries no emission time, so it is
         // stamped on receipt.
-        let at = result
-            .as_ref()
-            .map_or_else(|_| Timestamp::now(), |timed| timed.at);
+        let at = result.as_ref().map_or_else(
+            |_| Timestamp::now(),
+            |timed| {
+                Timestamp::new(timed.at.as_second(), timed.at.subsec_nanosecond())
+                    .expect("valid timestamp")
+            },
+        );
         let timed = match result {
             Ok(timed) => timed,
             Err(error) => return self.write_line(at, LineKind::Error { error }),

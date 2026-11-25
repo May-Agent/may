@@ -28,74 +28,64 @@ may-harness = { path = "../harness" }
 may-providers = { path = "../providers" }
 # The tasks.md rows the sidebar lists.
 may-tasks = { path = "../tasks" }
-aither-agent = { version = "0.31.0" }
-aither-core = { version = "0.31.0" }
-aither-sandbox = { version = "0.31.0" }
-arboard = "3"
-askama = "0.16"
-async-channel = "2"
-async-fs = "2.1"
-async-io = "2.6"
-base64 = "0.22"
-blocking = "1"
-bytes = "1"
-chrono = "0.4"
-crossterm = "0.28"
-dirs = "6"
-dunce = "1.0.5"
-event-listener = "5"
-executor-core = { version = "0.7", features = ["tokio"] }
-futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
-futures-lite = "2.6"
-futures-util = "0.3"
-humantime = { version = "2.4", default-features = false }
+aither-agent = { version = "0.31.0", default-features = false }
+aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
+aither-sandbox = { version = "0.31.0", default-features = false }
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+async-channel = { version = "2", default-features = false, features = ["std"] }
+async-fs = { version = "2.1", default-features = false }
+async-io = { version = "2.6", default-features = false }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+blocking = { version = "1", default-features = false }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "events", "windows"] }
+dirs = { version = "7.0.0", default-features = false }
+executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-itertools = "0.14.0"
-jiff = { version = "0.2", features = ["serde"] }
-mime_guess = "2"
-nucleo = "0.5"
-nucleo-matcher = "0.3"
-open = "5"
+itertools = { version = "0.15.0", default-features = false, features = ["use_std"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+mime_guess = { version = "2", default-features = false }
+nucleo = { version = "0.5", default-features = false }
+open = { version = "5", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
-ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
-regex = "1.12"
-schemars = { version = "1.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-streamdown-parser = "0.1"
+ratatui = { version = "0.30", default-features = false, features = ["all-widgets", "crossterm", "layout-cache", "scrolling-regions", "unstable-rendered-line-info"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+streamdown-parser = { version = "0.1", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-tempfile = "3.24.0"
+tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
 terminal-colorsaurus = { version = "1.0.3", default-features = false }
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-toml = "0.8"
-tracing = "0.1"
-aither-models = "0.31.0"
-fastrand = "2"
-shlex = "1"
-shell-words = "1"
-mime = "0.3"
-hyper = { version = "1", default-features = false, features = ["client", "http1"] }
-ahash = "0.8"
-linkify = "0.10"
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "display", "serde"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+aither-models = { version = "0.31.0", default-features = false }
+fastrand = { version = "2", default-features = false, features = ["std"] }
+shlex = { version = "2.0.1", default-features = false, features = ["std"] }
+shell-words = { version = "1.1", default-features = false, features = ["std"] }
+mime = { version = "0.3", default-features = false }
+hyper = { version = "1.13.0", default-features = false, features = ["client", "http1"] }
+ahash = { version = "0.8.13", default-features = false, features = ["std", "runtime-rng"] }
+linkify = { version = "0.12.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
-partial-json-fixer = "0.5"
-ignore = "0.4"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+partial-json-fixer = { version = "0.5", default-features = false }
+ignore = { version = "0.4.35", default-features = false }
 unicode-segmentation = { version = "1.13", default-features = false }
-unicode-width = "0.2"
-url = "2"
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
-whatlang = { version = "0.18", default-features = false }
+unicode-width = { version = "0.2", default-features = false, features = ["cjk"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = "0.3"
-objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSURL"] }
 
 [dev-dependencies]
-libc = "0.2"
+libc = { version = "0.2", default-features = false, features = ["std"] }
 repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
 
 [lints]

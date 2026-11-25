@@ -49,11 +49,11 @@ may-config = { path = "config" }
 # Feature edge the release build's update channel reads.
 may-harness = { path = "harness" }
 # Aither framework
-aither-core = { version = "0.31.0" }
-aither-agent = { version = "0.31.0" }
-aither-sandbox = { version = "0.31.0" }
-aither-copilot = { version = "0.31.0" }
-aither-codex = { version = "0.31.0" }
+aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
+aither-agent = { version = "0.31.0", default-features = false }
+aither-sandbox = { version = "0.31.0", default-features = false }
+aither-copilot = { version = "0.31.0", default-features = false }
+aither-codex = { version = "0.31.0", default-features = false }
 # Exact token counts (`LanguageModel::count_text`) for the decode meter.
 aither-openai = { version = "0.31.0", default-features = false, features = ["tokenizer"] }
 
@@ -63,59 +63,59 @@ aither-openai = { version = "0.31.0", default-features = false, features = ["tok
 repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
-futures-lite = "2.6"
-bytes = "1"
-async-stream = "0.3"
-executor-core = { version = "0.7", features = ["tokio"] }
-async-fs = "2.1"
-async-io = "2.6"
-async-process = "2.5"
-async-channel = "2"
-blocking = "1"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
+async-stream = { version = "0.3", default-features = false }
+executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
+async-fs = { version = "2.1", default-features = false }
+async-io = { version = "2.6", default-features = false }
+async-process = { version = "2.5", default-features = false }
+async-channel = { version = "2", default-features = false, features = ["std"] }
+blocking = { version = "1", default-features = false }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.8"
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "display", "serde"] }
 
 # Utils
-jiff = { version = "0.2", features = ["serde"] }
-libc = "0.2.191"
-dirs = "6"
-shell-escape = "0.1"
-arc-swap = { version = "1", features = ["weak"] }
-thiserror = "2"
-tracing = "0.1"
-anyhow = "1"
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
+dirs = { version = "7.0.0", default-features = false }
+shell-escape = { version = "0.1", default-features = false }
+arc-swap = { version = "1", default-features = false, features = ["weak"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+anyhow = { version = "1.0.105", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
-tempfile = "3.24.0"
-git2 = "0.20.3"
-rustls = { version = "0.23", features = ["ring"] }
-dunce = "1.0.5"
+tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
+git2 = { version = "0.21.0", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+dunce = { version = "1.0.5", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
-clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
-clap_complete = { version = "4.6.11", default-features = false }
+clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+clap_complete = { version = "4.6.12", default-features = false }
 indicatif = { version = "0.18.6", default-features = false }
 
 # TUI
-ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
-crossterm = "0.28"
-arboard = "3"
-open = "5"
+ratatui = { version = "0.30", default-features = false, features = ["all-widgets", "crossterm", "layout-cache", "scrolling-regions", "unstable-rendered-line-info"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "events", "windows"] }
+arboard = { version = "3.7.0", default-features = false }
+open = { version = "5", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
+hyper = { version = "1.13.0", default-features = false, features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1", default-features = false }
 
 # Browser automation (CDP)
-chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.9.1", default-features = false }
 
 # Logging
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
 
 # Templating
-askama = "0.16"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 
 [dev-dependencies]
 # Test-support helpers the integration tests drive.
@@ -124,12 +124,7 @@ may-tool-dist = { path = "tool-dist", features = ["test-fixtures"] }
 may-config = { path = "config", features = ["test-fixtures"] }
 may-harness = { path = "harness", features = ["testing"] }
 # Places jobs in a container or on a remote host for the memory guard's tests.
-aither-sandbox = { version = "0.31.0", features = ["test-util"] }
-# Builds the tar.xz artifacts the distribution tests extract.
-lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
-# Checks that every model-facing id word is one o200k_base token.
-tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
-tokio-test = "0.4"
+aither-sandbox = { version = "0.31.0", default-features = false, features = ["test-util"] }
 
 [workspace.lints]
 rust.missing_docs = "warn"

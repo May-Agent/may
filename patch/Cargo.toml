@@ -13,14 +13,14 @@ publish = false
 
 [dependencies]
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
-thiserror = "2"
+thiserror = { version = "2", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "apply_patch"
 path = "src/main.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
 [lints]
 workspace = true

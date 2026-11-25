@@ -342,7 +342,7 @@ impl SleepState {
         let times = self.db.sleep_times().await?;
         let nights: BTreeSet<_> = times
             .iter()
-            .map(|at| (*at - NIGHT_OFFSET).to_zoned(zone.clone()).date())
+            .map(|at| (*at - NIGHT_OFFSET).to_zoned_datetime(zone.clone()).date())
             .collect();
         if nights.len() < MIN_HABIT_NIGHTS {
             return Ok(false);
@@ -563,7 +563,7 @@ fn median_circular_deviation(minutes: &[u32], center: u32) -> u32 {
 }
 
 fn minute_of_day(at: Timestamp, zone: &TimeZone) -> u32 {
-    let time = at.to_zoned(zone.clone()).time();
+    let time = at.to_zoned_datetime(zone.clone()).time();
     u32::try_from(time.hour()).expect("hour is non-negative") * 60
         + u32::try_from(time.minute()).expect("minute is non-negative")
 }
