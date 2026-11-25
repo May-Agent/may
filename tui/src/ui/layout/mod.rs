@@ -3111,7 +3111,10 @@ mod tests {
 
     #[allow(deprecated)] // a fixed font size keeps the test off the real terminal
     fn image_state(protocol: ProtocolType) -> ImageState {
-        let mut picker = Picker::from_fontsize((10, 20));
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize {
+            width: 10,
+            height: 20,
+        });
         picker.set_protocol_type(protocol);
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             120,

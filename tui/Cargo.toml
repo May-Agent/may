@@ -31,29 +31,29 @@ may-tasks = { path = "../tasks" }
 aither-agent = { version = "0.31.0", default-features = false }
 aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
 aither-sandbox = { version = "0.31.0", default-features = false }
-arboard = { version = "3", default-features = false, features = ["image-data"] }
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 async-channel = { version = "2", default-features = false, features = ["std"] }
 async-fs = { version = "2.1", default-features = false }
 async-io = { version = "2.6", default-features = false }
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 blocking = { version = "1", default-features = false }
-bytes = { version = "1", default-features = false, features = ["std"] }
-crossterm = { version = "0.28", default-features = false, features = ["bracketed-paste", "events", "windows"] }
-dirs = { version = "6", default-features = false }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "events", "windows"] }
+dirs = { version = "7.0.0", default-features = false }
 executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-itertools = { version = "0.14.0", default-features = false, features = ["use_std"] }
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+itertools = { version = "0.15.0", default-features = false, features = ["use_std"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
 mime_guess = { version = "2", default-features = false }
 nucleo = { version = "0.5", default-features = false }
 open = { version = "5", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ratatui = { version = "0.30", default-features = false, features = ["all-widgets", "crossterm", "layout-cache", "scrolling-regions", "unstable-rendered-line-info"] }
-ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
-regex = { version = "1.12", default-features = false, features = ["std", "perf", "unicode"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode"] }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 streamdown-parser = { version = "0.1", default-features = false }
@@ -62,22 +62,22 @@ tempfile = { version = "3.24.0", default-features = false, features = ["getrando
 terminal-colorsaurus = { version = "1.0.3", default-features = false }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
-toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "display", "serde"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 aither-models = { version = "0.31.0", default-features = false }
 fastrand = { version = "2", default-features = false, features = ["std"] }
-shlex = { version = "1", default-features = false, features = ["std"] }
+shlex = { version = "2.0.1", default-features = false, features = ["std"] }
 shell-words = { version = "1.1", default-features = false, features = ["std"] }
 mime = { version = "0.3", default-features = false }
-hyper = { version = "1", default-features = false, features = ["client", "http1"] }
-ahash = { version = "0.8", default-features = false, features = ["std", "runtime-rng"] }
-linkify = { version = "0.10", default-features = false }
+hyper = { version = "1.13.0", default-features = false, features = ["client", "http1"] }
+ahash = { version = "0.8.13", default-features = false, features = ["std", "runtime-rng"] }
+linkify = { version = "0.12.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 partial-json-fixer = { version = "0.5", default-features = false }
-ignore = { version = "0.4", default-features = false }
+ignore = { version = "0.4.35", default-features = false }
 unicode-segmentation = { version = "1.13", default-features = false }
 unicode-width = { version = "0.2", default-features = false, features = ["cjk"] }
-url = { version = "2", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

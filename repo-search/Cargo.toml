@@ -23,13 +23,13 @@ askama = { version = "0.16", default-features = false, features = ["derive", "st
 blocking = { version = "1", default-features = false }
 dunce = { version = "1.0.5", default-features = false }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
-git2 = { version = "0.20.3", default-features = false }
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+git2 = { version = "0.21.0", default-features = false }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+utoipa = { version = "5.5", default-features = false, features = ["macros"] }
 
 [dev-dependencies]
 tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }

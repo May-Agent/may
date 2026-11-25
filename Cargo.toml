@@ -65,7 +65,7 @@ repo-search-client = { version = "0.0.10", default-features = false, features = 
 # Async runtime
 tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
-bytes = { version = "1", default-features = false, features = ["std"] }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
 async-stream = { version = "0.3", default-features = false }
 executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
 async-fs = { version = "2.1", default-features = false }
@@ -77,39 +77,39 @@ blocking = { version = "1", default-features = false }
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "display", "serde"] }
 
 # Utils
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
-dirs = { version = "6", default-features = false }
+dirs = { version = "7.0.0", default-features = false }
 shell-escape = { version = "0.1", default-features = false }
 arc-swap = { version = "1", default-features = false, features = ["weak"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-anyhow = { version = "1", default-features = false, features = ["std"] }
+anyhow = { version = "1.0.105", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
-git2 = { version = "0.20.3", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 dunce = { version = "1.0.5", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
-clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
-clap_complete = { version = "4.6.11", default-features = false }
+clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+clap_complete = { version = "4.6.12", default-features = false }
 indicatif = { version = "0.18.6", default-features = false }
 
 # TUI
 ratatui = { version = "0.30", default-features = false, features = ["all-widgets", "crossterm", "layout-cache", "scrolling-regions", "unstable-rendered-line-info"] }
-crossterm = { version = "0.28", default-features = false, features = ["bracketed-paste", "events", "windows"] }
-arboard = { version = "3", default-features = false }
+crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "events", "windows"] }
+arboard = { version = "3.7.0", default-features = false }
 open = { version = "5", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1"] }
+hyper = { version = "1.13.0", default-features = false, features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = { version = "0.1", default-features = false }
 
 # Browser automation (CDP)
-chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.9.1", default-features = false }
 
 # Logging
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }

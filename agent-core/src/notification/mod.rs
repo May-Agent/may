@@ -98,7 +98,9 @@ impl NotificationManager {
 
     /// Generate a new VAPID EC P-256 keypair and write the private key as PEM.
     async fn generate_vapid_keypair(pem_path: &Path) -> Result<(), NotificationError> {
-        let signing_key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        use p256::elliptic_curve::Generate as _;
+
+        let signing_key = SigningKey::generate();
         let pem = signing_key
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
             .map_err(|_| NotificationError::Pkcs8)?;
@@ -113,7 +115,7 @@ impl NotificationManager {
         let signing_key = SigningKey::from_pkcs8_pem(pem)
             .map_err(|e| NotificationError::P256Key(format!("Invalid PEM: {e}")))?;
         let verifying_key = signing_key.verifying_key();
-        let encoded_point = verifying_key.to_encoded_point(false);
+        let encoded_point = verifying_key.to_sec1_point(false);
         let bytes = encoded_point.as_bytes();
         Ok(base64_url_encode(bytes))
     }
@@ -238,7 +240,9 @@ async fn send_web_push_message(message: WebPushMessage) -> Result<PushDelivery, 
     let mut client = zenwave::client();
     let mut builder = client.post(url).map_err(|_| WebPushError::InvalidUri)?;
     for (name, value) in request.headers() {
-        let value = value.to_str().map_err(|_| WebPushError::InvalidCryptoKeys)?;
+        let value = value
+            .to_str()
+            .map_err(|_| WebPushError::InvalidCryptoKeys)?;
         builder = builder
             .header(name.as_str(), value)
             .map_err(|_| WebPushError::InvalidCryptoKeys)?;

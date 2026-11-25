@@ -28,24 +28,24 @@ async-process = { version = "2.5", default-features = false }
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 blocking = { version = "1", default-features = false }
 fd-lock = { version = "4.0.4", default-features = false }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"] }
 percent-encoding = { version = "2.3", default-features = false, features = ["std"] }
 semver = { version = "1.0.28", default-features = false, features = ["std", "serde"] }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-sha2 = { version = "0.10", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.1", default-features = false }
 shell-words = { version = "1.1", default-features = false, features = ["std"] }
 tar = { version = "0.4", default-features = false }
 tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-url = { version = "2", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
-zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [build-dependencies]
 may-container-image = { path = "../container-image" }
@@ -53,7 +53,7 @@ may-container-image = { path = "../container-image" }
 [dev-dependencies]
 executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
 # Builds the tar.xz artifacts the distribution tests extract.
-lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz", "encoder"] }
 schemars = { version = "1.0", default-features = false, features = ["derive", "std"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 

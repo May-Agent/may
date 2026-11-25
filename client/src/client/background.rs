@@ -105,8 +105,16 @@ impl From<KillCause> for WireKillCause {
             KillCause::User => Self::User,
             KillCause::Timeout(kill) => Self::Timeout {
                 timeout_ms: u64::try_from(kill.timeout.as_millis()).unwrap_or(u64::MAX),
-                started: kill.started,
-                killed: kill.killed,
+                started: jiff::Timestamp::new(
+                    kill.started.as_second(),
+                    kill.started.subsec_nanosecond(),
+                )
+                .expect("valid timestamp"),
+                killed: jiff::Timestamp::new(
+                    kill.killed.as_second(),
+                    kill.killed.subsec_nanosecond(),
+                )
+                .expect("valid timestamp"),
             },
             KillCause::MemoryRunaway {
                 footprint_bytes,
@@ -134,8 +142,8 @@ impl From<WireKillCause> for KillCause {
                 killed,
             } => Self::Timeout(TimeoutKill {
                 timeout: Duration::from_millis(timeout_ms),
-                started,
-                killed,
+                started: started.to_string().parse().expect("valid jiff timestamp"),
+                killed: killed.to_string().parse().expect("valid jiff timestamp"),
             }),
             WireKillCause::MemoryRunaway {
                 footprint_bytes,

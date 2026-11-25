@@ -24,16 +24,16 @@ may-config = { path = "../config" }
 aither-core = { version = "0.31.0", default-features = false, features = ["std", "derive", "serde"] }
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 arc-swap = { version = "1", default-features = false }
-ahash = { version = "0.8", default-features = false, features = ["std", "runtime-rng"] }
+ahash = { version = "0.8.13", default-features = false, features = ["std", "runtime-rng"] }
 async-channel = { version = "2", default-features = false, features = ["std"] }
 async-fs = { version = "2.1", default-features = false }
 async-io = { version = "2.6", default-features = false }
 async-lock = { version = "3", default-features = false, features = ["std"] }
 # webrtc-rs interceptors are `async_trait` traits.
 async-trait = { version = "0.1.92", default-features = false }
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 blocking = { version = "1", default-features = false }
-bytes = { version = "1", default-features = false, features = ["std"] }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
 dunce = { version = "1.0.5", default-features = false }
 executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
@@ -41,19 +41,19 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
 # Hardware H.264 (software AV1 on hosts without an encoder) and the
 # platform JPEG decode that feeds it.
-mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "dev", default-features = false, features = ["software-encode"] }
+mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "main", default-features = false, features = ["software-encode"] }
 mime = { version = "0.3", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-url = { version = "2", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 waterkit-vision = { git = "https://github.com/water-rs/waterkit", branch = "main", default-features = false, features = ["text"], optional = true }
-webrtc = { version = "0.17", default-features = false }
+webrtc = { version = "0.17.3", default-features = false }
 # RGB/BGRA to NV12 for the frames that cannot go to the encoder as surfaces;
 # already in the lockfile through mediax-codec.
-yuv = { version = "0.8", default-features = false }
+yuv = { version = "0.8.21", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6", default-features = false, features = ["std"] }

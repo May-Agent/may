@@ -2006,7 +2006,7 @@ mod tests {
     }
 
     fn sign(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("key");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))

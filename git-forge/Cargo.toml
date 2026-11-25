@@ -22,13 +22,13 @@ async-process = { version = "2.5", default-features = false }
 blocking = { version = "1", default-features = false }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-url = { version = "2", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 [dev-dependencies]

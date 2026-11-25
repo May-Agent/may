@@ -63,8 +63,10 @@ fn read_replies<I: AsFd, O: Write>(
     is_tmux: bool,
     timeout: Duration,
 ) -> io::Result<Option<Vec<Response>>> {
-    let mut options = QueryStdioOptions::default();
-    options.timeout = timeout;
+    let options = QueryStdioOptions {
+        timeout,
+        ..Default::default()
+    };
     output.write_all(Parser::query(is_tmux, options).as_bytes())?;
     output.flush()?;
 

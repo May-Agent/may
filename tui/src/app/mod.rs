@@ -7488,7 +7488,7 @@ mod tests {
         let now = date
             .parse::<jiff::civil::DateTime>()
             .expect("datetime")
-            .to_zoned(zone.clone())
+            .to_zoned_datetime(zone.clone())
             .expect("zoned")
             .timestamp();
         app.new_year.set_date(now, &zone);

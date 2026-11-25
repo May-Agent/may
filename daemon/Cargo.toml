@@ -44,7 +44,7 @@ tokio = { version = "1", default-features = false, features = ["fs", "io-util", 
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 futures-lite = { version = "2.6", default-features = false, features = ["race", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
-bytes = { version = "1", default-features = false, features = ["std"] }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
 event-listener = { version = "5", default-features = false, features = ["std"] }
 executor-core = { version = "0.7", default-features = false, features = ["std", "tokio"] }
 async-fs = { version = "2.1", default-features = false }
@@ -59,44 +59,44 @@ blocking = { version = "1", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 schemars = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-serde_yml = { version = "0.0.12", default-features = false }
+serde_yml = { version = "0.0.13", default-features = false }
 rmp-serde = { version = "1.3", default-features = false }
-toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "display", "serde"] }
 dashmap = { version = "6", default-features = false }
 
 # Utils
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated", "perf-inline", "serde"] }
 shell-escape = { version = "0.1", default-features = false }
 arc-swap = { version = "1", default-features = false, features = ["weak"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-anyhow = { version = "1", default-features = false, features = ["std"] }
-url = { version = "2", default-features = false, features = ["std"] }
+anyhow = { version = "1.0.105", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
 dunce = { version = "1.0.5", default-features = false }
 which = { version = "8", default-features = false }
 tempfile = { version = "3.24.0", default-features = false, features = ["getrandom"] }
-git2 = { version = "0.20.3", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios", "process"] }
 libc = { version = "0.2", default-features = false, features = ["std"] }
-notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
-hmac = { version = "0.12", default-features = false }
+notify = { version = "9.0.0", default-features = false, features = ["macos_fsevent"] }
+hmac = { version = "0.13.0", default-features = false }
 subtle = { version = "2.6", default-features = false, features = ["std"] }
-sha2 = { version = "0.10", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 fd-lock = { version = "4.0.4", default-features = false }
 include_dir = { version = "0.7", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 repo-search-client = { version = "0.0.10", default-features = false, features = ["launcher"] }
 
 # Clipboard, image, and browser
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "pem", "std"] }
+p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdsa", "getrandom", "pem", "pkcs8", "std"] }
 
 # HTTP and SSE plumbing
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1"] }
+hyper = { version = "1.13.0", default-features = false, features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # hyper over futures-io streams, for daemon connections outside tokio
 smol-hyper = { version = "0.1.1", default-features = false }
@@ -105,10 +105,10 @@ mime = { version = "0.3", default-features = false }
 mime_guess = { version = "2", default-features = false }
 
 # Web server for `may gui`/`may rest`
-skyzen = { version = "0.5.1", default-features = false, features = ["hyper", "json", "query", "sse", "openapi", "ws"] }
+skyzen = { version = "0.5.2", default-features = false, features = ["hyper", "json", "query", "sse", "openapi", "ws"] }
 # The daemon serves the router itself and renders errors as skyzen does.
-skyzen-core = { version = "0.2", default-features = false, features = ["std"] }
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+skyzen-core = { version = "0.2.1", default-features = false, features = ["std"] }
+utoipa = { version = "5.5", default-features = false, features = ["macros"] }
 
 # Logging
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }

@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn third_party_tools_match_their_pin() {
         assert_eq!(
-            format!("{:x}", Sha256::digest(THIRD_PARTY_TOOLS)),
+            hex::encode(Sha256::digest(THIRD_PARTY_TOOLS)),
             THIRD_PARTY_TOOLS_SHA256
         );
     }
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn may_artifacts_match_their_pin() {
         assert_eq!(
-            format!("{:x}", Sha256::digest(MAY_ARTIFACTS)),
+            hex::encode(Sha256::digest(MAY_ARTIFACTS)),
             MAY_ARTIFACTS_SHA256
         );
     }
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn host_programs_match_their_pin() {
         assert_eq!(
-            format!("{:x}", Sha256::digest(HOST_PROGRAMS)),
+            hex::encode(Sha256::digest(HOST_PROGRAMS)),
             HOST_PROGRAMS_SHA256
         );
     }
