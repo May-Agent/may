@@ -16,13 +16,16 @@ the `scope` job forwards:
   `--workspace` for `workspace`, empty for empty.
 - `linux-package-args` — `package-args` minus the members the Linux legs
   never compile (`LINUX_EXCLUDED`; none today).
-- `cargo-flags` / `linux-cargo-flags` — the target selection the test jobs
-  build and run: the affected packages as `-p` flags plus `--all-targets`
-  when the e2e gates run, `--lib --bins` when they do not, so a
-  client-only diff never compiles `tests/terminal_first_e2e.rs`. When the
-  e2e gates run, the root package — owner of the `may` binary and the
-  `tests/` harness — joins the set so the e2e and `may` binaries exist to
-  upload; `--workspace` for a workspace scope.
+- `cargo-flags` / `linux-cargo-flags` — the full target selection for
+  backwards compatibility (`-p` flags plus `--all-targets` when the e2e gates
+  run, `--lib --bins` when they do not).
+- `unit-test` — `true` when any crate outside the root e2e archive needs unit
+  tests.
+- `unit-cargo-flags` / `linux-unit-cargo-flags` — the target selection for
+  the parallel unit-test jobs: when `e2e` is on, drops `root_pkg` (which
+  `build-e2e` builds and archives with `--all-targets`) and keeps
+  `--all-targets` on the remaining affected crates; when `e2e` is off, keeps
+  every affected crate with `--lib --bins`.
 - `ui-clippy` — `true` when the `--features ui` clippy leg has work: a
   workspace scope, a `web-ui/` change, or an in-scope member carrying the
   `ui` feature that embeds the frontend bundle.
@@ -215,11 +218,15 @@ def reverse_closure(roots, dependents):
     return seen
 
 
-def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true"):
+def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true", root_pkg=ROOT_PACKAGE):
     """Every gate on: the diff can reach anywhere in the main workspace."""
     # `--exclude` composes with `--workspace` where `-p` cannot.
     excludes = " ".join(f"--exclude {name}" for name in sorted(linux_excluded))
     linux_scope = f"--workspace {excludes}".rstrip()
+    unit_excludes = " ".join(f"--exclude {name}" for name in sorted({root_pkg}))
+    linux_unit_excludes = " ".join(
+        f"--exclude {name}" for name in sorted(set(linux_excluded) | {root_pkg})
+    )
     return {
         "rust": "true",
         "sed": sed,
@@ -227,6 +234,7 @@ def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true"):
         "clippy": "true",
         "ui-clippy": "true",
         "test": "true",
+        "unit-test": "true",
         "e2e": "true",
         "acceptance": "true",
         "web_ui": "true",
@@ -235,6 +243,8 @@ def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true"):
         "linux-package-args": linux_scope,
         "cargo-flags": "--workspace --all-targets",
         "linux-cargo-flags": f"{linux_scope} --all-targets",
+        "unit-cargo-flags": f"--workspace {unit_excludes} --all-targets",
+        "linux-unit-cargo-flags": f"--workspace {linux_unit_excludes} --all-targets",
         "ui-args": ui_args,
     }
 
@@ -248,6 +258,7 @@ def empty_outputs(ui_args):
         "clippy": "false",
         "ui-clippy": "false",
         "test": "false",
+        "unit-test": "false",
         "e2e": "false",
         "acceptance": "false",
         "web_ui": "false",
@@ -256,6 +267,8 @@ def empty_outputs(ui_args):
         "linux-package-args": "",
         "cargo-flags": "--lib --bins",
         "linux-cargo-flags": "--lib --bins",
+        "unit-cargo-flags": "",
+        "linux-unit-cargo-flags": "",
         "ui-args": ui_args,
     }
 
@@ -278,7 +291,10 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
 
     if report["workspace"]:
         return workspace_outputs(
-            ui_args, linux_excluded, sed="true" if sed_changed else "false"
+            ui_args,
+            linux_excluded,
+            sed="true" if sed_changed else "false",
+            root_pkg=root_pkg,
         )
 
     affected = set(report["affected"])
@@ -322,6 +338,19 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
     cargo_flags = f"{package_args(test_names)} {target_kinds}".strip()
     linux_cargo_flags = f"{package_args(test_names - linux_excluded)} {target_kinds}".strip()
 
+    # The parallel unit-test job runs every affected crate outside the e2e
+    # archive: when `e2e` runs, `build-e2e` builds and archives `root_pkg`
+    # (`--all-targets`), so `unit_names` drops `root_pkg` and keeps
+    # `--all-targets` for the remaining crates (preserving e.g. `may-patch`'s
+    # integration tests). When `e2e` is off, `unit_names` keeps every affected
+    # crate with `--lib --bins`.
+    unit_names = (set(affected) - {root_pkg}) if e2e else set(affected)
+    linux_unit_names = unit_names - linux_excluded
+    unit_cargo_flags = f"{package_args(unit_names)} {target_kinds}".strip() if unit_names else ""
+    linux_unit_cargo_flags = (
+        f"{package_args(linux_unit_names)} {target_kinds}".strip() if linux_unit_names else ""
+    )
+
     has_rust_work = bool(affected) or sed_changed
     return {
         "rust": "true" if affected else "false",
@@ -330,6 +359,7 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
         "clippy": "true" if has_rust_work else "false",
         "ui-clippy": "true" if ui_clippy else "false",
         "test": "true" if has_rust_work else "false",
+        "unit-test": "true" if unit_names else "false",
         "e2e": "true" if e2e else "false",
         "acceptance": "true" if e2e else "false",
         "web_ui": "true" if web_ui else "false",
@@ -338,6 +368,8 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
         "linux-package-args": package_args(n for n in affected if n not in linux_excluded),
         "cargo-flags": cargo_flags,
         "linux-cargo-flags": linux_cargo_flags,
+        "unit-cargo-flags": unit_cargo_flags,
+        "linux-unit-cargo-flags": linux_unit_cargo_flags,
         "ui-args": ui_args,
     }
 
