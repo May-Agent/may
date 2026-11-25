@@ -218,6 +218,14 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["package-args"], "--workspace")
         self.assertEqual(out["linux-package-args"], "--workspace")
         self.assertEqual(out["cargo-flags"], "--workspace --all-targets")
+        self.assertEqual(out["unit-test"], "true")
+        self.assertEqual(
+            out["unit-cargo-flags"], "--workspace --exclude may-agent --all-targets"
+        )
+        self.assertEqual(
+            out["linux-unit-cargo-flags"],
+            "--workspace --exclude may-agent --all-targets",
+        )
         for key in ["fmt", "clippy", "ui-clippy", "test", "e2e", "acceptance", "web_ui"]:
             self.assertEqual(out[key], "true", key)
         self.assertEqual(out["ui-args"], "-p may-agent")
@@ -232,6 +240,10 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["linux-package-args"], "--workspace --exclude may-tui")
         self.assertEqual(
             out["linux-cargo-flags"], "--workspace --exclude may-tui --all-targets"
+        )
+        self.assertEqual(
+            out["linux-unit-cargo-flags"],
+            "--workspace --exclude may-agent --exclude may-tui --all-targets",
         )
         self.assertEqual(out["cargo-flags"], "--workspace --all-targets")
 
@@ -312,6 +324,9 @@ class ComputeTests(unittest.TestCase):
         out = compute(report(affected=["may-agent"], owners={"src/daemon/mod.rs": "may-agent"}))
         self.assertEqual(out["e2e"], "true")
         self.assertEqual(out["cargo-flags"], "-p may-agent --all-targets")
+        self.assertEqual(out["unit-test"], "false")
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
         self.assertEqual(out["ui-clippy"], "true")
 
     def test_client_only_diff_skips_e2e(self):
@@ -332,6 +347,11 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["e2e"], "false")
         self.assertEqual(out["acceptance"], "false")
         self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tui --lib --bins")
+        self.assertEqual(out["unit-test"], "true")
+        self.assertEqual(out["unit-cargo-flags"], "-p may-agent -p may-tui --lib --bins")
+        self.assertEqual(
+            out["linux-unit-cargo-flags"], "-p may-agent -p may-tui --lib --bins"
+        )
         # The ui-carrying crate is in scope, so the embed still gets checked.
         self.assertEqual(out["ui-clippy"], "true")
 
@@ -345,6 +365,8 @@ class ComputeTests(unittest.TestCase):
         )
         self.assertEqual(out["e2e"], "true")
         self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tui --all-targets")
+        self.assertEqual(out["unit-test"], "true")
+        self.assertEqual(out["unit-cargo-flags"], "-p may-tui --all-targets")
 
     def test_client_only_mixed_with_tool_crate_runs_e2e(self):
         out = compute(

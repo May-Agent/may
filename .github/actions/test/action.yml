@@ -1,35 +1,12 @@
-name: Test
-description: Build and test the workspace on the runner it runs on. The check job names are fixed by the ruleset, so each runner has a job of its own around these steps.
+name: Test unit crates
+description: Build and test the workspace unit-test crates on the runner it runs on.
 inputs:
-  run-workspace:
-    description: Whether to build and test the main Cargo workspace.
-    required: false
-    default: 'true'
-  run-sed:
-    description: Whether to build and test the standalone sed/ Cargo workspace.
-    required: false
-    default: 'false'
   cargo-flags:
     description: >
-      Package and target selection flags passed to cargo test --no-run and
-      cargo nextest run — the scope job's `-p <pkg>`/`--workspace` plus the
-      target kinds (`--all-targets` when the e2e gates run, `--lib --bins`
-      when they do not, so a client-only diff never compiles
-      tests/terminal_first_e2e.rs).
+      Package and target selection flags passed to cargo nextest run — the
+      scope job's `unit-cargo-flags` / `linux-unit-cargo-flags`.
     required: false
-    default: '--workspace --all-targets'
-  upload-may:
-    description: Whether to pack and upload target/debug/may as an artifact.
-    required: false
-    default: 'true'
-  verify-baseline-tools:
-    description: Whether to run the ignored baseline tools acceptance test after nextest.
-    required: false
-    default: 'false'
-  upload-e2e-bin:
-    description: Whether to pack and upload the terminal_first_e2e test binary for the container-acceptance job to run without compiling.
-    required: false
-    default: 'false'
+    default: '--workspace --exclude may-agent --all-targets'
 runs:
   using: composite
   steps:
@@ -71,7 +48,6 @@ runs:
     # debug=0 for workspace crates in $CARGO_HOME/config.toml while leaving
     # dependencies at default debuginfo=2 to match stow's public cache.
     - name: Disable debuginfo for workspace packages
-      if: inputs.run-workspace == 'true'
       shell: bash
       run: |
         cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
@@ -81,19 +57,17 @@ runs:
         done
     # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
-      if: inputs.run-workspace == 'true'
       shell: bash
       run: |
         chmod -R u+w target/tmp 2>/dev/null || true
         rm -rf target/tmp
     # The pinned tool artifacts, their prepared runtimes and heel, which the
-    # tests download from GitHub releases on a miss.
+    # sandbox unit tests download from GitHub releases on a miss.
     - id: downloads
-      if: inputs.run-workspace == 'true'
       uses: ./.github/actions/restore-test-downloads
     # rav1e's x86_64 assembly is built with nasm.
     - name: Install nasm
-      if: inputs.run-workspace == 'true' && runner.os == 'Linux' && runner.arch == 'X64'
+      if: runner.os == 'Linux' && runner.arch == 'X64'
       uses: ./.github/actions/install-nasm
     # Build and run in a single `cargo nextest` invocation so Cargo runs once
     # per job (avoiding any cross-step fingerprint or workspace-tree churn).
@@ -101,7 +75,6 @@ runs:
     # ran the suite, so `--no-run` only builds to seed `main`'s stow cache.
     - uses: taiki-e/install-action@nextest
     - name: cargo nextest
-      if: inputs.run-workspace == 'true'
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
@@ -112,83 +85,17 @@ runs:
         else
           cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
         fi
-    - name: cargo nextest (sed)
-      if: inputs.run-sed == 'true'
-      shell: bash
-      run: |
-        ulimit -n 65536 2>/dev/null || true
-        cargo nextest run --locked --manifest-path sed/Cargo.toml --all-targets
-    # Every run keeps the debug may it built, so a commit can be tested on
-    # another machine without building it there. Pack archives into runner.temp
-    # so nothing dirties the repository tree.
-    - name: Pack the debug may
-      if: inputs.upload-may == 'true'
-      shell: bash
-      env:
-        GZIP: '-1'
-      run: tar -czf "${{ runner.temp }}/may-debug.tar.gz" -C target/debug may
-    - name: Upload the debug may
-      if: inputs.upload-may == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: ${{ runner.temp }}/may-debug.tar.gz
-        retention-days: 90
-    - name: Pack the e2e test binary
-      if: inputs.upload-e2e-bin == 'true'
-      shell: bash
-      run: |
-        roots=(target/debug)
-        if [ -d "${HOME}/.stow/build-dir" ]; then
-          roots+=("${HOME}/.stow/build-dir")
-        fi
-        path="$(
-          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
-            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
-            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
-        )"
-        test -n "${path}"
-        tar -czf "${{ runner.temp }}/e2e-test-bin.tar.gz" -C "$(dirname "$path")" "$(basename "$path")"
-    - name: Upload the e2e test binary
-      if: inputs.upload-e2e-bin == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: e2e-test-bin-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: ${{ runner.temp }}/e2e-test-bin.tar.gz
-        retention-days: 30
-    # Invoke the already-built `terminal_first_e2e` binary directly (just as
-    # Container Acceptance does): `cargo nextest -E 'binary(terminal_first_e2e)'`
-    # narrows Cargo's target selection to `--test terminal_first_e2e`, changing
-    # workspace feature unification and paying a full ~9-minute recompile of
-    # may-agent and its codec dependencies at the end of the job.
-    - name: Verify baseline tools
-      if: inputs.verify-baseline-tools == 'true' && (github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true')
-      shell: bash
-      run: |
-        roots=(target/debug)
-        if [ -d "${HOME}/.stow/build-dir" ]; then
-          roots+=("${HOME}/.stow/build-dir")
-        fi
-        bin="$(
-          find "${roots[@]}" -type f -name 'terminal_first_e2e-*' \
-            ! -name '*.d' ! -name '*.o' ! -name '*.rmeta' ! -name '*.rlib' \
-            \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print -quit
-        )"
-        test -n "${bin}"
-        test -x "${PWD}/target/debug/may"
-        CARGO_BIN_EXE_may="${PWD}/target/debug/may" "${bin}" --ignored --exact --nocapture \
-          the_baseline_tools_pass_their_acceptance_script_in_the_sandbox
     - name: Upload cargo timings
-      if: always() && inputs.run-workspace == 'true'
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: cargo-timings-${{ github.job }}
         path: target/cargo-timings/
     - name: Drop test-written shims before saving cache
-      if: success() && inputs.run-workspace == 'true' && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+      if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
       shell: bash
       run: rm -rf "${{ steps.downloads.outputs.tools-path }}"/runtimes/*/shims
-    - if: success() && inputs.run-workspace == 'true' && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+    - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v4
       with:
         path: ${{ steps.downloads.outputs.tools-path }}

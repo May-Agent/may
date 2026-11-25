@@ -1,0 +1,58 @@
+name: Run E2E test shard
+description: Download the prebuilt `may-agent` nextest archive and run one shard without compiling Rust.
+inputs:
+  shard:
+    description: 1-based shard index.
+    required: true
+  total-shards:
+    description: Total number of parallel shards.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Stop a superseded merge group
+      if: github.event_name == 'merge_group'
+      shell: bash
+      run: |
+        if ! git ls-remote --exit-code "https://github.com/${{ github.repository }}" "${{ github.ref }}" > /dev/null; then
+          echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
+          exit 1
+        fi
+    - name: Enable unprivileged user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+    - name: Free runner disk
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo bash -c 'for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+          mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
+        done
+        rm -rf /tmp/gc-* &'
+    - name: Raise macOS open-file limits
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        sudo sysctl -w kern.maxfiles=200000 kern.maxfilesperproc=65536 >/dev/null 2>&1 || true
+        sudo launchctl limit maxfiles 65536 200000 >/dev/null 2>&1 || true
+    - uses: ./.github/actions/restore-test-downloads
+    - name: Download the E2E nextest archive
+      uses: actions/download-artifact@v4
+      with:
+        name: e2e-archive-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        path: ${{ runner.temp }}/e2e-archive
+    - uses: taiki-e/install-action@nextest
+    - name: cargo nextest (shard ${{ inputs.shard }}/${{ inputs.total-shards }})
+      shell: bash
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        extra=()
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          extra+=(--test-threads 6)
+        fi
+        cargo nextest run \
+          "${extra[@]}" \
+          --archive-file "${{ runner.temp }}/e2e-archive/e2e-archive.tar.zst" \
+          --workspace-remap . \
+          --partition "count:${{ inputs.shard }}/${{ inputs.total-shards }}"
