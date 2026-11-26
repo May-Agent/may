@@ -285,6 +285,7 @@ impl ContextSource for BotContextSource {
 struct BotLoopHandle {
     wake_tx: async_channel::Sender<()>,
     stop_tx: async_channel::Sender<()>,
+    done_rx: async_channel::Receiver<()>,
     rebuild_needed: Arc<AtomicBool>,
     run_state: Arc<Mutex<BotRunState>>,
 }
@@ -479,6 +480,23 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Stops every active resident bot loop and waits for each loop task to exit cleanly.
+    pub async fn shutdown(&self) {
+        let handles: Vec<BotLoopHandle> = {
+            let Ok(mut guard) = self.loops.lock() else {
+                return;
+            };
+            guard.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in &handles {
+            let _ = handle.stop_tx.try_send(());
+            handle.stop_tx.close();
+        }
+        for handle in handles {
+            let _ = handle.done_rx.recv().await;
+        }
     }
 
     /// Spawns the background proactive schedule ticker.
@@ -972,6 +990,7 @@ where
             && let Some(handle) = guard.remove(bot_id)
         {
             let _ = handle.stop_tx.try_send(());
+            handle.stop_tx.close();
         }
     }
 
@@ -993,6 +1012,7 @@ where
 
         let (wake_tx, wake_rx) = async_channel::unbounded();
         let (stop_tx, stop_rx) = async_channel::bounded(1);
+        let (done_tx, done_rx) = async_channel::bounded(1);
         let index_dirty = Arc::new(AtomicBool::new(false));
         let rebuild_needed = Arc::new(AtomicBool::new(false));
         let run_state = Arc::new(Mutex::new(BotRunState::Idle));
@@ -1024,6 +1044,7 @@ where
         let handle = BotLoopHandle {
             wake_tx: wake_tx.clone(),
             stop_tx,
+            done_rx,
             rebuild_needed: rebuild_needed.clone(),
             run_state: run_state.clone(),
         };
@@ -1040,6 +1061,7 @@ where
         let bot_id = bot.id.clone();
         let curator_for_loop = curator.clone();
         tokio::spawn(async move {
+            let _done_guard = done_tx;
             this.run_bot_loop(
                 bot_id,
                 paths,
@@ -1089,7 +1111,7 @@ where
         let mut agent: Option<Agent<LLM, BotHooks, LLM>> = None;
 
         loop {
-            if stop_rx.try_recv().is_ok() {
+            if stop_rx.is_closed() || stop_rx.try_recv().is_ok() {
                 break;
             }
 
@@ -1304,6 +1326,10 @@ where
                         .db
                         .upsert_bot_context_snapshot(&bot_id, &cp, &ledger)
                         .await;
+                }
+
+                if stop_rx.is_closed() || stop_rx.try_recv().is_ok() {
+                    break;
                 }
 
                 // Drain any newly arrived inbox entries immediately while keeping

@@ -778,6 +778,7 @@ impl DaemonState {
     pub async fn teardown_all_resources(&self) {
         self.session_prewarms.cancel_all();
         self.parked_agents.evict_all_and_wait().await;
+        self.bot_service.shutdown().await;
         self.services.debug.shutdown_all().await;
         let stopped = self.session_background.teardown_all().await;
         if stopped > 0 {

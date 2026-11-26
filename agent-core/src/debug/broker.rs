@@ -406,14 +406,27 @@ impl DebugBroker {
             .ok_or_else(|| {
                 DebugToolError::request_failed("no active debug session to detach from")
             })?;
-        let target_pid = entry.owned_job.as_ref().map(|j| j.job_pid).or(entry
-            .session
-            .status()
-            .await
-            .ok()
-            .and_then(|s| s.target_pid));
+        let status_before = entry.session.status().await.ok();
+        let target_pid = entry
+            .owned_job
+            .as_ref()
+            .map(|j| j.job_pid)
+            .or_else(|| status_before.as_ref().and_then(|s| s.target_pid));
         // Detach leaves the owning background job running untouched in JobRegistry.
         let _ = entry.session.detach().await;
+        #[cfg(target_os = "macos")]
+        if status_before
+            .as_ref()
+            .is_some_and(|s| s.state == DebugSessionState::Stopped)
+            && let Some(pid) = target_pid
+        {
+            // On XNU, detaching `lldb-dap` while stopped at a breakpoint can leave the
+            // process suspended with `SIGSTOP`; resume it so background jobs keep running.
+            let _ = async_process::Command::new("/bin/kill")
+                .args(["-CONT", &pid.to_string()])
+                .status()
+                .await;
+        }
         Ok(DebugResult::Detached { target_pid })
     }
 
