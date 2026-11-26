@@ -335,6 +335,15 @@ pub struct MayAgentConfig {
     pub session_role: crate::fusion::SessionRole,
     /// Optional parent session grants mirrored into a Fusion companion sidekick.
     pub shared_grants: Option<Grants>,
+    /// Shared session job registry reused across main-agent rebuilds.
+    pub shared_jobs: Option<aither_sandbox::Jobs>,
+    /// Shared session `tui` registry reused across main-agent rebuilds.
+    pub tui_registry: Option<super::tui_tool::TuiRegistry>,
+    /// Reader reporting whether this session currently owns a running managed browser.
+    pub live_browser: Option<super::live_resources::AnyBrowserLiveReader>,
+    /// Additional live-resource providers included in post-compaction recall and
+    /// turn-end unattended checks.
+    pub live_resource_providers: Vec<super::live_resources::AnyLiveResourceProvider>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -430,6 +439,15 @@ pub struct MayAgentSessionInput<'a> {
     pub session_role: crate::fusion::SessionRole,
     /// Optional parent session grants mirrored into a Fusion companion sidekick.
     pub shared_grants: Option<Grants>,
+    /// Shared session job registry reused across main-agent rebuilds.
+    pub shared_jobs: Option<aither_sandbox::Jobs>,
+    /// Shared session `tui` registry reused across main-agent rebuilds.
+    pub tui_registry: Option<super::tui_tool::TuiRegistry>,
+    /// Reader reporting whether this session currently owns a running managed browser.
+    pub live_browser: Option<super::live_resources::AnyBrowserLiveReader>,
+    /// Additional live-resource providers included in post-compaction recall and
+    /// turn-end unattended checks.
+    pub live_resource_providers: Vec<super::live_resources::AnyLiveResourceProvider>,
 }
 
 pub type MayAgentInner = Agent<ProviderLlm, MayHooks, ProviderLlm>;
@@ -1021,6 +1039,7 @@ impl MayAgent {
             },
             pool: Some(pool),
             connectivity: Some(config.connectivity.clone()),
+            jobs: config.shared_jobs.clone(),
         };
         let (sandbox, shared_terminal_commands_res) = futures_util::join!(
             assembly.sandbox(),
@@ -1402,6 +1421,7 @@ impl MayAgent {
                         model_listing: Some(config.model_listing.clone()),
                         services: config.services.clone(),
                         session_role: config.session_role.clone(),
+                        tui_registry: config.tui_registry.clone(),
                     },
                 ))
                 .await?;
@@ -1625,7 +1645,13 @@ impl MayAgent {
                 config.services.checkouts.clone(),
                 config.session_id.as_str(),
             ))
-            .context_source(JobReports::new(job_bridge.clone(), job_facts_tx.clone()));
+            .context_source(JobReports::new(job_bridge.clone(), job_facts_tx.clone()))
+            .context_source(super::live_resources::LiveResourcesContext::new(
+                shell.jobs(),
+                tui_registry.clone(),
+                config.live_browser.clone(),
+                config.live_resource_providers.clone(),
+            ));
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }
@@ -1829,6 +1855,10 @@ impl MayAgent {
             sleep,
             session_role,
             shared_grants,
+            shared_jobs,
+            tui_registry,
+            live_browser,
+            live_resource_providers,
         } = input;
         let providers = super::Providers::new(may_config, &pushed_providers);
         let selector = super::provider::parse_model_selector(model)?;
@@ -2025,6 +2055,10 @@ impl MayAgent {
             sleep,
             session_role,
             shared_grants,
+            shared_jobs,
+            tui_registry,
+            live_browser,
+            live_resource_providers,
         })
     }
 

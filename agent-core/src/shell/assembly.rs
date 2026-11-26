@@ -91,6 +91,9 @@ pub struct ShellAssembly<P> {
     pub pool: Option<JobConnection>,
     /// What tells a connection outage from a failing command.
     pub connectivity: Option<Connectivity>,
+    /// Shared session job registry reused across main-agent rebuilds so running
+    /// PIDs remain reachable; `None` starts a fresh registry.
+    pub jobs: Option<aither_sandbox::Jobs>,
 }
 
 impl<P> ShellAssembly<P>
@@ -132,7 +135,7 @@ where
             Some(_) => Shell::builder(sandbox),
             None => Shell::builder_on_host(sandbox, self.tools.host_launch()?),
         };
-        let builder = builder
+        let mut builder = builder
             .interpreters(self.interpreters)
             .limits(self.budgets.limits())
             .output(self.budgets.output())
@@ -142,6 +145,9 @@ where
             .tools(shell_tool_settings(&self.budgets))
             .policy(ServerApproval::new(sessions.clone()))
             .ipc(CommandBridge::new(commands, self.slot.clone()));
+        if let Some(jobs) = self.jobs {
+            builder = builder.jobs(jobs);
+        }
         let mut shell = self
             .policies
             .apply(builder)

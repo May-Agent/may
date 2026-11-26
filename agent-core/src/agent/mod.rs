@@ -36,6 +36,8 @@ mod keep_warm_tests;
 #[cfg(test)]
 mod live_content_tests;
 mod live_limits;
+/// Live session resource recall across compaction/reassembly and turn-end checks.
+pub mod live_resources;
 
 mod loop_watch;
 mod may;
@@ -98,6 +100,10 @@ pub use job_events::{
     BackgroundWake, DeliveredJobCompletion, JobFact, SessionJobHooks, render_job_ended,
 };
 pub use live_limits::LiveLimits;
+pub use live_resources::{
+    AnyBrowserLiveReader, AnyLiveResourceProvider, BrowserLiveReader, LiveBrowserStatus,
+    LiveResourceProvider, LiveResourceSection, LiveResourcesContext, UnattendedResource,
+};
 pub use loop_watch::LoopLimits;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,

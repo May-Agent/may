@@ -510,6 +510,7 @@ where
                 spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
                 pool: None,
                 connectivity: None,
+                jobs: None,
             };
             let shell = match assembly.build(registry_builder.build()).await {
                 Ok(sh) => sh,

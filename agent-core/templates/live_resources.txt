@@ -1,0 +1,6 @@
+The following live resources belong to this session and are still active after context reassembly:
+{% for section in sections %}
+{{ section.heading }}:
+{% for item in section.items %}- {{ item }}
+{% endfor %}{% endfor %}
+Reuse these live resources instead of launching duplicates, or stop them when they are no longer needed.

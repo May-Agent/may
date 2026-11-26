@@ -75,6 +75,7 @@ impl ParkedAgents {
         agent: MayAgent,
         released: crate::session::RunReleased,
     ) {
+        state.touch_browser_if_owned(session_id);
         // One pending wake is enough: the agent's context holds every event
         // a later wake would add, and the run it starts sees them all.
         let (wakes, wake_rx) = async_channel::bounded(1);
@@ -157,6 +158,20 @@ impl ParkedAgents {
     /// truncation.
     pub async fn evict_and_wait(&self, session_id: &str) {
         let _ = self.take(session_id).await;
+    }
+
+    /// Evicts every parked idle agent and waits for their worker loops to exit.
+    pub async fn evict_all_and_wait(&self) {
+        let workers: Vec<ParkedWorker> = {
+            let mut guard = self.workers();
+            guard.drain().map(|(_, worker)| worker).collect()
+        };
+        futures_util::future::join_all(workers.into_iter().map(|worker| async move {
+            let (reply, agent) = async_channel::bounded(1);
+            worker.release(reply);
+            let _ = agent.recv().await;
+        }))
+        .await;
     }
 
     /// Takes `session_id`'s idle agent for a turn.
@@ -251,6 +266,17 @@ impl SessionPrewarms {
     pub fn cancel(&self, session_id: &str) {
         let handle = self.tasks().remove(session_id);
         if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+
+    /// Aborts every in-flight pre-warm task (used on daemon shutdown).
+    pub fn cancel_all(&self) {
+        let handles: Vec<_> = {
+            let mut tasks = self.tasks();
+            tasks.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in handles {
             handle.abort();
         }
     }
