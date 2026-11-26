@@ -1080,11 +1080,17 @@ async fn fusion_sidekick_blocking_restart_recovery_async_steer_lease_and_usage_r
         roles[1]["keepWarmRequests"].as_u64().unwrap_or(0) >= 1,
         "sidekick keep_warm requests counted: {roles:?}"
     );
-    let lead_reqs = roles[0]["totalRequests"].as_u64().expect("lead reqs");
-    let sidekick_reqs = roles[1]["totalRequests"].as_u64().expect("sidekick reqs");
+    let lead_reqs = roles[0]["requests"].as_u64().expect("lead reqs");
+    let sidekick_reqs = roles[1]["requests"].as_u64().expect("sidekick reqs");
+    let total_model_reqs: u64 = usage["models"]
+        .as_array()
+        .expect("models array")
+        .iter()
+        .map(|row| row["requests"].as_u64().unwrap_or(0))
+        .sum();
     assert_eq!(
-        usage["totalRequests"].as_u64(),
-        Some(lead_reqs + sidekick_reqs),
+        total_model_reqs,
+        lead_reqs + sidekick_reqs,
         "session total aggregates lead + sidekick"
     );
 
