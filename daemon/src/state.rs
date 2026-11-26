@@ -754,12 +754,13 @@ impl DaemonState {
 
     /// Tears down all live in-memory resources owned by `session_id`.
     ///
-    /// Cancels pre-warm tasks, evicts any parked agent, kills session
-    /// background jobs and open `tui` sessions, cancels subagents, and
-    /// releases unheld managed browser ownership.
+    /// Cancels pre-warm tasks, evicts any parked agent, terminates active debug
+    /// sessions, kills session background jobs and open `tui` sessions, cancels
+    /// subagents, and releases unheld managed browser ownership.
     pub async fn teardown_session_resources(&self, session_id: &str) {
         self.session_prewarms.cancel(session_id);
         self.parked_agents.evict_and_wait(session_id).await;
+        self.services.debug.teardown_session(session_id).await;
         let stopped = self.session_background.teardown_session(session_id).await;
         if stopped > 0 {
             tracing::info!(
@@ -771,11 +772,13 @@ impl DaemonState {
         self.release_unheld_browser_for_session(session_id).await;
     }
 
-    /// Tears down every session's live jobs, `tui` sessions, subagents, parked
-    /// agents, and running managed browser during daemon shutdown.
+    /// Tears down every session's active debug sessions, live jobs, `tui`
+    /// sessions, subagents, parked agents, and running managed browser during
+    /// daemon shutdown.
     pub async fn teardown_all_resources(&self) {
         self.session_prewarms.cancel_all();
         self.parked_agents.evict_all_and_wait().await;
+        self.services.debug.shutdown_all().await;
         let stopped = self.session_background.teardown_all().await;
         if stopped > 0 {
             tracing::info!(
@@ -1556,10 +1559,13 @@ impl DaemonState {
             },
         )
         .await?;
-        let manager = Arc::new(crate::container::lifecycle::ContainerManager::new(
-            Arc::new(runtime),
-            self.may_dir.clone(),
-        ));
+        let manager = Arc::new(
+            crate::container::lifecycle::ContainerManager::new(
+                Arc::new(runtime),
+                self.may_dir.clone(),
+            )
+            .with_live_config(self.config.clone()),
+        );
         self.container_manager.store(Some(manager.clone()));
         Ok(manager)
     }

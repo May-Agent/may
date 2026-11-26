@@ -235,6 +235,7 @@ aither-codex = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-core = { git = "https://github.com/May-Agent/aither", branch = "main" }
+aither-dap = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-derive = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-gemini = { git = "https://github.com/May-Agent/aither", branch = "main" }
 aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main" }

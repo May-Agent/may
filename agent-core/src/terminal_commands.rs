@@ -193,6 +193,8 @@ pub struct SharedServices {
     /// working copy and signer is granted here, and `sign-commit` checks
     /// a subagent's working directory against the same set.
     pub signer_roots: crate::commit_signing::SignerRoots,
+    /// Host-brokered structured DAP debugging service shared across all sessions.
+    pub debug: crate::debug::DebugBroker,
     /// Optional daemon-hosted swarm coordination service.
     swarm: Arc<arc_swap::ArcSwapOption<crate::swarm::SwarmService>>,
     /// Optional daemon-hosted Fusion service (pair state, write leases, `sidekick` executor).
@@ -213,6 +215,7 @@ impl SharedServices {
             ),
             forge_auth: crate::forge::LiveForgeAuth::default(),
             signer_roots: crate::commit_signing::SignerRoots::default(),
+            debug: crate::debug::DebugBroker::new(),
             swarm: Arc::new(arc_swap::ArcSwapOption::empty()),
             fusion: Arc::new(arc_swap::ArcSwapOption::empty()),
             bot_approvals: Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -826,16 +829,40 @@ where
         vision_ocr,
         permissions,
     } = config.subagents;
+    let subagent_definitions: std::collections::BTreeMap<
+        String,
+        crate::harness::subagent_file::SubagentDefinition,
+    > = crate::bundle::Bundle::subagent_definitions()
+        .into_iter()
+        .map(|definition| (definition.name.clone(), definition))
+        .collect();
+    let read_only_subagents = crate::debug::tool::read_only_subagent_names(&subagent_definitions);
+
+    describe_arguments::<aither_dap::DebugArgs>(&mut descriptions, "debug");
+    {
+        let debug_broker = config.services.debug.clone();
+        let debug_session_id = config.session_id.clone();
+        let debug_prompts = config.session_prompts.clone();
+        let debug_prior_jobs = prior_jobs.clone();
+        builder.configure_bound_tool("debug", move |binding| {
+            crate::debug::MayDebugTool::for_binding(
+                debug_broker.clone(),
+                debug_session_id.clone(),
+                binding,
+                &read_only_subagents,
+                debug_prompts.clone(),
+                Some(debug_prior_jobs.clone()),
+            )
+        });
+    }
+
     let registry_slot = crate::ipc::RegistrySlot::new();
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
         approvals: config.child_approvals.clone(),
         tiers,
         models: config.subagent_models.clone(),
-        definitions: crate::bundle::Bundle::subagent_definitions()
-            .into_iter()
-            .map(|definition| (definition.name.clone(), definition))
-            .collect(),
+        definitions: subagent_definitions,
         files: {
             let files = PromptFiles::new(
                 config.sandbox_dir.clone(),
@@ -867,6 +894,8 @@ where
         global_agents: Some(
             crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md(),
         ),
+        session_id: config.session_id.clone(),
+        debug_broker: config.services.debug.clone(),
         languages: config.languages.clone(),
         externals,
         work: config.task_events.clone(),

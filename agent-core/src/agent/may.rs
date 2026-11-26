@@ -1646,12 +1646,21 @@ impl MayAgent {
                 config.session_id.as_str(),
             ))
             .context_source(JobReports::new(job_bridge.clone(), job_facts_tx.clone()))
-            .context_source(super::live_resources::LiveResourcesContext::new(
-                shell.jobs(),
-                tui_registry.clone(),
-                config.live_browser.clone(),
-                config.live_resource_providers.clone(),
-            ));
+            .context_source({
+                let mut providers = config.live_resource_providers.clone();
+                providers.push(super::live_resources::AnyLiveResourceProvider::new(
+                    crate::debug::DebugLiveResourceProvider::new(
+                        config.services.debug.clone(),
+                        config.session_id.as_str().to_owned(),
+                    ),
+                ));
+                super::live_resources::LiveResourcesContext::new(
+                    shell.jobs(),
+                    tui_registry.clone(),
+                    config.live_browser.clone(),
+                    providers,
+                )
+            });
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }

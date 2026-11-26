@@ -44,6 +44,8 @@ pub use may_protocol::command_output;
 pub use may_protocol::command_reading;
 /// Container runtime detection, images, and lifecycle.
 pub mod container;
+/// Host-brokered structured Debug Adapter Protocol (DAP) service and `debug` command.
+pub mod debug;
 /// Forge coordinates and per-host authentication (GitHub, GitLab).
 pub use may_config::forge;
 pub use may_config::fs_utils;

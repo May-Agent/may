@@ -56,6 +56,7 @@ aither-skills = { version = "0.31.0", default-features = false }
 aither-codex = { version = "0.31.0", default-features = false }
 aither-models = { version = "0.31.0", default-features = false }
 aither-browser = { version = "0.31.0", default-features = false }
+aither-dap = { version = "0.31.0", default-features = false }
 aither-acp = { version = "0.31.0", default-features = false }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
@@ -160,6 +161,7 @@ may-media = { path = "../media", features = ["testing"] }
 # The `tasks.md` fixtures the session and issue tests build.
 may-harness = { path = "../harness", features = ["testing"] }
 aither-sandbox = { version = "0.31.0", default-features = false, features = ["test-util"] }
+async-net = { version = "2", default-features = false }
 tokio-test = { version = "0.4", default-features = false }
 
 [lints]

@@ -1490,6 +1490,18 @@ pub struct MayConfig {
     /// Experimental, opt-in behavior switches.
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    /// Structured DAP debugger settings.
+    #[serde(default)]
+    pub debug: DebugConfig,
+}
+
+/// `[debug]` section: settings for the structured DAP debugger (`debug`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugConfig {
+    /// Grant `CAP_SYS_PTRACE` to managed workspace containers so native debug
+    /// adapters can attach to in-container processes. Off by default.
+    pub container_ptrace: bool,
 }
 
 const fn default_swarm_mention_wake_limit() -> u32 {
@@ -2326,6 +2338,7 @@ impl Default for MayConfig {
             issue_approval: IssueApprovalConfig::default(),
             forge: BTreeMap::new(),
             experimental: ExperimentalConfig::default(),
+            debug: DebugConfig::default(),
         }
     }
 }

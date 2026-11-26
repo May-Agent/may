@@ -932,6 +932,7 @@ pub async fn delete_all_sessions(
     let db = state.db();
     state.tunnels.remove_all();
     state.local_url_port_mapper.remove_all();
+    state.services.debug.shutdown_all().await;
     // Every live PR outlives its session — mark them `orphaned` first.
     if let Ok(prs) = db.list_prs(None, crate::db::PrFilter::Open).await {
         for pr in prs {

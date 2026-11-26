@@ -1,0 +1,1 @@
+Active debug session (adapter {{ adapter }}{% if let Some(pid) = target_pid %}, target pid {{ pid }}{% endif %}, state {{ state }}).
