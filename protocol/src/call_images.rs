@@ -22,6 +22,10 @@ pub struct RecordedCallImage {
     pub media_type: String,
     /// Human-readable command source label for `<recognized_text>`.
     pub source: String,
+    /// Skip native OCR and downscaling when attaching this image (for example,
+    /// images paired with exact structured text from `tui observe`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_ocr: bool,
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +166,7 @@ mod tests {
             path: PathBuf::from("/tmp/shot.png"),
             media_type: "image/png".to_string(),
             source: "browser screenshot".to_string(),
+            skip_ocr: false,
         };
 
         {
@@ -174,5 +179,32 @@ mod tests {
         // Late recording after scope ended is dropped rather than leaking.
         store.record(&call, vec![img]);
         assert_eq!(store.take(&call), Vec::<RecordedCallImage>::new());
+    }
+
+    #[test]
+    fn skip_ocr_defaults_false_and_round_trips() {
+        let normal = RecordedCallImage {
+            path: PathBuf::from("/tmp/a.png"),
+            media_type: "image/png".to_string(),
+            source: "browser screenshot".to_string(),
+            skip_ocr: false,
+        };
+        let wire = serde_json::to_string(&normal).expect("serialize normal");
+        assert!(!wire.contains("skipOcr"), "{wire}");
+        let decoded: RecordedCallImage = serde_json::from_str(&wire).expect("deserialize normal");
+        assert_eq!(decoded, normal);
+
+        let bypassed = RecordedCallImage {
+            skip_ocr: true,
+            ..normal
+        };
+        let wire_bypassed = serde_json::to_string(&bypassed).expect("serialize bypassed");
+        assert!(
+            wire_bypassed.contains("\"skipOcr\":true"),
+            "{wire_bypassed}"
+        );
+        let decoded_bypassed: RecordedCallImage =
+            serde_json::from_str(&wire_bypassed).expect("deserialize bypassed");
+        assert_eq!(decoded_bypassed, bypassed);
     }
 }

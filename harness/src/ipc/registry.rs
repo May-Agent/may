@@ -417,6 +417,42 @@ where
     )
 }
 
+fn bound_image_entry<T, F>(name: String, bind: F) -> (String, Entry)
+where
+    F: Fn(&Binding<'_>) -> T + Send + Sync + 'static,
+    T: IpcImageTool + Send + Sync + 'static,
+    T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+{
+    let schema = tool_schema::<T::Arguments>();
+    let help = schema_to_help(&schema);
+    let stdin_arg = detect_stdin_arg(&schema);
+    let bound_name = name.clone();
+    let entry_schema = schema.clone();
+    let factory: Factory = Arc::new(move |binding| {
+        let tool = bind(binding);
+        assert_eq!(
+            tool.name(),
+            bound_name,
+            "a bound command keeps the name it was registered under"
+        );
+        tool_handler_with_images(Arc::new(tool), schema.clone(), None, |result| {
+            T::images(result).to_vec()
+        })
+    });
+    (
+        name,
+        Entry {
+            help,
+            schema: Some(entry_schema),
+            stdin_arg,
+            main: factory,
+            main_side: MainSide::Serves,
+            subagent: SubagentSide::Same,
+            modes: Modes::Every,
+        },
+    )
+}
+
 /// A command's help: what it does, then its usage.
 #[derive(Template)]
 #[template(path = "command_help.txt", escape = "none")]
@@ -564,6 +600,22 @@ impl CommandRegistryBuilder {
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
     {
         self.insert_bound(name.into(), bind, None);
+    }
+
+    /// Registers a tool built for each call from the launch's [`Binding`] that
+    /// also returns structured [`RecordedCallImage`] artifacts.
+    ///
+    /// # Panics
+    /// Panics if the argument schema cannot be serialized, and, when a call
+    /// builds the tool, if it is not named `name`.
+    pub fn configure_bound_image_tool<T, F>(&mut self, name: impl Into<String>, bind: F)
+    where
+        F: Fn(&Binding<'_>) -> T + Send + Sync + 'static,
+        T: IpcImageTool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        let (name, entry) = bound_image_entry(name.into(), bind);
+        self.entries.insert(name, entry);
     }
 
     /// Like [`configure_bound_tool`](Self::configure_bound_tool), for a tool
@@ -826,6 +878,60 @@ impl CommandRegistry {
     #[must_use]
     pub fn command_sets(&self) -> &[AnyCommandSet] {
         &self.sets
+    }
+
+    /// Returns a derived registry that replaces `name` with a newly bound
+    /// [`IpcImageTool`], sharing kept-exchange and call-image channels.
+    ///
+    /// # Panics
+    /// Panics if the argument schema cannot be serialized or lays out its
+    /// positional fields invalidly.
+    #[must_use]
+    pub fn replace_bound_image_tool<T, F>(&self, name: impl Into<String>, bind: F) -> Self
+    where
+        F: Fn(&Binding<'_>) -> T + Send + Sync + 'static,
+        T: IpcImageTool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        let mut entries = (*self.entries).clone();
+        let (name, entry) = bound_image_entry(name.into(), bind);
+        entries.insert(name, entry);
+        Self {
+            entries: Arc::new(entries),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a derived registry where calling `name` is refused with `message`.
+    #[must_use]
+    pub fn refuse_command(
+        &self,
+        name: impl Into<String>,
+        help: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut entries = (*self.entries).clone();
+        let message: Arc<str> = Arc::from(message.into());
+        let handler: Handler = Arc::new(move |_caller, _args| {
+            let message = Arc::clone(&message);
+            Box::pin(async move { Err(message.to_string()) })
+        });
+        entries.insert(
+            name.into(),
+            Entry {
+                help: help.into(),
+                schema: None,
+                stdin_arg: None,
+                main: Arc::new(move |_| handler.clone()),
+                main_side: MainSide::Serves,
+                subagent: SubagentSide::Same,
+                modes: Modes::Every,
+            },
+        );
+        Self {
+            entries: Arc::new(entries),
+            ..self.clone()
+        }
     }
 
     fn set_entry(&self, name: &str) -> Option<Entry> {

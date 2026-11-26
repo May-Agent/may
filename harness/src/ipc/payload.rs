@@ -161,6 +161,7 @@ fn push_image_if_image_mime(
             path,
             media_type: mime.to_owned(),
             source: source.to_owned(),
+            skip_ocr: false,
         });
     }
 }

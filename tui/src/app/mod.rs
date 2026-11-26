@@ -7808,6 +7808,7 @@ mod tests {
             output_path: None,
             place: aither_sandbox::JobPlace::Host,
             timeout: None,
+            pty: false,
         }
     }
 

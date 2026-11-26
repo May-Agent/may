@@ -1,0 +1,9 @@
+The attached image is the current terminal screen ({{ cols }}x{{ rows }} cells, generation {{ generation }}, {{ screen_kind }} screen{% if let Some(title) = title %}, title {{ title }}{% endif %}).
+Cursor: ({{ cursor_col }}, {{ cursor_row }}), {% if cursor_visible %}visible{% else %}hidden{% endif %}.
+Active modes: {% if active_modes.is_empty() %}default{% else %}{% for mode in active_modes %}{% if !loop.first %}, {% endif %}{{ mode }}{% endfor %}{% endif %}.
+{% if !panes.is_empty() %}Panes:
+{% for pane in panes %}{{ pane.reference }} pane{% if let Some(title) = pane.title %} {{ title }}{% endif %} bounds=({{ pane.bounds.col }}, {{ pane.bounds.row }} {{ pane.bounds.width }}x{{ pane.bounds.height }}) center=({{ pane.center.0 }}, {{ pane.center.1 }})
+{% endfor %}{% endif %}{% if !elements.is_empty() %}Highlighted elements (references hold until generation {{ generation }} advances):
+{% for element in elements %}{{ element.reference }} {{ element.kind }} {{ element.label }} at ({{ element.center.0 }}, {{ element.center.1 }})
+{% endfor %}{% endif %}{% if panes.is_empty() && elements.is_empty() %}No box-drawing panes or highlighted selections were detected on the current screen.
+{% endif %}

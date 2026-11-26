@@ -292,6 +292,11 @@ pub struct SharedTerminalCommands {
     /// Earlier shells' job handles kept across main-agent rebuilds while
     /// retained pipeline stages remain within their retention window.
     pub prior_jobs: crate::agent::pipe_tool::PriorJobs,
+    /// Session-scoped registry of open `tui` PTY sessions.
+    pub tui_registry: crate::agent::tui_tool::TuiRegistry,
+    /// Finalized registry slot bound once `CommandRegistryBuilder::build`
+    /// completes so subagent shells derive scoped IPC bridges.
+    pub registry_slot: crate::ipc::RegistrySlot,
 }
 
 /// Why the shared terminal commands could not be registered.
@@ -716,6 +721,21 @@ where
         });
     }
 
+    let tui_registry = crate::agent::tui_tool::TuiRegistry::new();
+    describe_arguments::<crate::agent::tui_tool::TuiArgs>(&mut descriptions, "tui");
+    {
+        let tui_registry = tui_registry.clone();
+        let timeout_cap = config.timeout_cap.clone();
+        builder.configure_bound_image_tool("tui", move |binding| {
+            crate::agent::tui_tool::TuiTool::new(
+                binding.shell.cloned(),
+                binding.launch.clone(),
+                tui_registry.clone(),
+                timeout_cap.clone(),
+            )
+        });
+    }
+
     if !is_sidekick {
         describe_arguments::<crate::agent::serve_tool::ServeArgs>(&mut descriptions, "serve");
         let session_id = config.session_id.clone();
@@ -803,6 +823,7 @@ where
         vision_ocr,
         permissions,
     } = config.subagents;
+    let registry_slot = crate::ipc::RegistrySlot::new();
     let subagent_service = SubagentService::new(SubagentSettings {
         tracker: config.subagent_tracker,
         approvals: config.child_approvals.clone(),
@@ -857,6 +878,8 @@ where
         keep_alive,
         call_images: Some(builder.call_images()),
         vision_ocr,
+        registry: registry_slot.clone(),
+        timeout_cap: config.timeout_cap.clone(),
     });
     if !is_sidekick {
         describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
@@ -928,6 +951,8 @@ where
         fork_source,
         fork_launcher,
         prior_jobs,
+        tui_registry,
+        registry_slot,
     })
 }
 

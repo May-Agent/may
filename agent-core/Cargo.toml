@@ -114,6 +114,11 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # Clipboard, image, and browser
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Virtual terminal emulation and cell rasterization for `tui`.
+vte = { version = "0.15.0", default-features = false, features = ["std"] }
+unicode-width = { version = "0.2.3", default-features = false }
+fontdb = { version = "0.24.0", default-features = false, features = ["std", "fs", "memmap", "fontconfig"] }
+swash = { version = "0.2.10", default-features = false, features = ["std", "scale", "render"] }
 
 # HTTP client for fetching images and streaming provider calls.
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }

@@ -142,6 +142,7 @@ pub use may_harness::tasks_md;
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.
 pub mod terminal_permission_handler;
+pub mod tui_driver;
 /// Event bus publishing UI-facing state changes.
 pub use may_client::ui_event_bus;
 /// HTTP/SSE server backing the web UI.

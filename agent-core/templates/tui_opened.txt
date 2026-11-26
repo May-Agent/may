@@ -1,0 +1,3 @@
+Opened TUI session with PID {{ pid }} ({{ cols }}x{{ rows }} cells).
+{{ observation }}
+Use `tui observe {{ pid }}`, `tui text {{ pid }}`, `tui key {{ pid }} ...`, `tui type {{ pid }} ...`, `tui click {{ pid }} ...`, `tui resize {{ pid }} ...`, or `kill {{ pid }}` to stop it.

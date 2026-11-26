@@ -488,6 +488,7 @@ mod tests {
                     path: screenshot_path,
                     media_type: "image/png".to_owned(),
                     source: "computer screenshot".to_owned(),
+                    skip_ocr: false,
                 },
             })
             .hooks(hooks)

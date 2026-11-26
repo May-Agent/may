@@ -65,6 +65,7 @@ mod tests {
             output_path: None,
             place: JobPlace::Host,
             timeout,
+            pty: false,
         }
     }
 
