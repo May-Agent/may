@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -542,6 +542,7 @@ impl DebugBroker {
             .map_err(|err| DebugToolError::request_failed(err.to_string()))?;
 
         let script = build_native_launch_script(
+            kind,
             &params.program,
             &params.args,
             effective_cwd.as_deref(),
@@ -555,14 +556,11 @@ impl DebugBroker {
         )
         .await?;
         let job_pid = job.pid();
-        let host_root_pid = if ctx.launch_mode == SandboxMode::Unsandboxed {
+        let host_attach_pid = if ctx.launch_mode == SandboxMode::Unsandboxed {
             job_pid
         } else {
             resolve_sandbox_to_host_pid(Some(&shell), job_pid).await
         };
-        let host_attach_pid = resolve_debuggee_pid(host_root_pid).await;
-        let resolved_program =
-            resolve_launch_program_path(&params.program, effective_cwd.as_deref()).await;
 
         let (transport, adapter_kill) = spawn_host_stdio_adapter(&resolved)?;
         let config = DebugSessionConfig::new(resolved.kind.adapter_id())
@@ -586,10 +584,8 @@ impl DebugBroker {
         let mut outcome = match attach_launched_native_target(
             &session,
             resolved.kind,
-            adapter_kill.pid,
             &job,
             host_attach_pid,
-            &resolved_program,
             params.timeout,
         )
         .await
@@ -1032,20 +1028,24 @@ async fn kill_direct_child_processes(parent_pid: u32) {
 }
 
 #[cfg(target_os = "macos")]
-async fn wait_for_macos_debugserver_ready(adapter_pid: u32, max_wait: Duration) {
+async fn wait_for_macos_process_stopped(target_pid: u32, max_wait: Duration) {
     let deadline = Instant::now() + max_wait;
     while Instant::now() < deadline {
-        let children = list_child_processes(adapter_pid).await;
-        if children
-            .iter()
-            .any(|(_, comm)| comm.contains("debugserver"))
-        {
-            // Allow `$vAttachWait` to finish snapshotting existing processes before
-            // releasing the gated debuggee into `exec`.
-            async_io::Timer::after(Duration::from_millis(80)).await;
+        let Ok(out) = async_process::Command::new("/bin/ps")
+            .args(["-o", "state=", "-p", &target_pid.to_string()])
+            .output()
+            .await
+        else {
+            return;
+        };
+        if !out.status.success() {
             return;
         }
-        async_io::Timer::after(Duration::from_millis(25)).await;
+        let state = String::from_utf8_lossy(&out.stdout);
+        if state.trim().starts_with('T') {
+            return;
+        }
+        async_io::Timer::after(Duration::from_millis(15)).await;
     }
 }
 
@@ -1241,7 +1241,11 @@ fn native_attach_payload(kind: AdapterKind, pid: u32) -> serde_json::Value {
     }
 }
 
+#[cfg(target_os = "macos")]
+const MACOS_SUSPENDED_SPAWN_PY: &str = include_str!("macos_spawn_suspended.py");
+
 fn build_native_launch_script(
+    kind: AdapterKind,
     program: &str,
     args: &[String],
     cwd: Option<&str>,
@@ -1253,9 +1257,6 @@ fn build_native_launch_script(
     {
         parts.push(format!("cd {}", shell_escape::escape(Cow::Borrowed(dir))));
     }
-    // Gate `exec` on stdin so short-lived targets never run and exit before the
-    // host debug adapter completes initialization and prepares to catch entry.
-    parts.push("{ IFS= read -r _ || true; }".to_owned());
 
     let mut exec_tokens = Vec::new();
     for kv in env {
@@ -1265,6 +1266,32 @@ fn build_native_launch_script(
             exec_tokens.push(format!("{k}={}", shell_escape::escape(Cow::Borrowed(v))));
         }
     }
+
+    #[cfg(target_os = "macos")]
+    if kind == AdapterKind::LldbDap {
+        // On XNU, `POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED` replaces the
+        // shell in-place (`job_pid` unchanged) with `<program>` kernel-halted at
+        // `_dyld_start`, avoiding SIP `/bin/bash` attach restrictions and eliminating
+        // user-space `waitFor` polling races under heavy CPU load.
+        exec_tokens.push("exec".to_owned());
+        exec_tokens.push("python3".to_owned());
+        exec_tokens.push("-c".to_owned());
+        exec_tokens
+            .push(shell_escape::escape(Cow::Borrowed(MACOS_SUSPENDED_SPAWN_PY)).into_owned());
+        exec_tokens.push(shell_escape::escape(Cow::Borrowed(program)).into_owned());
+        for arg in args {
+            exec_tokens.push(shell_escape::escape(Cow::Borrowed(arg.as_str())).into_owned());
+        }
+        parts.push(exec_tokens.join(" "));
+        return parts.join(" && ");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = kind;
+
+    // Gate `exec` on stdin so short-lived targets never run and exit before the
+    // host debug adapter completes initialization and prepares to catch entry.
+    parts.push("{ IFS= read -r _ || true; }".to_owned());
     exec_tokens.push("exec".to_owned());
     exec_tokens.push(shell_escape::escape(Cow::Borrowed(program)).into_owned());
     for arg in args {
@@ -1274,55 +1301,28 @@ fn build_native_launch_script(
     parts.join(" && ")
 }
 
-async fn resolve_launch_program_path(program: &str, cwd: Option<&str>) -> PathBuf {
-    let candidate = Path::new(program);
-    let joined = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else if let Some(dir) = cwd
-        && !dir.trim().is_empty()
-    {
-        Path::new(dir).join(candidate)
-    } else {
-        candidate.to_path_buf()
-    };
-    async_fs::canonicalize(&joined).await.unwrap_or(joined)
-}
-
 async fn attach_launched_native_target(
     session: &DebugSession,
     kind: AdapterKind,
-    adapter_pid: u32,
     job: &Job,
     job_pid: u32,
-    resolved_program: &Path,
     timeout: Duration,
 ) -> Result<ExecutionOutcome, DapError> {
     let handshake_timeout = timeout.max(Duration::from_secs(5));
 
     #[cfg(target_os = "macos")]
     if kind == AdapterKind::LldbDap {
-        let release_job = job.clone();
-        let max_wait = handshake_timeout
-            .saturating_sub(Duration::from_secs(1))
-            .max(Duration::from_secs(2));
-        tokio::spawn(async move {
-            wait_for_macos_debugserver_ready(adapter_pid, max_wait).await;
-            let _ = release_job.input(b"\n".to_vec()).await;
-        });
+        wait_for_macos_process_stopped(job_pid, handshake_timeout).await;
         return session
             .attach(
                 json!({
-                    "program": resolved_program.display().to_string(),
-                    "waitFor": true,
+                    "pid": job_pid,
                     "stopOnEntry": true,
                 }),
                 handshake_timeout,
             )
             .await;
     }
-
-    #[cfg(not(target_os = "macos"))]
-    let _ = (adapter_pid, resolved_program);
 
     let attach_args = match kind {
         AdapterKind::DelveDap => native_attach_payload(kind, job_pid),
