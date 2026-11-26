@@ -1402,10 +1402,13 @@ impl DaemonState {
             },
         )
         .await?;
-        let manager = Arc::new(crate::container::lifecycle::ContainerManager::new(
-            Arc::new(runtime),
-            self.may_dir.clone(),
-        ));
+        let manager = Arc::new(
+            crate::container::lifecycle::ContainerManager::new(
+                Arc::new(runtime),
+                self.may_dir.clone(),
+            )
+            .with_live_config(self.config.clone()),
+        );
         self.container_manager.store(Some(manager.clone()));
         Ok(manager)
     }

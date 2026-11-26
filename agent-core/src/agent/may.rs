@@ -1528,6 +1528,10 @@ impl MayAgent {
                 swarm_seen.clone(),
             ));
         }
+        builder = builder.context_source(crate::debug::DebugLiveContext::new(
+            config.services.debug.clone(),
+            config.session_id.as_str().to_owned(),
+        ));
         builder = builder.context_source(document);
         if let Some(compaction) = config.compaction_llm.clone() {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);

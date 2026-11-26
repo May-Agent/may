@@ -85,6 +85,7 @@ async fn sweep_once(
         crate::panic_boundary::round("archive", archive_idle(&state.db(), before, held)).await?;
     if let Ok(archived) = &swept {
         for session_id in archived {
+            state.services.debug.teardown_session(session_id).await;
             state.parked_agents.evict(session_id);
         }
     }

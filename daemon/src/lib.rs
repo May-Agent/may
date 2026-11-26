@@ -717,6 +717,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    state.services.debug.shutdown_all().await;
     // The next daemon tells this stop from an unexpected exit by this record.
     state
         .db()

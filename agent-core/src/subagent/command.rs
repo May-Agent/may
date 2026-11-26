@@ -159,6 +159,10 @@ pub struct SubagentSettings<LLM> {
     pub git: crate::host_git::HostGit,
     /// Where the global `AGENTS.md` is read for a named subagent.
     pub global_agents: Option<PathBuf>,
+    /// Session ID owning subagent runs (used for scoped debug teardown).
+    pub session_id: String,
+    /// Host debug broker torn down per writable subagent when its run ends.
+    pub debug_broker: crate::debug::DebugBroker,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -1023,6 +1027,12 @@ impl<LLM: LanguageModel + 'static> Finish<LLM> {
             .work
             .record(WorkEvent::SubagentFinished(self.name.clone()));
         if let Body::Agent(session) = &held.body {
+            let debug_owner = crate::debug::tool::debug_owner_for_identity(
+                settings.session_id.clone(),
+                Some(session.identity()),
+                || self.name.clone(),
+            );
+            settings.debug_broker.teardown_owner(&debug_owner).await;
             let stopped = session.stop_jobs().await;
             if stopped > 0 {
                 tracing::info!(subagent = %self.name, stopped, "Stopped background jobs left by a subagent");

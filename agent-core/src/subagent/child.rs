@@ -278,6 +278,12 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             .collect()
     }
 
+    /// Identity of the child agent.
+    #[must_use]
+    pub const fn identity(&self) -> &aither_core::llm::AgentIdentity {
+        self.agent.identity()
+    }
+
     /// Stops the jobs the agent left running.
     pub async fn stop_jobs(&self) -> usize {
         self.shell.jobs().kill_all().await

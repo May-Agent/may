@@ -131,6 +131,7 @@ pub async fn start(
     .await;
     let connectivity = connectivity.context("failed to start the connectivity monitor")?;
     let config = config.context("Failed to load config")?;
+    let live_config = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
     let tool_distribution = Arc::new(
         crate::tools::embedded_distribution().context("embedded tool distribution is invalid")?,
     );
@@ -143,7 +144,8 @@ pub async fn start(
                 crate::container::lifecycle::ContainerManager::new(
                     Arc::new(runtime),
                     may_dir.clone(),
-                ),
+                )
+                .with_live_config(live_config.clone()),
             ))
         }
         Err(e) => {
@@ -276,7 +278,7 @@ pub async fn start(
 
     let live_limits = crate::agent::LiveLimits::of(&config);
     let forge_auth = crate::forge::LiveForgeAuth::new(&config);
-    let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
+    let config = live_config;
     // Each extraction resolves its models when it runs, so a model
     // configured or pushed later is used.
     let memory_processor = Some(crate::memory::MemoryProcessor::new(

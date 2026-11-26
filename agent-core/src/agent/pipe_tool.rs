@@ -35,6 +35,12 @@ impl PriorJobs {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Returns a snapshot of the retained prior-shell [`Jobs`] handles.
+    #[must_use]
+    pub fn handles(&self) -> Vec<Jobs> {
+        self.snapshot()
+    }
 }
 
 /// Read or list retained stages of a multi-stage pipeline by its `PID`.

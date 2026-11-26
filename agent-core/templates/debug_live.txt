@@ -1,0 +1,1 @@
+Active debug session: adapter {{ adapter }}{% if let Some(pid) = target_pid %}, target pid {{ pid }}{% endif %}{% if let Some(target) = target %}, target {{ target }}{% endif %}, state {{ state }}{% if let Some(loc) = stop_location %}, stopped at {{ loc }}{% endif %}. Use `debug status` to inspect or `debug detach` / `debug terminate` when finished.

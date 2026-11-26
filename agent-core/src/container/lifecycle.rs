@@ -66,6 +66,8 @@ struct SpecFingerprintPayload<'a> {
     name: &'a str,
     rev: &'a str,
     workspace: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    allow_ptrace: bool,
 }
 
 /// Manages container lifecycle for profile-based isolation.
@@ -75,6 +77,8 @@ pub struct ContainerManager {
     may_dir: PathBuf,
     /// Last activity timestamp per container ID.
     activity: Arc<ArcSwap<HashMap<String, Instant>>>,
+    /// Live configuration checked for opt-in container capabilities (such as `CAP_SYS_PTRACE`).
+    live_config: Option<Arc<ArcSwap<crate::config::MayConfig>>>,
 }
 
 impl ContainerManager {
@@ -86,7 +90,22 @@ impl ContainerManager {
             runtime,
             may_dir,
             activity: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            live_config: None,
         }
+    }
+
+    /// Attaches live May configuration so opt-in container capabilities
+    /// (such as `[debug] container_ptrace`) apply without restarting the daemon.
+    #[must_use]
+    pub fn with_live_config(mut self, live_config: Arc<ArcSwap<crate::config::MayConfig>>) -> Self {
+        self.live_config = Some(live_config);
+        self
+    }
+
+    fn allow_ptrace(&self) -> bool {
+        self.live_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.load().debug.container_ptrace)
     }
 
     /// Get the underlying runtime.
@@ -114,7 +133,9 @@ impl ContainerManager {
 
         let host_gateway = self.runtime.host_gateway().to_string();
         let shared_paths = self.ensure_shared_paths().await?;
-        let spec_fingerprint = Self::compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
+        let allow_ptrace = self.allow_ptrace();
+        let spec_fingerprint =
+            Self::compute_spec_fingerprint(spec, &host_gateway, &shared_paths, allow_ptrace)?;
 
         if let Some(container) = self.find_container_by_name(spec.name.as_str()).await? {
             let id = container
@@ -276,10 +297,12 @@ impl ContainerManager {
         let env = Self::effective_env(spec, host_gateway);
         let mounts = Self::effective_mounts(spec, shared_paths);
 
+        let allow_ptrace = self.allow_ptrace();
         let host_config = HostConfig {
             mounts: Some(mounts),
             // Add host.docker.internal / host.containers.internal
             extra_hosts: Some(vec![format!("{host_gateway}:host-gateway")]),
+            cap_add: allow_ptrace.then(|| vec!["SYS_PTRACE".to_string()]),
             ..Default::default()
         };
 
@@ -417,6 +440,7 @@ impl ContainerManager {
         spec: &ContainerLaunchSpec,
         host_gateway: &str,
         shared_paths: &SharedHostPaths,
+        allow_ptrace: bool,
     ) -> Result<String, ContainerError> {
         let mut env = Self::effective_env(spec, host_gateway);
         env.sort_unstable();
@@ -444,6 +468,7 @@ impl ContainerManager {
             name: &spec.name,
             rev: SPEC_FINGERPRINT_REVISION,
             workspace: spec.workspace.display().to_string(),
+            allow_ptrace,
         })
         .map_err(|error| {
             ContainerError::Bootstrap(format!(
@@ -749,9 +774,30 @@ mod tests {
         let mut second = first.clone();
         second.memories_dir = "/managed/memories-2".into();
         assert_ne!(
-            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &first)
-                .unwrap(),
-            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &second)
+            ContainerManager::compute_spec_fingerprint(
+                &spec,
+                "host.docker.internal",
+                &first,
+                false
+            )
+            .unwrap(),
+            ContainerManager::compute_spec_fingerprint(
+                &spec,
+                "host.docker.internal",
+                &second,
+                false
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            ContainerManager::compute_spec_fingerprint(
+                &spec,
+                "host.docker.internal",
+                &first,
+                false
+            )
+            .unwrap(),
+            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &first, true)
                 .unwrap()
         );
     }

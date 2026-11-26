@@ -827,6 +827,7 @@ pub async fn delete_session(
         .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
     state.session_prewarms.cancel(&id);
+    state.services.debug.teardown_session(&id).await;
     state.parked_agents.evict(&id);
     // After the eviction, whose dropped agent sessions start closing: the
     // host waits for those closes before it ends the rest and removes the
@@ -873,6 +874,7 @@ pub async fn delete_all_sessions(
     let db = state.db();
     state.tunnels.remove_all();
     state.local_url_port_mapper.remove_all();
+    state.services.debug.shutdown_all().await;
     // Every live PR outlives its session — mark them `orphaned` first.
     if let Ok(prs) = db.list_prs(None, crate::db::PrFilter::Open).await {
         for pr in prs {
@@ -1127,6 +1129,7 @@ pub async fn patch_session(
             if archived {
                 db.archive_session(&id).await.map_err(internal_error)?;
                 state.session_prewarms.cancel(&id);
+                state.services.debug.teardown_session(&id).await;
                 state.parked_agents.evict(&id);
             } else {
                 db.unarchive_session(&id).await.map_err(internal_error)?;
