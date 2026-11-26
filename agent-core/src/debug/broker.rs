@@ -481,6 +481,12 @@ impl DebugBroker {
         )
         .await?;
         let job_pid = job.pid();
+        let host_root_pid = if ctx.launch_mode == SandboxMode::Unsandboxed {
+            job_pid
+        } else {
+            resolve_sandbox_to_host_pid(Some(&shell), job_pid).await
+        };
+        let host_attach_pid = resolve_debuggee_pid(host_root_pid).await;
         let resolved_program =
             resolve_launch_program_path(&params.program, effective_cwd.as_deref()).await;
 
@@ -505,7 +511,7 @@ impl DebugBroker {
             &session,
             resolved.kind,
             &job,
-            job_pid,
+            host_attach_pid,
             &resolved_program,
             params.timeout,
         )
@@ -629,10 +635,14 @@ impl DebugBroker {
     ) -> Result<DebugResult, DebugToolError> {
         self.ensure_no_active_session(&ctx.owner).await?;
 
-        // Look up the real PID in JobRegistry (and prior shells across rebuilds) so
-        // `detach` preserves it and `terminate` kills it through `Jobs`.
+        // Look up the PID in JobRegistry (and prior shells across rebuilds) so
+        // `detach` preserves it and `terminate` kills it through `Jobs`, then map
+        // Linux `heel` nested-PID-namespace IDs to their real host OS PID for the
+        // host debug adapter.
         let owned_job = lookup_owned_job(ctx.shell.as_ref(), ctx.prior_jobs.as_ref(), pid).await;
-        let attach_pid = resolve_debuggee_pid(pid).await;
+        let host_root_pid = resolve_sandbox_to_host_pid(ctx.shell.as_ref(), pid).await;
+        let attach_pid = resolve_debuggee_pid(host_root_pid).await;
+        let reported_pid = owned_job.as_ref().map_or(attach_pid, |j| j.job_pid);
         let comm = inspect_process_comm(attach_pid).await;
 
         let kind = select_adapter_for_attach(comm.as_deref(), adapter.as_deref())
@@ -643,8 +653,8 @@ impl DebugBroker {
 
         let transport = spawn_host_stdio_adapter(&resolved)?;
         let config = DebugSessionConfig::new(resolved.kind.adapter_id())
-            .with_target(format!("pid:{attach_pid}"))
-            .with_target_pid(attach_pid);
+            .with_target(format!("pid:{reported_pid}"))
+            .with_target_pid(reported_pid);
         let (session, notif_rx) = DebugSession::start(&TokioGlobal, transport, config)
             .await
             .map_err(|err| {
@@ -660,7 +670,7 @@ impl DebugBroker {
             Err(err) => {
                 let _ = session.detach().await;
                 return Err(DebugToolError::request_failed(format!(
-                    "failed to attach {} to pid {attach_pid}: {err}",
+                    "failed to attach {} to pid {reported_pid} (host pid {attach_pid}): {err}",
                     resolved.kind.adapter_id()
                 )));
             }
@@ -669,7 +679,9 @@ impl DebugBroker {
         self.install_session(ctx.owner, session, owned_job, notif_rx, ctx.session_prompts)
             .await;
 
-        Ok(outcome.into_result(format!("Attached to pid {attach_pid}; target is running.")))
+        Ok(outcome.into_result(format!(
+            "Attached to pid {reported_pid}; target is running."
+        )))
     }
 
     async fn handle_connect(
@@ -859,6 +871,43 @@ async fn lookup_owned_job(
         }
     }
     None
+}
+
+/// Maps a PID inside the session's `heel` execution environment (`Job::pid()`)
+/// to its host root-namespace OS PID so host-spawned native debug adapters attach
+/// to the real debuggee rather than an unrelated host process on Linux nested PID
+/// namespaces.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+async fn resolve_sandbox_to_host_pid(shell: Option<&SessionShell>, sandbox_pid: u32) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        use futures_lite::StreamExt;
+
+        let Some(shell) = shell else {
+            return sandbox_pid;
+        };
+        let Ok(mut entries) = async_fs::read_dir("/proc").await else {
+            return sandbox_pid;
+        };
+        while let Some(Ok(entry)) = entries.next().await {
+            let name = entry.file_name();
+            let Some(host_pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if matches!(
+                shell.sandbox().pid_in_sandbox(host_pid).await,
+                Ok(Some(inner_pid)) if inner_pid == sandbox_pid
+            ) {
+                return host_pid;
+            }
+        }
+        sandbox_pid
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = shell;
+        sandbox_pid
+    }
 }
 
 /// Maximum bytes read from `JobRegistry` stdout per `debug output` call.
