@@ -1459,6 +1459,28 @@ const fn default_swarm_read_limit() -> usize {
     50
 }
 
+/// Default execution mode configured under `[experimental] execution_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultExecutionMode {
+    /// Default direct execution.
+    #[default]
+    Standard,
+    /// Prompt-driven subagent delegation to keep the main context lean.
+    Orchestrator,
+}
+
+impl DefaultExecutionMode {
+    /// Resolves this config default into a session [`may_protocol::execution_mode::ExecutionMode`].
+    #[must_use]
+    pub const fn to_execution_mode(self) -> may_protocol::execution_mode::ExecutionMode {
+        match self {
+            Self::Standard => may_protocol::execution_mode::ExecutionMode::Standard,
+            Self::Orchestrator => may_protocol::execution_mode::ExecutionMode::Orchestrator,
+        }
+    }
+}
+
 /// `[experimental]` section: features that are opt-in and may change shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1466,6 +1488,9 @@ pub struct ExperimentalConfig {
     /// Hashline search and editing: `search`/`edit` binaries on PATH,
     /// `apply_patch` absent, and semantic search answered by `rag`.
     pub hashline: bool,
+    /// Default execution mode for newly created sessions (`standard` or `orchestrator`).
+    #[serde(default)]
+    pub execution_mode: DefaultExecutionMode,
     /// Per-worktree coordination board, `@mention` wakeups and PR notifications
     /// when more than one working session shares a checkout.
     pub swarm: bool,
@@ -1478,10 +1503,19 @@ pub struct ExperimentalConfig {
     pub swarm_read_limit: usize,
 }
 
+impl ExperimentalConfig {
+    /// Default session [`may_protocol::execution_mode::ExecutionMode`] applied to new sessions.
+    #[must_use]
+    pub const fn default_execution_mode(&self) -> may_protocol::execution_mode::ExecutionMode {
+        self.execution_mode.to_execution_mode()
+    }
+}
+
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             hashline: false,
+            execution_mode: DefaultExecutionMode::Standard,
             swarm: false,
             swarm_mention_wake_limit: default_swarm_mention_wake_limit(),
             swarm_read_limit: default_swarm_read_limit(),

@@ -4464,6 +4464,7 @@ impl App {
             SlashCommand::Quit => self.request_quit(),
             SlashCommand::Compact => Some(SendAction::Compact(None)),
             SlashCommand::Recap => Some(SendAction::Recap),
+            SlashCommand::Orchestrator => Some(SendAction::ToggleOrchestrator),
             SlashCommand::Yolo => Some(SendAction::ToggleYolo),
             SlashCommand::MemoryOff => Some(SendAction::MemoryOff),
             SlashCommand::Sleep => Some(SendAction::Sleep),
@@ -5706,6 +5707,8 @@ pub enum SendAction {
     EnqueuePending(PendingMessage),
     /// Ask the daemon for a catch-up recap of the session.
     Recap,
+    /// Flip the session's orchestrator execution mode.
+    ToggleOrchestrator,
     /// Flip the session's yolo switch.
     ToggleYolo,
     /// Turn memory off for the rest of this session (`/memory off`).

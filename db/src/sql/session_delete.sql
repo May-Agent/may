@@ -22,6 +22,7 @@ DELETE FROM session_daemon_exit_alerts WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_rewind_alerts WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_prompt_watermarks WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_plans WHERE ? IS NULL OR session_id = ?;
+DELETE FROM session_execution_modes WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_yolo WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_memory WHERE ? IS NULL OR session_id = ?;
 DELETE FROM message_tool_cards WHERE ? IS NULL OR session_id = ?;

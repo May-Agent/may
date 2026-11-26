@@ -29,6 +29,7 @@ pub enum SlashCommand {
     Rewind,
     Jobs,
     Questions,
+    Orchestrator,
     Yolo,
     MemoryOff,
     Sleep,
@@ -86,6 +87,7 @@ impl SlashCommand {
         Self::Rewind,
         Self::Jobs,
         Self::Questions,
+        Self::Orchestrator,
         Self::Yolo,
         Self::MemoryOff,
         Self::Sleep,
@@ -145,6 +147,11 @@ impl SlashCommand {
             ),
             Self::Jobs => ("/jobs", "", "Background jobs and running subagents"),
             Self::Questions => ("/questions", "", "Answer the questions the agent left open"),
+            Self::Orchestrator => (
+                "/orchestrator",
+                "",
+                "Toggle experimental orchestrator mode for this session",
+            ),
             Self::Yolo => (
                 "/yolo",
                 "",

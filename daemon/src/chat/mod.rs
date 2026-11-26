@@ -3652,6 +3652,7 @@ pub struct SessionContext {
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_id: Option<String>,
     plan_state: crate::session::SessionPlanState,
+    execution_mode: crate::session::ExecutionMode,
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
 
@@ -4349,6 +4350,7 @@ pub async fn resolve_session_context(
         profile_environment,
         profile_id: session.profile_id,
         plan_state: runtime.plan_state,
+        execution_mode: runtime.execution_mode,
         reasoning_effort,
     })
 }
@@ -4929,6 +4931,7 @@ fn prepare_agent_for_request_with_stages<'a>(
                         profile_memories: ctx.profile_memories.as_ref(),
                         memory_off: ctx.memory_off,
                         plan_state: ctx.plan_state,
+                        execution_mode: ctx.execution_mode.clone(),
                         location: location.as_ref(),
                         cwd: &ctx.cwd,
                         ssh_servers: &ssh_servers,
@@ -5080,6 +5083,7 @@ fn build_session_agent<'a>(
                 profile_memories: ctx.profile_memories.clone(),
                 memory_off: ctx.memory_off,
                 plan_state: ctx.plan_state,
+                execution_mode: ctx.execution_mode.clone(),
                 location,
                 task_broker: Some(brokers.task),
                 session_prompts: Some(state.session_prompts.clone()),

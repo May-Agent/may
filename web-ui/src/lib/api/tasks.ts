@@ -1,6 +1,7 @@
 import { apiGet, apiPatch, apiPut } from './client';
 import type {
   ApiSession,
+  ExecutionMode,
   SessionTasksPayload,
   SessionPlanState,
 } from '../types';
@@ -24,6 +25,12 @@ export function putSessionPlanState(
   planState: SessionPlanState,
 ): Promise<ApiSession> {
   return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { planState });
+}
+export function putSessionExecutionMode(
+  sessionId: string,
+  executionMode: ExecutionMode,
+): Promise<ApiSession> {
+  return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { executionMode });
 }
 export function putSessionYolo(sessionId: string, yolo: boolean): Promise<ApiSession> {
   return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { yolo });

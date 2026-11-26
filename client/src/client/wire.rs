@@ -435,6 +435,9 @@ pub struct SessionRuntimeSnapshot {
     pub state: may_protocol::session_runtime::SessionRuntimeState,
     /// Plan-mode state.
     pub plan_state: may_protocol::session_plan::SessionPlanState,
+    /// Execution mode for the session, orthogonal to `plan_state`.
+    #[serde(default)]
+    pub execution_mode: may_protocol::execution_mode::ExecutionMode,
     /// Yolo switch: every approval request is granted at once.
     #[serde(default)]
     pub yolo: bool,
@@ -471,6 +474,7 @@ impl Default for SessionRuntimeSnapshot {
         Self {
             state: may_protocol::session_runtime::SessionRuntimeState::Idle,
             plan_state: may_protocol::session_plan::SessionPlanState::Disabled,
+            execution_mode: may_protocol::execution_mode::ExecutionMode::Standard,
             yolo: false,
             memory_off: false,
             interactions: SessionInteractionSnapshot::default(),
@@ -581,6 +585,9 @@ pub struct CreateSessionRequest {
     /// machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud: Option<crate::daemon::types::CloudSessionRequest>,
+    /// Execution mode override; absent uses `[experimental] execution_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<may_protocol::execution_mode::ExecutionMode>,
 }
 
 /// `PUT /api/sessions/{id}` request body.
@@ -608,6 +615,9 @@ pub struct UpdateSessionRequest {
     /// Turn memory off for the rest of the session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_off: Option<bool>,
+    /// New execution mode for the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<may_protocol::execution_mode::ExecutionMode>,
 }
 
 /// `POST /api/sessions/{id}/rewind` request body.

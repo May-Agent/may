@@ -2318,6 +2318,8 @@ pub struct StatusContext<'a> {
     pub queue_count: usize,
     /// Questions the agent asked that wait for an answer.
     pub open_questions: usize,
+    /// Session execution mode (`Standard` or `Orchestrator`).
+    pub execution_mode: may_protocol::execution_mode::ExecutionMode,
     /// The session grants every approval request without asking.
     pub yolo: bool,
     /// Memory is disabled for the rest of this session.
@@ -4387,6 +4389,10 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
 
     if ctx.queue_count > 0 {
         parts.push(format!("Q:{}", ctx.queue_count));
+    }
+
+    if ctx.execution_mode.is_orchestrator() {
+        parts.push("orchestrator · /orchestrator".to_string());
     }
 
     if ctx.yolo {
@@ -6621,6 +6627,7 @@ mod tests {
                             context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
+                            execution_mode: may_protocol::execution_mode::ExecutionMode::Standard,
                             yolo: false,
                             memory_off: false,
                             shells: 0,
@@ -8659,6 +8666,7 @@ mod tests {
                             context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
+                            execution_mode: may_protocol::execution_mode::ExecutionMode::Standard,
                             yolo: false,
                             memory_off: false,
                             shells: 0,
@@ -8957,6 +8965,7 @@ mod tests {
             context_policy: aither_agent::ContextPolicy::default(),
             queue_count: 0,
             open_questions: 0,
+            execution_mode: may_protocol::execution_mode::ExecutionMode::Standard,
             yolo: false,
             memory_off: false,
             shells: 0,
@@ -9003,6 +9012,7 @@ mod tests {
             context_policy: aither_agent::ContextPolicy::default(),
             queue_count: 0,
             open_questions: 0,
+            execution_mode: may_protocol::execution_mode::ExecutionMode::Standard,
             yolo: false,
             memory_off: false,
             shells: 0,
