@@ -550,18 +550,141 @@ impl ChatDb {
         mode: &ExecutionMode,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let sidekick_model: Option<&str> = None;
+        let sidekick_model = mode.sidekick_model().map(ToString::to_string);
         query!(
             self.db,
             "INSERT INTO session_execution_modes (session_id, mode, sidekick_model, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET mode = excluded.mode, sidekick_model = excluded.sidekick_model, updated_at = excluded.updated_at",
             session_id,
             mode.as_str(),
-            sidekick_model,
+            sidekick_model.as_deref(),
             now.as_str()
         )
         .execute()
         .await?;
         self.load_session_runtime_summary(session_id).await
+    }
+
+    /// Link a hidden companion session to `parent_session_id` under `role`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn link_companion_session(
+        &self,
+        session_id: &str,
+        parent_session_id: &str,
+        role: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_companions (session_id, parent_session_id, role, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET parent_session_id = excluded.parent_session_id, role = excluded.role",
+            session_id,
+            parent_session_id,
+            role,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Return the companion session id linked to `parent_session_id` under `role`, if any.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn companion_session_for(
+        &self,
+        parent_session_id: &str,
+        role: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT session_id FROM session_companions WHERE parent_session_id = ? AND role = ? ORDER BY created_at ASC LIMIT 1",
+            parent_session_id,
+            role
+        )
+        .fetch_optional::<SessionIdRow>()
+        .await?
+        .map(|row| row.session_id))
+    }
+
+    /// Return all companion session rows linked to `parent_session_id`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn companion_sessions_for(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<crate::entity::session_companions::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_companions WHERE parent_session_id = ? ORDER BY created_at ASC",
+            parent_session_id
+        )
+        .fetch_all::<crate::entity::session_companions::Model>()
+        .await?)
+    }
+
+    /// Return the companion link row when `session_id` is a hidden companion session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn parent_session_of(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::entity::session_companions::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_companions WHERE session_id = ? LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<crate::entity::session_companions::Model>()
+        .await?)
+    }
+
+    /// Return the oldest pending approval timestamp (`session_pending_permissions`,
+    /// `session_pending_workspace`, or blocking `ask_user`) for `session_id`, if any.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn oldest_pending_approval_created_at(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT MIN(created_at) AS value FROM (
+                SELECT created_at FROM session_pending_permissions WHERE session_id = ?
+                UNION ALL
+                SELECT created_at FROM session_pending_workspace WHERE session_id = ?
+                UNION ALL
+                SELECT created_at FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1
+            )",
+            session_id,
+            session_id,
+            session_id
+        )
+        .fetch_optional::<crate::common::OptionalStringValueRow>()
+        .await?;
+        Ok(row.and_then(|row| row.value))
+    }
+
+    /// Return the newest open `ask_user` timestamp (blocking or non-blocking) for `session_id`, if any.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn newest_open_ask_user_created_at(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT MAX(created_at) AS value FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<crate::common::OptionalStringValueRow>()
+        .await?;
+        Ok(row.and_then(|row| row.value))
     }
 
     async fn session_yolo_row(
@@ -1807,11 +1930,15 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Delete a session and every row that belongs to it, in one transaction.
+    /// Delete a session, its hidden companion sessions, and every row that belongs to them.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn delete_session(&self, id: &str) -> Result<(), ChatDbError> {
+        let companions = self.companion_sessions_for(id).await?;
+        for companion in companions {
+            self.delete_sessions(Some(&companion.session_id)).await?;
+        }
         self.delete_sessions(Some(id)).await?;
         Ok(())
     }
@@ -1838,15 +1965,18 @@ impl ChatDb {
         Ok(sessions)
     }
 
-    /// List all sessions ordered by `updated_at` descending.
+    /// List all user-facing sessions (omitting hidden companion sessions) ordered by `updated_at` descending.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn list_sessions(&self) -> Result<Vec<sessions::Model>, ChatDbError> {
         Ok(
-            query!(self.db, "SELECT * FROM sessions ORDER BY updated_at DESC")
-                .fetch_all::<sessions::Model>()
-                .await?,
+            query!(
+                self.db,
+                "SELECT * FROM sessions WHERE NOT EXISTS (SELECT 1 FROM session_companions sc WHERE sc.session_id = sessions.id) ORDER BY updated_at DESC"
+            )
+            .fetch_all::<sessions::Model>()
+            .await?,
         )
     }
 

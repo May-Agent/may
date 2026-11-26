@@ -29,6 +29,7 @@ pub enum SlashCommand {
     Jobs,
     Questions,
     Orchestrator,
+    Fusion,
     Yolo,
     MemoryOff,
     Sleep,
@@ -65,7 +66,7 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; if cfg!(feature = "ui") { 40 } else { 39 }] = [
+    pub const ALL: [Self; if cfg!(feature = "ui") { 41 } else { 40 }] = [
         Self::Help,
         Self::Session,
         Self::Archive,
@@ -86,6 +87,7 @@ impl SlashCommand {
         Self::Jobs,
         Self::Questions,
         Self::Orchestrator,
+        Self::Fusion,
         Self::Yolo,
         Self::MemoryOff,
         Self::Sleep,
@@ -148,6 +150,11 @@ impl SlashCommand {
                 "/orchestrator",
                 "",
                 "Toggle experimental orchestrator mode for this session",
+            ),
+            Self::Fusion => (
+                "/fusion",
+                "[provider::model|off]",
+                "Toggle experimental fusion mode (frontier lead + persistent sidekick)",
             ),
             Self::Yolo => (
                 "/yolo",

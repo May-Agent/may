@@ -6085,6 +6085,7 @@ dependencies = [
  "serde_yml",
  "sha2 0.11.1",
  "shell-escape",
+ "similar 3.2.1",
  "skyzen",
  "skyzen-core",
  "smol-hyper",

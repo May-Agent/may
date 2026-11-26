@@ -86,6 +86,12 @@ async fn sweep_once(
     if let Ok(archived) = &swept {
         for session_id in archived {
             state.parked_agents.evict(session_id);
+            if let Ok(companions) = state.db().companion_sessions_for(session_id).await {
+                for companion in companions {
+                    state.session_prewarms.cancel(&companion.session_id);
+                    state.parked_agents.evict(&companion.session_id);
+                }
+            }
         }
     }
     Some(swept)

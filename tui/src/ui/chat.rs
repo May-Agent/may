@@ -2735,6 +2735,33 @@ fn usage_report_lines(
             Span::styled(format_cost_usd(cost), value),
         ]));
     }
+    if !report.roles.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("By role", dim));
+        for role in &report.roles {
+            let cost_suffix = role
+                .cost_usd
+                .map_or_else(String::new, |cost| format!("  {}", format_cost_usd(cost)));
+            let keep_warm_suffix = if role.keep_warm_requests > 0 {
+                format!(" ({} keep-warm)", role.keep_warm_requests)
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<9}", role.role), value),
+                Span::styled(
+                    format!(
+                        "{} req{keep_warm_suffix}  in {}  out {}  hit {:.0}%{cost_suffix}",
+                        role.requests,
+                        compact_count(role.prompt_tokens),
+                        compact_count(role.completion_tokens),
+                        role.cache_hit_rate * 100.0,
+                    ),
+                    dim,
+                ),
+            ]));
+        }
+    }
     for model in &report.models {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -2888,6 +2915,67 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
             dim,
         ),
     ]));
+    for companion in &report.roles {
+        let pct = if companion.report.window_tokens > 0 {
+            companion.report.used_tokens as f64 / companion.report.window_tokens as f64 * 100.0
+        } else {
+            0.0
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("◆ Companion ({})", companion.role),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  {} ({})",
+                    companion.report.model_id, companion.report.provider_id
+                ),
+                dim,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "  {}/{}",
+                    format_number(companion.report.used_tokens),
+                    format_number(companion.report.window_tokens)
+                ),
+                value_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" tokens ({pct:.0}%, estimated)"), dim),
+        ]));
+    }
+    if !report.role_usage.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Role usage", dim));
+        for role in &report.role_usage {
+            let cost_suffix = role
+                .cost_usd
+                .map_or_else(String::new, |cost| format!("  {}", format_cost_usd(cost)));
+            let keep_warm_suffix = if role.keep_warm_requests > 0 {
+                format!(" ({} keep-warm)", role.keep_warm_requests)
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<9}", role.role), value_style),
+                Span::styled(
+                    format!(
+                        "{} req{keep_warm_suffix}  in {}  out {}  hit {:.0}%{cost_suffix}",
+                        role.requests,
+                        compact_count(role.prompt_tokens),
+                        compact_count(role.completion_tokens),
+                        role.cache_hit_rate * 100.0,
+                    ),
+                    dim,
+                ),
+            ]));
+        }
+    }
     lines.push(Line::from(vec![Span::styled(
         format!(
             "  compaction starts at {} · pauses at {}",
@@ -4391,8 +4479,14 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push(format!("Q:{}", ctx.queue_count));
     }
 
-    if ctx.execution_mode.is_orchestrator() {
-        parts.push("orchestrator · /orchestrator".to_string());
+    match &ctx.execution_mode {
+        may_protocol::execution_mode::ExecutionMode::Standard => {}
+        may_protocol::execution_mode::ExecutionMode::Orchestrator => {
+            parts.push("orchestrator · /orchestrator".to_string());
+        }
+        may_protocol::execution_mode::ExecutionMode::Fusion { sidekick_model } => {
+            parts.push(format!("fusion ({sidekick_model}) · /fusion"));
+        }
     }
 
     if ctx.yolo {
@@ -5943,6 +6037,7 @@ mod tests {
             },
             total_cost_usd: None,
             models: Vec::new(),
+            roles: Vec::new(),
             cache_miss_causes: Vec::new(),
             recent_cache_misses: Vec::new(),
         };
@@ -5996,6 +6091,7 @@ mod tests {
                 cost_usd: None,
                 keep_warm_requests: 1,
             }],
+            roles: Vec::new(),
             cache_miss_causes: vec![
                 may_protocol::cache_miss::CacheMissCauseRow {
                     cause: CacheMissCause::Expired,

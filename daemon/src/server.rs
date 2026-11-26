@@ -395,6 +395,11 @@ pub async fn start(
     )
     .with_transport(super::swarm_peers::DaemonSwarmTransport::new(state.clone()));
     state.services.set_swarm(swarm.clone());
+    state
+        .services
+        .set_fusion(super::daemon_fusion::DaemonSidekickExecutor::service(
+            state.clone(),
+        ));
     if let Err(error) = swarm.reconcile().await {
         tracing::warn!(%error, "failed initial swarm board reconciliation");
     }

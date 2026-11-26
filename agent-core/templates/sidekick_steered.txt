@@ -1,0 +1,1 @@
+Queued steer for the running sidekick turn; it will be applied at the next turn boundary without aborting in-progress work.

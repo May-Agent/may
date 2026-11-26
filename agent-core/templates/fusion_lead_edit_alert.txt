@@ -1,0 +1,3 @@
+<fusion_workspace_edit_reminder>
+Direct workspace edits detected ({{ changed_count }} path{% if changed_count != 1 %}s{% endif %}: {{ sample_paths }}). In Fusion mode, delegate routine implementation and verification to `sidekick` rather than editing workspace repository files directly, reserving direct edits for correctness-critical work (queries, metrics, evaluation harnesses, rubrics, or pipeline/model config).
+</fusion_workspace_edit_reminder>

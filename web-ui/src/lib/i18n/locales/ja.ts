@@ -705,8 +705,13 @@ export const ja: Messages = {
     failed: 'Yoloを変更できませんでした: {message}',
   },
   executionMode: {
+    standardLabel: '標準',
     orchestratorLabel: 'オーケストレーター',
     orchestratorDescription: '実作業をサブエージェントに委譲してメインコンテキストを小さく保つ',
+    fusionLabel: 'フュージョン',
+    fusionDescription: 'フロンティアリードと永続キャッシュ保温サイドキックを組み合わせる',
+    sidekickModelLabel: 'サイドキックモデル',
+    fusionNeedsModel: 'フュージョンモードを有効にする前にモデルを設定してください',
     failed: '実行モードを変更できませんでした: {message}',
   },
   memoryToggle: {

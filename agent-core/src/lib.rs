@@ -7,6 +7,8 @@
 pub mod agent;
 /// Main agents on one machine discover each other and exchange messages.
 pub mod agent_link;
+/// Experimental Fusion mode: frontier lead paired with a persistent cache-warm sidekick.
+pub mod fusion;
 /// Experimental per-worktree coordination board, `@mention` wakeups and PR alerts.
 pub mod swarm;
 /// Persistent storage for OAuth credentials.

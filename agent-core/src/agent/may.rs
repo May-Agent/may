@@ -28,10 +28,11 @@ use super::provider::{ModelSlot, ProviderLlm, resolve_provider_runtime};
 use super::runtime_context::{
     RepoCloneEntry, RuntimeSystemContext, build_agents_md_blocks, build_browser_context,
     build_capabilities, build_commands, build_efficiency, build_environment, build_evidence,
-    build_harness, build_identity, build_languages, build_orchestrator_mode_context,
-    build_permissions, build_plan_mode_context, build_prepared_tools, build_profile_memories,
-    build_profile_persona, build_repo_clones_context, build_session, build_subagent_instructions,
-    build_terminal, build_time, build_work, build_workspace_workdirs_context, tag,
+    build_fusion_lead_context, build_fusion_sidekick_context, build_harness, build_identity,
+    build_languages, build_orchestrator_mode_context, build_permissions, build_plan_mode_context,
+    build_prepared_tools, build_profile_memories, build_profile_persona, build_repo_clones_context,
+    build_session, build_subagent_instructions, build_terminal, build_time, build_work,
+    build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -330,6 +331,10 @@ pub struct MayAgentConfig {
     pub services: crate::terminal_commands::SharedServices,
     /// Daemon-wide sleep state observed by the session's sleep context source.
     pub sleep: Option<Arc<crate::sleep::SleepState>>,
+    /// Whether this agent runs as a normal user session or a hidden Fusion companion.
+    pub session_role: crate::fusion::SessionRole,
+    /// Optional parent session grants mirrored into a Fusion companion sidekick.
+    pub shared_grants: Option<Grants>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -421,6 +426,10 @@ pub struct MayAgentSessionInput<'a> {
     pub model_context_window: Option<u32>,
     /// Daemon-wide sleep state observed before each request.
     pub sleep: Option<Arc<crate::sleep::SleepState>>,
+    /// Whether this agent runs as a normal user session or a hidden Fusion companion.
+    pub session_role: crate::fusion::SessionRole,
+    /// Optional parent session grants mirrored into a Fusion companion sidekick.
+    pub shared_grants: Option<Grants>,
 }
 
 pub type MayAgentInner = Agent<ProviderLlm, MayHooks, ProviderLlm>;
@@ -504,6 +513,53 @@ pub struct MayAgent {
     /// This agent's entry among the daemon's btw fork hosts, while it is the
     /// session's agent.
     _fork_registration: Option<crate::agent_link::ForkRegistration>,
+    /// Database handle for Fusion keep-warm wait lookups.
+    db: ChatDb,
+    /// Live configuration for reading live-configurable Fusion grace windows.
+    live_config: Option<Arc<arc_swap::ArcSwap<MayConfig>>>,
+    /// Whether this agent is a main user session or a hidden Fusion companion sidekick.
+    session_role: crate::fusion::SessionRole,
+    /// Current live execution mode of this session.
+    execution_mode: crate::session::ExecutionMode,
+    /// Shared Fusion lead/sidekick pair state when hosted by a daemon.
+    fusion_pair: Option<Arc<crate::fusion::FusionPairState>>,
+    /// Workspace mutation tracker for lead `terminal` calls in Fusion mode.
+    edit_tracker: Option<crate::fusion::WorkspaceEditTracker>,
+    /// Parent session grants mirrored into a Fusion companion sidekick across turns.
+    shared_grants: Option<Grants>,
+}
+
+/// Effective prompt-cache lifetime for a session: Fusion lead and sidekick use
+/// a 1-hour retention window unless the backend's cache is permanent.
+const fn effective_cache_lifetime(
+    advertised: crate::cache_lifetime::CacheLifetime,
+    is_fusion: bool,
+) -> crate::cache_lifetime::CacheLifetime {
+    if is_fusion && matches!(advertised, crate::cache_lifetime::CacheLifetime::Limited(_)) {
+        crate::cache_lifetime::CacheLifetime::Limited(std::time::Duration::from_hours(1))
+    } else {
+        advertised
+    }
+}
+
+/// Mirrors the parent session's repository clones and external workspace grants
+/// into a companion sidekick while keeping the parent's sandbox scratch files
+/// and `$MAY_TASKS` isolated.
+fn mirror_parent_grants(grants: &Grants, parent_sandbox: &Path, shared: Option<&Grants>) {
+    grants.add_writable(parent_sandbox.join("repos"));
+    if let Some(shared) = shared {
+        let snapshot = shared.snapshot();
+        for path in &snapshot.readable {
+            if !path.starts_with(parent_sandbox) {
+                grants.add_readable(path);
+            }
+        }
+        for path in &snapshot.writable {
+            if !path.starts_with(parent_sandbox) {
+                grants.add_writable(path);
+            }
+        }
+    }
 }
 
 /// The prompt cache of `session_id`'s agent resumed at `epoch`: the one
@@ -677,9 +733,17 @@ impl MayAgent {
             .map_or_else(crate::config::MayConfig::default, |live| {
                 (**live.load()).clone()
             });
+        let repos_root = config
+            .session_role
+            .parent_sandbox_dir()
+            .unwrap_or(&config.sandbox_dir);
+        let repos_session_id = config
+            .session_role
+            .parent_session_id()
+            .unwrap_or(&config.session_id);
         let session_repos = crate::repo_clone::SessionRepos::new(
-            session_paths.root(),
-            config.session_id.as_str(),
+            repos_root,
+            repos_session_id.as_str(),
             config.db.clone(),
         )
         .with_may_config(may_config.clone())
@@ -756,6 +820,9 @@ impl MayAgent {
             &skills_dir,
             &[],
         );
+        if let Some(parent_sandbox) = config.session_role.parent_sandbox_dir() {
+            mirror_parent_grants(&grants, parent_sandbox, config.shared_grants.as_ref());
+        }
 
         let call_interpreters = super::hooks::CallInterpreters::default();
         // Every wait on the user holds the same pause: a command's own
@@ -815,6 +882,49 @@ impl MayAgent {
                 runtime.refused_reads()
             });
         let read_epochs = FileReadEpochs::default();
+        let fusion_pair = config
+            .services
+            .fusion()
+            .map(|fusion| match &config.session_role {
+                crate::fusion::SessionRole::Main => {
+                    fusion.pairs().for_parent(config.session_id.as_str())
+                }
+                crate::fusion::SessionRole::FusionSidekick {
+                    parent_session_id, ..
+                } => fusion
+                    .pairs()
+                    .link_companion(parent_session_id.as_str(), config.session_id.as_str()),
+            });
+        let (write_lease, edit_tracker) = if config.session_role.is_sidekick() {
+            (None, None)
+        } else {
+            let tasks_path = session_paths.tasks_path();
+            let (lease, tracker) = if let Some(pair) = &fusion_pair {
+                pair.set_execution_mode(config.execution_mode.clone());
+                let lease = pair.write_lease(&config.sandbox_dir, &tasks_path);
+                let tracker = pair.edit_tracker(config.sandbox_dir.clone(), tasks_path);
+                (lease, tracker)
+            } else {
+                let lease = crate::command_policy::WorkspaceWriteLease::new(
+                    &config.sandbox_dir,
+                    &tasks_path,
+                );
+                let tracker = crate::fusion::WorkspaceEditTracker::new(
+                    config.sandbox_dir.clone(),
+                    tasks_path,
+                    lease.clone(),
+                    config.execution_mode.is_fusion(),
+                );
+                (lease, tracker)
+            };
+            let extra_roots = workspace
+                .writable_dirs()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            tracker.set_extra_roots(extra_roots);
+            (Some(lease), Some(tracker))
+        };
         let budgets = config.limits.shell();
         let assembly = ShellAssembly {
             tools: tools.clone(),
@@ -870,6 +980,7 @@ impl MayAgent {
                     db: crate::command_policy::AnyCheckoutReadStore::new(config.db.clone()),
                     session_id: config.session_id.as_str().to_string(),
                 }),
+                write_lease,
             },
             slot: ShellSlot::new(),
             ssh_servers,
@@ -1264,6 +1375,7 @@ impl MayAgent {
                         subagent_models: config.subagent_models.clone(),
                         model_listing: Some(config.model_listing.clone()),
                         services: config.services.clone(),
+                        session_role: config.session_role.clone(),
                     },
                 ))
                 .await?;
@@ -1310,6 +1422,13 @@ impl MayAgent {
         ) = shared_terminal_commands_res?;
         let registry = commands.build();
         let shell = assembly.build_on(sandbox, registry.clone()).await?;
+        if let Some(pair) = &fusion_pair {
+            if config.session_role.is_sidekick() {
+                pair.set_sidekick_jobs(shell.jobs());
+            } else {
+                pair.set_lead_jobs(shell.jobs());
+            }
+        }
         // A side request forks the agent before it has run any bound command.
         shared_terminal_commands.fork_launcher.set(&shell);
 
@@ -1396,6 +1515,7 @@ impl MayAgent {
             call_images: registry.call_images(),
             outputs_dir: shell.output_store().dir().to_path_buf(),
             kept: super::hooks::KeptCalls::new(registry.kept_receiver()),
+            edit_tracker: edit_tracker.clone(),
         };
         let effective_max_iterations = if config.max_iterations == 0 {
             usize::MAX
@@ -1596,6 +1716,13 @@ impl MayAgent {
             read_epochs,
             runtime_context_fresh: true,
             _fork_registration: fork_registration,
+            db: config.db,
+            live_config: config.live_config,
+            session_role: config.session_role,
+            execution_mode: config.execution_mode,
+            fusion_pair,
+            edit_tracker,
+            shared_grants: config.shared_grants,
         })
     }
 
@@ -1667,6 +1794,8 @@ impl MayAgent {
             services,
             model_context_window,
             sleep,
+            session_role,
+            shared_grants,
         } = input;
         let providers = super::Providers::new(may_config, &pushed_providers);
         let selector = super::provider::parse_model_selector(model)?;
@@ -1723,12 +1852,18 @@ impl MayAgent {
             ),
         )
         .await?;
-        let cache_lifetime = providers
+        let advertised_cache_lifetime = providers
             .get(&provider_id)
             .map(|provider| provider.instance.cache_lifetime)
             .ok_or_else(|| {
                 MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
             })?;
+        // Fusion mode configures a 1-hour cache lifetime (and matching 1h provider
+        // TTL where supported), skipping permanent-cache backends.
+        let cache_lifetime = effective_cache_lifetime(
+            advertised_cache_lifetime,
+            execution_mode.is_fusion() || session_role.is_sidekick(),
+        );
         let subagent_models = {
             let may_config = Arc::new(may_config.clone());
             let pushed_providers = pushed_providers.clone();
@@ -1855,6 +1990,8 @@ impl MayAgent {
             limits,
             services,
             sleep,
+            session_role,
+            shared_grants,
         })
     }
 
@@ -1866,6 +2003,9 @@ impl MayAgent {
     ) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
         self.loops.begin_run();
+        if let Some(tracker) = &self.edit_tracker {
+            tracker.begin_turn();
+        }
         MayRun::new(self.inner.run(prompt, attachments), self.watch.clone())
     }
 
@@ -1892,6 +2032,9 @@ impl MayAgent {
     pub fn resume(&mut self) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
         self.loops.begin_run();
+        if let Some(tracker) = &self.edit_tracker {
+            tracker.begin_turn();
+        }
         MayRun::new(self.inner.resume(), self.watch.clone())
     }
 
@@ -2274,6 +2417,12 @@ impl MayAgent {
         self.shell.jobs().kill_all().await
     }
 
+    /// Names of the terminal IPC commands registered on this agent.
+    #[must_use]
+    pub fn named_commands(&self) -> &[String] {
+        &self.named_commands
+    }
+
     /// Exports the agent's restart-safe checkpoint.
     ///
     /// # Errors
@@ -2294,18 +2443,42 @@ impl MayAgent {
         self.inner.idle_compaction_due_in()
     }
 
-    /// How long from now the idle agent's cache entry is to be refreshed, or
-    /// `None` when no refresh is due: the entry is cold or permanent, or
-    /// every running background job ends before it cools. See
-    /// [`super::keep_warm::refresh_in`].
-    pub async fn keep_warm_due_in(&self) -> Option<std::time::Duration> {
+    /// Planned idle prompt-cache keep-warm timing for this agent.
+    ///
+    /// In Fusion mode (for both lead and companion sidekick), this evaluates the
+    /// unified pair predicate shared across both agents; non-Fusion sessions keep
+    /// the standard detached-job economics check.
+    pub async fn keep_warm_plan(&self) -> crate::fusion::KeepWarmPlan {
         let aither_agent::context::CacheLifetime::Limited(lifetime) = self.inner.cache_lifetime()
         else {
-            return None;
+            return crate::fusion::KeepWarmPlan::default();
         };
-        let cold_in = self.inner.cache_warmth().cold_in()?;
+        let Some(cold_in) = self.inner.cache_warmth().cold_in() else {
+            return crate::fusion::KeepWarmPlan::default();
+        };
+        if (self.execution_mode.is_fusion() || self.session_role.is_sidekick())
+            && let Some(pair) = &self.fusion_pair
+        {
+            let grace = self
+                .live_config
+                .as_ref()
+                .map_or(std::time::Duration::from_mins(15), |cfg| {
+                    cfg.load().experimental.fusion_keep_warm_grace
+                });
+            return pair
+                .evaluate_plan(
+                    &self.db,
+                    jiff::Timestamp::now().as_millisecond(),
+                    grace,
+                    Some(cold_in),
+                    lifetime,
+                )
+                .await;
+        }
         let jobs = self.shell.jobs().list().await;
-        let due = super::keep_warm::refresh_in(Some(cold_in), lifetime, &jobs)?;
+        let Some(due) = super::keep_warm::refresh_in(Some(cold_in), lifetime, &jobs) else {
+            return crate::fusion::KeepWarmPlan::default();
+        };
         // A running job that outlives the entry is a near-certain
         // continuation; refresh only when it still pays for itself.
         if self
@@ -2313,9 +2486,24 @@ impl MayAgent {
             .keep_warm_economics(1.0)
             .is_some_and(|economics| !economics.warm)
         {
-            return None;
+            return crate::fusion::KeepWarmPlan::default();
         }
-        Some(due)
+        crate::fusion::KeepWarmPlan {
+            refresh_in: Some(due),
+            recheck_in: None,
+        }
+    }
+
+    /// Shared Fusion pair state handle when this agent belongs to a Fusion pair.
+    #[must_use]
+    pub fn fusion_pair_handle(&self) -> Option<Arc<crate::fusion::FusionPairState>> {
+        self.fusion_pair.clone()
+    }
+
+    /// How long from now the idle agent's cache entry is to be refreshed, or
+    /// `None` when no refresh is due.
+    pub async fn keep_warm_due_in(&self) -> Option<std::time::Duration> {
+        self.keep_warm_plan().await.refresh_in
     }
 
     /// Refreshes the idle agent's cache entry with a one-token request whose
@@ -2563,11 +2751,15 @@ impl MayAgent {
             .get(&self.provider_id)
             .map(|provider| provider.instance.cache_lifetime)
         {
-            let lifetime: aither_agent::context::CacheLifetime = advertised.into();
+            let effective = effective_cache_lifetime(
+                advertised,
+                self.session_role.is_sidekick() || input.execution_mode.is_fusion(),
+            );
+            let lifetime: aither_agent::context::CacheLifetime = effective.into();
             if self.inner.cache_lifetime() != lifetime {
                 self.inner.set_cache_lifetime(lifetime);
             }
-            let ttl = advertised.claude_ttl();
+            let ttl = effective.claude_ttl();
             if self.inner.claude_cache_ttl() != ttl {
                 self.inner.set_claude_cache_ttl(ttl);
             }
@@ -2590,6 +2782,9 @@ impl MayAgent {
             &self.skills_dir,
             &self.readonly_checkouts,
         );
+        if let Some(parent_sandbox) = self.session_role.parent_sandbox_dir() {
+            mirror_parent_grants(&self.grants, parent_sandbox, self.shared_grants.as_ref());
+        }
         self.inner
             .set_restore_roots(crate::shell::shell_restore_roots(&self.shell));
         if !matches!(self.environment, AgentEnvironment::Container { .. }) {
@@ -2643,12 +2838,37 @@ impl MayAgent {
             .and_then(build_profile_memories);
         self.runtime_system_context
             .set_profile_memories(profile_memories);
+        let execution_mode_changed = self.execution_mode != input.execution_mode;
+        self.execution_mode = input.execution_mode.clone();
         self.runtime_system_context
             .set_instruction_opt(tag::PLAN_MODE, build_plan_mode_context(input.plan_state));
-        self.runtime_system_context.set_instruction_opt(
-            tag::ORCHESTRATOR_MODE,
-            build_orchestrator_mode_context(&input.execution_mode),
-        );
+        if self.session_role.is_sidekick() {
+            self.runtime_system_context
+                .set_instruction_opt(tag::ORCHESTRATOR_MODE, None);
+            self.runtime_system_context
+                .set_instruction_opt(tag::FUSION_MODE, Some(build_fusion_sidekick_context()));
+        } else {
+            self.runtime_system_context.set_instruction_opt(
+                tag::ORCHESTRATOR_MODE,
+                build_orchestrator_mode_context(&input.execution_mode),
+            );
+            self.runtime_system_context.set_instruction_opt(
+                tag::FUSION_MODE,
+                build_fusion_lead_context(&input.execution_mode),
+            );
+            if let Some(pair) = &self.fusion_pair {
+                pair.set_execution_mode(input.execution_mode.clone());
+            }
+            if let Some(tracker) = &self.edit_tracker {
+                tracker.set_enabled(input.execution_mode.is_fusion());
+            }
+            if execution_mode_changed {
+                self.runtime_system_context.set_commands(build_commands(
+                    &self.command_descriptions,
+                    self.commands.command_sets(),
+                ));
+            }
+        }
 
         self.sync_ssh_servers(input.ssh_servers);
         Ok(())
@@ -2917,9 +3137,18 @@ fn apply_runtime_context(
         runtime_system_context = runtime_system_context.with_instruction(tag::PLAN_MODE, plan_mode);
     }
 
-    if let Some(orchestrator_mode) = build_orchestrator_mode_context(&config.execution_mode) {
-        runtime_system_context =
-            runtime_system_context.with_instruction(tag::ORCHESTRATOR_MODE, orchestrator_mode);
+    if config.session_role.is_sidekick() {
+        runtime_system_context = runtime_system_context
+            .with_instruction(tag::FUSION_MODE, build_fusion_sidekick_context());
+    } else {
+        if let Some(orchestrator_mode) = build_orchestrator_mode_context(&config.execution_mode) {
+            runtime_system_context =
+                runtime_system_context.with_instruction(tag::ORCHESTRATOR_MODE, orchestrator_mode);
+        }
+        if let Some(fusion_mode) = build_fusion_lead_context(&config.execution_mode) {
+            runtime_system_context =
+                runtime_system_context.with_instruction(tag::FUSION_MODE, fusion_mode);
+        }
     }
 
     let browser_enabled = config.browser_broker.is_some()

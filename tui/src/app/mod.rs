@@ -4319,6 +4319,7 @@ impl App {
             SlashCommand::Compact => Some(SendAction::Compact(None)),
             SlashCommand::Recap => Some(SendAction::Recap),
             SlashCommand::Orchestrator => Some(SendAction::ToggleOrchestrator),
+            SlashCommand::Fusion => Some(SendAction::ToggleFusion(None)),
             SlashCommand::Yolo => Some(SendAction::ToggleYolo),
             SlashCommand::MemoryOff => Some(SendAction::MemoryOff),
             SlashCommand::Sleep => Some(SendAction::Sleep),
@@ -4668,6 +4669,14 @@ impl App {
                 return Some(SendAction::Compact(None));
             }
             return Some(SendAction::Compact(Some(focus.to_string())));
+        }
+        if let Some(rest) = trimmed.strip_prefix(SlashCommand::Fusion.name())
+            && attachments.is_empty()
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let arg = rest.trim();
+            let arg = (!arg.is_empty()).then(|| arg.to_string());
+            return Some(SendAction::ToggleFusion(arg));
         }
         if attachments.is_empty()
             && let Some(source) = [
@@ -5563,6 +5572,8 @@ pub enum SendAction {
     Recap,
     /// Flip the session's orchestrator execution mode.
     ToggleOrchestrator,
+    /// Toggle or configure Fusion execution mode (`/fusion [provider::model|off]`).
+    ToggleFusion(Option<String>),
     /// Flip the session's yolo switch.
     ToggleYolo,
     /// Turn memory off for the rest of this session (`/memory off`).

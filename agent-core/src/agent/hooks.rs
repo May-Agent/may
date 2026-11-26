@@ -133,6 +133,9 @@ pub struct MayHooks {
     pub(super) outputs_dir: PathBuf,
     /// The calls whose exchanges compaction keeps in place.
     pub(super) kept: KeptCalls,
+    /// Optional Fusion workspace-edit detector emitting a once-per-turn reminder on
+    /// direct lead workspace edits.
+    pub(super) edit_tracker: Option<crate::fusion::WorkspaceEditTracker>,
 }
 
 impl MayHooks {
@@ -176,25 +179,35 @@ impl MayHooks {
 }
 
 impl Hooks for MayHooks {
-    fn before_tool(
-        &self,
-        call: &ToolInvocation<'_>,
-    ) -> impl std::future::Future<Output = ToolDecision> + Send {
-        if call.name == "terminal"
-            && let Some(interpreter) = call
+    async fn before_tool(&self, call: &ToolInvocation<'_>) -> ToolDecision {
+        if call.name == "terminal" {
+            if let Some(interpreter) = call
                 .arguments
                 .get("interpreter")
                 .and_then(|value| serde_json::from_value::<Interpreter>(value.clone()).ok())
-        {
-            self.interpreters.record(call.call.clone(), interpreter);
+            {
+                self.interpreters.record(call.call.clone(), interpreter);
+            }
+            if let Some(tracker) = &self.edit_tracker {
+                tracker.before_terminal(call.call.call().clone()).await;
+            }
         }
-        std::future::ready(ToolDecision::Allow)
+        ToolDecision::Allow
     }
 
     async fn after_tool(&self, outcome: &ToolOutcome) -> AfterTool {
         if outcome.name != COMPACT_TOOL_NAME {
             self.valve.acted();
         }
+        let fusion_edit_alert = if outcome.name == "terminal" {
+            if let Some(tracker) = &self.edit_tracker {
+                tracker.after_terminal(outcome.call.call()).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // A tool result is never shown to the model unredacted: when the
         // stored secrets cannot be read, the run ends with that error.
         let redactions = match self.redactor.current().await {
@@ -204,7 +217,7 @@ impl Hooks for MayHooks {
         let shown = outcome.for_model();
         let mut result = shown.clone();
         redactions.redact_tool_result(&mut result);
-        let redacted = result != shown;
+        let mut modified = result != shown;
         let kept = self.kept.take(outcome.call.call());
         if let Some((mut augmented, attachments)) = crate::vision_ocr::augment_tool_outcome(
             &self.vision_ocr,
@@ -216,6 +229,9 @@ impl Hooks for MayHooks {
         )
         .await
         {
+            if let Some(alert) = fusion_edit_alert {
+                augmented = append_tool_result_text(augmented, alert);
+            }
             redactions.redact_tool_result(&mut augmented);
             return AfterTool::ReplaceWithAttachments {
                 result: augmented,
@@ -223,7 +239,12 @@ impl Hooks for MayHooks {
             }
             .with_kept(kept);
         }
-        if redacted {
+        if let Some(alert) = fusion_edit_alert {
+            result = append_tool_result_text(result, alert);
+            redactions.redact_tool_result(&mut result);
+            modified = true;
+        }
+        if modified {
             AfterTool::Replace(result).with_kept(kept)
         } else {
             AfterTool::Keep.with_kept(kept)
@@ -267,6 +288,43 @@ impl Hooks for MayHooks {
         }
         TurnBoundaryAction::Continue
     }
+}
+
+fn append_tool_result_text(
+    result: aither_core::llm::ToolResult,
+    extra: String,
+) -> aither_core::llm::ToolResult {
+    use aither_core::llm::ToolResult;
+    use aither_core::llm::tool::ToolResultPart;
+    let mut parts = match result {
+        ToolResult::Done => Vec::new(),
+        ToolResult::Parts { parts } => parts,
+        ToolResult::Text { text } => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ToolResultPart::Text { text }]
+            }
+        }
+        ToolResult::Tsv { text } => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ToolResultPart::Tsv { text }]
+            }
+        }
+        ToolResult::Binary { mime, content } => vec![ToolResultPart::Binary { mime, content }],
+        other @ (ToolResult::Command(_) | ToolResult::Error { .. }) => {
+            let rendered = other.render_for_model();
+            if rendered.is_empty() {
+                Vec::new()
+            } else {
+                vec![ToolResultPart::Text { text: rendered }]
+            }
+        }
+    };
+    parts.push(ToolResultPart::Text { text: extra });
+    ToolResult::parts(parts)
 }
 
 #[cfg(all(test, feature = "vision-ocr", target_os = "macos"))]
@@ -409,6 +467,7 @@ mod tests {
             call_images: call_images.clone(),
             outputs_dir: dir.path().join("outputs"),
             kept: KeptCalls::new(crate::ipc::KeptExchangeReceiver::none()),
+            edit_tracker: None,
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let llm = ScriptedModel {

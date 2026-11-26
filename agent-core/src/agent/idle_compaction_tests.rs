@@ -266,7 +266,7 @@ impl ScriptedHost {
         self.reads.load(Ordering::SeqCst)
     }
 
-    fn source(&self) -> HostReaderSource {
+    pub(super) fn source(&self) -> HostReaderSource {
         let host = self.clone();
         HostReaderSource::new(move || AnyHostReader::new(host.clone()))
     }
@@ -402,6 +402,8 @@ impl SessionParts {
             services: crate::terminal_commands::SharedServices::new(&self.dir.join(".may")),
             model_context_window: None,
             sleep: None,
+            session_role: crate::fusion::SessionRole::Main,
+            shared_grants: None,
         }
     }
 }

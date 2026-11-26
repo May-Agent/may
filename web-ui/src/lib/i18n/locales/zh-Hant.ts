@@ -705,8 +705,13 @@ export const zhHant: Messages = {
     failed: '無法變更 Yolo：{message}',
   },
   executionMode: {
+    standardLabel: '標準',
     orchestratorLabel: '編排模式',
     orchestratorDescription: '將實作工作委派給子代理以保持主對話精簡',
+    fusionLabel: '融合模式',
+    fusionDescription: '以前沿主代理搭配常駐快取保溫副手協作',
+    sidekickModelLabel: '副手模型',
+    fusionNeedsModel: '啟用融合模式前請先設定可用模型',
     failed: '無法變更執行模式：{message}',
   },
   memoryToggle: {

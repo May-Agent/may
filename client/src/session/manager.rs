@@ -504,7 +504,7 @@ impl SessionManager {
     }
 
     /// Set the execution mode override passed when materializing new sessions.
-    pub const fn set_execution_mode_override(&mut self, mode: Option<super::ExecutionMode>) {
+    pub fn set_execution_mode_override(&mut self, mode: Option<super::ExecutionMode>) {
         self.execution_mode_override = mode;
     }
 

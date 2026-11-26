@@ -12,6 +12,7 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
+use may_agent::model_selector::ModelSelector;
 use may_agent::session::{ExecutionMode, SessionLaunch};
 use may_agent::update::Channel;
 
@@ -48,13 +49,44 @@ pub enum CliMode {
     },
 }
 
+/// Execution mode requested on the CLI before loading `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliExecutionMode {
+    /// Fully specified execution mode.
+    Explicit(ExecutionMode),
+    /// `--mode fusion` without `--sidekick-model`: resolves `[experimental] fusion_sidekick_model`.
+    FusionFromConfig,
+}
+
+impl CliExecutionMode {
+    /// Resolves this CLI request into an [`ExecutionMode`], reading `[experimental]
+    /// fusion_sidekick_model` when `--sidekick-model` was omitted.
+    pub fn resolve(&self, config: &may_agent::config::MayConfig) -> anyhow::Result<ExecutionMode> {
+        match self {
+            Self::Explicit(mode) => Ok(mode.clone()),
+            Self::FusionFromConfig => {
+                let sidekick_model = config
+                    .experimental
+                    .fusion_sidekick_model
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "fusion mode requires --sidekick-model <provider::model> or [experimental] fusion_sidekick_model in config.toml"
+                        )
+                    })?;
+                Ok(ExecutionMode::Fusion { sidekick_model })
+            }
+        }
+    }
+}
+
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiArgs {
     /// How the TUI starts its sessions.
     pub launch: SessionLaunch,
     /// Optional execution mode override for newly created sessions.
-    pub execution_mode: Option<ExecutionMode>,
+    pub execution_mode: Option<CliExecutionMode>,
 }
 
 /// Parsed `may mode --session <id> <mode>` invocation.
@@ -63,7 +95,7 @@ pub struct ModeCliArgs {
     /// Session to update.
     pub session_id: String,
     /// Target execution mode.
-    pub execution_mode: ExecutionMode,
+    pub execution_mode: CliExecutionMode,
 }
 
 /// Parsed `may resume` invocation.
@@ -79,7 +111,7 @@ pub struct OneShotArgs {
     pub prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub execution_mode: Option<ExecutionMode>,
+    pub execution_mode: Option<CliExecutionMode>,
 }
 
 /// Parsed `may rest` invocation.
@@ -169,9 +201,12 @@ struct LaunchArgs {
     /// Open the TUI on a repository (`owner/repo` or a local path).
     #[arg(long, value_name = "OWNER/REPO|PATH", conflicts_with_all = ["model", "reasoning_effort", "prompt"])]
     repo: Option<String>,
-    /// Execution mode for the new session (`standard` or `orchestrator`).
+    /// Execution mode for the new session (`standard`, `orchestrator`, or `fusion`).
     #[arg(long, value_enum, ignore_case = true)]
     mode: Option<ExecutionModeArg>,
+    /// Sidekick model selector (`provider::model`) for `--mode fusion`.
+    #[arg(long, value_name = "PROVIDER::MODEL")]
+    sidekick_model: Option<ModelSelector>,
     /// Model id for the one-shot run.
     #[arg(long, value_name = "ID", requires = "prompt")]
     model: Option<String>,
@@ -187,18 +222,24 @@ struct LaunchArgs {
 enum Command {
     /// Open the TUI with repo-less chats (no directory, no repository).
     Chat {
-        /// Execution mode for the new session (`standard` or `orchestrator`).
+        /// Execution mode for the new session (`standard`, `orchestrator`, or `fusion`).
         #[arg(long, value_enum, ignore_case = true)]
         mode: Option<ExecutionModeArg>,
+        /// Sidekick model selector (`provider::model`) for `--mode fusion`.
+        #[arg(long, value_name = "PROVIDER::MODEL")]
+        sidekick_model: Option<ModelSelector>,
     },
     /// Set an existing session's execution mode live.
     Mode {
         /// Session id to update.
         #[arg(long, value_name = "ID")]
         session: String,
-        /// Execution mode (`standard` or `orchestrator`).
+        /// Execution mode (`standard`, `orchestrator`, or `fusion`).
         #[arg(value_enum, ignore_case = true)]
         mode: ExecutionModeArg,
+        /// Sidekick model selector (`provider::model`) for `fusion` mode.
+        #[arg(long, value_name = "PROVIDER::MODEL")]
+        sidekick_model: Option<ModelSelector>,
     },
     /// Reopen a session in the TUI.
     Resume {
@@ -352,14 +393,47 @@ enum ExecutionModeArg {
     Standard,
     /// Experimental orchestrator mode: prompt-driven subagent delegation.
     Orchestrator,
+    /// Experimental fusion mode: frontier lead paired with a persistent cache-warm sidekick.
+    Fusion,
 }
 
-impl From<ExecutionModeArg> for ExecutionMode {
-    fn from(value: ExecutionModeArg) -> Self {
-        match value {
-            ExecutionModeArg::Standard => Self::Standard,
-            ExecutionModeArg::Orchestrator => Self::Orchestrator,
+fn build_cli_execution_mode(
+    mode: ExecutionModeArg,
+    sidekick_model: Option<ModelSelector>,
+) -> Result<CliExecutionMode, clap::Error> {
+    match (mode, sidekick_model) {
+        (ExecutionModeArg::Standard, None) => {
+            Ok(CliExecutionMode::Explicit(ExecutionMode::Standard))
         }
+        (ExecutionModeArg::Orchestrator, None) => {
+            Ok(CliExecutionMode::Explicit(ExecutionMode::Orchestrator))
+        }
+        (ExecutionModeArg::Fusion, Some(sidekick_model)) => {
+            Ok(CliExecutionMode::Explicit(ExecutionMode::Fusion {
+                sidekick_model,
+            }))
+        }
+        (ExecutionModeArg::Fusion, None) => Ok(CliExecutionMode::FusionFromConfig),
+        (ExecutionModeArg::Standard | ExecutionModeArg::Orchestrator, Some(_)) => {
+            Err(Cli::command().error(
+                ErrorKind::ArgumentConflict,
+                "--sidekick-model is only valid with --mode fusion",
+            ))
+        }
+    }
+}
+
+fn build_opt_cli_execution_mode(
+    mode: Option<ExecutionModeArg>,
+    sidekick_model: Option<ModelSelector>,
+) -> Result<Option<CliExecutionMode>, clap::Error> {
+    match (mode, sidekick_model) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(Cli::command().error(
+            ErrorKind::ArgumentConflict,
+            "--sidekick-model requires --mode fusion",
+        )),
+        (Some(mode), sidekick_model) => build_cli_execution_mode(mode, sidekick_model).map(Some),
     }
 }
 
@@ -488,11 +562,12 @@ impl Cli {
                 let LaunchArgs {
                     repo,
                     mode,
+                    sidekick_model,
                     model,
                     reasoning_effort,
                     prompt,
                 } = self.launch;
-                let execution_mode = mode.map(Into::into);
+                let execution_mode = build_opt_cli_execution_mode(mode, sidekick_model)?;
                 if prompt.is_empty() {
                     CliMode::Tui(TuiArgs {
                         launch: repo.map_or_else(SessionLaunch::default, SessionLaunch::Repo),
@@ -511,13 +586,20 @@ impl Cli {
                     })
                 }
             }
-            Some(Command::Chat { mode }) => CliMode::Tui(TuiArgs {
+            Some(Command::Chat {
+                mode,
+                sidekick_model,
+            }) => CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::RepoLess,
-                execution_mode: mode.map(Into::into),
+                execution_mode: build_opt_cli_execution_mode(mode, sidekick_model)?,
             }),
-            Some(Command::Mode { session, mode }) => CliMode::Mode(ModeCliArgs {
+            Some(Command::Mode {
+                session,
+                mode,
+                sidekick_model,
+            }) => CliMode::Mode(ModeCliArgs {
                 session_id: session,
-                execution_mode: mode.into(),
+                execution_mode: build_cli_execution_mode(mode, sidekick_model)?,
             }),
             Some(Command::Resume { session }) => CliMode::Resume(ResumeArgs { session }),
             Some(Command::Gui { port }) => CliMode::Gui { port },
@@ -635,14 +717,14 @@ mod tests {
             parse(&["may", "--mode", "orchestrator"]),
             CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::default(),
-                execution_mode: Some(ExecutionMode::Orchestrator),
+                execution_mode: Some(CliExecutionMode::Explicit(ExecutionMode::Orchestrator)),
             })
         );
         assert_eq!(
             parse(&["may", "chat", "--mode", "orchestrator"]),
             CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::RepoLess,
-                execution_mode: Some(ExecutionMode::Orchestrator),
+                execution_mode: Some(CliExecutionMode::Explicit(ExecutionMode::Orchestrator)),
             })
         );
         assert_eq!(
@@ -651,14 +733,38 @@ mod tests {
                 prompt: "fix lints".to_string(),
                 model: None,
                 reasoning_effort: None,
-                execution_mode: Some(ExecutionMode::Orchestrator),
+                execution_mode: Some(CliExecutionMode::Explicit(ExecutionMode::Orchestrator)),
             })
         );
         assert_eq!(
             parse(&["may", "mode", "--session", "calm-river", "orchestrator"]),
             CliMode::Mode(ModeCliArgs {
                 session_id: "calm-river".to_string(),
-                execution_mode: ExecutionMode::Orchestrator,
+                execution_mode: CliExecutionMode::Explicit(ExecutionMode::Orchestrator),
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "may",
+                "mode",
+                "--session",
+                "calm-river",
+                "fusion",
+                "--sidekick-model",
+                "anthropic::claude-sonnet-4-6"
+            ]),
+            CliMode::Mode(ModeCliArgs {
+                session_id: "calm-river".to_string(),
+                execution_mode: CliExecutionMode::Explicit(ExecutionMode::Fusion {
+                    sidekick_model: ModelSelector::new("anthropic", "claude-sonnet-4-6"),
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "--mode", "fusion"]),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::default(),
+                execution_mode: Some(CliExecutionMode::FusionFromConfig),
             })
         );
     }

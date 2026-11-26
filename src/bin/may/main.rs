@@ -448,6 +448,10 @@ async fn run_mode_command(args: cli::ModeCliArgs) -> anyhow::Result<()> {
         id: String,
         runtime: may_agent::client::SessionRuntimeSnapshot,
     }
+    let config = may_agent::config::MayConfig::load()
+        .await
+        .unwrap_or_default();
+    let execution_mode = args.execution_mode.resolve(&config)?;
     let paths = may_agent::daemon::DaemonPaths::user()?;
     let client = may_agent::daemon::lifecycle::ensure_running(&paths, |line| {
         let _ = writeln!(io::stderr(), "[may] {line}");
@@ -456,7 +460,7 @@ async fn run_mode_command(args: cli::ModeCliArgs) -> anyhow::Result<()> {
     let session: ModeResponse = client
         .patch(
             &format!("/api/sessions/{}", args.session_id),
-            &serde_json::json!({ "executionMode": args.execution_mode }),
+            &serde_json::json!({ "executionMode": execution_mode }),
         )
         .await?;
     writeln!(
@@ -484,8 +488,13 @@ where
     let mut app = App::new(events.sender(), image_support).await?;
     app.band_bg = band_bg;
     app.session_manager.set_launch(tui_args.launch);
+    let resolved_execution_mode = tui_args
+        .execution_mode
+        .as_ref()
+        .map(|mode| mode.resolve(&app.config))
+        .transpose()?;
     app.session_manager
-        .set_execution_mode_override(tui_args.execution_mode);
+        .set_execution_mode_override(resolved_execution_mode);
     let mut worker: Option<AgentWorker> = None;
 
     tracing::info!("=== MAY STARTUP - channels created ===");
@@ -1805,6 +1814,75 @@ where
                                         "Orchestrator mode off: back to standard execution"
                                     }),
                                     Err(error) => app.chat.push_error(&error.to_string()),
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
+                    Some(SendAction::ToggleFusion(arg)) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                let next_result: Result<may_agent::session::ExecutionMode, String> =
+                                    match arg.as_deref().map(str::trim) {
+                                        Some("off" | "standard") => {
+                                            Ok(may_agent::session::ExecutionMode::Standard)
+                                        }
+                                        Some(raw) => raw
+                                            .parse::<may_agent::model_selector::ModelSelector>()
+                                            .map(|sidekick_model| {
+                                                may_agent::session::ExecutionMode::Fusion {
+                                                    sidekick_model,
+                                                }
+                                            })
+                                            .map_err(|error| {
+                                                format!(
+                                                    "Invalid sidekick model '{raw}': {error} (expected provider::model)"
+                                                )
+                                            }),
+                                        None if app.session_runtime.execution_mode.is_fusion() => {
+                                            Ok(may_agent::session::ExecutionMode::Standard)
+                                        }
+                                        None => app
+                                            .config
+                                            .experimental
+                                            .fusion_sidekick_model
+                                            .clone()
+                                            .map(|sidekick_model| {
+                                                may_agent::session::ExecutionMode::Fusion {
+                                                    sidekick_model,
+                                                }
+                                            })
+                                            .ok_or_else(|| {
+                                                "Pass /fusion <provider::model> or set [experimental] fusion_sidekick_model in config.toml".to_string()
+                                            }),
+                                    };
+                                match next_result {
+                                    Ok(next) => {
+                                        let put = client
+                                            .patch::<_, serde_json::Value>(
+                                                &format!("/api/sessions/{session_id}"),
+                                                &serde_json::json!({ "executionMode": next }),
+                                            )
+                                            .await;
+                                        match put {
+                                            Ok(_) => match &next {
+                                                may_agent::session::ExecutionMode::Fusion {
+                                                    sidekick_model,
+                                                } => app.chat.push_notice(&format!(
+                                                    "Fusion mode on: persistent sidekick on {sidekick_model}"
+                                                )),
+                                                _ => app.chat.push_notice(
+                                                    "Fusion mode off: back to standard execution",
+                                                ),
+                                            },
+                                            Err(error) => app.chat.push_error(&error.to_string()),
+                                        }
+                                    }
+                                    Err(message) => app.chat.push_error(&message),
                                 }
                             }
                             _ => app.chat.push_notice("No session is attached"),
