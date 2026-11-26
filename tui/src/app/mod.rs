@@ -525,15 +525,19 @@ pub struct SystemHostModifiers {
 
 impl SystemHostModifiers {
     /// Detect whether this process runs in a local graphical session.
+    #[cfg(target_os = "macos")]
     #[must_use]
     pub fn detect() -> Self {
-        #[cfg(target_os = "macos")]
         let local_session =
             std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none();
-        Self {
-            #[cfg(target_os = "macos")]
-            local_session,
-        }
+        Self { local_session }
+    }
+
+    /// Detect whether this process runs in a local graphical session.
+    #[cfg(not(target_os = "macos"))]
+    #[must_use]
+    pub const fn detect() -> Self {
+        Self {}
     }
 }
 
