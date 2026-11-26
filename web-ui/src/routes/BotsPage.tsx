@@ -67,17 +67,14 @@ export function BotsPage() {
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [newPersona, setNewPersona] = useState('');
-  const [personaDraft, setPersonaDraft] = useState('');
+  const [personaDraftByBot, setPersonaDraftByBot] = useState<Record<string, string>>({});
 
   useEffect(() => {
     void loadBots();
   }, [loadBots]);
 
   const selected = bots.find((b) => b.id === selectedBotId) ?? null;
-
-  useEffect(() => {
-    setPersonaDraft(selected?.persona ?? '');
-  }, [selected?.id, selected?.persona]);
+  const personaDraft = selected ? (personaDraftByBot[selected.id] ?? selected.persona ?? '') : '';
 
   const messages = selected ? (messagesByBot[selected.id] ?? []) : [];
   const trace = selected ? (traceByBot[selected.id] ?? []) : [];
@@ -532,13 +529,24 @@ export function BotsPage() {
                     <h2 className="text-sm font-semibold">Persona</h2>
                     <textarea
                       value={personaDraft}
-                      onChange={(e) => setPersonaDraft(e.target.value)}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setPersonaDraftByBot((prev) => ({ ...prev, [selected.id]: value }));
+                      }}
                       rows={4}
                       className="w-full rounded-md border border-input bg-background p-2 text-xs"
                     />
                     <Button
                       size="sm"
-                      onClick={() => void patchBot(selected.id, { persona: personaDraft })}
+                      onClick={() => {
+                        void patchBot(selected.id, { persona: personaDraft }).then(() => {
+                          setPersonaDraftByBot((prev) => {
+                            const next = { ...prev };
+                            delete next[selected.id];
+                            return next;
+                          });
+                        });
+                      }}
                     >
                       Save Persona
                     </Button>

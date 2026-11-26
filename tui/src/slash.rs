@@ -66,7 +66,7 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; if cfg!(feature = "ui") { 40 } else { 39 }] = [
+    pub const ALL: [Self; if cfg!(feature = "ui") { 41 } else { 40 }] = [
         Self::Help,
         Self::Session,
         Self::Archive,
