@@ -224,12 +224,8 @@ impl Available {
                     "Downloading May {}…",
                     latest.version
                 )));
-                let archive = self
-                    .github
-                    .download_release(&latest, &mut |downloaded, total| {
-                        progress(Progress::Download { downloaded, total });
-                    })
-                    .await?;
+                let archive = self.github.download_release(&latest, progress).await?;
+                progress(Progress::step("Unpacking May…"));
                 blocking::unblock(move || release::extract_executable(&archive, platform)).await?
             }
             Source::Ci { found } => {
@@ -238,15 +234,12 @@ impl Available {
                     short(&found.head_sha),
                     found.artifact.size_in_bytes / 1_000_000
                 )));
-                let zip = self
-                    .github
-                    .download(&found.artifact, &mut |downloaded, total| {
-                        progress(Progress::Download { downloaded, total });
-                    })
-                    .await?;
+                let zip = self.github.download(&found.artifact, progress).await?;
+                progress(Progress::step("Unpacking the CI build…"));
                 blocking::unblock(move || ci::extract_executable(&zip)).await?
             }
         };
+        progress(Progress::step("Installing May…"));
         let target = target.to_owned();
         blocking::unblock(move || install::replace_executable(&target, &executable)).await
     }
@@ -399,11 +392,8 @@ async fn this_commit_from(
         "Downloading {name} ({} MB)…",
         found.artifact.size_in_bytes / 1_000_000
     )));
-    let zip = github
-        .download(&found.artifact, &mut |downloaded, total| {
-            progress(Progress::Download { downloaded, total });
-        })
-        .await?;
+    let zip = github.download(&found.artifact, progress).await?;
+    progress(Progress::step(format!("Unpacking {name}…")));
     blocking::unblock(move || ci::extract_tarball(&zip)).await
 }
 
@@ -600,5 +590,120 @@ mod tests {
             Channel::Dev
         );
         assert_eq!(Channel::Dev.to_string(), "dev");
+    }
+
+    #[tokio::test]
+    async fn ci_install_reports_download_verification_unpacking_and_install_steps() {
+        use std::io::Write as _;
+        use std::sync::Arc;
+
+        use sha2::Digest as _;
+
+        let payload = "updated may executable 日本語 한국어 中文".as_bytes();
+        let mut tarball = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "may", payload)
+                .expect("tarball writes");
+            builder
+                .into_inner()
+                .expect("tarball finishes")
+                .finish()
+                .expect("gzip finishes");
+        }
+        let mut zip = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip));
+            writer
+                .start_file(
+                    "may-debug.tar.gz",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .expect("zip entry starts");
+            writer.write_all(&tarball).expect("zip entry writes");
+            writer.finish().expect("zip finishes");
+        }
+        let digest = hex::encode(sha2::Sha256::digest(&zip));
+        let zip_len = zip.len() as u64;
+        let served = Arc::new(zip);
+
+        let (base, _) = serve_api(move |request, _| match request.path.as_str() {
+            "/artifact.zip" => ApiReply::bytes(200, served.as_ref().clone()),
+            _ => ApiReply::json(404, r#"{"message":"Not Found"}"#),
+        })
+        .await;
+
+        let available = Available {
+            github: GitHub::new(&base, Some("test-token".into())),
+            source: Source::Ci {
+                found: ci::Found {
+                    head_sha: HEAD.to_owned(),
+                    artifact: ci::Artifact {
+                        size_in_bytes: zip_len,
+                        archive_download_url: format!("{base}/artifact.zip"),
+                        expired: false,
+                        digest: Some(format!("sha256:{digest}")),
+                    },
+                },
+            },
+            to: format!("the CI build of {}", short(HEAD)),
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("may");
+        std::fs::write(&target, b"old").expect("seed executable");
+
+        let mut events = Vec::new();
+        available
+            .install(&target, &mut |event| events.push(event))
+            .await
+            .expect("install succeeds");
+
+        assert_eq!(std::fs::read(&target).expect("reads installed"), payload);
+
+        let steps: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Progress::Step(text) => Some(text.as_str()),
+                Progress::Download { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                "Downloading the CI build of 6bbeeed53 (0 MB)…",
+                "Verifying download…",
+                "Unpacking the CI build…",
+                "Installing May…",
+            ]
+        );
+
+        let first_download = events
+            .iter()
+            .position(|event| matches!(event, Progress::Download { .. }))
+            .expect("download progress events emitted");
+        let verify_step = events
+            .iter()
+            .position(
+                |event| matches!(event, Progress::Step(text) if text == "Verifying download…"),
+            )
+            .expect("verify step emitted");
+        assert!(
+            first_download < verify_step,
+            "download progress must precede verification step: {events:?}"
+        );
+        assert!(events[..verify_step].iter().any(|event| matches!(
+            event,
+            Progress::Download { downloaded, total }
+                if *downloaded == zip_len && *total == Some(zip_len)
+        )));
     }
 }
