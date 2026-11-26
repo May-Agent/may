@@ -82,6 +82,7 @@ zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch 
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEventSource", "CGEventTypes"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSURL"] }
 
 [dev-dependencies]

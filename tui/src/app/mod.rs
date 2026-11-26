@@ -364,10 +364,16 @@ pub struct App {
     /// Where the pointer last was inside the chat column (screen cell);
     /// the link under it shows its target and is underlined while Cmd or Ctrl is held.
     pub hover: Option<(u16, u16)>,
+    /// Whether the terminal window currently holds focus.
+    pub terminal_focused: bool,
     /// Modifier keys held down via Kitty keyboard modifier press/release events.
     pub held_modifiers: HeldModifiers,
     /// Open modifiers carried on the latest pointer event inside the chat column.
     pub pointer_modifiers: KeyModifiers,
+    /// Live local host open modifiers (`Cmd`/`Ctrl`) cached while hovering.
+    pub host_open_modifiers: KeyModifiers,
+    /// Queries live local host open modifiers; replaced in tests.
+    pub host_modifiers: std::sync::Arc<dyn HostModifierSource>,
     /// Opens link targets; replaced in tests.
     pub link_opener: std::sync::Arc<dyn super::ui::links::LinkOpener>,
     /// Laid-out chat transcript: the render cache, and the plain-text
@@ -500,6 +506,59 @@ impl HeldModifiers {
             out = out.union(KeyModifiers::CONTROL);
         }
         out
+    }
+}
+
+/// Source of live local OS open-link modifiers (`Cmd`/`Ctrl`) used when the
+/// terminal does not report standalone modifier press/release events.
+pub trait HostModifierSource: Send + Sync + std::fmt::Debug {
+    /// Currently pressed local link-opening modifiers (`SUPER` / `CONTROL`).
+    fn open_modifiers(&self) -> KeyModifiers;
+}
+
+/// Reads the local host's modifier flags on macOS (disabled over SSH).
+#[derive(Debug, Clone, Copy)]
+pub struct SystemHostModifiers {
+    #[cfg(target_os = "macos")]
+    local_session: bool,
+}
+
+impl SystemHostModifiers {
+    /// Detect whether this process runs in a local graphical session.
+    #[must_use]
+    pub fn detect() -> Self {
+        #[cfg(target_os = "macos")]
+        let local_session =
+            std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none();
+        Self {
+            #[cfg(target_os = "macos")]
+            local_session,
+        }
+    }
+}
+
+impl HostModifierSource for SystemHostModifiers {
+    fn open_modifiers(&self) -> KeyModifiers {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_core_graphics::{CGEventFlags, CGEventSource, CGEventSourceStateID};
+            if !self.local_session {
+                return KeyModifiers::NONE;
+            }
+            let flags = CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState);
+            let mut out = KeyModifiers::NONE;
+            if flags.contains(CGEventFlags::MaskCommand) {
+                out |= KeyModifiers::SUPER;
+            }
+            if flags.contains(CGEventFlags::MaskControl) {
+                out |= KeyModifiers::CONTROL;
+            }
+            out
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            KeyModifiers::NONE
+        }
     }
 }
 
@@ -845,8 +904,11 @@ impl App {
             last_image_scan_version: u64::MAX,
             selection: None,
             hover: None,
+            terminal_focused: true,
             held_modifiers: HeldModifiers::default(),
             pointer_modifiers: KeyModifiers::NONE,
+            host_open_modifiers: KeyModifiers::NONE,
+            host_modifiers: std::sync::Arc::new(SystemHostModifiers::detect()),
             link_opener: std::sync::Arc::new(super::ui::links::SystemOpener),
             chat_layout: super::ui::chat_layout::ChatLayout::default(),
             frame_stats: super::perf::FrameStats::default(),
@@ -4021,12 +4083,13 @@ impl App {
         } else {
             KeyModifiers::NONE
         };
+        let _ = self.refresh_host_open_modifiers();
 
-        // Ctrl-click or Cmd-click (with Cmd tracked via Kitty modifier events)
-        // opens the link under the pointer instead of starting a selection.
+        // Ctrl-click or Cmd-click (with Cmd tracked via host or Kitty modifier
+        // state) opens the link under the pointer instead of starting a selection.
         let hit = self.link_at_screen(mouse.column, mouse.row);
         let mut open_mouse = mouse;
-        open_mouse.modifiers |= self.held_modifiers.as_key_modifiers();
+        open_mouse.modifiers |= self.held_modifiers.as_key_modifiers() | self.host_open_modifiers;
         if super::ui::links::dispatch_click(self.link_opener.as_ref(), &open_mouse, hit.as_ref()) {
             self.selection = None;
             self.last_click = None;
@@ -4161,11 +4224,26 @@ impl App {
         self.link_at_screen(col, row)
     }
 
+    /// Refresh cached live host open modifiers while hovering in a focused
+    /// terminal; returns whether the state changed so the loop can redraw.
+    pub fn refresh_host_open_modifiers(&mut self) -> bool {
+        let next = if self.terminal_focused && self.hover.is_some() {
+            super::ui::links::open_modifiers(self.host_modifiers.open_modifiers())
+        } else {
+            KeyModifiers::NONE
+        };
+        let changed = next != self.host_open_modifiers;
+        self.host_open_modifiers = next;
+        changed
+    }
+
     /// Whether `Cmd` or `Ctrl` is held so a hovered link should be underlined.
     #[must_use]
     pub(super) fn link_open_modifier_active(&self) -> bool {
         super::ui::links::has_open_modifier(
-            self.held_modifiers.as_key_modifiers() | self.pointer_modifiers,
+            self.held_modifiers.as_key_modifiers()
+                | self.pointer_modifiers
+                | self.host_open_modifiers,
         )
     }
 
@@ -6040,6 +6118,14 @@ mod tests {
     /// An app over a scratch May directory with one attached session,
     /// returning the session id. The directory must outlive the app.
     async fn app_with_session(dir: &std::path::Path) -> (App, String) {
+        #[derive(Debug)]
+        struct NoopHostModifiers;
+        impl super::HostModifierSource for NoopHostModifiers {
+            fn open_modifiers(&self) -> KeyModifiers {
+                KeyModifiers::NONE
+            }
+        }
+
         let mut sessions = SessionManager::at(dir.to_path_buf())
             .await
             .expect("session manager");
@@ -6071,7 +6157,8 @@ mod tests {
                 "anthropic",
                 "claude-test",
             ));
-        let app = App::with_parts(config, sessions, tx, None, None);
+        let mut app = App::with_parts(config, sessions, tx, None, None);
+        app.host_modifiers = std::sync::Arc::new(NoopHostModifiers);
         (app, id)
     }
 
@@ -6302,7 +6389,10 @@ mod tests {
         let buffer = draw_buffer(&mut app, width, height);
         let sidebar_width = crate::sidebar::SidebarState::width_for(width);
         let left = width - sidebar_width;
-        for y in 0..height {
+        let gap = crate::ui::band::H_PADDING;
+        let bottom_pad = crate::ui::band::V_PADDING;
+        let pane_height = height - bottom_pad;
+        for y in 0..pane_height {
             assert!(
                 (left..width).all(|x| buffer[(x, y)].bg == BLOCK_BG),
                 "sidebar row {y} is filled"
@@ -6315,12 +6405,10 @@ mod tests {
             );
         }
         // Inner padding: the first column of the block stays empty.
-        assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
-        // The outer margins on the left, before the sidebar and at the bottom
-        // stay unpainted on every row, so the input band keeps matching padding
-        // on all three sides.
-        let gap = crate::ui::band::H_PADDING;
-        let bottom_pad = crate::ui::band::V_PADDING;
+        assert!((0..pane_height).all(|y| buffer[(left, y)].symbol() == " "));
+        // The outer margins on the left, before the sidebar and across the
+        // bottom stay unpainted so the input band and sidebar share the same
+        // bottom row.
         for y in 0..height {
             for x in 0..gap {
                 assert_ne!(
@@ -6337,8 +6425,8 @@ mod tests {
                 );
             }
         }
-        for y in (height - bottom_pad)..height {
-            for x in 0..left {
+        for y in pane_height..height {
+            for x in 0..width {
                 assert_ne!(
                     buffer[(x, y)].bg,
                     BLOCK_BG,
@@ -6347,14 +6435,24 @@ mod tests {
             }
         }
         assert_eq!(
-            buffer[(gap, height - 1 - bottom_pad)].bg,
+            app.sidebar.area.bottom(),
+            pane_height,
+            "sidebar bottom aligns with the input band"
+        );
+        assert_eq!(
+            buffer[(gap, pane_height - 1)].bg,
             BLOCK_BG,
             "input band starts right after the left margin"
         );
         assert_eq!(
-            buffer[(left - gap - 1, height - 1 - bottom_pad)].bg,
+            buffer[(left - gap - 1, pane_height - 1)].bg,
             BLOCK_BG,
             "input band reaches the left side of the sidebar gap"
+        );
+        assert_eq!(
+            buffer[(left, pane_height - 1)].bg,
+            BLOCK_BG,
+            "sidebar bottom row aligns with input band bottom row"
         );
     }
 
@@ -8602,6 +8700,112 @@ mod tests {
         .expect("right cmd press");
         assert!(app.link_open_modifier_active());
         app.handle_event(AppEvent::FocusLost).expect("focus lost");
+        assert!(!app.link_open_modifier_active());
+    }
+
+    #[tokio::test]
+    async fn host_cmd_modifier_underlines_hovered_link_and_opens_on_click() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        #[derive(Debug, Default)]
+        struct TestOpener(Mutex<Vec<String>>);
+
+        impl crate::ui::links::LinkOpener for TestOpener {
+            fn open(&self, uri: &str) {
+                self.0.lock().unwrap().push(uri.to_string());
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct MockHostModifiers(AtomicBool);
+
+        impl super::HostModifierSource for MockHostModifiers {
+            fn open_modifiers(&self) -> KeyModifiers {
+                if self.0.load(Ordering::Relaxed) {
+                    KeyModifiers::SUPER
+                } else {
+                    KeyModifiers::NONE
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let opener = Arc::new(TestOpener::default());
+        let host = Arc::new(MockHostModifiers::default());
+        app.link_opener = opener.clone();
+        app.host_modifiers = host.clone();
+        app.chat
+            .push_user("open https://example.com/ime-safe now", Vec::new(), 0);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("term");
+        let rows = draw_rows(&mut terminal, &mut app);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("https://example.com/ime-safe"))
+            .expect("link row");
+        let byte_col = rows[y].find("https://example.com/ime-safe").expect("col");
+        let x = u16::try_from(unicode_width::UnicodeWidthStr::width(&rows[y][..byte_col]))
+            .expect("col");
+        let y = u16::try_from(y).expect("y");
+
+        // Plain hover without Cmd held does not underline.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("hover");
+        assert!(!app.refresh_host_open_modifiers());
+        let plain_buf = draw_buffer(&mut app, 80, 20);
+        assert!(
+            !plain_buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+
+        // Holding Cmd while hovering reports a state change and underlines the link.
+        host.0.store(true, Ordering::Relaxed);
+        assert!(app.refresh_host_open_modifiers());
+        let cmd_buf = draw_buffer(&mut app, 80, 20);
+        assert!(
+            cmd_buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+
+        // Cmd+Click opens the link even though the mouse event omits SUPER.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("cmd click");
+        assert_eq!(
+            *opener.0.lock().unwrap(),
+            vec!["https://example.com/ime-safe".to_string()]
+        );
+
+        // Losing focus suppresses host modifiers even while Cmd stays held; regaining restores them.
+        app.handle_event(AppEvent::FocusLost).expect("focus lost");
+        assert!(!app.refresh_host_open_modifiers());
+        assert!(!app.link_open_modifier_active());
+
+        app.handle_event(AppEvent::FocusGained)
+            .expect("focus gained");
+        assert!(app.refresh_host_open_modifiers());
+        assert!(app.link_open_modifier_active());
+
+        // Releasing Cmd clears the underline.
+        host.0.store(false, Ordering::Relaxed);
+        assert!(app.refresh_host_open_modifiers());
         assert!(!app.link_open_modifier_active());
     }
 

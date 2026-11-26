@@ -86,11 +86,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         _ => {}
     }
 
-    // The right sidebar takes a column of wide terminals; the chat and its
-    // sheets sit in an inset column beside it with matching outer margin on
-    // the left, right (before the sidebar or terminal edge) and bottom.
+    // The right sidebar takes a column of wide terminals and shares the same
+    // bottom outer margin as the chat column so its bottom edge aligns with
+    // the input band; the chat and its sheets sit beside it with matching
+    // outer margins on the left, right (before the sidebar or terminal edge)
+    // and bottom.
     let (column_outer, sidebar_area) = if app.sidebar.visible_at(area.width) {
         let width = crate::sidebar::SidebarState::width_for(area.width);
+        let v_pad = super::band::v_padding(area.height);
         (
             Rect {
                 width: area.width.saturating_sub(width),
@@ -99,6 +102,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Some(Rect {
                 x: area.x + area.width - width,
                 width,
+                height: area.height - v_pad,
                 ..area
             }),
         )

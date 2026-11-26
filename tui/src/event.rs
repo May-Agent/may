@@ -48,6 +48,8 @@ pub enum AppEvent {
         /// `true` on press or repeat, `false` on release.
         pressed: bool,
     },
+    /// Terminal window gained focus
+    FocusGained,
     /// Terminal window lost focus
     FocusLost,
     /// Tick (for polling)
@@ -340,6 +342,7 @@ impl AppEvent {
         match self {
             Self::Key(..) => "key",
             Self::ModifierKey { .. } => "modifier_key",
+            Self::FocusGained => "focus_gained",
             Self::FocusLost => "focus_lost",
             Self::Tick => "tick",
             Self::Resize(..) => "resize",
@@ -465,7 +468,7 @@ fn map_terminal_event(evt: Event) -> Option<AppEvent> {
         Event::Paste(text) => Some(AppEvent::Paste(text)),
         Event::Mouse(mouse) => Some(AppEvent::Mouse(mouse)),
         Event::FocusLost => Some(AppEvent::FocusLost),
-        Event::FocusGained => None,
+        Event::FocusGained => Some(AppEvent::FocusGained),
     }
 }
 
@@ -654,6 +657,10 @@ mod tests {
         assert!(matches!(
             map_terminal_event(Event::FocusLost),
             Some(AppEvent::FocusLost)
+        ));
+        assert!(matches!(
+            map_terminal_event(Event::FocusGained),
+            Some(AppEvent::FocusGained)
         ));
     }
 }
