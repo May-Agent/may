@@ -704,6 +704,11 @@ export const ja: Messages = {
     description: 'このチャットの承認リクエストをすべて確認なしで許可する',
     failed: 'Yoloを変更できませんでした: {message}',
   },
+  executionMode: {
+    orchestratorLabel: 'オーケストレーター',
+    orchestratorDescription: '実作業をサブエージェントに委譲してメインコンテキストを小さく保つ',
+    failed: '実行モードを変更できませんでした: {message}',
+  },
   memoryToggle: {
     label: 'メモリ',
     description: 'このチャットの残りでメモリの読み書きを停止する',

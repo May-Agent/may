@@ -1273,6 +1273,9 @@ pub struct CreateSessionRequest {
     /// machine.
     #[serde(default)]
     pub cloud: Option<CloudSessionRequest>,
+    /// Execution mode override; absent uses `[experimental] execution_mode`.
+    #[serde(default)]
+    pub execution_mode: Option<may_protocol::execution_mode::ExecutionMode>,
 }
 
 /// The cloud machine a new session runs on.
@@ -1430,6 +1433,9 @@ pub struct SessionPatch {
     /// New plan-mode state.
     #[serde(default)]
     pub plan_state: Option<SessionPlanState>,
+    /// New execution mode for the session.
+    #[serde(default)]
+    pub execution_mode: Option<may_protocol::execution_mode::ExecutionMode>,
 }
 
 /// Deserialize a field that is present in the body, keeping an explicit `null`
@@ -1758,6 +1764,7 @@ impl From<may_protocol::session_runtime::SessionRuntimeSummary> for SessionRunti
         Self {
             state: summary.state,
             plan_state: summary.plan_state,
+            execution_mode: summary.execution_mode,
             yolo: summary.yolo,
             memory_off: summary.memory_off,
             interactions: SessionInteractionResponse {
@@ -1884,6 +1891,8 @@ pub struct SessionRuntimeResponse {
     pub state: SessionRuntimeState,
     /// The session's plan-mode state.
     pub plan_state: SessionPlanState,
+    /// The session's execution mode, orthogonal to `plan_state`.
+    pub execution_mode: may_protocol::execution_mode::ExecutionMode,
     /// Whether unattended approvals are on.
     pub yolo: bool,
     /// Whether memory is disabled for the session.
@@ -1917,6 +1926,7 @@ impl Default for SessionRuntimeResponse {
         Self {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
+            execution_mode: may_protocol::execution_mode::ExecutionMode::Standard,
             yolo: false,
             memory_off: false,
             interactions: SessionInteractionResponse::default(),

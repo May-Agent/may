@@ -704,6 +704,11 @@ export const zhHant: Messages = {
     description: '自動允許此對話中的所有核准請求，不再詢問',
     failed: '無法變更 Yolo：{message}',
   },
+  executionMode: {
+    orchestratorLabel: '編排模式',
+    orchestratorDescription: '將實作工作委派給子代理以保持主對話精簡',
+    failed: '無法變更執行模式：{message}',
+  },
   memoryToggle: {
     label: '記憶',
     description: '在此對話其餘時間停止讀取與儲存記憶',

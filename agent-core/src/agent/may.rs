@@ -28,10 +28,10 @@ use super::provider::{ModelSlot, ProviderLlm, resolve_provider_runtime};
 use super::runtime_context::{
     RepoCloneEntry, RuntimeSystemContext, build_agents_md_blocks, build_browser_context,
     build_capabilities, build_commands, build_efficiency, build_environment, build_evidence,
-    build_harness, build_identity, build_languages, build_permissions, build_plan_mode_context,
-    build_prepared_tools, build_profile_memories, build_profile_persona, build_repo_clones_context,
-    build_session, build_subagent_instructions, build_terminal, build_time, build_work,
-    build_workspace_workdirs_context, tag,
+    build_harness, build_identity, build_languages, build_orchestrator_mode_context,
+    build_permissions, build_plan_mode_context, build_prepared_tools, build_profile_memories,
+    build_profile_persona, build_repo_clones_context, build_session, build_subagent_instructions,
+    build_terminal, build_time, build_work, build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -273,6 +273,8 @@ pub struct MayAgentConfig {
     pub memory_off: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
+    /// Session-scoped execution mode, orthogonal to `plan_state`.
+    pub execution_mode: crate::session::ExecutionMode,
     /// Global network restriction policy.
     pub network_policy: Option<CompiledNetworkPolicy>,
     /// Optional location info for location-aware profiles.
@@ -373,6 +375,8 @@ pub struct MayAgentSessionInput<'a> {
     pub memory_off: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
+    /// Session-scoped execution mode, orthogonal to `plan_state`.
+    pub execution_mode: crate::session::ExecutionMode,
     /// Resolved location info, when the profile is location-aware.
     pub location: Option<crate::location::LocationInfo>,
     /// Channel for scheduled-task create requests.
@@ -1641,6 +1645,7 @@ impl MayAgent {
             profile_memories,
             memory_off,
             plan_state,
+            execution_mode,
             location,
             task_broker,
             session_prompts,
@@ -1823,6 +1828,7 @@ impl MayAgent {
             profile_memories,
             memory_off,
             plan_state,
+            execution_mode,
             network_policy: may_config
                 .preferences
                 .network_policy
@@ -2639,6 +2645,10 @@ impl MayAgent {
             .set_profile_memories(profile_memories);
         self.runtime_system_context
             .set_instruction_opt(tag::PLAN_MODE, build_plan_mode_context(input.plan_state));
+        self.runtime_system_context.set_instruction_opt(
+            tag::ORCHESTRATOR_MODE,
+            build_orchestrator_mode_context(&input.execution_mode),
+        );
 
         self.sync_ssh_servers(input.ssh_servers);
         Ok(())
@@ -2796,6 +2806,8 @@ pub struct TurnSyncInput<'a> {
     pub memory_off: bool,
     /// The session's plan state.
     pub plan_state: SessionPlanState,
+    /// The session's execution mode.
+    pub execution_mode: crate::session::ExecutionMode,
     /// The session's resolved location.
     pub location: Option<&'a crate::location::LocationInfo>,
     /// The session's working directory.
@@ -2903,6 +2915,11 @@ fn apply_runtime_context(
 
     if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
         runtime_system_context = runtime_system_context.with_instruction(tag::PLAN_MODE, plan_mode);
+    }
+
+    if let Some(orchestrator_mode) = build_orchestrator_mode_context(&config.execution_mode) {
+        runtime_system_context =
+            runtime_system_context.with_instruction(tag::ORCHESTRATOR_MODE, orchestrator_mode);
     }
 
     let browser_enabled = config.browser_broker.is_some()

@@ -1,5 +1,6 @@
 //! Persisted session runtime state and server-owned pending messages.
 
+use crate::execution_mode::ExecutionMode;
 use crate::permission::PermissionRequestMode;
 use crate::session_plan::SessionPlanState;
 use crate::xml::XmlBlock;
@@ -356,6 +357,9 @@ pub struct SessionRuntimeSummary {
     /// Plan-mode state.
     #[serde(default, skip_serializing_if = "session_plan_state_is_disabled")]
     pub plan_state: SessionPlanState,
+    /// Execution mode for the session, orthogonal to `plan_state`.
+    #[serde(default, skip_serializing_if = "ExecutionMode::is_standard")]
+    pub execution_mode: ExecutionMode,
     /// Yolo switch: every approval request of the session is granted at once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub yolo: bool,
@@ -397,6 +401,7 @@ impl Default for SessionRuntimeSummary {
         Self {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
+            execution_mode: ExecutionMode::Standard,
             yolo: false,
             memory_off: false,
             interactions: SessionInteractionState::default(),
@@ -441,6 +446,7 @@ impl SessionRuntimeSummary {
     pub const fn is_empty(&self) -> bool {
         self.state.is_idle()
             && !self.plan_state.is_enabled()
+            && self.execution_mode.is_standard()
             && !self.yolo
             && self.interactions.is_empty()
             && self.queued_count == 0

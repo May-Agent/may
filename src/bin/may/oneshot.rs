@@ -218,6 +218,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             &may_agent::client::UpdateSessionRequest {
                 non_interactive: Some(true),
                 memory_off: Some(true),
+                execution_mode: args.execution_mode.clone(),
                 ..Default::default()
             },
         )

@@ -321,6 +321,7 @@ async fn memory_off_changes_prefix_only_on_reassembly() {
             profile_memories: None,
             memory_off: true,
             plan_state: crate::session::SessionPlanState::default(),
+            execution_mode: crate::session::ExecutionMode::Standard,
             location: None,
             cwd: &cwd,
             ssh_servers: &[],
@@ -375,5 +376,80 @@ async fn session_started_with_memory_off_never_injects_memories() {
         !first[0].contains("prefers concise answers"),
         "{}",
         first[0]
+    );
+}
+
+#[tokio::test]
+async fn toggling_orchestrator_mode_mid_session_preserves_cached_prefix_until_compaction() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(session_with(&stub, "", "rules\n")).await;
+    let model = format!(
+        "{}::{SESSION_MODEL}",
+        super::idle_compaction_tests::SESSION_PROVIDER
+    );
+    let cwd = session.temp.path().join("cwd");
+
+    // First turn in Standard mode: no `<orchestrator_mode>` anywhere.
+    turn(&mut session).await;
+
+    // Toggle Orchestrator mode on mid-session via `sync_for_turn`.
+    session
+        .agent
+        .sync_for_turn(crate::agent::TurnSyncInput {
+            may_config: &config,
+            pushed_providers: &crate::cloud::access::PushedProviders::default(),
+            current_model: &model,
+            reasoning_effort: None,
+            model_context_window: None,
+            provider_attempt: 0,
+            profile_id: None,
+            profile_persona: None,
+            profile_memories: None,
+            memory_off: false,
+            plan_state: crate::session::SessionPlanState::default(),
+            execution_mode: crate::session::ExecutionMode::Orchestrator,
+            location: None,
+            cwd: &cwd,
+            ssh_servers: &[],
+        })
+        .await
+        .expect("sync_for_turn");
+    turn(&mut session).await;
+    turn(&mut session).await;
+
+    let requests = turn_requests(&stub).await;
+    let [first, second, third] = requests.as_slice() else {
+        panic!("expected three turns: {requests:?}");
+    };
+    assert!(!first[0].contains("<orchestrator_mode>"), "{}", first[0]);
+    assert_eq!(
+        second[0], first[0],
+        "toggling orchestrator mode mid-session must not invalidate the cached prefix"
+    );
+    assert!(!second[0].contains("<orchestrator_mode>"), "{}", second[0]);
+    let alerts = diff_alerts(second, "orchestrator_mode_diff");
+    assert_eq!(alerts.len(), 1, "{second:?}");
+    assert!(
+        alerts[0].contains("subagent general --tier balanced"),
+        "{}",
+        alerts[0]
+    );
+    assert_eq!(third[0], first[0]);
+    assert_eq!(
+        diff_alerts(third, "orchestrator_mode_diff").len(),
+        1,
+        "{third:?}"
+    );
+
+    // Compaction folds the clean `<orchestrator_mode>` into the system prefix.
+    compact(&mut session).await;
+    turn(&mut session).await;
+    let requests = turn_requests(&stub).await;
+    let after = requests.last().expect("turn after compaction");
+    assert!(after[0].contains("<orchestrator_mode>"), "{}", after[0]);
+    assert_eq!(
+        diff_alerts(after, "orchestrator_mode_diff"),
+        Vec::<&String>::new()
     );
 }

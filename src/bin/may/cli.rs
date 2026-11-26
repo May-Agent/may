@@ -12,7 +12,7 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
-use may_agent::session::SessionLaunch;
+use may_agent::session::{ExecutionMode, SessionLaunch};
 use may_agent::update::Channel;
 
 /// Top-level CLI mode the binary resolves from argv.
@@ -39,6 +39,8 @@ pub enum CliMode {
     OneShot(OneShotArgs),
     /// Print the completion script of a shell.
     Completion(Shell),
+    /// Set a session's execution mode live.
+    Mode(ModeCliArgs),
     /// Replace this binary with the newest build of its channel and restart
     /// the daemon; the channel is switched first when one is given.
     Update {
@@ -51,6 +53,17 @@ pub enum CliMode {
 pub struct TuiArgs {
     /// How the TUI starts its sessions.
     pub launch: SessionLaunch,
+    /// Optional execution mode override for newly created sessions.
+    pub execution_mode: Option<ExecutionMode>,
+}
+
+/// Parsed `may mode --session <id> <mode>` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeCliArgs {
+    /// Session to update.
+    pub session_id: String,
+    /// Target execution mode.
+    pub execution_mode: ExecutionMode,
 }
 
 /// Parsed `may resume` invocation.
@@ -66,6 +79,7 @@ pub struct OneShotArgs {
     pub prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub execution_mode: Option<ExecutionMode>,
 }
 
 /// Parsed `may rest` invocation.
@@ -155,6 +169,9 @@ struct LaunchArgs {
     /// Open the TUI on a repository (`owner/repo` or a local path).
     #[arg(long, value_name = "OWNER/REPO|PATH", conflicts_with_all = ["model", "reasoning_effort", "prompt"])]
     repo: Option<String>,
+    /// Execution mode for the new session (`standard` or `orchestrator`).
+    #[arg(long, value_enum, ignore_case = true)]
+    mode: Option<ExecutionModeArg>,
     /// Model id for the one-shot run.
     #[arg(long, value_name = "ID", requires = "prompt")]
     model: Option<String>,
@@ -169,7 +186,20 @@ struct LaunchArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Open the TUI with repo-less chats (no directory, no repository).
-    Chat,
+    Chat {
+        /// Execution mode for the new session (`standard` or `orchestrator`).
+        #[arg(long, value_enum, ignore_case = true)]
+        mode: Option<ExecutionModeArg>,
+    },
+    /// Set an existing session's execution mode live.
+    Mode {
+        /// Session id to update.
+        #[arg(long, value_name = "ID")]
+        session: String,
+        /// Execution mode (`standard` or `orchestrator`).
+        #[arg(value_enum, ignore_case = true)]
+        mode: ExecutionModeArg,
+    },
     /// Reopen a session in the TUI.
     Resume {
         /// Session id; the most recently active session when omitted.
@@ -317,6 +347,23 @@ enum BrowserSubcommand {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExecutionModeArg {
+    /// Default direct execution.
+    Standard,
+    /// Experimental orchestrator mode: prompt-driven subagent delegation.
+    Orchestrator,
+}
+
+impl From<ExecutionModeArg> for ExecutionMode {
+    fn from(value: ExecutionModeArg) -> Self {
+        match value {
+            ExecutionModeArg::Standard => Self::Standard,
+            ExecutionModeArg::Orchestrator => Self::Orchestrator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum EffortArg {
     Low,
     Medium,
@@ -440,13 +487,16 @@ impl Cli {
             None => {
                 let LaunchArgs {
                     repo,
+                    mode,
                     model,
                     reasoning_effort,
                     prompt,
                 } = self.launch;
+                let execution_mode = mode.map(Into::into);
                 if prompt.is_empty() {
                     CliMode::Tui(TuiArgs {
                         launch: repo.map_or_else(SessionLaunch::default, SessionLaunch::Repo),
+                        execution_mode,
                     })
                 } else {
                     let prompt = joined(&prompt);
@@ -457,11 +507,17 @@ impl Cli {
                         prompt,
                         model,
                         reasoning_effort: reasoning_effort.map(Into::into),
+                        execution_mode,
                     })
                 }
             }
-            Some(Command::Chat) => CliMode::Tui(TuiArgs {
+            Some(Command::Chat { mode }) => CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::RepoLess,
+                execution_mode: mode.map(Into::into),
+            }),
+            Some(Command::Mode { session, mode }) => CliMode::Mode(ModeCliArgs {
+                session_id: session,
+                execution_mode: mode.into(),
             }),
             Some(Command::Resume { session }) => CliMode::Resume(ResumeArgs { session }),
             Some(Command::Gui { port }) => CliMode::Gui { port },
@@ -542,6 +598,7 @@ mod tests {
             prompt: prompt.to_string(),
             model: None,
             reasoning_effort: None,
+            execution_mode: None,
         }
     }
 
@@ -555,7 +612,8 @@ mod tests {
         assert_eq!(
             parse(&["may", "chat"]),
             CliMode::Tui(TuiArgs {
-                launch: SessionLaunch::RepoLess
+                launch: SessionLaunch::RepoLess,
+                execution_mode: None,
             })
         );
     }
@@ -565,7 +623,42 @@ mod tests {
         assert_eq!(
             parse(&["may", "--repo", "acme/app"]),
             CliMode::Tui(TuiArgs {
-                launch: SessionLaunch::Repo("acme/app".to_string())
+                launch: SessionLaunch::Repo("acme/app".to_string()),
+                execution_mode: None,
+            })
+        );
+    }
+
+    #[test]
+    fn execution_mode_flag_and_subcommand_parse() {
+        assert_eq!(
+            parse(&["may", "--mode", "orchestrator"]),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::default(),
+                execution_mode: Some(ExecutionMode::Orchestrator),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "chat", "--mode", "orchestrator"]),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::RepoLess,
+                execution_mode: Some(ExecutionMode::Orchestrator),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "--mode", "orchestrator", "fix", "lints"]),
+            CliMode::OneShot(OneShotArgs {
+                prompt: "fix lints".to_string(),
+                model: None,
+                reasoning_effort: None,
+                execution_mode: Some(ExecutionMode::Orchestrator),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "mode", "--session", "calm-river", "orchestrator"]),
+            CliMode::Mode(ModeCliArgs {
+                session_id: "calm-river".to_string(),
+                execution_mode: ExecutionMode::Orchestrator,
             })
         );
     }
@@ -735,6 +828,7 @@ mod tests {
             prompt: "inspect repo".to_string(),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some(ReasoningEffort::Low),
+            execution_mode: None,
         });
         assert_eq!(
             parse(&[
