@@ -420,6 +420,15 @@ impl PeerSwarmErrorBody {
     }
 }
 
+/// Candidate host currently claiming ownership of a board alongside its epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncumbentBoardHost<'a> {
+    /// Normalized machine name of the daemon currently hosting the board.
+    pub machine: &'a str,
+    /// Board generation currently hosted by `machine`.
+    pub board_epoch: u64,
+}
+
 /// Deterministically elects the single-writer Board Host for `group_key` from
 /// the voter machines of its reachable members.
 ///
@@ -458,6 +467,47 @@ pub fn elect_board_host<'a>(
         || any_cloud.then(|| CLOUD_MACHINE.to_string()),
         |winner| Some((*winner).to_string()),
     )
+}
+
+/// Resolves the authoritative Board Host for `group_key`, retaining an eligible
+/// incumbent host across reconciliations and falling back to [`elect_board_host`]
+/// only when no eligible incumbent remains.
+///
+/// Callers pass only incumbents that remain online, are not `draining`, and
+/// still have at least one active member or fronting voter in the group. When
+/// multiple incumbents claim the same group (e.g. after a transient partition),
+/// the highest `board_epoch` wins, breaking ties via [`elect_board_host`].
+#[must_use]
+pub fn resolve_board_host<'a>(
+    group_key: &str,
+    eligible_incumbents: impl IntoIterator<Item = IncumbentBoardHost<'a>>,
+    voter_machines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if !is_forge_group_key(group_key)
+        && let Some((machine, _)) = group_key.split_once(':')
+        && !machine.is_empty()
+        && !machine.starts_with('/')
+    {
+        return Some(machine.to_string());
+    }
+    let incumbents: Vec<IncumbentBoardHost<'a>> = eligible_incumbents
+        .into_iter()
+        .filter(|incumbent| !incumbent.machine.is_empty())
+        .collect();
+    if let Some(max_epoch) = incumbents.iter().map(|i| i.board_epoch).max() {
+        let mut tied: Vec<&str> = incumbents
+            .iter()
+            .filter(|i| i.board_epoch == max_epoch)
+            .map(|i| i.machine)
+            .collect();
+        tied.sort_unstable();
+        tied.dedup();
+        if let [single] = tied.as_slice() {
+            return Some((*single).to_string());
+        }
+        return elect_board_host(group_key, tied);
+    }
+    elect_board_host(group_key, voter_machines)
 }
 
 /// True when `group_key` names a canonical forge repository (`github:...` or `gitlab:...`).
@@ -550,6 +600,12 @@ pub trait SwarmTransport: Send + Sync + 'static {
     /// Normalized machine name of this daemon.
     fn local_machine(&self) -> String;
 
+    /// Whether this daemon is currently draining for shutdown/restart and must
+    /// step down from hosting boards.
+    fn is_draining(&self) -> bool {
+        false
+    }
+
     /// Collects reachable remote working sessions and mirrored remote board summaries.
     fn poll_world(&self) -> impl Future<Output = PeerSwarmWorld> + Send;
 
@@ -590,6 +646,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 trait SwarmTransportImpl: Send + Sync + 'static {
     fn local_machine(&self) -> String;
+    fn is_draining(&self) -> bool;
     fn poll_world(&self) -> BoxFuture<'_, PeerSwarmWorld>;
     fn notify_hosted_boards_changed(&self);
     fn read_remote_board<'a>(
@@ -617,6 +674,10 @@ trait SwarmTransportImpl: Send + Sync + 'static {
 impl<T: SwarmTransport> SwarmTransportImpl for T {
     fn local_machine(&self) -> String {
         SwarmTransport::local_machine(self)
+    }
+
+    fn is_draining(&self) -> bool {
+        SwarmTransport::is_draining(self)
     }
 
     fn poll_world(&self) -> BoxFuture<'_, PeerSwarmWorld> {
@@ -697,6 +758,12 @@ impl AnySwarmTransport {
     #[must_use]
     pub fn local_machine(&self) -> String {
         self.0.local_machine()
+    }
+
+    /// Whether this daemon is currently draining for shutdown/restart.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.0.is_draining()
     }
 
     /// Polls remote working sessions and mirrored boards.

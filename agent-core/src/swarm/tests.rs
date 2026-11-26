@@ -586,4 +586,46 @@ async fn forge_bound_worktrees_group_together_while_local_paths_stay_machine_sco
         super::elect_board_host("macbook:/tmp/demo", ["mac-mini", "macbook"]),
         Some("macbook".to_string())
     );
+
+    // Sticky resolution retains any eligible incumbent regardless of lexicographic rank or `cloud`.
+    assert_eq!(
+        super::resolve_board_host(
+            "github:May-Agent/may",
+            [super::IncumbentBoardHost {
+                machine: "macbook",
+                board_epoch: 1,
+            }],
+            ["apple", "macbook"],
+        ),
+        Some("macbook".to_string())
+    );
+    assert_eq!(
+        super::resolve_board_host(
+            "github:May-Agent/may",
+            [super::IncumbentBoardHost {
+                machine: "cloud",
+                board_epoch: 1,
+            }],
+            ["cloud", "macbook"],
+        ),
+        Some("cloud".to_string())
+    );
+    // Split-brain resolves to highest epoch first, then `elect_board_host`.
+    assert_eq!(
+        super::resolve_board_host(
+            "github:May-Agent/may",
+            [
+                super::IncumbentBoardHost {
+                    machine: "apple",
+                    board_epoch: 1,
+                },
+                super::IncumbentBoardHost {
+                    machine: "macbook",
+                    board_epoch: 2,
+                },
+            ],
+            ["apple", "macbook"],
+        ),
+        Some("macbook".to_string())
+    );
 }

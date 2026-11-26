@@ -76,8 +76,9 @@ pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 pub use session_intervals::SessionIntervals;
 pub use session_run::RunFence;
 pub use swarm::{
-    DissolvedSteerAction, NewSwarmMessage, SwarmBoardRow, SwarmMessageKind, SwarmMessageRow,
-    SwarmReadMode, SwarmReadResult, SwarmSessionStateRow, SwarmUnreadStatus,
+    DissolvedSteerAction, NewSwarmBufferedCloudNotice, NewSwarmMessage, SwarmBoardRow,
+    SwarmBufferedCloudNoticeRow, SwarmMessageKind, SwarmMessageRow, SwarmReadMode, SwarmReadResult,
+    SwarmSessionStateRow, SwarmUnreadStatus,
 };
 pub use transcript_rows::TranscriptRows;
 
