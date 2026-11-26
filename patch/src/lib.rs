@@ -308,6 +308,7 @@ fn write_file(base: &Path, path: &str, content: &str) -> Result<(), PatchError> 
     let full = base.join(path);
     if let Some(parent) = full.parent()
         && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
     {
         fs::create_dir_all(parent).map_err(|source| PatchError::Io {
             path: path.to_owned(),
@@ -798,5 +799,31 @@ mod tests {
         let patch = "*** Begin Patch\n*** Update File: none.txt\n@@\n-c d\n+x\n*** End Patch";
         let error = apply_patch_text(patch, dir.path()).expect_err("conflict");
         assert!(matches!(error, PatchError::Conflict { .. }), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patching_top_level_file_under_read_only_outer_parent_skips_mkdir_on_base() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outer = tempdir().expect("outer tempdir");
+        let work = outer.path().join("session");
+        fs::create_dir(&work).expect("create session dir");
+        write(&work, "root.txt", "alpha\n");
+
+        // Lock outer parent to 0o555 to mirror Linux Landlock where the
+        // session directory is writable while its parent (`sessions/`) denies
+        // `MakeDir` (`mkdir(work)` returns `EACCES` before `EEXIST`).
+        fs::set_permissions(outer.path(), fs::Permissions::from_mode(0o555))
+            .expect("lock outer dir");
+        let result = apply_patch_text(
+            "*** Begin Patch\n*** Update File: root.txt\n@@\n-alpha\n+alpha\n+beta\n*** End Patch",
+            &work,
+        );
+        fs::set_permissions(outer.path(), fs::Permissions::from_mode(0o755))
+            .expect("restore outer dir");
+
+        result.expect("top-level patch succeeds without calling mkdir on existing base");
+        assert_eq!(read(&work, "root.txt"), "alpha\nbeta\n");
     }
 }
