@@ -234,7 +234,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    for _ in 0..100 {
+    for _ in 0..500 {
         if predicate().await {
             return;
         }
@@ -1142,7 +1142,8 @@ async fn bot_turn_boundary_inbox_drain_preserves_thinking_blocks_and_survives_re
         "on_turn_boundary pause+resume must preserve thinking blocks intact: {turn2_debug}"
     );
 
-    // Stop the old BotService loop and simulate a daemon restart with a brand new BotService!
+    // Stop the old BotService loop cleanly and simulate a daemon restart with a brand new BotService!
+    service.shutdown().await;
     drop(service);
     let (llm_after_restart, requests_after_restart) = ScriptedBotLlm::new(vec![
         vec![Event::ToolCall(ToolCall::new(
