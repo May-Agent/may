@@ -1,0 +1,4 @@
+{% for item in items %}[{{ item.ts_utc }}] {{ item.kind_label }}{% if let Some(sender) = item.sender_label %} from {{ sender }}{% endif %}:
+{{ item.body }}
+{% if !loop.last %}
+{% endif %}{% endfor %}

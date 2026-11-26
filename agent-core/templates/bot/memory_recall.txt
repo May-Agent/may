@@ -1,0 +1,6 @@
+<memory-recall>
+Relevant long-term memories recalled for the current inbox event:
+{% for hit in hits %}
+- {{ hit.path }}{% if hit.updated %} [UPDATED]{% endif %}:
+{{ hit.content }}
+{% endfor %}</memory-recall>

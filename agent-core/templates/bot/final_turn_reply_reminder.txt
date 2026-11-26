@@ -1,0 +1,1 @@
+This run consumed a direct user message, but you have not called `send_message` with `to: "user"` yet. Plain text stays in internal run trace and is never shown to the user. Send your reply to the user with `send_message(to="user", ...)` before ending the run.

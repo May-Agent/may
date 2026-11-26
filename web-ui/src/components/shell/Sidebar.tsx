@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import {
   Archive,
+  Bot,
   ChevronDown,
   ChevronRight,
   Folder,
@@ -65,6 +66,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const loading = activeProfileId !== null && scoped === null;
 
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
+  const botsActive = location.pathname.startsWith('/bots');
   const settingsActive = location.pathname.startsWith('/settings');
   const archiveActive = location.pathname.endsWith('/archive');
 
@@ -356,6 +358,17 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
             )}
           </Link>
         )}
+        <Link
+          to="/bots"
+          aria-current={botsActive ? 'page' : undefined}
+          className={cn(
+            'flex h-7 items-center gap-2 rounded-md px-2 text-[13px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground touch:h-11',
+            botsActive && 'bg-accent text-foreground',
+          )}
+        >
+          <Bot className="size-4" strokeWidth={1.75} aria-hidden />
+          <span className="flex-1">Bots</span>
+        </Link>
         <Link
           to="/settings"
           aria-current={settingsActive ? 'page' : undefined}

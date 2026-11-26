@@ -1,0 +1,1 @@
+Delivered message to {{ target_kind }} {{ target_label }}{% if let Some(note) = note %} ({{ note }}){% endif %}.

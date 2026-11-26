@@ -3,6 +3,7 @@ import { SignInRequired } from '@/components/auth/SignInRequired';
 import { useAuthGate } from '@/lib/stores/authGate';
 import { AppShell } from '@/components/shell/AppShell';
 import { ArchivePage } from '@/routes/ArchivePage';
+import { BotsPage } from '@/routes/BotsPage';
 import { HomePage } from '@/routes/HomePage';
 import { SessionPage } from '@/routes/SessionPage';
 import { SettingsPage } from '@/routes/SettingsPage';
@@ -20,6 +21,7 @@ export function App() {
           <Route path="/p/:profileId" element={<HomePage />} />
           <Route path="/p/:profileId/archive" element={<ArchivePage />} />
           <Route path="/p/:profileId/s/:sessionId" element={<SessionPage />} />
+          <Route path="/bots" element={<BotsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<ProfileRedirect />} />
         </Route>

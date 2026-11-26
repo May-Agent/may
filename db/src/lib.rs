@@ -3,6 +3,7 @@
 //!
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
+mod bot;
 mod cache_misses;
 mod checkout_state;
 mod ci;
@@ -50,6 +51,10 @@ use skyzen_services::sql::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use may_protocol::permission::PermissionHistoryMode;
 use sql as db_sql;
 
+pub use bot::{
+    BotDelegateMessageRow, BotRow, BotStoreFactRow, NewBotApproval, NewBotDelegate,
+    NewBotInboxEntry, NewBotRow, NewBotSchedule, StoredBotContextSnapshot, UpdateBotRow,
+};
 pub use cache_misses::PromptCacheRequest;
 pub use ci::{CiBaselineRow, CiFindingRow, CiJobRow, CiPrRunRow, CiStepRow, CiTestRow, NewCiJob};
 pub use cloud_session::CloudSessionRow;

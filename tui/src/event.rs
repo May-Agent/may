@@ -64,6 +64,25 @@ pub enum AppEvent {
     SessionsLoaded(Result<Vec<SessionSummary>, TuiError>),
     /// Installed and connected ACP agents listed for the `/connect` picker
     AcpAgentsLoaded(Result<may_client::client::acp::AcpAgentsResponse, TuiError>),
+    /// Resident May Bots loaded for `/bot`.
+    BotsLoaded(Result<Vec<may_protocol::bot::BotSummary>, String>),
+    /// Details for the selected May Bot loaded.
+    BotDetailsLoaded {
+        /// Target bot id.
+        bot_id: String,
+        /// User-visible conversation messages.
+        messages: Vec<may_protocol::bot::BotChatMessage>,
+        /// Internal activity trace entries.
+        trace: Vec<may_protocol::bot::BotTraceEntry>,
+        /// Approval requests.
+        approvals: Vec<may_protocol::bot::BotApprovalItem>,
+        /// Hierarchical memory tree root.
+        memory_tree: Option<may_protocol::bot::BotMemoryNode>,
+        /// `memory.git` commit history.
+        memory_commits: Vec<may_protocol::bot::BotMemoryCommit>,
+    },
+    /// Live `bot_*` event pushed over `/api/events`.
+    BotSse(may_protocol::bot::BotSseEvent),
     /// A `/connect` request finished
     AcpConnectFinished(Result<super::connect::ConnectOutcome, TuiError>),
     /// Claude Code transcripts listed for the `/resume-claude` picker
@@ -328,6 +347,9 @@ impl AppEvent {
             Self::Mouse(_) => "mouse",
             Self::SessionsLoaded(_) => "sessions_loaded",
             Self::AcpAgentsLoaded(_) => "acp_agents_loaded",
+            Self::BotsLoaded(_) => "bots_loaded",
+            Self::BotDetailsLoaded { .. } => "bot_details_loaded",
+            Self::BotSse(_) => "bot_sse",
             Self::AcpConnectFinished(_) => "acp_connect_finished",
             Self::ResumeSessionsLoaded(_) => "resume_sessions_loaded",
             Self::SessionDeleted { .. } => "session_deleted",

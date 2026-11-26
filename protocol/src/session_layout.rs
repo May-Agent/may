@@ -20,6 +20,12 @@ pub struct ProfileHomePaths {
     root: PathBuf,
 }
 
+/// Canonical paths for one May Bot under `~/.may/bots/<bot_id>/`.
+#[derive(Debug, Clone)]
+pub struct BotPaths {
+    root: PathBuf,
+}
+
 impl MayHomePaths {
     /// Layout rooted at `root` (typically `~/.may`).
     #[must_use]
@@ -187,6 +193,62 @@ impl MayHomePaths {
         ProfileHomePaths {
             root: self.profiles_dir().join(profile_id),
         }
+    }
+
+    /// Directory holding all May Bots (`~/.may/bots`).
+    #[must_use]
+    pub fn bots_dir(&self) -> PathBuf {
+        self.root.join("bots")
+    }
+
+    /// Path layout for one May Bot (`~/.may/bots/<bot_id>`).
+    #[must_use]
+    pub fn bot_paths(&self, bot_id: &str) -> BotPaths {
+        BotPaths::new(self.bots_dir().join(bot_id))
+    }
+}
+
+impl BotPaths {
+    /// Construct layout rooted at `~/.may/bots/<bot_id>`.
+    #[must_use]
+    pub const fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Bot root directory (`~/.may/bots/<bot_id>`).
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Live published Markdown memory tree (`~/.may/bots/<bot_id>/memory`).
+    #[must_use]
+    pub fn memory_dir(&self) -> PathBuf {
+        self.root.join("memory")
+    }
+
+    /// Separated git repository storing 1-to-1 memory provenance commits (`~/.may/bots/<bot_id>/memory.git`).
+    #[must_use]
+    pub fn memory_git_dir(&self) -> PathBuf {
+        self.root.join("memory.git")
+    }
+
+    /// Isolated staging copy edited by the curator (`~/.may/bots/<bot_id>/memory.staging`).
+    #[must_use]
+    pub fn memory_staging_dir(&self) -> PathBuf {
+        self.root.join("memory.staging")
+    }
+
+    /// Directory holding delegated workers (`~/.may/bots/<bot_id>/delegates`).
+    #[must_use]
+    pub fn delegates_dir(&self) -> PathBuf {
+        self.root.join("delegates")
+    }
+
+    /// Working directory for one delegated worker (`~/.may/bots/<bot_id>/delegates/<agent_id>`).
+    #[must_use]
+    pub fn delegate_dir(&self, agent_id: &str) -> PathBuf {
+        self.delegates_dir().join(agent_id)
     }
 }
 

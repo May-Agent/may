@@ -128,12 +128,27 @@ impl Publication<'_> {
     }
 }
 
-/// Asks the user before the agent publishes, as the live `[issue_approval]`
-/// settings say.
+/// Asks the user (or a supervising May Bot) before the agent publishes, as the
+/// live `[issue_approval]` settings say.
 #[derive(Debug, Clone)]
 pub struct PublishGate {
     config: Arc<ArcSwap<MayConfig>>,
     approver: PermissionApprover,
+    /// Optional bot approval triage route for delegated workers and supervised sessions.
+    bot_route: Option<BotPublishRoute>,
+}
+
+/// Routes a publication gate through a supervising May Bot's `decide_approval`.
+#[derive(Debug, Clone)]
+pub struct BotPublishRoute {
+    /// Owning bot's approval router.
+    pub router: crate::bot::BotApprovalRouter,
+    /// Owning bot id.
+    pub bot_id: String,
+    /// `"delegate"` or `"session"`.
+    pub requester_kind: String,
+    /// Delegated worker `agent_id` or supervised `session_id`.
+    pub requester_id: String,
 }
 
 impl PublishGate {
@@ -141,7 +156,19 @@ impl PublishGate {
     /// `approver`.
     #[must_use]
     pub const fn new(config: Arc<ArcSwap<MayConfig>>, approver: PermissionApprover) -> Self {
-        Self { config, approver }
+        Self {
+            config,
+            approver,
+            bot_route: None,
+        }
+    }
+
+    /// Routes gated publications through `route` (the supervising May Bot's
+    /// `decide_approval`) before interrupting the user.
+    #[must_use]
+    pub fn with_bot_route(mut self, route: BotPublishRoute) -> Self {
+        self.bot_route = Some(route);
+        self
     }
 
     fn settings(&self) -> IssueApprovalConfig {
@@ -261,10 +288,32 @@ impl PublishGate {
         let text = publication
             .render(repository)
             .unwrap_or_else(|error| panic!("failed to render the publish request: {error}"));
-        let reason = match self.approver.request_publication(text, on_timeout).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => "the user denied it".to_string(),
-            Err(error) => error.to_string(),
+        let reason = if let Some(route) = &self.bot_route {
+            let pause = self.approver.approval_pause();
+            match route
+                .router
+                .request(
+                    &route.bot_id,
+                    &route.requester_kind,
+                    &route.requester_id,
+                    may_protocol::bot::BotApprovalGate::Publish,
+                    &text,
+                    None,
+                    &pause,
+                    None,
+                )
+                .await
+            {
+                Ok(crate::bot::ApprovalOutcome::Approved) => return Ok(()),
+                Ok(crate::bot::ApprovalOutcome::Denied(reason)) => reason,
+                Err(error) => error.to_string(),
+            }
+        } else {
+            match self.approver.request_publication(text, on_timeout).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => "the user denied it".to_string(),
+                Err(error) => error.to_string(),
+            }
         };
         Err(PublishDenied::new(
             PublishDeniedText { reason: &reason }

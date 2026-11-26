@@ -1,0 +1,8 @@
+Target: {{ kind }} `{{ id }}` ({{ name }})
+State: {{ state }}
+Elapsed: {{ elapsed_ms }} ms
+Tokens: {{ prompt_tokens }} prompt / {{ completion_tokens }} completion
+{% if let Some(cmd) = active_command %}Active command: {{ cmd }}
+{% endif %}Recent transcript ({{ entries.len() }} entries):
+{% for entry in entries %}[{{ entry.ts_utc }}] {{ entry.role }}: {{ entry.content }}
+{% endfor %}

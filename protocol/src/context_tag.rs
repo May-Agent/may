@@ -56,6 +56,17 @@ pub mod tag {
     /// The user-approved workspace directories.
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
+    /// May Bot identity and inbox-loop operating contract.
+    pub const BOT_IDENTITY: InstructionSlot = InstructionSlot::new("bot_identity");
+    /// May Bot persona overlay.
+    pub const BOT_PERSONA: InstructionSlot = InstructionSlot::new("bot_persona");
+    /// May Bot tool guidance.
+    pub const BOT_TOOLS: InstructionSlot = InstructionSlot::new("bot_tools");
+    /// May Bot time and timezone awareness.
+    pub const BOT_TIME: InstructionSlot = InstructionSlot::new("bot_time");
+    /// May Bot resident hierarchical `MEMORY.md` index (maintained via `LiveContent`).
+    pub const BOT_MEMORY_INDEX: ExternalSlot = ExternalSlot::new("bot_memory_index");
+
     /// The instruction slots May writes, in prompt order.
     pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
         IDENTITY,
@@ -120,6 +131,16 @@ pub mod tag {
                 HANDOFF_AGENTS_MD,
                 WORKSPACE_WORKDIRS,
             ],
+        )
+    }
+
+    /// The system prompt layout for a May Bot: static instructions first,
+    /// resident hierarchical `MEMORY.md` index last in an [`ExternalSlot`].
+    #[must_use]
+    pub fn bot_layout() -> SystemLayout {
+        SystemLayout::new(
+            [BOT_IDENTITY, BOT_PERSONA, BOT_TOOLS, BOT_TIME],
+            [BOT_MEMORY_INDEX],
         )
     }
 }
