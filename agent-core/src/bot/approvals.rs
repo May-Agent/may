@@ -596,11 +596,14 @@ mod tests {
 
         let wakes = Arc::new(AtomicUsize::new(0));
         let wakes_clone = wakes.clone();
+        let wake_notify = Arc::new(tokio::sync::Notify::new());
+        let wake_notify_clone = wake_notify.clone();
         let router = BotApprovalRouter::new(
             db.clone(),
             bus,
             Arc::new(move |_| {
                 wakes_clone.fetch_add(1, Ordering::SeqCst);
+                wake_notify_clone.notify_waiters();
             }),
             Arc::new(|_| {}),
         )
@@ -609,6 +612,9 @@ mod tests {
         let pause = ApprovalPause::new();
         let req_router = router.clone();
         let req_pause = pause.clone();
+        let notified = wake_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let waiter = tokio::spawn(async move {
             req_router
                 .request(
@@ -624,7 +630,9 @@ mod tests {
                 .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+            .await
+            .expect("bot wake callback must fire within 5s");
         assert_eq!(
             wakes.load(Ordering::SeqCst),
             1,
