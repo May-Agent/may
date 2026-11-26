@@ -6523,6 +6523,7 @@ dependencies = [
  "mime_guess",
  "nucleo",
  "objc2-app-kit",
+ "objc2-core-graphics",
  "objc2-foundation",
  "open",
  "partial-json-fixer",

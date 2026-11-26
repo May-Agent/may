@@ -331,12 +331,11 @@ async fn async_main() -> anyhow::Result<()> {
         EnableBracketedPaste,
         EnableFocusChange,
         EnableMouseCapture,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        )
+        // Keep REPORT_ALL_KEYS_AS_ESCAPE_CODES off: crossterm does not support
+        // REPORT_ASSOCIATED_TEXT, so enabling it causes Kitty-protocol
+        // terminals to encode IME candidate commits (e.g. pressing `1`) as raw
+        // keycodes and drop the committed UTF-8 text.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1019,9 +1018,11 @@ where
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
+            let hover_modifier_changed = app.refresh_host_open_modifiers();
             // The fireworks redraw every tick, and once more on the tick
             // that ends them so no spark stays on screen.
-            needs_draw = app.processing
+            needs_draw = hover_modifier_changed
+                || app.processing
                 || app.new_year.animating()
                 || app.compaction.is_holding()
                 || last_draw.elapsed() >= std::time::Duration::from_secs(1);
