@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,12 +11,12 @@ use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
 use aither_dap::{
     AnyDapTransport, ConnectMode, DEFAULT_EXECUTION_TIMEOUT, DapError, DapTransport, DebugArgs,
     DebugNotification, DebugResult, DebugSession, DebugSessionConfig, DebugSessionState,
-    DebugStatus, DebugToolError, ExecutionOutcome, FrameReader, ProtocolMessage, StdioTransport,
-    TcpTransport, TerminationSummary,
+    DebugStatus, DebugToolError, ExecutionOutcome, FrameReader, OutputBuffer, OutputCategory,
+    OutputSnapshot, ProtocolMessage, StdioTransport, TcpTransport, TerminationSummary,
 };
 use aither_sandbox::{
-    Interpreter, Job, Jobs, MediaResolution, Pipe, SandboxMode, SandboxedChild, ServiceArgs,
-    SpawnSpec, Stdio,
+    Interpreter, Job, JobRead, Jobs, MediaResolution, Pipe, SandboxMode, SandboxedChild,
+    ServiceArgs, SpawnSpec, Stdio,
 };
 use askama::Template;
 use async_channel::{Receiver, Sender};
@@ -132,13 +132,34 @@ impl Approver for InheritedUnsandboxedApprover {
     }
 }
 
+#[derive(Default)]
+struct JobStdoutMirror {
+    cursor: usize,
+    buffer: OutputBuffer,
+}
+
 /// Holds a reference to the `JobRegistry` background job backing a launched or attached target.
 #[derive(Clone)]
 struct OwnedDebugJob {
     jobs: Jobs,
     job_pid: u32,
-    /// Holds the job watch alive without terminating on drop (for `detach`).
-    _job: Job,
+    /// Holds the job watch alive without terminating on drop (for `detach`)
+    /// and reads target stdout captured by `JobRegistry`.
+    job: Job,
+    /// Incremental mirror of `JobRegistry` stdout so repeated `debug output`
+    /// reads work identically to adapter-emitted `output` events.
+    stdout_mirror: Arc<Mutex<JobStdoutMirror>>,
+}
+
+impl OwnedDebugJob {
+    fn new(jobs: Jobs, job_pid: u32, job: Job) -> Self {
+        Self {
+            jobs,
+            job_pid,
+            job,
+            stdout_mirror: Arc::new(Mutex::new(JobStdoutMirror::default())),
+        }
+    }
 }
 
 struct ActiveDebugSession {
@@ -343,19 +364,36 @@ impl DebugBroker {
         owner: &DebugOwner,
         args: &DebugArgs,
     ) -> Result<DebugResult, DebugToolError> {
-        let session = {
+        let (session, owned_job) = {
             let guard = self.state.lock().await;
-            guard.sessions.get(owner).map(|e| e.session.clone())
+            guard
+                .sessions
+                .get(owner)
+                .map(|e| (e.session.clone(), e.owned_job.clone()))
         }
         .ok_or_else(|| {
             DebugToolError::request_failed(
                 "no active debug session; start one with `debug launch`, `debug attach`, or `debug connect`",
             )
         })?;
-        session
+        let mut result = session
             .handle_command(args)
             .await
-            .map_err(|err| DebugToolError::request_failed(err.to_string()))
+            .map_err(|err| DebugToolError::request_failed(err.to_string()))?;
+        if let (
+            DebugArgs::Output {
+                category,
+                tail,
+                clear,
+            },
+            DebugResult::Output(snapshot),
+            Some(owned),
+        ) = (args, &mut result, owned_job.as_ref())
+        {
+            supplement_job_stdout(snapshot, owned, category.unwrap_or_default(), *tail, *clear)
+                .await;
+        }
+        Ok(result)
     }
 
     async fn handle_detach(&self, owner: &DebugOwner) -> Result<DebugResult, DebugToolError> {
@@ -434,7 +472,6 @@ impl DebugBroker {
             &params.args,
             effective_cwd.as_deref(),
             &params.env,
-            params.stop_on_entry,
         );
         let job = spawn_sandboxed_target(
             &shell,
@@ -444,12 +481,13 @@ impl DebugBroker {
         )
         .await?;
         let job_pid = job.pid();
-        let attach_pid = wait_for_debuggee_pid(job_pid, Duration::from_secs(2)).await;
+        let resolved_program =
+            resolve_launch_program_path(&params.program, effective_cwd.as_deref()).await;
 
         let transport = spawn_host_stdio_adapter(&resolved)?;
         let config = DebugSessionConfig::new(resolved.kind.adapter_id())
             .with_target(params.program.clone())
-            .with_target_pid(attach_pid);
+            .with_target_pid(job_pid);
         let (session, notif_rx) = DebugSession::start(&TokioGlobal, transport, config)
             .await
             .map_err(|err| {
@@ -463,14 +501,22 @@ impl DebugBroker {
                 ))
             })?;
 
-        let attach_args = native_attach_payload(resolved.kind, attach_pid);
-        let mut outcome = match session.attach(attach_args, params.timeout).await {
+        let mut outcome = match attach_launched_native_target(
+            &session,
+            resolved.kind,
+            &job,
+            job_pid,
+            &resolved_program,
+            params.timeout,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 let _ = session.terminate().await;
                 let _ = shell.jobs().kill(job_pid).await;
                 return Err(DebugToolError::request_failed(format!(
-                    "failed to attach {} to sandboxed target pid {attach_pid}: {err}",
+                    "failed to attach {} to sandboxed target pid {job_pid}: {err}",
                     resolved.kind.adapter_id()
                 )));
             }
@@ -483,11 +529,7 @@ impl DebugBroker {
             outcome = continued;
         }
 
-        let owned_job = OwnedDebugJob {
-            jobs: shell.jobs(),
-            job_pid,
-            _job: job,
-        };
+        let owned_job = OwnedDebugJob::new(shell.jobs(), job_pid, job);
         self.install_session(
             ctx.owner,
             session,
@@ -565,11 +607,7 @@ impl DebugBroker {
             }
         };
 
-        let owned_job = OwnedDebugJob {
-            jobs: shell.jobs(),
-            job_pid,
-            _job: job,
-        };
+        let owned_job = OwnedDebugJob::new(shell.jobs(), job_pid, job);
         self.install_session(
             ctx.owner,
             session,
@@ -810,25 +848,76 @@ async fn lookup_owned_job(
     if let Some(shell) = shell {
         let jobs = shell.jobs();
         if let Some(job) = jobs.get(pid).await {
-            return Some(OwnedDebugJob {
-                jobs,
-                job_pid: pid,
-                _job: job,
-            });
+            return Some(OwnedDebugJob::new(jobs, pid, job));
         }
     }
     if let Some(prior) = prior_jobs {
         for jobs in prior.handles() {
             if let Some(job) = jobs.get(pid).await {
-                return Some(OwnedDebugJob {
-                    jobs,
-                    job_pid: pid,
-                    _job: job,
-                });
+                return Some(OwnedDebugJob::new(jobs, pid, job));
             }
         }
     }
     None
+}
+
+/// Maximum bytes read from `JobRegistry` stdout per `debug output` call.
+const MAX_SUPPLEMENT_STDOUT_BYTES: usize = 64 * 1024;
+
+/// Supplements DAP `output` snapshots with target stdout captured by `JobRegistry`
+/// when a host-attached native debuggee's standard output flows into its `Shell` job
+/// rather than DAP `output` events.
+async fn supplement_job_stdout(
+    snapshot: &mut OutputSnapshot,
+    owned: &OwnedDebugJob,
+    category: OutputCategory,
+    tail: Option<usize>,
+    clear: bool,
+) {
+    if !matches!(category, OutputCategory::All | OutputCategory::Stdout) {
+        return;
+    }
+    if snapshot
+        .entries
+        .iter()
+        .any(|entry| entry.category == OutputCategory::Stdout)
+    {
+        return;
+    }
+    let mut mirror = owned.stdout_mirror.lock().await;
+    if let Ok(JobRead::Delta(delta)) = owned
+        .job
+        .read(mirror.cursor, MAX_SUPPLEMENT_STDOUT_BYTES)
+        .await
+    {
+        mirror.cursor = delta.cursor;
+        if !delta.bytes.is_empty() {
+            let text = String::from_utf8_lossy(&delta.bytes);
+            for line in text.split_inclusive('\n').filter(|line| !line.is_empty()) {
+                mirror
+                    .buffer
+                    .push(OutputCategory::Stdout, (*line).to_owned());
+            }
+        }
+    }
+    let mirrored = mirror.buffer.snapshot(OutputCategory::Stdout, tail, clear);
+    drop(mirror);
+    if mirrored.entries.is_empty() {
+        return;
+    }
+    snapshot.dropped_entries = snapshot
+        .dropped_entries
+        .saturating_add(mirrored.dropped_entries);
+    snapshot.dropped_bytes = snapshot
+        .dropped_bytes
+        .saturating_add(mirrored.dropped_bytes);
+    snapshot.entries.extend(mirrored.entries);
+    if let Some(limit) = tail
+        && snapshot.entries.len() > limit
+    {
+        let extra = snapshot.entries.len() - limit;
+        snapshot.entries.drain(..extra);
+    }
 }
 
 async fn spawn_sandboxed_target(
@@ -890,7 +979,6 @@ fn build_native_launch_script(
     args: &[String],
     cwd: Option<&str>,
     env: &[String],
-    stop_on_entry: bool,
 ) -> String {
     let mut parts = Vec::new();
     if let Some(dir) = cwd
@@ -898,13 +986,9 @@ fn build_native_launch_script(
     {
         parts.push(format!("cd {}", shell_escape::escape(Cow::Borrowed(dir))));
     }
-    #[cfg(target_os = "linux")]
-    if stop_on_entry {
-        // Pause before exec on Linux so host-side lldb-dap/gdb can attach before main runs.
-        parts.push("kill -STOP $$".to_owned());
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = stop_on_entry;
+    // Gate `exec` on stdin so short-lived targets never run and exit before the
+    // host debug adapter completes initialization and prepares to catch entry.
+    parts.push("{ IFS= read -r _ || true; }".to_owned());
 
     let mut exec_tokens = Vec::new();
     for kv in env {
@@ -921,6 +1005,76 @@ fn build_native_launch_script(
     }
     parts.push(exec_tokens.join(" "));
     parts.join(" && ")
+}
+
+async fn resolve_launch_program_path(program: &str, cwd: Option<&str>) -> PathBuf {
+    let candidate = Path::new(program);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else if let Some(dir) = cwd
+        && !dir.trim().is_empty()
+    {
+        Path::new(dir).join(candidate)
+    } else {
+        candidate.to_path_buf()
+    };
+    async_fs::canonicalize(&joined).await.unwrap_or(joined)
+}
+
+async fn attach_launched_native_target(
+    session: &DebugSession,
+    kind: AdapterKind,
+    job: &Job,
+    job_pid: u32,
+    resolved_program: &Path,
+    timeout: Duration,
+) -> Result<ExecutionOutcome, DapError> {
+    let handshake_timeout = timeout.max(Duration::from_secs(5));
+
+    #[cfg(target_os = "macos")]
+    if kind == AdapterKind::LldbDap {
+        let release_job = job.clone();
+        tokio::spawn(async move {
+            async_io::Timer::after(Duration::from_millis(120)).await;
+            let _ = release_job.input(b"\n".to_vec()).await;
+        });
+        return session
+            .attach(
+                json!({
+                    "program": resolved_program.display().to_string(),
+                    "waitFor": true,
+                    "stopOnEntry": true,
+                }),
+                handshake_timeout,
+            )
+            .await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = resolved_program;
+
+    let attach_args = match kind {
+        AdapterKind::DelveDap => native_attach_payload(kind, job_pid),
+        _ => json!({
+            "pid": job_pid,
+            "stopOnEntry": true,
+        }),
+    };
+    let outcome = session.attach(attach_args, handshake_timeout).await?;
+    match outcome {
+        ExecutionOutcome::Stopped(_) => {
+            let release_job = job.clone();
+            tokio::spawn(async move {
+                async_io::Timer::after(Duration::from_millis(40)).await;
+                let _ = release_job.input(b"\n".to_vec()).await;
+            });
+            session.continue_execution(None, handshake_timeout).await
+        }
+        other => {
+            let _ = job.input(b"\n".to_vec()).await;
+            Ok(other)
+        }
+    }
 }
 
 fn build_debugpy_launch_script(
@@ -964,17 +1118,6 @@ fn build_debugpy_launch_script(
     }
     parts.push(exec_tokens.join(" "));
     parts.join(" && ")
-}
-
-async fn wait_for_debuggee_pid(job_pid: u32, max_wait: Duration) -> u32 {
-    let deadline = Instant::now() + max_wait;
-    loop {
-        let resolved = resolve_debuggee_pid(job_pid).await;
-        if resolved != job_pid || Instant::now() >= deadline {
-            return resolved;
-        }
-        async_io::Timer::after(STARTUP_POLL_INTERVAL).await;
-    }
 }
 
 async fn connect_with_retry(
@@ -1183,6 +1326,9 @@ mod sandbox_tests {
     /// and that `terminate` tears down the owning job through `Jobs`.
     #[tokio::test]
     async fn host_broker_attaches_to_heel_sandboxed_native_target_and_tracks_job_registry() {
+        if !macos_developer_mode_enabled().await {
+            return;
+        }
         let Ok(resolved) = resolve_native_adapter(AdapterKind::LldbDap, true).await else {
             // Skip cleanly on hosts without lldb-dap or gdb installed.
             return;
@@ -1288,10 +1434,14 @@ int main(void) {{
                 },
             )
             .await;
-        let Ok(attached) = attached else {
-            // Some CI containers lack ptrace permissions on the host runner itself.
-            let _ = shell.jobs().kill(pid).await;
-            return;
+        let attached = match attached {
+            Ok(res) => res,
+            Err(err) if is_host_ptrace_permission_denied(&err.to_string()) => {
+                // Unprivileged containers or hosts without developer-mode ptrace grant.
+                let _ = shell.jobs().kill(pid).await;
+                return;
+            }
+            Err(err) => panic!("host adapter attach failed unexpectedly: {err}"),
         };
         assert!(
             matches!(
@@ -1339,6 +1489,193 @@ int main(void) {{
             async_io::Timer::after(Duration::from_millis(50)).await;
         }
         assert!(stopped, "terminate must stop the owning JobRegistry job");
+    }
+
+    fn is_host_ptrace_permission_denied(msg: &str) -> bool {
+        let lower = msg.to_ascii_lowercase();
+        lower.contains("operation not permitted")
+            || lower.contains("permission denied")
+            || lower.contains("cannot get permission to debug")
+            || lower.contains("eperm")
+            || lower.contains("ptrace")
+    }
+
+    async fn macos_developer_mode_enabled() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Ok(out) = async_process::Command::new("/usr/sbin/DevToolsSecurity")
+                .arg("-status")
+                .output()
+                .await
+            else {
+                return false;
+            };
+            String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .contains("enabled")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
+
+    /// Verifies that a short-lived native C program launched via `DebugArgs::Launch`
+    /// with `stop_on_entry: true` stops before `main` exits, binds source breakpoints,
+    /// evaluates frame expressions, and surfaces `JobRegistry` stdout via `debug output`.
+    #[tokio::test]
+    async fn host_broker_launches_short_lived_sandboxed_target_and_reads_job_stdout() {
+        if !macos_developer_mode_enabled().await {
+            return;
+        }
+        let Ok(resolved) = resolve_native_adapter(AdapterKind::LldbDap, true).await else {
+            return;
+        };
+        let Ok(cc) = which::which("cc") else {
+            return;
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_root = temp.path().join("session");
+        std::fs::create_dir_all(&session_root).expect("session dir");
+
+        let src_path = session_root.join("short_calc.c");
+        let bin_path = session_root.join("short_calc");
+        std::fs::write(
+            &src_path,
+            r#"#include <stdio.h>
+int compute_twice(int x) {
+    int doubled = x * 2;
+    printf("STEP_STDOUT:%d\n", doubled);
+    fflush(stdout);
+    return doubled;
+}
+int main(void) {
+    return compute_twice(60) == 120 ? 0 : 1;
+}
+"#,
+        )
+        .expect("write short_calc.c");
+
+        let compiled = async_process::Command::new(cc)
+            .args([
+                "-g",
+                "-O0",
+                src_path.to_str().unwrap(),
+                "-o",
+                bin_path.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .expect("compile short_calc.c");
+        assert!(compiled.status.success());
+
+        let terminal = TestTerminal::new(&session_root).await;
+        let shell = SessionShell::clone(terminal.shell());
+        let broker = DebugBroker::new();
+        let ctx = DebugCallContext {
+            owner: DebugOwner::MainSession("heel-launch-short".to_owned()),
+            shell: Some(shell),
+            working_dir: Some(session_root.display().to_string()),
+            launch_mode: SandboxMode::Sandboxed,
+            session_prompts: None,
+            prior_jobs: None,
+        };
+
+        let launched = broker
+            .handle(
+                ctx.clone(),
+                DebugArgs::Launch {
+                    program: bin_path.display().to_string(),
+                    adapter: Some(resolved.kind.adapter_id().to_owned()),
+                    cwd: Some(session_root.display().to_string()),
+                    env: Vec::new(),
+                    stop_on_entry: true,
+                    timeout_ms: Some(5000),
+                    args: Vec::new(),
+                },
+            )
+            .await;
+        let launched = match launched {
+            Ok(res) => res,
+            Err(err) if is_host_ptrace_permission_denied(&err.to_string()) => return,
+            Err(err) => panic!("short-lived debug launch failed unexpectedly: {err}"),
+        };
+        assert!(
+            matches!(launched, DebugResult::Stopped(_)),
+            "expected stop-on-entry for short-lived binary, got {launched:?}"
+        );
+
+        let bp = broker
+            .handle(
+                ctx.clone(),
+                DebugArgs::Break {
+                    file: src_path.display().to_string(),
+                    line: 6,
+                    column: None,
+                    condition: None,
+                    hit_condition: None,
+                    log_message: None,
+                },
+            )
+            .await
+            .expect("set breakpoint on return line");
+        assert!(matches!(bp, DebugResult::BreakpointSet(_)));
+
+        let resumed = broker
+            .handle(
+                ctx.clone(),
+                DebugArgs::Continue {
+                    thread_id: None,
+                    timeout_ms: Some(5000),
+                },
+            )
+            .await
+            .expect("continue to breakpoint");
+        assert!(
+            matches!(resumed, DebugResult::Stopped(_)),
+            "expected breakpoint stop, got {resumed:?}"
+        );
+
+        let eval = broker
+            .handle(
+                ctx.clone(),
+                DebugArgs::Eval {
+                    expression: "doubled + 7".to_owned(),
+                    frame: Some(0),
+                    context: None,
+                },
+            )
+            .await
+            .expect("evaluate doubled + 7");
+        assert!(
+            matches!(&eval, DebugResult::Eval(r) if r.value.contains("127")),
+            "expected 127 in eval result, got {eval:?}"
+        );
+
+        // Give JobRegistry output pipe a brief moment to ingest flushed stdout.
+        async_io::Timer::after(Duration::from_millis(60)).await;
+        let out = broker
+            .handle(
+                ctx.clone(),
+                DebugArgs::Output {
+                    category: Some(OutputCategory::Stdout),
+                    tail: None,
+                    clear: false,
+                },
+            )
+            .await
+            .expect("read debug output");
+        let DebugResult::Output(snap) = out else {
+            panic!("expected Output snapshot");
+        };
+        let combined: String = snap.entries.iter().map(|e| e.text.as_str()).collect();
+        assert!(
+            combined.contains("STEP_STDOUT:120"),
+            "expected STEP_STDOUT:120 in debug output, got {combined:?}"
+        );
+
+        let _ = broker.handle(ctx, DebugArgs::Terminate).await;
     }
 
     /// Verifies that a sandboxed Python process speaking DAP over loopback TCP
