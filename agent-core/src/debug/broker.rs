@@ -1549,6 +1549,7 @@ int main(void) {{
             || lower.contains("ptrace")
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
     async fn macos_developer_mode_enabled() -> bool {
         #[cfg(target_os = "macos")]
         {
