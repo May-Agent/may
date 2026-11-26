@@ -126,6 +126,102 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.acp_connect_finished(result);
             Ok(None)
         }
+        AppEvent::BotsLoaded(result) => {
+            let selected_id = if let AppMode::Bots(state) = &mut app.mode {
+                state.loading = false;
+                match result {
+                    Ok(bots) => {
+                        state.bots = bots;
+                        if state.selected >= state.bots.len() {
+                            state.selected = state.bots.len().saturating_sub(1);
+                        }
+                        state.notice = None;
+                        state.current().map(|b| b.id.clone())
+                    }
+                    Err(err) => {
+                        state.notice = Some(err);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(bot_id) = selected_id {
+                app.refresh_bot_details(bot_id);
+            }
+            Ok(None)
+        }
+        AppEvent::BotDetailsLoaded {
+            bot_id,
+            messages,
+            trace,
+            approvals,
+            memory_tree,
+            memory_commits,
+        } => {
+            if let AppMode::Bots(state) = &mut app.mode
+                && state.current().is_some_and(|b| b.id == bot_id)
+            {
+                state.messages = messages;
+                state.trace = trace;
+                state.approvals = approvals;
+                if state.approval_selected >= state.approvals.len() {
+                    state.approval_selected = state.approvals.len().saturating_sub(1);
+                }
+                state.memory_tree = memory_tree;
+                state.memory_commits = memory_commits;
+            }
+            Ok(None)
+        }
+        AppEvent::BotSse(event) => {
+            let mut refresh_id = None;
+            if let AppMode::Bots(state) = &mut app.mode {
+                match event {
+                    may_protocol::bot::BotSseEvent::BotState { bots } => {
+                        state.bots = bots;
+                        if state.selected >= state.bots.len() {
+                            state.selected = state.bots.len().saturating_sub(1);
+                        }
+                    }
+                    may_protocol::bot::BotSseEvent::BotChat { message } => {
+                        if state.current().is_some_and(|b| b.id == message.bot_id)
+                            && !state.messages.iter().any(|m| m.id == message.id)
+                        {
+                            state.messages.push(message);
+                        }
+                    }
+                    may_protocol::bot::BotSseEvent::BotTrace { entry } => {
+                        if state.current().is_some_and(|b| b.id == entry.bot_id)
+                            && !state.trace.iter().any(|t| t.id == entry.id)
+                        {
+                            state.trace.push(entry);
+                        }
+                    }
+                    may_protocol::bot::BotSseEvent::BotApproval { approval } => {
+                        if state.current().is_some_and(|b| b.id == approval.bot_id) {
+                            if let Some(slot) = state
+                                .approvals
+                                .iter_mut()
+                                .find(|a| a.request_id == approval.request_id)
+                            {
+                                *slot = approval;
+                            } else {
+                                state.approvals.insert(0, approval);
+                            }
+                        }
+                    }
+                    may_protocol::bot::BotSseEvent::BotMemory { bot_id, .. } => {
+                        if state.current().is_some_and(|b| b.id == bot_id) {
+                            refresh_id = Some(bot_id);
+                        }
+                    }
+                }
+            }
+            if let Some(bot_id) = refresh_id {
+                app.refresh_bot_details(bot_id);
+            }
+            Ok(None)
+        }
         AppEvent::ResumeSessionsLoaded(sessions) => {
             if let AppMode::ResumePicker(state) = &mut app.mode {
                 state.sessions = sessions;

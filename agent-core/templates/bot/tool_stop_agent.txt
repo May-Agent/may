@@ -1,0 +1,1 @@
+Stopped delegated worker `{{ agent_id }}` and persisted its context checkpoint. Use `resume_agent` to continue it later.

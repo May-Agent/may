@@ -4755,18 +4755,43 @@ fn spawn_workspace_forwarder(
 ) -> crate::workspace_request::WorkspaceRequestBroker {
     let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
     let workspace_approver = state.workspace_approver.clone();
+    let bot_service = state.bot_service.clone();
+    let db = state.db();
     let workspace_session_id = session_id.as_str().to_string();
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
+        let pause = crate::harness::approval_pause::ApprovalPause::new();
         while let Some(request) = workspace_queue.next().await {
-            let approved = match workspace_approver
-                .request_and_wait(workspace_session_id.as_str(), request.args.request.clone())
+            let supervising_bot = db
+                .supervising_bot_for_session(workspace_session_id.as_str())
                 .await
-            {
-                Ok(approved) => approved,
-                Err(error) => {
-                    tracing::error!(session_id = %workspace_session_id, error = %error, "workspace request failed");
-                    false
+                .ok()
+                .flatten();
+            let approved = if let Some(bot_id) = supervising_bot {
+                bot_service
+                    .approvals()
+                    .request(
+                        &bot_id,
+                        "session",
+                        workspace_session_id.as_str(),
+                        may_protocol::bot::BotApprovalGate::Workspace,
+                        &request.args.request.path,
+                        Some(&request.args.request.reason),
+                        &pause,
+                        None,
+                    )
+                    .await
+                    .is_ok_and(|outcome| outcome.is_approved())
+            } else {
+                match workspace_approver
+                    .request_and_wait(workspace_session_id.as_str(), request.args.request.clone())
+                    .await
+                {
+                    Ok(approved) => approved,
+                    Err(error) => {
+                        tracing::error!(session_id = %workspace_session_id, error = %error, "workspace request failed");
+                        false
+                    }
                 }
             };
             let _ = request.respond(approved);
@@ -4799,6 +4824,7 @@ pub fn local_agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::Age
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
             },
         )
+        .with_bot_wake(state.bot_service.wake_callback())
         .with_peers(LocalShadowFilter(state_for_shadow)),
         runtime_service: state.runtime_service.clone(),
         cache_lifetime: {
@@ -4877,6 +4903,7 @@ pub fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMess
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
             },
         )
+        .with_bot_wake(state.bot_service.wake_callback())
         .with_peers(crate::peers::DaemonPeerFabric::new(state.clone())),
         runtime_service: state.runtime_service.clone(),
         cache_lifetime: {

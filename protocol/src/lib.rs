@@ -10,6 +10,8 @@
 
 /// The `ask_user` wire types and their persisted shapes.
 pub mod ask_user;
+/// Wire and domain types for May Bots.
+pub mod bot;
 /// The `/btw` mailbox and side-request responses.
 pub mod btw;
 /// Provider prompt-cache lifetime.

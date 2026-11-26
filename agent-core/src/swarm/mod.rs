@@ -36,12 +36,12 @@ use crate::workspace::WorkspaceConfig;
 
 pub use conditions::{SwarmConditions, SwarmSeenState};
 pub use federation::{
-    AnySwarmTransport, PeerSwarmDeliverRequest, PeerSwarmDeliverResponse, PeerSwarmErrorBody,
-    PeerSwarmPostRequest, PeerSwarmPostResponse, PeerSwarmPrRequest, PeerSwarmReadRequest,
-    PeerSwarmReadResponse, PeerSwarmStateResponse, PeerSwarmWorld, RemoteWorkingSession,
-    SwarmBoardSummary, SwarmBoardsSsePayload, SwarmMember, SwarmTransport, WireSwarmMessage,
-    WireSwarmReadMode, display_group_key, elect_board_host, group_matches_pr_repo,
-    is_forge_group_key, resolve_session_group_key,
+    AnySwarmTransport, IncumbentBoardHost, PeerSwarmDeliverRequest, PeerSwarmDeliverResponse,
+    PeerSwarmErrorBody, PeerSwarmPostRequest, PeerSwarmPostResponse, PeerSwarmPrRequest,
+    PeerSwarmReadRequest, PeerSwarmReadResponse, PeerSwarmStateResponse, PeerSwarmWorld,
+    RemoteWorkingSession, SwarmBoardSummary, SwarmBoardsSsePayload, SwarmMember, SwarmTransport,
+    WireSwarmMessage, WireSwarmReadMode, display_group_key, elect_board_host,
+    group_matches_pr_repo, is_forge_group_key, resolve_board_host, resolve_session_group_key,
 };
 pub use tool::{BoardArgs, BoardCommandSet, BoardTool};
 
@@ -268,6 +268,12 @@ struct CandidateMember {
     is_local: bool,
 }
 
+fn has_member_or_voter(candidates: &[CandidateMember], machine: &str) -> bool {
+    candidates
+        .iter()
+        .any(|c| c.voter_machine == machine || (c.member.machine == machine && !c.member.suspended))
+}
+
 impl SwarmService {
     /// Builds the swarm coordination service backed by `messaging` and live `config`.
     #[must_use]
@@ -473,6 +479,13 @@ impl SwarmService {
                 },
             );
         }
+        // Preserve local session bindings for boards that remain active in case the
+        // remote host's SSE snapshot has not reconciled a newly joined local session yet.
+        for (session_id, group_key) in current.session_to_workdir {
+            if next.boards.contains_key(&group_key) {
+                next.session_to_workdir.insert(session_id, group_key);
+            }
+        }
         for (group_key, board) in &next.boards {
             for member in &board.members {
                 if member.machine == local_machine {
@@ -505,6 +518,7 @@ impl SwarmService {
         let _guard = self.reconcile_lock.lock().await;
         let db = self.db();
 
+        let prev_snapshot = self.snapshot.load_full();
         let prev_hosted = self.hosted_board_summaries();
 
         if !self.is_enabled() {
@@ -521,6 +535,7 @@ impl SwarmService {
                         .await;
                 }
             }
+            db.purge_all_buffered_cloud_notices().await?;
             self.snapshot
                 .store(Arc::new(ActiveSwarmSnapshot::default()));
             if touched_any {
@@ -537,6 +552,10 @@ impl SwarmService {
             return Ok(());
         }
 
+        let local_draining = self
+            .transport
+            .as_ref()
+            .is_some_and(AnySwarmTransport::is_draining);
         let peer_world = if let Some(transport) = &self.transport {
             Some(transport.poll_world().await)
         } else {
@@ -598,13 +617,16 @@ impl SwarmService {
             });
         }
 
-        let mut remote_boards_by_group: BTreeMap<String, SwarmBoardSummary> = BTreeMap::new();
+        let mut remote_boards_by_group: BTreeMap<String, Vec<SwarmBoardSummary>> = BTreeMap::new();
         if let Some(world) = peer_world {
             for summary in world.remote_boards {
                 let _ = db
                     .observe_swarm_epoch(&summary.group_key, summary.board_epoch)
                     .await;
-                remote_boards_by_group.insert(summary.group_key.clone(), summary);
+                remote_boards_by_group
+                    .entry(summary.group_key.clone())
+                    .or_default()
+                    .push(summary);
             }
             for remote in world.remote_sessions {
                 if remote.machine == local_machine {
@@ -661,35 +683,87 @@ impl SwarmService {
             }
         }
 
-        // Destroy any locally persisted board that fell to `<= 1` members OR whose
-        // elected Board Host moved to another online machine.
+        let existing_by_workdir: BTreeMap<&str, &crate::db::SwarmBoardRow> = existing_boards
+            .iter()
+            .map(|b| (b.workdir.as_str(), b))
+            .collect();
+
+        let mut resolved_hosts: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for (group_key, candidates) in &grouped {
+            if candidates.len() <= 1 {
+                continue;
+            }
+            if local_machine.is_empty() {
+                resolved_hosts.insert(group_key.clone(), Some(String::new()));
+                continue;
+            }
+            let mut incumbents = Vec::new();
+            if !local_draining
+                && let Some(local_board) = existing_by_workdir.get(group_key.as_str())
+                && has_member_or_voter(candidates, &local_machine)
+            {
+                incumbents.push(IncumbentBoardHost {
+                    machine: local_machine.as_str(),
+                    board_epoch: local_board.board_epoch,
+                });
+            }
+            if let Some(remotes) = remote_boards_by_group.get(group_key) {
+                for remote in remotes {
+                    if !remote.host_machine.is_empty()
+                        && remote.host_machine != local_machine
+                        && has_member_or_voter(candidates, &remote.host_machine)
+                    {
+                        incumbents.push(IncumbentBoardHost {
+                            machine: remote.host_machine.as_str(),
+                            board_epoch: remote.board_epoch,
+                        });
+                    }
+                }
+            }
+            let voters = candidates
+                .iter()
+                .filter(|c| !(local_draining && c.voter_machine == local_machine))
+                .map(|c| c.voter_machine.as_str());
+            let resolved = resolve_board_host(group_key, incumbents, voters);
+            resolved_hosts.insert(group_key.clone(), resolved);
+        }
+
+        // Destroy any locally persisted board that fell to `<= 1` members, OR
+        // step down cleanly when Board Host ownership moved while `> 1` working
+        // members remain (e.g. local drain or host departure).
         let mut touched_any = false;
         for board in &existing_boards {
-            let should_keep_locally = grouped.get(&board.workdir).is_some_and(|candidates| {
-                if candidates.len() <= 1 {
-                    return false;
-                }
-                if local_machine.is_empty() {
-                    return true;
-                }
-                let elected = elect_board_host(
-                    &board.workdir,
-                    candidates.iter().map(|c| c.voter_machine.as_str()),
-                );
-                elected.as_deref() == Some(local_machine.as_str())
-            });
-            if !should_keep_locally
-                && let Some((epoch, touched)) =
-                    self.destroy_board_and_steers(&board.workdir).await?
-            {
-                if !touched.is_empty() {
-                    touched_any = true;
-                }
-                let fell_below_quorum = grouped.get(&board.workdir).is_none_or(|c| c.len() <= 1);
+            let fell_below_quorum = grouped.get(&board.workdir).is_none_or(|c| c.len() <= 1);
+            let should_keep_locally = !local_draining
+                && !fell_below_quorum
+                && (local_machine.is_empty()
+                    || resolved_hosts
+                        .get(&board.workdir)
+                        .and_then(|h| h.as_deref())
+                        == Some(local_machine.as_str()));
+            if !should_keep_locally {
                 if fell_below_quorum {
-                    self.broadcast_dissolved_to_peers(&board.workdir, epoch, &prev_hosted)
-                        .await;
+                    if let Some((epoch, touched)) =
+                        self.destroy_board_and_steers(&board.workdir).await?
+                    {
+                        if !touched.is_empty() {
+                            touched_any = true;
+                        }
+                        self.broadcast_dissolved_to_peers(&board.workdir, epoch, &prev_hosted)
+                            .await;
+                    }
+                } else {
+                    let _ = db.step_down_swarm_board(&board.workdir).await?;
                 }
+            }
+        }
+
+        // Also purge buffered cloud notices if a remotely hosted board known to
+        // this daemon dissolved without delivering a `Dissolved` signal.
+        for prev_group in prev_snapshot.boards.keys() {
+            if grouped.get(prev_group).is_none_or(|c| c.len() <= 1) {
+                db.purge_buffered_cloud_notices_for_board(prev_group)
+                    .await?;
             }
         }
 
@@ -701,13 +775,16 @@ impl SwarmService {
             let elected_host = if local_machine.is_empty() {
                 String::new()
             } else {
-                elect_board_host(
-                    &group_key,
-                    candidates.iter().map(|c| c.voter_machine.as_str()),
-                )
-                .unwrap_or_else(|| local_machine.clone())
+                let Some(host) = resolved_hosts
+                    .get(&group_key)
+                    .and_then(std::clone::Clone::clone)
+                else {
+                    continue;
+                };
+                host
             };
-            let is_local_host = local_machine.is_empty() || elected_host == local_machine;
+            let is_local_host =
+                !local_draining && (local_machine.is_empty() || elected_host == local_machine);
             let members: Vec<SwarmMember> = candidates.iter().map(|c| c.member.clone()).collect();
 
             if is_local_host {
@@ -754,18 +831,16 @@ impl SwarmService {
                     },
                 );
             } else {
-                let (board_epoch, max_seq, effective_members) = if let Some(mirrored) =
-                    remote_boards_by_group.get(&group_key)
-                    && mirrored.host_machine == elected_host
-                {
-                    (
-                        mirrored.board_epoch.max(1),
-                        mirrored.max_seq,
-                        mirrored.members.clone(),
-                    )
-                } else {
-                    (1, 0, members)
-                };
+                let (board_epoch, max_seq, effective_members) = remote_boards_by_group
+                    .get(&group_key)
+                    .and_then(|list| list.iter().find(|m| m.host_machine == elected_host))
+                    .map_or((1, 0, members), |mirrored| {
+                        (
+                            mirrored.board_epoch.max(1),
+                            mirrored.max_seq,
+                            mirrored.members.clone(),
+                        )
+                    });
                 let _ = db.observe_swarm_epoch(&group_key, board_epoch).await;
                 for c in &candidates {
                     if c.is_local {
@@ -1360,6 +1435,9 @@ impl SwarmService {
                         }
                         DissolvedSteerAction::Keep
                     })
+                    .await?;
+                self.db()
+                    .purge_buffered_cloud_notices_for_board(&group_key)
                     .await?;
                 if !touched.is_empty() {
                     self.messaging

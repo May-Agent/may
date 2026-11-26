@@ -700,7 +700,12 @@ export type UiEvent =
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
   | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
-  | { kind: 'prs'; payload: { prs: import('./api/prs').ApiPr[] } };
+  | { kind: 'prs'; payload: { prs: import('./api/prs').ApiPr[] } }
+  | { kind: 'bot_state'; payload: import('./api/bots').BotStateEventPayload }
+  | { kind: 'bot_chat'; payload: import('./api/bots').BotChatEventPayload }
+  | { kind: 'bot_trace'; payload: import('./api/bots').BotTraceEventPayload }
+  | { kind: 'bot_approval'; payload: import('./api/bots').BotApprovalEventPayload }
+  | { kind: 'bot_memory'; payload: import('./api/bots').BotMemoryEventPayload };
 
 // ── Artifacts ──────────────────────────────────────────────
 

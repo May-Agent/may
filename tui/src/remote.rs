@@ -354,7 +354,7 @@ fn globals_query(session_id: &str) -> String {
     query
         .append_pair(
             "topics",
-            "config,sleep,user_notification,session_index,cloud_session,prs",
+            "config,sleep,user_notification,session_index,cloud_session,prs,bots",
         )
         .append_pair("sessionId", session_id);
     query.finish()
@@ -437,6 +437,13 @@ async fn follow_session_globals(
                 }
                 "prs" => {
                     let _ = app_events.send(AppEvent::PrsInvalidated).await;
+                }
+                "bot_state" | "bot_chat" | "bot_trace" | "bot_approval" | "bot_memory" => {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<may_protocol::bot::BotSseEvent>(&event.data)
+                    {
+                        let _ = app_events.send(AppEvent::BotSse(parsed)).await;
+                    }
                 }
                 _ => {}
             }

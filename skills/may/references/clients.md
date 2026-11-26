@@ -38,7 +38,7 @@ Typing sends: Enter sends the line. While the agent is working, Enter steers (in
 
 ## Web UI
 
-Served by the daemon on its loopback listener (`[daemon] port`, or the remote address, see `remote-access.md`) when built with the `ui` feature; `may gui` opens it. Routes: `/p/<profile>` (profile home), `/p/<profile>/s/<session>` (a chat), `/p/<profile>/archive`, `/settings`. A 401 from the daemon shows a sign-in-required page.
+Served by the daemon on its loopback listener (`[daemon] port`, or the remote address, see `remote-access.md`) when built with the `ui` feature; `may gui` opens it. Routes: `/p/<profile>` (profile home), `/p/<profile>/s/<session>` (a chat), `/p/<profile>/archive`, `/bots` (resident May Bots), `/settings`. A 401 from the daemon shows a sign-in-required page.
 
 - Sidebar: profile switcher and New profile; New chat (and New chat in a remote repo, with a searchable repository list across every authenticated `[forge."<host>"]` GitHub or GitLab host and recent local checkouts); sessions grouped Pinned (with folders), Recent and Archived; Recent sessions bound to a repository group under a project header (GitHub logo and `owner/repo`, never a path, for a GitHub project; the checkout's path for a local one) with a button for a new chat under that project, while repo-less sessions stay ungrouped above; per-session actions Pin/Unpin, Move to folder, Archive/Unarchive, Rename, Delete; notifications bell; Settings.
 - Shortcuts: Cmd/Ctrl+N new chat (Cmd/Ctrl+Shift+O also), Cmd/Ctrl+K command palette (sessions, new chat, settings, theme, language), Ctrl+Cmd+S (Mac) or Ctrl+Alt+S show/hide sidebar, Option+Cmd+0 (Mac) or Ctrl+Alt+0 show/hide inspector.

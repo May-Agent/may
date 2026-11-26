@@ -1,0 +1,1 @@
+Approval request `{{ request_id }}` ({{ gate }} for {{ requester_id }}) resolved: {{ outcome }}{% if let Some(detail) = detail %} ({{ detail }}){% endif %}.

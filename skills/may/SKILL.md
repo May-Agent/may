@@ -18,6 +18,7 @@ What the user sees and sets. Read the file for the area a question touches.
 - `references/tools-and-runtimes.md`: the managed bash, the tools and Python May provides, PATH order and uv, and the session desktop (`computer`).
 - `references/sleep.md`: `/sleep`, waking and the health reminder.
 - `references/remote-access.md`: Tailscale remote access, allowed logins and Funnel.
+- `references/bots.md`: resident May Bots (non-bash-first bridge agents, delegated-worker authority, `decide_approval`, git-backed hierarchical memory, and hybrid RAG).
 
 ## Terminal
 

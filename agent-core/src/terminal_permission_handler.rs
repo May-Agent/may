@@ -49,6 +49,12 @@ pub struct TerminalPermissionHandler {
     child_approvals: crate::subagent::ChildApprovals,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
+    /// Optional supervising May Bot routing `unsafe` and `ssh` approvals through `decide_approval`.
+    bot_route: Option<(
+        String,
+        crate::bot::BotApprovalRouter,
+        crate::harness::approval_pause::ApprovalPause,
+    )>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     profile_id: Option<String>,
     source: NetworkAccessSource,
@@ -77,10 +83,24 @@ impl TerminalPermissionHandler {
             child_approvals: crate::subagent::ChildApprovals::new(),
             runtime_service,
             session_id,
+            bot_route: None,
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
             profile_id,
             source: NetworkAccessSource::Chat,
         }
+    }
+
+    /// Routes top-level `unsafe` and `ssh` escalations through a supervising
+    /// May Bot's approval router instead of prompting the user directly.
+    #[must_use]
+    pub fn with_bot_route(
+        mut self,
+        bot_id: String,
+        router: crate::bot::BotApprovalRouter,
+        pause: crate::harness::approval_pause::ApprovalPause,
+    ) -> Self {
+        self.bot_route = Some((bot_id, router, pause));
+        self
     }
 
     /// Ask the user through `authorizer` before the first command on an SSH
@@ -107,6 +127,7 @@ impl TerminalPermissionHandler {
             child_approvals: crate::subagent::ChildApprovals::new(),
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
+            bot_route: None,
             network_policy: Arc::new(ArcSwap::from_pointee(network_policy)),
             profile_id,
             source: NetworkAccessSource::Exec,
@@ -272,15 +293,54 @@ impl Approver for TerminalPermissionHandler {
                     None => Ok(Approval::Approved),
                 }
             }
-            UNSANDBOXED_KIND => match &self.approver {
-                Some(approver) => approver.approve(request).await,
-                None => Ok(Approval::Approved),
-            },
+            UNSANDBOXED_KIND => {
+                if let Some((bot_id, router, pause)) = &self.bot_route {
+                    let requester = self.session_id.as_deref().unwrap_or("session");
+                    let subject = request.reason().unwrap_or("unsandboxed command");
+                    let call_id = request.call().map(|c| c.call().clone());
+                    return router
+                        .request(
+                            bot_id,
+                            "session",
+                            requester,
+                            may_protocol::bot::BotApprovalGate::Unsafe,
+                            subject,
+                            request.reason(),
+                            pause,
+                            call_id,
+                        )
+                        .await
+                        .map(crate::bot::ApprovalOutcome::into_aither)
+                        .map_err(ApproverFailure::new);
+                }
+                match &self.approver {
+                    Some(approver) => approver.approve(request).await,
+                    None => Ok(Approval::Approved),
+                }
+            }
             SSH_KIND if subagent => Ok(Approval::Denied {
                 reason: "a subagent cannot open a new SSH server".to_string(),
             }),
             SSH_KIND => {
                 let target = request.reason().unwrap_or_default();
+                if let Some((bot_id, router, pause)) = &self.bot_route {
+                    let requester = self.session_id.as_deref().unwrap_or("session");
+                    let call_id = request.call().map(|c| c.call().clone());
+                    return router
+                        .request(
+                            bot_id,
+                            "session",
+                            requester,
+                            may_protocol::bot::BotApprovalGate::Ssh,
+                            target,
+                            request.reason(),
+                            pause,
+                            call_id,
+                        )
+                        .await
+                        .map(crate::bot::ApprovalOutcome::into_aither)
+                        .map_err(ApproverFailure::new);
+                }
                 match self.authorize_server(target).await {
                     Ok(true) => Ok(Approval::Approved),
                     Ok(false) => Ok(Approval::Denied {

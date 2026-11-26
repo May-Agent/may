@@ -1693,6 +1693,147 @@ impl App {
             .cloned()
     }
 
+    /// Open the `/bot` resident May Bot overlay.
+    pub fn open_bots(&mut self) {
+        let state = crate::state::BotsState {
+            loading: true,
+            ..Default::default()
+        };
+        self.mode = AppMode::Bots(state);
+        self.refresh_bots();
+    }
+
+    /// Reloads the list of resident May Bots from the daemon.
+    pub fn refresh_bots(&self) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let res = client.list_bots().await.map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::BotsLoaded(res)).await;
+        })
+        .detach();
+    }
+
+    /// Loads messages, trace, approvals, and memory for `bot_id`.
+    pub fn refresh_bot_details(&self, bot_id: String) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let messages = client.list_bot_messages(&bot_id).await.unwrap_or_default();
+            let trace = client.list_bot_trace(&bot_id).await.unwrap_or_default();
+            let approvals = client.list_bot_approvals(&bot_id).await.unwrap_or_default();
+            let memory_tree = client.get_bot_memory(&bot_id).await.ok();
+            let memory_commits = client
+                .get_bot_memory_history(&bot_id)
+                .await
+                .unwrap_or_default();
+            let _ = tx
+                .send(AppEvent::BotDetailsLoaded {
+                    bot_id,
+                    messages,
+                    trace,
+                    approvals,
+                    memory_tree,
+                    memory_commits,
+                })
+                .await;
+        })
+        .detach();
+    }
+
+    /// Creates a new resident bot named `name` via the daemon.
+    pub fn create_bot_named(&self, name: String) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let req = may_protocol::bot::CreateBotRequest {
+                name,
+                persona: None,
+                model: None,
+                profile_id: None,
+                enabled: true,
+                approval_policy: may_protocol::bot::BotApprovalPolicy::default(),
+            };
+            if let Err(err) = client.create_bot(&req).await {
+                let _ = tx.send(AppEvent::BotsLoaded(Err(err.to_string()))).await;
+                return;
+            }
+            let res = client.list_bots().await.map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::BotsLoaded(res)).await;
+        })
+        .detach();
+    }
+
+    /// Sends a user message to `bot_id`.
+    pub fn send_bot_chat_message(&self, bot_id: String, content: String) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            if client.send_bot_message(&bot_id, &content).await.is_ok() {
+                let messages = client.list_bot_messages(&bot_id).await.unwrap_or_default();
+                let trace = client.list_bot_trace(&bot_id).await.unwrap_or_default();
+                let approvals = client.list_bot_approvals(&bot_id).await.unwrap_or_default();
+                let memory_tree = client.get_bot_memory(&bot_id).await.ok();
+                let memory_commits = client
+                    .get_bot_memory_history(&bot_id)
+                    .await
+                    .unwrap_or_default();
+                let _ = tx
+                    .send(AppEvent::BotDetailsLoaded {
+                        bot_id,
+                        messages,
+                        trace,
+                        approvals,
+                        memory_tree,
+                        memory_commits,
+                    })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Approves or denies an escalated bot approval request.
+    pub fn resolve_bot_approval_request(&self, bot_id: String, request_id: String, approved: bool) {
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let reason = (!approved).then(|| "Denied from TUI".to_string());
+            let _ = client
+                .resolve_bot_approval(&bot_id, &request_id, approved, reason)
+                .await;
+            let messages = client.list_bot_messages(&bot_id).await.unwrap_or_default();
+            let trace = client.list_bot_trace(&bot_id).await.unwrap_or_default();
+            let approvals = client.list_bot_approvals(&bot_id).await.unwrap_or_default();
+            let memory_tree = client.get_bot_memory(&bot_id).await.ok();
+            let memory_commits = client
+                .get_bot_memory_history(&bot_id)
+                .await
+                .unwrap_or_default();
+            let _ = tx
+                .send(AppEvent::BotDetailsLoaded {
+                    bot_id,
+                    messages,
+                    trace,
+                    approvals,
+                    memory_tree,
+                    memory_commits,
+                })
+                .await;
+        })
+        .detach();
+    }
+
     /// Open the jobs/subagents panel.
     pub fn open_jobs(&mut self) {
         if self.background.is_none() {
@@ -3188,6 +3329,7 @@ impl App {
             AppMode::JobDetail(_) => Ok(super::reducer::navigation::handle_job_detail_key(
                 self, code,
             )),
+            AppMode::Bots(_) => Ok(super::reducer::navigation::handle_bots_key(self, code)),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
             AppMode::Progress(_) => Ok(super::reducer::navigation::handle_progress_key(self, code)),
             AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
@@ -4278,6 +4420,10 @@ impl App {
             }
             SlashCommand::Jobs => {
                 self.open_jobs();
+                None
+            }
+            SlashCommand::Bot => {
+                self.open_bots();
                 None
             }
             SlashCommand::Questions => Some(SendAction::OpenQuestions),

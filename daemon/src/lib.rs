@@ -23,6 +23,9 @@ mod auth;
 mod auth_tests;
 mod auto_update;
 mod bootstrap;
+mod bots;
+#[cfg(test)]
+mod bots_tests;
 mod browser;
 mod chat;
 mod cloud_home;
@@ -145,7 +148,7 @@ use may_agent_core::{
     XmlBlock, XmlBlockError,
 };
 use may_agent_core::{
-    agent, agent_link, ask_user, bash, browser_service, cache_lifetime, client, cloud,
+    agent, agent_link, ask_user, bash, bot, browser_service, cache_lifetime, client, cloud,
     command_output, command_policy, command_reading, commit_signing, computer, config, container,
     copilot, db, decode_meter, forge, grok, harness, host_git, id, ipc, issue, jobserver,
     live_response, location, mcp, memory, model_selector, models, network_policy, notification,

@@ -1,0 +1,3 @@
+{% match outcome %}{% when ScheduleToolView::Created { id, name, kind, next_fire_at } %}Created {{ kind }} schedule `{{ id }}` ("{{ name }}").{% if let Some(next) = next_fire_at %} Next fire (UTC): {{ next }}.{% endif %}{% when ScheduleToolView::Deleted { id } %}Deleted schedule `{{ id }}`.{% when ScheduleToolView::Listed { items } %}{% if items.is_empty() %}No schedules configured.{% else %}Configured schedules:
+{% for item in items %}- `{{ item.id }}` ({{ item.kind }}, enabled={{ item.enabled }}): "{{ item.name }}"{% if let Some(next) = item.next_fire_at %} — next fire {{ next }}{% endif %}{% if let Some(cron) = item.cron_expression %} [cron: {{ cron }}]{% endif %}
+{% endfor %}{% endif %}{% endmatch %}

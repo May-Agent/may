@@ -194,6 +194,8 @@ pub struct SharedServices {
     swarm: Arc<arc_swap::ArcSwapOption<crate::swarm::SwarmService>>,
     /// Optional daemon-hosted Fusion service (pair state, write leases, `sidekick` executor).
     fusion: Arc<arc_swap::ArcSwapOption<crate::fusion::FusionService>>,
+    /// Optional daemon-hosted May Bot approval router for supervised sessions.
+    bot_approvals: Arc<arc_swap::ArcSwapOption<crate::bot::BotApprovalRouter>>,
 }
 
 impl SharedServices {
@@ -210,6 +212,7 @@ impl SharedServices {
             signer_roots: crate::commit_signing::SignerRoots::default(),
             swarm: Arc::new(arc_swap::ArcSwapOption::empty()),
             fusion: Arc::new(arc_swap::ArcSwapOption::empty()),
+            bot_approvals: Arc::new(arc_swap::ArcSwapOption::empty()),
         }
     }
 
@@ -244,6 +247,17 @@ impl SharedServices {
     #[must_use]
     pub fn fusion(&self) -> Option<crate::fusion::FusionService> {
         self.fusion.load_full().map(|arc| (*arc).clone())
+    }
+
+    /// Installs the daemon's live [`crate::bot::BotApprovalRouter`].
+    pub fn set_bot_approvals(&self, router: crate::bot::BotApprovalRouter) {
+        self.bot_approvals.store(Some(Arc::new(router)));
+    }
+
+    /// Returns the installed [`crate::bot::BotApprovalRouter`], when hosted by the daemon.
+    #[must_use]
+    pub fn bot_approvals(&self) -> Option<crate::bot::BotApprovalRouter> {
+        self.bot_approvals.load_full().map(|arc| (*arc).clone())
     }
 }
 

@@ -1,0 +1,1 @@
+Created supervised session `{{ session_id }}`{% if let Some(title) = title %} ("{{ title }}"){% endif %} and queued its initial prompt.

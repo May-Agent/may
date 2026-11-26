@@ -148,6 +148,8 @@ pub struct AgentDirectory {
     may_dir: PathBuf,
     /// Nudges the daemon to dispatch a session's stored pending work.
     wake: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Optional callback waking a resident May Bot after enqueueing into `bot_inbox`.
+    wake_bot: Option<crate::bot::BotWakeFn>,
     /// Optional cross-machine peer fabric (Tailscale peers + cloud homes).
     peers: Option<AnyPeerFabric>,
 }
@@ -171,7 +173,22 @@ impl AgentDirectory {
             runtime_service,
             may_dir,
             wake: Arc::new(wake),
+            wake_bot: None,
             peers: None,
+        }
+    }
+
+    /// Attaches a wake callback for resident May Bots registered in this directory.
+    #[must_use]
+    pub fn with_bot_wake(mut self, wake_bot: crate::bot::BotWakeFn) -> Self {
+        self.wake_bot = Some(wake_bot);
+        self
+    }
+
+    /// Wakes a resident May Bot after an inbox message has been enqueued.
+    pub fn wake_bot(&self, bot_id: &str) {
+        if let Some(wake) = &self.wake_bot {
+            (wake)(bot_id);
         }
     }
 
@@ -196,17 +213,37 @@ impl AgentDirectory {
         self.peers.as_ref()
     }
 
-    /// Every live agent, sorted by name: every session that is not archived.
+    /// Every live agent, sorted by name: every session that is not archived,
+    /// plus every enabled resident May Bot registered with its stable `agent_id`.
     ///
     /// # Errors
     /// [`AgentLinkError`] on storage failure or an unreadable `tasks.md`.
     pub async fn live(&self) -> Result<Vec<AgentStatus>, AgentLinkError> {
-        Ok(self
+        let mut agents: Vec<AgentStatus> = self
             .agent_tasks()
             .await?
             .into_iter()
             .map(|agent| agent.status)
-            .collect())
+            .collect();
+        let home = MayHomePaths::new(self.may_dir.clone());
+        for bot in self.runtime_service.db().list_bots().await? {
+            if !bot.enabled {
+                continue;
+            }
+            agents.push(AgentStatus {
+                session_id: bot.agent_id,
+                name: bot.name,
+                cwd: home.bot_paths(&bot.id).memory_dir(),
+                activity: Activity::Idle,
+                roots: Vec::new(),
+            });
+        }
+        agents.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        Ok(agents)
     }
 
     /// Local sessions formatted as [`RemoteAgentEntry`] rows for `GET /api/peers/agents`.
@@ -338,6 +375,13 @@ async fn status_name(
     runtime_service: &SessionRuntimeService,
     session_id: &str,
 ) -> Result<String, AgentLinkError> {
+    if let Some(bot) = runtime_service
+        .db()
+        .find_bot_by_identifier(session_id)
+        .await?
+    {
+        return Ok(bot.name);
+    }
     Ok(runtime_service
         .db()
         .get_session(session_id)
@@ -679,6 +723,35 @@ impl AgentMessaging {
         target: &str,
         body: &str,
     ) -> Result<String, AgentLinkError> {
+        // Resident May Bots are always-on and accept inter-agent messages directly
+        // into `bot_inbox` with monotonic UTC timestamps (never refused as cold).
+        if let Some(bot) = self
+            .runtime_service
+            .db()
+            .find_bot_by_identifier(target)
+            .await?
+            && bot.enabled
+        {
+            if bot.agent_id == sender_session_id || bot.id == sender_session_id {
+                return Err(AgentLinkError::SendToSelf);
+            }
+            let sender = status_name(&self.runtime_service, sender_session_id).await?;
+            let _ = self
+                .runtime_service
+                .db()
+                .enqueue_bot_inbox(crate::db::NewBotInboxEntry {
+                    bot_id: &bot.id,
+                    kind: may_protocol::bot::BotInboxKind::AgentMessage,
+                    sender_id: Some(sender_session_id),
+                    sender_name: Some(&sender),
+                    body,
+                    meta_json: None,
+                })
+                .await?;
+            self.directory.wake_bot(&bot.id);
+            return Ok(bot.name);
+        }
+
         let (resolved, local_machine) = self.resolve_recipient(sender_session_id, target).await?;
         match resolved {
             ResolvedRecipient::Local(recipient) => {
