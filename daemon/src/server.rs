@@ -400,7 +400,9 @@ pub async fn start(
         cloud_sessions,
         cloud_home_bridge,
         swarm_mirrors: super::swarm_peers::SwarmMirrorState::default(),
-        buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::default(),
+        buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::new(
+            db_for_archive.clone(),
+        ),
         pushed_providers,
         sleep: sleep_state,
         notification_service: notification_service.clone(),

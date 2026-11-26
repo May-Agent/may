@@ -30,44 +30,70 @@ use crate::swarm::{
 };
 use crate::ui_event_bus::UiEventTopics;
 
-/// Buffer of routine PR / lifecycle swarm notices destined for `Suspended`
-/// Codespaces cloud homes, flushed when the codespace next starts without ever
-/// booting a sleeping VM for routine PR chatter.
-#[derive(Debug, Clone, Default)]
+/// SQLite-backed buffer of routine PR / lifecycle swarm notices destined for
+/// `Suspended` or temporarily unreachable Codespaces cloud homes, flushed when
+/// the codespace next starts without booting a sleeping VM for routine PR chatter.
+#[derive(Debug, Clone)]
 pub struct BufferedCloudNotices {
-    queues: Arc<DashMap<String, Vec<PeerSwarmDeliverRequest>>>,
+    db: crate::db::ChatDb,
+    flush_lock: Arc<async_lock::Mutex<()>>,
 }
 
 impl BufferedCloudNotices {
-    /// Appends `notice` to `session_id`'s pending cloud buffer.
-    pub fn push(&self, session_id: &str, notice: PeerSwarmDeliverRequest) {
-        self.queues
-            .entry(session_id.to_string())
-            .or_default()
-            .push(notice);
+    /// Creates a buffered cloud notice store backed by `db`.
+    #[must_use]
+    pub fn new(db: crate::db::ChatDb) -> Self {
+        Self {
+            db,
+            flush_lock: Arc::new(async_lock::Mutex::new(())),
+        }
     }
 
-    /// Takes all buffered notices queued for `session_id`.
-    #[must_use]
-    pub fn drain_session(&self, session_id: &str) -> Vec<PeerSwarmDeliverRequest> {
-        self.queues
-            .remove(session_id)
-            .map_or_else(Vec::new, |(_, items)| items)
+    /// Appends `notice` to `session_id`'s persistent cloud buffer.
+    pub async fn push(&self, session_id: &str, notice: PeerSwarmDeliverRequest) {
+        let PeerSwarmDeliverRequest::Notice {
+            group_key,
+            board_epoch,
+            seq,
+            target_session_id: _,
+            kind,
+            body,
+        } = notice
+        else {
+            return;
+        };
+        if let Err(error) = self
+            .db
+            .push_buffered_cloud_notice(crate::db::NewSwarmBufferedCloudNotice {
+                session_id,
+                workdir: &group_key,
+                board_epoch,
+                seq,
+                kind: &kind,
+                body: &body,
+            })
+            .await
+        {
+            tracing::warn!(%error, session_id = %session_id, "failed to persist buffered cloud swarm notice");
+        }
     }
 
     /// Number of buffered notices currently waiting for `session_id`.
-    #[must_use]
-    pub fn buffered_len(&self, session_id: &str) -> usize {
-        self.queues.get(session_id).map_or(0, |v| v.len())
+    pub async fn buffered_len(&self, session_id: &str) -> usize {
+        self.db
+            .count_buffered_cloud_notices(session_id)
+            .await
+            .unwrap_or(0)
     }
 
     /// Drops buffered `Notice` entries belonging to a dissolved `group_key`.
-    pub fn drop_dissolved_group(&self, group_key: &str) {
-        for mut entry in self.queues.iter_mut() {
-            entry.value_mut().retain(|req| match req {
-                PeerSwarmDeliverRequest::Notice { group_key: g, .. } => g != group_key,
-                _ => true,
-            });
+    pub async fn drop_dissolved_group(&self, group_key: &str) {
+        if let Err(error) = self
+            .db
+            .purge_buffered_cloud_notices_for_board(group_key)
+            .await
+        {
+            tracing::warn!(%error, group_key = %group_key, "failed to purge buffered cloud notices for dissolved board");
         }
     }
 }
@@ -111,6 +137,15 @@ impl SwarmMirrorState {
     /// Purges cached mirrored boards for an unreachable peer.
     pub fn purge_peer(&self, machine: &str) {
         self.mirrored_boards.remove(machine);
+    }
+
+    /// Replaces cached mirrored boards for `machine` from a fresh state poll.
+    pub fn replace_peer(&self, machine: &str, boards: Vec<SwarmBoardSummary>) {
+        if boards.is_empty() {
+            self.mirrored_boards.remove(machine);
+        } else {
+            self.mirrored_boards.insert(machine.to_string(), boards);
+        }
     }
 
     /// Ensures each peer in `endpoints` has a running `/api/events?topics=swarm`
@@ -226,13 +261,21 @@ async fn stream_peer_sse_once(
 }
 
 /// Flushes any buffered swarm notices for `session_id` over `endpoint` once its
-/// Codespace forward becomes active.
+/// Codespace forward becomes active, removing each notice from SQLite only after
+/// `/api/peers/swarm/deliver` succeeds.
 pub async fn flush_cloud_session_notices(
     state: &DaemonState,
     session_id: &str,
     endpoint: &Endpoint,
 ) {
-    let pending = state.buffered_cloud_notices.drain_session(session_id);
+    let _flush_guard = state.buffered_cloud_notices.flush_lock.lock().await;
+    let pending = match state.db().list_buffered_cloud_notices(session_id).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(%error, session_id = %session_id, "failed to load buffered cloud swarm notices");
+            return;
+        }
+    };
     if pending.is_empty() {
         return;
     }
@@ -244,12 +287,42 @@ pub async fn flush_cloud_session_notices(
             .max(100),
     );
     for item in pending {
-        if let Ok(bytes) = serde_json::to_vec(&item) {
-            let _ = with_timeout(
-                timeout,
-                endpoint.exchange(hyper::Method::POST, "/api/peers/swarm/deliver", Some(bytes)),
-            )
-            .await;
+        let req = PeerSwarmDeliverRequest::Notice {
+            group_key: item.workdir,
+            board_epoch: item.board_epoch,
+            seq: item.seq,
+            target_session_id: item.session_id,
+            kind: item.kind,
+            body: item.body,
+        };
+        let Ok(bytes) = serde_json::to_vec(&req) else {
+            continue;
+        };
+        let delivered = match with_timeout(
+            timeout,
+            endpoint.exchange(hyper::Method::POST, "/api/peers/swarm/deliver", Some(bytes)),
+        )
+        .await
+        {
+            Ok(Ok((status, resp_bytes))) => {
+                decode_swarm_response::<PeerSwarmDeliverResponse>(status, &resp_bytes)
+            }
+            Ok(Err(error)) => Err(SwarmError::Remote(error.to_string())),
+            Err(()) => Err(SwarmError::Remote(
+                "timed out flushing buffered cloud notice".to_string(),
+            )),
+        };
+        match delivered {
+            Ok(_) => {
+                if let Err(error) = state.db().delete_buffered_cloud_notice(item.id).await {
+                    tracing::warn!(%error, id = item.id, session_id = %session_id, "failed to delete acknowledged cloud notice");
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, id = item.id, session_id = %session_id, "failed to flush buffered cloud notice; retaining for retry");
+                break;
+            }
         }
     }
 }
@@ -333,27 +406,29 @@ impl DaemonSwarmTransport {
         .await;
 
         let mut remote_sessions = Vec::new();
-        for list in cloud_lists {
-            remote_sessions.extend(list);
-        }
-
-        for (machine, state_opt) in &tailnet_states {
-            if state_opt.is_none() {
-                self.state.swarm_mirrors.purge_peer(machine);
+        let mut remote_boards_map: BTreeMap<String, SwarmBoardSummary> = BTreeMap::new();
+        for (sessions, hosted_boards) in cloud_lists {
+            remote_sessions.extend(sessions);
+            for mut board in hosted_boards {
+                board.host_machine = CLOUD_MACHINE.to_string();
+                remote_boards_map.insert(board.group_key.clone(), board);
             }
         }
 
-        let mut remote_boards_map: BTreeMap<String, SwarmBoardSummary> = BTreeMap::new();
-        for summary in self.state.swarm_mirrors.snapshot_boards() {
-            remote_boards_map.insert(summary.group_key.clone(), summary);
-        }
-
-        for (_, state_opt) in tailnet_states {
-            if let Some(state_resp) = state_opt {
-                remote_sessions.extend(state_resp.sessions);
-                for mut board in state_resp.hosted_boards {
-                    board.host_machine.clone_from(&state_resp.machine);
-                    remote_boards_map.insert(board.group_key.clone(), board);
+        for (machine, state_opt) in tailnet_states {
+            match state_opt {
+                Some(state_resp) => {
+                    remote_sessions.extend(state_resp.sessions);
+                    let mut peer_boards = Vec::with_capacity(state_resp.hosted_boards.len());
+                    for mut board in state_resp.hosted_boards {
+                        board.host_machine.clone_from(&state_resp.machine);
+                        remote_boards_map.insert(board.group_key.clone(), board.clone());
+                        peer_boards.push(board);
+                    }
+                    self.state.swarm_mirrors.replace_peer(&machine, peer_boards);
+                }
+                None => {
+                    self.state.swarm_mirrors.purge_peer(&machine);
                 }
             }
         }
@@ -364,6 +439,33 @@ impl DaemonSwarmTransport {
             remote_sessions,
             remote_boards: remote_boards_map.into_values().collect(),
         }
+    }
+
+    async fn exchange_cloud_board_rpc(
+        &self,
+        path: &str,
+        payload: Vec<u8>,
+    ) -> Result<(StatusCode, bytes::Bytes), SwarmError> {
+        let timeout = self.timeout();
+        for (_, host) in self.state.cloud_sessions.hosts_snapshot() {
+            let Ok(Ok(endpoint)) = with_timeout(timeout, host.endpoint(false)).await else {
+                continue;
+            };
+            let Ok(Ok((status, bytes))) = with_timeout(
+                timeout,
+                endpoint.exchange(hyper::Method::POST, path, Some(payload.clone())),
+            )
+            .await
+            else {
+                continue;
+            };
+            if status != StatusCode::NOT_FOUND {
+                return Ok((status, bytes));
+            }
+        }
+        Err(SwarmError::Remote(format!(
+            "Board Host '{CLOUD_MACHINE}' is unreachable"
+        )))
     }
 
     pub(crate) async fn read_host_side(
@@ -382,17 +484,21 @@ impl DaemonSwarmTransport {
                 .ok_or(SwarmError::NoActiveBoard)?;
             return swarm.serve_host_read(request).await;
         }
-        let Some(base_url) = endpoints.get(host_machine) else {
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| SwarmError::Remote(e.to_string()))?;
+        let (status, bytes) = if let Some(base_url) = endpoints.get(host_machine) {
+            let url = format!("{base_url}/api/peers/swarm/read");
+            http_json(zenwave::Method::POST, &url, Some(payload), self.timeout())
+                .await
+                .map_err(SwarmError::Remote)?
+        } else if host_machine == CLOUD_MACHINE {
+            self.exchange_cloud_board_rpc("/api/peers/swarm/read", payload)
+                .await?
+        } else {
             return Err(SwarmError::Remote(format!(
                 "Board Host '{host_machine}' is unreachable"
             )));
         };
-        let url = format!("{base_url}/api/peers/swarm/read");
-        let payload =
-            serde_json::to_vec(&request).map_err(|e| SwarmError::Remote(e.to_string()))?;
-        let (status, bytes) = http_json(zenwave::Method::POST, &url, Some(payload), self.timeout())
-            .await
-            .map_err(SwarmError::Remote)?;
         decode_swarm_response(status, &bytes)
     }
 
@@ -412,17 +518,21 @@ impl DaemonSwarmTransport {
                 .ok_or(SwarmError::NoActiveBoard)?;
             return swarm.serve_host_post(request).await;
         }
-        let Some(base_url) = endpoints.get(host_machine) else {
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| SwarmError::Remote(e.to_string()))?;
+        let (status, bytes) = if let Some(base_url) = endpoints.get(host_machine) {
+            let url = format!("{base_url}/api/peers/swarm/post");
+            http_json(zenwave::Method::POST, &url, Some(payload), self.timeout())
+                .await
+                .map_err(SwarmError::Remote)?
+        } else if host_machine == CLOUD_MACHINE {
+            self.exchange_cloud_board_rpc("/api/peers/swarm/post", payload)
+                .await?
+        } else {
             return Err(SwarmError::Remote(format!(
                 "Board Host '{host_machine}' is unreachable"
             )));
         };
-        let url = format!("{base_url}/api/peers/swarm/post");
-        let payload =
-            serde_json::to_vec(&request).map_err(|e| SwarmError::Remote(e.to_string()))?;
-        let (status, bytes) = http_json(zenwave::Method::POST, &url, Some(payload), self.timeout())
-            .await
-            .map_err(SwarmError::Remote)?;
         decode_swarm_response(status, &bytes)
     }
 
@@ -442,17 +552,21 @@ impl DaemonSwarmTransport {
                 .ok_or(SwarmError::NoActiveBoard)?;
             return swarm.serve_host_pr(request).await;
         }
-        let Some(base_url) = endpoints.get(host_machine) else {
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| SwarmError::Remote(e.to_string()))?;
+        let (status, bytes) = if let Some(base_url) = endpoints.get(host_machine) {
+            let url = format!("{base_url}/api/peers/swarm/pr");
+            http_json(zenwave::Method::POST, &url, Some(payload), self.timeout())
+                .await
+                .map_err(SwarmError::Remote)?
+        } else if host_machine == CLOUD_MACHINE {
+            self.exchange_cloud_board_rpc("/api/peers/swarm/pr", payload)
+                .await?
+        } else {
             return Err(SwarmError::Remote(format!(
                 "Board Host '{host_machine}' is unreachable"
             )));
         };
-        let url = format!("{base_url}/api/peers/swarm/pr");
-        let payload =
-            serde_json::to_vec(&request).map_err(|e| SwarmError::Remote(e.to_string()))?;
-        let (status, bytes) = http_json(zenwave::Method::POST, &url, Some(payload), self.timeout())
-            .await
-            .map_err(SwarmError::Remote)?;
         decode_swarm_response(status, &bytes)
     }
 
@@ -541,7 +655,7 @@ impl DaemonSwarmTransport {
                         flush_cloud_session_notices(&self.state, &target_id, &endpoint).await;
                         let payload = serde_json::to_vec(&request)
                             .map_err(|e| SwarmError::Remote(e.to_string()))?;
-                        let (status, bytes) = with_timeout(
+                        let delivered = match with_timeout(
                             timeout,
                             endpoint.exchange(
                                 hyper::Method::POST,
@@ -550,21 +664,42 @@ impl DaemonSwarmTransport {
                             ),
                         )
                         .await
-                        .map_err(|()| {
-                            SwarmError::Remote("timed out delivering cloud notice".to_string())
-                        })?
-                        .map_err(|e| SwarmError::Remote(e.to_string()))?;
-                        decode_swarm_response(status, &bytes)
+                        {
+                            Ok(Ok((status, bytes))) => {
+                                decode_swarm_response::<PeerSwarmDeliverResponse>(status, &bytes)
+                            }
+                            Ok(Err(error)) => Err(SwarmError::Remote(error.to_string())),
+                            Err(()) => Err(SwarmError::Remote(
+                                "timed out delivering cloud notice".to_string(),
+                            )),
+                        };
+                        match delivered {
+                            Ok(resp) => Ok(resp),
+                            Err(error) => {
+                                tracing::warn!(%error, session_id = %target_id, "failed to deliver cloud notice; buffering in SQLite");
+                                self.state
+                                    .buffered_cloud_notices
+                                    .push(&target_id, request)
+                                    .await;
+                                Ok(PeerSwarmDeliverResponse::default())
+                            }
+                        }
                     }
                     Ok(Err(CloudSessionError::Suspended)) => {
-                        self.state.buffered_cloud_notices.push(&target_id, request);
+                        self.state
+                            .buffered_cloud_notices
+                            .push(&target_id, request)
+                            .await;
                         Ok(PeerSwarmDeliverResponse {
                             woken: false,
                             capped: false,
                         })
                     }
                     Ok(Err(_)) | Err(()) => {
-                        self.state.buffered_cloud_notices.push(&target_id, request);
+                        self.state
+                            .buffered_cloud_notices
+                            .push(&target_id, request)
+                            .await;
                         Ok(PeerSwarmDeliverResponse::default())
                     }
                 }
@@ -572,7 +707,8 @@ impl DaemonSwarmTransport {
             PeerSwarmDeliverRequest::Dissolved { group_key, .. } => {
                 self.state
                     .buffered_cloud_notices
-                    .drop_dissolved_group(group_key);
+                    .drop_dissolved_group(group_key)
+                    .await;
                 for (row, host) in self.state.cloud_sessions.hosts_snapshot() {
                     if let Ok(Ok(endpoint)) = with_timeout(timeout, host.endpoint(false)).await
                         && let Ok(payload) = serde_json::to_vec(&request)
@@ -599,6 +735,12 @@ impl DaemonSwarmTransport {
 impl SwarmTransport for DaemonSwarmTransport {
     fn local_machine(&self) -> String {
         DaemonPeerFabric::new(self.state.clone()).local_machine_name()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.state
+            .draining
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn poll_world(&self) -> PeerSwarmWorld {
@@ -742,7 +884,7 @@ async fn probe_cloud_swarm_sessions(
     fronting_machine: &str,
     shadow_started: bool,
     timeout: Duration,
-) -> Vec<RemoteWorkingSession> {
+) -> (Vec<RemoteWorkingSession>, Vec<SwarmBoardSummary>) {
     let fallback_group = row
         .clone_repository
         .as_deref()
@@ -764,7 +906,7 @@ async fn probe_cloud_swarm_sessions(
                 && status.is_success()
                 && let Ok(parsed) = serde_json::from_slice::<PeerSwarmStateResponse>(&bytes)
             {
-                return parsed
+                let sessions = parsed
                     .sessions
                     .into_iter()
                     .map(|mut s| {
@@ -778,12 +920,13 @@ async fn probe_cloud_swarm_sessions(
                         s
                     })
                     .collect();
+                return (sessions, parsed.hosted_boards);
             }
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
         Ok(Err(CloudSessionError::Suspended)) => {
             if !shadow_started {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
             let title = state
                 .db()
@@ -793,18 +936,21 @@ async fn probe_cloud_swarm_sessions(
                 .flatten()
                 .and_then(|s| s.title)
                 .unwrap_or_else(|| row.session_id.clone());
-            vec![RemoteWorkingSession {
-                machine: CLOUD_MACHINE.to_string(),
-                voter_machine: fronting_machine.to_string(),
-                session_id: row.session_id.clone(),
-                name: title,
-                activity: Activity::Idle,
-                suspended: true,
-                roots: Vec::new(),
-                group_key: fallback_group,
-            }]
+            (
+                vec![RemoteWorkingSession {
+                    machine: CLOUD_MACHINE.to_string(),
+                    voter_machine: fronting_machine.to_string(),
+                    session_id: row.session_id.clone(),
+                    name: title,
+                    activity: Activity::Idle,
+                    suspended: true,
+                    roots: Vec::new(),
+                    group_key: fallback_group,
+                }],
+                Vec::new(),
+            )
         }
-        Ok(Err(_)) | Err(()) => Vec::new(),
+        Ok(Err(_)) | Err(()) => (Vec::new(), Vec::new()),
     }
 }
 
@@ -900,7 +1046,7 @@ pub async fn get_peer_swarm_state(
                 );
                 for (row, host) in state.cloud_sessions.hosts_snapshot() {
                     let started = local_working.contains(&row.session_id);
-                    let cloud_entries =
+                    let (cloud_entries, _) =
                         probe_cloud_swarm_sessions(&state, &row, &host, &machine, started, timeout)
                             .await;
                     sessions.extend(cloud_entries);
@@ -1330,9 +1476,17 @@ mod tests {
             kind: "PR".to_string(),
             body: "PR #99 merged".to_string(),
         };
-        fronting.state.buffered_cloud_notices.push("lynx", notice);
+        fronting
+            .state
+            .buffered_cloud_notices
+            .push("lynx", notice)
+            .await;
         assert_eq!(
-            fronting.state.buffered_cloud_notices.buffered_len("lynx"),
+            fronting
+                .state
+                .buffered_cloud_notices
+                .buffered_len("lynx")
+                .await,
             1
         );
 
@@ -1378,7 +1532,11 @@ mod tests {
         let endpoint = Endpoint::new(addr, token.expose());
         flush_cloud_session_notices(&fronting.state, "lynx", &endpoint).await;
         assert_eq!(
-            fronting.state.buffered_cloud_notices.buffered_len("lynx"),
+            fronting
+                .state
+                .buffered_cloud_notices
+                .buffered_len("lynx")
+                .await,
             0
         );
 
@@ -1394,5 +1552,464 @@ mod tests {
         .expect("flushed notice queued on codespace");
         let xml = claimed.hidden_context_xml.unwrap().into_inner();
         assert!(xml.contains("PR #99 merged"), "{xml}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sticky_board_host_survives_higher_priority_peer_and_cloud_join_and_fails_over_cleanly()
+    {
+        // 1. Start `macbook` with two working sessions -> opens epoch 1 on `macbook`.
+        let macbook = SwarmTestDaemon::spawn("macbook").await;
+        macbook
+            .start_forge_session("otter", "Frontend", "github:May-Agent/may")
+            .await;
+        macbook.set_cold("otter").await;
+        macbook
+            .start_forge_session("fox", "Tests", "github:May-Agent/may")
+            .await;
+        macbook.swarm.reconcile().await.unwrap();
+
+        let book_board = macbook
+            .swarm
+            .active_board_for("otter")
+            .expect("macbook hosts epoch 1");
+        assert!(book_board.is_local_host);
+        assert_eq!(book_board.board_epoch, 1);
+
+        // Post a message with CJK payload, advance fox's cursor, and leave an unconsumed @mention steer on cold `otter`.
+        let post_out = macbook
+            .swarm
+            .post_message("fox", "Working on API @otter — 日本語 / 한국어 / 中文")
+            .await
+            .unwrap();
+        assert!(post_out.contains("1:2"), "{post_out}");
+        let fox_read = macbook
+            .swarm
+            .read_board("fox", SwarmReadMode::Unread, None)
+            .await
+            .unwrap();
+        assert!(fox_read.contains("[1:1]"), "{fox_read}");
+        let cursor_before = macbook
+            .state
+            .db()
+            .get_swarm_cursor("github:May-Agent/may", "macbook:fox")
+            .await
+            .unwrap();
+        assert_eq!(cursor_before, 2);
+
+        // 2. Lexicographically smaller peer `apple` comes online and joins `github:May-Agent/may`.
+        let apple = SwarmTestDaemon::spawn("apple").await;
+        apple
+            .start_forge_session("badger", "Backend", "github:May-Agent/may")
+            .await;
+        apple.set_cold("badger").await;
+        macbook.state.update_config(|cfg| {
+            cfg.remote_access
+                .peer_endpoints
+                .insert("apple".to_string(), format!("http://{}", apple.addr));
+        });
+        apple.state.update_config(|cfg| {
+            cfg.remote_access
+                .peer_endpoints
+                .insert("macbook".to_string(), format!("http://{}", macbook.addr));
+        });
+
+        // Reconcile both peers repeatedly: `macbook` MUST remain Board Host with epoch 1, messages, cursors, and steers intact!
+        apple.swarm.reconcile().await.unwrap();
+        macbook.swarm.reconcile().await.unwrap();
+        apple.swarm.reconcile().await.unwrap();
+
+        let book_after_join = macbook
+            .swarm
+            .active_board_for("otter")
+            .expect("macbook stays active");
+        let apple_after_join = apple
+            .swarm
+            .active_board_for("badger")
+            .expect("apple joins macbook board");
+        assert!(book_after_join.is_local_host);
+        assert_eq!(book_after_join.board_epoch, 1);
+        assert_eq!(book_after_join.host_machine, "macbook");
+        assert!(!apple_after_join.is_local_host);
+        assert_eq!(apple_after_join.host_machine, "macbook");
+        assert_eq!(apple_after_join.board_epoch, 1);
+        assert_eq!(
+            macbook
+                .state
+                .db()
+                .board_max_seq("github:May-Agent/may")
+                .await
+                .unwrap(),
+            2,
+            "existing swarm_messages preserved"
+        );
+        assert_eq!(
+            macbook
+                .state
+                .db()
+                .get_swarm_cursor("github:May-Agent/may", "macbook:fox")
+                .await
+                .unwrap(),
+            2,
+            "existing read cursor preserved"
+        );
+        let otter_summary_before_failover = macbook
+            .state
+            .runtime_service
+            .get("otter")
+            .await
+            .expect("otter runtime");
+        let otter_steer_xml = otter_summary_before_failover
+            .pending_immediate
+            .expect("unconsumed @mention steer still pending on macbook")
+            .hidden_context_xml
+            .expect("xml")
+            .into_inner();
+        assert!(
+            !otter_steer_xml.contains("has since dissolved"),
+            "sticky host must not mark pending @mention dissolved: {otter_steer_xml}"
+        );
+
+        // Deliver a second @mention steer to cold `badger` on `apple` before failover.
+        macbook
+            .swarm
+            .post_message("fox", "Sync with @apple:badger")
+            .await
+            .unwrap();
+        // Wait until `badger`'s pending steer is queued in SQLite without claiming it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let summary = apple.state.runtime_service.get("badger").await.unwrap();
+            if summary.pending_immediate.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for badger pending steer"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // 3. Real failover: `apple` gets a second session so `> 1` remain when `macbook` drains.
+        apple
+            .start_forge_session("lynx", "Infra", "github:May-Agent/may")
+            .await;
+        macbook
+            .state
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        macbook.swarm.reconcile().await.unwrap();
+        apple.swarm.reconcile().await.unwrap();
+
+        // `macbook` stepped down cleanly without marking `otter`'s pending @mention steer dissolved.
+        assert!(
+            macbook
+                .state
+                .db()
+                .list_swarm_boards()
+                .await
+                .unwrap()
+                .is_empty(),
+            "draining host stepped down locally"
+        );
+        let otter_after_drain = macbook
+            .state
+            .runtime_service
+            .get("otter")
+            .await
+            .expect("otter runtime after drain");
+        let otter_xml_after = otter_after_drain
+            .pending_immediate
+            .expect("otter steer preserved across step-down")
+            .hidden_context_xml
+            .expect("xml")
+            .into_inner();
+        assert!(
+            !otter_xml_after.contains("has since dissolved"),
+            "step-down must NOT rewrite pending @mention steer as dissolved: {otter_xml_after}"
+        );
+
+        // `apple` failed over to `board_epoch = 2` and kept `badger`'s pending steer intact.
+        let apple_failover = apple
+            .swarm
+            .active_board_for("badger")
+            .expect("apple took over as Board Host");
+        assert!(apple_failover.is_local_host);
+        assert_eq!(apple_failover.board_epoch, 2);
+        let badger_after = apple.state.runtime_service.get("badger").await.unwrap();
+        let badger_xml = badger_after
+            .pending_immediate
+            .expect("badger steer kept across failover")
+            .hidden_context_xml
+            .expect("xml")
+            .into_inner();
+        assert!(
+            !badger_xml.contains("has since dissolved"),
+            "failover must not mark pending @mention dissolved: {badger_xml}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_daemon_joining_active_cloud_only_board_preserves_cloud_host() {
+        let cloud = SwarmTestDaemon::spawn("cloud").await;
+        cloud
+            .start_forge_session("c1", "Cloud One", "github:May-Agent/cloud-repo")
+            .await;
+        cloud
+            .start_forge_session("c2", "Cloud Two", "github:May-Agent/cloud-repo")
+            .await;
+        cloud.swarm.reconcile().await.unwrap();
+
+        let cloud_board = cloud
+            .swarm
+            .active_board_for("c1")
+            .expect("cloud hosts cloud-only board");
+        assert!(cloud_board.is_local_host);
+        assert_eq!(cloud_board.host_machine, "cloud");
+        assert_eq!(cloud_board.board_epoch, 1);
+        cloud
+            .swarm
+            .post_message("c1", "Existing cloud message — 日本語 / 한국어 / 中文")
+            .await
+            .unwrap();
+
+        // A non-cloud host daemon (`macbook`) comes online and joins the same repo.
+        let macbook = SwarmTestDaemon::spawn("macbook").await;
+        macbook
+            .start_forge_session("m1", "Macbook Member", "github:May-Agent/cloud-repo")
+            .await;
+        cloud.state.update_config(|cfg| {
+            cfg.remote_access
+                .peer_endpoints
+                .insert("macbook".to_string(), format!("http://{}", macbook.addr));
+        });
+        macbook.state.update_config(|cfg| {
+            cfg.remote_access
+                .peer_endpoints
+                .insert("cloud".to_string(), format!("http://{}", cloud.addr));
+        });
+
+        macbook.swarm.reconcile().await.unwrap();
+        cloud.swarm.reconcile().await.unwrap();
+
+        let cloud_after = cloud.swarm.active_board_for("c1").unwrap();
+        let macbook_after = macbook.swarm.active_board_for("m1").unwrap();
+        assert!(cloud_after.is_local_host);
+        assert_eq!(cloud_after.host_machine, "cloud");
+        assert_eq!(cloud_after.board_epoch, 1);
+        assert!(!macbook_after.is_local_host);
+        assert_eq!(macbook_after.host_machine, "cloud");
+        assert_eq!(macbook_after.board_epoch, 1);
+        assert_eq!(
+            cloud
+                .state
+                .db()
+                .board_max_seq("github:May-Agent/cloud-repo")
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_cloud_notices_survive_restart_and_transient_errors_until_acked_or_dissolved()
+    {
+        use skyzen::routing::CreateRouteNode as _;
+
+        #[derive(Clone)]
+        struct FlakyDeliverState {
+            attempts: Arc<std::sync::atomic::AtomicUsize>,
+            cloud: Arc<DaemonState>,
+        }
+
+        async fn flaky_deliver(
+            State(flaky): State<FlakyDeliverState>,
+            body: bytes::Bytes,
+        ) -> SkyResult<Response> {
+            let n = flaky
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 1 {
+                let mut resp = Response::new(skyzen::Body::empty());
+                *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                return Ok(resp);
+            }
+            let req: PeerSwarmDeliverRequest =
+                serde_json::from_slice(&body).map_err(bad_request_error)?;
+            let out = flaky
+                .cloud
+                .services
+                .swarm()
+                .unwrap()
+                .receive_peer_delivery(req)
+                .await
+                .map_err(|e| bad_request_error(e.to_string()))?;
+            Ok(peer_json_response(&out))
+        }
+
+        crate::test_support::install_global_executor();
+        let fronting_dir = tempfile::tempdir().unwrap();
+        let mut cfg = MayConfig::default();
+        cfg.experimental.swarm = true;
+        cfg.remote_access.machine_name = Some("macbook".to_string());
+        cfg.remote_access.peer_discovery_timeout_ms = 250;
+
+        // First daemon instance buffers two notices for a Suspended codespace `lynx`
+        // across two boards, then shuts down (build-id restart).
+        {
+            let state1 = Arc::new(
+                DaemonState::for_test(fronting_dir.path(), cfg.clone())
+                    .await
+                    .unwrap(),
+            );
+            state1
+                .buffered_cloud_notices
+                .push(
+                    "lynx",
+                    PeerSwarmDeliverRequest::Notice {
+                        group_key: "github:May-Agent/may".to_string(),
+                        board_epoch: 1,
+                        seq: 2,
+                        target_session_id: "lynx".to_string(),
+                        kind: "PR".to_string(),
+                        body: "PR #101 opened — 日本語 / 한국어 / 中文".to_string(),
+                    },
+                )
+                .await;
+            state1
+                .buffered_cloud_notices
+                .push(
+                    "lynx",
+                    PeerSwarmDeliverRequest::Notice {
+                        group_key: "github:May-Agent/may".to_string(),
+                        board_epoch: 1,
+                        seq: 3,
+                        target_session_id: "lynx".to_string(),
+                        kind: "PR".to_string(),
+                        body: "PR #101 merged".to_string(),
+                    },
+                )
+                .await;
+            state1
+                .buffered_cloud_notices
+                .push(
+                    "lynx",
+                    PeerSwarmDeliverRequest::Notice {
+                        group_key: "github:May-Agent/dissolved-repo".to_string(),
+                        board_epoch: 1,
+                        seq: 1,
+                        target_session_id: "lynx".to_string(),
+                        kind: "PR".to_string(),
+                        body: "stale PR #77".to_string(),
+                    },
+                )
+                .await;
+            assert_eq!(state1.buffered_cloud_notices.buffered_len("lynx").await, 3);
+        }
+
+        // Restarted daemon instance opening the same SQLite directory retains all 3 notices.
+        let state2 = Arc::new(
+            DaemonState::for_test(fronting_dir.path(), cfg)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            state2.buffered_cloud_notices.buffered_len("lynx").await,
+            3,
+            "buffered notices survive daemon restart in SQLite"
+        );
+
+        // Dissolving `github:May-Agent/dissolved-repo` purges only its buffered notices.
+        state2
+            .buffered_cloud_notices
+            .drop_dissolved_group("github:May-Agent/dissolved-repo")
+            .await;
+        assert_eq!(
+            state2.buffered_cloud_notices.buffered_len("lynx").await,
+            2,
+            "dissolved board notice purged while active board notices remain"
+        );
+
+        // Transient tunnel error (unreachable closed port): notices MUST NOT be dropped!
+        let dead_listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+        let token = FrontingToken::generate();
+        let dead_endpoint = Endpoint::new(dead_addr, token.expose());
+        flush_cloud_session_notices(&state2, "lynx", &dead_endpoint).await;
+        assert_eq!(
+            state2.buffered_cloud_notices.buffered_len("lynx").await,
+            2,
+            "unreachable tunnel retains buffered notices"
+        );
+
+        // HTTP 503 on second delivery: first notice is acked and removed, second stays for retry!
+        let cloud_dir = tempfile::tempdir().unwrap();
+        let home = CloudHome::for_token(&token, "lexoliu".to_string());
+        let mut cloud_cfg = MayConfig::default();
+        cloud_cfg.experimental.swarm = true;
+        let cloud_state = Arc::new(
+            DaemonState::for_test(cloud_dir.path(), cloud_cfg)
+                .await
+                .unwrap(),
+        );
+        let cloud_swarm = SwarmService::new(
+            crate::chat::agent_messaging(&cloud_state),
+            cloud_state.may_dir.clone(),
+            cloud_state.config.clone(),
+        );
+        cloud_state.services.set_swarm(cloud_swarm);
+        cloud_state
+            .db()
+            .create_session("lynx", Some("Cloud Lynx"), None)
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flaky_router = Arc::new(
+            skyzen::Route::new(("/api/peers/swarm/deliver".post(flaky_deliver),))
+                .middleware(State(FlakyDeliverState {
+                    attempts,
+                    cloud: cloud_state.clone(),
+                }))
+                .build(),
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _srv = tokio::spawn(crate::serve::serve_tcp(listener, flaky_router));
+
+        let endpoint = Endpoint::new(addr, token.expose());
+        let _ = home;
+        flush_cloud_session_notices(&state2, "lynx", &endpoint).await;
+        assert_eq!(
+            state2.buffered_cloud_notices.buffered_len("lynx").await,
+            1,
+            "first acked notice removed; second notice retained after HTTP 503"
+        );
+        let fence = RunFence {
+            session_id: "lynx".to_string(),
+            run_id: "r-lynx".to_string(),
+        };
+        let first_delivered = claim_pending_with_deadline(&cloud_state, &fence, "lynx")
+            .await
+            .expect("first notice delivered");
+        let xml1 = first_delivered.hidden_context_xml.unwrap().into_inner();
+        assert!(xml1.contains("PR #101 opened"), "{xml1}");
+
+        // Retry flush: remaining second notice succeeds and buffer empties.
+        flush_cloud_session_notices(&state2, "lynx", &endpoint).await;
+        assert_eq!(
+            state2.buffered_cloud_notices.buffered_len("lynx").await,
+            0,
+            "remaining notice removed once delivery succeeds"
+        );
+        let second_delivered = claim_pending_with_deadline(&cloud_state, &fence, "lynx")
+            .await
+            .expect("second notice delivered on retry");
+        let xml2 = second_delivered.hidden_context_xml.unwrap().into_inner();
+        assert!(xml2.contains("PR #101 merged"), "{xml2}");
     }
 }

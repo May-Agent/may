@@ -1619,7 +1619,7 @@ impl DaemonState {
             pushed_providers,
             cloud_home_bridge: super::cloud_home::CloudHomeBridge::default(),
             swarm_mirrors: super::swarm_peers::SwarmMirrorState::default(),
-            buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::default(),
+            buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::new(db.clone()),
             notification_service,
             memory_processor: None,
             local_url_port_mapper: std::sync::Arc::new(
