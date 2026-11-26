@@ -2,6 +2,7 @@
 //!
 //! Each session has its own sandbox directory and chat history.
 
+pub use may_protocol::execution_mode::{ExecutionMode, ExecutionModeParseError};
 pub use may_protocol::session_import::*;
 pub use may_protocol::session_messages::*;
 pub use may_protocol::session_runtime::*;

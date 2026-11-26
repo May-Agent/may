@@ -702,6 +702,11 @@ export const enUS = {
     description: 'Grant every approval request in this chat without asking',
     failed: 'Couldn’t change yolo: {message}',
   },
+  executionMode: {
+    orchestratorLabel: 'Orchestrator',
+    orchestratorDescription: 'Delegate hands-on work to subagents to keep the main context lean',
+    failed: 'Couldn’t change execution mode: {message}',
+  },
   memoryToggle: {
     label: 'Memory',
     description: 'Stop reading and saving memories for the rest of this chat',

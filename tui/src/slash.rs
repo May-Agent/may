@@ -28,6 +28,7 @@ pub enum SlashCommand {
     Rewind,
     Jobs,
     Questions,
+    Orchestrator,
     Yolo,
     MemoryOff,
     Sleep,
@@ -64,7 +65,7 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; if cfg!(feature = "ui") { 39 } else { 38 }] = [
+    pub const ALL: [Self; if cfg!(feature = "ui") { 40 } else { 39 }] = [
         Self::Help,
         Self::Session,
         Self::Archive,
@@ -84,6 +85,7 @@ impl SlashCommand {
         Self::Rewind,
         Self::Jobs,
         Self::Questions,
+        Self::Orchestrator,
         Self::Yolo,
         Self::MemoryOff,
         Self::Sleep,
@@ -142,6 +144,11 @@ impl SlashCommand {
             ),
             Self::Jobs => ("/jobs", "", "Background jobs and running subagents"),
             Self::Questions => ("/questions", "", "Answer the questions the agent left open"),
+            Self::Orchestrator => (
+                "/orchestrator",
+                "",
+                "Toggle experimental orchestrator mode for this session",
+            ),
             Self::Yolo => (
                 "/yolo",
                 "",

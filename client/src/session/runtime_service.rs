@@ -2,9 +2,10 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use may_db::ChatDb;
 
 use super::{
-    AcquireError, PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
-    PersistedPermissionRequest, PersistedWorkspaceRequest, RunOutcome, SessionPlanState,
-    SessionRuns, SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState, UserWait,
+    AcquireError, ExecutionMode, PendingUserMessage, PendingUserMessageMode,
+    PersistedAskUserRequest, PersistedPermissionRequest, PersistedWorkspaceRequest, RunOutcome,
+    SessionPlanState, SessionRuns, SessionRuntimeState, SessionRuntimeSummary,
+    TerminalRuntimeState, UserWait,
 };
 
 /// How often a stop re-checks whether the stopped run has ended.
@@ -386,6 +387,23 @@ impl SessionRuntimeService {
         let summary = self
             .db
             .set_session_plan_state(session_id, plan_state)
+            .await?;
+        self.publish_runtime_change(session_id);
+        Ok(summary)
+    }
+
+    /// Persist a session's execution mode.
+    ///
+    /// # Errors
+    /// Returns [`may_db::ChatDbError`] on storage failure.
+    pub async fn set_execution_mode(
+        &self,
+        session_id: &str,
+        execution_mode: ExecutionMode,
+    ) -> Result<SessionRuntimeSummary, may_db::ChatDbError> {
+        let summary = self
+            .db
+            .set_session_execution_mode(session_id, &execution_mode)
             .await?;
         self.publish_runtime_change(session_id);
         Ok(summary)

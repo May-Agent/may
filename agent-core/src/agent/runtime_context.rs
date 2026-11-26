@@ -26,7 +26,7 @@ use super::may::{AgentEnvironment, MayAgentError};
 use crate::agent::agents_md::{self, AgentsIndex, HandoffAgentDoc, RulesDocument};
 use crate::config::{SshServerConfig, TimeZoneName};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
-use crate::session::{SessionPaths, SessionPlanState};
+use crate::session::{ExecutionMode, SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
 use crate::terminal_commands::CoreCommandUsage;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
@@ -476,6 +476,10 @@ const LANGUAGES_CONTENT: LiveContent =
 /// The plan-mode instructions, announced when plan state changes mid-session.
 const PLAN_MODE_CONTENT: LiveContent = LiveContent::new("The plan mode", "plan_mode_diff");
 
+/// The orchestrator-mode instructions, announced when execution mode changes mid-session.
+const ORCHESTRATOR_MODE_CONTENT: LiveContent =
+    LiveContent::new("The orchestrator mode", "orchestrator_mode_diff");
+
 /// All instruction slots synced as live content so mid-session changes keep
 /// the cached prefix warm until reassembly.
 const LIVE_INSTRUCTIONS: &[(&LiveContent, InstructionSlot)] = &[
@@ -487,6 +491,7 @@ const LIVE_INSTRUCTIONS: &[(&LiveContent, InstructionSlot)] = &[
     (&TIME_CONTENT, tag::TIME),
     (&LANGUAGES_CONTENT, tag::LANGUAGES),
     (&PLAN_MODE_CONTENT, tag::PLAN_MODE),
+    (&ORCHESTRATOR_MODE_CONTENT, tag::ORCHESTRATOR_MODE),
 ];
 
 fn is_live_instruction(slot: &InstructionSlot) -> bool {
@@ -1259,6 +1264,24 @@ pub fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<String> {
             .render()
             .unwrap_or_else(|error| panic!("failed to render plan mode: {error}")),
     )
+}
+
+#[derive(Template)]
+#[template(path = "prompt/orchestrator_mode.md", escape = "none")]
+struct OrchestratorModeTemplate;
+
+/// Renders `<orchestrator_mode>` when `execution_mode` is
+/// [`ExecutionMode::Orchestrator`]; `None` for other modes.
+#[must_use]
+pub fn build_orchestrator_mode_context(execution_mode: &ExecutionMode) -> Option<String> {
+    match execution_mode {
+        ExecutionMode::Standard => None,
+        ExecutionMode::Orchestrator => Some(
+            OrchestratorModeTemplate
+                .render()
+                .unwrap_or_else(|error| panic!("failed to render orchestrator mode: {error}")),
+        ),
+    }
 }
 
 #[derive(Template)]

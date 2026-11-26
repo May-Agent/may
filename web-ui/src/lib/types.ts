@@ -107,6 +107,8 @@ export type SessionRuntimeState =
 
 export type SessionPlanState = 'disabled' | 'draft' | 'approved';
 
+export type ExecutionMode = { mode: 'standard' } | { mode: 'orchestrator' };
+
 export type PendingUserMessageMode = 'steer' | 'queue';
 
 export interface BrowserInteractionState {
@@ -264,6 +266,7 @@ export interface PersistedAskUserRequest {
 export interface SessionRuntimeSummary {
   state?: SessionRuntimeState;
   planState?: SessionPlanState;
+  executionMode?: ExecutionMode;
   yolo?: boolean;
   memoryOff?: boolean;
   interactions?: SessionInteractionState;

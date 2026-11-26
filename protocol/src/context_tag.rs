@@ -28,6 +28,8 @@ pub mod tag {
     pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
     /// The plan-mode phase and its constraints.
     pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
+    /// The orchestrator-mode delegation guidance.
+    pub const ORCHESTRATOR_MODE: InstructionSlot = InstructionSlot::new("orchestrator_mode");
     /// What the sandbox allows and how `unsafe` escalation works.
     pub const PERMISSIONS: InstructionSlot = InstructionSlot::new("permissions");
     /// The mechanisms the harness runs around the agent.
@@ -57,7 +59,7 @@ pub mod tag {
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
     /// The instruction slots May writes, in prompt order.
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 20] = [
         IDENTITY,
         HARNESS,
         EVIDENCE,
@@ -76,6 +78,7 @@ pub mod tag {
         SESSION,
         REPO_CLONES,
         PLAN_MODE,
+        ORCHESTRATOR_MODE,
         PROJECT_RULES,
     ];
 
@@ -87,7 +90,7 @@ pub mod tag {
     /// environment, terminal, prepared tools, efficiency, capabilities and
     /// the command table, browser, work, permissions, time and languages.
     /// Text specific to the session comes last: the session section, repo
-    /// clones, plan mode and project rules, then the external content.
+    /// clones, plan mode, orchestrator mode and project rules, then the external content.
     #[must_use]
     pub fn layout() -> SystemLayout {
         SystemLayout::new(
@@ -110,6 +113,7 @@ pub mod tag {
                 SESSION,
                 REPO_CLONES,
                 PLAN_MODE,
+                ORCHESTRATOR_MODE,
                 PROJECT_RULES,
             ],
             [

@@ -36,6 +36,8 @@ pub mod daemon_api;
 pub mod decode_meter;
 /// Disk-exhaustion classification shared by the database, shells and daemon.
 pub mod disk_exhaustion;
+/// Session-scoped execution mode, orthogonal to plan mode.
+pub mod execution_mode;
 /// Per-session file-change tracking backed by detached git trees.
 pub mod file_tracker;
 /// Model-facing ids: session names and each session's pool of words.

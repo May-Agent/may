@@ -219,6 +219,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 context_policy: app.config.context.policy(),
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
+                execution_mode: app.session_runtime.execution_mode.clone(),
                 yolo: app.session_runtime.yolo,
                 memory_off: app.session_runtime.memory_off,
                 shells: running_shells,

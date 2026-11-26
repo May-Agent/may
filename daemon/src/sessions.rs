@@ -598,13 +598,16 @@ pub async fn create_session(
         (Some(_), Some(spec)) => Some(cloud_repository(spec)?),
         _ => None,
     };
-    let model = {
+    let (model, default_execution_mode) = {
         let config = state.config_snapshot();
-        req.model
+        let model = req
+            .model
             .or_else(|| config.last_model.as_ref().map(ToString::to_string))
             .or_else(|| preferred_advanced_model(&config))
-            .ok_or_else(|| bad_request_error("No model configured"))?
+            .ok_or_else(|| bad_request_error("No model configured"))?;
+        (model, config.experimental.default_execution_mode())
     };
+    let execution_mode = req.execution_mode.unwrap_or(default_execution_mode);
 
     let resolved_profile_id = requested_profile_id
         .clone()
@@ -660,6 +663,14 @@ pub async fn create_session(
         _ => None,
     };
 
+    if !execution_mode.is_standard() {
+        state
+            .db()
+            .set_session_execution_mode(&id, &execution_mode)
+            .await
+            .map_err(internal_error)?;
+    }
+
     // The model a user last chose is this machine's user's choice; a cloud
     // home's sessions carry the choice made on the fronting daemon.
     if !fronted.0 {
@@ -672,6 +683,7 @@ pub async fn create_session(
     let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
     session.repo = resolved_repo;
     session.location = location;
+    session.runtime.execution_mode = execution_mode;
     if req.cloud.is_none() {
         state.session_prewarms.spawn(&state, &session.id);
     }
@@ -1151,6 +1163,13 @@ pub async fn patch_session(
         state
             .runtime_service
             .set_plan_state(&id, plan_state)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(execution_mode) = req.execution_mode {
+        state
+            .runtime_service
+            .set_execution_mode(&id, execution_mode)
             .await
             .map_err(internal_error)?;
     }
