@@ -38,10 +38,15 @@ mod daemon_computer;
 /// agent-core re-exports occupy).
 #[path = "config.rs"]
 mod daemon_config;
+/// Daemon-side Fusion companion runtime (renamed off `fusion`, which the
+/// agent-core re-exports occupy).
+#[path = "fusion.rs"]
+mod daemon_fusion;
 pub mod disk_exhaustion;
 mod error;
 mod error_chain;
 mod events;
+pub use may_agent_core::fusion;
 /// Forge-authentication routes and their wire types.
 ///
 /// Exposed publicly so the CLI and TUI share the daemon's request and
@@ -106,6 +111,8 @@ mod user_wait;
 mod compression_tests;
 #[cfg(test)]
 mod funnel_tests;
+#[cfg(test)]
+mod fusion_tests;
 #[cfg(test)]
 mod issue_brief_tests;
 #[cfg(test)]

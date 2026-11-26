@@ -107,7 +107,10 @@ export type SessionRuntimeState =
 
 export type SessionPlanState = 'disabled' | 'draft' | 'approved';
 
-export type ExecutionMode = { mode: 'standard' } | { mode: 'orchestrator' };
+export type ExecutionMode =
+  | { mode: 'standard' }
+  | { mode: 'orchestrator' }
+  | { mode: 'fusion'; sidekickModel: string };
 
 export type PendingUserMessageMode = 'steer' | 'queue';
 

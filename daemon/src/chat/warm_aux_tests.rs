@@ -34,7 +34,7 @@ pub async fn state_with_idle_agent_on(
 ) -> (Arc<DaemonState>, ManualClock, tempfile::TempDir) {
     let config = saved_config(stub, None);
     let state = Arc::new(
-        DaemonState::for_test(dir, config.clone())
+        Box::pin(DaemonState::for_test(dir, config.clone()))
             .await
             .expect("test daemon state"),
     );

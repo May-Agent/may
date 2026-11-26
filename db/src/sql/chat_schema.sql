@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS network_access_logs (id INTEGER PRIMARY KEY AUTOINCRE
 CREATE TABLE IF NOT EXISTS session_runtimes (session_id TEXT PRIMARY KEY, state TEXT NOT NULL, run_id TEXT, browser_takeover_active BOOLEAN NOT NULL, browser_takeover_alert_pending BOOLEAN NOT NULL, terminal_pid INTEGER, terminal_output_file TEXT, terminal_output_preview TEXT, terminal_input_notice TEXT, terminal_background_reason TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_plans (session_id TEXT PRIMARY KEY, plan_state TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_execution_modes (session_id TEXT PRIMARY KEY, mode TEXT NOT NULL, sidekick_model TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_companions (session_id TEXT PRIMARY KEY, parent_session_id TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_session_companions_parent ON session_companions(parent_session_id);
 CREATE TABLE IF NOT EXISTS session_yolo (session_id TEXT PRIMARY KEY, enabled BOOLEAN NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_memory (session_id TEXT PRIMARY KEY, disabled BOOLEAN NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_pending_permissions (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, mode TEXT NOT NULL, script TEXT NOT NULL, created_at TEXT NOT NULL, agent_id TEXT);

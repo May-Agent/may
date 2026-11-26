@@ -169,6 +169,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub model_listing: Option<crate::agent::models_tool::ModelListing>,
     /// Handles every session of the host shares.
     pub services: SharedServices,
+    /// Whether this session is a normal user-facing session or a hidden Fusion companion.
+    pub session_role: crate::fusion::SessionRole,
 }
 
 /// Handles the host owns once and every session's commands share: cloning
@@ -190,6 +192,8 @@ pub struct SharedServices {
     pub signer_roots: crate::commit_signing::SignerRoots,
     /// Optional daemon-hosted swarm coordination service.
     swarm: Arc<arc_swap::ArcSwapOption<crate::swarm::SwarmService>>,
+    /// Optional daemon-hosted Fusion service (pair state, write leases, `sidekick` executor).
+    fusion: Arc<arc_swap::ArcSwapOption<crate::fusion::FusionService>>,
     /// Optional daemon-hosted May Bot approval router for supervised sessions.
     bot_approvals: Arc<arc_swap::ArcSwapOption<crate::bot::BotApprovalRouter>>,
 }
@@ -207,6 +211,7 @@ impl SharedServices {
             forge_auth: crate::forge::LiveForgeAuth::default(),
             signer_roots: crate::commit_signing::SignerRoots::default(),
             swarm: Arc::new(arc_swap::ArcSwapOption::empty()),
+            fusion: Arc::new(arc_swap::ArcSwapOption::empty()),
             bot_approvals: Arc::new(arc_swap::ArcSwapOption::empty()),
         }
     }
@@ -231,6 +236,17 @@ impl SharedServices {
     #[must_use]
     pub fn swarm(&self) -> Option<crate::swarm::SwarmService> {
         self.swarm.load_full().map(|arc| (*arc).clone())
+    }
+
+    /// Installs the daemon's live [`crate::fusion::FusionService`].
+    pub fn set_fusion(&self, fusion: crate::fusion::FusionService) {
+        self.fusion.store(Some(Arc::new(fusion)));
+    }
+
+    /// Returns the installed [`crate::fusion::FusionService`], when hosted by the daemon.
+    #[must_use]
+    pub fn fusion(&self) -> Option<crate::fusion::FusionService> {
+        self.fusion.load_full().map(|arc| (*arc).clone())
     }
 
     /// Installs the daemon's live [`crate::bot::BotApprovalRouter`].
@@ -314,6 +330,16 @@ where
 {
     let mut descriptions = Vec::new();
     let mut usages = Vec::new();
+    let is_sidekick = config.session_role.is_sidekick();
+    let repos_root = config
+        .session_role
+        .parent_sandbox_dir()
+        .unwrap_or(&config.sandbox_dir)
+        .to_path_buf();
+    let repos_session_id = config
+        .session_role
+        .parent_session_id()
+        .map_or_else(|| config.session_id.clone(), |id| id.as_str().to_string());
 
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, MayWebFetch::new());
@@ -368,8 +394,8 @@ where
             Some(config.db.clone()),
             Some(
                 crate::repo_clone::SessionRepos::new(
-                    &config.sandbox_dir,
-                    config.session_id.clone(),
+                    &repos_root,
+                    repos_session_id.clone(),
                     config.db.clone(),
                 )
                 .with_may_config(may_config.clone())
@@ -428,8 +454,13 @@ where
         issue_tool = issue_tool.with_owners(owners.clone());
         subagent_issue_tool = subagent_issue_tool.with_owners(owners);
     }
-    describe_tool(&mut descriptions, &issue_tool);
-    builder.configure_role_tools(issue_tool, subagent_issue_tool);
+    if is_sidekick {
+        describe_tool(&mut descriptions, &subagent_issue_tool);
+        builder.configure_tool(subagent_issue_tool);
+    } else {
+        describe_tool(&mut descriptions, &issue_tool);
+        builder.configure_role_tools(issue_tool, subagent_issue_tool);
+    }
     // Issue and PR changes reach GitHub through `issue` and `pr` alone. The command exists
     // in sandboxed modes only, so an approved unsafe command resolves `gh` on
     // the host's PATH and runs the real program.
@@ -476,8 +507,8 @@ where
 
     let pr_context = crate::pr::PrContext {
         db: Some(config.db.clone()),
-        session_id: config.session_id.clone(),
-        session_root: config.sandbox_dir.clone(),
+        session_id: repos_session_id.clone(),
+        session_root: repos_root.clone(),
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
@@ -498,30 +529,32 @@ where
     };
     let ci_tool = crate::agent::ci_tool::CiTool::new(
         config.db.clone(),
-        config.session_id.clone(),
+        repos_session_id.clone(),
         config.may_dir.clone(),
         config.services.forge_auth.clone(),
     );
     describe_tool(&mut descriptions, &ci_tool);
     builder.configure_tool(ci_tool);
-    let mut pr_command = PrCommand::new(pr_context, config.timeout_cap.clone());
-    if let Some(guard) = &config.languages {
-        pr_command = pr_command.with_languages(guard.clone());
+    if !is_sidekick {
+        let mut pr_command = PrCommand::new(pr_context, config.timeout_cap.clone());
+        if let Some(guard) = &config.languages {
+            pr_command = pr_command.with_languages(guard.clone());
+        }
+        if let Some(swarm) = config.services.swarm() {
+            pr_command = pr_command.with_swarm(swarm);
+        }
+        describe_arguments::<PrArgs>(&mut descriptions, "pr");
+        // Built per terminal: git inside a session clone and the project checks
+        // run on that terminal's sandbox.
+        builder.configure_bound_tool("pr", move |binding| pr_command.for_terminal(binding));
     }
-    if let Some(swarm) = config.services.swarm() {
-        pr_command = pr_command.with_swarm(swarm);
-    }
-    describe_arguments::<PrArgs>(&mut descriptions, "pr");
-    // Built per terminal: git inside a session clone and the project checks
-    // run on that terminal's sandbox.
-    builder.configure_bound_tool("pr", move |binding| pr_command.for_terminal(binding));
 
     let repo_context = RepoContext {
         cwd: config.cwd.clone(),
-        session_root: config.sandbox_dir.clone(),
+        session_root: repos_root,
         workspace_config: config.workspace_config.clone(),
         db: config.db.clone(),
-        session_id: config.session_id.clone(),
+        session_id: repos_session_id,
         scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         host: config.git.clone(),
         may_config: may_config.clone(),
@@ -534,10 +567,15 @@ where
     };
     let repo_tool = RepoTool::new(repo_context.clone());
     let subagent_repo_tool = SubagentRepoTool::new(repo_context);
-    describe_tool(&mut descriptions, &repo_tool);
-    builder.configure_role_tools(repo_tool, subagent_repo_tool);
+    if is_sidekick {
+        describe_tool(&mut descriptions, &subagent_repo_tool);
+        builder.configure_tool(subagent_repo_tool);
+    } else {
+        describe_tool(&mut descriptions, &repo_tool);
+        builder.configure_role_tools(repo_tool, subagent_repo_tool);
+    }
 
-    if let Some(runtime) = config.ask_user {
+    if !is_sidekick && let Some(runtime) = config.ask_user {
         let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone())
             .with_task_events(config.task_events.clone())
             .with_cards(config.subagent_tracker.cards().clone());
@@ -563,7 +601,7 @@ where
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
     }
 
-    if let Some(import) = config.rules_import {
+    if !is_sidekick && let Some(import) = config.rules_import {
         let global_rules = crate::rules_import::GlobalRulesTool::new(
             import,
             config.session_id.clone(),
@@ -585,7 +623,7 @@ where
     }
 
     let fork_launcher = crate::agent_link::ForkLauncher::default();
-    if let Some(messaging) = config.agent_messaging {
+    if !is_sidekick && let Some(messaging) = config.agent_messaging {
         let mut btw =
             crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone())
                 .with_fork_launcher(fork_launcher.clone());
@@ -653,7 +691,7 @@ where
         );
     }
 
-    if let Some(task_broker) = config.task_broker {
+    if !is_sidekick && let Some(task_broker) = config.task_broker {
         // A task belongs to the session's main agent: the prompt its runs
         // inject wakes that agent, so a subagent cannot create one.
         let task = TaskTool::new(
@@ -678,10 +716,8 @@ where
         });
     }
 
-    describe_arguments::<crate::agent::serve_tool::ServeArgs>(&mut descriptions, "serve");
-    {
-        // A service's alerts land on the session's main agent: a subagent
-        // has no `serve`.
+    if !is_sidekick {
+        describe_arguments::<crate::agent::serve_tool::ServeArgs>(&mut descriptions, "serve");
         let session_id = config.session_id.clone();
         let tunnel_broker = config.tunnel_broker.clone();
         builder.main_only(|reserved| {
@@ -695,7 +731,7 @@ where
         });
     }
 
-    if let Some(tunnel_broker) = config.tunnel_broker {
+    if !is_sidekick && let Some(tunnel_broker) = config.tunnel_broker {
         // A tunnel exposes the session to the outside: main-agent authority.
         builder.main_only(|reserved| {
             register_tool_with_description(
@@ -716,7 +752,7 @@ where
         builder.configure_image_tool(tool);
     }
 
-    if let Some(register_skills_broker) = config.register_skills_broker {
+    if !is_sidekick && let Some(register_skills_broker) = config.register_skills_broker {
         // Registering skills reshapes the session: main-agent authority.
         builder.main_only(|reserved| {
             register_tool_with_description(
@@ -730,7 +766,7 @@ where
         });
     }
 
-    if let Some(workspace_request_broker) = config.workspace_request_broker {
+    if !is_sidekick && let Some(workspace_request_broker) = config.workspace_request_broker {
         // A workspace request asks the user to widen the session's view of
         // the host: main-agent authority.
         let approval_pause = builder.approval_pause();
@@ -822,36 +858,46 @@ where
         call_images: Some(builder.call_images()),
         vision_ocr,
     });
-    describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
-    usages.push(CoreCommandUsage {
-        name: "subagent".to_string(),
-        usage: arguments_usage::<SubagentArgs>(),
-    });
-    describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
-    usages.push(CoreCommandUsage {
-        name: "explore".to_string(),
-        usage: arguments_usage::<ExploreArgs>(),
-    });
-    // Built for the main agent's shell alone: a subagent has no `subagent`
-    // or `explore` command.
-    builder.main_exclusive(|main| {
-        let explore_service = subagent_service.clone();
-        main.configure_bound_usage_tool("subagent", move |binding| {
-            SubagentCommand::new(subagent_service.clone(), binding.shell.cloned()).with_cards()
+    if !is_sidekick {
+        describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
+        usages.push(CoreCommandUsage {
+            name: "subagent".to_string(),
+            usage: arguments_usage::<SubagentArgs>(),
         });
-        main.configure_bound_usage_tool("explore", move |binding| {
-            ExploreTool::new(SubagentCommand::new(
-                explore_service.clone(),
-                binding.shell.cloned(),
-            ))
+        describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
+        usages.push(CoreCommandUsage {
+            name: "explore".to_string(),
+            usage: arguments_usage::<ExploreArgs>(),
         });
-    });
+        // Built for the main agent's shell alone: a subagent has no `subagent`,
+        // `explore`, or `sidekick` command.
+        builder.main_exclusive(|main| {
+            let explore_service = subagent_service.clone();
+            main.configure_bound_usage_tool("subagent", move |binding| {
+                SubagentCommand::new(subagent_service.clone(), binding.shell.cloned()).with_cards()
+            });
+            main.configure_bound_usage_tool("explore", move |binding| {
+                ExploreTool::new(SubagentCommand::new(
+                    explore_service.clone(),
+                    binding.shell.cloned(),
+                ))
+            });
+            if let Some(fusion) = config.services.fusion() {
+                let sidekick = crate::fusion::SidekickTool::new(
+                    fusion,
+                    config.session_id.clone(),
+                    config.sandbox_dir.clone(),
+                );
+                main.command_set(crate::fusion::SidekickCommandSet::new(sidekick));
+            }
+        });
 
-    if let Some(listing) = config.model_listing {
-        // `subagent --model` is the main agent's choice; its catalog is too.
-        let models = crate::agent::models_tool::ModelsTool::new(listing);
-        describe_tool(&mut descriptions, &models);
-        builder.main_only(|reserved| reserved.configure_tool(models));
+        if let Some(listing) = config.model_listing {
+            // `subagent --model` is the main agent's choice; its catalog is too.
+            let models = crate::agent::models_tool::ModelsTool::new(listing);
+            describe_tool(&mut descriptions, &models);
+            builder.main_only(|reserved| reserved.configure_tool(models));
+        }
     }
 
     // A running subagent's line back to the main agent that launched it —
@@ -1085,6 +1131,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1186,6 +1233,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1260,6 +1308,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1328,6 +1377,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1391,6 +1441,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1567,6 +1618,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1701,6 +1753,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1766,6 +1819,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1835,6 +1889,7 @@ mod tests {
                 subagent_models: None,
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

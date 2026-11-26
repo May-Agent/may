@@ -9,6 +9,8 @@ pub mod agent;
 pub mod agent_link;
 /// Always-on non-bash-first bridge agents with git-backed hierarchical memory.
 pub mod bot;
+/// Experimental Fusion mode: frontier lead paired with a persistent cache-warm sidekick.
+pub mod fusion;
 /// Experimental per-worktree coordination board, `@mention` wakeups and PR alerts.
 pub mod swarm;
 /// Persistent storage for OAuth credentials.

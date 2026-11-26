@@ -102,6 +102,9 @@ pub enum ConfigError {
     /// Invalid `[update]` config.
     #[error("invalid update config: {0}")]
     InvalidUpdateConfig(String),
+    /// Invalid `[experimental]` config.
+    #[error("invalid experimental config: {0}")]
+    InvalidExperimentalConfig(String),
     /// A provider instance already exists under the ID with a different type.
     #[error(
         "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
@@ -1459,6 +1462,14 @@ const fn default_swarm_read_limit() -> usize {
     50
 }
 
+const fn default_fusion_keep_warm_grace() -> Duration {
+    Duration::from_mins(15)
+}
+
+fn is_default_fusion_keep_warm_grace(value: &Duration) -> bool {
+    *value == default_fusion_keep_warm_grace()
+}
+
 /// Default execution mode configured under `[experimental] execution_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1468,29 +1479,52 @@ pub enum DefaultExecutionMode {
     Standard,
     /// Prompt-driven subagent delegation to keep the main context lean.
     Orchestrator,
+    /// Frontier lead paired with a persistent cache-warm companion sidekick.
+    Fusion,
 }
 
 impl DefaultExecutionMode {
-    /// Resolves this config default into a session [`may_protocol::execution_mode::ExecutionMode`].
+    /// Resolves this config default into a session [`may_protocol::execution_mode::ExecutionMode`],
+    /// using `sidekick_model` when configured as [`Self::Fusion`].
     #[must_use]
-    pub const fn to_execution_mode(self) -> may_protocol::execution_mode::ExecutionMode {
+    pub fn to_execution_mode(
+        self,
+        sidekick_model: Option<&ModelSelector>,
+    ) -> may_protocol::execution_mode::ExecutionMode {
         match self {
             Self::Standard => may_protocol::execution_mode::ExecutionMode::Standard,
             Self::Orchestrator => may_protocol::execution_mode::ExecutionMode::Orchestrator,
+            Self::Fusion => sidekick_model.cloned().map_or(
+                may_protocol::execution_mode::ExecutionMode::Standard,
+                |sidekick_model| may_protocol::execution_mode::ExecutionMode::Fusion {
+                    sidekick_model,
+                },
+            ),
         }
     }
 }
 
 /// `[experimental]` section: features that are opt-in and may change shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Hashline search and editing: `search`/`edit` binaries on PATH,
     /// `apply_patch` absent, and semantic search answered by `rag`.
     pub hashline: bool,
-    /// Default execution mode for newly created sessions (`standard` or `orchestrator`).
+    /// Default execution mode for newly created sessions (`standard`, `orchestrator`, or `fusion`).
     #[serde(default)]
     pub execution_mode: DefaultExecutionMode,
+    /// Companion sidekick `provider::model` selector used when `execution_mode = "fusion"`
+    /// and as the default when toggling `/fusion` without an explicit model argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_sidekick_model: Option<ModelSelector>,
+    /// Grace window for open `ask_user` and approval waits while Fusion `keep_warm` stays active.
+    #[serde(
+        default = "default_fusion_keep_warm_grace",
+        with = "duration_text",
+        skip_serializing_if = "is_default_fusion_keep_warm_grace"
+    )]
+    pub fusion_keep_warm_grace: Duration,
     /// Per-worktree coordination board, `@mention` wakeups and PR notifications
     /// when more than one working session shares a checkout.
     pub swarm: bool,
@@ -1506,8 +1540,26 @@ pub struct ExperimentalConfig {
 impl ExperimentalConfig {
     /// Default session [`may_protocol::execution_mode::ExecutionMode`] applied to new sessions.
     #[must_use]
-    pub const fn default_execution_mode(&self) -> may_protocol::execution_mode::ExecutionMode {
-        self.execution_mode.to_execution_mode()
+    pub fn default_execution_mode(&self) -> may_protocol::execution_mode::ExecutionMode {
+        self.execution_mode
+            .to_execution_mode(self.fusion_sidekick_model.as_ref())
+    }
+
+    /// Validates experimental settings.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidExperimentalConfig`] when `execution_mode = "fusion"`
+    /// is configured without `fusion_sidekick_model`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.execution_mode == DefaultExecutionMode::Fusion
+            && self.fusion_sidekick_model.is_none()
+        {
+            return Err(ConfigError::InvalidExperimentalConfig(
+                "`fusion_sidekick_model` is required when `execution_mode = \"fusion\"`"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1516,6 +1568,8 @@ impl Default for ExperimentalConfig {
         Self {
             hashline: false,
             execution_mode: DefaultExecutionMode::Standard,
+            fusion_sidekick_model: None,
+            fusion_keep_warm_grace: default_fusion_keep_warm_grace(),
             swarm: false,
             swarm_mention_wake_limit: default_swarm_mention_wake_limit(),
             swarm_read_limit: default_swarm_read_limit(),
@@ -2336,6 +2390,7 @@ impl MayConfig {
         self.browser.validate()?;
         self.ci.validate()?;
         self.update.validate()?;
+        self.experimental.validate()?;
         for (id, instance) in &self.provider {
             instance.validate(id)?;
         }

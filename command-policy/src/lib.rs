@@ -279,6 +279,10 @@ pub struct CheckoutReadTracker {
     pub session_id: String,
 }
 
+mod write_lease;
+
+pub use write_lease::{WorkspaceWriteLease, WorkspaceWriteLeaseGuard, WorkspaceWriteLeasePolicy};
+
 /// What May's policies for the shell of one agent are chosen by.
 #[derive(Debug, Default)]
 pub struct PolicySet {
@@ -291,6 +295,8 @@ pub struct PolicySet {
     pub read_epochs: FileReadEpochs,
     /// Optional tracker recording terminal file reads inside daemon checkouts.
     pub checkout_reads: Option<CheckoutReadTracker>,
+    /// Optional exclusive workspace write lease held while an async Fusion `sidekick` runs.
+    pub write_lease: Option<WorkspaceWriteLease>,
 }
 
 /// Per-agent epochs invalidating [`UnchangedFileReads`] across a compaction,
@@ -344,6 +350,11 @@ impl PolicySet {
             .policy(WhitespacePatch);
         let builder = if let Some(tracker) = self.checkout_reads {
             builder.policy(CheckoutFileReads { tracker })
+        } else {
+            builder
+        };
+        let builder = if let Some(lease) = self.write_lease {
+            builder.policy(WorkspaceWriteLeasePolicy::new(lease))
         } else {
             builder
         };

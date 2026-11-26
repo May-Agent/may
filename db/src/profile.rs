@@ -740,22 +740,44 @@ impl ChatDb {
                 "cannot archive active session {id} while {reason}"
             )));
         }
+        let companions = self.companion_sessions_for(id).await?;
+        for companion in &companions {
+            let companion_runtime = self
+                .load_session_runtime_summary(&companion.session_id)
+                .await?;
+            if companion_runtime.blocks_auto_archive() {
+                return Err(storage_error(format!(
+                    "cannot archive session {id} while companion {} is active",
+                    companion.session_id
+                )));
+            }
+        }
         query!(self.db, "UPDATE sessions SET archived = TRUE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", id)
             .execute()
             .await?;
+        for companion in companions {
+            query!(self.db, "UPDATE sessions SET archived = TRUE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", companion.session_id.as_str())
+                .execute()
+                .await?;
+        }
         Ok(())
     }
 
-    /// Unarchive (reopen) a session.
+    /// Unarchive (reopen) a session and its hidden companion sessions.
     ///
     /// # Errors
     ///
     /// Returns [`ChatDbError`] when the update fails.
     pub async fn unarchive_session(&self, id: &str) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        query!(self.db, "UPDATE sessions SET archived = FALSE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL, updated_at = ? WHERE id = ?", now, id)
+        query!(self.db, "UPDATE sessions SET archived = FALSE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL, updated_at = ? WHERE id = ?", now.as_str(), id)
             .execute()
             .await?;
+        for companion in self.companion_sessions_for(id).await? {
+            query!(self.db, "UPDATE sessions SET archived = FALSE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL, updated_at = ? WHERE id = ?", now.as_str(), companion.session_id.as_str())
+                .execute()
+                .await?;
+        }
         Ok(())
     }
 
@@ -851,7 +873,7 @@ impl ChatDb {
         Ok(())
     }
 
-    /// List sessions for a specific profile, ordered by `updated_at` descending.
+    /// List user-facing sessions for a specific profile (omitting hidden companion sessions), ordered by `updated_at` descending.
     ///
     /// # Errors
     ///
@@ -862,7 +884,7 @@ impl ChatDb {
     ) -> Result<Vec<sessions::Model>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT * FROM sessions WHERE profile_id = ? ORDER BY updated_at DESC",
+            "SELECT * FROM sessions WHERE profile_id = ? AND NOT EXISTS (SELECT 1 FROM session_companions sc WHERE sc.session_id = sessions.id) ORDER BY updated_at DESC",
             profile_id
         )
         .fetch_all::<sessions::Model>()
@@ -920,9 +942,21 @@ impl ChatDb {
                 .map(|row| row.session_id),
         );
 
-        let sessions = query!(self.db, "SELECT * FROM sessions WHERE pinned = FALSE AND archived = FALSE AND updated_at < ? ORDER BY updated_at ASC", cutoff)
-            .fetch_all::<sessions::Model>()
+        let sessions = query!(
+            self.db,
+            "SELECT * FROM sessions WHERE pinned = FALSE AND archived = FALSE AND updated_at < ? AND NOT EXISTS (SELECT 1 FROM session_companions sc WHERE sc.session_id = sessions.id) ORDER BY updated_at ASC",
+            cutoff
+        )
+        .fetch_all::<sessions::Model>()
+        .await?;
+        let companion_links = query!(self.db, "SELECT * FROM session_companions")
+            .fetch_all::<crate::entity::session_companions::Model>()
             .await?;
+        for link in companion_links {
+            if active_session_ids.contains(&link.session_id) {
+                active_session_ids.insert(link.parent_session_id);
+            }
+        }
         Ok(sessions
             .into_iter()
             .filter(|session| !active_session_ids.contains(&session.id))

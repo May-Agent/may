@@ -1,0 +1,15 @@
+<sidekick_completed>
+Asynchronous sidekick turn finished and released the workspace write lease.
+
+{{ report }}
+{% if !diff.is_empty() %}
+
+Incremental git diff against pre-handoff baseline:
+```diff
+{{ diff }}
+```
+{% else %}
+
+No workspace file changes detected against the pre-handoff baseline.
+{% endif %}
+</sidekick_completed>

@@ -502,6 +502,7 @@ where
                     refused: crate::command_policy::RefusedReads::default(),
                     read_epochs: crate::command_policy::FileReadEpochs::default(),
                     checkout_reads: None,
+                    write_lease: None,
                 },
                 slot: crate::ipc::ShellSlot::new(),
                 ssh_servers: Vec::new(),

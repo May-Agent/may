@@ -281,11 +281,19 @@ async fn next_command(
     // provider that refuses them is not asked again at once.
     let mut keep_warm_failed = false;
     loop {
-        let compaction_due_in = agent.idle_compaction_due_in();
-        let keep_warm_due_in = if keep_warm_failed {
+        let keep_warm_plan = if keep_warm_failed {
+            crate::fusion::KeepWarmPlan::default()
+        } else {
+            agent.keep_warm_plan().await
+        };
+        let keep_warm_due_in = keep_warm_plan.refresh_in;
+        let fusion_pair = agent.fusion_pair_handle();
+        // Suppress idle compaction whenever keep-warm is active so 54m idle
+        // compaction never pre-empts a 59m30s prompt-cache refresh.
+        let compaction_due_in = if keep_warm_due_in.is_some() {
             None
         } else {
-            agent.keep_warm_due_in().await
+            agent.idle_compaction_due_in()
         };
         let step = futures_lite::future::or(
             async { IdleStep::Command(command_rx.recv().await.ok()) },
@@ -309,24 +317,50 @@ async fn next_command(
                             None => std::future::pending().await,
                         }
                     },
-                    async {
-                        match background_wakes {
-                            Some(background) => {
-                                // A job finishing before the run that parked the
-                                // agent released the session would wake a host
-                                // that finds the session held.
-                                background.released.wait().await;
-                                IdleStep::Background(agent.wait_background().await)
+                    futures_lite::future::or(
+                        async {
+                            futures_lite::future::or(
+                                async {
+                                    match keep_warm_plan.recheck_in {
+                                        Some(recheck_in) => {
+                                            async_io::Timer::after(recheck_in).await;
+                                            IdleStep::Recheck
+                                        }
+                                        None => std::future::pending().await,
+                                    }
+                                },
+                                async {
+                                    match &fusion_pair {
+                                        Some(pair) => {
+                                            pair.changed().await;
+                                            IdleStep::Recheck
+                                        }
+                                        None => std::future::pending().await,
+                                    }
+                                },
+                            )
+                            .await
+                        },
+                        async {
+                            match background_wakes {
+                                Some(background) => {
+                                    // A job finishing before the run that parked the
+                                    // agent released the session would wake a host
+                                    // that finds the session held.
+                                    background.released.wait().await;
+                                    IdleStep::Background(agent.wait_background().await)
+                                }
+                                None => std::future::pending().await,
                             }
-                            None => std::future::pending().await,
-                        }
-                    },
+                        },
+                    ),
                 ),
             ),
         )
         .await;
         match step {
             IdleStep::Command(command) => return command,
+            IdleStep::Recheck => {}
             IdleStep::KeepWarm => match crate::panic_boundary::round(
                 "keep warm",
                 keep_warm_idle(agent, command_rx, runs),
@@ -368,6 +402,8 @@ enum IdleStep {
     Compact,
     /// The prompt-cache refresh is due.
     KeepWarm,
+    /// A Fusion grace deadline or peer activity transition occurred; re-evaluate timers.
+    Recheck,
     /// A detached background command finished or raised an alert.
     Background(super::BackgroundWake),
 }

@@ -132,9 +132,9 @@ pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,
 };
 
-pub use may_protocol::session_usage::{ModelUsageRow, SessionUsageReport};
+pub use may_protocol::session_usage::{ModelUsageRow, RoleUsageSummary, SessionUsageReport};
 pub use may_protocol::wall_clock::{Interval, IntervalSet, WallClockSplit};
 
 mod usage;
 pub use may_protocol::cache_miss::{CacheMissCauseRow, CacheMissRow};
-pub use usage::assemble_usage_report;
+pub use usage::{assemble_fusion_usage_report, assemble_role_usage_summary, assemble_usage_report};

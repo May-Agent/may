@@ -15,6 +15,7 @@ pub mod push_subscriptions;
 pub mod request_logs;
 pub mod scheduled_task_runs;
 pub mod scheduled_tasks;
+pub mod session_companions;
 pub mod session_execution_modes;
 pub mod session_intervals;
 pub mod session_memory;

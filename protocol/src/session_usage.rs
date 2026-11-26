@@ -37,6 +37,38 @@ pub struct ModelUsageRow {
     pub keep_warm_requests: u64,
 }
 
+/// Provider usage attributed to one role inside a Fusion session (`lead` or `sidekick`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleUsageSummary {
+    /// Role label (`"lead"` or `"sidekick"`).
+    pub role: String,
+    /// Session id backing this role.
+    pub session_id: String,
+    /// Requests made by this role, including keep-warm refreshes.
+    pub requests: u64,
+    /// Input tokens, cached ones included.
+    pub prompt_tokens: u64,
+    /// Completion tokens.
+    pub completion_tokens: u64,
+    /// Input tokens served from the provider cache.
+    pub cache_read_tokens: u64,
+    /// Tokens written to the provider cache.
+    pub cache_write_tokens: u64,
+    /// Provider wall time across this role's requests, milliseconds.
+    pub api_ms: u64,
+    /// Share of input tokens served from cache.
+    pub cache_hit_rate: f64,
+    /// Known cost in USD for this role; `None` when no model's pricing is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// How many of `requests` refreshed the prompt cache via keep-warm.
+    #[serde(default)]
+    pub keep_warm_requests: u64,
+    /// Per-model breakdown within this role, most input first.
+    pub models: Vec<ModelUsageRow>,
+}
+
 /// Aggregated provider usage of one session, answer of `/usage`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +86,9 @@ pub struct SessionUsageReport {
     pub total_cost_usd: Option<f64>,
     /// Per-model breakdown, most input first.
     pub models: Vec<ModelUsageRow>,
+    /// Per-role breakdown (`lead` and `sidekick`) for Fusion sessions; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<RoleUsageSummary>,
     /// Cache misses by cause, most missed tokens first.
     pub cache_miss_causes: Vec<CacheMissCauseRow>,
     /// The newest cache misses, newest first.
