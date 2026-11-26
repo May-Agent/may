@@ -1362,6 +1362,13 @@ impl<LLM: LanguageModel + 'static> std::fmt::Debug for ConfinedShellCuratorSessi
     }
 }
 
+fn curator_audit_log_path(staging_dir: &Path) -> PathBuf {
+    staging_dir
+        .parent()
+        .map_or_else(std::env::temp_dir, Path::to_path_buf)
+        .join(".curator-network-audit.log")
+}
+
 impl<LLM: LanguageModel + 'static> ConfinedShellCuratorSession<LLM> {
     /// Builds a confined bash-first curator agent over `staging_dir` with no
     /// network access and no `unsafe` escalation.
@@ -1390,8 +1397,8 @@ impl<LLM: LanguageModel + 'static> ConfinedShellCuratorSession<LLM> {
         let grants = Grants::new();
         grants.add_writable(&staging_dir);
         let budgets = crate::shell::ShellBudgets::of(&crate::config::ShellSettings::default());
-        let audit_log = heel::NetworkAuditLog::file(staging_dir.join(".curator-network-audit.log"))
-            .map_err(|error| {
+        let audit_log =
+            heel::NetworkAuditLog::file(curator_audit_log_path(&staging_dir)).map_err(|error| {
                 BotMemoryError::Curation(format!("curator audit log failed: {error}"))
             })?;
         let assembly = crate::shell::ShellAssembly {
@@ -1854,5 +1861,29 @@ mod tests {
             .expect("rag 4")
             .expect("recalled after compaction reset");
         assert!(!recalled4.contains("[UPDATED]"), "{recalled4}");
+    }
+
+    #[tokio::test]
+    async fn curator_audit_log_lives_outside_staging_directory() {
+        let dir = tempdir().expect("tempdir");
+        let paths = BotPaths::new(dir.path().join("bots/bot-audit"));
+        ensure_bot_memory_initialized(&paths).await.expect("init");
+        let staging = paths.memory_staging_dir();
+        mirror_dir_sync(&paths.memory_dir(), &staging).expect("mirror");
+
+        let audit_path = curator_audit_log_path(&staging);
+        assert_eq!(audit_path, paths.root().join(".curator-network-audit.log"));
+        let _audit = heel::NetworkAuditLog::file(audit_path.clone()).expect("open audit log");
+
+        assert!(audit_path.exists());
+        assert!(
+            !staging.join(".curator-network-audit.log").exists(),
+            "curator network audit log must never pollute memory.staging"
+        );
+        let violations = verify_memory_tree(&staging).expect("verify staging");
+        assert!(
+            violations.is_empty(),
+            "staging tree must remain free of violations: {violations:?}"
+        );
     }
 }
