@@ -138,6 +138,45 @@ pub struct SwarmSessionStateRow {
     pub consecutive_mention_wakes: u32,
 }
 
+/// Buffered swarm notice awaiting delivery to a `Suspended` or unreachable
+/// cloud-home session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwarmBufferedCloudNoticeRow {
+    /// Monotonic primary key preserving FIFO delivery order.
+    pub id: i64,
+    /// Target cloud session id.
+    pub session_id: String,
+    /// Canonical swarm group key (`workdir`).
+    pub workdir: String,
+    /// Board generation when the notice was emitted.
+    pub board_epoch: u64,
+    /// Board sequence number.
+    pub seq: u64,
+    /// Notice kind label (`"PR"`, `"notice"`, etc.).
+    pub kind: String,
+    /// Rendered notice body.
+    pub body: String,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+}
+
+/// Parameters for persisting a buffered cloud-home swarm notice.
+#[derive(Debug, Clone, Copy)]
+pub struct NewSwarmBufferedCloudNotice<'a> {
+    /// Target cloud session id.
+    pub session_id: &'a str,
+    /// Canonical swarm group key (`workdir`).
+    pub workdir: &'a str,
+    /// Board generation.
+    pub board_epoch: u64,
+    /// Board sequence number.
+    pub seq: u64,
+    /// Notice kind label.
+    pub kind: &'a str,
+    /// Rendered notice body.
+    pub body: &'a str,
+}
+
 #[derive(Debug, serde::Deserialize, skyzen::FromRow)]
 struct RawBoardRow {
     workdir: String,
@@ -189,6 +228,35 @@ struct RawSessionStateRow {
     told_workdir: Option<String>,
     told_epoch: i64,
     consecutive_mention_wakes: i64,
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::FromRow)]
+struct RawBufferedCloudNoticeRow {
+    id: i64,
+    session_id: String,
+    workdir: String,
+    board_epoch: i64,
+    seq: i64,
+    kind: String,
+    body: String,
+    created_at: String,
+}
+
+impl RawBufferedCloudNoticeRow {
+    fn into_model(self) -> Result<SwarmBufferedCloudNoticeRow, ChatDbError> {
+        Ok(SwarmBufferedCloudNoticeRow {
+            id: self.id,
+            session_id: self.session_id,
+            workdir: self.workdir,
+            board_epoch: u64::try_from(self.board_epoch)
+                .map_err(|e| overflow_error("swarm_buffered_cloud_notices.board_epoch", &e))?,
+            seq: u64::try_from(self.seq)
+                .map_err(|e| overflow_error("swarm_buffered_cloud_notices.seq", &e))?,
+            kind: self.kind,
+            body: self.body,
+            created_at: self.created_at,
+        })
+    }
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::FromRow)]
@@ -448,6 +516,13 @@ impl ChatDb {
         query!(tx, "DELETE FROM swarm_cursors WHERE workdir = ?", workdir)
             .execute()
             .await?;
+        query!(
+            tx,
+            "DELETE FROM swarm_buffered_cloud_notices WHERE workdir = ?",
+            workdir
+        )
+        .execute()
+        .await?;
 
         let candidates = query!(
             tx,
@@ -513,6 +588,40 @@ impl ChatDb {
 
         tx.commit().await?;
         Ok(Some((board.board_epoch, touched_sessions)))
+    }
+
+    /// Steps down as Board Host for `workdir` while `> 1` working members remain
+    /// on other daemons: clears local board, message, and cursor rows without
+    /// rewriting unconsumed pending `@mention` steers as dissolved or purging
+    /// buffered cloud notices.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn step_down_swarm_board(&self, workdir: &str) -> Result<Option<u64>, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        let Some(existing) = query!(
+            tx,
+            "SELECT workdir, board_epoch, created_at FROM swarm_boards WHERE workdir = ?",
+            workdir
+        )
+        .fetch_optional::<RawBoardRow>()
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let board = existing.into_model()?;
+        query!(tx, "DELETE FROM swarm_boards WHERE workdir = ?", workdir)
+            .execute()
+            .await?;
+        query!(tx, "DELETE FROM swarm_messages WHERE workdir = ?", workdir)
+            .execute()
+            .await?;
+        query!(tx, "DELETE FROM swarm_cursors WHERE workdir = ?", workdir)
+            .execute()
+            .await?;
+        tx.commit().await?;
+        Ok(Some(board.board_epoch))
     }
 
     /// Rewrites or drops unconsumed pending swarm steers on a member daemon when
@@ -940,6 +1049,123 @@ impl ChatDb {
         .await?;
         Ok(())
     }
+
+    /// Persists a routine swarm notice destined for a `Suspended` or
+    /// temporarily unreachable cloud-home session, returning its row id.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn push_buffered_cloud_notice(
+        &self,
+        notice: NewSwarmBufferedCloudNotice<'_>,
+    ) -> Result<i64, ChatDbError> {
+        let epoch_i64 = to_i64_from_u64(notice.board_epoch, "board_epoch")?;
+        let seq_i64 = to_i64_from_u64(notice.seq, "seq")?;
+        let now = jiff::Timestamp::now().to_string();
+        let row = query!(
+            self.db,
+            "INSERT INTO swarm_buffered_cloud_notices
+             (session_id, workdir, board_epoch, seq, kind, body, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             RETURNING id AS value",
+            notice.session_id,
+            notice.workdir,
+            epoch_i64,
+            seq_i64,
+            notice.kind,
+            notice.body,
+            now.as_str()
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?;
+        Ok(row.value)
+    }
+
+    /// Lists all buffered cloud notices waiting for `session_id` in FIFO order.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn list_buffered_cloud_notices(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SwarmBufferedCloudNoticeRow>, ChatDbError> {
+        let rows = query!(
+            self.db,
+            "SELECT id, session_id, workdir, board_epoch, seq, kind, body, created_at
+             FROM swarm_buffered_cloud_notices
+             WHERE session_id = ?
+             ORDER BY id ASC",
+            session_id
+        )
+        .fetch_all::<RawBufferedCloudNoticeRow>()
+        .await?;
+        rows.into_iter()
+            .map(RawBufferedCloudNoticeRow::into_model)
+            .collect()
+    }
+
+    /// Counts buffered cloud notices currently waiting for `session_id`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn count_buffered_cloud_notices(
+        &self,
+        session_id: &str,
+    ) -> Result<usize, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT COUNT(*) AS value FROM swarm_buffered_cloud_notices WHERE session_id = ?",
+            session_id
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?;
+        usize::try_from(row.value)
+            .map_err(|e| overflow_error("swarm_buffered_cloud_notices.count", &e))
+    }
+
+    /// Removes one acknowledged buffered cloud notice after delivery succeeded.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn delete_buffered_cloud_notice(&self, id: i64) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "DELETE FROM swarm_buffered_cloud_notices WHERE id = ?",
+            id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Purges all buffered cloud notices belonging to a dissolved `workdir` board.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn purge_buffered_cloud_notices_for_board(
+        &self,
+        workdir: &str,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "DELETE FROM swarm_buffered_cloud_notices WHERE workdir = ?",
+            workdir
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Purges all buffered cloud notices across every board (e.g. when swarm is disabled).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn purge_all_buffered_cloud_notices(&self) -> Result<(), ChatDbError> {
+        query!(self.db, "DELETE FROM swarm_buffered_cloud_notices")
+            .execute()
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1049,5 +1275,98 @@ mod tests {
 
         db.reset_swarm_mention_wakes("otter").await.unwrap();
         assert!(db.record_swarm_mention_wake("otter", 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn step_down_preserves_epoch_and_buffered_notices_while_destroy_purges_board_notices() {
+        let dir = tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db opens");
+
+        let (board, created) = db
+            .open_or_get_swarm_board("github:May-Agent/may")
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(board.board_epoch, 1);
+
+        let _ = db
+            .append_swarm_message(NewSwarmMessage {
+                workdir: "github:May-Agent/may",
+                session_id: Some("mac-mini:badger"),
+                sender: "badger",
+                kind: SwarmMessageKind::Post,
+                body: "keep going",
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        db.set_swarm_cursor("github:May-Agent/may", "mac-mini:badger", 1)
+            .await
+            .unwrap();
+
+        let id1 = db
+            .push_buffered_cloud_notice(NewSwarmBufferedCloudNotice {
+                session_id: "lynx",
+                workdir: "github:May-Agent/may",
+                board_epoch: 1,
+                seq: 2,
+                kind: "PR",
+                body: "PR #10 opened",
+            })
+            .await
+            .unwrap();
+        let id2 = db
+            .push_buffered_cloud_notice(NewSwarmBufferedCloudNotice {
+                session_id: "lynx",
+                workdir: "github:May-Agent/other",
+                board_epoch: 1,
+                seq: 1,
+                kind: "PR",
+                body: "PR #20 opened",
+            })
+            .await
+            .unwrap();
+        assert_ne!(id1, id2);
+        assert_eq!(db.count_buffered_cloud_notices("lynx").await.unwrap(), 2);
+
+        // Step-down clears local board/messages/cursors without purging buffered notices or resetting epoch.
+        let stepped = db
+            .step_down_swarm_board("github:May-Agent/may")
+            .await
+            .unwrap();
+        assert_eq!(stepped, Some(1));
+        assert!(
+            db.get_swarm_board("github:May-Agent/may")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.board_max_seq("github:May-Agent/may").await.unwrap(), 0);
+        assert_eq!(db.count_buffered_cloud_notices("lynx").await.unwrap(), 2);
+
+        // Re-opening after step-down advances epoch to 2.
+        let (reopened, was_created) = db
+            .open_or_get_swarm_board("github:May-Agent/may")
+            .await
+            .unwrap();
+        assert!(was_created);
+        assert_eq!(reopened.board_epoch, 2);
+
+        // Destroying the dissolved board purges only that board's buffered notices.
+        let dissolved = db
+            .destroy_swarm_board("github:May-Agent/may", |_, _| DissolvedSteerAction::Keep)
+            .await
+            .unwrap();
+        assert_eq!(dissolved.map(|(e, _)| e), Some(2));
+        let remaining = db.list_buffered_cloud_notices("lynx").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].workdir, "github:May-Agent/other");
+
+        db.delete_buffered_cloud_notice(remaining[0].id)
+            .await
+            .unwrap();
+        assert_eq!(db.count_buffered_cloud_notices("lynx").await.unwrap(), 0);
     }
 }
