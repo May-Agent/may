@@ -289,16 +289,24 @@ pub async fn augment_tool_outcome(
     if let Some(store) = call_images {
         for image in store.take(call_id) {
             seen_paths.insert(image.path.clone());
-            inspect_file_image(
-                ocr,
-                outputs_dir,
-                &image.path,
-                &image.media_type,
-                &image.source,
-                &mut attachments,
-                &mut recognized,
-            )
-            .await;
+            if image.skip_ocr {
+                if let Some(attachment) =
+                    file_or_data_attachment(&image.path, &image.media_type).await
+                {
+                    attachments.push(attachment);
+                }
+            } else {
+                inspect_file_image(
+                    ocr,
+                    outputs_dir,
+                    &image.path,
+                    &image.media_type,
+                    &image.source,
+                    &mut attachments,
+                    &mut recognized,
+                )
+                .await;
+            }
         }
     }
 
@@ -1047,6 +1055,75 @@ mod tests {
             bin_result
                 .render_for_model()
                 .contains("<recognized_text source=\"mcp_screen\">")
+        );
+    }
+
+    #[tokio::test]
+    async fn augment_tool_outcome_bypasses_ocr_when_skip_ocr_is_set() {
+        use crate::call_images::RecordedCallImage;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image_path = dir.path().join("tui_screen.png");
+        let outputs_dir = dir.path().join("outputs");
+        #[cfg(all(feature = "vision-ocr", target_os = "macos"))]
+        let png = render_multilingual_text_png(
+            &[
+                "TUI panel: files and diagnostics",
+                "中文界面状态：所有测试通过",
+                "日本語ログ：完了しました",
+                "한국어 상태: 정상 작동",
+            ],
+            1200,
+            600,
+        );
+        #[cfg(not(all(feature = "vision-ocr", target_os = "macos")))]
+        let png = make_photo_png(640, 480);
+
+        async_fs::write(&image_path, &png).await.expect("write png");
+
+        let ocr = VisionOcr::new();
+        let store = CallImageStore::default();
+        let call_id = ToolCallId::new("call-tui-skip-ocr");
+        let _scope = store.open_scope(call_id.clone());
+        store.record(
+            &call_id,
+            vec![RecordedCallImage {
+                path: image_path.clone(),
+                media_type: "image/png".to_owned(),
+                source: "tui observe".to_owned(),
+                skip_ocr: true,
+            }],
+        );
+
+        let (result, attachments) = augment_tool_outcome(
+            &ocr,
+            Some(&store),
+            Some(&outputs_dir),
+            &call_id,
+            "tui",
+            ToolResult::text("120x40 cells"),
+        )
+        .await
+        .expect("image attached without OCR");
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].media_type().as_ref(), "image/png");
+        let attached_path = attachments[0]
+            .url()
+            .to_file_path()
+            .expect("file url attachment");
+        assert_eq!(
+            attached_path,
+            async_fs::canonicalize(&image_path)
+                .await
+                .expect("canonicalize original"),
+            "skip_ocr must attach the original PNG directly without downscaling"
+        );
+        let rendered = result.render_for_model();
+        assert_eq!(rendered, "120x40 cells");
+        assert!(
+            !rendered.contains("<recognized_text"),
+            "skip_ocr must not emit <recognized_text>: {rendered}"
         );
     }
 }

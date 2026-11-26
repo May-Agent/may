@@ -76,6 +76,8 @@ pub mod ssh_authorizer;
 pub mod subagent_spaces;
 /// The `task` tool: the session's scheduled tasks.
 pub mod task_tool;
+/// The `tui` tool: interactive PTY applications and screen observation.
+pub mod tui_tool;
 /// The `tunnel` tool: exposing session serves publicly.
 pub mod tunnel_tool;
 

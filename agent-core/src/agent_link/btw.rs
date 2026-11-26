@@ -58,16 +58,25 @@ struct ForkHost {
     redactor: SecretRedactor,
 }
 
-/// The shell of a session's main agent, filled when the agent's shell is
-/// built.
+/// The shell (and optional command registry) of a session's main agent, filled
+/// when the agent's shell is built.
 #[derive(Debug, Clone, Default)]
-pub struct ForkLauncher(Arc<OnceLock<SessionShell>>);
+pub struct ForkLauncher(Arc<OnceLock<(SessionShell, Option<crate::ipc::CommandRegistry>)>>);
 
 impl ForkLauncher {
     /// Records `shell` as the one the session's forks launch from.
     pub fn set(&self, shell: &SessionShell) {
         // A shell bound later belongs to the same agent; the first stays.
-        let _ = self.0.set(shell.clone());
+        let _ = self.0.set((shell.clone(), None));
+    }
+
+    /// Records `shell` and `registry` so read-only forks refuse `tui`.
+    pub fn set_with_registry(&self, shell: &SessionShell, registry: crate::ipc::CommandRegistry) {
+        let _ = self.0.set((shell.clone(), Some(registry)));
+    }
+
+    fn get(&self) -> Option<&(SessionShell, Option<crate::ipc::CommandRegistry>)> {
+        self.0.get()
     }
 }
 
@@ -94,15 +103,33 @@ impl ForkHost {
         &self,
         snapshot: &aither_agent::ForkSnapshot,
         launcher: &SessionShell,
+        base_registry: Option<&crate::ipc::CommandRegistry>,
         task: ForkTask<'_>,
     ) -> Result<ForkOutcome, AgentLinkError> {
-        let shell = launcher
+        let mut shell = launcher
             .subagent(SubagentGrant::new(), None, "btw")
             .await
             .map_err(|error| AgentLinkError::Fork(error.to_string()))?
             // A fork answers with quick, read-only commands: its shell is
             // confined like a `read_only` subagent's.
             .with_approver(self.read_only_permissions.clone());
+        let shell = if let Some(registry) = base_registry {
+            let sub_slot = crate::ipc::ShellSlot::new();
+            let sub_registry = registry.refuse_command(
+                "tui",
+                "Unavailable in btw forks",
+                crate::agent::tui_tool::read_only_tui_refusal(),
+            );
+            shell = shell.with_ipc(crate::ipc::CommandBridge::new(
+                sub_registry,
+                sub_slot.clone(),
+            ));
+            let shell = Arc::new(shell);
+            sub_slot.bind(&shell);
+            shell
+        } else {
+            Arc::new(shell)
+        };
         let space = shell.working_dir().clone();
         let valve = Arc::new(CompactSignal::default());
         let builder = aither_agent::AgentBuilder::new(self.model.llm.clone())
@@ -324,8 +351,14 @@ impl AgentMessaging {
                 .render()
                 .expect("btw question template must render");
 
+                let base_registry = host.launcher.get().and_then(|(_, reg)| reg.as_ref());
                 let ForkOutcome::Answer(answer) = host
-                    .run_fork(&snapshot, launcher, ForkTask::Answer(&prompt))
+                    .run_fork(
+                        &snapshot,
+                        launcher,
+                        base_registry,
+                        ForkTask::Answer(&prompt),
+                    )
                     .await?
                 else {
                     unreachable!("an answering fork gives an answer");
@@ -394,9 +427,8 @@ impl AgentMessaging {
             .source
             .latest()
             .ok_or_else(|| AgentLinkError::NoForkContext(recipient.name.clone()))?;
-        let target_launcher = host
+        let (target_launcher, base_registry) = host
             .launcher
-            .0
             .get()
             .ok_or_else(|| AgentLinkError::NoForkContext(recipient.name.clone()))?;
         if !snapshot.allows_fork() {
@@ -411,7 +443,12 @@ impl AgentMessaging {
         .map_err(|e| AgentLinkError::Fork(e.to_string()))?;
 
         let ForkOutcome::Answer(answer) = host
-            .run_fork(&snapshot, target_launcher, ForkTask::Answer(&prompt))
+            .run_fork(
+                &snapshot,
+                target_launcher,
+                base_registry.as_ref(),
+                ForkTask::Answer(&prompt),
+            )
             .await?
         else {
             unreachable!("an answering fork gives an answer");
@@ -446,7 +483,7 @@ impl AgentMessaging {
         let Some(snapshot) = host.source.latest() else {
             return Ok(None);
         };
-        let Some(launcher) = host.launcher.0.get() else {
+        let Some((launcher, base_registry)) = host.launcher.get() else {
             return Ok(None);
         };
         let name = status_name(&self.runtime_service, session_id).await?;
@@ -471,7 +508,12 @@ impl AgentMessaging {
         .render()
         .expect("btw user question template must render");
         let ForkOutcome::Answer(answer) = host
-            .run_fork(&snapshot, launcher, ForkTask::Answer(&prompt))
+            .run_fork(
+                &snapshot,
+                launcher,
+                base_registry.as_ref(),
+                ForkTask::Answer(&prompt),
+            )
             .await?
         else {
             unreachable!("an answering fork gives an answer");
@@ -499,7 +541,7 @@ impl AgentMessaging {
         let Some(snapshot) = host.source.latest() else {
             return Ok(None);
         };
-        let Some(launcher) = host.launcher.0.get() else {
+        let Some((launcher, base_registry)) = host.launcher.get() else {
             return Ok(None);
         };
         let name = status_name(&self.runtime_service, session_id).await?;
@@ -522,7 +564,12 @@ impl AgentMessaging {
             messages,
             cache_epoch,
         } = host
-            .run_fork(&snapshot, launcher, ForkTask::ReadContext)
+            .run_fork(
+                &snapshot,
+                launcher,
+                base_registry.as_ref(),
+                ForkTask::ReadContext,
+            )
             .await?
         else {
             unreachable!("a context-reading fork gives its context");

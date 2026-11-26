@@ -1,0 +1,1 @@
+`tui` is not available to read-only subagents or `btw` forks because it opens interactive PTY processes. Report what needs interactive verification back to the main agent.

@@ -1172,6 +1172,7 @@ mod tests {
             output_path: None,
             place: may_client::client::background::WirePlace::Host,
             timeout_ms: None,
+            pty: false,
         };
         let upserted = stream_app_event(
             "job.upserted",

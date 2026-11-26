@@ -184,7 +184,8 @@ enum Woke {
 /// An in-process subagent: its agent, its shell and what its loop holds.
 pub struct ChildSession<LLM: LanguageModel + 'static> {
     agent: Agent<LLM, ChildHooks, LLM, HandoffDocument>,
-    shell: SessionShell,
+    shell: Arc<SessionShell>,
+    tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
     requested: Arc<AtomicBool>,
     /// Handles on the jobs the run waited for, so their output stays
     /// readable.
@@ -209,13 +210,15 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
     pub const fn new(
         agent: Agent<LLM, ChildHooks, LLM, HandoffDocument>,
         requested: Arc<AtomicBool>,
-        shell: SessionShell,
+        shell: Arc<SessionShell>,
+        tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
         parts: ChildParts,
     ) -> Self {
         let lifetime = agent.cache_lifetime();
         Self {
             agent,
             shell,
+            tui_registry,
             requested,
             held: Vec::new(),
             lifetime,
@@ -233,7 +236,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
 
     /// The shell the agent runs in.
     #[must_use]
-    pub const fn shell(&self) -> &SessionShell {
+    pub fn shell(&self) -> &SessionShell {
         &self.shell
     }
 
@@ -278,9 +281,13 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
             .collect()
     }
 
-    /// Stops the jobs the agent left running.
+    /// Stops the jobs and TUI sessions the agent left running.
     pub async fn stop_jobs(&self) -> usize {
-        self.shell.jobs().kill_all().await
+        let mut stopped = 0;
+        if let Some(tui) = &self.tui_registry {
+            stopped += tui.close_all().await;
+        }
+        stopped + self.shell.jobs().kill_all().await
     }
 
     fn credit(&self) -> Credit {

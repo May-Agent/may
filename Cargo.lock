@@ -127,6 +127,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fca89247609239eeb6915e6991111866b92d7b31025e69302bbf430cc4d2c38"
 dependencies = [
  "cfg-if",
+ "getrandom 0.3.4",
  "getrandom 0.4.3",
  "once_cell",
  "serde",
@@ -146,7 +147,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "async-channel",
  "async-process",
@@ -163,7 +164,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-attachments",
  "aither-connectivity",
@@ -199,7 +200,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -212,7 +213,7 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "askama 0.16.1",
@@ -225,7 +226,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -245,7 +246,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -264,7 +265,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -288,7 +289,7 @@ dependencies = [
 [[package]]
 name = "aither-connectivity"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -313,7 +314,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -334,7 +335,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-derive",
  "askama 0.16.1",
@@ -362,7 +363,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -374,7 +375,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -399,7 +400,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "arc-swap",
@@ -423,7 +424,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "serde",
@@ -433,7 +434,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -458,7 +459,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -509,7 +510,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -521,7 +522,7 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=main#16cfe0d7738fb251feb5019ffa840f48149df969"
+source = "git+https://github.com/May-Agent/aither?branch=main#8f6b992ff8f042a3ec2f9bbe51f8fb7ec9f7c194"
 dependencies = [
  "aither-core",
  "askama 0.16.1",
@@ -2902,7 +2903,7 @@ checksum = "263c0ccfc6b3b6a93e959edad4f985779e76c0b36dbb2e13e3d27c690974adf1"
 dependencies = [
  "cfg-if",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "windows-sys 0.61.2",
 ]
 
@@ -3498,6 +3499,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "font-types"
+version = "0.12.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "fontconfig-parser"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
+dependencies = [
+ "roxmltree",
+]
+
+[[package]]
+name = "fontdb"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f"
+dependencies = [
+ "fontconfig-parser",
+ "log",
+ "memmap2",
+ "slotmap",
+ "tinyvec",
+]
+
+[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3881,7 +3913,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.62.2",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -4059,7 +4091,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "heel"
 version = "0.10.1"
-source = "git+https://github.com/May-Agent/heel.git?branch=main#b536c036031223b5d384e5945ab13214844b96ea"
+source = "git+https://github.com/May-Agent/heel.git?branch=main#6187e05f01ced00a25101c7184e7818ba76e5433"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -4102,7 +4134,7 @@ dependencies = [
 [[package]]
 name = "heel-shim"
 version = "0.1.0"
-source = "git+https://github.com/May-Agent/heel.git?branch=main#b536c036031223b5d384e5945ab13214844b96ea"
+source = "git+https://github.com/May-Agent/heel.git?branch=main#6187e05f01ced00a25101c7184e7818ba76e5433"
 dependencies = [
  "blocking",
  "clap",
@@ -4578,7 +4610,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5821,6 +5853,7 @@ dependencies = [
  "dunce",
  "event-listener",
  "executor-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "fontdb",
  "futures",
  "futures-lite",
  "futures-util",
@@ -5861,14 +5894,17 @@ dependencies = [
  "shell-words",
  "shlex",
  "skyzen",
+ "swash",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
  "toml 1.2.2+spec-1.1.0",
  "tracing",
+ "unicode-width",
  "url",
  "utoipa",
+ "vte",
  "walkdir",
  "web-push",
  "which 8.0.6",
@@ -6574,6 +6610,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "memmem"
@@ -8595,7 +8640,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -8634,7 +8679,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -9029,6 +9074,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "read-fonts"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
+dependencies = [
+ "bytemuck",
+ "font-types",
+ "once_cell",
+]
+
+[[package]]
 name = "recursive"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9325,6 +9381,12 @@ dependencies = [
  "rmp",
  "serde",
 ]
+
+[[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rs-tree-sitter-languages"
@@ -10085,6 +10147,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
+name = "skrifa"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
+dependencies = [
+ "bytemuck",
+ "read-fonts",
+]
+
+[[package]]
 name = "skyzen"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10734,6 +10806,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "swash"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
+dependencies = [
+ "skrifa",
+ "yazi",
+ "zeno",
+]
+
+[[package]]
 name = "swift-bridge"
 version = "0.1.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10931,7 +11014,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
@@ -13326,6 +13409,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "yazi"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac366ea532fa8ee6a992cec9dea525b1dc284e69702f36c2ab5fbebadc81ec86"
+
+[[package]]
 name = "yoke"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13419,6 +13508,12 @@ checksum = "2da34e7164b75d803c3197b86e6cf61b874106fbd472c5082575a8bc5fbd0907"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "zeno"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zenwave"

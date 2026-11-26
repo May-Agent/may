@@ -511,7 +511,7 @@ where
         context.db.clone(),
     )
     .map_err(ExecError::ResolveIssueBackend)?;
-    register_shared_terminal_commands(
+    let shared = register_shared_terminal_commands(
         &mut builder,
         SharedTerminalCommandConfig {
             #[cfg(target_os = "macos")]
@@ -584,7 +584,9 @@ where
     )
     .await
     .map_err(ExecError::RegisterCommands)?;
-    Ok(builder.build())
+    let registry = builder.build();
+    shared.registry_slot.bind(registry.clone());
+    Ok(registry)
 }
 
 /// Resolves `server_id` among the SSH servers attached to the session's profile.

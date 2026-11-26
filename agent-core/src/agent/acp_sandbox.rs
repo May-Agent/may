@@ -253,13 +253,14 @@ impl AcpSandbox {
             env.extend(fifo.environment());
         }
         env.extend(spec.env.clone());
-        let stdio = aither_sandbox::Stdio {
-            stdin: match process {
+        let stdio = aither_sandbox::Stdio::pipes(
+            match process {
                 Process::Agent { .. } => aither_sandbox::Pipe::Piped,
                 Process::Terminal => aither_sandbox::Pipe::Null,
             },
-            ..aither_sandbox::Stdio::default()
-        };
+            aither_sandbox::Pipe::Piped,
+            aither_sandbox::Pipe::Piped,
+        );
         let child = self
             .sandbox
             .spawn(

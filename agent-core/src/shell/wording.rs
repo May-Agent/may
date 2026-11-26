@@ -194,6 +194,8 @@ impl ShellWording for MayShellWording {
                     | CallRefusal::InvalidPipelineStep { .. }
                     | CallRefusal::ZeroMaxBytes
                     | CallRefusal::NoStdin { .. }
+                    | CallRefusal::PtyJob { .. }
+                    | CallRefusal::InvalidPtySize { .. }
             ),
             "the shell refused a call May has no wording for: {refusal:?}"
         );
@@ -344,5 +346,23 @@ mod tests {
             "not today".into(),
         )));
         assert_eq!(text, "not today");
+    }
+
+    #[test]
+    fn pty_refusals_direct_the_model_to_tui() {
+        let call = MayShellWording.call_refused(&CallRefusal::PtyJob { pid: 9001 });
+        assert!(
+            call.contains("PID 9001") && call.contains("tui observe 9001"),
+            "{call}"
+        );
+        let size = MayShellWording.call_refused(&CallRefusal::InvalidPtySize { cols: 0, rows: 24 });
+        assert!(size.contains("0x24"), "{size}");
+        let mon = MayShellWording.monitor_refusal(&MonitorRefusal::PtyJob { pid: 9001 });
+        assert!(
+            mon.contains("PID 9001") && mon.contains("tui observe 9001"),
+            "{mon}"
+        );
+        let unknown = MayShellWording.monitor_refusal(&MonitorRefusal::UnknownJob { pid: 777 });
+        assert!(unknown.contains("777"), "{unknown}");
     }
 }

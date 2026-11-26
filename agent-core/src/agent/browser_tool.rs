@@ -98,6 +98,7 @@ impl BrowserTool {
             path,
             media_type: screenshot.mime_type.clone(),
             source: "browser screenshot".to_owned(),
+            skip_ocr: false,
         }]
     }
 }

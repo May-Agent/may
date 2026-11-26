@@ -3211,6 +3211,7 @@ mod tests {
             status,
             output_path: None,
             timeout: None,
+            pty: false,
         }
     }
 

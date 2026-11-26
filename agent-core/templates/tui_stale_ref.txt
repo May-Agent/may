@@ -1,0 +1,1 @@
+Refused, nothing was acted on: {{ reason }}. Run `tui observe` again and act on a reference from its new listing.

@@ -1,0 +1,1 @@
+Refused, nothing was acted on: {{ reason }}.

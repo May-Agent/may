@@ -445,6 +445,8 @@ pub struct MayAgent {
     /// Earlier shells' job registries kept for `pipe` while retained stages
     /// remain within their retention window.
     prior_jobs: super::pipe_tool::PriorJobs,
+    /// Session-scoped registry of open `tui` PTY sessions.
+    tui_registry: super::tui_tool::TuiRegistry,
     tools: ToolEnvironments,
     environment: AgentEnvironment,
     /// Where a fact of a main-agent job is told to the clients that show it.
@@ -1445,6 +1447,9 @@ impl MayAgent {
             remote_repo,
         ) = shared_terminal_commands_res?;
         let registry = commands.build();
+        shared_terminal_commands
+            .registry_slot
+            .bind(registry.clone());
         let shell = assembly.build_on(sandbox, registry.clone()).await?;
         if let Some(pair) = &fusion_pair {
             if config.session_role.is_sidekick() {
@@ -1454,11 +1459,14 @@ impl MayAgent {
             }
         }
         // A side request forks the agent before it has run any bound command.
-        shared_terminal_commands.fork_launcher.set(&shell);
+        shared_terminal_commands
+            .fork_launcher
+            .set_with_registry(&shell, registry.clone());
 
         // The command table, the capabilities and the efficiency rules are
         // rendered from the commands registered above.
         let prior_jobs = shared_terminal_commands.prior_jobs.clone();
+        let tui_registry = shared_terminal_commands.tui_registry.clone();
         let command_descriptions = shared_terminal_commands.descriptions.clone();
         let core_commands = shared_terminal_commands.usages.clone();
         let capabilities = build_capabilities(
@@ -1702,6 +1710,7 @@ impl MayAgent {
             sandbox_dir: shell.working_dir().clone(),
             job_events: job_bridge,
             prior_jobs,
+            tui_registry,
             tools,
             environment: config.environment,
             job_facts_tx,
@@ -2349,6 +2358,12 @@ impl MayAgent {
     #[must_use]
     pub fn jobs(&self) -> aither_sandbox::Jobs {
         self.shell.jobs()
+    }
+
+    /// Registry of open interactive `tui` PTY sessions owned by this agent.
+    #[must_use]
+    pub const fn tui_registry(&self) -> &super::tui_tool::TuiRegistry {
+        &self.tui_registry
     }
 
     /// Registry of in-flight `subagent` command runs.
