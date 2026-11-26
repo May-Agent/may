@@ -187,6 +187,19 @@ impl FontCatalog {
             "Malgun Gothic",
             "AppleGothic",
             "NanumGothic",
+            "Droid Sans Fallback",
+            "Unifont",
+            "GNU Unifont",
+            "IPAGothic",
+            "IPAexGothic",
+            "VL Gothic",
+            "TakaoPGothic",
+            "UnDotum",
+            "AR PL UMing CN",
+            "AR PL UKai CN",
+            "Noto Serif CJK SC",
+            "Noto Serif CJK JP",
+            "Noto Serif CJK KR",
         ];
         for name in cjk_names {
             if let Some(id) = db.query(&fontdb::Query {
@@ -201,6 +214,22 @@ impl FontCatalog {
         for face in db.faces() {
             if face.monospaced && !preferred_mono.contains(&face.id) {
                 preferred_mono.push(face.id);
+            }
+            if !preferred_cjk.contains(&face.id)
+                && face.families.iter().any(|(family, _)| {
+                    let lower = family.to_ascii_lowercase();
+                    lower.contains("cjk")
+                        || lower.contains("unifont")
+                        || lower.contains("droid sans fallback")
+                        || lower.contains("han")
+                        || lower.contains("gothic")
+                        || lower.contains("pingfang")
+                        || lower.contains("hiragino")
+                        || lower.contains("nanum")
+                        || lower.contains("wenquanyi")
+                })
+            {
+                preferred_cjk.push(face.id);
             }
             all_faces.push(face.id);
         }
@@ -262,11 +291,11 @@ impl FontCatalog {
             &self.preferred_cjk
         };
 
-        for id in primary_list
-            .iter()
-            .chain(secondary_list.iter())
-            .chain(self.all_faces.iter().take(64))
-        {
+        for id in primary_list.iter().chain(secondary_list.iter()).chain(
+            self.all_faces
+                .iter()
+                .filter(|id| !primary_list.contains(id) && !secondary_list.contains(id)),
+        ) {
             let Some(face) = self.face_data(*id) else {
                 continue;
             };
@@ -493,9 +522,59 @@ impl CellRasterizer {
             return;
         }
 
-        // Minimal built-in 5x7 ASCII fallback when no system font covers the glyph.
+        // Built-in fallbacks when no system font covers the glyph.
         if ch.is_ascii_graphic() {
             draw_ascii_fallback(image, ch as u8, rect.x, rect.y, rect.w, rect.h, fg);
+        } else if !ch.is_control() && !ch.is_whitespace() {
+            draw_missing_glyph_box(image, ch, rect, fg);
+        }
+    }
+}
+
+/// Deterministic missing-glyph tofu box drawn when no installed system font
+/// covers a printable non-ASCII codepoint (for example CJK on minimal CI hosts).
+fn draw_missing_glyph_box(image: &mut RgbImage, ch: char, rect: PixelRect, fg: [u8; 3]) {
+    if rect.w < 4 || rect.h < 4 {
+        fill_rect(image, rect.x, rect.y, rect.w, rect.h, fg);
+        return;
+    }
+    let x0 = rect.x + 1;
+    let y0 = rect.y + 1;
+    let w = rect.w - 2;
+    let h = rect.h - 2;
+    // 1px outer frame.
+    fill_rect(image, x0, y0, w, 1, fg);
+    fill_rect(image, x0, y0 + h - 1, w, 1, fg);
+    fill_rect(image, x0, y0, 1, h, fg);
+    fill_rect(image, x0 + w - 1, y0, 1, h, fg);
+
+    // Deterministic 4x4 bit pattern from the codepoint's lower 16 bits inside
+    // the frame so distinct missing glyphs remain visually distinguishable.
+    if w >= 6 && h >= 6 {
+        let code = u32::from(ch);
+        let bits = (code ^ (code >> 16)) & 0xFFFF;
+        let inner_x = x0 + 2;
+        let inner_y = y0 + 2;
+        let inner_w = w - 4;
+        let inner_h = h - 4;
+        for row in 0..4_u32 {
+            for col in 0..4_u32 {
+                let shift = row * 4 + col;
+                if (bits >> shift) & 1 == 1 {
+                    let px0 = inner_x + (col * inner_w) / 4;
+                    let px1 = inner_x + ((col + 1) * inner_w) / 4;
+                    let py0 = inner_y + (row * inner_h) / 4;
+                    let py1 = inner_y + ((row + 1) * inner_h) / 4;
+                    fill_rect(
+                        image,
+                        px0,
+                        py0,
+                        px1.saturating_sub(px0).max(1),
+                        py1.saturating_sub(py0).max(1),
+                        fg,
+                    );
+                }
+            }
         }
     }
 }
@@ -1286,5 +1365,27 @@ mod tests {
         let rgb = rasterizer.render_image(&snap);
         let lit = count_non_bg_pixels(&rgb, 0, 0, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT);
         assert!(lit > 10, "expected fallback pixels for 'H', got {lit}");
+    }
+
+    #[test]
+    fn missing_glyph_fallback_renders_cjk_when_no_system_fonts_loaded() {
+        let mut emu = TerminalEmulator::new(20, 3);
+        emu.feed("中文\r\n日本語\r\n한국어".as_bytes());
+        let snap = emu.snapshot();
+        let rasterizer = CellRasterizer::without_system_fonts();
+        let rgb = rasterizer.render_image(&snap);
+        for (label, row_idx) in [("Chinese", 0_u32), ("Japanese", 1_u32), ("Korean", 2_u32)] {
+            let lit = count_non_bg_pixels(
+                &rgb,
+                0,
+                row_idx * DEFAULT_CELL_HEIGHT,
+                DEFAULT_CELL_WIDTH * 2,
+                DEFAULT_CELL_HEIGHT,
+            );
+            assert!(
+                lit > 0,
+                "{label} fallback glyph at row {row_idx} produced no pixels"
+            );
+        }
     }
 }

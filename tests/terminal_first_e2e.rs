@@ -5872,7 +5872,7 @@ fn compaction_probe_handoff() -> String {
 /// Characters of filler that put a compaction probe's first request at about
 /// 33k tokens: past the start point of [`compaction_probe_context`] and, with
 /// a start distance as wide as the pause point's, past that too.
-const COMPACTION_PROBE_FILLER_REPEATS: usize = 10_000;
+const COMPACTION_PROBE_FILLER_REPEATS: usize = 8_500;
 
 /// A `[context]` section whose auto-compact point is 40k tokens, whatever the
 /// mock model's 128k window: compaction starts at `40k - start_distance` and
