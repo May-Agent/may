@@ -404,6 +404,10 @@ impl SessionParts {
             sleep: None,
             session_role: crate::fusion::SessionRole::Main,
             shared_grants: None,
+            shared_jobs: None,
+            tui_registry: None,
+            live_browser: None,
+            live_resource_providers: Vec::new(),
         }
     }
 }

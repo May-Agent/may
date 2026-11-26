@@ -16,5 +16,5 @@ pub mod tool;
 
 pub use adapter::{AdapterError, AdapterKind, ResolvedNativeAdapter};
 pub use broker::{DebugBroker, DebugCallContext, DebugOwner};
-pub use context::DebugLiveContext;
+pub use context::DebugLiveResourceProvider;
 pub use tool::MayDebugTool;

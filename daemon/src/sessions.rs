@@ -861,15 +861,14 @@ pub async fn delete_session(
         .await
         .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
-    state.session_prewarms.cancel(&id);
-    state.services.debug.teardown_session(&id).await;
-    state.parked_agents.evict(&id);
+    state.teardown_session_resources(&id).await;
     if let Some(fusion) = state.services.fusion() {
         fusion.pairs().remove_parent(&id);
     }
     for companion in &companions {
-        state.session_prewarms.cancel(&companion.session_id);
-        state.parked_agents.evict(&companion.session_id);
+        state
+            .teardown_session_resources(&companion.session_id)
+            .await;
         state
             .runtime_service
             .forget_terminal_grants(&companion.session_id);
@@ -1204,13 +1203,12 @@ pub async fn patch_session(
         {
             if archived {
                 db.archive_session(&id).await.map_err(internal_error)?;
-                state.session_prewarms.cancel(&id);
-                state.services.debug.teardown_session(&id).await;
-                state.parked_agents.evict(&id);
+                state.teardown_session_resources(&id).await;
                 if let Ok(companions) = db.companion_sessions_for(&id).await {
                     for companion in companions {
-                        state.session_prewarms.cancel(&companion.session_id);
-                        state.parked_agents.evict(&companion.session_id);
+                        state
+                            .teardown_session_resources(&companion.session_id)
+                            .await;
                     }
                 }
             } else {

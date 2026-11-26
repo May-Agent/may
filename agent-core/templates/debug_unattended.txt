@@ -1,1 +1,1 @@
-An active debug session is still open (adapter {{ adapter }}{% if let Some(pid) = target_pid %}, target pid {{ pid }}{% endif %}, state {{ state }}). Close it with `debug detach` (to leave an attached background job running) or `debug terminate` (to stop the target) before finishing unless you intend to keep it active.
+Active debug session (adapter {{ adapter }}{% if let Some(pid) = target_pid %}, target pid {{ pid }}{% endif %}, state {{ state }}).

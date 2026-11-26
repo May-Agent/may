@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aither_agent::{ContextSource, Moment};
 use aither_core::llm::{
     AgentIdentity, CallIdentity, IntoToolResult, SubagentIdentity, Tool, ToolCallId, ToolContext,
 };
@@ -17,10 +16,11 @@ use aither_dap::{
 use aither_sandbox::{LaunchId, LaunchInfo, SandboxMode};
 use async_net::{TcpListener, TcpStream};
 use futures_lite::io::BufReader;
+use may_agent_core::agent::LiveResourceProvider;
 use may_agent_core::db::ChatDb;
 use may_agent_core::debug::{
-    AdapterError, AdapterKind, DebugBroker, DebugCallContext, DebugLiveContext, DebugOwner,
-    MayDebugTool, adapter,
+    AdapterError, AdapterKind, DebugBroker, DebugCallContext, DebugLiveResourceProvider,
+    DebugOwner, MayDebugTool, adapter,
 };
 use may_agent_core::ipc::Binding;
 use may_agent_core::session::{MayHomePaths, SessionRuntimeService};
@@ -305,30 +305,19 @@ async fn async_stop_wakes_session_prompts_and_live_context_recalls_and_tears_dow
         .unwrap();
     assert!(matches!(connected, DebugResult::Stopped(_)));
 
-    // 2. Post-compaction DebugLiveContext recalls active session on reassembled=true,
-    // emits nothing on reassembled=false, and raises Moment::FinalTurn at most once.
-    let mut live_ctx = DebugLiveContext::new(broker.clone(), "debug-session".to_owned());
-    assert_eq!(
-        live_ctx
-            .blocks(Moment::Request { reassembled: false })
-            .await,
-        [] as [aither_agent::ContextBlock; 0]
-    );
-    let reassembled_blocks = live_ctx.blocks(Moment::Request { reassembled: true }).await;
-    assert_eq!(reassembled_blocks.len(), 1);
-    assert!(reassembled_blocks[0].block().content().contains("dap-tcp"));
-    assert!(
-        reassembled_blocks[0]
-            .block()
-            .content()
-            .contains("src/main.rs:42:1")
-    );
+    // 2. Post-compaction DebugLiveResourceProvider reports active session into
+    // LiveResourcesContext and exposes unattended FinalTurn entry.
+    let live_provider = DebugLiveResourceProvider::new(broker.clone(), "debug-session".to_owned());
+    let sections = live_provider.snapshot().await;
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].heading, "Active debug sessions");
+    assert!(sections[0].items[0].contains("dap-tcp"));
+    assert!(sections[0].items[0].contains("src/main.rs:42:1"));
 
-    let final_first = live_ctx.blocks(Moment::FinalTurn).await;
-    assert_eq!(final_first.len(), 1);
-    assert!(final_first[0].block().content().contains("debug detach"));
-    let final_second = live_ctx.blocks(Moment::FinalTurn).await;
-    assert_eq!(final_second, [] as [aither_agent::ContextBlock; 0]);
+    let unattended = live_provider.unattended_final_turn().await;
+    assert_eq!(unattended.len(), 1);
+    assert!(unattended[0].key.starts_with("debug:"));
+    assert!(unattended[0].cleanup_hint.contains("debug detach"));
 
     // 3. Continue with short timeout returns Running, then delayed breakpoint hit
     // wakes SessionPrompts once with hidden context!
@@ -366,8 +355,12 @@ async fn async_stop_wakes_session_prompts_and_live_context_recalls_and_tears_dow
     };
     assert_eq!(s.state, DebugSessionState::Inactive);
     assert_eq!(
-        live_ctx.blocks(Moment::Request { reassembled: true }).await,
-        [] as [aither_agent::ContextBlock; 0]
+        live_provider.snapshot().await,
+        [] as [may_agent_core::agent::LiveResourceSection; 0]
+    );
+    assert_eq!(
+        live_provider.unattended_final_turn().await,
+        [] as [may_agent_core::agent::UnattendedResource; 0]
     );
 }
 

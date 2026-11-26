@@ -83,6 +83,14 @@ The `tui` command (`tui --help`; bundled skill `tui` gated on `requires-command:
 - `tui resize PID COLS ROWS` updates the virtual screen and forwards the PTY window size (`TIOCSWINSZ` / `SIGWINCH`). Close programs with their quit key or native `kill <pid>` inside `terminal`.
 - `read_only` subagents and `btw` forks are refused `tui`. Writable subagents run `tui` against their own subagent shell so any TUI they open terminates when the subagent finishes and never enters the main session's TUI registry.
 
+## Live session resource lifecycle
+
+The main session shares its `Jobs` and `TuiRegistry` across `MayAgent` rebuilds (configuration or model changes) so running background jobs and open `tui` PIDs stay directly reachable by `terminal_read`, `terminal_input`, `monitor`, and `tui`; ephemeral subagents keep per-run shells whose jobs and TUIs stop when the subagent run finishes.
+
+- **Post-compaction recall**: Whenever context reassembles after foreground or idle compaction, May queries live session state and injects a `<live-resources>` inventory naming running background jobs, open `tui` sessions, and any running managed `browser` owned by the session (omitting the block when empty and never touching warm prompt caches).
+- **Turn-end and idle reclamation**: Attempting to finish a main turn while an interactive `tui` remains open raises a one-shot cleanup prompt per open PID. Managed headless Chrome stops automatically after `[browser] idle_timeout` (default `5m`, live-configurable) once no active turn, WebRTC viewer, or user takeover holds it.
+- **Session teardown**: Archiving or deleting a session, or shutting down the daemon, kills the session's background jobs, closes its `tui` sessions, cancels subagents, and stops the managed browser if no viewer or takeover holds it.
+
 ## Image OCR for model attachments
 
 Every image sent to a vision-capable model (user uploads in TUI and Web UI, `computer` and `browser` screenshots, `CommandStream::Image`, and `ToolResult::Binary`/`Parts`) always stays attached as an image. When the `vision-ocr` Cargo feature is enabled on a supported host OS (macOS / Windows), `src/vision_ocr.rs` classifies text density via `waterkit-vision` `RecognizeText` (`blocking::unblock`); text-dense screenshots and document images are downscaled to at most 768px on the longer edge and accompanied by `<recognized_text>`, while photographs and unsupported platforms send the original image unchanged. Images emitted by `tui observe` set `skip_ocr = true` and bypass OCR because `tui` already provides structured terminal state and exact cell text.

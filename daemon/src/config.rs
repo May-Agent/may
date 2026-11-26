@@ -356,28 +356,37 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
     let next_browser_manager = if updated.browser.enabled {
         let next_browser_config = updated.browser.clone();
         match &previous_browser_manager {
-            // Nothing but possibly the codec changed: the running browser
-            // keeps its pages and only its stream moves to the new codec.
-            Some(manager) if next_browser_config == previous_config.browser => {
+            // Nothing but possibly the codec or idle_timeout changed: the
+            // running browser keeps its pages and updates live.
+            Some(manager)
+                if next_browser_config.same_runtime_settings(&previous_config.browser) =>
+            {
                 if codec_changed {
                     manager
                         .set_codec(codec)
                         .await
                         .map_err(browser_stream_error)?;
                 }
+                if next_browser_config.idle_timeout != previous_config.browser.idle_timeout {
+                    manager.set_idle_timeout(next_browser_config.idle_timeout);
+                }
                 Some(manager.clone())
             }
-            _ => Some(Arc::new(
-                crate::container::browser::BrowserManager::new(
-                    next_browser_config,
-                    state.may_dir.clone(),
-                    crate::container::browser::BrowserLifecyclePublisher::new(
-                        state.browser_lifecycle_tx.clone(),
-                    ),
-                    codec,
-                )
-                .map_err(browser_stream_error)?,
-            )),
+            _ => {
+                let manager = Arc::new(
+                    crate::container::browser::BrowserManager::new(
+                        next_browser_config,
+                        state.may_dir.clone(),
+                        crate::container::browser::BrowserLifecyclePublisher::new(
+                            state.browser_lifecycle_tx.clone(),
+                        ),
+                        codec,
+                    )
+                    .map_err(browser_stream_error)?,
+                );
+                state.attach_browser_idle_hooks(&manager);
+                Some(manager)
+            }
         }
     } else {
         None
@@ -897,9 +906,16 @@ pub async fn reload_config_from_disk(state: &Arc<DaemonState>) {
     let mut browser_updated = false;
     let next_browser_manager = if loaded.browser.enabled {
         match &previous_browser_manager {
-            Some(manager) if loaded.browser == previous_config.browser => {
+            Some(manager)
+                if loaded
+                    .browser
+                    .same_runtime_settings(&previous_config.browser) =>
+            {
                 if codec_changed && let Err(error) = manager.set_codec(codec).await {
                     tracing::warn!(%error, "failed to update browser stream codec after config.toml reload");
+                }
+                if loaded.browser.idle_timeout != previous_config.browser.idle_timeout {
+                    manager.set_idle_timeout(loaded.browser.idle_timeout);
                 }
                 Some(manager.clone())
             }
@@ -912,8 +928,10 @@ pub async fn reload_config_from_disk(state: &Arc<DaemonState>) {
                 codec,
             ) {
                 Ok(manager) => {
+                    let manager = Arc::new(manager);
+                    state.attach_browser_idle_hooks(&manager);
                     browser_updated = true;
-                    Some(Arc::new(manager))
+                    Some(manager)
                 }
                 Err(error) => {
                     tracing::warn!(%error, "failed to initialize browser manager after config.toml reload");

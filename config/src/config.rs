@@ -1033,6 +1033,16 @@ pub struct BrowserConfig {
     /// copy and never touch the source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_profile: Option<SystemProfileConfig>,
+    /// Stop the managed headless browser after this much inactivity once no
+    /// active turn, WebRTC viewer, or user takeover holds it. Set to `"0s"`
+    /// to disable automatic idle shutdown. Applied live without restarting
+    /// the browser.
+    #[serde(
+        default = "default_browser_idle_timeout",
+        with = "duration_text",
+        skip_serializing_if = "is_default_browser_idle_timeout"
+    )]
+    pub idle_timeout: Duration,
 }
 
 /// Existing Chromium profile seeded into the managed browser on first launch.
@@ -1082,6 +1092,15 @@ const fn default_stealth_enabled() -> bool {
     true
 }
 
+const fn default_browser_idle_timeout() -> Duration {
+    Duration::from_mins(5)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_browser_idle_timeout(value: &Duration) -> bool {
+    *value == default_browser_idle_timeout()
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
@@ -1096,11 +1115,30 @@ impl Default for BrowserConfig {
             every_nth_frame: default_every_nth_frame(),
             stealth_enabled: default_stealth_enabled(),
             system_profile: None,
+            idle_timeout: default_browser_idle_timeout(),
         }
     }
 }
 
 impl BrowserConfig {
+    /// Whether two browser configs share the same runtime settings that require
+    /// rebuilding the browser manager (ignoring live-updated fields like
+    /// `idle_timeout`).
+    #[must_use]
+    pub fn same_runtime_settings(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.backend == other.backend
+            && self.port == other.port
+            && self.remote_cdp_endpoint == other.remote_cdp_endpoint
+            && self.screencast_jpeg_quality == other.screencast_jpeg_quality
+            && self.encoder_initial_bitrate_kbps == other.encoder_initial_bitrate_kbps
+            && self.screencast_max_width == other.screencast_max_width
+            && self.screencast_max_height == other.screencast_max_height
+            && self.every_nth_frame == other.every_nth_frame
+            && self.stealth_enabled == other.stealth_enabled
+            && self.system_profile == other.system_profile
+    }
+
     /// Check the browser config for consistency.
     ///
     /// # Errors
@@ -3345,5 +3383,42 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![std::ffi::OsString::from("config.toml")]);
+    }
+
+    #[test]
+    fn browser_idle_timeout_defaults_parses_and_skips_runtime_rebuild() {
+        let defaults = BrowserConfig::default();
+        assert_eq!(defaults.idle_timeout, Duration::from_mins(5));
+
+        let parsed: MayConfig = toml::from_str(
+            r#"
+[browser]
+enabled = true
+idle_timeout = "90s"
+"#,
+        )
+        .expect("parse browser idle_timeout");
+        assert_eq!(parsed.browser.idle_timeout, Duration::from_secs(90));
+        let rendered = toml::to_string_pretty(&parsed).expect("serialize");
+        assert!(
+            rendered.contains("idle_timeout ="),
+            "non-default idle_timeout must serialize: {rendered}"
+        );
+        let round_tripped: MayConfig = toml::from_str(&rendered).expect("re-parse");
+        assert_eq!(round_tripped.browser.idle_timeout, Duration::from_secs(90));
+
+        let disabled: MayConfig = toml::from_str(
+            r#"
+[browser]
+enabled = true
+idle_timeout = "0s"
+"#,
+        )
+        .expect("parse disabled idle_timeout");
+        assert_eq!(disabled.browser.idle_timeout, Duration::ZERO);
+        assert!(
+            parsed.browser.same_runtime_settings(&disabled.browser),
+            "changing idle_timeout alone must not require rebuilding BrowserManager"
+        );
     }
 }

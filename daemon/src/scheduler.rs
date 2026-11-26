@@ -1422,6 +1422,7 @@ impl TaskRuntime {
             spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
             pool,
             connectivity: self.connectivity.clone(),
+            jobs: None,
         }
         .build(commands.build())
         .await

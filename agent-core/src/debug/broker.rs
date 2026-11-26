@@ -1042,11 +1042,7 @@ async fn spawn_container_loopback_bridge(
     );
     let spec = SpawnSpec::new("python3")
         .args(["-u", "-c", &bridge_py])
-        .stdio(Stdio {
-            stdin: Pipe::Piped,
-            stdout: Pipe::Piped,
-            stderr: Pipe::Null,
-        });
+        .stdio(Stdio::pipes(Pipe::Piped, Pipe::Piped, Pipe::Null));
     let child = shell.sandbox().spawn(spec).await.map_err(|err| {
         DebugToolError::request_failed(format!(
             "failed to bridge sandbox loopback DAP server at {endpoint}: {err}"

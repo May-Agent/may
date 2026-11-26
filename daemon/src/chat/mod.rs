@@ -5296,6 +5296,16 @@ fn build_session_agent<'a>(
                 sleep: Some(state.sleep.clone()),
                 session_role,
                 shared_grants,
+                shared_jobs: state
+                    .session_background
+                    .shared_jobs(ctx.session_id.as_str()),
+                tui_registry: Some(
+                    state
+                        .session_background
+                        .tui_registry(ctx.session_id.as_str()),
+                ),
+                live_browser: Some(state.browser_live_reader(ctx.session_id.as_str().to_string())),
+                live_resource_providers: Vec::new(),
             },
         )
         .await

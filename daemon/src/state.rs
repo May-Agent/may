@@ -705,6 +705,130 @@ impl DaemonState {
         self.browser_manager.store(browser_manager);
     }
 
+    /// Wires active-turn hold detection and idle-stop cleanup onto `manager`.
+    ///
+    /// `[browser] idle_timeout` shuts down Chrome once no active turn, WebRTC
+    /// viewer, or user takeover holds it.
+    pub fn attach_browser_idle_hooks(
+        self: &Arc<Self>,
+        manager: &crate::container::browser::BrowserManager,
+    ) {
+        let active_weak = Arc::downgrade(self);
+        let stop_weak = Arc::downgrade(self);
+        manager.set_idle_hooks(crate::container::browser::BrowserIdleHooks {
+            is_turn_active: Some(Arc::new(move || {
+                active_weak.upgrade().is_some_and(|state| {
+                    state
+                        .browser_owner_session_id()
+                        .is_some_and(|owner| state.runtime_service.runs().is_held(&owner))
+                })
+            })),
+            on_idle_stop: Some(Arc::new(move || {
+                if let Some(state) = stop_weak.upgrade() {
+                    state.set_browser_owner_session_id(None);
+                    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+                }
+            })),
+        });
+    }
+
+    /// Resets the managed browser's idle timer when `session_id` currently owns it.
+    pub fn touch_browser_if_owned(&self, session_id: &str) {
+        if self.browser_owner_session_id().as_deref() == Some(session_id)
+            && let Some(manager) = self.browser_manager()
+        {
+            manager.touch();
+        }
+    }
+
+    /// Returns a live-resource browser reader scoped to `session_id`.
+    pub fn browser_live_reader(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> crate::agent::AnyBrowserLiveReader {
+        crate::agent::AnyBrowserLiveReader::new(DaemonBrowserLiveReader {
+            state: Arc::downgrade(self),
+            session_id,
+        })
+    }
+
+    /// Tears down all live in-memory resources owned by `session_id`.
+    ///
+    /// Cancels pre-warm tasks, evicts any parked agent, terminates active debug
+    /// sessions, kills session background jobs and open `tui` sessions, cancels
+    /// subagents, and releases unheld managed browser ownership.
+    pub async fn teardown_session_resources(&self, session_id: &str) {
+        self.session_prewarms.cancel(session_id);
+        self.parked_agents.evict_and_wait(session_id).await;
+        self.services.debug.teardown_session(session_id).await;
+        let stopped = self.session_background.teardown_session(session_id).await;
+        if stopped > 0 {
+            tracing::info!(
+                session_id,
+                stopped,
+                "stopped live resources for torn-down session"
+            );
+        }
+        self.release_unheld_browser_for_session(session_id).await;
+    }
+
+    /// Tears down every session's active debug sessions, live jobs, `tui`
+    /// sessions, subagents, parked agents, and running managed browser during
+    /// daemon shutdown.
+    pub async fn teardown_all_resources(&self) {
+        self.session_prewarms.cancel_all();
+        self.parked_agents.evict_all_and_wait().await;
+        self.services.debug.shutdown_all().await;
+        let stopped = self.session_background.teardown_all().await;
+        if stopped > 0 {
+            tracing::info!(
+                stopped,
+                "stopped remaining live session resources on daemon shutdown"
+            );
+        }
+        if let Some(manager) = self.browser_manager()
+            && manager.is_running()
+            && let Err(error) = manager.stop().await
+        {
+            tracing::warn!(%error, "failed to stop managed browser on daemon shutdown");
+        }
+        self.set_browser_owner_session_id(None);
+    }
+
+    async fn release_unheld_browser_for_session(&self, session_id: &str) {
+        if self.browser_owner_session_id().as_deref() != Some(session_id) {
+            return;
+        }
+        let Some(manager) = self.browser_manager() else {
+            self.set_browser_owner_session_id(None);
+            return;
+        };
+        let takeover_held = manager.has_takeover()
+            || self
+                .runtime_service
+                .find_browser_takeover_session()
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+        if manager.active_peer_count() > 0 || takeover_held {
+            self.set_browser_owner_session_id(None);
+            self.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            return;
+        }
+        if manager.is_running()
+            && let Err(error) = manager.stop().await
+        {
+            tracing::warn!(
+                session_id,
+                %error,
+                "failed to stop managed browser on session teardown"
+            );
+        }
+        self.set_browser_owner_session_id(None);
+        self.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+    }
+
     pub fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
         self.browser_lifecycle_tx.subscribe()
     }
@@ -739,6 +863,30 @@ impl DaemonState {
             self.session_events_epoch,
             self.turn_hub.cursor_index(session_id),
         )
+    }
+}
+
+struct DaemonBrowserLiveReader {
+    state: std::sync::Weak<DaemonState>,
+    session_id: String,
+}
+
+impl crate::agent::BrowserLiveReader for DaemonBrowserLiveReader {
+    fn status(&self) -> Option<crate::agent::LiveBrowserStatus> {
+        let state = self.state.upgrade()?;
+        if state.browser_owner_session_id().as_deref() != Some(self.session_id.as_str()) {
+            return None;
+        }
+        let manager = state.browser_manager()?;
+        if !manager.is_running() {
+            return None;
+        }
+        Some(crate::agent::LiveBrowserStatus {
+            running: true,
+            cdp_endpoint: manager.cdp_endpoint(),
+            active_peers: manager.active_peer_count(),
+            user_takeover: manager.has_takeover(),
+        })
     }
 }
 

@@ -1418,6 +1418,7 @@ impl<LLM: LanguageModel + 'static> ConfinedShellCuratorSession<LLM> {
             spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
             pool: None,
             connectivity: None,
+            jobs: None,
         };
         let registry = crate::ipc::CommandRegistryBuilder::new().build();
         let shell = assembly

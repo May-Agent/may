@@ -38,6 +38,13 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 struct SessionBackground {
     subagents: SubagentTracker,
+    /// Shared session `Jobs` registry reused across main-agent rebuilds so
+    /// running PIDs remain directly reachable by `terminal_read`,
+    /// `terminal_input`, `monitor`, and `tui`.
+    shared_jobs: Option<Jobs>,
+    /// Shared session `TuiRegistry` reused across main-agent rebuilds so open
+    /// interactive `tui` sessions remain reachable by PID.
+    tui_registry: crate::agent::tui_tool::TuiRegistry,
     /// Jobs of the session's agents' shells, numbered, newest last.
     jobs: Vec<(u64, Jobs)>,
     /// Cached script text per pipeline `launch_id`, preserved after foreground exit.
@@ -139,6 +146,24 @@ impl SessionBackgrounds {
             .clone()
     }
 
+    /// The shared shell [`Jobs`] registry `session_id`'s rebuilt agents reuse,
+    /// once the session's first agent has initialized one.
+    pub fn shared_jobs(&self, session_id: &str) -> Option<Jobs> {
+        self.sessions()
+            .get(session_id)
+            .and_then(|entry| entry.shared_jobs.clone())
+    }
+
+    /// The session-scoped [`crate::agent::tui_tool::TuiRegistry`] shared across
+    /// `session_id`'s main-agent rebuilds.
+    pub fn tui_registry(&self, session_id: &str) -> crate::agent::tui_tool::TuiRegistry {
+        self.sessions()
+            .entry(session_id.to_string())
+            .or_default()
+            .tui_registry
+            .clone()
+    }
+
     /// Records the jobs of the shell of an agent just built for `session_id`.
     pub fn add_jobs(&self, session_id: &str, jobs: Jobs) {
         let id = self
@@ -166,10 +191,16 @@ impl SessionBackgrounds {
     /// event queues into `agent`, and injects any pre-cut completions restored
     /// across a rewind.
     pub async fn attach_agent_jobs(&self, session_id: &str, agent: &mut crate::MayAgent) {
-        let (older_registries, abandoned, delivered, restored_alerts) = {
+        let agent_jobs = agent.jobs();
+        let (reused_shared, older_registries, abandoned, delivered, restored_alerts) = {
             let mut sessions = self.sessions();
             let entry = sessions.entry(session_id.to_string()).or_default();
+            let reused_shared = entry.shared_jobs.is_some();
+            if !reused_shared {
+                entry.shared_jobs = Some(agent_jobs.clone());
+            }
             let tuple = (
+                reused_shared,
                 entry.jobs.clone(),
                 entry.abandoned_jobs.clone(),
                 entry.delivered_completions.clone(),
@@ -184,20 +215,22 @@ impl SessionBackgrounds {
             .clone();
         let mut prior_events = Vec::new();
         let mut prior_jobs = Vec::new();
-        for (_, registry) in older_registries {
-            let has_surviving = registry.list().await.into_iter().any(|job| {
-                !abandoned_snapshot.contains(&(job.pid, job.started_at))
-                    && (job.status == JobStatus::Running || job.status.completion_pending())
-            });
-            if has_surviving {
-                prior_events.push(registry.events());
+        if !reused_shared {
+            for (_, registry) in older_registries {
+                let has_surviving = registry.list().await.into_iter().any(|job| {
+                    !abandoned_snapshot.contains(&(job.pid, job.started_at))
+                        && (job.status == JobStatus::Running || job.status.completion_pending())
+                });
+                if has_surviving {
+                    prior_events.push(registry.events());
+                }
+                let has_pipelines = !registry.pipelines().await.is_empty();
+                if has_surviving || has_pipelines {
+                    prior_jobs.push(registry);
+                }
             }
-            let has_pipelines = !registry.pipelines().await.is_empty();
-            if has_surviving || has_pipelines {
-                prior_jobs.push(registry);
-            }
+            self.add_jobs(session_id, agent_jobs);
         }
-        self.add_jobs(session_id, agent.jobs());
         let hooks = SessionJobHooks::new(
             move |pid, started_at| {
                 let guard = abandoned
@@ -640,6 +673,37 @@ impl SessionBackgrounds {
             + self
                 .subagents_of(session_id)
                 .map_or(0, |tracker| tracker.runs().cancel_all())
+    }
+
+    /// Tears down all background jobs, open `tui` sessions, and subagents for
+    /// `session_id` and removes its in-memory entry.
+    pub async fn teardown_session(&self, session_id: &str) -> usize {
+        let entry = self.sessions().remove(session_id);
+        let Some(entry) = entry else {
+            return 0;
+        };
+        Self::teardown_entry(entry).await
+    }
+
+    /// Tears down all sessions' background jobs, open `tui` sessions, and
+    /// subagents (used on daemon shutdown).
+    pub async fn teardown_all(&self) -> usize {
+        let entries: Vec<SessionBackground> = {
+            let mut sessions = self.sessions();
+            sessions.drain().map(|(_, entry)| entry).collect()
+        };
+        let counts =
+            futures_util::future::join_all(entries.into_iter().map(Self::teardown_entry)).await;
+        counts.into_iter().sum()
+    }
+
+    async fn teardown_entry(entry: SessionBackground) -> usize {
+        let mut stopped = entry.tui_registry.open_sessions().len();
+        entry.tui_registry.close_all().await;
+        for (_, jobs) in entry.jobs {
+            stopped += jobs.kill_all().await;
+        }
+        stopped + entry.subagents.runs().cancel_all()
     }
 
     /// The sessions with background work: a command or subagent run in
@@ -1154,5 +1218,72 @@ mod tests {
         }
 
         backgrounds.stop_all("s").await;
+    }
+
+    #[tokio::test]
+    async fn shared_jobs_and_tui_survive_shell_rebuild_and_teardown_cleans_all() {
+        crate::test_support::install_global_executor();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backgrounds = SessionBackgrounds::default();
+
+        // Build first shell and launch both a background job and a PTY TUI session.
+        let (first_shell, _first_job, bg_pid) = shell_with_job(&dir.path().join("first")).await;
+        let shared_jobs = first_shell.shell().jobs();
+        backgrounds.add_jobs("s", shared_jobs.clone());
+        let tui_registry = backgrounds.tui_registry("s");
+        let pty_job = first_shell
+            .shell()
+            .run_pty(aither_sandbox::PtyArgs {
+                description: "test tui".to_string(),
+                script: "sleep 30".to_string(),
+                interpreter: aither_sandbox::Interpreter::Shell,
+                sandbox: aither_sandbox::SandboxMode::Sandboxed,
+                cols: 80,
+                rows: 24,
+                timeout: 60,
+                working_dir: None,
+                inherited_launch: None,
+            })
+            .await
+            .expect("spawn pty job");
+        let tui_pid = pty_job.job.pid();
+        let _tui_session = tui_registry.register("sleep 30".to_string(), 80, 24, pty_job);
+
+        // Rebuild a brand-new Shell sharing the same `Jobs` registry and verify
+        // pre-rebuild PIDs remain directly addressable without duplicating entries.
+        let rebuilt =
+            TestTerminal::with_jobs(&dir.path().join("rebuilt"), shared_jobs.clone()).await;
+
+        assert!(
+            rebuilt.shell().jobs().get(bg_pid).await.is_some(),
+            "rebuilt shell must directly reach pre-rebuild background job PID"
+        );
+        assert!(
+            rebuilt.shell().jobs().get(tui_pid).await.is_some(),
+            "rebuilt shell must directly reach pre-rebuild PTY PID"
+        );
+        assert!(
+            backgrounds.tui_registry("s").get(tui_pid).is_some(),
+            "shared TuiRegistry must keep pre-rebuild TUI session reachable"
+        );
+
+        // Teardown kills both jobs and closes the open TUI session.
+        let stopped = backgrounds.teardown_session("s").await;
+        assert!(
+            stopped >= 2,
+            "expected teardown to stop both jobs, got {stopped}"
+        );
+        assert!(
+            backgrounds.tui_registry("s").open_sessions().is_empty(),
+            "teardown must clear open TUI sessions"
+        );
+        assert!(
+            shared_jobs
+                .list()
+                .await
+                .into_iter()
+                .all(|job| job.status != JobStatus::Running),
+            "teardown must leave no running jobs behind"
+        );
     }
 }
