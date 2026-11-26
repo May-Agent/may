@@ -566,6 +566,127 @@ pub fn handle_image_view_key(app: &mut App, code: KeyCode) -> Option<SendAction>
     None
 }
 
+/// `/bot` resident May Bot panel key handling.
+pub fn handle_bots_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let mut load_bot_id = None;
+    let mut create_name = None;
+    let mut send_pair = None;
+    let mut resolve_req = None;
+    let mut should_refresh = false;
+
+    if let AppMode::Bots(state) = &mut app.mode {
+        if state.creating_bot || state.composing {
+            match code {
+                KeyCode::Esc => {
+                    state.creating_bot = false;
+                    state.composing = false;
+                    state.input.clear();
+                }
+                KeyCode::Backspace => {
+                    state.input.pop();
+                }
+                KeyCode::Enter => {
+                    let text = state.input.trim().to_string();
+                    state.input.clear();
+                    if !text.is_empty() {
+                        if state.creating_bot {
+                            create_name = Some(text);
+                        } else if let Some(bot) = state.current() {
+                            send_pair = Some((bot.id.clone(), text));
+                        }
+                    }
+                    state.creating_bot = false;
+                    state.composing = false;
+                }
+                KeyCode::Char(c) => {
+                    state.input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.mode = AppMode::Chat;
+                    return None;
+                }
+                KeyCode::Tab => {
+                    state.tab = state.tab.next();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if state.tab == crate::state::BotsTab::Approvals && !state.approvals.is_empty()
+                    {
+                        state.approval_selected = state.approval_selected.saturating_sub(1);
+                    } else if state.selected > 0 {
+                        state.selected -= 1;
+                        load_bot_id = state.current().map(|b| b.id.clone());
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if state.tab == crate::state::BotsTab::Approvals && !state.approvals.is_empty()
+                    {
+                        if state.approval_selected + 1 < state.approvals.len() {
+                            state.approval_selected += 1;
+                        }
+                    } else if state.selected + 1 < state.bots.len() {
+                        state.selected += 1;
+                        load_bot_id = state.current().map(|b| b.id.clone());
+                    }
+                }
+                KeyCode::Char('n') => {
+                    state.creating_bot = true;
+                    state.composing = false;
+                    state.input.clear();
+                }
+                KeyCode::Char('i') => {
+                    if state.current().is_some() {
+                        state.tab = crate::state::BotsTab::Chat;
+                        state.composing = true;
+                        state.creating_bot = false;
+                        state.input.clear();
+                    }
+                }
+                KeyCode::Char('a') => {
+                    if state.tab == crate::state::BotsTab::Approvals
+                        && let Some(bot) = state.current()
+                        && let Some(item) = state.approvals.get(state.approval_selected)
+                    {
+                        resolve_req = Some((bot.id.clone(), item.request_id.clone(), true));
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if state.tab == crate::state::BotsTab::Approvals
+                        && let Some(bot) = state.current()
+                        && let Some(item) = state.approvals.get(state.approval_selected)
+                    {
+                        resolve_req = Some((bot.id.clone(), item.request_id.clone(), false));
+                    }
+                }
+                KeyCode::Char('r') => {
+                    should_refresh = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(name) = create_name {
+        app.create_bot_named(name);
+    }
+    if let Some((bot_id, text)) = send_pair {
+        app.send_bot_chat_message(bot_id, text);
+    }
+    if let Some((bot_id, request_id, approved)) = resolve_req {
+        app.resolve_bot_approval_request(bot_id, request_id, approved);
+    }
+    if let Some(bot_id) = load_bot_id {
+        app.refresh_bot_details(bot_id);
+    }
+    if should_refresh {
+        app.refresh_bots();
+    }
+    None
+}
+
 /// Job detail view: scroll output, stop a running job, refresh, back to Jobs.
 pub fn handle_job_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let AppMode::JobDetail(state) = &mut app.mode else {

@@ -38,6 +38,7 @@ DELETE FROM pr_check_alerts WHERE ? IS NULL OR session_id = ?;
 DELETE FROM swarm_cursors WHERE ? IS NULL OR session_id = ?;
 DELETE FROM swarm_session_state WHERE ? IS NULL OR session_id = ?;
 DELETE FROM swarm_buffered_cloud_notices WHERE ? IS NULL OR session_id = ?;
+DELETE FROM bot_supervised_sessions WHERE ? IS NULL OR session_id = ?;
 DELETE FROM prompt_cache_routes WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_headers WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_prompt_attachments WHERE ? IS NULL OR session_id = ?;

@@ -1,0 +1,1 @@
+Resumed delegated worker `{{ agent_id }}` from its persisted checkpoint. Further completion, failure, and permission events will arrive in your inbox.

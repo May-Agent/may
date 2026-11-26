@@ -9,6 +9,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 ## Sessions and profiles
 
 - `/new` starts a new session (also Ctrl+N). `/new <repo or path>` starts it directly on that repository, like `may --repo`: `owner/repo` and `github:`/`gitlab:` bindings need no local checkout.
+- `/bot` opens the resident May Bot overlay (create/select bots, chat, toggle internal trace, approve/deny escalated requests with bot notes, and inspect memory tree and `memory.git` history).
 - `/session` opens the recent-session list (search by typing; Enter opens; Tab / Shift+Tab switch profile when more than one exists). `/archive` opens the archived list; opening an archived session unarchives it.
 - `/profile` opens the profile picker (also Ctrl+P); with a single profile it opens the session list instead. See `profiles.md`.
 - `/rewind` opens a picker of the session's earlier prompts (also Esc twice when idle). Choosing one truncates the conversation and model context (including context snapshots, queued/steer messages, and open questions from the cut turns) to before that prompt, kills background commands and subagents started in the rewound turns while keeping earlier jobs alive, syncs attached clients over the session stream, and puts the prompt's text and attachments back in the input for editing; "(current)" cancels. Workspace files, `tasks.md`, commits, PRs and issues stay as they are, and the daemon injects a one-shot reminder on the next turn. Refused while a turn is running (`409` on concurrent runs), and when there are no prompts.

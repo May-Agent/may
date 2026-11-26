@@ -1,0 +1,1 @@
+Queued fact curation #{{ queue_id }} for source {{ source_agent }} at {{ source_time }}. Memory updates and git commit will run asynchronously in FIFO order.

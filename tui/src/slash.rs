@@ -14,6 +14,7 @@ pub enum SlashCommand {
     Archive,
     New,
     Chat,
+    Bot,
     #[cfg(feature = "ui")]
     Gui,
     Profile,
@@ -65,12 +66,13 @@ pub struct SlashSpec {
 
 impl SlashCommand {
     /// Every command, in the order completion and help list them.
-    pub const ALL: [Self; if cfg!(feature = "ui") { 40 } else { 39 }] = [
+    pub const ALL: [Self; if cfg!(feature = "ui") { 41 } else { 40 }] = [
         Self::Help,
         Self::Session,
         Self::Archive,
         Self::New,
         Self::Chat,
+        Self::Bot,
         #[cfg(feature = "ui")]
         Self::Gui,
         Self::Profile,
@@ -122,6 +124,7 @@ impl SlashCommand {
                 "Start a new session, optionally on a repository",
             ),
             Self::Chat => ("/chat", "", "Start a new repo-less chat"),
+            Self::Bot => ("/bot", "", "Manage and chat with resident May Bots"),
             #[cfg(feature = "ui")]
             Self::Gui => ("/gui", "", "Open this session in the web UI"),
             Self::Profile => ("/profile", "", "Switch profile (Ctrl+P)"),

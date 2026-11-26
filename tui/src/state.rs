@@ -81,6 +81,8 @@ pub enum AppMode {
     Jobs,
     /// Detail view of one background job or subagent run
     JobDetail(JobDetailState),
+    /// `/bot` resident May Bot management, chat, trace, approvals, and memory viewer
+    Bots(BotsState),
     /// `/btw` side-question overlay: answered outside conversation history
     Btw(BtwState),
     /// `/progress` overlay: the remaining work with a progress bar
@@ -135,6 +137,7 @@ impl AppMode {
             Self::ResumePicker(_) => "resume-picker",
             Self::Jobs => "jobs",
             Self::JobDetail(_) => "job-detail",
+            Self::Bots(_) => "bots",
             Self::Btw(_) => "btw",
             Self::Progress(_) => "progress",
             Self::ImageView(_) => "image-view",
@@ -149,6 +152,85 @@ impl AppMode {
 pub struct QuitConfirmState {
     /// Mode to go back to when the quit is cancelled.
     pub return_to: Box<AppMode>,
+}
+
+/// Active tab inside the `/bot` overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BotsTab {
+    /// User-visible conversation with the selected bot.
+    #[default]
+    Chat,
+    /// Internal activity trace (plain text & tool events).
+    Trace,
+    /// Permission approvals (including escalated cards with bot notes).
+    Approvals,
+    /// Hierarchical memory tree & `memory.git` commit history.
+    Memory,
+}
+
+impl BotsTab {
+    /// Cycles to the next tab.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Chat => Self::Trace,
+            Self::Trace => Self::Approvals,
+            Self::Approvals => Self::Memory,
+            Self::Memory => Self::Chat,
+        }
+    }
+
+    /// Display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Trace => "Trace",
+            Self::Approvals => "Approvals",
+            Self::Memory => "Memory",
+        }
+    }
+}
+
+/// State of the `/bot` overlay.
+#[derive(Debug, Clone, Default)]
+pub struct BotsState {
+    /// Loaded resident bots.
+    pub bots: Vec<may_protocol::bot::BotSummary>,
+    /// Selected index into `bots`.
+    pub selected: usize,
+    /// Active detail tab.
+    pub tab: BotsTab,
+    /// Messages for the selected bot.
+    pub messages: Vec<may_protocol::bot::BotChatMessage>,
+    /// Internal run trace entries for the selected bot.
+    pub trace: Vec<may_protocol::bot::BotTraceEntry>,
+    /// Approval requests for the selected bot.
+    pub approvals: Vec<may_protocol::bot::BotApprovalItem>,
+    /// Selected approval index on the Approvals tab.
+    pub approval_selected: usize,
+    /// Memory tree root for the selected bot.
+    pub memory_tree: Option<may_protocol::bot::BotMemoryNode>,
+    /// `memory.git` commit history for the selected bot.
+    pub memory_commits: Vec<may_protocol::bot::BotMemoryCommit>,
+    /// Message composer input on the Chat tab (or new bot name when `creating_bot` is true).
+    pub input: String,
+    /// Whether the user is typing a new bot name (`n`).
+    pub creating_bot: bool,
+    /// Whether the user is typing a chat message (`i`).
+    pub composing: bool,
+    /// Loading indicator.
+    pub loading: bool,
+    /// Error or status banner inside the overlay.
+    pub notice: Option<String>,
+}
+
+impl BotsState {
+    /// Currently selected bot, if any.
+    #[must_use]
+    pub fn current(&self) -> Option<&may_protocol::bot::BotSummary> {
+        self.bots.get(self.selected)
+    }
 }
 
 /// `/btw` overlay state: type a question, stream a one-off answer.

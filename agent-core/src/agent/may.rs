@@ -775,7 +775,13 @@ impl MayAgent {
             child_approvals = child_approvals
                 .with_session(prompts.clone(), config.session_id.as_str().to_string());
         }
-        let permissions = TerminalPermissionHandler::for_agent(
+        let supervising_bot = config
+            .db
+            .supervising_bot_for_session(config.session_id.as_str())
+            .await
+            .ok()
+            .flatten();
+        let mut permissions = TerminalPermissionHandler::for_agent(
             permission_approver.clone(),
             config.network_policy.clone(),
             config.profile_id.clone(),
@@ -787,6 +793,12 @@ impl MayAgent {
             approval_pause.clone(),
         ))
         .with_child_approvals(child_approvals.clone());
+        if let (Some(bot_id), Some(bot_router)) =
+            (supervising_bot.as_ref(), config.services.bot_approvals())
+        {
+            permissions =
+                permissions.with_bot_route(bot_id.clone(), bot_router, approval_pause.clone());
+        }
         // Local and container commands draw from the pool: a container
         // command's fifo is made in the container's kernel and brokered by
         // aither's relay over its exec, so it works on VM-backed runtimes
@@ -1174,13 +1186,25 @@ impl MayAgent {
                     &config.services.forge_auth,
                     config.db.clone(),
                 )?;
-                let publish_gate = config
+                let mut publish_gate = config
                     .live_config
                     .clone()
                     .zip(permission_approver.clone())
                     .map(|(live, approver)| {
                         super::publish_approval::PublishGate::new(live, approver)
                     });
+                if let (Some(bot_id), Some(bot_router)) =
+                    (supervising_bot.as_ref(), config.services.bot_approvals())
+                {
+                    publish_gate = publish_gate.map(|gate| {
+                        gate.with_bot_route(super::publish_approval::BotPublishRoute {
+                            router: bot_router,
+                            bot_id: bot_id.clone(),
+                            requester_kind: "session".to_string(),
+                            requester_id: config.session_id.as_str().to_string(),
+                        })
+                    });
+                }
                 let imagine_config = ImagineCommandConfig {
                     generator: config.image_generator.clone(),
                     artifacts_dir: session_paths.artifacts_dir(),

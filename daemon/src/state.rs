@@ -469,6 +469,10 @@ pub struct DaemonState {
     /// Sequential lifecycle facts emitted by the browser actor, fanned out
     /// to every active SSE client subscribed to `browser_lifecycle`.
     pub browser_lifecycle_tx: broadcast::Sender<BrowserLifecycleEvent>,
+    /// Resident May Bot service managing bots, inbox loops, delegates, approvals, and memory.
+    pub bot_service: Arc<super::bots::DaemonBotService>,
+    /// Live `bot_*` SSE events fanned out onto `/api/events`.
+    pub bot_events_tx: broadcast::Sender<may_protocol::bot::BotSseEvent>,
     /// The `computer-agent` helper client — every session's desktop
     /// (display, stream, input) lives in that respawnable process.
     pub computer: Arc<crate::computer::ComputerAgent>,
@@ -703,6 +707,11 @@ impl DaemonState {
 
     pub fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
         self.browser_lifecycle_tx.subscribe()
+    }
+
+    /// Subscribes to live `bot_*` events multiplexed onto `/api/events`.
+    pub fn bot_events_subscribe(&self) -> broadcast::Receiver<may_protocol::bot::BotSseEvent> {
+        self.bot_events_tx.subscribe()
     }
 
     /// Queues `kind` for the session's diff publisher, which recomputes
@@ -1510,6 +1519,54 @@ impl DaemonState {
         let live_limits = crate::agent::LiveLimits::of(&config);
         let forge_auth = crate::forge::LiveForgeAuth::new(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
+        let sleep = std::sync::Arc::new(crate::sleep::SleepState::load(
+            may_dir,
+            ui_event_bus.clone(),
+            db.clone(),
+        ));
+        let pushed_providers = crate::cloud::access::PushedProviders::default();
+        let services = crate::terminal_commands::SharedServices::new(may_dir)
+            .with_forge_auth(forge_auth.clone());
+        let (bot_events_tx, _) = tokio::sync::broadcast::channel(64);
+        let bot_model_factory = std::sync::Arc::new(super::bots::DaemonBotModelFactory::new(
+            config.clone(),
+            pushed_providers.clone(),
+            may_dir.to_path_buf(),
+        ));
+        let bot_curator_factory = std::sync::Arc::new(super::bots::DaemonCuratorFactory::new(
+            db.clone(),
+            may_dir.to_path_buf(),
+            tool_distribution.clone(),
+            (*bot_model_factory).clone(),
+        ));
+        let bot_delegate_runner = super::bots::build_daemon_delegate_runner(
+            db.clone(),
+            may_dir.to_path_buf(),
+            tool_distribution.clone(),
+            (*bot_model_factory).clone(),
+        );
+        let bot_service = crate::bot::BotService::new(crate::bot::BotServiceDeps {
+            db: db.clone(),
+            may_dir: may_dir.to_path_buf(),
+            model_factory: bot_model_factory,
+            curator_factory: bot_curator_factory,
+            delegate_runner: bot_delegate_runner,
+            search_backend: crate::repo_search::RepoSearchCollections::new(
+                services.repo_search.clone(),
+            ),
+            sessions: std::sync::Arc::new(crate::bot::NoopSessionBridge),
+            runtime_service: Some(runtime_service.clone()),
+            notifications: Some(notification_service.clone()),
+            sleep: Some(sleep.clone()),
+            ui_event_bus: ui_event_bus.clone(),
+            publish_event: {
+                let tx = bot_events_tx.clone();
+                std::sync::Arc::new(move |event| {
+                    let _ = tx.send(event);
+                })
+            },
+        });
+        services.set_bot_approvals(bot_service.approvals());
         Ok(Self {
             tcp_listeners: super::TcpListeners::new(),
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
@@ -1518,11 +1575,7 @@ impl DaemonState {
                 tokio::runtime::Handle::current(),
             )),
             tokio_handle: tokio::runtime::Handle::current(),
-            sleep: std::sync::Arc::new(crate::sleep::SleepState::load(
-                may_dir,
-                ui_event_bus.clone(),
-                db.clone(),
-            )),
+            sleep,
             db: db.clone(),
             github_api: crate::pr::PrContext::default_github_api(forge_auth.clone()),
             forge_auth: forge_auth.clone(),
@@ -1548,6 +1601,8 @@ impl DaemonState {
             browser_manager: arc_swap::ArcSwapOption::empty(),
             browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
             browser_lifecycle_tx,
+            bot_service,
+            bot_events_tx,
             computer: std::sync::Arc::new(crate::computer::ComputerAgent::detached()),
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
@@ -1561,7 +1616,7 @@ impl DaemonState {
                 )
                 .await?,
             ),
-            pushed_providers: crate::cloud::access::PushedProviders::default(),
+            pushed_providers,
             cloud_home_bridge: super::cloud_home::CloudHomeBridge::default(),
             swarm_mirrors: super::swarm_peers::SwarmMirrorState::default(),
             buffered_cloud_notices: super::swarm_peers::BufferedCloudNotices::new(db.clone()),
@@ -1587,8 +1642,7 @@ impl DaemonState {
             .await
             .expect("test jobserver starts"),
             may_dir: may_dir.to_path_buf(),
-            services: crate::terminal_commands::SharedServices::new(may_dir)
-                .with_forge_auth(forge_auth.clone()),
+            services,
             quota_patterns: crate::quota::QuotaPatterns::default(),
             vision_ocr: crate::vision_ocr::VisionOcr::new(),
             secret_patterns: crate::secrets::SecretPatterns::default(),

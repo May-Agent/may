@@ -248,11 +248,16 @@ pub async fn start(
     let job_server = crate::jobserver::JobServer::start(&may_dir, config.sandbox.job_pool_size())
         .await
         .context("failed to create the jobserver pool")?;
-    // Prompts that task runs store for their sessions; dispatched once the
-    // daemon state exists.
+    // Prompts that task runs store for their sessions or resident bots;
+    // dispatched once the daemon state exists.
     let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
+    let (task_bot_wake_tx, task_bot_wake_rx) = async_channel::unbounded::<String>();
     let session_prompts =
-        crate::task_wake::SessionPrompts::new(runtime_service.clone(), task_wake_tx);
+        crate::task_wake::SessionPrompts::new(runtime_service.clone(), task_wake_tx).with_bot_wake(
+            Arc::new(move |bot_id: &str| {
+                let _ = task_bot_wake_tx.try_send(bot_id.to_string());
+            }),
+        );
     let mut task_runtime = crate::scheduler::TaskRuntime::load(
         db_for_archive.clone(),
         may_dir.clone(),
@@ -307,6 +312,63 @@ pub async fn start(
         .context("failed to read the cloud home record")?;
     let cloud_home_bridge = super::cloud_home::CloudHomeBridge::new(cloud_home.is_some());
 
+    let (bot_events_tx, _) = tokio::sync::broadcast::channel::<may_protocol::bot::BotSseEvent>(256);
+    let sleep_state = Arc::new(crate::sleep::SleepState::load(
+        &may_dir,
+        ui_event_bus.clone(),
+        db_for_archive.clone(),
+    ));
+    let services =
+        crate::terminal_commands::SharedServices::new(&may_dir).with_forge_auth(forge_auth.clone());
+    let bot_session_bridge = Arc::new(super::bots::DaemonSessionBridge::new());
+    let bot_model_factory = Arc::new(super::bots::DaemonBotModelFactory::new(
+        config.clone(),
+        pushed_providers.clone(),
+        may_dir.clone(),
+    ));
+    let bot_curator_factory = Arc::new(super::bots::DaemonCuratorFactory::new(
+        db_for_archive.clone(),
+        may_dir.clone(),
+        tool_distribution.clone(),
+        (*bot_model_factory).clone(),
+    ));
+    let bot_delegate_runner = super::bots::build_daemon_delegate_runner(
+        db_for_archive.clone(),
+        may_dir.clone(),
+        tool_distribution.clone(),
+        (*bot_model_factory).clone(),
+    );
+    let bot_service = crate::bot::BotService::new(crate::bot::BotServiceDeps {
+        db: db_for_archive.clone(),
+        may_dir: may_dir.clone(),
+        model_factory: bot_model_factory,
+        curator_factory: bot_curator_factory,
+        delegate_runner: bot_delegate_runner,
+        search_backend: crate::repo_search::RepoSearchCollections::new(
+            services.repo_search.clone(),
+        ),
+        sessions: bot_session_bridge.clone(),
+        runtime_service: Some(runtime_service.clone()),
+        notifications: Some(notification_service.clone()),
+        sleep: Some(sleep_state.clone()),
+        ui_event_bus: ui_event_bus.clone(),
+        publish_event: {
+            let tx = bot_events_tx.clone();
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            })
+        },
+    });
+    services.set_bot_approvals(bot_service.approvals());
+    {
+        let bot_service_wake = bot_service.clone();
+        tokio::spawn(async move {
+            while let Ok(bot_id) = task_bot_wake_rx.recv().await {
+                bot_service_wake.wake_bot(&bot_id);
+            }
+        });
+    }
+
     let state = Arc::new(DaemonState {
         acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
@@ -330,6 +392,8 @@ pub async fn start(
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
         browser_lifecycle_tx,
+        bot_service: bot_service.clone(),
+        bot_events_tx,
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
         tcp_listeners: super::TcpListeners::new(),
@@ -340,11 +404,7 @@ pub async fn start(
             db_for_archive.clone(),
         ),
         pushed_providers,
-        sleep: Arc::new(crate::sleep::SleepState::load(
-            &may_dir,
-            ui_event_bus.clone(),
-            db_for_archive.clone(),
-        )),
+        sleep: sleep_state,
         notification_service: notification_service.clone(),
         memory_processor,
         local_url_port_mapper: Arc::new(super::local_url_mapper::LocalUrlPortMapper::new()),
@@ -356,8 +416,7 @@ pub async fn start(
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         job_server,
-        services: crate::terminal_commands::SharedServices::new(&may_dir)
-            .with_forge_auth(forge_auth.clone()),
+        services,
         quota_patterns: crate::quota::QuotaPatterns::default(),
         vision_ocr: crate::vision_ocr::VisionOcr::new(),
         secret_patterns: crate::secrets::SecretPatterns::default(),
@@ -390,6 +449,14 @@ pub async fn start(
     });
 
     state.ensure_session_publisher();
+    bot_session_bridge.bind(state.clone());
+    state
+        .bot_service
+        .set_messaging(super::chat::agent_messaging(&state));
+    if let Err(error) = state.bot_service.start_all().await {
+        tracing::warn!(%error, "failed to start persisted May Bots");
+    }
+    let _bot_scheduler = state.bot_service.spawn_scheduler();
     let swarm = crate::swarm::SwarmService::new(
         super::chat::agent_messaging(&state),
         state.may_dir.clone(),
@@ -525,6 +592,12 @@ fn api_routes() -> Route {
         map_container_local_url, prepare_slidev_preview, report_artifact_diagnostics,
     };
     use super::bootstrap::get_bootstrap;
+    use super::bots::{
+        create_bot, delete_bot, delete_bot_schedule, get_bot, get_bot_memory,
+        get_bot_memory_history, list_bot_approvals, list_bot_delegates, list_bot_inbox,
+        list_bot_messages, list_bot_schedules, list_bot_trace, list_bots, post_bot_message,
+        resolve_bot_approval, stop_bot_delegate, update_bot,
+    };
     use super::browser::{
         browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
         browser_takeover_start, browser_takeover_stop,
@@ -776,6 +849,27 @@ fn api_routes() -> Route {
             "/notifications".route(Route::new((
                 "/mailbox".at(list_notification_mailbox),
                 "/network-access".at(list_network_access_logs),
+            ))),
+            "/bots".route(Route::new((
+                "".at(list_bots),
+                "".post(create_bot),
+                "/{id}".route(Route::new((
+                    "".at(get_bot),
+                    "".patch(update_bot),
+                    "".delete(delete_bot),
+                    "/messages".at(list_bot_messages),
+                    "/messages".post(post_bot_message),
+                    "/trace".at(list_bot_trace),
+                    "/inbox".at(list_bot_inbox),
+                    "/delegates".at(list_bot_delegates),
+                    "/delegates/{agentId}/stop".post(stop_bot_delegate),
+                    "/approvals".at(list_bot_approvals),
+                    "/approvals/{requestId}".post(resolve_bot_approval),
+                    "/schedules".at(list_bot_schedules),
+                    "/schedules/{scheduleId}".delete(delete_bot_schedule),
+                    "/memory".at(get_bot_memory),
+                    "/memory/history".at(get_bot_memory_history),
+                ))),
             ))),
         )),
     ))

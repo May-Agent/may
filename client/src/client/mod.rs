@@ -304,6 +304,144 @@ impl DaemonClient {
         self.get("/api/health").await
     }
 
+    // ── May Bot API ─────────────────────────────────────────────
+
+    /// `GET /api/bots`: lists all resident May Bots.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn list_bots(&self) -> Result<Vec<may_protocol::bot::BotSummary>, DaemonClientError> {
+        self.get("/api/bots").await
+    }
+
+    /// `POST /api/bots`: creates a new resident May Bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn create_bot(
+        &self,
+        req: &may_protocol::bot::CreateBotRequest,
+    ) -> Result<may_protocol::bot::BotSummary, DaemonClientError> {
+        self.post("/api/bots", req).await
+    }
+
+    /// `PATCH /api/bots/{id}`: updates a bot's live configuration.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn update_bot(
+        &self,
+        bot_id: &str,
+        req: &may_protocol::bot::UpdateBotRequest,
+    ) -> Result<may_protocol::bot::BotSummary, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        self.patch(&format!("/api/bots/{id}"), req).await
+    }
+
+    /// `DELETE /api/bots/{id}`: deletes a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn delete_bot(&self, bot_id: &str) -> Result<(), DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        let _: serde_json::Value = self.delete(&format!("/api/bots/{id}")).await?;
+        Ok(())
+    }
+
+    /// `GET /api/bots/{id}/messages`: lists user-visible chat messages with a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn list_bot_messages(
+        &self,
+        bot_id: &str,
+    ) -> Result<Vec<may_protocol::bot::BotChatMessage>, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        self.get(&format!("/api/bots/{id}/messages")).await
+    }
+
+    /// `POST /api/bots/{id}/messages`: sends a user message to a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn send_bot_message(
+        &self,
+        bot_id: &str,
+        content: &str,
+    ) -> Result<may_protocol::bot::BotChatMessage, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        let req = may_protocol::bot::SendBotMessageRequest {
+            content: content.to_string(),
+        };
+        self.post(&format!("/api/bots/{id}/messages"), &req).await
+    }
+
+    /// `GET /api/bots/{id}/trace`: lists internal run trace entries for a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn list_bot_trace(
+        &self,
+        bot_id: &str,
+    ) -> Result<Vec<may_protocol::bot::BotTraceEntry>, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        self.get(&format!("/api/bots/{id}/trace")).await
+    }
+
+    /// `GET /api/bots/{id}/approvals`: lists permission approval requests for a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn list_bot_approvals(
+        &self,
+        bot_id: &str,
+    ) -> Result<Vec<may_protocol::bot::BotApprovalItem>, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        self.get(&format!("/api/bots/{id}/approvals")).await
+    }
+
+    /// `POST /api/bots/{id}/approvals/{requestId}`: approves or denies an escalated bot approval.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn resolve_bot_approval(
+        &self,
+        bot_id: &str,
+        request_id: &str,
+        approved: bool,
+        reason: Option<String>,
+    ) -> Result<may_protocol::bot::BotApprovalItem, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        let rid = encode_path_segment(request_id);
+        let req = may_protocol::bot::ResolveBotApprovalRequest { approved, reason };
+        self.post(&format!("/api/bots/{id}/approvals/{rid}"), &req)
+            .await
+    }
+
+    /// `GET /api/bots/{id}/memory`: returns the hierarchical memory tree for a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn get_bot_memory(
+        &self,
+        bot_id: &str,
+    ) -> Result<may_protocol::bot::BotMemoryNode, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        self.get(&format!("/api/bots/{id}/memory")).await
+    }
+
+    /// `GET /api/bots/{id}/memory/history`: lists `memory.git` commit history for a bot.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn get_bot_memory_history(
+        &self,
+        bot_id: &str,
+    ) -> Result<Vec<may_protocol::bot::BotMemoryCommit>, DaemonClientError> {
+        let id = encode_path_segment(bot_id);
+        self.get(&format!("/api/bots/{id}/memory/history")).await
+    }
+
     /// `GET /api/forge-auth`: every forge host's configuration and whether a
     /// credential currently resolves for it.
     ///

@@ -1,0 +1,9 @@
+memory: {{ subject }}
+
+Fact: {{ fact }}
+Source-Agent: {{ source_agent }}
+Source-Sender: {{ source_sender }}
+Source-Time: {{ source_time }}
+
+Verbatim-Quote:
+{{ verbatim_quote }}

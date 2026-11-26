@@ -41,6 +41,8 @@ pub enum UiEventTopic {
     Prs = 1 << 22,
     /// Authoritative swarm board summaries hosted on this daemon changed.
     Swarm = 1 << 23,
+    /// May Bots state, chat, trace, approvals, or memory changed.
+    Bots = 1 << 24,
 }
 
 impl UiEventTopic {
@@ -68,6 +70,7 @@ impl UiEventTopic {
             Self::CloudSession => "cloud_session",
             Self::Prs => "prs",
             Self::Swarm => "swarm",
+            Self::Bots => "bots",
         }
     }
 }
@@ -93,6 +96,7 @@ impl FromStr for UiEventTopic {
             "cloud_session" => Ok(Self::CloudSession),
             "prs" => Ok(Self::Prs),
             "swarm" => Ok(Self::Swarm),
+            "bots" => Ok(Self::Bots),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -137,6 +141,8 @@ impl UiEventTopics {
     pub const PRS: Self = Self(UiEventTopic::Prs.bit());
     /// `swarm` topic bit (subscribed by peer daemons for zero-RTT board summaries).
     pub const SWARM: Self = Self(UiEventTopic::Swarm.bit());
+    /// `bots` topic bit (May Bots state, chat, trace, approvals, and memory).
+    pub const BOTS: Self = Self(UiEventTopic::Bots.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -152,7 +158,8 @@ impl UiEventTopics {
             | Self::SESSION_INDEX.0
             | Self::SLEEP.0
             | Self::CLOUD_SESSION.0
-            | Self::PRS.0,
+            | Self::PRS.0
+            | Self::BOTS.0,
     );
 
     /// Whether no topics are set.

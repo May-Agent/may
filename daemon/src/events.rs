@@ -57,6 +57,7 @@ struct EventSignatures {
     sleep: String,
     prs: String,
     swarm: String,
+    bots: String,
     session_index: String,
 }
 
@@ -99,6 +100,8 @@ pub async fn stream_events(
     // loading indicator.
     let mut cloud_rx = state.cloud_sessions.subscribe();
     let cloud_subscribed = subscribed_topics.contains(UiEventTopics::CLOUD_SESSION);
+    let mut bot_rx = state.bot_events_subscribe();
+    let bots_subscribed = subscribed_topics.contains(UiEventTopics::BOTS);
     let index_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_INDEX);
     let cwd = query
         .cwd
@@ -222,6 +225,19 @@ pub async fn stream_events(
                             Err(RecvError::Closed) => {}
                         }
                     }
+                    bot_event = bot_rx.recv(), if bots_subscribed => {
+                        match bot_event {
+                            Ok(event) => {
+                                if !send_event(&sender, event.sse_event_name(), &event).await {
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "bot event stream lagged; dropping events");
+                            }
+                            Err(RecvError::Closed) => {}
+                        }
+                    }
                     _ = heartbeat.tick() => {
                         if !send_event(&sender, "heartbeat", &SseHeartbeat { ok: true }).await {
                             break;
@@ -319,6 +335,11 @@ async fn emit_topics_if_changed(
     }
     if topics.contains(UiEventTopics::SWARM)
         && !emit_swarm_if_changed(state, sender, &mut signatures.swarm).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::BOTS)
+        && !emit_bots_if_changed(state, sender, &mut signatures.bots).await
     {
         return false;
     }
@@ -744,6 +765,30 @@ async fn emit_swarm_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "swarm", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_bots_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let bots = match state.bot_service.list_bots().await {
+        Ok(bots) => bots,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load bot snapshot for SSE stream");
+            return true;
+        }
+    };
+    let payload = may_protocol::bot::BotSseEvent::BotState { bots };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, payload.sse_event_name(), &payload).await {
             return false;
         }
         *last_sig = sig;
