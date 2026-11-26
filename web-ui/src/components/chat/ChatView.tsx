@@ -19,6 +19,7 @@ import { PlanBanner } from './PlanBanner';
 import { WarningMessage } from './WarningMessage';
 import { MemoryToggle } from './MemoryToggle';
 import { YoloToggle } from './YoloToggle';
+import { ExecutionModeToggle } from './ExecutionModeToggle';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment, ApiMessage } from '@/lib/types';
@@ -255,6 +256,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       />
       {isDraftSessionId(active.id) ? null : (
         <div className="flex items-center justify-end gap-4 px-4 py-1 sm:px-6">
+          <ExecutionModeToggle
+            sessionId={active.id}
+            executionMode={active.runtime?.executionMode ?? { mode: 'standard' }}
+          />
           <MemoryToggle
             sessionId={active.id}
             memoryOff={active.runtime?.memoryOff ?? false}

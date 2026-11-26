@@ -210,6 +210,15 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
     // Nobody answers permission prompts of a one-shot run; the daemon
     // refuses them instead of asking.
+    let execution_mode = match &args.execution_mode {
+        Some(mode) => {
+            let config = may_agent::config::MayConfig::load()
+                .await
+                .unwrap_or_default();
+            Some(mode.resolve(&config)?)
+        }
+        None => None,
+    };
     runtime_deps
         .daemon()
         .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
@@ -218,6 +227,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             &may_agent::client::UpdateSessionRequest {
                 non_interactive: Some(true),
                 memory_off: Some(true),
+                execution_mode,
                 ..Default::default()
             },
         )

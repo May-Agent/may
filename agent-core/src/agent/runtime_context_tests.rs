@@ -563,7 +563,9 @@ fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
     );
     assert!(prompt.contains("`cargo clippy --fix`"), "{prompt}");
     assert!(
-        prompt.contains("Hand a large batch of small manual fixes to a subagent"),
+        prompt.contains(
+            "Route lint findings with no autofix, and large batches of small manual fixes, to a `subagent general --tier fast`"
+        ),
         "{prompt}"
     );
 }
@@ -778,4 +780,154 @@ fn subagent_instructions_report_to_the_parent_and_never_the_user() {
             && text.contains("Stored secrets: API_KEY"),
         "{text}"
     );
+}
+
+#[test]
+fn efficiency_routes_unautofixed_lint_findings_to_fast_subagent() {
+    let efficiency = build_efficiency(&[], false);
+    assert!(
+        efficiency.contains("subagent general --tier fast"),
+        "{efficiency}"
+    );
+    assert!(
+        efficiency.contains("lint findings with no autofix"),
+        "{efficiency}"
+    );
+}
+
+#[test]
+fn orchestrator_mode_renders_delta_without_duplicating_efficiency() {
+    assert!(
+        tag::layout()
+            .instructions()
+            .contains(&tag::ORCHESTRATOR_MODE)
+    );
+    assert_eq!(
+        super::build_orchestrator_mode_context(&crate::session::ExecutionMode::Standard),
+        None
+    );
+
+    let block =
+        super::build_orchestrator_mode_context(&crate::session::ExecutionMode::Orchestrator)
+            .expect("orchestrator mode renders");
+    assert!(block.starts_with("<orchestrator_mode>\n"), "{block}");
+    assert!(block.ends_with("</orchestrator_mode>"), "{block}");
+    for expected in [
+        "subagent fork",
+        "subagent general --tier advanced",
+        "subagent general --tier balanced",
+        "subagent resume --id",
+        "subagent-spaces/<run>/repo",
+        "AGENTS.md",
+        "repo clone",
+        "foreground",
+    ] {
+        assert!(block.contains(expected), "missing `{expected}`:\n{block}");
+    }
+    // Only the delta over `<efficiency>` — never repeats `explore` or `--tier fast` lint routing.
+    assert!(!block.contains("explore --prompt-file"), "{block}");
+    assert!(!block.contains("--tier fast"), "{block}");
+}
+
+#[test]
+fn orchestrator_mode_and_plan_mode_reconcile_orthogonally() {
+    let (_dir, memory_path) = test_memory_file();
+    let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new());
+    let mut context = test_context();
+
+    runtime_context.set_instruction_opt(
+        tag::PLAN_MODE,
+        super::build_plan_mode_context(crate::session::SessionPlanState::Draft),
+    );
+    runtime_context.set_instruction_opt(
+        tag::ORCHESTRATOR_MODE,
+        super::build_orchestrator_mode_context(&crate::session::ExecutionMode::Orchestrator),
+    );
+    runtime_context.reconcile(&mut context);
+    assert!(context.instructions().contains(&tag::PLAN_MODE));
+    assert!(context.instructions().contains(&tag::ORCHESTRATOR_MODE));
+
+    // Switching back to Standard removes `<orchestrator_mode>` without disturbing `<plan_mode>`.
+    runtime_context.set_instruction_opt(
+        tag::ORCHESTRATOR_MODE,
+        super::build_orchestrator_mode_context(&crate::session::ExecutionMode::Standard),
+    );
+    runtime_context.reconcile(&mut context);
+    assert!(context.instructions().contains(&tag::PLAN_MODE));
+    assert!(!context.instructions().contains(&tag::ORCHESTRATOR_MODE));
+}
+
+#[test]
+fn fusion_mode_templates_cover_lead_and_sidekick_contracts() {
+    assert!(tag::layout().instructions().contains(&tag::FUSION_MODE));
+    assert_eq!(
+        super::build_fusion_lead_context(&crate::session::ExecutionMode::Standard),
+        None
+    );
+    assert_eq!(
+        super::build_fusion_lead_context(&crate::session::ExecutionMode::Orchestrator),
+        None
+    );
+
+    let fusion = crate::session::ExecutionMode::Fusion {
+        sidekick_model: crate::ModelSelector::new("openai", "gpt-5-mini"),
+    };
+    assert_eq!(super::build_orchestrator_mode_context(&fusion), None);
+
+    let lead = super::build_fusion_lead_context(&fusion).expect("fusion lead renders");
+    assert!(lead.starts_with("<fusion_mode>\n"), "{lead}");
+    assert!(lead.ends_with("</fusion_mode>"), "{lead}");
+    for expected in [
+        "openai::gpt-5-mini",
+        "sidekick",
+        "queries",
+        "metrics",
+        "evaluation harnesses",
+        "rubrics",
+        "pipeline",
+        "subagent",
+    ] {
+        assert!(lead.contains(expected), "missing `{expected}`:\n{lead}");
+    }
+
+    let sidekick = super::build_fusion_sidekick_context();
+    assert!(sidekick.starts_with("<fusion_mode>\n"), "{sidekick}");
+    assert!(sidekick.ends_with("</fusion_mode>"), "{sidekick}");
+    for expected in ["sidekick", "lead", "shared repository clones", "background"] {
+        assert!(
+            sidekick.contains(expected),
+            "missing `{expected}`:\n{sidekick}"
+        );
+    }
+}
+
+#[test]
+fn fusion_mode_and_plan_mode_reconcile_orthogonally_without_touching_static_prefix() {
+    let (_dir, memory_path) = test_memory_file();
+    let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+        .with_instruction(tag::IDENTITY, super::build_identity());
+    let mut context = test_context();
+    runtime_context.reconcile(&mut context);
+
+    let fusion = crate::session::ExecutionMode::Fusion {
+        sidekick_model: crate::ModelSelector::new("openai", "gpt-5-mini"),
+    };
+    runtime_context.set_instruction_opt(
+        tag::PLAN_MODE,
+        super::build_plan_mode_context(crate::session::SessionPlanState::Draft),
+    );
+    runtime_context
+        .set_instruction_opt(tag::FUSION_MODE, super::build_fusion_lead_context(&fusion));
+    runtime_context.reconcile(&mut context);
+    assert!(context.instructions().contains(&tag::PLAN_MODE));
+    assert!(context.instructions().contains(&tag::FUSION_MODE));
+    assert!(context.instructions().contains(&tag::IDENTITY));
+
+    runtime_context.set_instruction_opt(
+        tag::FUSION_MODE,
+        super::build_fusion_lead_context(&crate::session::ExecutionMode::Standard),
+    );
+    runtime_context.reconcile(&mut context);
+    assert!(context.instructions().contains(&tag::PLAN_MODE));
+    assert!(!context.instructions().contains(&tag::FUSION_MODE));
 }

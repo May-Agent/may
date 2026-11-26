@@ -11,6 +11,7 @@ pub mod backend;
 pub mod indexer;
 
 pub use backend::{CollectionBackend, CollectionHit, RepoSearchCollections};
+pub use repo_search_client::protocol::Document;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

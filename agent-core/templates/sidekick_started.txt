@@ -1,0 +1,1 @@
+Started asynchronous sidekick turn. Sidekick now holds an exclusive workspace write lease over repository working trees until it finishes; you may continue read-only inspection, scratch/task edits, or call `sidekick` again to steer it. Completion and incremental diff will be delivered automatically.

@@ -285,6 +285,9 @@ pub struct WireJob {
     /// bounds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Whether this job runs in a PTY (driven through `tui`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pty: bool,
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -313,6 +316,7 @@ impl From<&JobInfo> for WireJob {
             timeout_ms: job
                 .timeout
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+            pty: job.pty,
         }
     }
 }
@@ -330,6 +334,7 @@ impl From<WireJob> for JobInfo {
             output_path: job.output_path,
             place: job.place.into(),
             timeout: job.timeout_ms.map(Duration::from_millis),
+            pty: job.pty,
         }
     }
 }
@@ -765,6 +770,7 @@ mod tests {
             output_path: None,
             place: WirePlace::Host,
             timeout_ms: None,
+            pty: false,
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
@@ -798,6 +804,7 @@ mod tests {
             output_path: None,
             place: JobPlace::Host,
             timeout: Some(Duration::from_secs(60)),
+            pty: false,
         };
         let wire: WireJob =
             serde_json::from_str(&serde_json::to_string(&WireJob::from(&job)).expect("serializes"))

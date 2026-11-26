@@ -1,0 +1,3 @@
+Memory tree structural verification failed with the following violation(s). Fix every item in the staging directory before finishing:
+{% for violation in violations %}- {{ violation }}
+{% endfor %}

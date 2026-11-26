@@ -12,6 +12,7 @@ use super::RunFence;
 use std::collections::HashMap;
 
 use jiff::Timestamp;
+use may_protocol::execution_mode::ExecutionMode;
 use may_protocol::session_plan::SessionPlanState;
 use may_protocol::session_runtime::{
     BrowserInteractionState, PendingUserMessage, PersistedAskUserRequest,
@@ -25,13 +26,13 @@ use may_protocol::xml::XmlBlock;
 use super::common::{
     I64ValueRow, PendingAskUserQuestionOptionRow, PendingAskUserQuestionRow,
     PendingAskUserRequestRow, PendingMessageAttachmentRow, PendingMessageEntryRow, SessionIdRow,
-    db_custom_error, overflow_error, parse_attachment_kind, parse_pending_user_message_mode,
-    parse_session_plan_state, parse_session_runtime_state, row_not_found,
-    session_not_found_db_error, storage_error,
+    db_custom_error, overflow_error, parse_attachment_kind, parse_execution_mode,
+    parse_pending_user_message_mode, parse_session_plan_state, parse_session_runtime_state,
+    row_not_found, session_not_found_db_error, storage_error,
 };
 use super::entity::{
-    session_memory, session_pending_permissions, session_pending_workspace, session_plans,
-    session_runtimes, session_yolo, sessions,
+    session_execution_modes, session_memory, session_pending_permissions,
+    session_pending_workspace, session_plans, session_runtimes, session_yolo, sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 
@@ -48,6 +49,7 @@ struct PendingAskUserParts {
 #[derive(Clone, Copy)]
 struct SessionModeRows<'a> {
     plan: Option<&'a session_plans::Model>,
+    execution_mode: Option<&'a session_execution_modes::Model>,
     yolo: Option<&'a session_yolo::Model>,
     memory: Option<&'a session_memory::Model>,
 }
@@ -342,6 +344,12 @@ impl ChatDb {
                         row.plan_state.as_str()
                     }),
             )?,
+            execution_mode: match mode_rows.execution_mode {
+                Some(row) => {
+                    parse_execution_mode(row.mode.as_str(), row.sidekick_model.as_deref())?
+                }
+                None => ExecutionMode::Standard,
+            },
             yolo: mode_rows.yolo.is_some_and(|row| row.enabled),
             memory_off: mode_rows.memory.is_some_and(|row| row.disabled),
             interactions: SessionInteractionState {
@@ -481,6 +489,7 @@ impl ChatDb {
         )
         .fetch_optional::<session_plans::Model>()
         .await?;
+        let execution_mode_row = self.session_execution_mode_row(session_id).await?;
         let yolo_row = self.session_yolo_row(session_id).await?;
         let memory_row = self.session_memory_row(session_id).await?;
         Self::build_session_runtime_summary(
@@ -497,10 +506,185 @@ impl ChatDb {
             },
             SessionModeRows {
                 plan: plan_row.as_ref(),
+                execution_mode: execution_mode_row.as_ref(),
                 yolo: yolo_row.as_ref(),
                 memory: memory_row.as_ref(),
             },
         )
+    }
+
+    async fn session_execution_mode_row(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<session_execution_modes::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_execution_modes WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_execution_modes::Model>()
+        .await?)
+    }
+
+    /// Return the session's persisted execution mode (`Standard` when absent).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    pub async fn session_execution_mode(
+        &self,
+        session_id: &str,
+    ) -> Result<ExecutionMode, ChatDbError> {
+        match self.session_execution_mode_row(session_id).await? {
+            Some(row) => parse_execution_mode(row.mode.as_str(), row.sidekick_model.as_deref()),
+            None => Ok(ExecutionMode::Standard),
+        }
+    }
+
+    /// Persist a session's execution mode.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    pub async fn set_session_execution_mode(
+        &self,
+        session_id: &str,
+        mode: &ExecutionMode,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let sidekick_model = mode.sidekick_model().map(ToString::to_string);
+        query!(
+            self.db,
+            "INSERT INTO session_execution_modes (session_id, mode, sidekick_model, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET mode = excluded.mode, sidekick_model = excluded.sidekick_model, updated_at = excluded.updated_at",
+            session_id,
+            mode.as_str(),
+            sidekick_model.as_deref(),
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    /// Link a hidden companion session to `parent_session_id` under `role`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn link_companion_session(
+        &self,
+        session_id: &str,
+        parent_session_id: &str,
+        role: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_companions (session_id, parent_session_id, role, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET parent_session_id = excluded.parent_session_id, role = excluded.role",
+            session_id,
+            parent_session_id,
+            role,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Return the companion session id linked to `parent_session_id` under `role`, if any.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn companion_session_for(
+        &self,
+        parent_session_id: &str,
+        role: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT session_id FROM session_companions WHERE parent_session_id = ? AND role = ? ORDER BY created_at ASC LIMIT 1",
+            parent_session_id,
+            role
+        )
+        .fetch_optional::<SessionIdRow>()
+        .await?
+        .map(|row| row.session_id))
+    }
+
+    /// Return all companion session rows linked to `parent_session_id`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn companion_sessions_for(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<crate::entity::session_companions::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_companions WHERE parent_session_id = ? ORDER BY created_at ASC",
+            parent_session_id
+        )
+        .fetch_all::<crate::entity::session_companions::Model>()
+        .await?)
+    }
+
+    /// Return the companion link row when `session_id` is a hidden companion session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn parent_session_of(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::entity::session_companions::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_companions WHERE session_id = ? LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<crate::entity::session_companions::Model>()
+        .await?)
+    }
+
+    /// Return the oldest pending approval timestamp (`session_pending_permissions`,
+    /// `session_pending_workspace`, or blocking `ask_user`) for `session_id`, if any.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn oldest_pending_approval_created_at(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT MIN(created_at) AS value FROM (
+                SELECT created_at FROM session_pending_permissions WHERE session_id = ?
+                UNION ALL
+                SELECT created_at FROM session_pending_workspace WHERE session_id = ?
+                UNION ALL
+                SELECT created_at FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1
+            )",
+            session_id,
+            session_id,
+            session_id
+        )
+        .fetch_optional::<crate::common::OptionalStringValueRow>()
+        .await?;
+        Ok(row.and_then(|row| row.value))
+    }
+
+    /// Return the newest open `ask_user` timestamp (blocking or non-blocking) for `session_id`, if any.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn newest_open_ask_user_created_at(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT MAX(created_at) AS value FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<crate::common::OptionalStringValueRow>()
+        .await?;
+        Ok(row.and_then(|row| row.value))
     }
 
     async fn session_yolo_row(
@@ -829,6 +1013,17 @@ impl ChatDb {
         .map(|row| (row.session_id.clone(), row))
         .collect();
 
+        let execution_mode_by_session: HashMap<String, session_execution_modes::Model> = query!(
+            tx,
+            "SELECT * FROM session_execution_modes WHERE session_id IN (SELECT value FROM json_each(?))",
+            ids_json.as_str()
+        )
+        .fetch_all::<session_execution_modes::Model>()
+        .await?
+        .into_iter()
+        .map(|row| (row.session_id.clone(), row))
+        .collect();
+
         let yolo_by_session: HashMap<String, session_yolo::Model> = query!(
             tx,
             "SELECT * FROM session_yolo WHERE session_id IN (SELECT value FROM json_each(?))",
@@ -901,6 +1096,7 @@ impl ChatDb {
                 },
                 SessionModeRows {
                     plan: plan_by_session.get(session_id),
+                    execution_mode: execution_mode_by_session.get(session_id),
                     yolo: yolo_by_session.get(session_id),
                     memory: memory_by_session.get(session_id),
                 },
@@ -1734,11 +1930,15 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Delete a session and every row that belongs to it, in one transaction.
+    /// Delete a session, its hidden companion sessions, and every row that belongs to them.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn delete_session(&self, id: &str) -> Result<(), ChatDbError> {
+        let companions = self.companion_sessions_for(id).await?;
+        for companion in companions {
+            self.delete_sessions(Some(&companion.session_id)).await?;
+        }
         self.delete_sessions(Some(id)).await?;
         Ok(())
     }
@@ -1765,15 +1965,18 @@ impl ChatDb {
         Ok(sessions)
     }
 
-    /// List all sessions ordered by `updated_at` descending.
+    /// List all user-facing sessions (omitting hidden companion sessions) ordered by `updated_at` descending.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn list_sessions(&self) -> Result<Vec<sessions::Model>, ChatDbError> {
         Ok(
-            query!(self.db, "SELECT * FROM sessions ORDER BY updated_at DESC")
-                .fetch_all::<sessions::Model>()
-                .await?,
+            query!(
+                self.db,
+                "SELECT * FROM sessions WHERE NOT EXISTS (SELECT 1 FROM session_companions sc WHERE sc.session_id = sessions.id) ORDER BY updated_at DESC"
+            )
+            .fetch_all::<sessions::Model>()
+            .await?,
         )
     }
 
@@ -1979,7 +2182,7 @@ mod tests {
 
     /// Audit and history tables that name a session but outlive it, and the
     /// search outbox, whose triggers queue index removals for deleted messages.
-    const RETAINED_ON_DELETE: [&str; 12] = [
+    const RETAINED_ON_DELETE: [&str; 13] = [
         "search_outbox",
         "prs",
         "pr_events",
@@ -1992,6 +2195,7 @@ mod tests {
         "scheduled_tasks",
         "scheduled_task_runs",
         "swarm_messages",
+        "bot_approvals",
     ];
 
     #[derive(Debug, serde::Deserialize, skyzen::FromRow)]

@@ -7,6 +7,10 @@
 pub mod agent;
 /// Main agents on one machine discover each other and exchange messages.
 pub mod agent_link;
+/// Always-on non-bash-first bridge agents with git-backed hierarchical memory.
+pub mod bot;
+/// Experimental Fusion mode: frontier lead paired with a persistent cache-warm sidekick.
+pub mod fusion;
 /// Experimental per-worktree coordination board, `@mention` wakeups and PR alerts.
 pub mod swarm;
 /// Persistent storage for OAuth credentials.
@@ -140,6 +144,7 @@ pub use may_harness::tasks_md;
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.
 pub mod terminal_permission_handler;
+pub mod tui_driver;
 /// Event bus publishing UI-facing state changes.
 pub use may_client::ui_event_bus;
 /// HTTP/SSE server backing the web UI.

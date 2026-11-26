@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use aither_sandbox::{IpcProvider, LaunchInfo, OutputStore};
 use arc_swap::ArcSwapWeak;
@@ -44,6 +44,30 @@ impl ShellSlot {
 
     fn get(&self) -> Option<Arc<SessionShell>> {
         self.0.load().upgrade()
+    }
+}
+
+/// The finalized [`CommandRegistry`] of a session, bound once after all
+/// commands are registered so subagent launchers can derive scoped bridges.
+#[derive(Debug, Clone, Default)]
+pub struct RegistrySlot(Arc<OnceLock<CommandRegistry>>);
+
+impl RegistrySlot {
+    /// An empty registry slot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Binds `registry` into the slot.
+    pub fn bind(&self, registry: CommandRegistry) {
+        let _ = self.0.set(registry);
+    }
+
+    /// Returns the bound registry, when initialized.
+    #[must_use]
+    pub fn get(&self) -> Option<CommandRegistry> {
+        self.0.get().cloned()
     }
 }
 

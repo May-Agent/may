@@ -9,6 +9,7 @@
 
 use skyzen_services::DbError as SkyDbError;
 
+use may_protocol::execution_mode::ExecutionMode;
 use may_protocol::profile::{
     ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences,
 };
@@ -563,6 +564,11 @@ pub struct OptionalI64ValueRow {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub struct OptionalStringValueRow {
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct AssistantCacheUsageSummaryRow {
     pub(super) assistant_message_count: i64,
     pub(super) cache_hit_message_count: i64,
@@ -791,6 +797,34 @@ pub fn parse_session_plan_state(value: &str) -> Result<SessionPlanState, ChatDbE
     value
         .parse()
         .map_err(|error| storage_error(format!("invalid session plan state: {error}")))
+}
+
+pub fn parse_execution_mode(
+    mode: &str,
+    sidekick_model: Option<&str>,
+) -> Result<ExecutionMode, ChatDbError> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "standard" => Ok(ExecutionMode::Standard),
+        "orchestrator" => Ok(ExecutionMode::Orchestrator),
+        "fusion" => {
+            let raw = sidekick_model.ok_or_else(|| {
+                storage_error("invalid session execution mode: fusion mode requires sidekick_model")
+            })?;
+            let selector = raw
+                .parse::<may_protocol::model_selector::ModelSelector>()
+                .map_err(|error| {
+                    storage_error(format!(
+                        "invalid session execution mode sidekick_model '{raw}': {error}"
+                    ))
+                })?;
+            Ok(ExecutionMode::Fusion {
+                sidekick_model: selector,
+            })
+        }
+        other => Err(storage_error(format!(
+            "invalid session execution mode: {other}"
+        ))),
+    }
 }
 
 pub fn parse_attachment_kind(

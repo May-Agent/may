@@ -375,11 +375,53 @@ pub async fn context_report(
 ) -> SkyResult<skyzen::Response> {
     let session_id = session_id_param(&params)?;
     let worker = idle_agent(&state, &session_id).await?;
-    match answer(worker.context_report()).await {
-        Some(TuiEvent::ContextReport(Ok(report))) => json_ok_response(&report),
-        Some(TuiEvent::ContextReport(Err(error))) => Err(internal_error(error)),
-        _ => Err(internal_error_message("the agent gave no context report")),
+    let mut report = match answer(worker.context_report()).await {
+        Some(TuiEvent::ContextReport(Ok(report))) => report,
+        Some(TuiEvent::ContextReport(Err(error))) => return Err(internal_error(error)),
+        _ => return Err(internal_error_message("the agent gave no context report")),
+    };
+    if let Some(sidekick_id) = state
+        .db()
+        .companion_session_for(&session_id, crate::fusion::SIDEKICK_ROLE)
+        .await
+        .map_err(internal_error)?
+    {
+        if let Ok(sidekick_worker) = idle_agent(&state, &sidekick_id).await
+            && let Some(TuiEvent::ContextReport(Ok(sidekick_report))) =
+                answer(sidekick_worker.context_report()).await
+        {
+            report
+                .roles
+                .push(may_protocol::context_report::RoleContextReport {
+                    role: crate::fusion::SIDEKICK_ROLE.to_string(),
+                    session_id: sidekick_id.clone(),
+                    report: Box::new(sidekick_report),
+                });
+        }
+        let db = state.runtime_service.db();
+        let (lead_rows, lead_misses, sidekick_rows, sidekick_misses) = futures_util::try_join!(
+            db.request_logs_for_session(&session_id),
+            db.cache_misses_for_session(&session_id),
+            db.request_logs_for_session(&sidekick_id),
+            db.cache_misses_for_session(&sidekick_id),
+        )
+        .map_err(internal_error)?;
+        report.role_usage = vec![
+            crate::agent::assemble_role_usage_summary(
+                "lead",
+                &session_id,
+                &lead_rows,
+                &lead_misses,
+            ),
+            crate::agent::assemble_role_usage_summary(
+                crate::fusion::SIDEKICK_ROLE,
+                &sidekick_id,
+                &sidekick_rows,
+                &sidekick_misses,
+            ),
+        ];
     }
+    json_ok_response(&report)
 }
 
 /// Answer of `GET /api/sessions/{id}/usage`: the session's provider usage
@@ -389,27 +431,20 @@ pub async fn usage_report(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let session_id = session_id_param(&params)?;
-    let rows = state
-        .runtime_service
-        .db()
+    let db = state.runtime_service.db();
+    let rows = db
         .request_logs_for_session(&session_id)
         .await
         .map_err(internal_error)?;
-    let intervals = state
-        .runtime_service
-        .db()
+    let intervals = db
         .session_intervals(&session_id)
         .await
         .map_err(internal_error)?;
-    let misses = state
-        .runtime_service
-        .db()
+    let misses = db
         .cache_misses_for_session(&session_id)
         .await
         .map_err(internal_error)?;
-    let created_at_ms = state
-        .runtime_service
-        .db()
+    let created_at_ms = db
         .get_session(&session_id)
         .await
         .map_err(internal_error)?
@@ -421,6 +456,28 @@ pub async fn usage_report(
                 .map(jiff::Timestamp::as_millisecond)
         });
     let now_ms = jiff::Timestamp::now().as_millisecond();
+    if let Some(sidekick_id) = db
+        .companion_session_for(&session_id, crate::fusion::SIDEKICK_ROLE)
+        .await
+        .map_err(internal_error)?
+    {
+        let (sidekick_rows, sidekick_misses) = futures_util::try_join!(
+            db.request_logs_for_session(&sidekick_id),
+            db.cache_misses_for_session(&sidekick_id),
+        )
+        .map_err(internal_error)?;
+        return json_ok_response(&crate::agent::assemble_fusion_usage_report(
+            &session_id,
+            &rows,
+            &misses,
+            &sidekick_id,
+            &sidekick_rows,
+            &sidekick_misses,
+            &intervals,
+            created_at_ms,
+            now_ms,
+        ));
+    }
     json_ok_response(&crate::agent::assemble_usage_report(
         &session_id,
         &rows,

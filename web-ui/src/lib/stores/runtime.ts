@@ -18,6 +18,7 @@ import { useModelsStore } from './models';
 import { useConfigStore } from './config';
 import { useBrowserViewStore } from './browserView';
 import { useInspectorStore } from './inspector';
+import { useBotsStore } from './bots';
 import type { NotificationMailboxEntry } from '../api/notifications';
 import type { ApiPr } from '../api/prs';
 
@@ -88,6 +89,7 @@ const SUBSCRIBED_TOPICS = [
   'network_access_logs',
   'request_logs',
   'prs',
+  'bots',
 ];
 
 function updateProfileSessionRuntimes(
@@ -318,6 +320,21 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => {
               }
               break;
             }
+            case 'bot_state':
+              useBotsStore.getState().applyBotStateEvent(evt.payload);
+              break;
+            case 'bot_chat':
+              useBotsStore.getState().applyBotChatEvent(evt.payload);
+              break;
+            case 'bot_trace':
+              useBotsStore.getState().applyBotTraceEvent(evt.payload);
+              break;
+            case 'bot_approval':
+              useBotsStore.getState().applyBotApprovalEvent(evt.payload);
+              break;
+            case 'bot_memory':
+              useBotsStore.getState().applyBotMemoryEvent(evt.payload);
+              break;
             default:
               break;
           }

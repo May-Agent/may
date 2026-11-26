@@ -1,0 +1,1 @@
+Spawned delegated worker `{{ agent_id }}` ({{ name }}, definition: {{ definition }}). Working directory: {{ work_dir }}. Completion, failure, and permission events will arrive in your inbox.

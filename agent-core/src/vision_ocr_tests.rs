@@ -145,11 +145,13 @@ async fn child_hooks_forward_ocr_and_downscaled_images() {
             path: screenshot_path.clone(),
             media_type: "image/png".to_owned(),
             source: "computer screenshot".to_owned(),
+            skip_ocr: false,
         },
         RecordedCallImage {
             path: photo_path.clone(),
             media_type: "image/png".to_owned(),
             source: "browser screenshot".to_owned(),
+            skip_ocr: false,
         },
     ];
     let requests = Arc::new(Mutex::new(Vec::new()));

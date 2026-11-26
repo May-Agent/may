@@ -1,0 +1,1 @@
+An asynchronous `sidekick` turn currently holds the exclusive workspace write lease, so this workspace write (`{{ detail }}`) was refused to avoid clobbering concurrent edits. You can still run read-only commands, edit files inside your session directory (`tmp/`, `files/`, `outputs/`) or `$MAY_TASKS`, or call `sidekick` to steer the running sidekick turn.

@@ -447,6 +447,8 @@ pub struct SessionManager {
     launch: SessionLaunch,
     /// A repository start for the next session only.
     once: Option<SessionLaunch>,
+    /// Execution mode override applied to newly materialized sessions (from CLI `--mode`).
+    execution_mode_override: Option<super::ExecutionMode>,
 }
 
 impl SessionManager {
@@ -477,6 +479,7 @@ impl SessionManager {
             current_profile_id: None,
             launch: SessionLaunch::default(),
             once: None,
+            execution_mode_override: None,
         };
         Ok(manager)
     }
@@ -498,6 +501,11 @@ impl SessionManager {
     #[must_use]
     pub fn launch(&self) -> &SessionLaunch {
         self.once.as_ref().unwrap_or(&self.launch)
+    }
+
+    /// Set the execution mode override passed when materializing new sessions.
+    pub fn set_execution_mode_override(&mut self, mode: Option<super::ExecutionMode>) {
+        self.execution_mode_override = mode;
     }
 
     /// The directory the next session works in, given the client's own.
@@ -686,6 +694,7 @@ impl SessionManager {
                         cloud: cloud.map(|machine_type| {
                             crate::daemon::types::CloudSessionRequest { machine_type }
                         }),
+                        execution_mode: self.execution_mode_override.clone(),
                     },
                 )
                 .await?;

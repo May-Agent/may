@@ -6,7 +6,7 @@ use super::cache_miss::CacheMissCause;
 use crate::db::SessionIntervals;
 use crate::db::entity::{cache_misses, request_logs};
 use may_protocol::cache_miss::{CacheMissCauseRow, CacheMissRow};
-use may_protocol::session_usage::{ModelUsageRow, SessionUsageReport};
+use may_protocol::session_usage::{ModelUsageRow, RoleUsageSummary, SessionUsageReport};
 use may_protocol::wall_clock::{Interval, IntervalSet, WallClockSplit};
 
 /// How many of the newest cache misses `/usage` lists one by one.
@@ -161,9 +161,97 @@ pub fn assemble_usage_report(
         split,
         total_cost_usd: total_cost,
         models,
+        roles: Vec::new(),
         cache_miss_causes,
         recent_cache_misses,
     }
+}
+
+/// Aggregates provider usage for one role (`lead` or `sidekick`).
+#[must_use]
+pub fn assemble_role_usage_summary(
+    role: &str,
+    session_id: &str,
+    rows: &[request_logs::Model],
+    misses: &[cache_misses::Model],
+) -> RoleUsageSummary {
+    let sub = assemble_usage_report(
+        session_id,
+        rows,
+        misses,
+        &SessionIntervals::default(),
+        None,
+        0,
+    );
+    let requests = sub.models.iter().map(|m| m.requests).sum();
+    let keep_warm_requests = sub.models.iter().map(|m| m.keep_warm_requests).sum();
+    let prompt_tokens: u64 = sub.models.iter().map(|m| m.prompt_tokens).sum();
+    let completion_tokens = sub.models.iter().map(|m| m.completion_tokens).sum();
+    let cache_read_tokens: u64 = sub.models.iter().map(|m| m.cache_read_tokens).sum();
+    let cache_write_tokens = sub.models.iter().map(|m| m.cache_write_tokens).sum();
+    let cache_hit_rate = if prompt_tokens > 0 {
+        cache_read_tokens as f64 / prompt_tokens as f64
+    } else {
+        0.0
+    };
+    RoleUsageSummary {
+        role: role.to_string(),
+        session_id: session_id.to_string(),
+        requests,
+        prompt_tokens,
+        completion_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        api_ms: sub.api_ms,
+        cache_hit_rate,
+        cost_usd: sub.total_cost_usd,
+        keep_warm_requests,
+        models: sub.models,
+    }
+}
+
+/// Aggregates a Fusion lead session alongside its companion sidekick session,
+/// combining total usage and attaching per-role breakdowns (`lead`, `sidekick`).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn assemble_fusion_usage_report(
+    lead_session_id: &str,
+    lead_rows: &[request_logs::Model],
+    lead_misses: &[cache_misses::Model],
+    sidekick_session_id: &str,
+    sidekick_rows: &[request_logs::Model],
+    sidekick_misses: &[cache_misses::Model],
+    intervals: &SessionIntervals,
+    created_at_ms: Option<i64>,
+    now_ms: i64,
+) -> SessionUsageReport {
+    let mut combined_rows = Vec::with_capacity(lead_rows.len() + sidekick_rows.len());
+    combined_rows.extend_from_slice(lead_rows);
+    combined_rows.extend_from_slice(sidekick_rows);
+
+    let mut combined_misses = Vec::with_capacity(lead_misses.len() + sidekick_misses.len());
+    combined_misses.extend_from_slice(lead_misses);
+    combined_misses.extend_from_slice(sidekick_misses);
+    combined_misses.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+
+    let mut report = assemble_usage_report(
+        lead_session_id,
+        &combined_rows,
+        &combined_misses,
+        intervals,
+        created_at_ms,
+        now_ms,
+    );
+    report.roles = vec![
+        assemble_role_usage_summary("lead", lead_session_id, lead_rows, lead_misses),
+        assemble_role_usage_summary(
+            "sidekick",
+            sidekick_session_id,
+            sidekick_rows,
+            sidekick_misses,
+        ),
+    ];
+    report
 }
 
 /// The known cost of one aggregated row: input and output rates plus the

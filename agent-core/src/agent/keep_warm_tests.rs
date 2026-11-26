@@ -265,3 +265,322 @@ async fn the_idle_worker_sends_nothing_when_every_command_ends_first() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(stub.requests.lock().await.len(), sent);
 }
+
+#[derive(Debug)]
+struct NoopSidekickExecutor;
+
+impl crate::fusion::SidekickExecutor for NoopSidekickExecutor {
+    fn execute(
+        &self,
+        _request: crate::fusion::SidekickRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::fusion::SidekickOutcome, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Ok(crate::fusion::SidekickOutcome::Completed {
+                report: String::new(),
+                diff: String::new(),
+            })
+        })
+    }
+}
+
+fn fusion_service() -> crate::fusion::FusionService {
+    crate::fusion::FusionService::new(
+        crate::fusion::FusionPairRegistry::default(),
+        std::sync::Arc::new(NoopSidekickExecutor),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_fusion_agent(
+    config: &MayConfig,
+    live_config: Option<std::sync::Arc<arc_swap::ArcSwap<MayConfig>>>,
+    parts: &super::idle_compaction_tests::SessionParts,
+    fusion: crate::fusion::FusionService,
+    role: crate::fusion::SessionRole,
+    execution_mode: crate::session::ExecutionMode,
+    clock: Option<&aither_agent::ManualClock>,
+    override_lifetime: Option<CacheLifetime>,
+) -> MayAgent {
+    let mut input = parts.input().await;
+    input.execution_mode = execution_mode;
+    input.session_role = role;
+    input.live_config = live_config;
+    input.limits = crate::agent::LiveLimits::of(config);
+    input.services.set_fusion(fusion);
+    let mut agent_config = MayAgent::session_config(config, input)
+        .await
+        .expect("fusion session config resolves");
+    if let Some(lifetime) = override_lifetime {
+        agent_config.cache_lifetime = lifetime;
+    }
+    agent_config.clock = clock.cloned();
+    agent_config.host_reader = Some(parts.host.source());
+    Box::pin(MayAgent::new(agent_config))
+        .await
+        .expect("fusion agent builds")
+}
+
+/// Fusion lead and sidekick both promote a limited provider cache lifetime to
+/// 1 hour (with matching 1h Claude prompt-cache TTL), while permanent-cache
+/// backends stay permanent; the unified pair predicate gates `keep_warm_plan`
+/// on peer turns, background jobs, and open `ask_user` waits within the live-
+/// configurable grace window.
+#[tokio::test]
+async fn fusion_mode_configures_one_hour_ttl_and_unified_keep_warm_predicate() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let parts = super::idle_compaction_tests::SessionParts::new(temp.path().to_path_buf()).await;
+    parts
+        .db
+        .create_session(
+            parts.session_id.as_str(),
+            Some("Lead"),
+            Some("session::session-model"),
+        )
+        .await
+        .expect("create lead session");
+
+    let fusion_mode = crate::session::ExecutionMode::Fusion {
+        sidekick_model: crate::ModelSelector::new("session", SESSION_MODEL),
+    };
+    let config = config_with_lifetime(&stub, CacheLifetime::Limited(Duration::from_mins(5)));
+    let live_config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
+    let service = fusion_service();
+    let clock = aither_agent::ManualClock::new();
+
+    let mut lead = build_fusion_agent(
+        &config,
+        Some(live_config.clone()),
+        &parts,
+        service.clone(),
+        crate::fusion::SessionRole::Main,
+        fusion_mode.clone(),
+        Some(&clock),
+        None,
+    )
+    .await;
+    assert_eq!(
+        lead.cache_lifetime(),
+        aither_agent::context::CacheLifetime::Limited(Duration::from_hours(1)),
+        "fusion lead promotes 5m limited cache to 1h"
+    );
+    assert_eq!(
+        lead.claude_cache_ttl(),
+        aither_core::llm::model::ClaudePromptCacheTtl::OneHour,
+        "fusion lead requests 1h Claude prompt-cache TTL"
+    );
+
+    let sidekick = build_fusion_agent(
+        &config,
+        Some(live_config.clone()),
+        &parts,
+        service.clone(),
+        crate::fusion::SessionRole::FusionSidekick {
+            parent_session_id: parts.session_id.clone(),
+            parent_sandbox_dir: temp.path().join("sandbox"),
+        },
+        crate::session::ExecutionMode::Standard,
+        Some(&clock),
+        None,
+    )
+    .await;
+    assert_eq!(
+        sidekick.cache_lifetime(),
+        aither_agent::context::CacheLifetime::Limited(Duration::from_hours(1)),
+        "fusion sidekick promotes 5m limited cache to 1h"
+    );
+    assert_eq!(
+        sidekick.claude_cache_ttl(),
+        aither_core::llm::model::ClaudePromptCacheTtl::OneHour,
+        "fusion sidekick requests 1h Claude prompt-cache TTL"
+    );
+
+    // Permanent-cache backends stay permanent in Fusion mode.
+    let perm_config = config_with_lifetime(&stub, CacheLifetime::Permanent);
+    let perm_lead = build_fusion_agent(
+        &perm_config,
+        None,
+        &parts,
+        service.clone(),
+        crate::fusion::SessionRole::Main,
+        fusion_mode,
+        Some(&clock),
+        None,
+    )
+    .await;
+    assert_eq!(
+        perm_lead.cache_lifetime(),
+        aither_agent::context::CacheLifetime::Permanent,
+        "permanent cache backend is skipped by 1h override"
+    );
+
+    // Warm the lead's cache entry above compaction_floor.
+    super::idle_compaction_tests::run_turn(&mut lead).await;
+    assert_eq!(
+        lead.keep_warm_plan().await.refresh_in,
+        None,
+        "idle pair with no jobs, turns, or open ask_user does not keep warm"
+    );
+    assert!(
+        lead.idle_compaction_due_in().is_some(),
+        "idle compaction is ready when keep-warm predicate is false"
+    );
+
+    // Peer sidekick active turn activates lead keep-warm.
+    let pair = service.pairs().for_parent(parts.session_id.as_str());
+    let active_sidekick = pair.begin_sidekick_turn();
+    assert_eq!(lead.keep_warm_plan().await.refresh_in, Some(DUE));
+    drop(active_sidekick);
+    assert_eq!(lead.keep_warm_plan().await.refresh_in, None);
+
+    // Sidekick background job activates lead keep-warm.
+    let sidekick_job = start_job(sidekick.shell(), LONG).await;
+    assert_eq!(lead.keep_warm_plan().await.refresh_in, Some(DUE));
+    drop(sidekick_job);
+    let _ = sidekick.shell().jobs().kill_all().await;
+    eventually(
+        Duration::from_secs(5),
+        "sidekick job terminates",
+        async || lead.keep_warm_plan().await.refresh_in.is_none(),
+    )
+    .await;
+
+    // Open ask_user younger than the live-configurable grace window activates
+    // keep-warm with a recheck timer, and stops as soon as the live grace window
+    // is tightened below the request's age.
+    let ask_req = may_protocol::ask_user::PersistedAskUserRequest {
+        id: "ask-fusion-1".to_string(),
+        questions: vec![may_protocol::ask_user::PersistedAskUserQuestion {
+            section: "Confirm".to_string(),
+            question: "Proceed?".to_string(),
+            option: vec!["Yes".to_string(), "No".to_string()],
+            multi_select: false,
+            secret: None,
+        }],
+    };
+    parts
+        .db
+        .set_waiting_ask_user(parts.session_id.as_str(), Some(ask_req))
+        .await
+        .expect("insert open ask_user");
+    let plan = lead.keep_warm_plan().await;
+    assert_eq!(plan.refresh_in, Some(DUE));
+    assert!(
+        plan.recheck_in.is_some(),
+        "grace-bounded ask_user schedules an earlier recheck before 59m30s"
+    );
+
+    // Tighten live grace window to 0s: predicate flips false immediately without restart.
+    let mut tightened = config.clone();
+    tightened.experimental.fusion_keep_warm_grace = Duration::ZERO;
+    live_config.store(std::sync::Arc::new(tightened));
+    assert_eq!(
+        lead.keep_warm_plan().await.refresh_in,
+        None,
+        "expired grace window stops keep-warm immediately"
+    );
+}
+
+/// While the Fusion keep-warm predicate is active, `runner::next_command`
+/// suppresses `idle_compaction_due_in` (so 54m compaction never pre-empts
+/// 59m30s cache refresh). As soon as the predicate flips false, `next_command`
+/// wakes and runs `compact_when_idle` while the cache is still warm.
+#[tokio::test]
+async fn fusion_idle_worker_suppresses_early_compaction_then_hands_off_when_predicate_clears() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let parts = super::idle_compaction_tests::SessionParts::new(temp.path().to_path_buf()).await;
+    parts
+        .db
+        .create_session(
+            parts.session_id.as_str(),
+            Some("Lead"),
+            Some("session::session-model"),
+        )
+        .await
+        .expect("create lead session");
+
+    let fusion_mode = crate::session::ExecutionMode::Fusion {
+        sidekick_model: crate::ModelSelector::new("session", SESSION_MODEL),
+    };
+    let config = config_with_lifetime(&stub, CacheLifetime::Limited(Duration::from_secs(3)));
+    let service = fusion_service();
+    let mut lead = build_fusion_agent(
+        &config,
+        None,
+        &parts,
+        service.clone(),
+        crate::fusion::SessionRole::Main,
+        fusion_mode,
+        None,
+        Some(CacheLifetime::Limited(Duration::from_secs(3))),
+    )
+    .await;
+
+    // Seed history above compaction_floor so idle_compaction_due_in is armed.
+    super::idle_compaction_tests::run_turn(&mut lead).await;
+    assert!(
+        lead.idle_compaction_due_in().is_some(),
+        "idle compaction would fire at 90% of lifetime if not suppressed"
+    );
+
+    // Hold sidekick active turn so unified predicate keeps lead warm.
+    let pair = service.pairs().for_parent(parts.session_id.as_str());
+    let active_sidekick = pair.begin_sidekick_turn();
+
+    let db = parts.db.clone();
+    let session_id = parts.session_id.as_str().to_string();
+    let runs = crate::session::SessionRuns::new(db.clone(), crate::ui_event_bus::UiEventBus::new());
+    let _worker = spawn_worker(executor_core::DefaultExecutor, lead, db.clone(), runs);
+
+    // Wait for at least 2 keep-warm refreshes (crossing past the 90% idle-compaction mark).
+    eventually(
+        Duration::from_secs(15),
+        "fusion idle worker refreshed the cache twice",
+        async || {
+            db.request_logs_for_session(&session_id)
+                .await
+                .expect("request logs")
+                .iter()
+                .filter(|row| row.keep_warm)
+                .count()
+                >= 2
+        },
+    )
+    .await;
+
+    {
+        let has_compaction = stub
+            .requests
+            .lock()
+            .await
+            .iter()
+            .any(|body| body.contains(super::idle_compaction_tests::COMPACTION_MARKER));
+        assert!(
+            !has_compaction,
+            "idle compaction must not pre-empt keep-warm while predicate is active"
+        );
+    }
+
+    // Drop the active sidekick turn: predicate flips false and pair.notify_changed()
+    // wakes runner::next_command so compact_when_idle fires while the cache is still warm.
+    drop(active_sidekick);
+    eventually(
+        Duration::from_secs(10),
+        "idle compaction ran after keep-warm predicate turned false",
+        async || {
+            stub.requests
+                .lock()
+                .await
+                .iter()
+                .any(|body| body.contains(super::idle_compaction_tests::COMPACTION_MARKER))
+        },
+    )
+    .await;
+}

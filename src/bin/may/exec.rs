@@ -470,6 +470,7 @@ async fn build_exec_shell(
             refused: may_agent::command_policy::RefusedReads::default(),
             read_epochs: may_agent::command_policy::FileReadEpochs::default(),
             checkout_reads: None,
+            write_lease: None,
         },
         slot: ShellSlot::new(),
         ssh_servers: ssh_server.into_iter().collect(),
@@ -510,7 +511,7 @@ where
         context.db.clone(),
     )
     .map_err(ExecError::ResolveIssueBackend)?;
-    register_shared_terminal_commands(
+    let shared = register_shared_terminal_commands(
         &mut builder,
         SharedTerminalCommandConfig {
             #[cfg(target_os = "macos")]
@@ -521,6 +522,7 @@ where
             child_approvals,
             services: may_agent::SharedServices::new(&context.may_dir)
                 .with_forge_auth(forge_auth.clone()),
+            session_role: may_agent::fusion::SessionRole::Main,
             llm,
             ask_flagship: None,
             ask_balanced: None,
@@ -582,7 +584,9 @@ where
     )
     .await
     .map_err(ExecError::RegisterCommands)?;
-    Ok(builder.build())
+    let registry = builder.build();
+    shared.registry_slot.bind(registry.clone());
+    Ok(registry)
 }
 
 /// Resolves `server_id` among the SSH servers attached to the session's profile.

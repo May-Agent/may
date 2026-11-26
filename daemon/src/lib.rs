@@ -23,6 +23,9 @@ mod auth;
 mod auth_tests;
 mod auto_update;
 mod bootstrap;
+mod bots;
+#[cfg(test)]
+mod bots_tests;
 mod browser;
 mod chat;
 mod cloud_home;
@@ -35,10 +38,15 @@ mod daemon_computer;
 /// agent-core re-exports occupy).
 #[path = "config.rs"]
 mod daemon_config;
+/// Daemon-side Fusion companion runtime (renamed off `fusion`, which the
+/// agent-core re-exports occupy).
+#[path = "fusion.rs"]
+mod daemon_fusion;
 pub mod disk_exhaustion;
 mod error;
 mod error_chain;
 mod events;
+pub use may_agent_core::fusion;
 /// Forge-authentication routes and their wire types.
 ///
 /// Exposed publicly so the CLI and TUI share the daemon's request and
@@ -104,6 +112,8 @@ mod compression_tests;
 #[cfg(test)]
 mod funnel_tests;
 #[cfg(test)]
+mod fusion_tests;
+#[cfg(test)]
 mod issue_brief_tests;
 #[cfg(test)]
 mod memory_off_tests;
@@ -138,7 +148,7 @@ use may_agent_core::{
     XmlBlock, XmlBlockError,
 };
 use may_agent_core::{
-    agent, agent_link, ask_user, bash, browser_service, cache_lifetime, client, cloud,
+    agent, agent_link, ask_user, bash, bot, browser_service, cache_lifetime, client, cloud,
     command_output, command_policy, command_reading, commit_signing, computer, config, container,
     copilot, db, decode_meter, forge, grok, harness, host_git, id, ipc, issue, jobserver,
     live_response, location, mcp, memory, model_selector, models, network_policy, notification,

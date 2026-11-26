@@ -68,6 +68,17 @@ pub struct ContextCategoryRow {
     pub detail: Option<String>,
 }
 
+/// Context report for one companion role (for example a Fusion sidekick).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoleContextReport {
+    /// Role label (`"sidekick"`).
+    pub role: String,
+    /// Companion session identifier.
+    pub session_id: String,
+    /// Companion context breakdown.
+    pub report: Box<ContextReport>,
+}
+
 /// Estimated composition of the context window the next request would use.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContextReport {
@@ -93,6 +104,12 @@ pub struct ContextReport {
     /// Tokens at which the agent pauses to finish the compaction:
     /// `min(window - handoff_reserve, compact_ceiling)`.
     pub compact_tokens: usize,
+    /// Companion role context breakdowns (for example Fusion sidekick), when present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<RoleContextReport>,
+    /// Per-role provider usage rollups (`lead` and `sidekick`) for Fusion sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_usage: Vec<crate::session_usage::RoleUsageSummary>,
 }
 
 /// Result of splitting the `capabilities` block, or the command table, into
@@ -250,6 +267,8 @@ impl ContextReport {
             autocompact_buffer_tokens: autocompact_buffer,
             compact_start_tokens: policy.start_point(metrics.context_window),
             compact_tokens,
+            roles: Vec::new(),
+            role_usage: Vec::new(),
         }
     }
 }

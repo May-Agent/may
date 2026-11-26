@@ -598,13 +598,29 @@ pub async fn create_session(
         (Some(_), Some(spec)) => Some(cloud_repository(spec)?),
         _ => None,
     };
-    let model = {
+    let (model, default_execution_mode) = {
         let config = state.config_snapshot();
-        req.model
+        let model = req
+            .model
             .or_else(|| config.last_model.as_ref().map(ToString::to_string))
             .or_else(|| preferred_advanced_model(&config))
-            .ok_or_else(|| bad_request_error("No model configured"))?
+            .ok_or_else(|| bad_request_error("No model configured"))?;
+        (model, config.experimental.default_execution_mode())
     };
+    let execution_mode = req.execution_mode.unwrap_or(default_execution_mode);
+    if let Some(sidekick_model) = execution_mode.sidekick_model() {
+        let config = state.config_snapshot();
+        if !config.provider.contains_key(sidekick_model.provider_id())
+            && state
+                .pushed_providers
+                .get(sidekick_model.provider_id())
+                .is_none()
+        {
+            return Err(bad_request_error(format!(
+                "unknown fusion sidekick model {sidekick_model}"
+            )));
+        }
+    }
 
     let resolved_profile_id = requested_profile_id
         .clone()
@@ -660,6 +676,20 @@ pub async fn create_session(
         _ => None,
     };
 
+    if !execution_mode.is_standard() {
+        state
+            .db()
+            .set_session_execution_mode(&id, &execution_mode)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(fusion) = state.services.fusion() {
+        fusion
+            .pairs()
+            .for_parent(&id)
+            .set_execution_mode(execution_mode.clone());
+    }
+
     // The model a user last chose is this machine's user's choice; a cloud
     // home's sessions carry the choice made on the fronting daemon.
     if !fronted.0 {
@@ -672,6 +702,7 @@ pub async fn create_session(
     let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
     session.repo = resolved_repo;
     session.location = location;
+    session.runtime.execution_mode = execution_mode;
     if req.cloud.is_none() {
         state.session_prewarms.spawn(&state, &session.id);
     }
@@ -793,6 +824,10 @@ pub async fn delete_session(
         .await
         .map_err(internal_error)?
         .and_then(|session| session.profile_id);
+    let companions = db
+        .companion_sessions_for(&id)
+        .await
+        .map_err(internal_error)?;
     // Live PRs of the dying session stay on record — the audit log marks
     // them `orphaned` so a later session knows to `pr adopt` before merge.
     if let Ok(prs) = db.list_session_prs(&id).await {
@@ -829,6 +864,24 @@ pub async fn delete_session(
     state.session_prewarms.cancel(&id);
     state.services.debug.teardown_session(&id).await;
     state.parked_agents.evict(&id);
+    if let Some(fusion) = state.services.fusion() {
+        fusion.pairs().remove_parent(&id);
+    }
+    for companion in &companions {
+        state.session_prewarms.cancel(&companion.session_id);
+        state.parked_agents.evict(&companion.session_id);
+        state
+            .runtime_service
+            .forget_terminal_grants(&companion.session_id);
+        state
+            .runtime_service
+            .forget_task_events(&companion.session_id);
+        state
+            .tool_environments
+            .evict(&crate::session::SessionId::from_string(
+                companion.session_id.as_str(),
+            ));
+    }
     // After the eviction, whose dropped agent sessions start closing: the
     // host waits for those closes before it ends the rest and removes the
     // session's ACP storage.
@@ -857,6 +910,12 @@ pub async fn delete_session(
         .tool_environments
         .evict(&crate::session::SessionId::from_string(id.as_str()));
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    for companion in &companions {
+        store
+            .delete_session(&companion.session_id, profile_id.as_deref(), &db)
+            .await
+            .map_err(internal_error)?;
+    }
     store
         .delete_session(&id, profile_id.as_deref(), &db)
         .await
@@ -997,6 +1056,23 @@ pub async fn patch_session(
     {
         return Err(bad_request_error(format!("unknown model {model}")));
     }
+    if let Some(sidekick_model) = req
+        .execution_mode
+        .as_ref()
+        .and_then(crate::session::ExecutionMode::sidekick_model)
+    {
+        let config = state.config_snapshot();
+        if !config.provider.contains_key(sidekick_model.provider_id())
+            && state
+                .pushed_providers
+                .get(sidekick_model.provider_id())
+                .is_none()
+        {
+            return Err(bad_request_error(format!(
+                "unknown fusion sidekick model {sidekick_model}"
+            )));
+        }
+    }
     let validated_repo_patch = match req.repo.as_ref() {
         Some(super::types::NullableStringPatch::Set(spec)) => Some(Some(
             resolve_repo_binding_async(Some(spec.clone()))
@@ -1131,6 +1207,12 @@ pub async fn patch_session(
                 state.session_prewarms.cancel(&id);
                 state.services.debug.teardown_session(&id).await;
                 state.parked_agents.evict(&id);
+                if let Ok(companions) = db.companion_sessions_for(&id).await {
+                    for companion in companions {
+                        state.session_prewarms.cancel(&companion.session_id);
+                        state.parked_agents.evict(&companion.session_id);
+                    }
+                }
             } else {
                 db.unarchive_session(&id).await.map_err(internal_error)?;
             }
@@ -1156,6 +1238,19 @@ pub async fn patch_session(
             .set_plan_state(&id, plan_state)
             .await
             .map_err(internal_error)?;
+    }
+    if let Some(execution_mode) = req.execution_mode {
+        state
+            .runtime_service
+            .set_execution_mode(&id, execution_mode.clone())
+            .await
+            .map_err(internal_error)?;
+        if let Some(fusion) = state.services.fusion() {
+            fusion
+                .pairs()
+                .for_parent(&id)
+                .set_execution_mode(execution_mode);
+        }
     }
 
     if list_visible_changed {

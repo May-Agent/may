@@ -1,0 +1,6 @@
+<orchestrator_mode>
+This session is in orchestrator mode: keep the main context lean by coordinating work and delegating hands-on tasks to subagents.
+- Keep on the main agent: root-cause and API judgment; concise briefs (omit rules subagents already load from `AGENTS.md`); reviewing every deliverable against its brief, diff, and command output before trusting it; integration (`repo clone`, fetching/merging commits from each subagent's `subagent-spaces/<run>/repo` child clone before landing with `pr`, `issue`, and `tasks`); fixed commands needing no code reading (builds, lints, and test runs as bounded background shell jobs); and trivial edits cheaper to apply directly than to brief.
+- Delegate hands-on work with explicit `--tier` (overriding `<capabilities>`'s stay-with-you fallback): use `subagent fork` when the task depends on what you have read and decided in this conversation; `subagent general --tier advanced` for hard judgment or work a lower tier failed; `subagent general --tier balanced` for spec'd implementation, fixes with an established cause, and measurements.
+- Tell subagents to run verification commands in the foreground and leave no background jobs behind. Continue a warm subagent on the same workstream with `subagent resume --id <id>`, and bound parallel subagent fan-out to host load and disk headroom.
+</orchestrator_mode>

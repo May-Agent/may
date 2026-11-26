@@ -219,6 +219,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 context_policy: app.config.context.policy(),
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
+                execution_mode: app.session_runtime.execution_mode.clone(),
                 yolo: app.session_runtime.yolo,
                 memory_off: app.session_runtime.memory_off,
                 shells: running_shells,
@@ -388,7 +389,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             rows(crate::reducer::jobs_rows(app).len() * 2 + 3).max(6),
             pct(60),
         ),
-        AppMode::JobDetail(_) => (pct(80), pct(80)),
+        AppMode::JobDetail(_) | AppMode::Bots(_) => (pct(80), pct(80)),
         AppMode::Btw(state) => (if !state.loading && !state.done { 5 } else { 14 }, pct(60)),
         AppMode::Progress(_) => (16, pct(60)),
         AppMode::PermissionConfirm(state) => (
@@ -479,6 +480,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
                 app.band_bg,
             );
         }
+        AppMode::Bots(state) => render_bots_panel(frame, sheet, state, app.band_bg),
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state, app.band_bg),
         AppMode::Progress(state) => render_progress_popup(frame, sheet, state, app.band_bg),
         AppMode::PermissionConfirm(state) => {
@@ -1148,6 +1150,175 @@ fn job_row_detail(job: &aither_sandbox::JobInfo, status: &str) -> String {
 
 /// Jobs panel: bottom-anchored drawer listing running subagents and
 /// background terminal jobs.
+fn render_bots_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::state::BotsState,
+    band_bg: Option<Color>,
+) {
+    let title = state.current().map_or_else(
+        || " May Bots · n: create bot · r: refresh · Esc: close ".to_string(),
+        |bot| {
+            format!(
+                " May Bots — {} ({}) [{}] · Tab: switch tab · n: new · i: message · a/d: approval · r: refresh · Esc: close ",
+                bot.name,
+                bot.agent_id,
+                state.tab.label()
+            )
+        },
+    );
+    let mut style = Style::default();
+    if let Some(bg) = band_bg {
+        style = style.bg(bg);
+    }
+    let block = Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .title(title)
+        .style(style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(notice) = &state.notice {
+        lines.push(Line::styled(
+            format!("Notice: {notice}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if state.creating_bot {
+        lines.push(Line::styled(
+            format!("New bot name> {}_", state.input),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if state.composing {
+        lines.push(Line::styled(
+            format!("Send message> {}_", state.input),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if state.loading && state.bots.is_empty() {
+        lines.push(Line::from("Loading resident bots..."));
+    } else if state.bots.is_empty() {
+        lines.push(Line::from(
+            "No resident May Bots yet. Press `n` to create one.",
+        ));
+    } else {
+        for (idx, bot) in state.bots.iter().enumerate() {
+            let prefix = if idx == state.selected { "> " } else { "  " };
+            let row_style = if idx == state.selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::styled(
+                format!(
+                    "{prefix}{} ({}) [{}] inbox:{} approvals:{}",
+                    bot.name, bot.agent_id, bot.run_state, bot.pending_inbox, bot.pending_approvals
+                ),
+                row_style,
+            ));
+        }
+        lines.push(Line::from("─".repeat(usize::from(inner.width.min(80)))));
+
+        match state.tab {
+            crate::state::BotsTab::Chat => {
+                if state.messages.is_empty() {
+                    lines.push(Line::from("No chat messages yet. Press `i` to message."));
+                } else {
+                    for msg in state.messages.iter().rev().take(12).rev() {
+                        lines.push(Line::from(format!(
+                            "[{}] {}: {}",
+                            msg.ts_utc, msg.role, msg.content
+                        )));
+                    }
+                }
+            }
+            crate::state::BotsTab::Trace => {
+                if state.trace.is_empty() {
+                    lines.push(Line::from("No internal trace entries yet."));
+                } else {
+                    for entry in state.trace.iter().rev().take(12).rev() {
+                        lines.push(Line::from(format!(
+                            "[{}] ({}) {}",
+                            entry.ts_utc, entry.kind, entry.content
+                        )));
+                    }
+                }
+            }
+            crate::state::BotsTab::Approvals => {
+                if state.approvals.is_empty() {
+                    lines.push(Line::from("No approval requests."));
+                } else {
+                    for (idx, item) in state.approvals.iter().enumerate() {
+                        let sel = if idx == state.approval_selected {
+                            "> "
+                        } else {
+                            "  "
+                        };
+                        let note = item
+                            .decision_note
+                            .as_deref()
+                            .map_or_default(|n| format!(" | note: {n}"));
+                        lines.push(Line::from(format!(
+                            "{sel}[{}] {} {} ({}) {}{}",
+                            item.status,
+                            item.gate,
+                            item.requester_id,
+                            item.request_id,
+                            item.subject,
+                            note
+                        )));
+                    }
+                }
+            }
+            crate::state::BotsTab::Memory => {
+                lines.push(Line::styled(
+                    "Memory tree:",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                if let Some(root) = &state.memory_tree {
+                    let mut stack: Vec<(usize, &may_protocol::bot::BotMemoryNode)> =
+                        vec![(0, root)];
+                    let mut shown = 0usize;
+                    while let Some((depth, node)) = stack.pop() {
+                        if shown >= 12 {
+                            break;
+                        }
+                        if !node.path.is_empty() {
+                            let indent = "  ".repeat(depth);
+                            lines.push(Line::from(format!("{indent}- {}", node.path)));
+                            shown += 1;
+                        }
+                        for child in node.children.iter().rev() {
+                            stack.push((depth + 1, child));
+                        }
+                    }
+                }
+                lines.push(Line::styled(
+                    "Recent memory.git commits:",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                for commit in state.memory_commits.iter().take(8) {
+                    let short: String = commit.sha.chars().take(8).collect();
+                    lines.push(Line::from(format!("  {short} {}", commit.subject)));
+                }
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
     use crate::reducer::{JobRow, jobs_rows};
 
@@ -3040,6 +3211,7 @@ mod tests {
             status,
             output_path: None,
             timeout: None,
+            pty: false,
         }
     }
 

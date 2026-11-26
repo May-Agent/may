@@ -163,6 +163,13 @@ pub struct SubagentSettings<LLM> {
     pub session_id: String,
     /// Host debug broker torn down per writable subagent when its run ends.
     pub debug_broker: crate::debug::DebugBroker,
+    /// Finalized session command registry used to derive per-subagent IPC bridges.
+    ///
+    /// Refuses `tui` on read-only subagents and scopes writable subagent `tui`
+    /// sessions to the subagent's own shell.
+    pub registry: crate::ipc::RegistrySlot,
+    /// Live shell timeout cap applied to subagent `tui open` calls.
+    pub timeout_cap: aither_sandbox::LiveDuration,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -214,7 +221,8 @@ enum Body<LLM: LanguageModel + 'static> {
     /// grants its processes run with.
     External {
         session: Box<AcpSession>,
-        _shell: Option<Box<SessionShell>>,
+        shell: Option<Arc<SessionShell>>,
+        tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
     },
 }
 
@@ -274,7 +282,8 @@ struct Pending<LLM: LanguageModel + 'static> {
     slot: ModelSlot<LLM>,
     /// The model name the run reports.
     model: String,
-    shell: SessionShell,
+    shell: Arc<SessionShell>,
+    tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
     source: Source,
     /// The directories the grant hands over, a run's diff covers them.
     granted: Vec<PathBuf>,
@@ -445,15 +454,21 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         Ok(snapshot)
     }
 
-    /// The shell a subagent holding `grant` works in, derived from the
-    /// caller's; a `confined` one's scripts stay inside the sandbox.
+    /// Launches a subagent shell derived from the caller's.
+    ///
+    /// A `confined` subagent stays inside the sandbox and cannot open `tui`
+    /// sessions; a writable subagent gets an isolated `TuiRegistry` torn down
+    /// when its run finishes.
     async fn launch(
         &self,
         grant: SubagentGrant,
         caller: Option<&Path>,
         name: &str,
         confined: bool,
-    ) -> anyhow::Result<SessionShell> {
+    ) -> anyhow::Result<(
+        Arc<SessionShell>,
+        Option<crate::agent::tui_tool::TuiRegistry>,
+    )> {
         let Some(shell) = &self.shell else {
             anyhow::bail!("a subagent needs the shell of the agent that launches it");
         };
@@ -464,7 +479,42 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         if confined {
             shell = shell.with_approver(self.settings().read_only_permissions.clone());
         }
-        Ok(shell)
+        if let Some(base_registry) = self.settings().registry.get() {
+            let sub_slot = crate::ipc::ShellSlot::new();
+            if confined {
+                let sub_registry = base_registry.refuse_command(
+                    "tui",
+                    "Unavailable in read-only subagents",
+                    crate::agent::tui_tool::read_only_tui_refusal(),
+                );
+                shell = shell.with_ipc(crate::ipc::CommandBridge::new(
+                    sub_registry,
+                    sub_slot.clone(),
+                ));
+                let shell = Arc::new(shell);
+                sub_slot.bind(&shell);
+                return Ok((shell, None));
+            }
+            let sub_tui = crate::agent::tui_tool::TuiRegistry::new();
+            let tui_for_bridge = sub_tui.clone();
+            let timeout_cap = self.settings().timeout_cap.clone();
+            let sub_registry = base_registry.replace_bound_image_tool("tui", move |binding| {
+                crate::agent::tui_tool::TuiTool::new(
+                    binding.shell.cloned(),
+                    binding.launch.clone(),
+                    tui_for_bridge.clone(),
+                    timeout_cap.clone(),
+                )
+            });
+            shell = shell.with_ipc(crate::ipc::CommandBridge::new(
+                sub_registry,
+                sub_slot.clone(),
+            ));
+            let shell = Arc::new(shell);
+            sub_slot.bind(&shell);
+            return Ok((shell, Some(sub_tui)));
+        }
+        Ok((Arc::new(shell), None))
     }
 
     async fn start_external(
@@ -477,7 +527,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         let working_dir = self.caller_dir(caller);
         // The agent and its commands run in the space and with the grants of
         // this shell, as a native subagent's commands do.
-        let shell = self
+        let (shell, tui_registry) = self
             .launch(
                 requested.grant(Some(working_dir)),
                 Some(working_dir),
@@ -507,7 +557,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             working_copies,
             body: Body::External {
                 session: Box::new(session),
-                _shell: Some(Box::new(shell)),
+                shell: Some(shell),
+                tui_registry,
             },
         })
     }
@@ -624,7 +675,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         );
         let working_dir = self.caller_dir(caller);
         let granted = grant.granted(Some(working_dir));
-        let shell = self
+        let (shell, tui_registry) = self
             .launch(grant.grant(Some(working_dir)), caller, &name, confined)
             .await?;
         // A named subagent works under the rules of where it works: its
@@ -651,6 +702,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             slot,
             model,
             shell,
+            tui_registry,
             source,
             granted,
             agents,
@@ -667,6 +719,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             slot,
             model,
             shell,
+            tui_registry,
             source,
             granted,
             agents,
@@ -740,6 +793,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             agent,
             requested,
             shell,
+            tui_registry,
             ChildParts {
                 name: name.clone(),
                 valve: Some(valve),
@@ -1026,16 +1080,34 @@ impl<LLM: LanguageModel + 'static> Finish<LLM> {
         settings
             .work
             .record(WorkEvent::SubagentFinished(self.name.clone()));
-        if let Body::Agent(session) = &held.body {
-            let debug_owner = crate::debug::tool::debug_owner_for_identity(
-                settings.session_id.clone(),
-                Some(session.identity()),
-                || self.name.clone(),
-            );
-            settings.debug_broker.teardown_owner(&debug_owner).await;
-            let stopped = session.stop_jobs().await;
-            if stopped > 0 {
-                tracing::info!(subagent = %self.name, stopped, "Stopped background jobs left by a subagent");
+        match &held.body {
+            Body::Agent(session) => {
+                let debug_owner = crate::debug::tool::debug_owner_for_identity(
+                    settings.session_id.clone(),
+                    Some(session.identity()),
+                    || self.name.clone(),
+                );
+                settings.debug_broker.teardown_owner(&debug_owner).await;
+                let stopped = session.stop_jobs().await;
+                if stopped > 0 {
+                    tracing::info!(subagent = %self.name, stopped, "Stopped background jobs left by a subagent");
+                }
+            }
+            Body::External {
+                shell,
+                tui_registry,
+                ..
+            } => {
+                let mut stopped = 0;
+                if let Some(tui) = tui_registry {
+                    stopped += tui.close_all().await;
+                }
+                if let Some(shell) = shell {
+                    stopped += shell.jobs().kill_all().await;
+                }
+                if stopped > 0 {
+                    tracing::info!(subagent = %self.name, stopped, "Stopped background jobs left by an external subagent");
+                }
             }
         }
         // Whatever way the run ended, the commits it made and the diff it

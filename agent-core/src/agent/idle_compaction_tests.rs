@@ -266,7 +266,7 @@ impl ScriptedHost {
         self.reads.load(Ordering::SeqCst)
     }
 
-    fn source(&self) -> HostReaderSource {
+    pub(super) fn source(&self) -> HostReaderSource {
         let host = self.clone();
         HostReaderSource::new(move || AnyHostReader::new(host.clone()))
     }
@@ -381,6 +381,7 @@ impl SessionParts {
             profile_memories: self.profile_memories.clone(),
             memory_off: self.memory_off,
             plan_state: SessionPlanState::default(),
+            execution_mode: crate::session::ExecutionMode::Standard,
             location: None,
             task_broker: None,
             tunnel_broker: None,
@@ -401,6 +402,8 @@ impl SessionParts {
             services: crate::terminal_commands::SharedServices::new(&self.dir.join(".may")),
             model_context_window: None,
             sleep: None,
+            session_role: crate::fusion::SessionRole::Main,
+            shared_grants: None,
         }
     }
 }
@@ -817,6 +820,7 @@ async fn a_providers_advertised_cache_lifetime_syncs_live() {
             profile_memories: None,
             memory_off: false,
             plan_state: crate::session::SessionPlanState::default(),
+            execution_mode: crate::session::ExecutionMode::Standard,
             location: None,
             cwd: &cwd,
             ssh_servers: &[],

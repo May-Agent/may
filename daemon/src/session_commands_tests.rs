@@ -351,3 +351,159 @@ async fn patch_memory_off_is_one_way_and_rejects_false() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 }
+
+#[tokio::test]
+async fn execution_mode_persists_toggles_live_and_is_orthogonal_to_plan_state() {
+    let state = state().await;
+    seed(&state).await;
+    let mut events = state.ui_event_bus.subscribe();
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
+
+    // Default session starts in standard mode.
+    assert_eq!(
+        state
+            .db()
+            .session_execution_mode(SESSION)
+            .await
+            .expect("db"),
+        crate::session::ExecutionMode::Standard
+    );
+
+    // Enable plan draft and orchestrator mode independently.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({
+            "planState": "draft",
+            "executionMode": {"mode": "orchestrator"}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["runtime"]["planState"].as_str(), Some("draft"));
+    assert_eq!(
+        body["runtime"]["executionMode"]["mode"].as_str(),
+        Some("orchestrator")
+    );
+    assert_eq!(
+        state
+            .db()
+            .session_execution_mode(SESSION)
+            .await
+            .expect("db"),
+        crate::session::ExecutionMode::Orchestrator
+    );
+
+    // Verify SSE runtime invalidation was emitted on the unified bus.
+    let notifications: Vec<UiEventTopics> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(
+        notifications
+            .iter()
+            .any(|topics| topics.contains(UiEventTopics::SESSION_RUNTIMES)),
+        "expected SESSION_RUNTIMES event: {notifications:?}"
+    );
+
+    // Switching executionMode back to standard preserves planState = draft.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"executionMode": {"mode": "standard"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["runtime"]["planState"].as_str(), Some("draft"));
+    assert_eq!(
+        body["runtime"]["executionMode"]["mode"].as_str(),
+        Some("standard")
+    );
+
+    // Switching planState to approved while re-enabling orchestrator keeps both.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"executionMode": {"mode": "orchestrator"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/sessions/{SESSION}"),
+        Some(json!({"planState": "approved"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["runtime"]["planState"].as_str(), Some("approved"));
+    assert_eq!(
+        body["runtime"]["executionMode"]["mode"].as_str(),
+        Some("orchestrator")
+    );
+}
+
+#[tokio::test]
+async fn create_session_honors_experimental_default_execution_mode_and_request_override() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = MayConfig {
+        last_model: Some("openai::gpt-5".parse().expect("selector")),
+        experimental: crate::config::ExperimentalConfig {
+            execution_mode: crate::config::DefaultExecutionMode::Orchestrator,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = Arc::new(
+        DaemonState::for_test(dir.path(), cfg)
+            .await
+            .expect("daemon state"),
+    );
+    state
+        .db()
+        .create_profile(crate::db::CreateProfileParams {
+            id: &state.default_profile_id,
+            name: "Test",
+            environment: crate::db::ProfileEnvironmentKind::Local,
+            slug: None,
+            icon: None,
+            persona: None,
+            preferences: None,
+            location_aware: false,
+        })
+        .await
+        .expect("profile");
+    let router = build_router(state.clone(), DaemonMode::Rest, SocketOwner);
+
+    // Omitting executionMode inherits `[experimental] execution_mode = "orchestrator"`.
+    let (status, body) = call(&router, "POST", "/api/sessions", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let id = body["id"].as_str().expect("id");
+    assert_eq!(
+        body["runtime"]["executionMode"]["mode"].as_str(),
+        Some("orchestrator")
+    );
+    assert_eq!(
+        state.db().session_execution_mode(id).await.expect("db"),
+        crate::session::ExecutionMode::Orchestrator
+    );
+
+    // Explicit `standard` overrides the config default.
+    let (status, body) = call(
+        &router,
+        "POST",
+        "/api/sessions",
+        Some(json!({"executionMode": {"mode": "standard"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let std_id = body["id"].as_str().expect("id");
+    assert_eq!(
+        body["runtime"]["executionMode"]["mode"].as_str(),
+        Some("standard")
+    );
+    assert_eq!(
+        state.db().session_execution_mode(std_id).await.expect("db"),
+        crate::session::ExecutionMode::Standard
+    );
+}

@@ -66,6 +66,9 @@ pub struct SessionPrompts {
     /// Receives the id of each session with newly stored work; the daemon
     /// dispatches it.
     wake: async_channel::Sender<String>,
+    /// Optional callback waking a resident May Bot when a scheduled task or
+    /// webhook targets a bot instead of a session.
+    wake_bot: Option<crate::bot::BotWakeFn>,
 }
 
 impl std::fmt::Debug for SessionPrompts {
@@ -99,11 +102,20 @@ impl SessionPrompts {
         Self {
             runtime_service,
             wake,
+            wake_bot: None,
         }
     }
 
-    /// Queue `body` for `session_id` as a message from task `task_id`, behind
-    /// whatever the session is running, and wake it.
+    /// Attaches a bot wake callback so `wake` commands and webhook triggers can
+    /// wake resident May Bots as well as sessions.
+    #[must_use]
+    pub fn with_bot_wake(mut self, wake_bot: crate::bot::BotWakeFn) -> Self {
+        self.wake_bot = Some(wake_bot);
+        self
+    }
+
+    /// Queue `body` for `session_id` (or resident bot) as a message from task
+    /// `task_id`, behind whatever the target is running, and wake it.
     ///
     /// # Errors
     /// [`TaskWakeError`] on storage failure or unusable text.
@@ -117,6 +129,30 @@ impl SessionPrompts {
         task_name: &str,
         body: &str,
     ) -> Result<(), TaskWakeError> {
+        if let Some(bot) = self
+            .runtime_service
+            .db()
+            .find_bot_by_identifier(session_id)
+            .await?
+        {
+            let _ = self
+                .runtime_service
+                .db()
+                .enqueue_bot_inbox(crate::db::NewBotInboxEntry {
+                    bot_id: &bot.id,
+                    kind: may_protocol::bot::BotInboxKind::TaskWake,
+                    sender_id: Some(task_id),
+                    sender_name: Some(task_name),
+                    body,
+                    meta_json: None,
+                })
+                .await?;
+            if let Some(wake_bot) = &self.wake_bot {
+                (wake_bot)(&bot.id);
+            }
+            return Ok(());
+        }
+
         let word = self
             .runtime_service
             .db()
@@ -178,6 +214,43 @@ impl SessionPrompts {
             .await?;
         let _ = self.wake.try_send(session_id.to_string());
         Ok(())
+    }
+
+    /// Delivers a webhook payload directly to a resident bot's inbox if
+    /// `target_id` matches a bot; returns `Ok(true)` when delivered to a bot.
+    ///
+    /// # Errors
+    /// [`TaskWakeError`] on storage failure.
+    pub async fn deliver_webhook_to_bot(
+        &self,
+        target_id: &str,
+        source: &str,
+        body: &str,
+    ) -> Result<bool, TaskWakeError> {
+        let Some(bot) = self
+            .runtime_service
+            .db()
+            .find_bot_by_identifier(target_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let _ = self
+            .runtime_service
+            .db()
+            .enqueue_bot_inbox(crate::db::NewBotInboxEntry {
+                bot_id: &bot.id,
+                kind: may_protocol::bot::BotInboxKind::WebhookWake,
+                sender_id: Some(source),
+                sender_name: Some(source),
+                body,
+                meta_json: None,
+            })
+            .await?;
+        if let Some(wake_bot) = &self.wake_bot {
+            (wake_bot)(&bot.id);
+        }
+        Ok(true)
     }
 }
 

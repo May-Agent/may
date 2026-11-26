@@ -2299,6 +2299,19 @@ fn run_agent_loop<'a>(
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
     Box::pin(async move {
+        let _fusion_turn_guard = if let Some(fusion) = state.services.fusion() {
+            match state.db().parent_session_of(&req.session_id).await {
+                Ok(Some(link)) if link.role == crate::fusion::SIDEKICK_ROLE => Some(
+                    fusion
+                        .pairs()
+                        .link_companion(&link.parent_session_id, &req.session_id)
+                        .begin_sidekick_turn(),
+                ),
+                _ => Some(fusion.pairs().for_parent(&req.session_id).begin_lead_turn()),
+            }
+        } else {
+            None
+        };
         let turn = run_agent_loop_attempts(
             state,
             req,
@@ -2320,6 +2333,148 @@ fn run_agent_loop<'a>(
             }
         }
     })
+}
+
+/// Sink capturing assistant reply text and errors for a Fusion companion sidekick turn.
+#[derive(Default)]
+struct CompanionSink {
+    text: String,
+    error: Option<String>,
+}
+
+#[allow(clippy::unused_async_trait_impl)]
+impl ChatSink for CompanionSink {
+    async fn on_start(&mut self, _session_id: &str, _assistant_id: &str) -> bool {
+        true
+    }
+    async fn on_text(&mut self, chunk: &str) -> bool {
+        self.text.push_str(chunk);
+        true
+    }
+    async fn on_reasoning(&mut self, _chunk: &str) -> bool {
+        true
+    }
+    async fn on_tool_delta(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _arguments_fragment: &str,
+        _summary: crate::tool_summary::ToolSummary,
+    ) -> bool {
+        true
+    }
+    async fn on_tool_start(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _arguments: &str,
+        _summary: crate::tool_summary::ToolSummary,
+    ) -> bool {
+        true
+    }
+    async fn on_tool_end(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _arguments: Option<&str>,
+        _result: &ToolResult,
+        _refused: bool,
+        _summary: crate::tool_summary::ToolSummary,
+    ) -> bool {
+        true
+    }
+    async fn on_todo_update(&mut self, _rows: Vec<crate::task_rows::TaskRow>) -> bool {
+        true
+    }
+    async fn on_speed(&mut self, _tokens_per_second: f64) -> bool {
+        true
+    }
+    async fn on_retract(&mut self) -> bool {
+        self.text.clear();
+        true
+    }
+    async fn on_error(&mut self, _code: ApiErrorCode, message: &str, _retryable: bool) -> bool {
+        self.error = Some(message.to_string());
+        true
+    }
+}
+
+/// Executes a companion sidekick turn (and any queued mid-run steers) through the
+/// standard daemon turn runner, returning the collected assistant report text.
+pub async fn run_companion_turn(
+    state: &Arc<DaemonState>,
+    sidekick_session_id: &str,
+    prompt: String,
+    mut guard: SessionRunGuard,
+) -> Result<String, String> {
+    let mut reports = Vec::new();
+    let mut current_req = ChatRequest {
+        session_id: sidekick_session_id.to_string(),
+        content: prompt,
+        attachments: Vec::new(),
+        hidden_context_xml: None,
+        delivery_mode: crate::session::PendingUserMessageMode::default(),
+        pending_entry_id: None,
+    };
+    loop {
+        let mut sink = CompanionSink::default();
+        let res = run_agent_loop(
+            state,
+            &current_req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        match res {
+            Ok(_) => {
+                let text = sink.text.trim().to_string();
+                if !text.is_empty() {
+                    reports.push(text);
+                }
+                match guard.finish(RunOutcome::Completed).await {
+                    Ok(Some(continued)) => {
+                        guard = continued;
+                        let next = match state
+                            .runtime_service
+                            .take_next_for_run(guard.fence(), sidekick_session_id)
+                            .await
+                        {
+                            Ok(next) => next,
+                            Err(error) => {
+                                let _ = guard.finish_idle(RunOutcome::Failed).await;
+                                return Err(format!(
+                                    "failed to load steered companion message: {error}"
+                                ));
+                            }
+                        };
+                        let Some(next_message) = next else {
+                            let _ = guard.finish_idle(RunOutcome::Completed).await;
+                            return Ok(reports.join("\n\n"));
+                        };
+                        current_req = ChatRequest {
+                            session_id: sidekick_session_id.to_string(),
+                            content: next_message.content,
+                            attachments: api_attachments_from_persisted(next_message.attachments),
+                            hidden_context_xml: next_message.hidden_context_xml,
+                            delivery_mode: next_message.delivery_mode,
+                            pending_entry_id: next_message.id,
+                        };
+                    }
+                    Ok(None) => return Ok(reports.join("\n\n")),
+                    Err(error) => return Err(format!("failed to finish companion turn: {error}")),
+                }
+            }
+            Err(error) => {
+                let _ = guard.finish_idle(RunOutcome::Failed).await;
+                return Err(sink
+                    .error
+                    .unwrap_or_else(|| format!("companion turn failed: {error:?}")));
+            }
+        }
+    }
 }
 
 /// Delete all rows a turn wrote after `turn_boundary`, restore alerts it
@@ -3652,6 +3807,7 @@ pub struct SessionContext {
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_id: Option<String>,
     plan_state: crate::session::SessionPlanState,
+    execution_mode: crate::session::ExecutionMode,
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
 
@@ -4349,6 +4505,7 @@ pub async fn resolve_session_context(
         profile_environment,
         profile_id: session.profile_id,
         plan_state: runtime.plan_state,
+        execution_mode: runtime.execution_mode,
         reasoning_effort,
     })
 }
@@ -4598,18 +4755,43 @@ fn spawn_workspace_forwarder(
 ) -> crate::workspace_request::WorkspaceRequestBroker {
     let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
     let workspace_approver = state.workspace_approver.clone();
+    let bot_service = state.bot_service.clone();
+    let db = state.db();
     let workspace_session_id = session_id.as_str().to_string();
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
+        let pause = crate::harness::approval_pause::ApprovalPause::new();
         while let Some(request) = workspace_queue.next().await {
-            let approved = match workspace_approver
-                .request_and_wait(workspace_session_id.as_str(), request.args.request.clone())
+            let supervising_bot = db
+                .supervising_bot_for_session(workspace_session_id.as_str())
                 .await
-            {
-                Ok(approved) => approved,
-                Err(error) => {
-                    tracing::error!(session_id = %workspace_session_id, error = %error, "workspace request failed");
-                    false
+                .ok()
+                .flatten();
+            let approved = if let Some(bot_id) = supervising_bot {
+                bot_service
+                    .approvals()
+                    .request(
+                        &bot_id,
+                        "session",
+                        workspace_session_id.as_str(),
+                        may_protocol::bot::BotApprovalGate::Workspace,
+                        &request.args.request.path,
+                        Some(&request.args.request.reason),
+                        &pause,
+                        None,
+                    )
+                    .await
+                    .is_ok_and(|outcome| outcome.is_approved())
+            } else {
+                match workspace_approver
+                    .request_and_wait(workspace_session_id.as_str(), request.args.request.clone())
+                    .await
+                {
+                    Ok(approved) => approved,
+                    Err(error) => {
+                        tracing::error!(session_id = %workspace_session_id, error = %error, "workspace request failed");
+                        false
+                    }
                 }
             };
             let _ = request.respond(approved);
@@ -4642,6 +4824,7 @@ pub fn local_agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::Age
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
             },
         )
+        .with_bot_wake(state.bot_service.wake_callback())
         .with_peers(LocalShadowFilter(state_for_shadow)),
         runtime_service: state.runtime_service.clone(),
         cache_lifetime: {
@@ -4720,6 +4903,7 @@ pub fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMess
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
             },
         )
+        .with_bot_wake(state.bot_service.wake_callback())
         .with_peers(crate::peers::DaemonPeerFabric::new(state.clone())),
         runtime_service: state.runtime_service.clone(),
         cache_lifetime: {
@@ -4902,6 +5086,7 @@ fn prepare_agent_for_request_with_stages<'a>(
                         profile_memories: ctx.profile_memories.as_ref(),
                         memory_off: ctx.memory_off,
                         plan_state: ctx.plan_state,
+                        execution_mode: ctx.execution_mode.clone(),
                         location: location.as_ref(),
                         cwd: &ctx.cwd,
                         ssh_servers: &ssh_servers,
@@ -5023,6 +5208,27 @@ fn build_session_agent<'a>(
 
         let subagents = state.session_background.subagents(ctx.session_id.as_str());
         cards::forward_updates(state, ctx.session_id.as_str(), subagents.cards());
+        let (session_role, shared_grants) =
+            match state.db().parent_session_of(ctx.session_id.as_str()).await {
+                Ok(Some(link)) if link.role == crate::fusion::SIDEKICK_ROLE => {
+                    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+                    let parent_sandbox_dir =
+                        store.sandbox_dir(&link.parent_session_id, ctx.profile_id.as_deref());
+                    let grants = state
+                        .runtime_service
+                        .terminal_grants(&link.parent_session_id);
+                    (
+                        crate::fusion::SessionRole::FusionSidekick {
+                            parent_session_id: SessionId::from_string(
+                                link.parent_session_id.as_str(),
+                            ),
+                            parent_sandbox_dir,
+                        },
+                        grants,
+                    )
+                }
+                _ => (crate::fusion::SessionRole::Main, None),
+            };
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
             crate::agent::MayAgentSessionInput {
@@ -5053,6 +5259,7 @@ fn build_session_agent<'a>(
                 profile_memories: ctx.profile_memories.clone(),
                 memory_off: ctx.memory_off,
                 plan_state: ctx.plan_state,
+                execution_mode: ctx.execution_mode.clone(),
                 location,
                 task_broker: Some(brokers.task),
                 session_prompts: Some(state.session_prompts.clone()),
@@ -5087,6 +5294,8 @@ fn build_session_agent<'a>(
                 services: state.services.clone(),
                 model_context_window,
                 sleep: Some(state.sleep.clone()),
+                session_role,
+                shared_grants,
             },
         )
         .await

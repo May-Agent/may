@@ -12,7 +12,8 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
-use may_agent::session::SessionLaunch;
+use may_agent::model_selector::ModelSelector;
+use may_agent::session::{ExecutionMode, SessionLaunch};
 use may_agent::update::Channel;
 
 /// Top-level CLI mode the binary resolves from argv.
@@ -39,6 +40,8 @@ pub enum CliMode {
     OneShot(OneShotArgs),
     /// Print the completion script of a shell.
     Completion(Shell),
+    /// Set a session's execution mode live.
+    Mode(ModeCliArgs),
     /// Replace this binary with the newest build of its channel and restart
     /// the daemon; the channel is switched first when one is given.
     Update {
@@ -46,11 +49,53 @@ pub enum CliMode {
     },
 }
 
+/// Execution mode requested on the CLI before loading `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliExecutionMode {
+    /// Fully specified execution mode.
+    Explicit(ExecutionMode),
+    /// `--mode fusion` without `--sidekick-model`: resolves `[experimental] fusion_sidekick_model`.
+    FusionFromConfig,
+}
+
+impl CliExecutionMode {
+    /// Resolves this CLI request into an [`ExecutionMode`], reading `[experimental]
+    /// fusion_sidekick_model` when `--sidekick-model` was omitted.
+    pub fn resolve(&self, config: &may_agent::config::MayConfig) -> anyhow::Result<ExecutionMode> {
+        match self {
+            Self::Explicit(mode) => Ok(mode.clone()),
+            Self::FusionFromConfig => {
+                let sidekick_model = config
+                    .experimental
+                    .fusion_sidekick_model
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "fusion mode requires --sidekick-model <provider::model> or [experimental] fusion_sidekick_model in config.toml"
+                        )
+                    })?;
+                Ok(ExecutionMode::Fusion { sidekick_model })
+            }
+        }
+    }
+}
+
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiArgs {
     /// How the TUI starts its sessions.
     pub launch: SessionLaunch,
+    /// Optional execution mode override for newly created sessions.
+    pub execution_mode: Option<CliExecutionMode>,
+}
+
+/// Parsed `may mode --session <id> <mode>` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeCliArgs {
+    /// Session to update.
+    pub session_id: String,
+    /// Target execution mode.
+    pub execution_mode: CliExecutionMode,
 }
 
 /// Parsed `may resume` invocation.
@@ -66,6 +111,7 @@ pub struct OneShotArgs {
     pub prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub execution_mode: Option<CliExecutionMode>,
 }
 
 /// Parsed `may rest` invocation.
@@ -155,6 +201,12 @@ struct LaunchArgs {
     /// Open the TUI on a repository (`owner/repo` or a local path).
     #[arg(long, value_name = "OWNER/REPO|PATH", conflicts_with_all = ["model", "reasoning_effort", "prompt"])]
     repo: Option<String>,
+    /// Execution mode for the new session (`standard`, `orchestrator`, or `fusion`).
+    #[arg(long, value_enum, ignore_case = true)]
+    mode: Option<ExecutionModeArg>,
+    /// Sidekick model selector (`provider::model`) for `--mode fusion`.
+    #[arg(long, value_name = "PROVIDER::MODEL")]
+    sidekick_model: Option<ModelSelector>,
     /// Model id for the one-shot run.
     #[arg(long, value_name = "ID", requires = "prompt")]
     model: Option<String>,
@@ -169,7 +221,26 @@ struct LaunchArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Open the TUI with repo-less chats (no directory, no repository).
-    Chat,
+    Chat {
+        /// Execution mode for the new session (`standard`, `orchestrator`, or `fusion`).
+        #[arg(long, value_enum, ignore_case = true)]
+        mode: Option<ExecutionModeArg>,
+        /// Sidekick model selector (`provider::model`) for `--mode fusion`.
+        #[arg(long, value_name = "PROVIDER::MODEL")]
+        sidekick_model: Option<ModelSelector>,
+    },
+    /// Set an existing session's execution mode live.
+    Mode {
+        /// Session id to update.
+        #[arg(long, value_name = "ID")]
+        session: String,
+        /// Execution mode (`standard`, `orchestrator`, or `fusion`).
+        #[arg(value_enum, ignore_case = true)]
+        mode: ExecutionModeArg,
+        /// Sidekick model selector (`provider::model`) for `fusion` mode.
+        #[arg(long, value_name = "PROVIDER::MODEL")]
+        sidekick_model: Option<ModelSelector>,
+    },
     /// Reopen a session in the TUI.
     Resume {
         /// Session id; the most recently active session when omitted.
@@ -317,6 +388,56 @@ enum BrowserSubcommand {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExecutionModeArg {
+    /// Default direct execution.
+    Standard,
+    /// Experimental orchestrator mode: prompt-driven subagent delegation.
+    Orchestrator,
+    /// Experimental fusion mode: frontier lead paired with a persistent cache-warm sidekick.
+    Fusion,
+}
+
+fn build_cli_execution_mode(
+    mode: ExecutionModeArg,
+    sidekick_model: Option<ModelSelector>,
+) -> Result<CliExecutionMode, clap::Error> {
+    match (mode, sidekick_model) {
+        (ExecutionModeArg::Standard, None) => {
+            Ok(CliExecutionMode::Explicit(ExecutionMode::Standard))
+        }
+        (ExecutionModeArg::Orchestrator, None) => {
+            Ok(CliExecutionMode::Explicit(ExecutionMode::Orchestrator))
+        }
+        (ExecutionModeArg::Fusion, Some(sidekick_model)) => {
+            Ok(CliExecutionMode::Explicit(ExecutionMode::Fusion {
+                sidekick_model,
+            }))
+        }
+        (ExecutionModeArg::Fusion, None) => Ok(CliExecutionMode::FusionFromConfig),
+        (ExecutionModeArg::Standard | ExecutionModeArg::Orchestrator, Some(_)) => {
+            Err(Cli::command().error(
+                ErrorKind::ArgumentConflict,
+                "--sidekick-model is only valid with --mode fusion",
+            ))
+        }
+    }
+}
+
+fn build_opt_cli_execution_mode(
+    mode: Option<ExecutionModeArg>,
+    sidekick_model: Option<ModelSelector>,
+) -> Result<Option<CliExecutionMode>, clap::Error> {
+    match (mode, sidekick_model) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(Cli::command().error(
+            ErrorKind::ArgumentConflict,
+            "--sidekick-model requires --mode fusion",
+        )),
+        (Some(mode), sidekick_model) => build_cli_execution_mode(mode, sidekick_model).map(Some),
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum EffortArg {
     Low,
     Medium,
@@ -440,13 +561,17 @@ impl Cli {
             None => {
                 let LaunchArgs {
                     repo,
+                    mode,
+                    sidekick_model,
                     model,
                     reasoning_effort,
                     prompt,
                 } = self.launch;
+                let execution_mode = build_opt_cli_execution_mode(mode, sidekick_model)?;
                 if prompt.is_empty() {
                     CliMode::Tui(TuiArgs {
                         launch: repo.map_or_else(SessionLaunch::default, SessionLaunch::Repo),
+                        execution_mode,
                     })
                 } else {
                     let prompt = joined(&prompt);
@@ -457,11 +582,24 @@ impl Cli {
                         prompt,
                         model,
                         reasoning_effort: reasoning_effort.map(Into::into),
+                        execution_mode,
                     })
                 }
             }
-            Some(Command::Chat) => CliMode::Tui(TuiArgs {
+            Some(Command::Chat {
+                mode,
+                sidekick_model,
+            }) => CliMode::Tui(TuiArgs {
                 launch: SessionLaunch::RepoLess,
+                execution_mode: build_opt_cli_execution_mode(mode, sidekick_model)?,
+            }),
+            Some(Command::Mode {
+                session,
+                mode,
+                sidekick_model,
+            }) => CliMode::Mode(ModeCliArgs {
+                session_id: session,
+                execution_mode: build_cli_execution_mode(mode, sidekick_model)?,
             }),
             Some(Command::Resume { session }) => CliMode::Resume(ResumeArgs { session }),
             Some(Command::Gui { port }) => CliMode::Gui { port },
@@ -542,6 +680,7 @@ mod tests {
             prompt: prompt.to_string(),
             model: None,
             reasoning_effort: None,
+            execution_mode: None,
         }
     }
 
@@ -555,7 +694,8 @@ mod tests {
         assert_eq!(
             parse(&["may", "chat"]),
             CliMode::Tui(TuiArgs {
-                launch: SessionLaunch::RepoLess
+                launch: SessionLaunch::RepoLess,
+                execution_mode: None,
             })
         );
     }
@@ -565,7 +705,66 @@ mod tests {
         assert_eq!(
             parse(&["may", "--repo", "acme/app"]),
             CliMode::Tui(TuiArgs {
-                launch: SessionLaunch::Repo("acme/app".to_string())
+                launch: SessionLaunch::Repo("acme/app".to_string()),
+                execution_mode: None,
+            })
+        );
+    }
+
+    #[test]
+    fn execution_mode_flag_and_subcommand_parse() {
+        assert_eq!(
+            parse(&["may", "--mode", "orchestrator"]),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::default(),
+                execution_mode: Some(CliExecutionMode::Explicit(ExecutionMode::Orchestrator)),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "chat", "--mode", "orchestrator"]),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::RepoLess,
+                execution_mode: Some(CliExecutionMode::Explicit(ExecutionMode::Orchestrator)),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "--mode", "orchestrator", "fix", "lints"]),
+            CliMode::OneShot(OneShotArgs {
+                prompt: "fix lints".to_string(),
+                model: None,
+                reasoning_effort: None,
+                execution_mode: Some(CliExecutionMode::Explicit(ExecutionMode::Orchestrator)),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "mode", "--session", "calm-river", "orchestrator"]),
+            CliMode::Mode(ModeCliArgs {
+                session_id: "calm-river".to_string(),
+                execution_mode: CliExecutionMode::Explicit(ExecutionMode::Orchestrator),
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "may",
+                "mode",
+                "--session",
+                "calm-river",
+                "fusion",
+                "--sidekick-model",
+                "anthropic::claude-sonnet-4-6"
+            ]),
+            CliMode::Mode(ModeCliArgs {
+                session_id: "calm-river".to_string(),
+                execution_mode: CliExecutionMode::Explicit(ExecutionMode::Fusion {
+                    sidekick_model: ModelSelector::new("anthropic", "claude-sonnet-4-6"),
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&["may", "--mode", "fusion"]),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::default(),
+                execution_mode: Some(CliExecutionMode::FusionFromConfig),
             })
         );
     }
@@ -735,6 +934,7 @@ mod tests {
             prompt: "inspect repo".to_string(),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some(ReasoningEffort::Low),
+            execution_mode: None,
         });
         assert_eq!(
             parse(&[

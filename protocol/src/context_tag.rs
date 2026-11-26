@@ -28,6 +28,10 @@ pub mod tag {
     pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
     /// The plan-mode phase and its constraints.
     pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
+    /// The orchestrator-mode delegation guidance.
+    pub const ORCHESTRATOR_MODE: InstructionSlot = InstructionSlot::new("orchestrator_mode");
+    /// The fusion-mode lead/sidekick role contract.
+    pub const FUSION_MODE: InstructionSlot = InstructionSlot::new("fusion_mode");
     /// What the sandbox allows and how `unsafe` escalation works.
     pub const PERMISSIONS: InstructionSlot = InstructionSlot::new("permissions");
     /// The mechanisms the harness runs around the agent.
@@ -56,8 +60,19 @@ pub mod tag {
     /// The user-approved workspace directories.
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
+    /// May Bot identity and inbox-loop operating contract.
+    pub const BOT_IDENTITY: InstructionSlot = InstructionSlot::new("bot_identity");
+    /// May Bot persona overlay.
+    pub const BOT_PERSONA: InstructionSlot = InstructionSlot::new("bot_persona");
+    /// May Bot tool guidance.
+    pub const BOT_TOOLS: InstructionSlot = InstructionSlot::new("bot_tools");
+    /// May Bot time and timezone awareness.
+    pub const BOT_TIME: InstructionSlot = InstructionSlot::new("bot_time");
+    /// May Bot resident hierarchical `MEMORY.md` index (maintained via `LiveContent`).
+    pub const BOT_MEMORY_INDEX: ExternalSlot = ExternalSlot::new("bot_memory_index");
+
     /// The instruction slots May writes, in prompt order.
-    pub const MAY_INSTRUCTIONS: [InstructionSlot; 19] = [
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 21] = [
         IDENTITY,
         HARNESS,
         EVIDENCE,
@@ -76,6 +91,8 @@ pub mod tag {
         SESSION,
         REPO_CLONES,
         PLAN_MODE,
+        ORCHESTRATOR_MODE,
+        FUSION_MODE,
         PROJECT_RULES,
     ];
 
@@ -87,7 +104,7 @@ pub mod tag {
     /// environment, terminal, prepared tools, efficiency, capabilities and
     /// the command table, browser, work, permissions, time and languages.
     /// Text specific to the session comes last: the session section, repo
-    /// clones, plan mode and project rules, then the external content.
+    /// clones, plan mode, orchestrator mode, fusion mode and project rules, then the external content.
     #[must_use]
     pub fn layout() -> SystemLayout {
         SystemLayout::new(
@@ -110,6 +127,8 @@ pub mod tag {
                 SESSION,
                 REPO_CLONES,
                 PLAN_MODE,
+                ORCHESTRATOR_MODE,
+                FUSION_MODE,
                 PROJECT_RULES,
             ],
             [
@@ -120,6 +139,16 @@ pub mod tag {
                 HANDOFF_AGENTS_MD,
                 WORKSPACE_WORKDIRS,
             ],
+        )
+    }
+
+    /// The system prompt layout for a May Bot: static instructions first,
+    /// resident hierarchical `MEMORY.md` index last in an [`ExternalSlot`].
+    #[must_use]
+    pub fn bot_layout() -> SystemLayout {
+        SystemLayout::new(
+            [BOT_IDENTITY, BOT_PERSONA, BOT_TOOLS, BOT_TIME],
+            [BOT_MEMORY_INDEX],
         )
     }
 }

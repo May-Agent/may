@@ -702,6 +702,16 @@ export const enUS = {
     description: 'Grant every approval request in this chat without asking',
     failed: 'Couldn’t change yolo: {message}',
   },
+  executionMode: {
+    standardLabel: 'Standard',
+    orchestratorLabel: 'Orchestrator',
+    orchestratorDescription: 'Delegate hands-on work to subagents to keep the main context lean',
+    fusionLabel: 'Fusion',
+    fusionDescription: 'Pair this frontier lead with a persistent cache-warm sidekick',
+    sidekickModelLabel: 'Sidekick model',
+    fusionNeedsModel: 'Configure a model before enabling Fusion mode',
+    failed: 'Couldn’t change execution mode: {message}',
+  },
   memoryToggle: {
     label: 'Memory',
     description: 'Stop reading and saving memories for the rest of this chat',
