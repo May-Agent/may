@@ -259,7 +259,7 @@ pub async fn resolve_native_adapter(
 }
 
 async fn find_lldb_dap() -> Option<PathBuf> {
-    if let Ok(path) = which::which("lldb-dap") {
+    if let Some(path) = blocking::unblock(|| which::which("lldb-dap").ok()).await {
         return Some(path);
     }
     #[cfg(target_os = "macos")]

@@ -79,6 +79,7 @@ pub async fn resolve_debuggee_pid(pid: u32) -> u32 {
 }
 
 /// Reads the short executable name (`comm`) of `pid`, when accessible on this host.
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 pub async fn inspect_process_comm(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -111,6 +112,7 @@ pub async fn inspect_process_comm(pid: u32) -> Option<String> {
     }
 }
 
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 async fn direct_child_pids(pid: u32) -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {
