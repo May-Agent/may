@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
+use aither_dap::transport::StreamTransport;
 use aither_dap::{
     AnyDapTransport, ConnectMode, DEFAULT_EXECUTION_TIMEOUT, DapError, DapTransport, DebugArgs,
     DebugNotification, DebugResult, DebugSession, DebugSessionConfig, DebugSessionState,
     DebugStatus, DebugToolError, ExecutionOutcome, FrameReader, OutputBuffer, OutputCategory,
-    OutputSnapshot, ProtocolMessage, StdioTransport, TcpTransport, TerminationSummary,
+    OutputSnapshot, ProtocolMessage, TcpTransport, TerminationSummary,
 };
 use aither_sandbox::{
     Interpreter, Job, JobRead, Jobs, MediaResolution, Pipe, SandboxMode, SandboxedChild,
@@ -41,6 +42,10 @@ const DEBUGPY_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll interval while waiting for a freshly spawned target or `debugpy` port to come up.
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Grace bound for `terminate` / `detach` DAP RPCs before force-killing a wedged
+/// host stdio adapter subprocess (such as `lldb-dap` blocked inside `waitFor`).
+const ADAPTER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Identifies which agent owns an active debug session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -162,10 +167,73 @@ impl OwnedDebugJob {
     }
 }
 
+#[derive(Clone)]
+struct HostAdapterKillHandle {
+    pid: u32,
+    child: Arc<Mutex<Option<async_process::Child>>>,
+}
+
+impl HostAdapterKillHandle {
+    async fn force_kill(&self) {
+        kill_direct_child_processes(self.pid).await;
+        let taken = self.child.lock().await.take();
+        if let Some(mut child) = taken {
+            let _ = child.kill();
+            let _ = child.status().await;
+        }
+    }
+}
+
+struct HostAdapterTransport {
+    kill_handle: HostAdapterKillHandle,
+    stream: StreamTransport<async_process::ChildStdout, async_process::ChildStdin>,
+}
+
+impl DapTransport for HostAdapterTransport {
+    async fn send(&mut self, message: &ProtocolMessage) -> Result<(), DapError> {
+        self.stream.send(message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<ProtocolMessage>, DapError> {
+        self.stream.recv().await
+    }
+
+    async fn close(&mut self) -> Result<(), DapError> {
+        let _ = self.stream.close().await;
+        // Give the adapter a brief window to exit cleanly after `disconnect`
+        // before falling back to `SIGKILL`.
+        for _ in 0..6 {
+            let exited = {
+                let mut guard = self.kill_handle.child.lock().await;
+                guard
+                    .as_mut()
+                    .is_none_or(|child| matches!(child.try_status(), Ok(Some(_))))
+            };
+            if exited {
+                let _ = self.kill_handle.child.lock().await.take();
+                return Ok(());
+            }
+            async_io::Timer::after(Duration::from_millis(25)).await;
+        }
+        self.kill_handle.force_kill().await;
+        Ok(())
+    }
+
+    async fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        let mut guard = self.kill_handle.child.lock().await;
+        let status = guard
+            .as_mut()
+            .and_then(|child| child.try_status().ok().flatten());
+        drop(guard);
+        status
+    }
+}
+
 struct ActiveDebugSession {
     generation: u64,
     session: DebugSession,
     owned_job: Option<OwnedDebugJob>,
+    adapter_kill: Option<HostAdapterKillHandle>,
 }
 
 #[derive(Default)]
@@ -413,7 +481,7 @@ impl DebugBroker {
             .map(|j| j.job_pid)
             .or_else(|| status_before.as_ref().and_then(|s| s.target_pid));
         // Detach leaves the owning background job running untouched in JobRegistry.
-        let _ = entry.session.detach().await;
+        detach_session_bounded(&entry.session, entry.adapter_kill.as_ref()).await;
         #[cfg(target_os = "macos")]
         if status_before
             .as_ref()
@@ -440,14 +508,7 @@ impl DebugBroker {
             .ok_or_else(|| {
                 DebugToolError::request_failed("no active debug session to terminate")
             })?;
-        let summary = entry
-            .session
-            .terminate()
-            .await
-            .unwrap_or_else(|_| TerminationSummary {
-                exit_code: None,
-                reason: Some("terminated".to_owned()),
-            });
+        let summary = terminate_session_bounded(&entry.session, entry.adapter_kill.as_ref()).await;
         if let Some(owned) = entry.owned_job {
             let _ = owned.jobs.kill(owned.job_pid).await;
         }
@@ -503,15 +564,17 @@ impl DebugBroker {
         let resolved_program =
             resolve_launch_program_path(&params.program, effective_cwd.as_deref()).await;
 
-        let transport = spawn_host_stdio_adapter(&resolved)?;
+        let (transport, adapter_kill) = spawn_host_stdio_adapter(&resolved)?;
         let config = DebugSessionConfig::new(resolved.kind.adapter_id())
             .with_target(params.program.clone())
             .with_target_pid(job_pid);
+        let init_kill = adapter_kill.clone();
         let (session, notif_rx) = DebugSession::start(&TokioGlobal, transport, config)
             .await
             .map_err(|err| {
                 let jobs = shell.jobs();
                 tokio::spawn(async move {
+                    init_kill.force_kill().await;
                     let _ = jobs.kill(job_pid).await;
                 });
                 DebugToolError::request_failed(format!(
@@ -523,6 +586,7 @@ impl DebugBroker {
         let mut outcome = match attach_launched_native_target(
             &session,
             resolved.kind,
+            adapter_kill.pid,
             &job,
             host_attach_pid,
             &resolved_program,
@@ -532,7 +596,7 @@ impl DebugBroker {
         {
             Ok(outcome) => outcome,
             Err(err) => {
-                let _ = session.terminate().await;
+                let _ = terminate_session_bounded(&session, Some(&adapter_kill)).await;
                 let _ = shell.jobs().kill(job_pid).await;
                 return Err(DebugToolError::request_failed(format!(
                     "failed to attach {} to sandboxed target pid {job_pid}: {err}",
@@ -553,6 +617,7 @@ impl DebugBroker {
             ctx.owner,
             session,
             Some(owned_job),
+            Some(adapter_kill),
             notif_rx,
             ctx.session_prompts,
         )
@@ -618,7 +683,7 @@ impl DebugBroker {
         let outcome = match session.attach(attach_payload, params.timeout).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                let _ = session.terminate().await;
+                let _ = terminate_session_bounded(&session, None).await;
                 let _ = shell.jobs().kill(job_pid).await;
                 return Err(DebugToolError::request_failed(format!(
                     "debugpy attach failed: {err}"
@@ -631,6 +696,7 @@ impl DebugBroker {
             ctx.owner,
             session,
             Some(owned_job),
+            None,
             notif_rx,
             ctx.session_prompts,
         )
@@ -664,13 +730,17 @@ impl DebugBroker {
             .await
             .map_err(|err| DebugToolError::request_failed(err.to_string()))?;
 
-        let transport = spawn_host_stdio_adapter(&resolved)?;
+        let (transport, adapter_kill) = spawn_host_stdio_adapter(&resolved)?;
         let config = DebugSessionConfig::new(resolved.kind.adapter_id())
             .with_target(format!("pid:{reported_pid}"))
             .with_target_pid(reported_pid);
+        let init_kill = adapter_kill.clone();
         let (session, notif_rx) = DebugSession::start(&TokioGlobal, transport, config)
             .await
             .map_err(|err| {
+                tokio::spawn(async move {
+                    init_kill.force_kill().await;
+                });
                 DebugToolError::request_failed(format!(
                     "failed to initialize {} adapter: {err}",
                     resolved.kind.adapter_id()
@@ -681,7 +751,7 @@ impl DebugBroker {
         let outcome = match session.attach(attach_args, timeout).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                let _ = session.detach().await;
+                detach_session_bounded(&session, Some(&adapter_kill)).await;
                 return Err(DebugToolError::request_failed(format!(
                     "failed to attach {} to pid {reported_pid} (host pid {attach_pid}): {err}",
                     resolved.kind.adapter_id()
@@ -689,8 +759,15 @@ impl DebugBroker {
             }
         };
 
-        self.install_session(ctx.owner, session, owned_job, notif_rx, ctx.session_prompts)
-            .await;
+        self.install_session(
+            ctx.owner,
+            session,
+            owned_job,
+            Some(adapter_kill),
+            notif_rx,
+            ctx.session_prompts,
+        )
+        .await;
 
         Ok(outcome.into_result(format!(
             "Attached to pid {reported_pid}; target is running."
@@ -760,8 +837,15 @@ impl DebugBroker {
             }
         };
 
-        self.install_session(ctx.owner, session, None, notif_rx, ctx.session_prompts)
-            .await;
+        self.install_session(
+            ctx.owner,
+            session,
+            None,
+            None,
+            notif_rx,
+            ctx.session_prompts,
+        )
+        .await;
 
         Ok(outcome.into_result(format!(
             "Connected to {}; target is running.",
@@ -799,6 +883,7 @@ impl DebugBroker {
         owner: DebugOwner,
         session: DebugSession,
         owned_job: Option<OwnedDebugJob>,
+        adapter_kill: Option<HostAdapterKillHandle>,
         notif_rx: Receiver<DebugNotification>,
         session_prompts: Option<SessionPrompts>,
     ) {
@@ -813,6 +898,7 @@ impl DebugBroker {
                     generation,
                     session,
                     owned_job,
+                    adapter_kill,
                 },
             );
         }
@@ -859,9 +945,107 @@ struct ConnectParams {
 }
 
 async fn teardown_entry(entry: ActiveDebugSession) {
-    let _ = entry.session.terminate().await;
+    let _ = terminate_session_bounded(&entry.session, entry.adapter_kill.as_ref()).await;
     if let Some(owned) = entry.owned_job {
         let _ = owned.jobs.kill(owned.job_pid).await;
+    }
+}
+
+async fn terminate_session_bounded(
+    session: &DebugSession,
+    adapter_kill: Option<&HostAdapterKillHandle>,
+) -> TerminationSummary {
+    let outcome = futures_lite::future::or(async { Some(session.terminate().await) }, async {
+        async_io::Timer::after(ADAPTER_TEARDOWN_TIMEOUT).await;
+        None
+    })
+    .await;
+    if let Some(handle) = adapter_kill {
+        handle.force_kill().await;
+    }
+    if let Some(Ok(summary)) = outcome {
+        summary
+    } else {
+        TerminationSummary {
+            exit_code: None,
+            reason: Some("terminated".to_owned()),
+        }
+    }
+}
+
+async fn detach_session_bounded(
+    session: &DebugSession,
+    adapter_kill: Option<&HostAdapterKillHandle>,
+) {
+    let finished = futures_lite::future::or(
+        async {
+            let _ = session.detach().await;
+            true
+        },
+        async {
+            async_io::Timer::after(ADAPTER_TEARDOWN_TIMEOUT).await;
+            false
+        },
+    )
+    .await;
+    if !finished && let Some(handle) = adapter_kill {
+        handle.force_kill().await;
+    }
+}
+
+async fn list_child_processes(parent_pid: u32) -> Vec<(u32, String)> {
+    let Ok(out) = async_process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,comm="])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut children = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(child_pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(entry_parent_pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if entry_parent_pid == parent_pid {
+            let comm = parts.collect::<Vec<_>>().join(" ");
+            children.push((child_pid, comm));
+        }
+    }
+    children
+}
+
+async fn kill_direct_child_processes(parent_pid: u32) {
+    for (child_pid, _) in list_child_processes(parent_pid).await {
+        let _ = async_process::Command::new("/bin/kill")
+            .args(["-KILL", &child_pid.to_string()])
+            .status()
+            .await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_debugserver_ready(adapter_pid: u32, max_wait: Duration) {
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
+        let children = list_child_processes(adapter_pid).await;
+        if children
+            .iter()
+            .any(|(_, comm)| comm.contains("debugserver"))
+        {
+            // Allow `$vAttachWait` to finish snapshotting existing processes before
+            // releasing the gated debuggee into `exec`.
+            async_io::Timer::after(Duration::from_millis(80)).await;
+            return;
+        }
+        async_io::Timer::after(Duration::from_millis(25)).await;
     }
 }
 
@@ -1012,16 +1196,37 @@ async fn spawn_sandboxed_target(
 
 fn spawn_host_stdio_adapter(
     resolved: &crate::debug::adapter::ResolvedNativeAdapter,
-) -> Result<AnyDapTransport, DebugToolError> {
-    let mut cmd = async_process::Command::new(&resolved.program);
-    cmd.args(&resolved.args);
-    let transport = StdioTransport::from_command(&mut cmd).map_err(|err| {
-        DebugToolError::request_failed(format!(
-            "failed to start host debug adapter `{}`: {err}",
-            resolved.program.display()
-        ))
+) -> Result<(AnyDapTransport, HostAdapterKillHandle), DebugToolError> {
+    let mut child = async_process::Command::new(&resolved.program)
+        .args(&resolved.args)
+        .stdin(async_process::Stdio::piped())
+        .stdout(async_process::Stdio::piped())
+        .stderr(async_process::Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            DebugToolError::request_failed(format!(
+                "failed to start host debug adapter `{}`: {err}",
+                resolved.program.display()
+            ))
+        })?;
+    let pid = child.id();
+    let stdin = child.stdin.take().ok_or_else(|| {
+        let _ = child.kill();
+        DebugToolError::request_failed("host debug adapter stdin pipe unavailable")
     })?;
-    Ok(AnyDapTransport::new(transport))
+    let stdout = child.stdout.take().ok_or_else(|| {
+        let _ = child.kill();
+        DebugToolError::request_failed("host debug adapter stdout pipe unavailable")
+    })?;
+    let kill_handle = HostAdapterKillHandle {
+        pid,
+        child: Arc::new(Mutex::new(Some(child))),
+    };
+    let transport = HostAdapterTransport {
+        kill_handle: kill_handle.clone(),
+        stream: StreamTransport::new(stdout, stdin),
+    };
+    Ok((AnyDapTransport::new(transport), kill_handle))
 }
 
 fn native_attach_payload(kind: AdapterKind, pid: u32) -> serde_json::Value {
@@ -1086,6 +1291,7 @@ async fn resolve_launch_program_path(program: &str, cwd: Option<&str>) -> PathBu
 async fn attach_launched_native_target(
     session: &DebugSession,
     kind: AdapterKind,
+    adapter_pid: u32,
     job: &Job,
     job_pid: u32,
     resolved_program: &Path,
@@ -1096,8 +1302,11 @@ async fn attach_launched_native_target(
     #[cfg(target_os = "macos")]
     if kind == AdapterKind::LldbDap {
         let release_job = job.clone();
+        let max_wait = handshake_timeout
+            .saturating_sub(Duration::from_secs(1))
+            .max(Duration::from_secs(2));
         tokio::spawn(async move {
-            async_io::Timer::after(Duration::from_millis(120)).await;
+            wait_for_macos_debugserver_ready(adapter_pid, max_wait).await;
             let _ = release_job.input(b"\n".to_vec()).await;
         });
         return session
@@ -1113,7 +1322,7 @@ async fn attach_launched_native_target(
     }
 
     #[cfg(not(target_os = "macos"))]
-    let _ = resolved_program;
+    let _ = (adapter_pid, resolved_program);
 
     let attach_args = match kind {
         AdapterKind::DelveDap => native_attach_payload(kind, job_pid),
@@ -1654,7 +1863,7 @@ int main(void) {
                     cwd: Some(session_root.display().to_string()),
                     env: Vec::new(),
                     stop_on_entry: true,
-                    timeout_ms: Some(5000),
+                    timeout_ms: Some(15_000),
                     args: Vec::new(),
                 },
             )
