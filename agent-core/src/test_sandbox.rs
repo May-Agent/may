@@ -53,7 +53,7 @@ impl std::fmt::Debug for TestTerminal {
 impl TestTerminal {
     /// A terminal in `session_root` serving the baseline commands.
     pub async fn new(session_root: &Path) -> Self {
-        Self::configured(session_root, CommandRegistryBuilder::new(), None).await
+        Self::configured(session_root, CommandRegistryBuilder::new(), None, None).await
     }
 
     /// A terminal as the daemon builds one for a session that signs: the
@@ -73,23 +73,35 @@ impl TestTerminal {
             .unwrap();
         let mut commands = CommandRegistryBuilder::new();
         commands.configure_tool(may_config::commit_signing::SignCommitTool::new(signing));
-        Self::configured(session_root, commands, None).await
+        Self::configured(session_root, commands, None, None).await
     }
 
     /// A terminal whose scripts can call the commands `commands` holds.
     pub async fn with_commands(session_root: &Path, commands: CommandRegistryBuilder) -> Self {
-        Self::configured(session_root, commands, None).await
+        Self::configured(session_root, commands, None, None).await
     }
 
     /// A terminal whose commands see the environment `env` supplies.
     pub async fn with_env(session_root: &Path, env: CommandEnv) -> Self {
-        Self::configured(session_root, CommandRegistryBuilder::new(), Some(env)).await
+        Self::configured(session_root, CommandRegistryBuilder::new(), Some(env), None).await
+    }
+
+    /// A terminal whose shell shares an existing [`aither_sandbox::Jobs`] registry.
+    pub async fn with_jobs(session_root: &Path, jobs: aither_sandbox::Jobs) -> Self {
+        Self::configured(
+            session_root,
+            CommandRegistryBuilder::new(),
+            None,
+            Some(jobs),
+        )
+        .await
     }
 
     async fn configured(
         session_root: &Path,
         commands: CommandRegistryBuilder,
         env_source: Option<CommandEnv>,
+        jobs: Option<aither_sandbox::Jobs>,
     ) -> Self {
         // A shell spawns its job registry on the global executor, which
         // the `may` binary installs at startup.
@@ -135,6 +147,7 @@ impl TestTerminal {
             spaces: crate::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
             pool: None,
             connectivity: None,
+            jobs,
         }
         .build(commands.build())
         .await

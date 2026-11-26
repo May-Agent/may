@@ -449,6 +449,9 @@ pub async fn start(
     });
 
     state.ensure_session_publisher();
+    if let Some(browser_manager) = state.browser_manager() {
+        state.attach_browser_idle_hooks(&browser_manager);
+    }
     bot_session_bridge.bind(state.clone());
     state
         .bot_service

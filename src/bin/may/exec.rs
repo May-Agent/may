@@ -478,6 +478,7 @@ async fn build_exec_shell(
         spaces: may_agent::agent::subagent_spaces::SessionSubagentSpaces::without_clones(),
         pool,
         connectivity: None,
+        jobs: None,
     }
     .build(commands)
     .await
@@ -523,6 +524,7 @@ where
             services: may_agent::SharedServices::new(&context.may_dir)
                 .with_forge_auth(forge_auth.clone()),
             session_role: may_agent::fusion::SessionRole::Main,
+            tui_registry: None,
             llm,
             ask_flagship: None,
             ask_balanced: None,

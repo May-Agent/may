@@ -365,6 +365,7 @@ enum BrowserSessionBacking {
 struct BrowserRuntimeSnapshot {
     running: bool,
     peer_count: usize,
+    takeover_active: bool,
     cdp_endpoint: Option<Arc<str>>,
 }
 
@@ -472,6 +473,83 @@ enum BrowserCommand {
         device_scale_factor: f64,
         reply: oneshot::Sender<Result<(), BrowserError>>,
     },
+    /// Live update for `[browser] idle_timeout`. `Duration::ZERO` disables
+    /// automatic idle shutdown.
+    SetIdleTimeout {
+        timeout: Duration,
+    },
+    /// Install or replace daemon callbacks governing automatic idle shutdown.
+    SetIdleHooks {
+        hooks: BrowserIdleHooks,
+    },
+    /// Record browser activity (for example when a turn using it finishes or
+    /// user input arrives) to reset the idle shutdown timer.
+    Touch,
+}
+
+/// Daemon callbacks governing automatic idle shutdown of the managed browser.
+#[derive(Clone, Default)]
+pub struct BrowserIdleHooks {
+    /// Returns `true` while an active agent turn holds the browser.
+    pub is_turn_active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Invoked after the actor stops the browser due to `idle_timeout`.
+    pub on_idle_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BrowserIdleHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserIdleHooks")
+            .field("is_turn_active", &self.is_turn_active.is_some())
+            .field("on_idle_stop", &self.on_idle_stop.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleDecision {
+    Disabled,
+    Held(Duration),
+    StopAt(Instant),
+    StopNow,
+}
+
+#[derive(Debug)]
+struct IdleTracker {
+    timeout: Duration,
+    last_activity: Instant,
+}
+
+impl IdleTracker {
+    const fn new(timeout: Duration, now: Instant) -> Self {
+        Self {
+            timeout,
+            last_activity: now,
+        }
+    }
+
+    const fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    const fn touch(&mut self, now: Instant) {
+        self.last_activity = now;
+    }
+
+    fn evaluate(&mut self, running: bool, held: bool, now: Instant) -> IdleDecision {
+        if !running || self.timeout.is_zero() {
+            return IdleDecision::Disabled;
+        }
+        if held {
+            self.last_activity = now;
+            return IdleDecision::Held(self.timeout.min(Duration::from_secs(1)));
+        }
+        let deadline = self.last_activity + self.timeout;
+        if now >= deadline {
+            IdleDecision::StopNow
+        } else {
+            IdleDecision::StopAt(deadline)
+        }
+    }
 }
 
 /// Lightweight publisher used by the browser actor to emit lifecycle
@@ -558,11 +636,18 @@ impl BrowserRuntime {
         let _ = snapshot_tx.send(BrowserRuntimeSnapshot {
             running: self.session.is_some(),
             peer_count: self.peers.len(),
+            takeover_active: self.takeover_owner.load_full().is_some(),
             cdp_endpoint: self
                 .session
                 .as_ref()
                 .map(|session| Arc::<str>::from(session.browser.websocket_address().as_str())),
         });
+    }
+
+    fn is_idle_held(&self, hooks: &BrowserIdleHooks) -> bool {
+        !self.peers.is_empty()
+            || self.takeover_owner.load_full().is_some()
+            || hooks.is_turn_active.as_ref().is_some_and(|check| check())
     }
 
     /// Brings the CDP screencast in line with the peers map: running while at
@@ -776,6 +861,26 @@ impl BrowserManager {
         lifecycle: BrowserLifecyclePublisher,
         preference: StreamCodec,
     ) -> Result<Self, BrowserError> {
+        Self::new_with_hooks(
+            config,
+            may_dir,
+            lifecycle,
+            preference,
+            BrowserIdleHooks::default(),
+        )
+    }
+
+    /// Create a new browser manager with daemon idle-shutdown hooks.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] when the config fails validation or codec/interceptor registration fails.
+    pub fn new_with_hooks(
+        config: MayBrowserConfig,
+        may_dir: PathBuf,
+        lifecycle: BrowserLifecyclePublisher,
+        preference: StreamCodec,
+        mut idle_hooks: BrowserIdleHooks,
+    ) -> Result<Self, BrowserError> {
         config
             .validate()
             .map_err(|error| BrowserError::browser_operation("validate browser config", error))?;
@@ -790,12 +895,51 @@ impl BrowserManager {
 
         tokio::spawn(async move {
             let mut runtime = BrowserRuntime::new(codec, video_track, api, lifecycle);
+            let mut idle = IdleTracker::new(config.idle_timeout, Instant::now());
             runtime.publish_snapshot(&snapshot_tx);
 
-            while let Some(command) = command_rx.recv().await {
+            loop {
+                let held = runtime.is_idle_held(&idle_hooks);
+                let idle_sleep =
+                    match idle.evaluate(runtime.session.is_some(), held, Instant::now()) {
+                        IdleDecision::StopNow => {
+                            tracing::info!(
+                                idle_timeout = ?idle.timeout,
+                                "stopping idle managed browser"
+                            );
+                            if let Err(error) = runtime.stop().await {
+                                tracing::warn!(%error, "failed to stop idle managed browser");
+                            }
+                            runtime.publish_snapshot(&snapshot_tx);
+                            if let Some(callback) = idle_hooks.on_idle_stop.as_ref() {
+                                callback();
+                            }
+                            continue;
+                        }
+                        IdleDecision::Disabled => None,
+                        IdleDecision::Held(delay) => Some(tokio::time::Instant::now() + delay),
+                        IdleDecision::StopAt(deadline) => {
+                            Some(tokio::time::Instant::from_std(deadline))
+                        }
+                    };
+
+                let next_command = if let Some(deadline) = idle_sleep {
+                    tokio::select! {
+                        command = command_rx.recv() => command,
+                        () = tokio::time::sleep_until(deadline) => continue,
+                    }
+                } else {
+                    command_rx.recv().await
+                };
+
+                let Some(command) = next_command else {
+                    break;
+                };
+
                 match command {
                     BrowserCommand::Start { reply } => {
                         let result = runtime.start(&config, may_dir.as_path()).await;
+                        idle.touch(Instant::now());
                         runtime.publish_snapshot(&snapshot_tx);
                         let _ = reply.send(result);
                     }
@@ -809,21 +953,26 @@ impl BrowserManager {
                         offer_sdp,
                         reply,
                     } => {
-                        let _ = reply.send(
-                            runtime
-                                .handle_offer(session_id, offer_sdp, actor_tx.clone(), &config)
-                                .await,
-                        );
+                        let result = runtime
+                            .handle_offer(session_id, offer_sdp, actor_tx.clone(), &config)
+                            .await;
+                        idle.touch(Instant::now());
+                        runtime.publish_snapshot(&snapshot_tx);
+                        let _ = reply.send(result);
                     }
                     BrowserCommand::ReadPage {
                         url,
                         options,
                         reply,
                     } => {
-                        let _ = reply.send(runtime.read_page(url.as_str(), options).await);
+                        let result = runtime.read_page(url.as_str(), options).await;
+                        idle.touch(Instant::now());
+                        let _ = reply.send(result);
                     }
                     BrowserCommand::DropPeer { peer_id } => {
                         runtime.drop_peer(peer_id.as_str(), &config).await;
+                        idle.touch(Instant::now());
+                        runtime.publish_snapshot(&snapshot_tx);
                     }
                     BrowserCommand::SetCodec { preference, reply } => {
                         let result = runtime.set_codec(preference, &config).await;
@@ -832,6 +981,8 @@ impl BrowserManager {
                     }
                     BrowserCommand::SetTakeover { session_id } => {
                         runtime.set_takeover(session_id);
+                        idle.touch(Instant::now());
+                        runtime.publish_snapshot(&snapshot_tx);
                     }
                     BrowserCommand::ResizeViewport {
                         width,
@@ -839,11 +990,20 @@ impl BrowserManager {
                         device_scale_factor,
                         reply,
                     } => {
-                        let _ = reply.send(
-                            runtime
-                                .resize_viewport(width, height, device_scale_factor)
-                                .await,
-                        );
+                        let result = runtime
+                            .resize_viewport(width, height, device_scale_factor)
+                            .await;
+                        idle.touch(Instant::now());
+                        let _ = reply.send(result);
+                    }
+                    BrowserCommand::SetIdleTimeout { timeout } => {
+                        idle.set_timeout(timeout);
+                    }
+                    BrowserCommand::SetIdleHooks { hooks } => {
+                        idle_hooks = hooks;
+                    }
+                    BrowserCommand::Touch => {
+                        idle.touch(Instant::now());
                     }
                 }
             }
@@ -869,6 +1029,29 @@ impl BrowserManager {
     #[must_use]
     pub fn active_peer_count(&self) -> usize {
         self.snapshot_rx.borrow().peer_count
+    }
+
+    /// Whether user takeover is currently active on the managed runtime.
+    #[must_use]
+    pub fn has_takeover(&self) -> bool {
+        self.snapshot_rx.borrow().takeover_active
+    }
+
+    /// Updates `[browser] idle_timeout` live without stopping or restarting the browser.
+    pub fn set_idle_timeout(&self, timeout: Duration) {
+        let _ = self
+            .command_tx
+            .send(BrowserCommand::SetIdleTimeout { timeout });
+    }
+
+    /// Installs or replaces the daemon callbacks governing automatic idle shutdown.
+    pub fn set_idle_hooks(&self, hooks: BrowserIdleHooks) {
+        let _ = self.command_tx.send(BrowserCommand::SetIdleHooks { hooks });
+    }
+
+    /// Resets the browser's idle shutdown timer (for example when a turn using it ends).
+    pub fn touch(&self) {
+        let _ = self.command_tx.send(BrowserCommand::Touch);
     }
 
     /// CDP websocket endpoint URL for agent connections.
@@ -2379,6 +2562,7 @@ fn setup_data_channel_handler(
             // The channel closes with the viewer's connection, long before ICE
             // gives up on a viewer that closed: webrtc does not move the
             // connection to `Closed` on the viewer's DTLS close alert.
+            let input_events = peer_events.clone();
             dc.on_close(Box::new(move || {
                 let _ = peer_events.send(BrowserCommand::DropPeer {
                     peer_id: peer_id.clone(),
@@ -2390,7 +2574,9 @@ fn setup_data_channel_handler(
                 let page = page.clone();
                 let peer_session_id = peer_session_id.clone();
                 let takeover_owner = takeover_owner.clone();
+                let input_events = input_events.clone();
                 Box::pin(async move {
+                    let _ = input_events.send(BrowserCommand::Touch);
                     let Ok(text) = String::from_utf8(msg.data.to_vec()) else {
                         return;
                     };
@@ -2675,5 +2861,53 @@ mod tests {
             super::cleanup_profile_lock_files(dir.path()).await;
             assert!(lock.symlink_metadata().is_err());
         });
+    }
+
+    #[test]
+    fn idle_tracker_respects_holds_and_live_timeout_updates() {
+        use std::time::{Duration, Instant};
+
+        use super::{IdleDecision, IdleTracker};
+
+        let start = Instant::now();
+        let mut tracker = IdleTracker::new(Duration::from_mins(5), start);
+
+        // Not running -> disabled.
+        assert_eq!(
+            tracker.evaluate(false, false, start + Duration::from_mins(10)),
+            IdleDecision::Disabled
+        );
+
+        // Unheld before deadline -> schedules StopAt.
+        assert_eq!(
+            tracker.evaluate(true, false, start + Duration::from_secs(100)),
+            IdleDecision::StopAt(start + Duration::from_mins(5))
+        );
+
+        // Held refreshes activity and postpones shutdown.
+        let held_at = start + Duration::from_secs(290);
+        assert_eq!(
+            tracker.evaluate(true, true, held_at),
+            IdleDecision::Held(Duration::from_secs(1))
+        );
+        // Once released, full timeout counts from last held observation.
+        assert_eq!(
+            tracker.evaluate(true, false, held_at + Duration::from_secs(100)),
+            IdleDecision::StopAt(held_at + Duration::from_mins(5))
+        );
+
+        // Live-shortening idle_timeout triggers immediate StopNow when already past.
+        tracker.set_timeout(Duration::from_mins(1));
+        assert_eq!(
+            tracker.evaluate(true, false, held_at + Duration::from_secs(100)),
+            IdleDecision::StopNow
+        );
+
+        // Live-disabling with 0s prevents shutdown.
+        tracker.set_timeout(Duration::ZERO);
+        assert_eq!(
+            tracker.evaluate(true, false, held_at + Duration::from_secs(1_000)),
+            IdleDecision::Disabled
+        );
     }
 }

@@ -171,6 +171,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub services: SharedServices,
     /// Whether this session is a normal user-facing session or a hidden Fusion companion.
     pub session_role: crate::fusion::SessionRole,
+    /// Session-scoped registry of open `tui` PTY sessions reused across
+    /// main-agent rebuilds; `None` starts a fresh registry.
+    pub tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
 }
 
 /// Handles the host owns once and every session's commands share: cloning
@@ -721,7 +724,7 @@ where
         });
     }
 
-    let tui_registry = crate::agent::tui_tool::TuiRegistry::new();
+    let tui_registry = config.tui_registry.unwrap_or_default();
     describe_arguments::<crate::agent::tui_tool::TuiArgs>(&mut descriptions, "tui");
     {
         let tui_registry = tui_registry.clone();
@@ -1157,6 +1160,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1259,6 +1263,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1334,6 +1339,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1403,6 +1409,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1467,6 +1474,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1644,6 +1652,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1779,6 +1788,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1845,6 +1855,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1915,6 +1926,7 @@ mod tests {
                 model_listing: None,
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

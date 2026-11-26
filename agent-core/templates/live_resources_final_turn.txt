@@ -1,0 +1,4 @@
+Before ending this turn, the following interactive session resources are still open:
+{% for item in items %}- {{ item.description }} {{ item.cleanup_hint }}
+{% endfor %}
+If they are no longer needed, close them now. If you intend to leave them running, confirm briefly and finish.
